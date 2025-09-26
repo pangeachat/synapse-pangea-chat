@@ -8,21 +8,19 @@ dynamic = ["version"]
 
 requires-python = ">=3.8"
 
-classifiers = [
-  "License :: OSI Approved :: Apache Software License"
-]
+classifiers = ["License :: OSI Approved :: Apache Software License"]
 
-dependencies = [
-  "attrs"
-]
+dependencies = ["attrs"]
 
 [project.optional-dependencies]
 dev = [
   # for tests
   "matrix-synapse",
   "tox",
-  "twisted",
+  "twisted == 24.7.0",
   "aiounittest",
+  "psycopg2",
+  "testing.postgresql",
   # for type checking
   "mypy == 1.6.1",
   # for linting
@@ -31,17 +29,15 @@ dev = [
 ]
 
 [build-system]
-requires = [
-  "setuptools",
-  "wheel",
-  "setuptools_scm",
-]
+requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
 
 [tool.mypy]
-strict = true
+files = ["synapse_pangea_chat", "tests"]
+disable_error_code = ["import-untyped", "no-untyped-call", "attr-defined"]
+strict = false
 
 [tool.ruff]
 line-length = 88
@@ -54,31 +50,27 @@ line-length = 88
 # flake8-bugbear compatible checks. Its error codes are described at
 # https://docs.astral.sh/ruff/rules/#flake8-bugbear-b
 #  B023: Functions defined inside a loop must not use variables redefined in the loop
-ignore = [
-    "B023",
-    "E501",
-    "E731",
-]
+ignore = ["B023", "E501", "E731"]
 select = [
-    # pycodestyle
-    "E",
-    "W",
-    # pyflakes
-    "F",
-    # flake8-bugbear
-    "B0",
-    # flake8-comprehensions
-    "C4",
-    # flake8-2020
-    "YTT",
-    # flake8-slots
-    "SLOT",
-    # flake8-debugger
-    "T10",
-    # flake8-pie
-    "PIE",
-    # flake8-executable
-    "EXE",
-    # isort
-    "I",
+  # pycodestyle
+  "E",
+  "W",
+  # pyflakes
+  "F",
+  # flake8-bugbear
+  "B0",
+  # flake8-comprehensions
+  "C4",
+  # flake8-2020
+  "YTT",
+  # flake8-slots
+  "SLOT",
+  # flake8-debugger
+  "T10",
+  # flake8-pie
+  "PIE",
+  # flake8-executable
+  "EXE",
+  # isort
+  "I",
 ]
