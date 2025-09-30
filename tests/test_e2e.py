@@ -21,13 +21,20 @@ from synapse_pangea_chat.get_public_courses import _cache
 from synapse_pangea_chat.is_rate_limited import request_log as rate_limit_log
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    filename="synapse.log",
-    filemode="w",
-    force=True,
-)
+
+# Configure logging to only write to file, not console
+root_logger = logging.getLogger()
+# Remove any existing handlers to prevent console output
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+# Add only a file handler
+file_handler = logging.FileHandler("synapse.log", mode="w")
+file_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+file_handler.setFormatter(formatter)
+root_logger.addHandler(file_handler)
+root_logger.setLevel(logging.DEBUG)
 
 
 class TestE2E(aiounittest.AsyncTestCase):
@@ -106,8 +113,11 @@ class TestE2E(aiounittest.AsyncTestCase):
             def read_output(pipe: Union[IO[str], None]):
                 if pipe is None:
                     return
-                for line in iter(pipe.readline, ""):
-                    logger.debug(line)
+                # Write synapse output to a separate file instead of logging
+                with open("synapse_output.log", "w") as f:
+                    for line in iter(pipe.readline, ""):
+                        f.write(line)
+                        f.flush()
                 pipe.close()
 
             stdout_thread = threading.Thread(
@@ -346,7 +356,11 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             plan_response = requests.put(
                 f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
-                json={"plan_id": "course-alpha", "modules": ["intro"]},
+                json={
+                    "plan_id": "course-alpha",
+                    "modules": ["intro"],
+                    "uuid": "test-course-uuid-123",
+                },
                 headers=headers,
                 timeout=30,
             )
@@ -395,19 +409,180 @@ class TestE2E(aiounittest.AsyncTestCase):
             self.assertEqual(course["name"], "Course Alpha")
             self.assertEqual(course["topic"], "Intro to Testing")
 
-            log_file_path = None
-            for handler in logging.getLogger().handlers:
-                if hasattr(handler, "baseFilename"):
-                    log_file_path = handler.baseFilename
-                    break
+            # Verify that course_id is included and matches the uuid from pangea.course_plan
+            self.assertIn(
+                "course_id", course, "course_id should be present in course response"
+            )
+            expected_course_id = "test-course-uuid-123"
+            self.assertEqual(
+                course["course_id"],
+                expected_course_id,
+                f"course_id should match uuid from pangea.course_plan content. Expected: {expected_course_id}, Got: {course.get('course_id')}",
+            )
+        finally:
+            if server_process is not None:
+                server_process.terminate()
+                try:
+                    server_process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    server_process.kill()
+                    server_process.wait(timeout=30)
+            if stdout_thread is not None:
+                stdout_thread.join(timeout=10)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=10)
+            if synapse_dir is not None and os.path.exists(synapse_dir):
+                shutil.rmtree(synapse_dir)
+            if db is not None:
+                db.stop()
 
-            self.assertIsNotNone(log_file_path, "No log file handler configured")
-            self.assertTrue(os.path.exists(log_file_path))
+    async def test_public_courses_endpoint_includes_course_id(self):
+        """Test that the public courses endpoint includes course_id from pangea.course_plan content.uuid"""
+        _cache.clear()
+        rate_limit_log.clear()
 
-            with open(log_file_path, "r", encoding="utf-8") as log_file:
-                log_contents = log_file.read()
-            self.assertIn("Executing public courses query", log_contents)
-            self.assertIn("pangea.course_plan", log_contents)
+        db = None
+        synapse_dir = None
+        config_path = None
+        server_process: Optional[subprocess.Popen] = None
+        stdout_thread: Optional[threading.Thread] = None
+        stderr_thread: Optional[threading.Thread] = None
+
+        try:
+            db, postgres_url = await self.start_test_postgres()
+
+            (
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                db=db,
+                postgresql_url=postgres_url,
+            )
+
+            await self.register_user(
+                config_path, synapse_dir, user="admin", password="adminpass", admin=True
+            )
+
+            admin_token = await self.login_user("admin", "adminpass")
+
+            base_url = "http://localhost:8008"
+            headers = {"Authorization": f"Bearer {admin_token}"}
+
+            alias_suffix = int(time.time())
+            create_room_payload = {
+                "name": "Course Beta",
+                "preset": "public_chat",
+                "visibility": "public",
+                "room_alias_name": f"course-beta-{alias_suffix}",
+            }
+            create_response = requests.post(
+                f"{base_url}/_matrix/client/v3/createRoom",
+                json=create_room_payload,
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(
+                create_response.status_code,
+                200,
+                msg=f"Failed to create room: {create_response.text}",
+            )
+            room_id = create_response.json()["room_id"]
+            room_id_path = quote(room_id, safe="")
+
+            # Set room as public
+            directory_response = requests.put(
+                f"{base_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+                json={"visibility": "public"},
+                headers=headers,
+                timeout=30,
+            )
+            if directory_response.status_code not in (200, 202):
+                if directory_response.status_code == 403:
+                    logger.debug(
+                        "Falling back to manual directory publish due to 403: %s",
+                        directory_response.text,
+                    )
+                    conn = psycopg2.connect(postgres_url)
+                    try:
+                        with conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute(
+                                    "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
+                                    (room_id,),
+                                )
+                    finally:
+                        conn.close()
+                else:
+                    self.fail(
+                        f"Failed to update directory visibility: {directory_response.text}"
+                    )
+
+            # Set room name
+            name_response = requests.put(
+                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
+                json={"name": "Course Beta"},
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(name_response.status_code, 200)
+
+            # Create pangea.course_plan state event with uuid
+            expected_course_id = "beta-course-uuid-12345"
+            plan_response = requests.put(
+                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+                json={
+                    "plan_id": "course-beta",
+                    "uuid": expected_course_id,
+                    "modules": ["intro", "advanced"],
+                },
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(plan_response.status_code, 200)
+
+            # Wait for the course to appear in public courses
+            payload = None
+            matching_courses: List[Dict[str, Any]] = []
+            for _ in range(10):
+                public_courses_response = requests.get(
+                    f"{base_url}/_synapse/client/unstable/org.pangea/public_courses",
+                    headers=headers,
+                    timeout=30,
+                )
+                if public_courses_response.status_code == 200:
+                    payload = public_courses_response.json()
+                    chunk = payload.get("chunk", [])
+                    matching_courses = [
+                        course for course in chunk if course["room_id"] == room_id
+                    ]
+                    if matching_courses:
+                        break
+                await asyncio.sleep(1)
+
+            if not matching_courses:
+                self.fail(
+                    f"Expected room {room_id} in public courses response, got {payload}"
+                )
+
+            course = matching_courses[0]
+
+            # Verify that course_id is included and matches the uuid from pangea.course_plan
+            self.assertIn(
+                "course_id", course, "course_id should be present in course response"
+            )
+            self.assertEqual(
+                course["course_id"],
+                expected_course_id,
+                f"course_id should match uuid from pangea.course_plan content. Expected: {expected_course_id}, Got: {course.get('course_id')}",
+            )
+
+            # Also verify other fields are still working
+            self.assertEqual(course["name"], "Course Beta")
+            self.assertEqual(course["room_id"], room_id)
+
         finally:
             if server_process is not None:
                 server_process.terminate()

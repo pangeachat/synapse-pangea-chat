@@ -17,7 +17,8 @@ AllRoomsState = Dict[str, RoomStateMap]
 _cache: Dict[str, Tuple[RoomStateMap, float]] = {}
 _CACHE_TTL_SECONDS = 60  # 1 minute TTL
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("synapse_pangea_chat.get_public_courses")
+logger.setLevel(logging.DEBUG)
 
 # List of state events required to build a course preview
 RESPONSE_STATE_EVENTS: Tuple[str, ...] = (
@@ -94,6 +95,7 @@ def _get_event_content(
 class Course(TypedDict):
     avatar_url: Optional[str]
     canonical_alias: Optional[str]
+    course_id: Optional[str]
     guest_can_join: bool
     join_rule: Optional[str]
     name: Optional[str]
@@ -117,6 +119,8 @@ async def get_public_courses(
     limit: int,
     since: Optional[str],
 ) -> PublicCoursesResponse:
+    logger.debug("Executing public courses query")
+
     # Clean up expired cache entries periodically
     _cleanup_expired_cache()
 
@@ -290,6 +294,7 @@ ORDER BY e.room_id, e.type, e.state_key, e.origin_server_ts DESC
         topic = None
         avatar_url = None
         canonical_alias = None
+        course_id = None
 
         if "m.room.name" in room_data:
             name_content = _get_event_content(room_data["m.room.name"])
@@ -307,12 +312,17 @@ ORDER BY e.room_id, e.type, e.state_key, e.origin_server_ts DESC
             alias_content = _get_event_content(room_data["m.room.canonical_alias"])
             canonical_alias = alias_content.get("alias")
 
+        # Extract course_id from pangea.course_plan state event content
+        course_plan_content = _get_event_content(course_event_state)
+        course_id = course_plan_content.get("uuid")
+
         course: Course = {
             "room_id": room_id,
             "name": name,
             "topic": topic,
             "avatar_url": avatar_url,
             "canonical_alias": canonical_alias,
+            "course_id": course_id,
             "num_joined_members": 0,
             "world_readable": False,
             "guest_can_join": False,
