@@ -128,7 +128,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             )
             stdout_thread.start()
             stderr_thread.start()
-            server_url = "http://localhost:8008"
+            server_url = "http://localhost:8008/health"
             max_wait_time = 10
             wait_interval = 1
             total_wait_time = 0
@@ -582,6 +582,301 @@ class TestE2E(aiounittest.AsyncTestCase):
             # Also verify other fields are still working
             self.assertEqual(course["name"], "Course Beta")
             self.assertEqual(course["room_id"], room_id)
+
+        finally:
+            if server_process is not None:
+                server_process.terminate()
+                try:
+                    server_process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    server_process.kill()
+                    server_process.wait(timeout=30)
+            if stdout_thread is not None:
+                stdout_thread.join(timeout=10)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=10)
+            if synapse_dir is not None and os.path.exists(synapse_dir):
+                shutil.rmtree(synapse_dir)
+            if db is not None:
+                db.stop()
+
+    async def test_public_courses_returns_room_stats_attributes(self):
+        """Test that the public courses endpoint returns room stats attributes correctly.
+
+        Verifies that the new attributes (world_readable, guest_can_join, join_rule,
+        room_type, num_joined_members) are returned correctly and that old attributes
+        (name, topic, course_id, etc.) still work.
+        """
+        _cache.clear()
+        rate_limit_log.clear()
+
+        db = None
+        synapse_dir = None
+        config_path = None
+        server_process: Optional[subprocess.Popen] = None
+        stdout_thread: Optional[threading.Thread] = None
+        stderr_thread: Optional[threading.Thread] = None
+
+        try:
+            db, postgres_url = await self.start_test_postgres()
+
+            (
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                db=db,
+                postgresql_url=postgres_url,
+            )
+
+            await self.register_user(
+                config_path, synapse_dir, user="admin", password="adminpass", admin=True
+            )
+            await self.register_user(
+                config_path,
+                synapse_dir,
+                user="student1",
+                password="studentpass",
+                admin=False,
+            )
+            await self.register_user(
+                config_path,
+                synapse_dir,
+                user="student2",
+                password="studentpass",
+                admin=False,
+            )
+
+            admin_token = await self.login_user("admin", "adminpass")
+            student1_token = await self.login_user("student1", "studentpass")
+            student2_token = await self.login_user("student2", "studentpass")
+
+            base_url = "http://localhost:8008"
+            headers = {"Authorization": f"Bearer {admin_token}"}
+
+            alias_suffix = int(time.time())
+            create_room_payload = {
+                "name": "Course Gamma",
+                "preset": "public_chat",
+                "visibility": "public",
+                "room_alias_name": f"course-gamma-{alias_suffix}",
+            }
+            create_response = requests.post(
+                f"{base_url}/_matrix/client/v3/createRoom",
+                json=create_room_payload,
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(
+                create_response.status_code,
+                200,
+                msg=f"Failed to create room: {create_response.text}",
+            )
+            room_id = create_response.json()["room_id"]
+            room_id_path = quote(room_id, safe="")
+
+            # Set room as public
+            directory_response = requests.put(
+                f"{base_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+                json={"visibility": "public"},
+                headers=headers,
+                timeout=30,
+            )
+            if directory_response.status_code not in (200, 202):
+                if directory_response.status_code == 403:
+                    logger.debug(
+                        "Falling back to manual directory publish due to 403: %s",
+                        directory_response.text,
+                    )
+                    conn = psycopg2.connect(postgres_url)
+                    try:
+                        with conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute(
+                                    "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
+                                    (room_id,),
+                                )
+                    finally:
+                        conn.close()
+                else:
+                    self.fail(
+                        f"Failed to update directory visibility: {directory_response.text}"
+                    )
+
+            # Set room name
+            name_response = requests.put(
+                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
+                json={"name": "Course Gamma"},
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(name_response.status_code, 200)
+
+            # Set room topic
+            topic_response = requests.put(
+                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.topic",
+                json={"topic": "Testing Room Stats"},
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(topic_response.status_code, 200)
+
+            # Set join rules to public
+            join_rule_response = requests.put(
+                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.join_rules",
+                json={"join_rule": "public"},
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(join_rule_response.status_code, 200)
+
+            # Set guest access
+            guest_access_response = requests.put(
+                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.guest_access",
+                json={"guest_access": "can_join"},
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(guest_access_response.status_code, 200)
+
+            # Set history visibility to world_readable
+            history_visibility_response = requests.put(
+                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.history_visibility",
+                json={"history_visibility": "world_readable"},
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(history_visibility_response.status_code, 200)
+
+            # Create pangea.course_plan state event
+            expected_course_id = "gamma-course-uuid-999"
+            plan_response = requests.put(
+                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+                json={
+                    "plan_id": "course-gamma",
+                    "uuid": expected_course_id,
+                    "modules": ["stats-testing"],
+                },
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(plan_response.status_code, 200)
+
+            # Have students join the room to increase member count
+            student1_headers = {"Authorization": f"Bearer {student1_token}"}
+            join_response1 = requests.post(
+                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/join",
+                headers=student1_headers,
+                timeout=30,
+            )
+            self.assertEqual(join_response1.status_code, 200)
+
+            student2_headers = {"Authorization": f"Bearer {student2_token}"}
+            join_response2 = requests.post(
+                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/join",
+                headers=student2_headers,
+                timeout=30,
+            )
+            self.assertEqual(join_response2.status_code, 200)
+
+            # Wait a bit for room stats to update
+            await asyncio.sleep(2)
+
+            # Wait for the course to appear in public courses
+            payload = None
+            matching_courses: List[Dict[str, Any]] = []
+            for _ in range(10):
+                public_courses_response = requests.get(
+                    f"{base_url}/_synapse/client/unstable/org.pangea/public_courses",
+                    headers=headers,
+                    timeout=30,
+                )
+                if public_courses_response.status_code == 200:
+                    payload = public_courses_response.json()
+                    chunk = payload.get("chunk", [])
+                    matching_courses = [
+                        course for course in chunk if course["room_id"] == room_id
+                    ]
+                    if matching_courses:
+                        break
+                await asyncio.sleep(1)
+
+            if not matching_courses:
+                self.fail(
+                    f"Expected room {room_id} in public courses response, got {payload}"
+                )
+
+            course = matching_courses[0]
+
+            # Verify OLD attributes still work
+            self.assertEqual(
+                course["name"], "Course Gamma", "Old attribute 'name' should still work"
+            )
+            self.assertEqual(
+                course["topic"],
+                "Testing Room Stats",
+                "Old attribute 'topic' should still work",
+            )
+            self.assertEqual(
+                course["room_id"], room_id, "Old attribute 'room_id' should still work"
+            )
+            self.assertEqual(
+                course["course_id"],
+                expected_course_id,
+                "Old attribute 'course_id' should still work",
+            )
+
+            # Verify NEW room stats attributes are present and correct
+            self.assertIn(
+                "world_readable",
+                course,
+                "New attribute 'world_readable' should be present",
+            )
+            self.assertTrue(
+                course["world_readable"],
+                "world_readable should be True when history_visibility is 'world_readable'",
+            )
+
+            self.assertIn(
+                "guest_can_join",
+                course,
+                "New attribute 'guest_can_join' should be present",
+            )
+            self.assertTrue(
+                course["guest_can_join"],
+                "guest_can_join should be True when guest_access is 'can_join'",
+            )
+
+            self.assertIn(
+                "join_rule", course, "New attribute 'join_rule' should be present"
+            )
+            self.assertEqual(
+                course["join_rule"],
+                "public",
+                "join_rule should match the room's join rules",
+            )
+
+            self.assertIn(
+                "room_type", course, "New attribute 'room_type' should be present"
+            )
+            # room_type can be None for regular rooms
+            self.assertIsNone(
+                course["room_type"], "room_type should be None for regular rooms"
+            )
+
+            self.assertIn(
+                "num_joined_members",
+                course,
+                "New attribute 'num_joined_members' should be present",
+            )
+            # Should be at least 3 (admin + 2 students), but allow for timing variations
+            self.assertGreaterEqual(
+                course["num_joined_members"],
+                3,
+                f"num_joined_members should be at least 3 (admin + 2 students), got {course['num_joined_members']}",
+            )
 
         finally:
             if server_process is not None:
