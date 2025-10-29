@@ -38,6 +38,8 @@ root_logger.setLevel(logging.DEBUG)
 
 
 class TestE2E(aiounittest.AsyncTestCase):
+    server_url = "http://localhost:8008"
+
     async def start_test_synapse(
         self,
         *,
@@ -128,14 +130,13 @@ class TestE2E(aiounittest.AsyncTestCase):
             )
             stdout_thread.start()
             stderr_thread.start()
-            server_url = "http://localhost:8008/health"
             max_wait_time = 10
             wait_interval = 1
             total_wait_time = 0
             server_ready = False
             while not server_ready and total_wait_time < max_wait_time:
                 try:
-                    response = requests.get(server_url, timeout=10)
+                    response = requests.get(f"{self.server_url}/health", timeout=10)
                     if response.status_code == 200:
                         server_ready = True
                         break
@@ -231,7 +232,7 @@ class TestE2E(aiounittest.AsyncTestCase):
         subprocess.check_call(register_user_cmd, cwd=dir)
 
     async def login_user(self, user: str, password: str) -> str:
-        login_url = "http://localhost:8008/_matrix/client/v3/login"
+        login_url = f"{self.server_url}/_matrix/client/v3/login"
         login_data = {
             "type": "m.login.password",
             "user": user,
@@ -279,7 +280,6 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             admin_token = await self.login_user("admin", "adminpass")
 
-            base_url = "http://localhost:8008"
             headers = {"Authorization": f"Bearer {admin_token}"}
 
             alias_suffix = int(time.time())
@@ -290,7 +290,7 @@ class TestE2E(aiounittest.AsyncTestCase):
                 "room_alias_name": f"course-alpha-{alias_suffix}",
             }
             create_response = requests.post(
-                f"{base_url}/_matrix/client/v3/createRoom",
+                f"{self.server_url}/_matrix/client/v3/createRoom",
                 json=create_room_payload,
                 headers=headers,
                 timeout=30,
@@ -304,7 +304,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             room_id_path = quote(room_id, safe="")
 
             directory_response = requests.put(
-                f"{base_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+                f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
                 json={"visibility": "public"},
                 headers=headers,
                 timeout=30,
@@ -331,7 +331,7 @@ class TestE2E(aiounittest.AsyncTestCase):
                     )
 
             name_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
                 json={"name": "Course Alpha"},
                 headers=headers,
                 timeout=30,
@@ -339,7 +339,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             self.assertEqual(name_response.status_code, 200)
 
             topic_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.topic",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.topic",
                 json={"topic": "Intro to Testing"},
                 headers=headers,
                 timeout=30,
@@ -347,7 +347,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             self.assertEqual(topic_response.status_code, 200)
 
             join_rule_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.join_rules",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.join_rules",
                 json={"join_rule": "public"},
                 headers=headers,
                 timeout=30,
@@ -355,7 +355,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             self.assertEqual(join_rule_response.status_code, 200)
 
             plan_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
                 json={
                     "plan_id": "course-alpha",
                     "modules": ["intro"],
@@ -370,7 +370,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             matching_courses: List[Dict[str, Any]] = []
             for _ in range(10):
                 public_courses_response = requests.get(
-                    f"{base_url}/_synapse/client/unstable/org.pangea/public_courses",
+                    f"{self.server_url}/_synapse/client/unstable/org.pangea/public_courses",
                     headers=headers,
                     timeout=30,
                 )
@@ -468,7 +468,6 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             admin_token = await self.login_user("admin", "adminpass")
 
-            base_url = "http://localhost:8008"
             headers = {"Authorization": f"Bearer {admin_token}"}
 
             alias_suffix = int(time.time())
@@ -479,7 +478,7 @@ class TestE2E(aiounittest.AsyncTestCase):
                 "room_alias_name": f"course-beta-{alias_suffix}",
             }
             create_response = requests.post(
-                f"{base_url}/_matrix/client/v3/createRoom",
+                f"{self.server_url}/_matrix/client/v3/createRoom",
                 json=create_room_payload,
                 headers=headers,
                 timeout=30,
@@ -494,7 +493,7 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             # Set room as public
             directory_response = requests.put(
-                f"{base_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+                f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
                 json={"visibility": "public"},
                 headers=headers,
                 timeout=30,
@@ -522,7 +521,7 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             # Set room name
             name_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
                 json={"name": "Course Beta"},
                 headers=headers,
                 timeout=30,
@@ -532,7 +531,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             # Create pangea.course_plan state event with uuid
             expected_course_id = "beta-course-uuid-12345"
             plan_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
                 json={
                     "plan_id": "course-beta",
                     "uuid": expected_course_id,
@@ -548,7 +547,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             matching_courses: List[Dict[str, Any]] = []
             for _ in range(10):
                 public_courses_response = requests.get(
-                    f"{base_url}/_synapse/client/unstable/org.pangea/public_courses",
+                    f"{self.server_url}/_synapse/client/unstable/org.pangea/public_courses",
                     headers=headers,
                     timeout=30,
                 )
@@ -653,7 +652,6 @@ class TestE2E(aiounittest.AsyncTestCase):
             student1_token = await self.login_user("student1", "studentpass")
             student2_token = await self.login_user("student2", "studentpass")
 
-            base_url = "http://localhost:8008"
             headers = {"Authorization": f"Bearer {admin_token}"}
 
             alias_suffix = int(time.time())
@@ -664,7 +662,7 @@ class TestE2E(aiounittest.AsyncTestCase):
                 "room_alias_name": f"course-gamma-{alias_suffix}",
             }
             create_response = requests.post(
-                f"{base_url}/_matrix/client/v3/createRoom",
+                f"{self.server_url}/_matrix/client/v3/createRoom",
                 json=create_room_payload,
                 headers=headers,
                 timeout=30,
@@ -679,7 +677,7 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             # Set room as public
             directory_response = requests.put(
-                f"{base_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+                f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
                 json={"visibility": "public"},
                 headers=headers,
                 timeout=30,
@@ -707,7 +705,7 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             # Set room name
             name_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
                 json={"name": "Course Gamma"},
                 headers=headers,
                 timeout=30,
@@ -716,7 +714,7 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             # Set room topic
             topic_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.topic",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.topic",
                 json={"topic": "Testing Room Stats"},
                 headers=headers,
                 timeout=30,
@@ -725,7 +723,7 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             # Set join rules to public
             join_rule_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.join_rules",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.join_rules",
                 json={"join_rule": "public"},
                 headers=headers,
                 timeout=30,
@@ -734,7 +732,7 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             # Set guest access
             guest_access_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.guest_access",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.guest_access",
                 json={"guest_access": "can_join"},
                 headers=headers,
                 timeout=30,
@@ -743,7 +741,7 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             # Set history visibility to world_readable
             history_visibility_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.history_visibility",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.history_visibility",
                 json={"history_visibility": "world_readable"},
                 headers=headers,
                 timeout=30,
@@ -753,7 +751,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             # Create pangea.course_plan state event
             expected_course_id = "gamma-course-uuid-999"
             plan_response = requests.put(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
                 json={
                     "plan_id": "course-gamma",
                     "uuid": expected_course_id,
@@ -767,7 +765,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             # Have students join the room to increase member count
             student1_headers = {"Authorization": f"Bearer {student1_token}"}
             join_response1 = requests.post(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/join",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/join",
                 headers=student1_headers,
                 timeout=30,
             )
@@ -775,7 +773,7 @@ class TestE2E(aiounittest.AsyncTestCase):
 
             student2_headers = {"Authorization": f"Bearer {student2_token}"}
             join_response2 = requests.post(
-                f"{base_url}/_matrix/client/v3/rooms/{room_id_path}/join",
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/join",
                 headers=student2_headers,
                 timeout=30,
             )
@@ -789,7 +787,7 @@ class TestE2E(aiounittest.AsyncTestCase):
             matching_courses: List[Dict[str, Any]] = []
             for _ in range(10):
                 public_courses_response = requests.get(
-                    f"{base_url}/_synapse/client/unstable/org.pangea/public_courses",
+                    f"{self.server_url}/_synapse/client/unstable/org.pangea/public_courses",
                     headers=headers,
                     timeout=30,
                 )

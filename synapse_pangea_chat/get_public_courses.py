@@ -3,8 +3,9 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from synapse.storage.databases.main.room import RoomStore
 from synapse.api.constants import HistoryVisibility
+from synapse.storage.databases.main.room import RoomStore
+
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.types import Course, PublicCoursesResponse
 
@@ -264,11 +265,11 @@ ORDER BY e.room_id, e.type, e.state_key, e.origin_server_ts DESC
     # Fetch room stats and metadata for all display rooms
     room_stats_placeholders = ",".join(["?" for _ in display_room_ids])
     room_stats_query = f"""
-SELECT 
-    room_id, 
-    history_visibility, 
-    guest_access, 
-    join_rules, 
+SELECT
+    room_id,
+    history_visibility,
+    guest_access,
+    join_rules,
     room_type,
     joined_members
 FROM room_stats_state
