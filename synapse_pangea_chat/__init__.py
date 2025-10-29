@@ -1,11 +1,10 @@
 from typing import Any, Dict, Mapping, Tuple
 
+from synapse.events import EventBase
 from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.public_courses import PublicCourses
-from synapse.events import EventBase
-
 from synapse_pangea_chat.unassign_activity_role_on_leave import (
     unassigned_activity_role_on_leave,
 )
@@ -51,10 +50,7 @@ class PangeaChat:
             return
 
         # Only process events for types we care about
-        if (
-            event.type != "m.room.membership"
-            and event.content.get("membership") != "leave"
-        ):
+        if event.type != "m.room.member" or event.content.get("membership") != "leave":
             return
 
         await unassigned_activity_role_on_leave(
