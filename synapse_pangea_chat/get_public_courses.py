@@ -1,11 +1,13 @@
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, Tuple
 
+from synapse.api.constants import HistoryVisibility
 from synapse.storage.databases.main.room import RoomStore
 
 from synapse_pangea_chat.config import PangeaChatConfig
+from synapse_pangea_chat.types import Course, PublicCoursesResponse
 
 # In-memory cache for course preview data
 # Structure: {room_id: (data, timestamp)}
@@ -90,27 +92,6 @@ def _get_event_content(
                 return content
 
     return {}
-
-
-class Course(TypedDict):
-    avatar_url: Optional[str]
-    canonical_alias: Optional[str]
-    course_id: Optional[str]
-    guest_can_join: bool
-    join_rule: Optional[str]
-    name: Optional[str]
-    num_joined_members: int
-    room_id: str
-    room_type: Optional[str]
-    topic: Optional[str]
-    world_readable: bool
-
-
-class PublicCoursesResponse(TypedDict):
-    chunk: List[Course]
-    next_batch: Optional[str]
-    prev_batch: Optional[str]
-    total_room_count_estimate: Optional[int]
 
 
 async def get_public_courses(
@@ -281,6 +262,45 @@ ORDER BY e.room_id, e.type, e.state_key, e.origin_server_ts DESC
             rooms_data[room_id] = room_state
             _cache_room_data(room_id, room_state)
 
+    # Fetch room stats and metadata for all display rooms
+    room_stats_placeholders = ",".join(["?" for _ in display_room_ids])
+    room_stats_query = f"""
+SELECT
+    room_id,
+    history_visibility,
+    guest_access,
+    join_rules,
+    room_type,
+    joined_members
+FROM room_stats_state
+INNER JOIN room_stats_current USING (room_id)
+WHERE room_id IN ({room_stats_placeholders})
+    """
+
+    room_stats_rows = await room_store.db_pool.execute(
+        "get_public_courses_room_stats",
+        room_stats_query,
+        *display_room_ids,
+    )
+
+    room_stats: Dict[str, Dict[str, Any]] = {}
+    for row in room_stats_rows:
+        (
+            room_id,
+            history_visibility,
+            guest_access,
+            join_rules,
+            room_type,
+            joined_members,
+        ) = row
+        room_stats[room_id] = {
+            "history_visibility": history_visibility,
+            "guest_access": guest_access,
+            "join_rules": join_rules,
+            "room_type": room_type,
+            "joined_members": joined_members,
+        }
+
     for room_id in display_room_ids:
         room_data = rooms_data.get(room_id)
         if not room_data:
@@ -316,6 +336,14 @@ ORDER BY e.room_id, e.type, e.state_key, e.origin_server_ts DESC
         course_plan_content = _get_event_content(course_event_state)
         course_id = course_plan_content.get("uuid")
 
+        # Get room stats data
+        stats = room_stats.get(room_id, {})
+        history_visibility = stats.get("history_visibility")
+        guest_access = stats.get("guest_access")
+        join_rules = stats.get("join_rules")
+        room_type = stats.get("room_type")
+        joined_members = stats.get("joined_members", 0)
+
         course: Course = {
             "room_id": room_id,
             "name": name,
@@ -323,11 +351,11 @@ ORDER BY e.room_id, e.type, e.state_key, e.origin_server_ts DESC
             "avatar_url": avatar_url,
             "canonical_alias": canonical_alias,
             "course_id": course_id,
-            "num_joined_members": 0,
-            "world_readable": False,
-            "guest_can_join": False,
-            "join_rule": None,
-            "room_type": None,
+            "num_joined_members": joined_members,
+            "world_readable": history_visibility == HistoryVisibility.WORLD_READABLE,
+            "guest_can_join": guest_access == "can_join",
+            "join_rule": join_rules,
+            "room_type": room_type,
         }
         courses.append(course)
 
