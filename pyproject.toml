@@ -1,12 +1,12 @@
 [project]
 name = "synapse_pangea_chat"
-description = "Add Pangea Chat's specific functionality to existing Synapse instance"
+description = "Unified Pangea Chat Synapse modules: public courses, room preview, room code, auto-accept invite, delete room, limit user directory"
 readme = "README.md"
 
 dynamic = ["version"]
 
 
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 
 classifiers = ["License :: OSI Approved :: Apache Software License"]
 
