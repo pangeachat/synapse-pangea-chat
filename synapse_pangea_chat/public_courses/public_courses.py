@@ -16,8 +16,11 @@ from twisted.internet import defer
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.config import PangeaChatConfig
-from synapse_pangea_chat.get_public_courses import get_public_courses
-from synapse_pangea_chat.is_rate_limited import RateLimitError, is_rate_limited
+from synapse_pangea_chat.public_courses.get_public_courses import get_public_courses
+from synapse_pangea_chat.public_courses.is_rate_limited import (
+    RateLimitError,
+    is_rate_limited,
+)
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.public_courses")
 

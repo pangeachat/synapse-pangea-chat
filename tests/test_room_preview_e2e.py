@@ -9,8 +9,8 @@ import psycopg2.extensions
 import requests
 from psycopg2.extensions import parse_dsn
 
-from synapse_pangea_chat.get_public_courses import _cache
-from synapse_pangea_chat.is_rate_limited import request_log as rate_limit_log
+from synapse_pangea_chat.public_courses import _cache
+from synapse_pangea_chat.public_courses import request_log as rate_limit_log
 
 from .base_e2e import BaseSynapseE2ETest
 

@@ -19,6 +19,7 @@ dev = [
   "tox",
   "twisted == 24.7.0",
   "aiounittest",
+  "aiohttp",
   "psycopg2",
   "testing.postgresql",
   # for type checking

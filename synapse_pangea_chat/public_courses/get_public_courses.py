@@ -7,7 +7,7 @@ from synapse.api.constants import HistoryVisibility
 from synapse.storage.databases.main.room import RoomStore
 
 from synapse_pangea_chat.config import PangeaChatConfig
-from synapse_pangea_chat.types import Course, PublicCoursesResponse
+from synapse_pangea_chat.public_courses.types import Course, PublicCoursesResponse
 
 # In-memory cache for course preview data
 # Structure: {room_id: (data, timestamp)}
