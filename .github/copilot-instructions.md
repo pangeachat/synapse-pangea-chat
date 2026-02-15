@@ -1,4 +1,4 @@
-You own the docs. Three sources of truth must agree: **docs**, **code**, and **prior user guidance**. When they don't, resolve it. Update this file when your changes shift conventions. Fix obvious factual errors (paths, class names) without asking. Flag ambiguity when sources contradict. Keep instruction docs focused on decision logic, contracts, and "why" — don't restate method signatures or field names that the code already defines, because those go stale across sessions. Treat instruction docs as stable architecture specs: only update them for major logical flaws, not implementation-level drift.
+Check the relevant `.github/instructions/` doc before and after coding. If it doesn't exist, create it with the user first.
 
 # synapse-pangea-chat
 
