@@ -199,14 +199,12 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             conn = psycopg2.connect(postgres_url)
             conn.autocommit = True
             cursor = conn.cursor()
-            cursor.execute(
-                f"""
+            cursor.execute(f"""
                 CREATE DATABASE {dbname}
                 WITH TEMPLATE template0
                 LC_COLLATE 'C'
                 LC_CTYPE 'C';
-            """
-            )
+            """)
             cursor.close()
             conn.close()
 
