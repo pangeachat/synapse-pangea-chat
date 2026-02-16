@@ -2,6 +2,8 @@
 EVENT_TYPE_M_ROOM_JOIN_RULES = "m.room.join_rules"
 JOIN_RULE_CONTENT_KEY = "join_rule"
 KNOCK_JOIN_RULE_VALUE = "knock"  # Existing join rule value
+KNOCK_RESTRICTED_JOIN_RULE_VALUE = "knock_restricted"
+RESTRICTED_JOIN_RULE_VALUE = "restricted"
 ACCESS_CODE_JOIN_RULE_CONTENT_KEY = "access_code"  # New join rule content key
 
 # https://spec.matrix.org/v1.11/client-server-api/#mroommember
@@ -11,6 +13,8 @@ MEMBERSHIP_CONTENT_KEY = "membership"  # existing membership content key
 MEMBERSHIP_KNOCK = "knock"  # existing membership value
 MEMBERSHIP_INVITE = "invite"  # existing membership value
 MEMBERSHIP_JOIN = "join"  # existing membership value
+MEMBERSHIP_LEAVE = "leave"  # existing membership value
+MEMBERSHIP_BAN = "ban"  # existing membership value
 
 # https://spec.matrix.org/v1.11/client-server-api/#mroompower_levels
 EVENT_TYPE_M_ROOM_POWER_LEVELS = "m.room.power_levels"

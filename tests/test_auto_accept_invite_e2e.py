@@ -294,3 +294,197 @@ class TestE2E(BaseSynapseE2ETest):
                 synapse_dir=synapse_dir,
                 postgres=postgres,
             )
+
+    async def create_knock_restricted_room(
+        self, access_token: str, parent_room_id: str
+    ) -> str:
+        """Create a room with knock_restricted join rules allowing members of parent_room_id."""
+        headers = {"Authorization": f"Bearer {access_token}"}
+        create_room_url = f"http://localhost:8008/_matrix/client/v3/createRoom"
+        create_room_data = {
+            "visibility": "private",
+            "preset": "private_chat",
+            "room_version": "10",
+            "initial_state": [
+                {
+                    "type": "m.room.join_rules",
+                    "state_key": "",
+                    "content": {
+                        "join_rule": "knock_restricted",
+                        "allow": [
+                            {
+                                "type": "m.room_membership",
+                                "room_id": parent_room_id,
+                            },
+                        ],
+                    },
+                }
+            ],
+        }
+        response = requests.post(
+            create_room_url,
+            json=create_room_data,
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()["room_id"]
+
+    async def get_room_power_levels(self, room_id: str, access_token: str) -> dict:
+        """Get current power levels for a room."""
+        url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/m.room.power_levels"
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    async def create_space(self, access_token: str) -> str:
+        """Create a space (used as the parent for knock_restricted rooms)."""
+        headers = {"Authorization": f"Bearer {access_token}"}
+        create_room_url = f"http://localhost:8008/_matrix/client/v3/createRoom"
+        create_room_data = {
+            "visibility": "private",
+            "preset": "private_chat",
+            "creation_content": {"type": "m.space"},
+        }
+        response = requests.post(
+            create_room_url,
+            json=create_room_data,
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()["room_id"]
+
+    async def test_promote_on_leave_knock_restricted(self):
+        """
+        Test that when the last admin leaves a knock_restricted room,
+        a remaining user is promoted to have invite power, allowing
+        restricted joins to succeed.
+
+        Scenario:
+        1. User1 (admin, power level 100) creates a space and a
+           knock_restricted child room
+        2. User2 (non-admin, power level 0) is invited and joins both
+        3. Power levels set: user1=100, user2=0, invite requires 50
+        4. User1 leaves the child room
+        5. Expected: module detects leave in knock_restricted room,
+           promotes User2 to power level >= 50
+        6. User3 (member of parent space) can join child room via
+           restricted join
+        """
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            # Register users
+            users = [
+                {"user": "user1", "password": "pw1"},
+                {"user": "user2", "password": "pw2"},
+                {"user": "user3", "password": "pw3"},
+            ]
+            for register_user in users:
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user=register_user["user"],
+                    password=register_user["password"],
+                    admin=False,
+                )
+
+            # Login users
+            tokens = {}
+            user_ids = {}
+            for token_user in users:
+                user_id, token = await self.login_user(
+                    token_user["user"], token_user["password"]
+                )
+                tokens[token_user["user"]] = token
+                user_ids[token_user["user"]] = user_id
+
+            # User1 creates a parent space
+            space_id = await self.create_space(tokens["user1"])
+
+            # User1 creates a knock_restricted child room
+            room_id = await self.create_knock_restricted_room(tokens["user1"], space_id)
+
+            # User1 invites User2 to space and child room
+            for target_room in [space_id, room_id]:
+                invited = await self.invite_user_to_room(
+                    target_room, user_ids["user2"], tokens["user1"]
+                )
+                self.assertTrue(invited)
+                accepted = await self.accept_room_invitation(
+                    target_room, tokens["user2"]
+                )
+                self.assertTrue(accepted)
+
+            # User1 invites User3 to space only (so they can do restricted join later)
+            invited = await self.invite_user_to_room(
+                space_id, user_ids["user3"], tokens["user1"]
+            )
+            self.assertTrue(invited)
+            accepted = await self.accept_room_invitation(space_id, tokens["user3"])
+            self.assertTrue(accepted)
+
+            # Set power levels in child room: user1=100, user2=0, invite requires 50
+            await self.set_room_power_levels(
+                room_id=room_id,
+                access_token=tokens["user1"],
+                user_power_levels={
+                    user_ids["user1"]: 100,
+                    user_ids["user2"]: 0,
+                },
+            )
+
+            # User1 (the only admin) leaves the child room
+            await self.leave_room(room_id=room_id, access_token=tokens["user1"])
+
+            # Wait for background process to complete
+            await asyncio.sleep(3)
+
+            # Verify that User2 has been promoted to have invite power (>= 50)
+            power_levels = await self.get_room_power_levels(room_id, tokens["user2"])
+            user2_power = power_levels.get("users", {}).get(user_ids["user2"], 0)
+            self.assertGreaterEqual(
+                user2_power,
+                50,
+                f"User2 should have been promoted to power level >= 50, "
+                f"but has {user2_power}",
+            )
+
+            # User3 (member of parent space) should now be able to do a
+            # restricted join on the child room
+            join_url = f"http://localhost:8008/_matrix/client/v3/join/{room_id}"
+            response = requests.post(
+                join_url,
+                headers={"Authorization": f"Bearer {tokens['user3']}"},
+                timeout=10,
+            )
+            self.assertEqual(
+                response.status_code,
+                200,
+                f"User3 should be able to join knock_restricted room via "
+                f"restricted join after admin left. Response: {response.text}",
+            )
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )

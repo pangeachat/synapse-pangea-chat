@@ -9,6 +9,13 @@ from synapse.module_api import (
     run_as_background_process,
 )
 
+from synapse_pangea_chat.room_code.constants import (
+    EVENT_TYPE_M_ROOM_JOIN_RULES,
+    JOIN_RULE_CONTENT_KEY,
+    KNOCK_RESTRICTED_JOIN_RULE_VALUE,
+    RESTRICTED_JOIN_RULE_VALUE,
+)
+from synapse_pangea_chat.room_code.get_inviter_user import get_inviter_user
 from synapse_pangea_chat.room_code.invite_user_to_room import invite_user_to_room
 
 logger = logging.getLogger(__name__)
@@ -100,6 +107,17 @@ class AutoAcceptInviteIfKnocked:
                 "auto_invite_knocker",
                 self._auto_invite_knocker,
                 event.state_key,
+                event.room_id,
+                bg_start_span=False,
+            )
+            return
+
+        # Handle leave/ban: proactively ensure a remaining local user has
+        # invite power so that restricted joins continue to work.
+        if event.membership in ("leave", "ban"):
+            await run_as_background_process(
+                "ensure_inviter_on_leave",
+                self._ensure_inviter_on_leave,
                 event.room_id,
                 bg_start_span=False,
             )
@@ -265,6 +283,54 @@ class AutoAcceptInviteIfKnocked:
             logger.error(
                 "Failed to auto-invite knocker %s to room %s: %s",
                 knocker_user_id,
+                room_id,
+                e,
+            )
+
+    async def _ensure_inviter_on_leave(self, room_id: str) -> None:
+        """
+        After a user leaves or is banned/kicked from a room, ensure that at
+        least one remaining local member has sufficient power to authorize
+        restricted joins (i.e. can set join_authorised_via_users_server).
+
+        Only acts on rooms with 'knock_restricted' or 'restricted' join rules,
+        where the authorization is required by the spec.
+        """
+        try:
+            join_rules_state = await self._api.get_room_state(
+                room_id=room_id,
+                event_filter=[(EVENT_TYPE_M_ROOM_JOIN_RULES, None)],
+            )
+
+            join_rule = None
+            for state_event in join_rules_state.values():
+                if state_event.type == EVENT_TYPE_M_ROOM_JOIN_RULES:
+                    join_rule = state_event.content.get(JOIN_RULE_CONTENT_KEY)
+                    break
+
+            if join_rule not in (
+                KNOCK_RESTRICTED_JOIN_RULE_VALUE,
+                RESTRICTED_JOIN_RULE_VALUE,
+            ):
+                return
+
+            logger.info(
+                "User left/was removed from %s (join_rule=%s), "
+                "ensuring a local user retains invite power",
+                room_id,
+                join_rule,
+            )
+
+            inviter = await get_inviter_user(api=self._api, room_id=room_id)
+            if inviter is None:
+                logger.warning(
+                    "No local user could be promoted to inviter in room %s "
+                    "after member departure",
+                    room_id,
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to ensure inviter after member departure in room %s: %s",
                 room_id,
                 e,
             )

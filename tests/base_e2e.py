@@ -203,6 +203,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 f"""
                 CREATE DATABASE {dbname}
                 WITH TEMPLATE template0
+                ENCODING 'UTF8'
                 LC_COLLATE 'C'
                 LC_CTYPE 'C';
             """
