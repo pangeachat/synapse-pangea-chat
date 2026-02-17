@@ -18,6 +18,7 @@ from synapse_pangea_chat.room_preview import (
     RoomPreview,
     invalidate_room_cache,
 )
+from synapse_pangea_chat.user_activity import UserActivity
 
 logger = logging.getLogger(f"synapse.module.{__name__}")
 
@@ -78,6 +79,13 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/delete_room",
             resource=self.delete_room_resource,
+        )
+
+        # --- User Activity ---
+        self.user_activity_resource = UserActivity(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/user_activity",
+            resource=self.user_activity_resource,
         )
 
         # --- Limit User Directory ---
@@ -160,6 +168,14 @@ class PangeaChat:
             "delete_room_burst_duration_seconds", 60
         )
 
+        # --- user_activity config ---
+        user_activity_requests_per_burst = config.get(
+            "user_activity_requests_per_burst", 10
+        )
+        user_activity_burst_duration_seconds = config.get(
+            "user_activity_burst_duration_seconds", 60
+        )
+
         # --- limit_user_directory config ---
         limit_user_directory_public_attribute_search_path = config.get(
             "limit_user_directory_public_attribute_search_path", None
@@ -215,6 +231,8 @@ class PangeaChat:
             auto_accept_invite_worker=auto_accept_invite_worker,
             delete_room_requests_per_burst=delete_room_requests_per_burst,
             delete_room_burst_duration_seconds=delete_room_burst_duration_seconds,
+            user_activity_requests_per_burst=user_activity_requests_per_burst,
+            user_activity_burst_duration_seconds=user_activity_burst_duration_seconds,
             limit_user_directory_public_attribute_search_path=limit_user_directory_public_attribute_search_path,
             limit_user_directory_whitelist_requester_id_patterns=limit_user_directory_whitelist_requester_id_patterns,
             limit_user_directory_filter_search_if_missing_public_attribute=limit_user_directory_filter_search_if_missing_public_attribute,

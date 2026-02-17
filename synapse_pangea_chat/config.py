@@ -48,6 +48,10 @@ class PangeaChatConfig:
     delete_room_requests_per_burst: int = 10
     delete_room_burst_duration_seconds: int = 60
 
+    # --- user_activity config ---
+    user_activity_requests_per_burst: int = 10
+    user_activity_burst_duration_seconds: int = 60
+
     # --- limit_user_directory config ---
     limit_user_directory_public_attribute_search_path: Optional[str] = None
     limit_user_directory_whitelist_requester_id_patterns: List[str] = attr.Factory(list)
