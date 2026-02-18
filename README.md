@@ -10,6 +10,7 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 | [Room Preview](#room-preview) | `synapse_pangea_chat/room_preview/` | `GET /_synapse/client/unstable/org.pangea/room_preview` | Read room state events without membership |
 | [Room Code](#room-code) | `synapse_pangea_chat/room_code/` | `POST /_synapse/client/pangea/v1/knock_with_code` | Secret-code-based room invitations |
 | | | `GET /_synapse/client/pangea/v1/request_room_code` | Generate a unique room access code |
+| [Request Auto Join](#request-auto-join) | `synapse_pangea_chat/request_auto_join/` | `POST /_synapse/client/unstable/org.pangea/v1/request_auto_join` | Invite a previous member back when no admin can |
 | [Auto Accept Invite](#auto-accept-invite) | `synapse_pangea_chat/auto_accept_invite/` | *(callback)* | Auto-accept invites for users who previously knocked |
 | [Delete Room](#delete-room) | `synapse_pangea_chat/delete_room/` | `POST /_synapse/client/pangea/v1/delete_room` | Room deletion for highest-power-level members |
 | [Limit User Directory](#limit-user-directory) | `synapse_pangea_chat/limit_user_directory/` | *(spam checker)* | Filter user directory by public profile attribute |
@@ -42,6 +43,10 @@ modules:
       # --- Room Code ---
       knock_with_code_requests_per_burst: 10       # default: 10
       knock_with_code_burst_duration_seconds: 60   # default: 60
+
+      # --- Request Auto Join ---
+      request_auto_join_requests_per_burst: 10     # default: 10
+      request_auto_join_burst_duration_seconds: 60 # default: 60
 
       # --- Auto Accept Invite ---
       auto_accept_invite_worker: null              # worker name, null for main process
@@ -192,6 +197,33 @@ Extend rooms to optionally have a secret code. Upon knocking with a valid code, 
 
 ---
 
+## Request Auto Join
+
+Allow a previously-joined user to rejoin a room even when no remaining member has invite power. The endpoint finds the local member with the highest power level, promotes them to invite power if necessary (using internal Synapse APIs), and sends an invite on their behalf. Combined with the [Auto Accept Invite](#auto-accept-invite) module, this completes the full rejoin flow.
+
+**Route:** `POST /_synapse/client/unstable/org.pangea/v1/request_auto_join`
+
+**Body:** `{ "room_id": "!room:example.com" }`
+
+**Response (200):**
+```json
+{ "message": "Invited user", "room_id": "!room:example.com" }
+```
+
+### Validation
+
+| Check | HTTP Status | Error |
+|-------|-------------|-------|
+| Missing or invalid auth token | 403 | `Forbidden` |
+| Missing or invalid `room_id` | 400 | `Missing or invalid 'room_id'` |
+| User was never a member | 403 | `User was not previously a member of this room` |
+| User is currently joined | 400 | `User is already a member of this room` |
+| No local member available to invite | 500 | `Internal server error` |
+
+Rate limited per user (default: 10 requests per 60 seconds).
+
+---
+
 ## Auto Accept Invite
 
 Automatically accept invites for users who previously knocked on a room. When a user knocks on a room and is later invited, the module auto-accepts the invite on their behalf.
@@ -269,6 +301,7 @@ synapse_pangea_chat/
 ├── types.py                     # Shared types
 ├── room_preview/                # Room preview module
 ├── room_code/                   # Room code module
+├── request_auto_join/           # Request auto join module
 ├── auto_accept_invite/          # Auto accept invite module
 ├── delete_room/                 # Delete room module
 └── limit_user_directory/        # Limit user directory module
@@ -278,6 +311,7 @@ tests/
 ├── test_room_preview_e2e.py     # Room preview E2E tests
 ├── test_room_preview_reactive_cache.py
 ├── test_room_code_e2e.py        # Room code E2E tests
+├── test_request_auto_join_e2e.py # Request auto join E2E tests
 ├── test_auto_accept_invite_e2e.py
 ├── test_delete_room_e2e.py
 └── test_limit_user_directory_e2e.py

@@ -10,6 +10,7 @@ from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.delete_room import DeleteRoom
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.public_courses import PublicCourses
+from synapse_pangea_chat.request_auto_join import RequestAutoJoin
 from synapse_pangea_chat.room_code import KnockWithCode, RequestRoomCode
 from synapse_pangea_chat.room_preview import (
     PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE,
@@ -68,6 +69,13 @@ class PangeaChat:
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/request_room_code",
             resource=self.request_code_resource,
+        )
+
+        # --- Request Auto Join ---
+        self.request_auto_join_resource = RequestAutoJoin(api, config)
+        api.register_web_resource(
+            path="/_synapse/client/unstable/org.pangea/v1/request_auto_join",
+            resource=self.request_auto_join_resource,
         )
 
         # --- Auto Accept Invite If Knocked ---
@@ -152,6 +160,14 @@ class PangeaChat:
         # --- auto_accept_invite config ---
         auto_accept_invite_worker = config.get("auto_accept_invite_worker", None)
 
+        # --- request_auto_join config ---
+        request_auto_join_requests_per_burst = config.get(
+            "request_auto_join_requests_per_burst", 10
+        )
+        request_auto_join_burst_duration_seconds = config.get(
+            "request_auto_join_burst_duration_seconds", 60
+        )
+
         # --- delete_room config ---
         delete_room_requests_per_burst = config.get(
             "delete_room_requests_per_burst", 10
@@ -213,6 +229,8 @@ class PangeaChat:
             knock_with_code_requests_per_burst=knock_with_code_requests_per_burst,
             knock_with_code_burst_duration_seconds=knock_with_code_burst_duration_seconds,
             auto_accept_invite_worker=auto_accept_invite_worker,
+            request_auto_join_requests_per_burst=request_auto_join_requests_per_burst,
+            request_auto_join_burst_duration_seconds=request_auto_join_burst_duration_seconds,
             delete_room_requests_per_burst=delete_room_requests_per_burst,
             delete_room_burst_duration_seconds=delete_room_burst_duration_seconds,
             limit_user_directory_public_attribute_search_path=limit_user_directory_public_attribute_search_path,
