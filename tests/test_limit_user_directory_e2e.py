@@ -143,7 +143,7 @@ class TestE2E(BaseSynapseE2ETest):
                 await self.register_user(
                     config_path, synapse_dir, f"user{i}", f"password{i}", False
                 )
-                username, access_token = await self.login_user(
+                (username, access_token) = await self.login_user(
                     f"user{i}", f"password{i}"
                 )
                 creds.append((username, access_token))
@@ -164,7 +164,7 @@ class TestE2E(BaseSynapseE2ETest):
                     ...
 
             for i in range(6):
-                username, access_token = creds[i]
+                (username, access_token) = creds[i]
                 users = await self.search_users("user", access_token)
                 # Expect that the search results do not include the searcher's own ID.
                 self.assertNotIn(username, users)
@@ -181,7 +181,7 @@ class TestE2E(BaseSynapseE2ETest):
             await self.register_user(
                 config_path, synapse_dir, "whitelisted", "password", True
             )
-            whitelisted_username, whitelisted_access_token = await self.login_user(
+            (whitelisted_username, whitelisted_access_token) = await self.login_user(
                 "whitelisted", "password"
             )
             users = await self.search_users("user", whitelisted_access_token)
@@ -194,8 +194,8 @@ class TestE2E(BaseSynapseE2ETest):
             await self.register_user(
                 config_path, synapse_dir, "userB", "passwordB", False
             )
-            userA, tokenA = await self.login_user("userA", "passwordA")
-            userB, tokenB = await self.login_user("userB", "passwordB")
+            (userA, tokenA) = await self.login_user("userA", "passwordA")
+            (userB, tokenB) = await self.login_user("userB", "passwordB")
             # Ensure both users have private profiles.
             await self.set_public_attribute_of_user(userA, False, tokenA)
             await self.set_public_attribute_of_user(userB, False, tokenB)
@@ -271,8 +271,8 @@ class TestE2E(BaseSynapseE2ETest):
             await self.register_user(
                 config_path, synapse_dir, "publicUser", "passwordP", False
             )
-            filterUser, tokenF = await self.login_user("filterUser", "passwordF")
-            publicUser, tokenP = await self.login_user("publicUser", "passwordP")
+            (filterUser, tokenF) = await self.login_user("filterUser", "passwordF")
+            (publicUser, tokenP) = await self.login_user("publicUser", "passwordP")
 
             # Set public attribute only for publicUser.
             await self.set_public_attribute_of_user(publicUser, True, tokenP)
@@ -282,7 +282,7 @@ class TestE2E(BaseSynapseE2ETest):
             await self.register_user(
                 config_path, synapse_dir, "searcher", "passwordS", False
             )
-            searcher, tokenS = await self.login_user("searcher", "passwordS")
+            (searcher, tokenS) = await self.login_user("searcher", "passwordS")
             # Set searcher to public so they can search.
             await self.set_public_attribute_of_user(searcher, True, tokenS)
 
@@ -327,7 +327,7 @@ class TestE2E(BaseSynapseE2ETest):
             await self.register_user(
                 config_path, synapse_dir, "selfUser", "passwordSelf", False
             )
-            selfUser, tokenSelf = await self.login_user("selfUser", "passwordSelf")
+            (selfUser, tokenSelf) = await self.login_user("selfUser", "passwordSelf")
             # Optionally, set the public attribute to True.
             await self.set_public_attribute_of_user(selfUser, True, tokenSelf)
 
