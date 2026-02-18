@@ -4,7 +4,7 @@ on:
     branches: ["main"]
   pull_request:
 
-jobs: 
+jobs:
   check-code-style:
     name: Check code style
     runs-on: ubuntu-latest
@@ -34,8 +34,8 @@ jobs:
       matrix:
         # Run the unit tests both against our oldest supported Python version
         # and the newest stable.
-        python_version: [ "3.8", "3.x" ]
-    steps: 
+        python_version: ["3.10", "3.x"]
+    steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v4
         with:

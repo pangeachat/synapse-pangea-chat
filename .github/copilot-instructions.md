@@ -2,7 +2,7 @@ Check the relevant `.github/instructions/` doc before and after coding. If it do
 
 # synapse-pangea-chat
 
-Unified Synapse module (Python 3.9+) bundling all Pangea Chat server-side features into `synapse_pangea_chat.PangeaChat`.
+Unified Synapse module (Python 3.10+) bundling all Pangea Chat server-side features into `synapse_pangea_chat.PangeaChat`.
 
 ## Architecture
 
@@ -56,10 +56,20 @@ Missing either var → immediate `sys.exit` with `FATAL:` message.
 
 ### Conventions
 
+- Python **≥ 3.10** (no 3.8/3.9 support)
 - E2E tests: `aiounittest.AsyncTestCase`, `requests` (sync HTTP), local Synapse
 - Staging tests: `unittest.IsolatedAsyncioTestCase`, `aiohttp` (async HTTP), live server
 - Linting: `black`, `ruff`
 - Type checking: `mypy`
+
+### Code Style (MUST pass before committing)
+
+Run `black --check synapse_pangea_chat tests` and `ruff check synapse_pangea_chat tests` before every commit. CI enforces these via `tox -e check_codestyle`.
+
+Common pitfalls:
+- **Empty class bodies**: Use a docstring alone (no trailing `...`). If no docstring, use `pass` on its own line. Do NOT leave an empty class body with only blank lines.
+- **Stub functions**: Use two-line form `def f():\n    ...` — never one-line `def f(): ...` (black rejects it).
+- **Extra blank lines**: black enforces exactly one blank line after a class docstring, two blank lines between top-level definitions. Do not add extra blank lines inside class bodies.
 
 ## Dependencies
 
