@@ -186,8 +186,9 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def test_knock_auto_invite_admin_left(self):
         """
-        Test that knocking on a room via the standard Matrix knock API
-        auto-invites and auto-joins the knocker when all admins have left.
+        Test that knocking on a room when all admins have left does NOT
+        auto-join the user, because the module no longer promotes users
+        via internal Synapse APIs (which caused replication crashes).
 
         Scenario:
         1. User1 (admin, power level 100) creates a knock room
@@ -195,8 +196,8 @@ class TestE2E(BaseSynapseE2ETest):
         3. User1 sets power levels (invite requires 50)
         4. User1 (only admin) leaves the room
         5. User3 knocks on the room via standard Matrix /knock API
-        6. Expected: module auto-promotes User2, auto-invites User3,
-           and auto-accepts the invite so User3 ends up joined
+        6. Expected: User3 remains in 'knock' state (no auto-join)
+           because no remaining member has invite power
         """
         postgres = None
         synapse_dir = None
@@ -211,7 +212,9 @@ class TestE2E(BaseSynapseE2ETest):
                 server_process,
                 stdout_thread,
                 stderr_thread,
-            ) = await self.start_test_synapse()
+            ) = await self.start_test_synapse(
+                module_config={"auto_invite_knocker_enabled": True},
+            )
 
             # Register users
             users = [
@@ -269,21 +272,20 @@ class TestE2E(BaseSynapseE2ETest):
                 "User3 should be able to knock on the room",
             )
 
-            # Wait for User3 to be auto-joined
-            # The module should: detect knock -> promote User2 -> invite User3
-            # -> detect invite replaces knock -> auto-join User3
+            # Wait to confirm User3 is NOT auto-joined
+            # The module should fail gracefully: no user has invite power,
+            # so the knock auto-invite cannot proceed.
             is_joined = await self.wait_for_membership(
                 room_id=room_id,
                 user_id=user_ids["user3"],
                 access_token=tokens["user2"],
                 expected_membership="join",
-                max_wait=10,
+                max_wait=5,
             )
-            self.assertTrue(
+            self.assertFalse(
                 is_joined,
-                "User3 should be auto-joined after knocking. "
-                "Expected: module promotes User2, invites User3, "
-                "and auto-accepts the invite.",
+                "User3 should NOT be auto-joined when no member has invite power. "
+                "The module should gracefully skip the auto-invite.",
             )
 
         finally:

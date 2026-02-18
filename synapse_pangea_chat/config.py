@@ -43,6 +43,7 @@ class PangeaChatConfig:
 
     # --- auto_accept_invite config ---
     auto_accept_invite_worker: Optional[str] = None
+    auto_invite_knocker_enabled: bool = False
 
     # --- delete_room config ---
     delete_room_requests_per_burst: int = 10

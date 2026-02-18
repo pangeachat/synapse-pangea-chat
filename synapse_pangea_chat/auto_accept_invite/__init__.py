@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any, Dict
 
 from synapse.module_api import (
@@ -15,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 ACCOUNT_DATA_DIRECT_MESSAGE_LIST = "m.direct"
 
+# Cooldown period (seconds) after a failed knock auto-invite per room
+_KNOCK_COOLDOWN_SECONDS = 300  # 5 minutes
+
 
 class AutoAcceptInviteIfKnocked:
     def __init__(self, config: Any, api: ModuleApi):
@@ -22,6 +26,12 @@ class AutoAcceptInviteIfKnocked:
         self._api = api
         self._config = config
         self._event_handler = api._hs.get_event_handler()
+        self._auto_invite_knocker_enabled = getattr(
+            config, "auto_invite_knocker_enabled", False
+        )
+        # Track rooms that recently failed knock auto-invite {room_id: timestamp}
+        self._knock_cooldowns: Dict[str, float] = {}
+
         should_run_on_this_worker = (
             config.auto_accept_invite_worker == self._api.worker_name
         )
@@ -86,11 +96,23 @@ class AutoAcceptInviteIfKnocked:
                     )
             return
 
-        # Handle knocks: automatically find/promote an inviter and invite the
+        # Handle knocks: automatically find an inviter and invite the
         # knocker so the auto-accept flow above completes the join.
-        # This fixes the case where all admins have left a room and a user
-        # (including a former admin) knocks to rejoin.
-        if event.membership == "knock":
+        # Only enabled when auto_invite_knocker_enabled is True in config.
+        if event.membership == "knock" and self._auto_invite_knocker_enabled:
+            # Check cooldown — skip if this room recently failed
+            now = time.monotonic()
+            last_failure = self._knock_cooldowns.get(event.room_id, 0)
+            if now - last_failure < _KNOCK_COOLDOWN_SECONDS:
+                logger.info(
+                    "Skipping auto-invite for knocker %s in room %s "
+                    "(cooldown active, %ds remaining)",
+                    event.state_key,
+                    event.room_id,
+                    int(_KNOCK_COOLDOWN_SECONDS - (now - last_failure)),
+                )
+                return
+
             logger.info(
                 "User %s knocked on room %s, attempting to auto-invite",
                 event.state_key,
@@ -213,8 +235,8 @@ class AutoAcceptInviteIfKnocked:
         self, sender: str, target: str, room_id: str, new_membership: str
     ) -> None:
         """
-        A function to retry sending the `make_join` request with an increasing backoff. This is
-        implemented to work around a race condition when receiving invites over federation.
+        Retry sending the `make_join` request with increasing backoff.
+        Works around a race condition when receiving invites over federation.
 
         Args:
             sender: the user performing the membership change
@@ -225,9 +247,10 @@ class AutoAcceptInviteIfKnocked:
 
         sleep = 0
         retries = 0
+        max_retries = 3
         join_event = None
 
-        while retries < 5:
+        while retries < max_retries:
             try:
                 await self._api.sleep(sleep)
                 join_event = await self._api.update_room_membership(
@@ -237,8 +260,14 @@ class AutoAcceptInviteIfKnocked:
                     new_membership=new_membership,
                 )
             except Exception as e:
-                logger.info(
-                    f"Update_room_membership raised the following exception: {e}"
+                logger.warning(
+                    "update_room_membership failed for %s in room %s "
+                    "(attempt %d/%d): %s",
+                    target,
+                    room_id,
+                    retries + 1,
+                    max_retries,
+                    e,
                 )
                 sleep = 2**retries
                 retries += 1
@@ -250,10 +279,12 @@ class AutoAcceptInviteIfKnocked:
         """
         Automatically invite a user who knocked on a room.
 
-        Uses the same inviter-finding and promotion logic as knock_with_code
-        to locate (or promote) a room member with invite power, then sends
-        the invite. The existing invite auto-accept logic will then detect
-        that the invite replaced a knock and auto-join the user.
+        Locates a room member with invite power and sends the invite.
+        The existing invite auto-accept logic will then detect that the
+        invite replaced a knock and auto-join the user.
+
+        If no user has sufficient power to invite, this is a no-op.
+        On failure, sets a cooldown to avoid hammering the same room.
         """
         try:
             await invite_user_to_room(
@@ -268,3 +299,5 @@ class AutoAcceptInviteIfKnocked:
                 room_id,
                 e,
             )
+            # Set cooldown so we don't retry this room immediately
+            self._knock_cooldowns[room_id] = time.monotonic()

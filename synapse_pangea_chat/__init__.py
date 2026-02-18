@@ -151,6 +151,9 @@ class PangeaChat:
 
         # --- auto_accept_invite config ---
         auto_accept_invite_worker = config.get("auto_accept_invite_worker", None)
+        auto_invite_knocker_enabled = config.get("auto_invite_knocker_enabled", False)
+        if not isinstance(auto_invite_knocker_enabled, bool):
+            raise ValueError('Config "auto_invite_knocker_enabled" must be a boolean')
 
         # --- delete_room config ---
         delete_room_requests_per_burst = config.get(
@@ -213,6 +216,7 @@ class PangeaChat:
             knock_with_code_requests_per_burst=knock_with_code_requests_per_burst,
             knock_with_code_burst_duration_seconds=knock_with_code_burst_duration_seconds,
             auto_accept_invite_worker=auto_accept_invite_worker,
+            auto_invite_knocker_enabled=auto_invite_knocker_enabled,
             delete_room_requests_per_burst=delete_room_requests_per_burst,
             delete_room_burst_duration_seconds=delete_room_burst_duration_seconds,
             limit_user_directory_public_attribute_search_path=limit_user_directory_public_attribute_search_path,
