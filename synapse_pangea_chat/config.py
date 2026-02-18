@@ -44,6 +44,10 @@ class PangeaChatConfig:
     # --- auto_accept_invite config ---
     auto_accept_invite_worker: Optional[str] = None
 
+    # --- request_auto_join config ---
+    request_auto_join_requests_per_burst: int = 10
+    request_auto_join_burst_duration_seconds: int = 60
+
     # --- delete_room config ---
     delete_room_requests_per_burst: int = 10
     delete_room_burst_duration_seconds: int = 60
