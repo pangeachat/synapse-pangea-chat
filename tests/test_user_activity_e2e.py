@@ -62,7 +62,7 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
             )
 
     async def test_user_activity_admin_access(self):
-        """Admin users should get user activity data."""
+        """Admin users should get paginated user activity data."""
         postgres = None
         synapse_dir = None
         server_process = None
@@ -106,11 +106,17 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
             )
             self.assertEqual(response.status_code, 200)
             data = response.json()
-            self.assertIn("users", data)
-            self.assertIsInstance(data["users"], list)
+
+            # Paginated response shape
+            self.assertIn("docs", data)
+            self.assertIsInstance(data["docs"], list)
+            self.assertIn("page", data)
+            self.assertIn("limit", data)
+            self.assertIn("totalDocs", data)
+            self.assertIn("maxPage", data)
 
             # Should have at least 2 users (admin + user1)
-            user_ids = [u["user_id"] for u in data["users"]]
+            user_ids = [u["user_id"] for u in data["docs"]]
             self.assertIn("@admin:my.domain.name", user_ids)
             self.assertIn("@user1:my.domain.name", user_ids)
 
@@ -231,47 +237,107 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
             )
             self.assertEqual(send_resp.status_code, 200)
 
-            # Wait a moment for events to be processed
-            await asyncio.sleep(1)
+            # Synapse batches user_ips writes every 5 s, so wait long
+            # enough for the flush to complete before querying.
+            await asyncio.sleep(6)
 
-            # Query user activity
+            # Query user activity (paginated)
             url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
             response = requests.get(url, headers=headers_admin, timeout=30)
             self.assertEqual(response.status_code, 200)
             data = response.json()
 
-            # Find the learner in the results
-            learner_data = None
-            for user in data["users"]:
-                if user["user_id"] == "@learner:my.domain.name":
-                    learner_data = user
-                    break
+            # Paginated response shape
+            self.assertIn("docs", data)
+            self.assertIn("page", data)
+            self.assertIn("limit", data)
+            self.assertIn("totalDocs", data)
+            self.assertIn("maxPage", data)
 
-            self.assertIsNotNone(learner_data)
+            # Find the learner in the paginated docs
+            learner_list = [
+                u for u in data["docs"] if u["user_id"] == "@learner:my.domain.name"
+            ]
+            self.assertEqual(len(learner_list), 1)
+            learner_data = learner_list[0]
+
             self.assertGreater(learner_data["last_message_ts"], 0)
             self.assertGreater(learner_data["last_login_ts"], 0)
+
+            # User docs should NOT contain courses (moved to user_courses endpoint)
+            self.assertNotIn("courses", learner_data)
+            self.assertNotIn("most_recent_course_room_id", learner_data)
+
+            # Query user_courses endpoint for the learner
+            courses_url = (
+                f"{self.server_url}/_synapse/client/pangea/v1/user_courses"
+                f"?user_id=@learner:my.domain.name"
+            )
+            courses_resp = requests.get(
+                courses_url, headers=headers_admin, timeout=30
+            )
+            self.assertEqual(courses_resp.status_code, 200)
+            courses_data = courses_resp.json()
+
+            # Paginated response shape
+            self.assertIn("docs", courses_data)
+            self.assertIn("page", courses_data)
+            self.assertIn("limit", courses_data)
+            self.assertIn("totalDocs", courses_data)
+            self.assertIn("maxPage", courses_data)
+            self.assertEqual(courses_data["user_id"], "@learner:my.domain.name")
 
             # Learner should have the course in their courses list
             course_rooms = [
                 c
-                for c in learner_data["courses"]
+                for c in courses_data["docs"]
                 if c["room_id"] == course_room_id and c["is_course"]
             ]
             self.assertEqual(len(course_rooms), 1)
+            # Course entry should include most_recent_activity_ts
+            self.assertIn("most_recent_activity_ts", course_rooms[0])
 
-            # Most recent course should be the one they sent a message in
-            self.assertEqual(learner_data["most_recent_course_room_id"], course_room_id)
+            # Query course activities endpoint
+            activities_url = (
+                f"{self.server_url}/_synapse/client/pangea/v1/course_activities"
+                f"?course_room_id={course_room_id}"
+            )
+            activities_resp = requests.get(
+                activities_url, headers=headers_admin, timeout=30
+            )
+            self.assertEqual(activities_resp.status_code, 200)
+            activities_data = activities_resp.json()
 
-            # Activity rooms by course should include our activity room
-            activity_rooms = learner_data.get("activity_rooms_by_course", {})
-            course_activities = activity_rooms.get(course_room_id, [])
-            self.assertGreater(len(course_activities), 0)
+            self.assertEqual(activities_data["course_room_id"], course_room_id)
+            self.assertIn("activities", activities_data)
+            self.assertGreater(len(activities_data["activities"]), 0)
 
             activity_room_entry = [
-                a for a in course_activities if a["room_id"] == activity_room_id
+                a
+                for a in activities_data["activities"]
+                if a["room_id"] == activity_room_id
             ]
             self.assertEqual(len(activity_room_entry), 1)
             self.assertEqual(activity_room_entry[0]["activity_id"], "activity-456")
+
+            # Test exclude_user_id filter — admin is a member, so excluding admin
+            # should still return the activity (learner is not a member of it though)
+            exclude_url = (
+                f"{self.server_url}/_synapse/client/pangea/v1/course_activities"
+                f"?course_room_id={course_room_id}"
+                f"&exclude_user_id=@learner:my.domain.name"
+            )
+            exclude_resp = requests.get(
+                exclude_url, headers=headers_admin, timeout=30
+            )
+            self.assertEqual(exclude_resp.status_code, 200)
+            exclude_data = exclude_resp.json()
+            # Learner did NOT join the activity room, so excluding learner
+            # should still return the activity
+            exclude_activity_ids = [
+                a["room_id"] for a in exclude_data["activities"]
+            ]
+            self.assertIn(activity_room_id, exclude_activity_ids)
 
         finally:
             self.stop_synapse(

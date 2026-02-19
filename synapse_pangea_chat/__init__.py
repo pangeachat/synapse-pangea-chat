@@ -18,7 +18,7 @@ from synapse_pangea_chat.room_preview import (
     RoomPreview,
     invalidate_room_cache,
 )
-from synapse_pangea_chat.user_activity import UserActivity
+from synapse_pangea_chat.user_activity import CourseActivities, UserActivity, UserCourses
 
 logger = logging.getLogger(f"synapse.module.{__name__}")
 
@@ -86,6 +86,20 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/user_activity",
             resource=self.user_activity_resource,
+        )
+
+        # --- Course Activities ---
+        self.course_activities_resource = CourseActivities(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/course_activities",
+            resource=self.course_activities_resource,
+        )
+
+        # --- User Courses ---
+        self.user_courses_resource = UserCourses(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/user_courses",
+            resource=self.user_courses_resource,
         )
 
         # --- Limit User Directory ---
