@@ -20,7 +20,6 @@ from synapse_pangea_chat.user_activity.get_course_activities import (
 )
 from synapse_pangea_chat.user_activity.get_user_courses import get_user_courses
 from synapse_pangea_chat.user_activity.get_users import get_users
-from synapse_pangea_chat.user_activity.is_rate_limited import is_rate_limited
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -64,12 +63,6 @@ class UserActivity(_AdminResourceBase):
                     403,
                     {"error": "Forbidden: server admin required"},
                     send_cors=True,
-                )
-                return
-
-            if is_rate_limited(requester_id, self._config):
-                respond_with_json(
-                    request, 429, {"error": "Rate limited"}, send_cors=True
                 )
                 return
 
@@ -119,12 +112,6 @@ class UserCourses(_AdminResourceBase):
                     403,
                     {"error": "Forbidden: server admin required"},
                     send_cors=True,
-                )
-                return
-
-            if is_rate_limited(requester_id, self._config):
-                respond_with_json(
-                    request, 429, {"error": "Rate limited"}, send_cors=True
                 )
                 return
 
@@ -191,12 +178,6 @@ class CourseActivities(_AdminResourceBase):
                 )
                 return
 
-            if is_rate_limited(requester_id, self._config):
-                respond_with_json(
-                    request, 429, {"error": "Rate limited"}, send_cors=True
-                )
-                return
-
             course_room_id = _str_param(request, b"course_room_id")
             if not course_room_id:
                 respond_with_json(
@@ -222,11 +203,16 @@ class CourseActivities(_AdminResourceBase):
                 )
                 return
 
+            page = _int_param(request, b"page", default=1, minimum=1)
+            limit = _int_param(request, b"limit", default=50, minimum=1, maximum=200)
+
             data = await get_course_activities(
                 self._datastores.main,
                 course_room_id,
                 include_user_id=include_user_id,
                 exclude_user_id=exclude_user_id,
+                page=page,
+                limit=limit,
             )
 
             if "error" in data:
