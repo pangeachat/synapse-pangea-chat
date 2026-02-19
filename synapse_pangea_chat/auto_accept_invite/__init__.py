@@ -9,8 +9,6 @@ from synapse.module_api import (
     run_as_background_process,
 )
 
-from synapse_pangea_chat.room_code.invite_user_to_room import invite_user_to_room
-
 logger = logging.getLogger(__name__)
 
 ACCOUNT_DATA_DIRECT_MESSAGE_LIST = "m.direct"
@@ -44,65 +42,47 @@ class AutoAcceptInviteIfKnocked:
         )
 
     async def on_new_event(self, event: EventBase, _: StateMap[EventBase]) -> None:
-        # Only handle membership state events
-        if event.type != "m.room.member" or not event.is_state():
+        # Check if the event is an invite for a local user.
+        is_invite_for_local_user = (
+            event.type == "m.room.member"
+            and event.is_state()
+            and event.membership == "invite"
+            and self._api.is_mine(event.state_key)
+        )
+        if not is_invite_for_local_user:
+            # Not an invite for a local user, ignore it.
             return
 
-        # Handle invites for local users: auto-accept if the user previously knocked
-        if event.membership == "invite" and self._api.is_mine(event.state_key):
-            is_direct_message = event.content.get("is_direct", False)
+        is_direct_message = event.content.get("is_direct", False)
 
-            has_previously_knocked = await self._has_user_previously_knocked(
-                inviter=event.sender,
-                invitee=event.state_key,
-                room_id=event.room_id,
-            )
-            logger.debug(
-                "User %s has previously knocked on room %s: %s",
-                event.state_key,
-                event.room_id,
-                has_previously_knocked,
-            )
+        has_previously_knocked = await self._has_user_previously_knocked(
+            inviter=event.sender, invitee=event.state_key, room_id=event.room_id
+        )
+        logger.debug(
+            "User %s has previously knocked on room %s: %s",
+            event.state_key,
+            event.room_id,
+            has_previously_knocked,
+        )
 
-            if has_previously_knocked:
-                # Make the user join the room. We run this as a background process
-                # to circumvent a race condition that occurs when responding to
-                # invites over federation (see
-                # https://github.com/matrix-org/synapse-auto-accept-invite/issues/12)
-                await run_as_background_process(
-                    "retry_make_join",
-                    self._retry_make_join,
-                    event.state_key,
-                    event.state_key,
-                    event.room_id,
-                    "join",
-                    bg_start_span=False,
-                )
-
-                if is_direct_message:
-                    # Mark this room as a direct message!
-                    await self._mark_room_as_direct_message(
-                        event.state_key, event.sender, event.room_id
-                    )
-            return
-
-        # Handle knocks: automatically find/promote an inviter and invite the
-        # knocker so the auto-accept flow above completes the join.
-        # This fixes the case where all admins have left a room and a user
-        # (including a former admin) knocks to rejoin.
-        if event.membership == "knock":
-            logger.info(
-                "User %s knocked on room %s, attempting to auto-invite",
-                event.state_key,
-                event.room_id,
-            )
+        if has_previously_knocked:
+            # Make the user join the room. We run this as a background process to circumvent a race condition
+            # that occurs when responding to invites over federation (see https://github.com/matrix-org/synapse-auto-accept-invite/issues/12)
             await run_as_background_process(
-                "auto_invite_knocker",
-                self._auto_invite_knocker,
+                "retry_make_join",
+                self._retry_make_join,
+                event.state_key,
                 event.state_key,
                 event.room_id,
+                "join",
                 bg_start_span=False,
             )
+
+            if is_direct_message:
+                # Mark this room as a direct message!
+                await self._mark_room_as_direct_message(
+                    event.state_key, event.sender, event.room_id
+                )
 
     async def _mark_room_as_direct_message(
         self, user_id: str, dm_user_id: str, room_id: str
@@ -245,26 +225,3 @@ class AutoAcceptInviteIfKnocked:
 
             if join_event is not None:
                 break
-
-    async def _auto_invite_knocker(self, knocker_user_id: str, room_id: str) -> None:
-        """
-        Automatically invite a user who knocked on a room.
-
-        Uses the same inviter-finding and promotion logic as knock_with_code
-        to locate (or promote) a room member with invite power, then sends
-        the invite. The existing invite auto-accept logic will then detect
-        that the invite replaced a knock and auto-join the user.
-        """
-        try:
-            await invite_user_to_room(
-                api=self._api,
-                user_id=knocker_user_id,
-                room_id=room_id,
-            )
-        except Exception as e:
-            logger.error(
-                "Failed to auto-invite knocker %s to room %s: %s",
-                knocker_user_id,
-                room_id,
-                e,
-            )

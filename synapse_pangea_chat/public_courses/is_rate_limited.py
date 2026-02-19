@@ -11,6 +11,7 @@ request_log: Dict[str, List[float]] = {}
 
 class RateLimitError(Exception):
     """Custom exception for rate limiting errors."""
+
     pass
 
 
