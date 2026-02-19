@@ -1,78 +1,162 @@
 ---
-applyTo: "synapse_pangea_chat/user_engagement/**"
+applyTo: "synapse_pangea_chat/user_activity/**"
 ---
 
-# User Engagement Endpoint
+# User Activity Endpoints
 
-Admin-only endpoint that returns per-user engagement data from the Synapse PostgreSQL database. Consumed by the bot's [engagement script](../../../pangea-bot/.github/instructions/initiate.engagement.instructions.md) and individually by engagement actions like [invite-to-activity](../../../pangea-bot/.github/instructions/invite-to-activity.engagement.instructions.md).
+Three Synapse module endpoints that power the re-engagement system. Called by the [bot engagement script](../../../bot/.github/instructions/initiate.engagement.instructions.md).
 
-## Endpoint Contract
+## Endpoints
 
-`GET /_synapse/client/pangea/v1/user_engagement`
+### 1. Users (paginated)
 
-- **Auth:** Bearer token, server admin only (403 for non-admin, 401 for missing/invalid token)
-- **Rate limit:** Configurable via `user_engagement_requests_per_burst` (default 10) and `user_engagement_burst_duration_seconds` (default 60) in the module config
+`GET /_synapse/client/pangea/v1/user_activity`
 
-### Query Parameters
+- **Auth:** Matrix bearer token, server admin required
+- **Rate limiting:** Per-user, configurable via `PangeaChatConfig`
+- **Query params:** `page` (int, default 1), `limit` (int, default 50, max 200)
 
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `since_days` | int | 7 | Timestamp floor for `events`-table queries. Only affects `last_message_ts`. `last_login_ts` (from `user_ips`) is **always** the true value regardless of this param. Hard-capped at **90 days** server-side — any value > 90 is silently clamped. |
-
-> ⚠️ **Increasing `since_days` is dangerous.** Large windows scan more of the `events` table and can degrade DB performance. The 7-day default is intentionally tight. Only override when you have a specific reason (e.g., one-off audit) and never in automated/cron usage.
-
-**Interpretation by the caller:** When `last_message_ts` is `null`, it means "no message within the `since_days` window" — not "user has never sent a message." `last_login_ts` is the reliable inactivity signal because it's unaffected by the floor.
-
-### Response Shape
+**Response:**
 
 ```json
 {
-  "users": [
+  "docs": [
     {
-      "user_id": "@user:domain",
-      "display_name": "...",
+      "user_id": "@alice:example.com",
+      "display_name": "Alice",
       "last_login_ts": 1700000000000,
-      "last_message_ts": 1700000000000,
-      "course_space_ids": ["!room1:domain", "!room2:domain"]
+      "last_message_ts": 1700000000000
+    }
+  ],
+  "page": 1,
+  "limit": 50,
+  "totalDocs": 200,
+  "maxPage": 4
+}
+```
+
+User docs contain only basic activity metadata. Course memberships are available via the `user_courses` endpoint below.
+
+### 2. User Courses (paginated)
+
+`GET /_synapse/client/pangea/v1/user_courses`
+
+- **Auth:** Matrix bearer token, server admin required
+- **Rate limiting:** Per-user, configurable via `PangeaChatConfig`
+- **Required params:** `user_id`
+- **Query params:** `page` (int, default 1), `limit` (int, default 50, max 200)
+
+**Response:**
+
+```json
+{
+  "user_id": "@alice:example.com",
+  "docs": [
+    {
+      "room_id": "!abc:example.com",
+      "room_name": "Spanish 101",
+      "is_course": true,
+      "is_activity": false,
+      "activity_id": null,
+      "parent_course_room_id": null,
+      "most_recent_activity_ts": 1700000000000
+    }
+  ],
+  "page": 1,
+  "limit": 50,
+  "totalDocs": 12,
+  "maxPage": 1
+}
+```
+
+Courses are sorted by `most_recent_activity_ts` descending — the most recently active course is first. For course rooms, `most_recent_activity_ts` aggregates the user's last message in both the course room itself and its child activity rooms.
+
+### 3. Course Activities (with user filtering)
+
+`GET /_synapse/client/pangea/v1/course_activities`
+
+- **Auth:** Matrix bearer token, server admin required
+- **Rate limiting:** Per-user, configurable via `PangeaChatConfig`
+- **Required params:** `course_room_id`
+- **Optional params (mutually exclusive):**
+  - `include_user_id` — only activities where user IS a member
+  - `exclude_user_id` — only activities where user is NOT a member
+
+**Response:**
+
+```json
+{
+  "course_room_id": "!abc:example.com",
+  "activities": [
+    {
+      "room_id": "!def:example.com",
+      "room_name": "Activity 1",
+      "activity_id": "act-123",
+      "members": ["@alice:example.com"],
+      "created_ts": 1700000000000
     }
   ]
 }
 ```
 
-| Field | Source | Notes |
-|-------|--------|-------|
-| `last_login_ts` | `user_ips` | Always the true value — never scoped by `since_days` |
-| `last_message_ts` | `events` (type `m.room.message`) | Scoped by `since_days`. `null` = no message in window |
-| `course_space_ids` | `room_memberships` + `current_state_events` | Rooms the user has joined that have a `pangea.course_plan` state event. The caller uses these to query `room_preview` for activity session state. |
+Activity rooms sorted by `created_ts` descending — most recent first.
+
+## Why Three Endpoints
+
+The original single endpoint embedded courses inside each user doc and activity rooms in a top-level dict. This caused:
+
+- **Scaling issues** — response grew with user count × course count × activity count
+- **Redundant data** — activity rooms were duplicated for every request
+- **Unbounded course lists** — a user with many courses bloated their user doc
+
+Splitting into three endpoints lets the bot:
+1. Paginate through users efficiently (lightweight docs)
+2. Fetch courses per-user on demand (paginated, sorted by recency)
+3. Fetch course activities per-course with `exclude_user_id` filtering
 
 ## DB Query Strategy
 
-The endpoint runs sequential read-only queries against the Synapse Postgres DB via `room_store.db_pool.execute(...)`.
+### Users queries (`get_users.py`)
 
-### Query Stages
+1. **Count** — Total active (non-deactivated, non-guest) users.
+2. **Users + last login** — CTE pre-aggregates `user_ips` then JOINs, `LIMIT/OFFSET` for pagination.
+3. **Last message per user** — `events` table scoped with `WHERE sender IN (...)`.
 
-1. **Users** — `users` + `profiles` + `user_ips` (use CTE/JOIN for last login, not correlated subquery)
-2. **Last message per user** — `events` filtered to `m.room.message`, grouped by sender. **Must scope** with `WHERE sender IN (...)` and the `since_days` timestamp floor
-3. **Course memberships** — `room_memberships` joined with `current_state_events` to find rooms with `pangea.course_plan` state, yielding `course_space_ids`
+### User Courses queries (`get_user_courses.py`)
 
-### Performance Constraints
+1. **Memberships** — `SELECT DISTINCT` rooms where user has `join` membership AND room has `pangea.course_plan` or `pangea.activity_plan` state.
+2. **State events** — Batch classify rooms as course vs activity.
+3. **Room names** — Batch-fetch `m.room.name`.
+4. **Space parents** — Map activity rooms → parent course.
+5. **Last message per room** — User's last message in each room, bubbled up to parent course for `most_recent_activity_ts`.
+6. **Sort + paginate** — In-memory sort by `most_recent_activity_ts` desc, then slice for pagination.
 
-- **Never scan the full `events` table.** Always filter by `sender IN (...)` **and** the `since_days` timestamp floor.
-- **`user_ips` is always unscoped** — it's a small table and returning the true `last_login_ts` is critical for inactivity detection.
-- **Hard cap at 90 days** — the endpoint clamps `since_days` server-side to prevent callers from accidentally scanning months of events.
-- **Use CTEs or JOINs** instead of correlated subqueries (e.g., `user_ips` last login).
-- **Check indexes** — queries rely on indexes on `events(type, sender)`, `current_state_events(room_id, type)`, and `room_memberships(room_id, membership)`. Verify these exist on production Synapse before deploying.
-- The endpoint is **rate-limited** but still runs heavy queries. Do not add caching until we've measured real production load.
+### Course Activities queries (`get_course_activities.py`)
 
-## Sub-module Pattern
+1. **Verify course** — Confirm room has `pangea.course_plan` state.
+2. **Find children** — Rooms with `m.space.parent` pointing to this course AND `pangea.activity_plan` state.
+3. **Activity IDs, room names, members, creation timestamps** — Batch queries.
+4. **Filter & assemble** — Apply `include_user_id` / `exclude_user_id`, sort by `created_ts` desc.
 
-Follows the existing Twisted Resource pattern:
+All `events` table queries are scoped to specific user IDs via `WHERE sender IN (...)` or `WHERE sender = ?` to prevent full-table scans.
 
-- `user_engagement.py` — Resource class, request handling, auth, rate limiting
-- `get_user_engagement.py` — DB queries and data assembly
-- `is_rate_limited.py` — In-memory rate limiter (same pattern as other sub-modules)
+## Bot-Side Consumer
 
-Accesses `self._api._hs.get_datastores().main` (private Synapse API — may break on Synapse upgrades, but consistent with all other sub-modules in this repo).
+The [engagement script](../../../bot/.github/instructions/initiate.engagement.instructions.md) in `pangea-bot`:
+
+1. Paginates through all users via `user_activity`
+2. For each inactive user, fetches their courses via `user_courses` — picks the first course (most recently active)
+3. Calls `course_activities` with `exclude_user_id=<user_id>` to find activity rooms the user hasn't joined
+4. Picks the newest eligible room and invites the user
+
+## Key Files
+
+- **Endpoint handlers:** [`user_activity.py`](../../synapse_pangea_chat/user_activity/user_activity.py) — `UserActivity`, `UserCourses`, and `CourseActivities` Resource classes
+- **Users query:** [`get_users.py`](../../synapse_pangea_chat/user_activity/get_users.py)
+- **User courses query:** [`get_user_courses.py`](../../synapse_pangea_chat/user_activity/get_user_courses.py)
+- **Course activities query:** [`get_course_activities.py`](../../synapse_pangea_chat/user_activity/get_course_activities.py)
+- **Rate limiting:** [`is_rate_limited.py`](../../synapse_pangea_chat/user_activity/is_rate_limited.py)
+- **E2E tests:** [`test_user_activity_e2e.py`](../../tests/test_user_activity_e2e.py)
 
 ## Future Work
 

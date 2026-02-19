@@ -16,7 +16,7 @@ Single entry-point class `PangeaChat` (`synapse_pangea_chat/__init__.py`) compos
 | Request Auto Join | `request_auto_join/` | `POST /_synapse/client/unstable/org.pangea/v1/request_auto_join` |
 | Auto Accept Invite | `auto_accept_invite/` | *(third-party rules callback — no HTTP endpoint)* |
 | Delete Room | `delete_room/` | `POST /_synapse/client/pangea/v1/delete_room` |
-| User Engagement | `user_engagement/` | `GET /_synapse/client/pangea/v1/user_engagement` |
+| User Activity | `user_activity/` | `GET /_synapse/client/pangea/v1/user_activity`, `GET /_synapse/client/pangea/v1/user_courses`, `GET /_synapse/client/pangea/v1/course_activities` |
 | Limit User Directory | `limit_user_directory/` | *(spam checker callback — no HTTP endpoint)* |
 
 ## Key Files
