@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import Any, Dict, List, Optional
 
 from synapse.storage.databases.main.room import RoomStore
@@ -18,6 +19,8 @@ async def get_course_activities(
     *,
     include_user_id: Optional[str] = None,
     exclude_user_id: Optional[str] = None,
+    page: int = 1,
+    limit: int = 50,
 ) -> Dict[str, Any]:
     """Return activity rooms for a course, optionally filtered by user membership.
 
@@ -185,4 +188,22 @@ async def get_course_activities(
     # Sort by created_ts descending (most recent first)
     activities.sort(key=lambda x: x["created_ts"], reverse=True)
 
-    return {"course_room_id": course_room_id, "activities": activities}
+    # --- 8. Paginate ----------------------------------------------------------
+    total_docs = len(activities)
+    max_page = max(1, math.ceil(total_docs / limit))
+    if page < 1:
+        page = 1
+    if page > max_page:
+        page = max_page
+
+    offset = (page - 1) * limit
+    paged_activities = activities[offset : offset + limit]
+
+    return {
+        "course_room_id": course_room_id,
+        "activities": paged_activities,
+        "page": page,
+        "limit": limit,
+        "totalDocs": total_docs,
+        "maxPage": max_page,
+    }

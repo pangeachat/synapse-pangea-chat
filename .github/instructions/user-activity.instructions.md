@@ -12,8 +12,8 @@ Three Synapse module endpoints that power the re-engagement system. Called by th
 
 `GET /_synapse/client/pangea/v1/user_activity`
 
-- **Auth:** Matrix bearer token, server admin required
-- **Rate limiting:** Per-user, configurable via `PangeaChatConfig`
+- **Auth:** Matrix bearer token, server admin required (403 if not admin)
+- **Rate limiting:** None (admin-only, no rate limiting)
 - **Query params:** `page` (int, default 1), `limit` (int, default 50, max 200)
 
 **Response:**
@@ -41,8 +41,8 @@ User docs contain only basic activity metadata. Course memberships are available
 
 `GET /_synapse/client/pangea/v1/user_courses`
 
-- **Auth:** Matrix bearer token, server admin required
-- **Rate limiting:** Per-user, configurable via `PangeaChatConfig`
+- **Auth:** Matrix bearer token, server admin required (403 if not admin)
+- **Rate limiting:** None (admin-only, no rate limiting)
 - **Required params:** `user_id`
 - **Query params:** `page` (int, default 1), `limit` (int, default 50, max 200)
 
@@ -71,13 +71,14 @@ User docs contain only basic activity metadata. Course memberships are available
 
 Courses are sorted by `most_recent_activity_ts` descending — the most recently active course is first. For course rooms, `most_recent_activity_ts` aggregates the user's last message in both the course room itself and its child activity rooms.
 
-### 3. Course Activities (with user filtering)
+### 3. Course Activities (paginated, with user filtering)
 
 `GET /_synapse/client/pangea/v1/course_activities`
 
-- **Auth:** Matrix bearer token, server admin required
-- **Rate limiting:** Per-user, configurable via `PangeaChatConfig`
+- **Auth:** Matrix bearer token, server admin required (403 if not admin)
+- **Rate limiting:** None (admin-only, no rate limiting)
 - **Required params:** `course_room_id`
+- **Query params:** `page` (int, default 1), `limit` (int, default 50, max 200)
 - **Optional params (mutually exclusive):**
   - `include_user_id` — only activities where user IS a member
   - `exclude_user_id` — only activities where user is NOT a member
@@ -95,7 +96,11 @@ Courses are sorted by `most_recent_activity_ts` descending — the most recently
       "members": ["@alice:example.com"],
       "created_ts": 1700000000000
     }
-  ]
+  ],
+  "page": 1,
+  "limit": 50,
+  "totalDocs": 12,
+  "maxPage": 1
 }
 ```
 
@@ -136,7 +141,7 @@ Splitting into three endpoints lets the bot:
 1. **Verify course** — Confirm room has `pangea.course_plan` state.
 2. **Find children** — Rooms with `m.space.parent` pointing to this course AND `pangea.activity_plan` state.
 3. **Activity IDs, room names, members, creation timestamps** — Batch queries.
-4. **Filter & assemble** — Apply `include_user_id` / `exclude_user_id`, sort by `created_ts` desc.
+4. **Filter, assemble & paginate** — Apply `include_user_id` / `exclude_user_id`, sort by `created_ts` desc, then slice for pagination.
 
 All `events` table queries are scoped to specific user IDs via `WHERE sender IN (...)` or `WHERE sender = ?` to prevent full-table scans.
 
