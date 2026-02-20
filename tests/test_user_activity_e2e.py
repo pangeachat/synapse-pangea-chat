@@ -273,9 +273,7 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
                 f"{self.server_url}/_synapse/client/pangea/v1/user_courses"
                 f"?user_id=@learner:my.domain.name"
             )
-            courses_resp = requests.get(
-                courses_url, headers=headers_admin, timeout=30
-            )
+            courses_resp = requests.get(courses_url, headers=headers_admin, timeout=30)
             self.assertEqual(courses_resp.status_code, 200)
             courses_data = courses_resp.json()
 
@@ -327,16 +325,12 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
                 f"?course_room_id={course_room_id}"
                 f"&exclude_user_id=@learner:my.domain.name"
             )
-            exclude_resp = requests.get(
-                exclude_url, headers=headers_admin, timeout=30
-            )
+            exclude_resp = requests.get(exclude_url, headers=headers_admin, timeout=30)
             self.assertEqual(exclude_resp.status_code, 200)
             exclude_data = exclude_resp.json()
             # Learner did NOT join the activity room, so excluding learner
             # should still return the activity
-            exclude_activity_ids = [
-                a["room_id"] for a in exclude_data["activities"]
-            ]
+            exclude_activity_ids = [a["room_id"] for a in exclude_data["activities"]]
             self.assertIn(activity_room_id, exclude_activity_ids)
 
         finally:

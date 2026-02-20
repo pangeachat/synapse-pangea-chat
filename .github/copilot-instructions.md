@@ -27,12 +27,12 @@ Single entry-point class `PangeaChat` (`synapse_pangea_chat/__init__.py`) compos
 
 ## Testing
 
-### E2E tests (local Synapse + PostgreSQL)
+### Integration tests (local Synapse + PostgreSQL)
 
 Located in `tests/`. Each test class extends `tests.base_e2e.BaseSynapseE2ETest`, which spins up a temporary Synapse + PostgreSQL instance. Uses `aiounittest.AsyncTestCase` and `testing.postgresql`.
 
 ```sh
-# Run all e2e tests
+# Run all integration tests
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 

@@ -1,8 +1,12 @@
-name: Linting and Tests
+name: Linting
 on:
   push:
     branches: ["main"]
   pull_request:
+
+# Integration tests require a local PostgreSQL + Synapse instance
+# (via testing.postgresql + BaseSynapseE2ETest). Run them locally
+# before merging — see testing.instructions.md.
 
 jobs:
   check-code-style:
@@ -26,19 +30,3 @@ jobs:
           python-version: "3.x"
       - run: python -m pip install tox
       - run: tox -e check_types
-
-  unit-tests:
-    name: Unit tests
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        # Run the unit tests both against our oldest supported Python version
-        # and the newest stable.
-        python_version: ["3.10", "3.x"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v4
-        with:
-          python-version: ${{ matrix.python_version }}
-      - run: python -m pip install tox
-      - run: tox -e py
