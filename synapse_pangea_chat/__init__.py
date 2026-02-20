@@ -19,7 +19,12 @@ from synapse_pangea_chat.room_preview import (
     RoomPreview,
     invalidate_room_cache,
 )
-from synapse_pangea_chat.user_activity import CourseActivities, UserActivity, UserCourses
+from synapse_pangea_chat.user_activity import (
+    CourseActivities,
+    CourseActivitySummary,
+    UserActivity,
+    UserCourses,
+)
 
 logger = logging.getLogger(f"synapse.module.{__name__}")
 
@@ -101,6 +106,13 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/course_activities",
             resource=self.course_activities_resource,
+        )
+
+        # --- Course Activity Summary (client-accessible) ---
+        self.course_activity_summary_resource = CourseActivitySummary(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/course_activity_summary",
+            resource=self.course_activity_summary_resource,
         )
 
         # --- User Courses ---

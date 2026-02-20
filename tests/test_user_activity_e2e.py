@@ -273,9 +273,7 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
                 f"{self.server_url}/_synapse/client/pangea/v1/user_courses"
                 f"?user_id=@learner:my.domain.name"
             )
-            courses_resp = requests.get(
-                courses_url, headers=headers_admin, timeout=30
-            )
+            courses_resp = requests.get(courses_url, headers=headers_admin, timeout=30)
             self.assertEqual(courses_resp.status_code, 200)
             courses_data = courses_resp.json()
 
@@ -327,16 +325,12 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
                 f"?course_room_id={course_room_id}"
                 f"&exclude_user_id=@learner:my.domain.name"
             )
-            exclude_resp = requests.get(
-                exclude_url, headers=headers_admin, timeout=30
-            )
+            exclude_resp = requests.get(exclude_url, headers=headers_admin, timeout=30)
             self.assertEqual(exclude_resp.status_code, 200)
             exclude_data = exclude_resp.json()
             # Learner did NOT join the activity room, so excluding learner
             # should still return the activity
-            exclude_activity_ids = [
-                a["room_id"] for a in exclude_data["activities"]
-            ]
+            exclude_activity_ids = [a["room_id"] for a in exclude_data["activities"]]
             self.assertIn(activity_room_id, exclude_activity_ids)
 
         finally:
@@ -368,6 +362,451 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
             url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
             response = requests.get(url, timeout=30)
             self.assertEqual(response.status_code, 401)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+
+class TestCourseActivitySummaryE2E(BaseSynapseE2ETest):
+    async def test_course_activity_summary_requires_auth(self):
+        """Requests without auth should get 401."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                _config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            url = (
+                f"{self.server_url}/_synapse/client/pangea/v1/course_activity_summary"
+                f"?course_room_id=!fake:my.domain.name"
+            )
+            response = requests.get(url, timeout=30)
+            self.assertEqual(response.status_code, 401)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_course_activity_summary_missing_param(self):
+        """Missing course_room_id should get 400."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="user1",
+                password="pw1",
+                admin=False,
+            )
+            _, token = await self.login_user("user1", "pw1")
+
+            url = f"{self.server_url}/_synapse/client/pangea/v1/course_activity_summary"
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("course_room_id", response.json().get("error", ""))
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_course_activity_summary_non_member_forbidden(self):
+        """Non-member of the course room should get 403."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            # Create admin (course owner) and a regular user
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="outsider",
+                password="pw1",
+                admin=False,
+            )
+
+            _, admin_token = await self.login_user("admin", "adminpw")
+            _, outsider_token = await self.login_user("outsider", "pw1")
+
+            # Create a course room
+            create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
+            course_resp = requests.post(
+                create_room_url,
+                json={
+                    "visibility": "public",
+                    "preset": "public_chat",
+                    "creation_content": {"type": "m.space"},
+                    "initial_state": [
+                        {
+                            "type": "pangea.course_plan",
+                            "state_key": "",
+                            "content": {"uuid": "course-summary-test"},
+                        }
+                    ],
+                    "name": "Summary Test Course",
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(course_resp.status_code, 200)
+            course_room_id = course_resp.json()["room_id"]
+
+            # Outsider does NOT join the course — should get 403
+            url = (
+                f"{self.server_url}/_synapse/client/pangea/v1/course_activity_summary"
+                f"?course_room_id={course_room_id}"
+            )
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {outsider_token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 403)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_course_activity_summary_success(self):
+        """Joined member gets lightweight activity metadata."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            # Register admin + learner
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="learner",
+                password="pw1",
+                admin=False,
+            )
+
+            _, admin_token = await self.login_user("admin", "adminpw")
+            _, learner_token = await self.login_user("learner", "pw1")
+
+            headers_admin = {"Authorization": f"Bearer {admin_token}"}
+            create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
+
+            # Create course space
+            course_resp = requests.post(
+                create_room_url,
+                json={
+                    "visibility": "public",
+                    "preset": "public_chat",
+                    "creation_content": {"type": "m.space"},
+                    "initial_state": [
+                        {
+                            "type": "pangea.course_plan",
+                            "state_key": "",
+                            "content": {"uuid": "course-summary-full"},
+                        }
+                    ],
+                    "name": "Summary Full Course",
+                },
+                headers=headers_admin,
+                timeout=30,
+            )
+            self.assertEqual(course_resp.status_code, 200)
+            course_room_id = course_resp.json()["room_id"]
+
+            # Create activity room with number_of_participants=2
+            activity_resp = requests.post(
+                create_room_url,
+                json={
+                    "visibility": "private",
+                    "preset": "private_chat",
+                    "initial_state": [
+                        {
+                            "type": "pangea.activity_plan",
+                            "state_key": "",
+                            "content": {
+                                "activity_id": "act-summary-1",
+                                "req": {
+                                    "number_of_participants": 2,
+                                    "topic": "Test",
+                                    "mode": "roleplay",
+                                    "objective": "Learn",
+                                    "target_language": "es",
+                                    "language_of_instructions": "en",
+                                    "activity_cefr_level": "A1",
+                                    "count": 1,
+                                },
+                            },
+                        },
+                        {
+                            "type": "m.space.parent",
+                            "state_key": course_room_id,
+                            "content": {"via": ["my.domain.name"]},
+                        },
+                    ],
+                    "name": "Activity Room Summary",
+                },
+                headers=headers_admin,
+                timeout=30,
+            )
+            self.assertEqual(activity_resp.status_code, 200)
+            activity_room_id = activity_resp.json()["room_id"]
+
+            # Learner joins the course
+            join_url = f"{self.server_url}/_matrix/client/v3/join/{course_room_id}"
+            join_resp = requests.post(
+                join_url,
+                headers={"Authorization": f"Bearer {learner_token}"},
+                timeout=30,
+            )
+            self.assertEqual(join_resp.status_code, 200)
+
+            # Learner queries course_activity_summary
+            url = (
+                f"{self.server_url}/_synapse/client/pangea/v1/course_activity_summary"
+                f"?course_room_id={course_room_id}"
+            )
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {learner_token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+
+            # Verify response shape
+            self.assertEqual(data["course_room_id"], course_room_id)
+            self.assertIn("activities", data)
+            self.assertGreater(len(data["activities"]), 0)
+
+            # No pagination fields
+            self.assertNotIn("page", data)
+            self.assertNotIn("limit", data)
+            self.assertNotIn("totalDocs", data)
+
+            # Find the activity
+            act = [a for a in data["activities"] if a["room_id"] == activity_room_id]
+            self.assertEqual(len(act), 1)
+            act = act[0]
+
+            self.assertEqual(act["activity_id"], "act-summary-1")
+            self.assertEqual(act["number_of_participants"], 2)
+            # Admin created the room, so admin is joined (member_count >= 1)
+            self.assertGreaterEqual(act["member_count"], 1)
+
+            # Verify NO heavy fields are present
+            self.assertNotIn("members", act)
+            self.assertNotIn("room_name", act)
+            self.assertNotIn("created_ts", act)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_course_activity_summary_not_a_course(self):
+        """Querying a non-course room should get 404."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="user1",
+                password="pw1",
+                admin=False,
+            )
+            _, token = await self.login_user("user1", "pw1")
+
+            # Create a regular room (no pangea.course_plan state)
+            create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
+            room_resp = requests.post(
+                create_room_url,
+                json={
+                    "visibility": "private",
+                    "preset": "private_chat",
+                    "name": "Not a Course",
+                },
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            )
+            self.assertEqual(room_resp.status_code, 200)
+            room_id = room_resp.json()["room_id"]
+
+            url = (
+                f"{self.server_url}/_synapse/client/pangea/v1/course_activity_summary"
+                f"?course_room_id={room_id}"
+            )
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 404)
+            self.assertIn("error", response.json())
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_course_activity_summary_admin_also_works(self):
+        """Admin who is also a course member can use the endpoint."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            _, admin_token = await self.login_user("admin", "adminpw")
+            headers_admin = {"Authorization": f"Bearer {admin_token}"}
+
+            create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
+            course_resp = requests.post(
+                create_room_url,
+                json={
+                    "visibility": "public",
+                    "preset": "public_chat",
+                    "creation_content": {"type": "m.space"},
+                    "initial_state": [
+                        {
+                            "type": "pangea.course_plan",
+                            "state_key": "",
+                            "content": {"uuid": "admin-summary-test"},
+                        }
+                    ],
+                    "name": "Admin Summary Course",
+                },
+                headers=headers_admin,
+                timeout=30,
+            )
+            self.assertEqual(course_resp.status_code, 200)
+            course_room_id = course_resp.json()["room_id"]
+
+            # Admin is already a member (created the room)
+            url = (
+                f"{self.server_url}/_synapse/client/pangea/v1/course_activity_summary"
+                f"?course_room_id={course_room_id}"
+            )
+            response = requests.get(url, headers=headers_admin, timeout=30)
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data["course_room_id"], course_room_id)
+            self.assertEqual(data["activities"], [])
 
         finally:
             self.stop_synapse(

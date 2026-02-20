@@ -106,7 +106,42 @@ Courses are sorted by `most_recent_activity_ts` descending — the most recently
 
 Activity rooms sorted by `created_ts` descending — most recent first.
 
-## Why Three Endpoints
+### 4. Course Activity Summary (client-accessible)
+
+`GET /_synapse/client/pangea/v1/course_activity_summary`
+
+- **Auth:** Matrix bearer token, requester must be a **joined member** of the course room (not admin-only)
+- **Rate limiting:** None
+- **Required params:** `course_room_id`
+
+**Response:**
+
+```json
+{
+  "course_room_id": "!abc:example.com",
+  "activities": [
+    {
+      "room_id": "!def:example.com",
+      "activity_id": "act-123",
+      "member_count": 3,
+      "number_of_participants": 2
+    }
+  ]
+}
+```
+
+No pagination — course activity counts are bounded (typically <50 per course).
+
+| Field | Source |
+|-------|--------|
+| `room_id` | Room ID of the activity room |
+| `activity_id` | From `pangea.activity_plan` state event `content.activity_id` |
+| `member_count` | `COUNT(*)` of `join` memberships in the room |
+| `number_of_participants` | From `pangea.activity_plan` state event `content.req.number_of_participants` |
+
+This endpoint exists so the client can determine topic unlock state with a **single Synapse request** instead of N choreo/CMS requests. See pangeachat/client#5758.
+
+## Why Three + One Endpoints
 
 The original single endpoint embedded courses inside each user doc and activity rooms in a top-level dict. This caused:
 
@@ -114,10 +149,12 @@ The original single endpoint embedded courses inside each user doc and activity 
 - **Redundant data** — activity rooms were duplicated for every request
 - **Unbounded course lists** — a user with many courses bloated their user doc
 
-Splitting into three endpoints lets the bot:
+The three admin endpoints let the bot:
 1. Paginate through users efficiently (lightweight docs)
 2. Fetch courses per-user on demand (paginated, sorted by recency)
 3. Fetch course activities per-course with `exclude_user_id` filtering
+
+The **course_activity_summary** endpoint is separate because it's client-accessible (not admin-only) and returns only the lightweight metadata needed for topic unlock logic.
 
 ## DB Query Strategy
 
@@ -143,6 +180,14 @@ Splitting into three endpoints lets the bot:
 3. **Activity IDs, room names, members, creation timestamps** — Batch queries.
 4. **Filter, assemble & paginate** — Apply `include_user_id` / `exclude_user_id`, sort by `created_ts` desc, then slice for pagination.
 
+### Course Activity Summary queries (`get_course_activity_summary.py`)
+
+1. **Verify course** — Confirm room has `pangea.course_plan` state.
+2. **Find children** — Same as course activities: rooms with `m.space.parent` pointing to this course AND `pangea.activity_plan` state.
+3. **Activity metadata** — Extract `activity_id` and `req.number_of_participants` from `pangea.activity_plan` state event JSON.
+4. **Member counts** — `COUNT(*)` grouped by `room_id` (no full member list).
+5. **Assemble** — No filtering, sorting, or pagination.
+
 All `events` table queries are scoped to specific user IDs via `WHERE sender IN (...)` or `WHERE sender = ?` to prevent full-table scans.
 
 ## Bot-Side Consumer
@@ -156,13 +201,14 @@ The [engagement script](../../../bot/.github/instructions/initiate.engagement.in
 
 ## Key Files
 
-- **Endpoint handlers:** [`user_activity.py`](../../synapse_pangea_chat/user_activity/user_activity.py) — `UserActivity`, `UserCourses`, and `CourseActivities` Resource classes
+- **Endpoint handlers:** [`user_activity.py`](../../synapse_pangea_chat/user_activity/user_activity.py) — `UserActivity`, `UserCourses`, `CourseActivities`, and `CourseActivitySummary` Resource classes
 - **Users query:** [`get_users.py`](../../synapse_pangea_chat/user_activity/get_users.py)
 - **User courses query:** [`get_user_courses.py`](../../synapse_pangea_chat/user_activity/get_user_courses.py)
 - **Course activities query:** [`get_course_activities.py`](../../synapse_pangea_chat/user_activity/get_course_activities.py)
+- **Course activity summary query:** [`get_course_activity_summary.py`](../../synapse_pangea_chat/user_activity/get_course_activity_summary.py)
 - **Rate limiting:** [`is_rate_limited.py`](../../synapse_pangea_chat/user_activity/is_rate_limited.py)
 - **E2E tests:** [`test_user_activity_e2e.py`](../../tests/test_user_activity_e2e.py)
 
 ## Future Work
 
-_(No linked issues yet.)_
+- pangeachat/client#5758 — Client-side lazy-loading of course activities (consumer of `course_activity_summary`)

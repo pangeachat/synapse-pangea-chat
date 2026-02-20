@@ -18,6 +18,9 @@ from twisted.web.resource import Resource
 from synapse_pangea_chat.user_activity.get_course_activities import (
     get_course_activities,
 )
+from synapse_pangea_chat.user_activity.get_course_activity_summary import (
+    get_course_activity_summary,
+)
 from synapse_pangea_chat.user_activity.get_user_courses import get_user_courses
 from synapse_pangea_chat.user_activity.get_users import get_users
 
@@ -231,6 +234,93 @@ class CourseActivities(_AdminResourceBase):
             )
         except Exception:  # noqa: BLE001
             logger.exception("Error processing course_activities request")
+            respond_with_json(
+                request, 500, {"error": "Internal server error"}, send_cors=True
+            )
+
+
+class CourseActivitySummary(Resource):
+    """GET /_synapse/client/pangea/v1/course_activity_summary
+
+    Lightweight per-activity metadata for topic unlock logic.
+    Auth: Matrix bearer token, requester must be a joined member of the course room.
+    Required: course_room_id
+    """
+
+    isLeaf = True
+
+    def __init__(self, api: ModuleApi, config: PangeaChatConfig):
+        super().__init__()
+        self._api = api
+        self._config = config
+        self._auth = self._api._hs.get_auth()
+        self._datastores = self._api._hs.get_datastores()
+
+    def render_GET(self, request: SynapseRequest):
+        defer.ensureDeferred(self._async_render_GET(request))
+        return server.NOT_DONE_YET
+
+    async def _async_render_GET(self, request: SynapseRequest):
+        try:
+            requester = await self._auth.get_user_by_req(request)
+            requester_id = requester.user.to_string()
+
+            course_room_id = _str_param(request, b"course_room_id")
+            if not course_room_id:
+                respond_with_json(
+                    request,
+                    400,
+                    {"error": "Missing required parameter: course_room_id"},
+                    send_cors=True,
+                )
+                return
+
+            # Verify requester is a joined member of the course room
+            membership_query = """
+            SELECT 1 FROM room_memberships rm
+            INNER JOIN current_state_events cse
+                ON cse.event_id = rm.event_id
+            WHERE rm.room_id = ?
+              AND rm.user_id = ?
+              AND rm.membership = 'join'
+            LIMIT 1
+            """
+            membership_rows = await self._datastores.main.db_pool.execute(
+                "check_course_membership",
+                membership_query,
+                course_room_id,
+                requester_id,
+            )
+            if not membership_rows:
+                respond_with_json(
+                    request,
+                    403,
+                    {"error": "Forbidden: you must be a member of the course room"},
+                    send_cors=True,
+                )
+                return
+
+            data = await get_course_activity_summary(
+                self._datastores.main,
+                course_room_id,
+            )
+
+            if "error" in data:
+                respond_with_json(request, 404, data, send_cors=True)
+                return
+
+            respond_with_json(request, 200, data, send_cors=True)
+
+        except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
+            logger.info("Authentication failed: %s", e)
+            respond_with_json(
+                request,
+                401,
+                {"error": "Unauthorized", "errcode": "M_UNAUTHORIZED"},
+                send_cors=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Error processing course_activity_summary request")
             respond_with_json(
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
