@@ -12,8 +12,6 @@ request_log: Dict[str, List[float]] = {}
 class RateLimitError(Exception):
     """Custom exception for rate limiting errors."""
 
-    pass
-
 
 def _get_config_window(config: PangeaChatConfig) -> Tuple[int, int]:
     duration = getattr(config, "public_courses_burst_duration_seconds", 120)

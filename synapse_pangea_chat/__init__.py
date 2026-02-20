@@ -19,7 +19,11 @@ from synapse_pangea_chat.room_preview import (
     RoomPreview,
     invalidate_room_cache,
 )
-from synapse_pangea_chat.user_activity import CourseActivities, UserActivity, UserCourses
+from synapse_pangea_chat.user_activity import (
+    CourseActivities,
+    UserActivity,
+    UserCourses,
+)
 
 logger = logging.getLogger(f"synapse.module.{__name__}")
 

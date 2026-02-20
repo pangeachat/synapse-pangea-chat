@@ -182,9 +182,7 @@ async def get_user_courses(
 
     # For courses: aggregate activity from both the course room and child
     # activity rooms to get the most_recent_activity_ts
-    course_room_ids = [
-        rid for rid, info in room_info.items() if info.get("is_course")
-    ]
+    course_room_ids = [rid for rid, info in room_info.items() if info.get("is_course")]
     course_activity_ts: Dict[str, int] = {}
     for crid in course_room_ids:
         course_activity_ts[crid] = room_last_msg.get(crid, 0)
