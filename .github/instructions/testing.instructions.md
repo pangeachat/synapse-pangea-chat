@@ -38,6 +38,15 @@ Code style is enforced via `tox -e check_codestyle` (black + ruff). Tests are ru
 - Deploy to staging via Ansible, then run staging smoke-tests
 - SSH to staging and check Synapse logs: `sudo journalctl -fu matrix-synapse.service`
 
+## Code Style (MUST pass before committing)
+
+Run `black --check synapse_pangea_chat tests` and `ruff check synapse_pangea_chat tests` before every commit. CI enforces these via `tox -e check_codestyle`.
+
+Common pitfalls:
+- **Empty class bodies**: Use a docstring alone (no trailing `...`). If no docstring, use `pass` on its own line. Do NOT leave an empty class body with only blank lines.
+- **Stub functions**: Use two-line form `def f():\n    ...` — never one-line `def f(): ...` (black rejects it).
+- **Extra blank lines**: black enforces exactly one blank line after a class docstring, two blank lines between top-level definitions. Do not add extra blank lines inside class bodies.
+
 ## Future Work
 
 _(No linked issues yet.)_
