@@ -5,7 +5,6 @@ Unified configuration combining all previously separate synapse module configs:
 - public_courses (original synapse-pangea-chat)
 - room_preview (from synapse-room-preview)
 - room_code (from synapse-room-code)
-- auto_accept_invite (from synapse-auto-accept-invite-if-knocked)
 - delete_room (from synapse-delete-room-rest-api)
 - limit_user_directory (from synapse-limit-user-directory)
 """
@@ -40,13 +39,6 @@ class PangeaChatConfig:
     # --- room_code config ---
     knock_with_code_requests_per_burst: int = 10
     knock_with_code_burst_duration_seconds: int = 60
-
-    # --- auto_accept_invite config ---
-    auto_accept_invite_worker: Optional[str] = None
-
-    # --- request_auto_join config ---
-    request_auto_join_requests_per_burst: int = 10
-    request_auto_join_burst_duration_seconds: int = 60
 
     # --- delete_room config ---
     delete_room_requests_per_burst: int = 10
