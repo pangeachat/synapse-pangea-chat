@@ -4,47 +4,49 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 
 ## Modules
 
-| Module | Subpackage | Endpoint | Description |
-|--------|-----------|----------|-------------|
-| [Public Courses](#public-courses) | `synapse_pangea_chat/` | `GET /_synapse/client/unstable/org.pangea/public_courses` | Course catalog with filtering and pagination |
-| [Room Preview](#room-preview) | `synapse_pangea_chat/room_preview/` | `GET /_synapse/client/unstable/org.pangea/room_preview` | Read room state events without membership |
-| [Room Code](#room-code) | `synapse_pangea_chat/room_code/` | `POST /_synapse/client/pangea/v1/knock_with_code` | Secret-code-based room invitations |
-| | | `GET /_synapse/client/pangea/v1/request_room_code` | Generate a unique room access code |
-| [Delete Room](#delete-room) | `synapse_pangea_chat/delete_room/` | `POST /_synapse/client/pangea/v1/delete_room` | Room deletion for highest-power-level members |
-| [Limit User Directory](#limit-user-directory) | `synapse_pangea_chat/limit_user_directory/` | *(spam checker)* | Filter user directory by public profile attribute |
+| Module                                        | Subpackage                                  | Endpoint                                                  | Description                                       |
+| --------------------------------------------- | ------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------- |
+| [Public Courses](#public-courses)             | `synapse_pangea_chat/`                      | `GET /_synapse/client/unstable/org.pangea/public_courses` | Course catalog with filtering and pagination      |
+| [Room Preview](#room-preview)                 | `synapse_pangea_chat/room_preview/`         | `GET /_synapse/client/unstable/org.pangea/room_preview`   | Read room state events without membership         |
+| [Room Code](#room-code)                       | `synapse_pangea_chat/room_code/`            | `POST /_synapse/client/pangea/v1/knock_with_code`         | Secret-code-based room invitations                |
+|                                               |                                             | `GET /_synapse/client/pangea/v1/request_room_code`        | Generate a unique room access code                |
+| [Delete Room](#delete-room)                   | `synapse_pangea_chat/delete_room/`          | `POST /_synapse/client/pangea/v1/delete_room`             | Room deletion for highest-power-level members     |
+| [Limit User Directory](#limit-user-directory) | `synapse_pangea_chat/limit_user_directory/` | _(spam checker)_                                          | Filter user directory by public profile attribute |
 
 ## Installation
 
 From the virtual environment that you use for Synapse, install this module with:
+
 ```shell
 pip install path/to/synapse-pangea-chat
 ```
 
 Then alter your homeserver configuration, adding to your `modules` configuration:
+
 ```yaml
 modules:
   - module: synapse_pangea_chat.PangeaChat
     config:
       # --- Public Courses ---
-      public_courses_burst_duration_seconds: 120   # default: 120
-      public_courses_requests_per_burst: 120       # default: 120
-      course_plan_state_event_type: "pangea.course_plan"  # default: null (falls back to pangea.course_plan)
+      public_courses_burst_duration_seconds: 120 # default: 120
+      public_courses_requests_per_burst: 120 # default: 120
+      course_plan_state_event_type: "pangea.course_plan" # default: null (falls back to pangea.course_plan)
 
       # --- Room Preview ---
-      room_preview_state_event_types:              # additional state event types to expose
+      room_preview_state_event_types: # additional state event types to expose
         - "p.room_summary"
         - "pangea.activity_plan"
         - "pangea.activity_roles"
-      room_preview_burst_duration_seconds: 60      # default: 60
-      room_preview_requests_per_burst: 10          # default: 10
+      room_preview_burst_duration_seconds: 60 # default: 60
+      room_preview_requests_per_burst: 10 # default: 10
 
       # --- Room Code ---
-      knock_with_code_requests_per_burst: 10       # default: 10
-      knock_with_code_burst_duration_seconds: 60   # default: 60
+      knock_with_code_requests_per_burst: 10 # default: 10
+      knock_with_code_burst_duration_seconds: 60 # default: 60
 
       # --- Delete Room ---
-      delete_room_requests_per_burst: 10           # default: 10
-      delete_room_burst_duration_seconds: 60       # default: 60
+      delete_room_requests_per_burst: 10 # default: 10
+      delete_room_burst_duration_seconds: 60 # default: 60
 
       # --- Limit User Directory (disabled when path is null) ---
       limit_user_directory_public_attribute_search_path: "profile.user_settings.public"
@@ -69,9 +71,9 @@ Requires a valid Matrix access token; unauthenticated calls return `401 M_UNAUTH
 
 ### Query Parameters
 
-| Name    | Type    | Default | Description |
-|---------|---------|---------|-------------|
-| `limit` | integer | `10`    | Maximum number of courses to return |
+| Name    | Type    | Default | Description                                  |
+| ------- | ------- | ------- | -------------------------------------------- |
+| `limit` | integer | `10`    | Maximum number of courses to return          |
 | `since` | string  | `None`  | Pagination token returned by a previous call |
 
 ### Response
@@ -116,9 +118,9 @@ Allow authenticated users to read content of pre-configured state events from ro
 
 ### Query Parameters
 
-| Name    | Type   | Default | Description |
-|---------|--------|---------|-------------|
-| `rooms` | string | *(empty)* | Comma-delimited list of room IDs |
+| Name    | Type   | Default   | Description                      |
+| ------- | ------ | --------- | -------------------------------- |
+| `rooms` | string | _(empty)_ | Comma-delimited list of room IDs |
 
 ### Response
 
@@ -127,7 +129,9 @@ Allow authenticated users to read content of pre-configured state events from ro
   "rooms": {
     "!room_id:example.com": {
       "event_type": {
-        "state_key": { /* full event JSON content */ }
+        "state_key": {
+          /* full event JSON content */
+        }
       },
       "membership_summary": {
         "@user_id:example.com": "join"
@@ -152,7 +156,7 @@ Included for rooms containing `pangea.activity_roles` (activity rooms) or `pange
 
 In-memory cache with 1-minute TTL. Cache is reactively invalidated when relevant state events change.
 
-*Originally: [pangeachat/synapse-room-preview](https://github.com/pangeachat/synapse-room-preview)*
+_Originally: [pangeachat/synapse-room-preview](https://github.com/pangeachat/synapse-room-preview)_
 
 ---
 
@@ -167,6 +171,7 @@ Extend rooms to optionally have a secret code. Upon knocking with a valid code, 
 **Body:** `{ "access_code": "<7-char alphanumeric with ≥1 digit>" }`
 
 **Response (200):**
+
 ```json
 {
   "message": "string",
@@ -180,11 +185,12 @@ Extend rooms to optionally have a secret code. Upon knocking with a valid code, 
 **Route:** `GET /_synapse/client/pangea/v1/request_room_code`
 
 **Response (200):**
+
 ```json
 { "access_code": "A1B2C3D" }
 ```
 
-*Originally: [pangeachat/synapse-room-code](https://github.com/pangeachat/synapse-room-code)*
+_Originally: [pangeachat/synapse-room-code](https://github.com/pangeachat/synapse-room-code)_
 
 ---
 
@@ -197,13 +203,14 @@ Expose an endpoint for room admins (members with the highest power level) to kic
 **Body:** `{ "room_id": "!room:example.com" }`
 
 **Response (200):**
+
 ```json
 { "message": "Deleted" }
 ```
 
 Requester must be a member of the room and have the highest power level.
 
-*Originally: [pangeachat/synapse-delete-room-rest-api](https://github.com/pangeachat/synapse-delete-room-rest-api)*
+_Originally: [pangeachat/synapse-delete-room-rest-api](https://github.com/pangeachat/synapse-delete-room-rest-api)_
 
 ---
 
@@ -213,15 +220,15 @@ Spam checker callback that filters the user directory based on a public profile 
 
 ### Config
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `limit_user_directory_public_attribute_search_path` | string \| null | `null` | Dot-syntax path to the public boolean attribute (e.g. `profile.user_settings.public`). Module is disabled when `null`. |
-| `limit_user_directory_filter_search_if_missing_public_attribute` | bool | `true` | Whether to filter users who lack the attribute entirely |
-| `limit_user_directory_whitelist_requester_id_patterns` | list[str] | `[]` | Regex patterns for user IDs that bypass filtering |
+| Key                                                              | Type           | Default | Description                                                                                                            |
+| ---------------------------------------------------------------- | -------------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `limit_user_directory_public_attribute_search_path`              | string \| null | `null`  | Dot-syntax path to the public boolean attribute (e.g. `profile.user_settings.public`). Module is disabled when `null`. |
+| `limit_user_directory_filter_search_if_missing_public_attribute` | bool           | `true`  | Whether to filter users who lack the attribute entirely                                                                |
+| `limit_user_directory_whitelist_requester_id_patterns`           | list[str]      | `[]`    | Regex patterns for user IDs that bypass filtering                                                                      |
 
 Users sharing a room with the requester are always visible regardless of the public attribute.
 
-*Originally: [pangeachat/synapse-limit-user-directory](https://github.com/pangeachat/synapse-limit-user-directory)*
+_Originally: [pangeachat/synapse-limit-user-directory](https://github.com/pangeachat/synapse-limit-user-directory)_
 
 ---
 
@@ -267,66 +274,76 @@ tests/
 ## Development
 
 In a virtual environment with pip ≥ 21.1, run
+
 ```shell
 pip install -e .[dev]
 ```
 
 To run the unit tests, you can either use:
+
 ```shell
 tox -e py
 ```
+
 or
+
 ```shell
 trial tests
 ```
 
 To view test logs for debugging, use:
+
 ```shell
 tail -f synapse.log
 ```
 
 To run the linters and `mypy` type checker, use `./scripts-dev/lint.sh`.
 
-
 ## Releasing
 
 The exact steps for releasing will vary; but this is an approach taken by the
 Synapse developers (assuming a Unix-like shell):
 
- 1. Set a shell variable to the version you are releasing (this just makes
+1.  Set a shell variable to the version you are releasing (this just makes
     subsequent steps easier):
+
     ```shell
     version=X.Y.Z
     ```
 
- 2. Update `setup.cfg` so that the `version` is correct.
+2.  Update `setup.cfg` so that the `version` is correct.
 
- 3. Stage the changed files and commit.
+3.  Stage the changed files and commit.
+
     ```shell
     git add -u
     git commit -m v$version -n
     ```
 
- 4. Push your changes.
+4.  Push your changes.
+
     ```shell
     git push
     ```
 
- 5. When ready, create a signed tag for the release:
+5.  When ready, create a signed tag for the release:
+
     ```shell
     git tag -s v$version
     ```
+
     Base the tag message on the changelog.
 
- 6. Push the tag.
+6.  Push the tag.
+
     ```shell
     git push origin tag v$version
     ```
 
- 7. If applicable:
-    Create a *release*, based on the tag you just pushed, on GitHub or GitLab.
+7.  If applicable:
+    Create a _release_, based on the tag you just pushed, on GitHub or GitLab.
 
- 8. If applicable:
+8.  If applicable:
     Create a source distribution and upload it to PyPI:
     ```shell
     python -m build

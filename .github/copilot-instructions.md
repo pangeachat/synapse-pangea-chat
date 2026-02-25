@@ -12,7 +12,7 @@ Single entry-point class `PangeaChat` (`synapse_pangea_chat/__init__.py`) compos
 | -------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Public Courses       | `public_courses/`       | `GET /_synapse/client/unstable/org.pangea/public_courses`                                                                                         |
 | Room Preview         | `room_preview/`         | `GET /_synapse/client/unstable/org.pangea/room_preview`                                                                                           |
-| Room Code            | `room_code/`            | `POST /_synapse/client/pangea/v1/knock_with_code`, `GET /_synapse/client/pangea/v1/request_room_code`                                             |
+| Room Code            | `room_code/`            | `POST /_synapse/client/pangea/v1/knock_with_code`, `GET /_synapse/client/pangea/v1/request_room_code` — see [knock-with-code.instructions.md](.github/instructions/knock-with-code.instructions.md) |
 | Delete Room          | `delete_room/`          | `POST /_synapse/client/pangea/v1/delete_room`                                                                                                     |
 | User Activity        | `user_activity/`        | `GET /_synapse/client/pangea/v1/user_activity`, `GET /_synapse/client/pangea/v1/user_courses`, `GET /_synapse/client/pangea/v1/course_activities` |
 | Limit User Directory | `limit_user_directory/` | _(spam checker callback — no HTTP endpoint)_                                                                                                      |
