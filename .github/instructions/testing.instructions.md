@@ -4,7 +4,7 @@ applyTo: "**/*test*,**/tests/**"
 
 # Testing Guide (synapse-pangea-chat)
 
-Follows the [cross-repo testing strategy](../../.github/instructions/testing.instructions.md) — see that doc for tier definitions (unit / integration / e2e), conventions, and rationale. This doc covers synapse module-specific details only.
+Follows the [cross-repo testing strategy](../../../.github/instructions/testing.instructions.md) — see that doc for tier definitions (unit / integration / e2e), conventions, and rationale. This doc covers synapse module-specific details only.
 
 ## Stack
 
