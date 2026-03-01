@@ -17,7 +17,7 @@ dev = [
   # for tests
   "matrix-synapse",
   "tox",
-  "twisted == 24.7.0",
+  "twisted == 25.5.0",
   "aiounittest",
   "aiohttp",
   "psycopg2",
