@@ -10,6 +10,9 @@ jobs:
   bandit:
     name: Bandit (Python)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
 
@@ -21,5 +24,28 @@ jobs:
         run: pip install bandit
 
       - name: Run Bandit
+        id: bandit
         continue-on-error: true
-        run: bandit -r synapse_pangea_chat/ -ll -ii
+        run: bandit -r synapse_pangea_chat/ -ll -ii 2>&1 | tee bandit-output.txt
+
+      - name: Create or update issue for findings
+        if: steps.bandit.outcome == 'failure' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="Bandit: security findings detected"
+          echo "### Bandit scan — $(date -u +%Y-%m-%d)" > issue-body.md
+          echo "" >> issue-body.md
+          echo "**Run:** $RUN_URL" >> issue-body.md
+          echo "" >> issue-body.md
+          echo '```' >> issue-body.md
+          tail -50 bandit-output.txt >> issue-body.md
+          echo '```' >> issue-body.md
+          gh label create security --color d73a4a 2>/dev/null || true
+          EXISTING=$(gh issue list --state open --label security --json number,title | jq -r --arg title "$TITLE" '.[] | select(.title == $title) | .number' | head -1)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file issue-body.md
+          else
+            gh issue create --title "$TITLE" --label security --body-file issue-body.md
+          fi
