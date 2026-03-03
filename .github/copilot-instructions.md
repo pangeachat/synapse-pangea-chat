@@ -15,7 +15,8 @@ Single entry-point class `PangeaChat` (`synapse_pangea_chat/__init__.py`) compos
 | Room Code            | `room_code/`            | `POST /_synapse/client/pangea/v1/knock_with_code`, `GET /_synapse/client/pangea/v1/request_room_code` — see [knock-with-code.instructions.md](.github/instructions/knock-with-code.instructions.md) |
 | Delete Room          | `delete_room/`          | `POST /_synapse/client/pangea/v1/delete_room`                                                                                                     |
 | User Activity        | `user_activity/`        | `GET /_synapse/client/pangea/v1/user_activity`, `GET /_synapse/client/pangea/v1/user_courses`, `GET /_synapse/client/pangea/v1/course_activities` |
-| Limit User Directory | `limit_user_directory/` | _(spam checker callback — no HTTP endpoint)_                                                                                                      |
+| Limit User Directory | `limit_user_directory/` | _(spam checker callback — no HTTP endpoint)_ — see [limit-user-directory.instructions.md](.github/instructions/limit-user-directory.instructions.md) |
+| User Directory Search | `user_directory_search/` | `POST /_synapse/client/pangea/v1/user_directory/search` — see [limit-user-directory.instructions.md](.github/instructions/limit-user-directory.instructions.md) |
 
 ## Key Files
 

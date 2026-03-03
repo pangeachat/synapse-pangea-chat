@@ -8,6 +8,10 @@ logger = logging.getLogger("synapse.modules.synapse_pangea_chat.limit_user_direc
 
 
 class LimitUserDirectory:
+    # TODO(phase-out): This legacy post-filter callback should be removed once
+    # all consumers switch to the DB-filtered endpoint:
+    # /_synapse/client/pangea/v1/user_directory/search
+    # Keep logic aligned with user_directory_search/search_users.py until removal.
     def __init__(self, config: Any, api: ModuleApi):
         self._api = api
         self._config = config
