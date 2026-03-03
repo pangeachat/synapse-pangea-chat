@@ -22,6 +22,7 @@ from synapse_pangea_chat.user_activity import (
     UserActivity,
     UserCourses,
 )
+from synapse_pangea_chat.user_directory_search import UserDirectorySearch
 
 logger = logging.getLogger(f"synapse.module.{__name__}")
 
@@ -103,7 +104,20 @@ class PangeaChat:
 
         # --- Limit User Directory ---
         if config.limit_user_directory_public_attribute_search_path is not None:
+            # TODO(phase-out): Remove LimitUserDirectory spam-checker callback after
+            # all clients are migrated to /_synapse/client/pangea/v1/user_directory/search.
+            # Keeping both paths temporarily preserves backwards compatibility.
             self.limit_user_directory = LimitUserDirectory(config, api)
+
+        # --- User Directory Search ---
+        if config.limit_user_directory_public_attribute_search_path is not None:
+            # TODO(phase-out): Once migration is complete, make this endpoint the
+            # only supported directory search path and delete legacy callback wiring.
+            self.user_directory_search_resource = UserDirectorySearch(api, config)
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/user_directory/search",
+                resource=self.user_directory_search_resource,
+            )
 
     async def _on_new_event_room_preview(
         self,
@@ -229,6 +243,14 @@ class PangeaChat:
                 'Config "limit_user_directory_filter_search_if_missing_public_attribute" must be a boolean'
             )
 
+        # --- user_directory_search config ---
+        user_directory_search_requests_per_burst = config.get(
+            "user_directory_search_requests_per_burst", 10
+        )
+        user_directory_search_burst_duration_seconds = config.get(
+            "user_directory_search_burst_duration_seconds", 60
+        )
+
         return PangeaChatConfig(
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
@@ -245,4 +267,6 @@ class PangeaChat:
             limit_user_directory_public_attribute_search_path=limit_user_directory_public_attribute_search_path,
             limit_user_directory_whitelist_requester_id_patterns=limit_user_directory_whitelist_requester_id_patterns,
             limit_user_directory_filter_search_if_missing_public_attribute=limit_user_directory_filter_search_if_missing_public_attribute,
+            user_directory_search_requests_per_burst=user_directory_search_requests_per_burst,
+            user_directory_search_burst_duration_seconds=user_directory_search_burst_duration_seconds,
         )

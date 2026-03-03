@@ -52,3 +52,7 @@ class PangeaChatConfig:
     limit_user_directory_public_attribute_search_path: Optional[str] = None
     limit_user_directory_whitelist_requester_id_patterns: List[str] = attr.Factory(list)
     limit_user_directory_filter_search_if_missing_public_attribute: bool = True
+
+    # --- user_directory_search config ---
+    user_directory_search_requests_per_burst: int = 10
+    user_directory_search_burst_duration_seconds: int = 60
