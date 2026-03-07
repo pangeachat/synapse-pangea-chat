@@ -1,4 +1,3 @@
-```instructions
 ---
 applyTo: "synapse_pangea_chat/limit_user_directory/**,synapse_pangea_chat/user_directory_search/**,tests/test_limit_user_directory*,tests/test_user_directory_search*"
 ---
@@ -97,4 +96,3 @@ All config keys live under the module's `config` block in `homeserver.yaml`:
 - **Integration tests (spam checker)**: `tests/test_limit_user_directory_e2e.py`
 - **Unit tests (spam checker)**: `tests/test_limit_user_directory_unit.py`
 - **Integration tests (custom endpoint)**: `tests/test_user_directory_search_e2e.py`
-```
