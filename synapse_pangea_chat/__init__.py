@@ -213,6 +213,12 @@ class PangeaChat:
         delete_user_burst_duration_seconds = config.get(
             "delete_user_burst_duration_seconds", 60
         )
+        delete_user_schedule_delay_seconds = config.get(
+            "delete_user_schedule_delay_seconds", 7 * 24 * 60 * 60
+        )
+        delete_user_processor_interval_seconds = config.get(
+            "delete_user_processor_interval_seconds", 60
+        )
 
         # --- limit_user_directory config ---
         limit_user_directory_public_attribute_search_path = config.get(
@@ -280,6 +286,8 @@ class PangeaChat:
             user_activity_burst_duration_seconds=user_activity_burst_duration_seconds,
             delete_user_requests_per_burst=delete_user_requests_per_burst,
             delete_user_burst_duration_seconds=delete_user_burst_duration_seconds,
+            delete_user_schedule_delay_seconds=delete_user_schedule_delay_seconds,
+            delete_user_processor_interval_seconds=delete_user_processor_interval_seconds,
             limit_user_directory_public_attribute_search_path=limit_user_directory_public_attribute_search_path,
             limit_user_directory_whitelist_requester_id_patterns=limit_user_directory_whitelist_requester_id_patterns,
             limit_user_directory_filter_search_if_missing_public_attribute=limit_user_directory_filter_search_if_missing_public_attribute,

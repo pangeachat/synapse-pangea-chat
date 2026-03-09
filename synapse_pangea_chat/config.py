@@ -51,6 +51,8 @@ class PangeaChatConfig:
     # --- delete_user config ---
     delete_user_requests_per_burst: int = 5
     delete_user_burst_duration_seconds: int = 60
+    delete_user_schedule_delay_seconds: int = 7 * 24 * 60 * 60
+    delete_user_processor_interval_seconds: int = 60
 
     # --- limit_user_directory config ---
     limit_user_directory_public_attribute_search_path: Optional[str] = None

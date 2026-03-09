@@ -52,6 +52,8 @@ modules:
       # --- Delete User ---
       delete_user_requests_per_burst: 5 # default: 5
       delete_user_burst_duration_seconds: 60 # default: 60
+      delete_user_schedule_delay_seconds: 604800 # default: 7 days
+      delete_user_processor_interval_seconds: 60 # default: 60
 
       # --- Limit User Directory (disabled when path is null) ---
       limit_user_directory_public_attribute_search_path: "profile.user_settings.public"
@@ -221,24 +223,38 @@ _Originally: [pangeachat/synapse-delete-room-rest-api](https://github.com/pangea
 
 ## Delete User
 
-Delete user associations (`external_ids` and local `threepids`) and then deactivate the account with data erasure enabled.
+Schedule user deletion for one week in the future by default. Supports canceling or forcing the scheduled deletion.
 
 **Route:** `POST /_synapse/client/pangea/v1/delete_user`
 
-**Body (optional):** `{ "user_id": "@user:example.com" }`
+**Body (optional):**
+
+```json
+{
+  "action": "schedule|cancel|force",
+  "user_id": "@user:example.com"
+}
+```
 
 - If `user_id` is omitted, the requester is deleted.
 - Server admins may specify another local user ID.
 - Non-admins can only delete themselves.
+- `action` defaults to `schedule`.
+
+Behavior by action:
+
+- `schedule`: Creates/updates a deletion schedule for `now + 7 days` (or configured delay).
+- `cancel`: Cancels an existing schedule.
+- `force`: Immediately executes a previously scheduled deletion.
 
 **Response (200):**
 
 ```json
 {
-  "message": "Deleted",
+  "message": "Delete scheduled",
+  "action": "schedule",
   "user_id": "@user:example.com",
-  "deleted_external_ids": 1,
-  "deleted_threepids": 1
+  "execute_at_ms": 1762790400000
 }
 ```
 
