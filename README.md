@@ -11,6 +11,7 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 | [Room Code](#room-code)                       | `synapse_pangea_chat/room_code/`            | `POST /_synapse/client/pangea/v1/knock_with_code`         | Secret-code-based room invitations                |
 |                                               |                                             | `GET /_synapse/client/pangea/v1/request_room_code`        | Generate a unique room access code                |
 | [Delete Room](#delete-room)                   | `synapse_pangea_chat/delete_room/`          | `POST /_synapse/client/pangea/v1/delete_room`             | Room deletion for highest-power-level members     |
+| [Delete User](#delete-user)                   | `synapse_pangea_chat/delete_user/`          | `POST /_synapse/client/pangea/v1/delete_user`             | Delete user associations then deactivate account   |
 | [Limit User Directory](#limit-user-directory) | `synapse_pangea_chat/limit_user_directory/` | _(spam checker)_                                          | Filter user directory by public profile attribute |
 
 ## Installation
@@ -47,6 +48,10 @@ modules:
       # --- Delete Room ---
       delete_room_requests_per_burst: 10 # default: 10
       delete_room_burst_duration_seconds: 60 # default: 60
+
+      # --- Delete User ---
+      delete_user_requests_per_burst: 5 # default: 5
+      delete_user_burst_duration_seconds: 60 # default: 60
 
       # --- Limit User Directory (disabled when path is null) ---
       limit_user_directory_public_attribute_search_path: "profile.user_settings.public"
@@ -211,6 +216,31 @@ Expose an endpoint for room admins (members with the highest power level) to kic
 Requester must be a member of the room and have the highest power level.
 
 _Originally: [pangeachat/synapse-delete-room-rest-api](https://github.com/pangeachat/synapse-delete-room-rest-api)_
+
+---
+
+## Delete User
+
+Delete user associations (`external_ids` and local `threepids`) and then deactivate the account with data erasure enabled.
+
+**Route:** `POST /_synapse/client/pangea/v1/delete_user`
+
+**Body (optional):** `{ "user_id": "@user:example.com" }`
+
+- If `user_id` is omitted, the requester is deleted.
+- Server admins may specify another local user ID.
+- Non-admins can only delete themselves.
+
+**Response (200):**
+
+```json
+{
+  "message": "Deleted",
+  "user_id": "@user:example.com",
+  "deleted_external_ids": 1,
+  "deleted_threepids": 1
+}
+```
 
 ---
 

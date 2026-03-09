@@ -7,6 +7,7 @@ from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.delete_room import DeleteRoom
+from synapse_pangea_chat.delete_user import DeleteUser
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.public_courses import PublicCourses
 from synapse_pangea_chat.room_code import KnockWithCode, RequestRoomCode
@@ -79,6 +80,13 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/delete_room",
             resource=self.delete_room_resource,
+        )
+
+        # --- Delete User ---
+        self.delete_user_resource = DeleteUser(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/delete_user",
+            resource=self.delete_user_resource,
         )
 
         # --- User Activity ---
@@ -200,6 +208,12 @@ class PangeaChat:
             "user_activity_burst_duration_seconds", 60
         )
 
+        # --- delete_user config ---
+        delete_user_requests_per_burst = config.get("delete_user_requests_per_burst", 5)
+        delete_user_burst_duration_seconds = config.get(
+            "delete_user_burst_duration_seconds", 60
+        )
+
         # --- limit_user_directory config ---
         limit_user_directory_public_attribute_search_path = config.get(
             "limit_user_directory_public_attribute_search_path", None
@@ -264,6 +278,8 @@ class PangeaChat:
             delete_room_burst_duration_seconds=delete_room_burst_duration_seconds,
             user_activity_requests_per_burst=user_activity_requests_per_burst,
             user_activity_burst_duration_seconds=user_activity_burst_duration_seconds,
+            delete_user_requests_per_burst=delete_user_requests_per_burst,
+            delete_user_burst_duration_seconds=delete_user_burst_duration_seconds,
             limit_user_directory_public_attribute_search_path=limit_user_directory_public_attribute_search_path,
             limit_user_directory_whitelist_requester_id_patterns=limit_user_directory_whitelist_requester_id_patterns,
             limit_user_directory_filter_search_if_missing_public_attribute=limit_user_directory_filter_search_if_missing_public_attribute,
