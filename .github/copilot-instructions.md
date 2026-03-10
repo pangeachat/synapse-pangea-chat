@@ -2,6 +2,8 @@
 
 Unified Synapse module (Python 3.10+) bundling all Pangea Chat server-side features into `synapse_pangea_chat.PangeaChat`.
 
+For Synapse Admin API, Module API, and Matrix spec documentation links, see [synapse-docs.instructions.md](../../.github/.github/instructions/synapse-docs.instructions.md).
+
 ## Architecture
 
 Single entry-point class `PangeaChat` (`synapse_pangea_chat/__init__.py`) composes sub-modules. Each sub-module lives in its own sub-package under `synapse_pangea_chat/`.
