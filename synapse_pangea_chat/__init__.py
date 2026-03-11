@@ -7,7 +7,13 @@ from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.delete_room import DeleteRoom
-from synapse_pangea_chat.delete_user import DeleteUser
+try:
+    from synapse_pangea_chat.delete_user import DeleteUser
+    _DELETE_USER_AVAILABLE = True
+except ImportError as _delete_user_import_error:
+    # Requires Synapse >= 1.148.0.  Older installations skip this sub-module
+    # rather than crashing all of Synapse.  See COMPAT.yml.
+    _DELETE_USER_AVAILABLE = False
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.public_courses import PublicCourses
 from synapse_pangea_chat.room_code import KnockWithCode, RequestRoomCode
@@ -82,12 +88,17 @@ class PangeaChat:
             resource=self.delete_room_resource,
         )
 
-        # --- Delete User ---
-        self.delete_user_resource = DeleteUser(api, config)
-        self._api.register_web_resource(
-            path="/_synapse/client/pangea/v1/delete_user",
-            resource=self.delete_user_resource,
-        )
+        # --- Delete User (requires Synapse >= 1.148.0, see COMPAT.yml) ---
+        if _DELETE_USER_AVAILABLE:
+            self.delete_user_resource = DeleteUser(api, config)
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/delete_user",
+                resource=self.delete_user_resource,
+            )
+        else:
+            logger.warning(
+                "delete_user endpoint disabled: %s", _delete_user_import_error
+            )
 
         # --- User Activity ---
         self.user_activity_resource = UserActivity(api, config)

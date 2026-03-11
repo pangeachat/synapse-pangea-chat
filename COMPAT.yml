@@ -1,0 +1,9 @@
+# Minimum Synapse version required by this commit of synapse-pangea-chat.
+# This file is read by the ansible deploy.sh script to prevent deploying
+# module code to a Synapse homeserver that is too old.
+#
+# If this file is absent in a given commit, any Synapse version is assumed compatible.
+# Do not lower min_synapse_version without auditing all sub-module imports first.
+
+min_synapse_version: "1.148.0"
+reason: "delete_user uses synapse.util.duration, which does not exist in Synapse < 1.148.0 (confirmed broken on 1.124.0, confirmed working on 1.148.0)"
