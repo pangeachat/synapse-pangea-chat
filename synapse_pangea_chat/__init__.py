@@ -7,13 +7,26 @@ from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.delete_room import DeleteRoom
+
 try:
     from synapse_pangea_chat.delete_user import DeleteUser
+
     _DELETE_USER_AVAILABLE = True
-except ImportError as _delete_user_import_error:
+    _delete_user_import_err = ""
+except ImportError as e:
     # Requires Synapse >= 1.148.0.  Older installations skip this sub-module
     # rather than crashing all of Synapse.  See COMPAT.yml.
     _DELETE_USER_AVAILABLE = False
+    _delete_user_import_err = str(e)
+try:
+    from synapse_pangea_chat.export_user_data import ExportUserData
+
+    _EXPORT_USER_DATA_AVAILABLE = True
+    _export_user_data_import_err = ""
+except ImportError as e:
+    # Requires Synapse >= 1.148.0 (same Duration dependency as delete_user).
+    _EXPORT_USER_DATA_AVAILABLE = False
+    _export_user_data_import_err = str(e)
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.public_courses import PublicCourses
 from synapse_pangea_chat.room_code import KnockWithCode, RequestRoomCode
@@ -96,8 +109,19 @@ class PangeaChat:
                 resource=self.delete_user_resource,
             )
         else:
+            logger.warning("delete_user endpoint disabled: %s", _delete_user_import_err)
+
+        # --- Export User Data (requires Synapse >= 1.148.0, see COMPAT.yml) ---
+        if _EXPORT_USER_DATA_AVAILABLE:
+            self.export_user_data_resource = ExportUserData(api, config)
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/export_user_data",
+                resource=self.export_user_data_resource,
+            )
+        else:
             logger.warning(
-                "delete_user endpoint disabled: %s", _delete_user_import_error
+                "export_user_data endpoint disabled: %s",
+                _export_user_data_import_err,
             )
 
         # --- User Activity ---
@@ -231,6 +255,38 @@ class PangeaChat:
             "delete_user_processor_interval_seconds", 60
         )
 
+        # --- export_user_data config ---
+        export_user_data_requests_per_burst = config.get(
+            "export_user_data_requests_per_burst", 3
+        )
+        export_user_data_burst_duration_seconds = config.get(
+            "export_user_data_burst_duration_seconds", 60
+        )
+        export_user_data_processor_interval_seconds = config.get(
+            "export_user_data_processor_interval_seconds", 60
+        )
+        export_user_data_output_dir = config.get(
+            "export_user_data_output_dir", "/tmp/pangea-export-user-data"
+        )
+        if not isinstance(export_user_data_output_dir, str):
+            raise ValueError('Config "export_user_data_output_dir" must be a string')
+        if not export_user_data_output_dir.strip():
+            raise ValueError('Config "export_user_data_output_dir" cannot be empty')
+
+        cms_base_url = config.get("cms_base_url")
+        if not isinstance(cms_base_url, str):
+            raise ValueError('Config "cms_base_url" is required and must be a string')
+        if not cms_base_url.strip():
+            raise ValueError('Config "cms_base_url" cannot be empty')
+
+        cms_service_api_key = config.get("cms_service_api_key")
+        if not isinstance(cms_service_api_key, str):
+            raise ValueError(
+                'Config "cms_service_api_key" is required and must be a string'
+            )
+        if not cms_service_api_key.strip():
+            raise ValueError('Config "cms_service_api_key" cannot be empty')
+
         # --- limit_user_directory config ---
         limit_user_directory_public_attribute_search_path = config.get(
             "limit_user_directory_public_attribute_search_path", None
@@ -299,6 +355,12 @@ class PangeaChat:
             delete_user_burst_duration_seconds=delete_user_burst_duration_seconds,
             delete_user_schedule_delay_seconds=delete_user_schedule_delay_seconds,
             delete_user_processor_interval_seconds=delete_user_processor_interval_seconds,
+            export_user_data_requests_per_burst=export_user_data_requests_per_burst,
+            export_user_data_burst_duration_seconds=export_user_data_burst_duration_seconds,
+            export_user_data_processor_interval_seconds=export_user_data_processor_interval_seconds,
+            export_user_data_output_dir=export_user_data_output_dir,
+            cms_base_url=cms_base_url,
+            cms_service_api_key=cms_service_api_key,
             limit_user_directory_public_attribute_search_path=limit_user_directory_public_attribute_search_path,
             limit_user_directory_whitelist_requester_id_patterns=limit_user_directory_whitelist_requester_id_patterns,
             limit_user_directory_filter_search_if_missing_public_attribute=limit_user_directory_filter_search_if_missing_public_attribute,

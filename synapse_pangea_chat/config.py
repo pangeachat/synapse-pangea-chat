@@ -54,6 +54,14 @@ class PangeaChatConfig:
     delete_user_schedule_delay_seconds: int = 7 * 24 * 60 * 60
     delete_user_processor_interval_seconds: int = 60
 
+    # --- export_user_data config ---
+    export_user_data_requests_per_burst: int = 3
+    export_user_data_burst_duration_seconds: int = 60
+    export_user_data_processor_interval_seconds: int = 60
+    export_user_data_output_dir: str = "/tmp/pangea-export-user-data"
+    cms_base_url: str = ""
+    cms_service_api_key: str = ""
+
     # --- limit_user_directory config ---
     limit_user_directory_public_attribute_search_path: Optional[str] = None
     limit_user_directory_whitelist_requester_id_patterns: List[str] = attr.Factory(list)
