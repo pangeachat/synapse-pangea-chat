@@ -65,10 +65,20 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 config = yaml.safe_load(f)
             log_config_path = config.get("log_config")
 
+            effective_module_config = {
+                "export_user_data_output_dir": os.path.join(
+                    synapse_dir, "export-user-data"
+                ),
+                "cms_base_url": "http://127.0.0.1:9",
+                "cms_service_api_key": "test-cms-api-key",
+            }
+            if module_config:
+                effective_module_config.update(module_config)
+
             config["modules"] = [
                 {
                     "module": "synapse_pangea_chat.PangeaChat",
-                    "config": module_config or {},
+                    "config": effective_module_config,
                 }
             ]
 
