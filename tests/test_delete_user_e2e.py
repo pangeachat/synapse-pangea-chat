@@ -5,6 +5,7 @@ import yaml
 from psycopg2 import connect
 
 from .base_e2e import BaseSynapseE2ETest
+from .mock_cms_server import MockCmsServer
 
 
 class TestDeleteUserE2E(BaseSynapseE2ETest):
@@ -483,6 +484,354 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
             )
             self.assertNotEqual(login_response.status_code, 200)
         finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    # ---- CMS feedback-log delete tests ----
+
+    async def test_delete_user_removes_cms_feedback_logs(self):
+        """Seed 2 logs → force delete → response reports 2 deleted, mock confirms."""
+        mock_cms = MockCmsServer()
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            cms_url = mock_cms.start()
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config={
+                    "cms_base_url": cms_url,
+                    "cms_service_api_key": "test-key",
+                }
+            )
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="delcms",
+                password="pw1",
+                admin=False,
+            )
+            _, access_token = await self.login_user("delcms", "pw1")
+            user_id = "@delcms:my.domain.name"
+
+            mock_cms.seed_feedback_logs(
+                user_id,
+                [
+                    {"id": "fb1", "req": {"user_id": user_id}},
+                    {"id": "fb2", "req": {"user_id": user_id}},
+                ],
+            )
+
+            delete_url = "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
+            requests.post(
+                delete_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            force = requests.post(
+                delete_url,
+                json={"action": "force"},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            self.assertEqual(force.status_code, 200)
+            self.assertEqual(force.json()["deleted_cms_feedback_logs"], 2)
+            self.assertEqual(mock_cms.get_remaining_logs(user_id), [])
+        finally:
+            mock_cms.stop()
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_delete_user_reports_zero_when_no_feedback_logs(self):
+        """No seeded data → deleted_cms_feedback_logs: 0."""
+        mock_cms = MockCmsServer()
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            cms_url = mock_cms.start()
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config={
+                    "cms_base_url": cms_url,
+                    "cms_service_api_key": "test-key",
+                }
+            )
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="nocms",
+                password="pw1",
+                admin=False,
+            )
+            _, access_token = await self.login_user("nocms", "pw1")
+
+            delete_url = "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
+            requests.post(
+                delete_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            force = requests.post(
+                delete_url,
+                json={"action": "force"},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            self.assertEqual(force.status_code, 200)
+            self.assertEqual(force.json()["deleted_cms_feedback_logs"], 0)
+        finally:
+            mock_cms.stop()
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_delete_user_succeeds_when_cms_unavailable(self):
+        """Dead CMS URL → account still deactivated, feedback logs = 0."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config={
+                    "cms_base_url": "http://127.0.0.1:9",
+                    "cms_service_api_key": "test-key",
+                }
+            )
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="deadcms",
+                password="pw1",
+                admin=False,
+            )
+            _, access_token = await self.login_user("deadcms", "pw1")
+
+            delete_url = "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
+            requests.post(
+                delete_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            force = requests.post(
+                delete_url,
+                json={"action": "force"},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            self.assertEqual(force.status_code, 200)
+            self.assertEqual(force.json()["deleted_cms_feedback_logs"], 0)
+
+            login_url = "http://localhost:8008/_matrix/client/v3/login"
+            login_response = requests.post(
+                login_url,
+                json={
+                    "type": "m.login.password",
+                    "user": "deadcms",
+                    "password": "pw1",
+                },
+            )
+            self.assertNotEqual(login_response.status_code, 200)
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_scheduled_delete_removes_cms_feedback_logs(self):
+        """Seed data + short delay + fast processor → logs gone & account deactivated."""
+        mock_cms = MockCmsServer()
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            cms_url = mock_cms.start()
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config={
+                    "delete_user_schedule_delay_seconds": 3,
+                    "delete_user_processor_interval_seconds": 1,
+                    "cms_base_url": cms_url,
+                    "cms_service_api_key": "test-key",
+                }
+            )
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="schedcms",
+                password="pw1",
+                admin=False,
+            )
+            _, access_token = await self.login_user("schedcms", "pw1")
+            user_id = "@schedcms:my.domain.name"
+
+            mock_cms.seed_feedback_logs(
+                user_id,
+                [{"id": "sc1", "req": {"user_id": user_id}}],
+            )
+
+            delete_url = "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
+            schedule_resp = requests.post(
+                delete_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            self.assertEqual(schedule_resp.status_code, 200)
+
+            await asyncio.sleep(6)
+
+            self.assertEqual(mock_cms.get_remaining_logs(user_id), [])
+            self.assertEqual(self._count_schedules(config_path, user_id), 0)
+
+            login_url = "http://localhost:8008/_matrix/client/v3/login"
+            login_response = requests.post(
+                login_url,
+                json={
+                    "type": "m.login.password",
+                    "user": "schedcms",
+                    "password": "pw1",
+                },
+            )
+            self.assertNotEqual(login_response.status_code, 200)
+        finally:
+            mock_cms.stop()
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_admin_force_delete_removes_other_users_feedback_logs(self):
+        """Admin deletes target → target's feedback logs removed."""
+        mock_cms = MockCmsServer()
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            cms_url = mock_cms.start()
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config={
+                    "cms_base_url": cms_url,
+                    "cms_service_api_key": "test-key",
+                }
+            )
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admindel",
+                password="pw1",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="victimcms",
+                password="pw2",
+                admin=False,
+            )
+            _, admin_token = await self.login_user("admindel", "pw1")
+            target_user_id = "@victimcms:my.domain.name"
+
+            mock_cms.seed_feedback_logs(
+                target_user_id,
+                [
+                    {"id": "v1", "req": {"user_id": target_user_id}},
+                    {"id": "v2", "req": {"user_id": target_user_id}},
+                    {"id": "v3", "req": {"user_id": target_user_id}},
+                ],
+            )
+
+            delete_url = "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
+            requests.post(
+                delete_url,
+                json={"user_id": target_user_id},
+                headers={"Authorization": f"Bearer {admin_token}"},
+            )
+            force = requests.post(
+                delete_url,
+                json={"action": "force", "user_id": target_user_id},
+                headers={"Authorization": f"Bearer {admin_token}"},
+            )
+            self.assertEqual(force.status_code, 200)
+            self.assertEqual(force.json()["deleted_cms_feedback_logs"], 3)
+            self.assertEqual(mock_cms.get_remaining_logs(target_user_id), [])
+
+            login_url = "http://localhost:8008/_matrix/client/v3/login"
+            login_response = requests.post(
+                login_url,
+                json={
+                    "type": "m.login.password",
+                    "user": "victimcms",
+                    "password": "pw2",
+                },
+            )
+            self.assertNotEqual(login_response.status_code, 200)
+        finally:
+            mock_cms.stop()
             self.stop_synapse(
                 server_process=server_process,
                 stdout_thread=stdout_thread,
