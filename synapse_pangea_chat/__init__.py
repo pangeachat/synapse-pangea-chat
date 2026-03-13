@@ -197,6 +197,17 @@ class PangeaChat:
 
         course_plan_state_event_type = config.get("course_plan_state_event_type", None)
 
+        public_courses_cms_cache_ttl_seconds = config.get(
+            "public_courses_cms_cache_ttl_seconds", 5
+        )
+        if (
+            not isinstance(public_courses_cms_cache_ttl_seconds, int)
+            or public_courses_cms_cache_ttl_seconds < 1
+        ):
+            raise ValueError(
+                "public_courses_cms_cache_ttl_seconds must be an integer >= 1"
+            )
+
         # --- room_preview config ---
         room_preview_state_event_types = config.get(
             "room_preview_state_event_types", ["p.room_summary"]
@@ -342,6 +353,7 @@ class PangeaChat:
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
             course_plan_state_event_type=course_plan_state_event_type,
+            public_courses_cms_cache_ttl_seconds=public_courses_cms_cache_ttl_seconds,
             room_preview_state_event_types=all_event_types,
             room_preview_burst_duration_seconds=room_preview_burst_duration_seconds,
             room_preview_requests_per_burst=room_preview_requests_per_burst,

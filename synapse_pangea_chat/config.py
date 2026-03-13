@@ -22,6 +22,7 @@ class PangeaChatConfig:
     public_courses_burst_duration_seconds: int = 120
     public_courses_requests_per_burst: int = 120
     course_plan_state_event_type: Optional[str] = None
+    public_courses_cms_cache_ttl_seconds: int = 5
 
     # --- room_preview config ---
     room_preview_state_event_types: List[str] = attr.Factory(list)

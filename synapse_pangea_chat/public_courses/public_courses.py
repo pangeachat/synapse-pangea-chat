@@ -21,6 +21,7 @@ from synapse_pangea_chat.public_courses.is_rate_limited import (
     RateLimitError,
     is_rate_limited,
 )
+from synapse_pangea_chat.public_courses.types import CourseFilters
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.public_courses")
 
@@ -46,8 +47,12 @@ class PublicCourses(Resource):
 
             is_rate_limited(requester_id, self._config)
 
+            def _get_raw_arg(key: str):
+                # Synapse/Twisted request arg keys may be bytes or str depending on code path.
+                return request.args.get(key.encode("utf-8")) or request.args.get(key)
+
             # Parse query parameters from query string
-            limit_param = request.args.get(b"limit", [b"10"])
+            limit_param = _get_raw_arg("limit") or [b"10"]
             if isinstance(limit_param, list):
                 limit_value = limit_param[0] if limit_param else b"10"
             else:
@@ -63,7 +68,7 @@ class PublicCourses(Resource):
             except (ValueError, TypeError):
                 limit = 10
 
-            since_param = request.args.get(b"since")
+            since_param = _get_raw_arg("since")
             since_value: Optional[str] = None
             if since_param:
                 candidate = (
@@ -74,8 +79,37 @@ class PublicCourses(Resource):
                 else:
                     since_value = str(candidate)
 
+            # Parse optional language / CEFR filter params
+            filters = CourseFilters()
+
+            def _str_param(key: str) -> Optional[str]:
+                raw = _get_raw_arg(key)
+                if not raw:
+                    return None
+                val = raw[0] if isinstance(raw, list) else raw
+                decoded = (
+                    val.decode("utf-8", errors="ignore")
+                    if isinstance(val, bytes)
+                    else str(val)
+                )
+                return decoded.strip() or None
+
+            tl = _str_param("target_language")
+            if tl:
+                filters["target_language"] = tl
+            loi = _str_param("language_of_instructions")
+            if loi:
+                filters["language_of_instructions"] = loi
+            cl = _str_param("cefr_level")
+            if cl:
+                filters["cefr_level"] = cl
+
             public_courses = await get_public_courses(
-                self._datastores.main, self._config, limit, since_value
+                self._datastores.main,
+                self._config,
+                limit,
+                since_value,
+                filters=filters if filters else None,
             )
 
             respond_with_json(

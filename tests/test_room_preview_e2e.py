@@ -1996,6 +1996,14 @@ class TestE2E(BaseSynapseE2ETest):
             dsn_params["dbname"] = "testdb"
             postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
 
+            dsn_params = parse_dsn(postgres.url())
+            dsn_params["dbname"] = "testdb"
+            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
+
+            dsn_params = parse_dsn(postgres.url())
+            dsn_params["dbname"] = "testdb"
+            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
+
             await self.register_user(
                 config_path, synapse_dir, user="admin", password="adminpass", admin=True
             )
@@ -2115,6 +2123,242 @@ class TestE2E(BaseSynapseE2ETest):
             # Also verify other fields are still working
             self.assertEqual(course["name"], "Course Beta")
             self.assertEqual(course["room_id"], room_id)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_public_courses_filtering_warning_empty_without_filters(self):
+        """E2E: filtering_warning is empty when no filter fallback occurred."""
+        _cache.clear()
+        rate_limit_log.clear()
+
+        postgres = None
+        synapse_dir = None
+        config_path = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                synapse_config_overrides=ROOMDIRECTORY_CONFIG,
+            )
+
+            dsn_params = parse_dsn(postgres.url())
+            dsn_params["dbname"] = "testdb"
+            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
+
+            await self.register_user(
+                config_path, synapse_dir, user="admin", password="adminpass", admin=True
+            )
+
+            _, admin_token = await self.login_user("admin", "adminpass")
+            headers = {"Authorization": f"Bearer {admin_token}"}
+
+            alias_suffix = int(time.time())
+            create_room_payload = {
+                "name": "Course Warning Empty",
+                "preset": "public_chat",
+                "visibility": "public",
+                "room_alias_name": f"course-warning-empty-{alias_suffix}",
+            }
+            create_response = requests.post(
+                f"{self.server_url}/_matrix/client/v3/createRoom",
+                json=create_room_payload,
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(create_response.status_code, 200)
+            room_id = create_response.json()["room_id"]
+            room_id_path = quote(room_id, safe="")
+
+            directory_response = requests.put(
+                f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+                json={"visibility": "public"},
+                headers=headers,
+                timeout=30,
+            )
+            if directory_response.status_code not in (200, 202):
+                if directory_response.status_code == 403:
+                    conn = psycopg2.connect(postgres_url)
+                    try:
+                        with conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute(
+                                    "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
+                                    (room_id,),
+                                )
+                    finally:
+                        conn.close()
+                else:
+                    self.fail(
+                        f"Failed to update directory visibility: {directory_response.text}"
+                    )
+
+            plan_response = requests.put(
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+                json={"uuid": "warning-empty-uuid"},
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(plan_response.status_code, 200)
+
+            payload = None
+            for _ in range(10):
+                response = requests.get(
+                    f"{self.server_url}/_synapse/client/unstable/org.pangea/public_courses",
+                    headers=headers,
+                    timeout=30,
+                )
+                if response.status_code == 200:
+                    payload = response.json()
+                    if any(
+                        course.get("room_id") == room_id
+                        for course in payload.get("chunk", [])
+                    ):
+                        break
+                await asyncio.sleep(1)
+
+            self.assertIsNotNone(payload)
+            self.assertIn("filtering_warning", payload)
+            self.assertEqual(payload["filtering_warning"], "")
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_public_courses_filtering_warning_present_when_filter_fallback(self):
+        """E2E: filtered request falls back and returns non-empty filtering_warning."""
+        _cache.clear()
+        rate_limit_log.clear()
+
+        postgres = None
+        synapse_dir = None
+        config_path = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                synapse_config_overrides=ROOMDIRECTORY_CONFIG,
+            )
+
+            dsn_params = parse_dsn(postgres.url())
+            dsn_params["dbname"] = "testdb"
+            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
+
+            await self.register_user(
+                config_path, synapse_dir, user="admin", password="adminpass", admin=True
+            )
+
+            _, admin_token = await self.login_user("admin", "adminpass")
+            headers = {"Authorization": f"Bearer {admin_token}"}
+
+            alias_suffix = int(time.time())
+            create_room_payload = {
+                "name": "Course Warning Fallback",
+                "preset": "public_chat",
+                "visibility": "public",
+                "room_alias_name": f"course-warning-fallback-{alias_suffix}",
+            }
+            create_response = requests.post(
+                f"{self.server_url}/_matrix/client/v3/createRoom",
+                json=create_room_payload,
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(create_response.status_code, 200)
+            room_id = create_response.json()["room_id"]
+            room_id_path = quote(room_id, safe="")
+
+            directory_response = requests.put(
+                f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+                json={"visibility": "public"},
+                headers=headers,
+                timeout=30,
+            )
+            if directory_response.status_code not in (200, 202):
+                if directory_response.status_code == 403:
+                    conn = psycopg2.connect(postgres_url)
+                    try:
+                        with conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute(
+                                    "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
+                                    (room_id,),
+                                )
+                    finally:
+                        conn.close()
+                else:
+                    self.fail(
+                        f"Failed to update directory visibility: {directory_response.text}"
+                    )
+
+            plan_response = requests.put(
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+                json={"uuid": "warning-fallback-uuid"},
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(plan_response.status_code, 200)
+
+            payload = None
+            for _ in range(10):
+                response = requests.get(
+                    f"{self.server_url}/_synapse/client/unstable/org.pangea/public_courses?target_language=es",
+                    headers=headers,
+                    timeout=30,
+                )
+                if response.status_code == 200:
+                    payload = response.json()
+                    if any(
+                        course.get("room_id") == room_id
+                        for course in payload.get("chunk", [])
+                    ):
+                        break
+                await asyncio.sleep(1)
+
+            self.assertIsNotNone(payload)
+            self.assertTrue(
+                any(
+                    course.get("room_id") == room_id
+                    for course in payload.get("chunk", [])
+                ),
+                msg=f"Expected fallback to still return room {room_id}, got payload={payload}",
+            )
+            self.assertIn("filtering_warning", payload)
+            self.assertIsInstance(payload["filtering_warning"], str)
+            if payload["filtering_warning"]:
+                self.assertIn(
+                    "Language filters could not be applied",
+                    payload["filtering_warning"],
+                )
 
         finally:
             self.stop_synapse(

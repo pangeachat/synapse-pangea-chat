@@ -32,6 +32,7 @@ modules:
       public_courses_burst_duration_seconds: 120 # default: 120
       public_courses_requests_per_burst: 120 # default: 120
       course_plan_state_event_type: "pangea.course_plan" # default: null (falls back to pangea.course_plan)
+      public_courses_cms_cache_ttl_seconds: 5 # default: 5s — short burst cache; refreshes quickly
 
       # --- Room Preview ---
       room_preview_state_event_types: # additional state event types to expose
@@ -78,10 +79,15 @@ Requires a valid Matrix access token; unauthenticated calls return `401 M_UNAUTH
 
 ### Query Parameters
 
-| Name    | Type    | Default | Description                                  |
-| ------- | ------- | ------- | -------------------------------------------- |
-| `limit` | integer | `10`    | Maximum number of courses to return          |
-| `since` | string  | `None`  | Pagination token returned by a previous call |
+| Name                       | Type    | Default | Description                                                              |
+| -------------------------- | ------- | ------- | ------------------------------------------------------------------------ |
+| `limit`                    | integer | `10`    | Maximum number of courses to return                                      |
+| `since`                    | string  | `None`  | Pagination token returned by a previous call                             |
+| `target_language`          | string  | `None`  | Filter by target language (CMS `l2` field, e.g. `es`)                    |
+| `language_of_instructions` | string  | `None`  | Filter by language of instructions (CMS `originalL1` field, e.g. `en`)   |
+| `cefr_level`               | string  | `None`  | Filter by CEFR level (CMS `cefrLevel` field, e.g. `A1`, `B2`)           |
+
+When any filter parameter is provided, the endpoint queries Payload CMS to match course plans against the filters. This requires `cms_base_url` and `cms_service_api_key` to be configured. If CMS is missing/misconfigured or unavailable, the endpoint falls back to the previous unfiltered behavior.
 
 ### Response
 
@@ -98,14 +104,20 @@ Requires a valid Matrix access token; unauthenticated calls return `401 M_UNAUTH
       "world_readable": false,
       "guest_can_join": false,
       "join_rule": null,
-      "room_type": null
+      "room_type": null,
+      "target_language": "es",
+      "language_of_instructions": "en",
+      "cefr_level": "A1"
     }
   ],
+  "filtering_warning": "",
   "next_batch": "10",
   "prev_batch": null,
   "total_room_count_estimate": 23
 }
 ```
+
+`filtering_warning` is empty when filtering behavior succeeded (or no filters were requested). If language filters were requested but CMS is unavailable/misconfigured, the endpoint still returns normal unfiltered results and sets `filtering_warning` to a non-empty message.
 
 ### Room Selection Criteria
 
@@ -301,6 +313,7 @@ synapse_pangea_chat/
 ├── config.py                    # Unified PangeaChatConfig
 ├── public_courses.py            # Public courses endpoint
 ├── get_public_courses.py        # Public courses query logic
+├── course_metadata_cache.py     # CMS language metadata cache
 ├── is_rate_limited.py           # Public courses rate limiter
 ├── types.py                     # Shared types
 ├── room_preview/                # Room preview module
