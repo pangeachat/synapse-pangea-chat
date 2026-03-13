@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import tempfile
@@ -8,6 +9,7 @@ import yaml
 from psycopg2 import connect
 
 from .base_e2e import BaseSynapseE2ETest
+from .mock_cms_server import MockCmsServer
 
 
 class TestExportUserDataE2E(BaseSynapseE2ETest):
@@ -1008,6 +1010,378 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                     expected_body="disk should still work",
                 )
             finally:
+                self.stop_synapse(
+                    server_process=server_process,
+                    stdout_thread=stdout_thread,
+                    stderr_thread=stderr_thread,
+                    synapse_dir=synapse_dir,
+                    postgres=postgres,
+                )
+
+    # ---- CMS feedback-log tests ----
+
+    async def test_export_includes_cms_feedback_logs_in_zip(self):
+        """Seed 3 feedback logs → admin force export → ZIP contains them."""
+        mock_cms = MockCmsServer()
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        with tempfile.TemporaryDirectory() as export_dir:
+            try:
+                cms_url = mock_cms.start()
+                (
+                    postgres,
+                    synapse_dir,
+                    config_path,
+                    server_process,
+                    stdout_thread,
+                    stderr_thread,
+                ) = await self.start_test_synapse(
+                    module_config={
+                        "export_user_data_processor_interval_seconds": 60,
+                        "export_user_data_output_dir": export_dir,
+                        "cms_base_url": cms_url,
+                        "cms_service_api_key": "test-key",
+                    }
+                )
+
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="admin",
+                    password="pw1",
+                    admin=True,
+                )
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="fbuser",
+                    password="pw2",
+                    admin=False,
+                )
+                _, admin_token = await self.login_user("admin", "pw1")
+                user_id, _ = await self.login_user("fbuser", "pw2")
+
+                mock_cms.seed_feedback_logs(
+                    user_id,
+                    [
+                        {"id": "1", "req": {"user_id": user_id}, "data": "a"},
+                        {"id": "2", "req": {"user_id": user_id}, "data": "b"},
+                        {"id": "3", "req": {"user_id": user_id}, "data": "c"},
+                    ],
+                )
+
+                requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "schedule", "user_id": user_id},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                force = requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "force", "user_id": user_id},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                self.assertEqual(force.status_code, 200)
+
+                zip_path = self._zip_path_for_user(export_dir, user_id)
+                user_data = self._read_export_json(zip_path)
+                logs = user_data.get("cms_process_token_feedback_logs", [])
+                self.assertEqual(len(logs), 3)
+                self.assertEqual({doc["id"] for doc in logs}, {"1", "2", "3"})
+            finally:
+                mock_cms.stop()
+                self.stop_synapse(
+                    server_process=server_process,
+                    stdout_thread=stdout_thread,
+                    stderr_thread=stderr_thread,
+                    synapse_dir=synapse_dir,
+                    postgres=postgres,
+                )
+
+    async def test_export_includes_empty_feedback_logs_when_user_has_none(self):
+        """No seeded data → export contains empty list."""
+        mock_cms = MockCmsServer()
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        with tempfile.TemporaryDirectory() as export_dir:
+            try:
+                cms_url = mock_cms.start()
+                (
+                    postgres,
+                    synapse_dir,
+                    config_path,
+                    server_process,
+                    stdout_thread,
+                    stderr_thread,
+                ) = await self.start_test_synapse(
+                    module_config={
+                        "export_user_data_processor_interval_seconds": 60,
+                        "export_user_data_output_dir": export_dir,
+                        "cms_base_url": cms_url,
+                        "cms_service_api_key": "test-key",
+                    }
+                )
+
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="admin",
+                    password="pw1",
+                    admin=True,
+                )
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="nofb",
+                    password="pw2",
+                    admin=False,
+                )
+                _, admin_token = await self.login_user("admin", "pw1")
+                user_id, _ = await self.login_user("nofb", "pw2")
+
+                requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "schedule", "user_id": user_id},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                force = requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "force", "user_id": user_id},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                self.assertEqual(force.status_code, 200)
+
+                zip_path = self._zip_path_for_user(export_dir, user_id)
+                user_data = self._read_export_json(zip_path)
+                self.assertEqual(user_data.get("cms_process_token_feedback_logs"), [])
+            finally:
+                mock_cms.stop()
+                self.stop_synapse(
+                    server_process=server_process,
+                    stdout_thread=stdout_thread,
+                    stderr_thread=stderr_thread,
+                    synapse_dir=synapse_dir,
+                    postgres=postgres,
+                )
+
+    async def test_export_paginates_feedback_logs(self):
+        """Seed items exceeding a single page → all appear in export.
+
+        The mock returns pages of configurable size via the limit param.
+        We seed 5 items and the export code uses limit=100 by default,
+        so all appear in one page. This test verifies the pagination loop
+        handles the hasNextPage=false termination correctly.
+        """
+        mock_cms = MockCmsServer()
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        with tempfile.TemporaryDirectory() as export_dir:
+            try:
+                cms_url = mock_cms.start()
+                (
+                    postgres,
+                    synapse_dir,
+                    config_path,
+                    server_process,
+                    stdout_thread,
+                    stderr_thread,
+                ) = await self.start_test_synapse(
+                    module_config={
+                        "export_user_data_processor_interval_seconds": 60,
+                        "export_user_data_output_dir": export_dir,
+                        "cms_base_url": cms_url,
+                        "cms_service_api_key": "test-key",
+                    }
+                )
+
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="admin",
+                    password="pw1",
+                    admin=True,
+                )
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="pager",
+                    password="pw2",
+                    admin=False,
+                )
+                _, admin_token = await self.login_user("admin", "pw1")
+                user_id, _ = await self.login_user("pager", "pw2")
+
+                mock_cms.seed_feedback_logs(
+                    user_id,
+                    [{"id": str(i), "req": {"user_id": user_id}} for i in range(5)],
+                )
+
+                requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "schedule", "user_id": user_id},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                force = requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "force", "user_id": user_id},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                self.assertEqual(force.status_code, 200)
+
+                zip_path = self._zip_path_for_user(export_dir, user_id)
+                user_data = self._read_export_json(zip_path)
+                logs = user_data.get("cms_process_token_feedback_logs", [])
+                self.assertEqual(len(logs), 5)
+            finally:
+                mock_cms.stop()
+                self.stop_synapse(
+                    server_process=server_process,
+                    stdout_thread=stdout_thread,
+                    stderr_thread=stderr_thread,
+                    synapse_dir=synapse_dir,
+                    postgres=postgres,
+                )
+
+    async def test_export_succeeds_when_cms_unavailable(self):
+        """Dead CMS URL → ZIP still valid with empty feedback-logs array."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        with tempfile.TemporaryDirectory() as export_dir:
+            try:
+                (
+                    postgres,
+                    synapse_dir,
+                    config_path,
+                    server_process,
+                    stdout_thread,
+                    stderr_thread,
+                ) = await self.start_test_synapse(
+                    module_config={
+                        "export_user_data_processor_interval_seconds": 60,
+                        "export_user_data_output_dir": export_dir,
+                        "cms_base_url": "http://127.0.0.1:9",
+                        "cms_service_api_key": "test-key",
+                    }
+                )
+
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="admin",
+                    password="pw1",
+                    admin=True,
+                )
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="deadcms",
+                    password="pw2",
+                    admin=False,
+                )
+                _, admin_token = await self.login_user("admin", "pw1")
+                user_id, _ = await self.login_user("deadcms", "pw2")
+
+                requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "schedule", "user_id": user_id},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                force = requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "force", "user_id": user_id},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                self.assertEqual(force.status_code, 200)
+
+                zip_path = self._zip_path_for_user(export_dir, user_id)
+                user_data = self._read_export_json(zip_path)
+                self.assertEqual(user_data.get("cms_process_token_feedback_logs"), [])
+            finally:
+                self.stop_synapse(
+                    server_process=server_process,
+                    stdout_thread=stdout_thread,
+                    stderr_thread=stderr_thread,
+                    synapse_dir=synapse_dir,
+                    postgres=postgres,
+                )
+
+    async def test_scheduled_export_includes_feedback_logs(self):
+        """Seed data, background processor (interval=1s) → ZIP has feedback logs."""
+        mock_cms = MockCmsServer()
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        with tempfile.TemporaryDirectory() as export_dir:
+            try:
+                cms_url = mock_cms.start()
+                (
+                    postgres,
+                    synapse_dir,
+                    config_path,
+                    server_process,
+                    stdout_thread,
+                    stderr_thread,
+                ) = await self.start_test_synapse(
+                    module_config={
+                        "export_user_data_processor_interval_seconds": 1,
+                        "export_user_data_output_dir": export_dir,
+                        "cms_base_url": cms_url,
+                        "cms_service_api_key": "test-key",
+                    }
+                )
+
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="schedexp",
+                    password="pw1",
+                    admin=False,
+                )
+                user_id, user_token = await self.login_user("schedexp", "pw1")
+
+                mock_cms.seed_feedback_logs(
+                    user_id,
+                    [
+                        {"id": "s1", "req": {"user_id": user_id}},
+                        {"id": "s2", "req": {"user_id": user_id}},
+                    ],
+                )
+
+                response = requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "schedule"},
+                    headers={"Authorization": f"Bearer {user_token}"},
+                )
+                self.assertEqual(response.status_code, 200)
+
+                await asyncio.sleep(8)
+
+                self.assertEqual(self._count_schedules(config_path, user_id), 0)
+
+                zip_path = self._zip_path_for_user(export_dir, user_id)
+                user_data = self._read_export_json(zip_path)
+                logs = user_data.get("cms_process_token_feedback_logs", [])
+                self.assertEqual(len(logs), 2)
+            finally:
+                mock_cms.stop()
                 self.stop_synapse(
                     server_process=server_process,
                     stdout_thread=stdout_thread,

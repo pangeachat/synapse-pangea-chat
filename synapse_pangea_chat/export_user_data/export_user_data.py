@@ -6,6 +6,7 @@ import logging
 import os
 import zipfile
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence
+from urllib.parse import quote
 
 from synapse.api.errors import (
     AuthError,
@@ -332,6 +333,11 @@ class ExportUserData(Resource):
         await self._admin_handler.export_user_data(user_id, writer)
         export_data = writer.finished()
 
+        # Step 1b: Fetch CMS feedback logs and attach to export data
+        export_data[
+            "cms_process_token_feedback_logs"
+        ] = await self._cms_fetch_token_feedback_logs(user_id)
+
         # Step 2: Build ZIP
         zip_bytes = await self._build_export_zip(user_id, export_data)
 
@@ -443,6 +449,67 @@ class ExportUserData(Resource):
                     logger.warning("Failed to include media %s: %s", media_id, e)
 
         return buf.getvalue()
+
+    async def _cms_fetch_token_feedback_logs(
+        self, user_id: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch all process-token-feedback-logs for *user_id* from CMS.
+
+        Paginates through all pages. Returns [] on any failure (non-blocking).
+        """
+        cms_base_url = self._config.cms_base_url
+        cms_api_key = self._config.cms_service_api_key
+        if not cms_base_url or not cms_api_key:
+            return []
+
+        try:
+            from twisted.internet import reactor
+            from twisted.web.client import Agent, readBody
+            from twisted.web.http_headers import Headers
+
+            agent = Agent(reactor)
+            all_docs: List[Dict[str, Any]] = []
+            page = 1
+
+            while True:
+                encoded_uid = quote(user_id, safe="")
+                url = (
+                    f"{cms_base_url}/api/process-token-feedback-logs"
+                    f"?where[req.user_id][equals]={encoded_uid}"
+                    f"&limit=100&page={page}"
+                ).encode("utf-8")
+
+                response = await agent.request(
+                    b"GET",
+                    url,
+                    Headers(
+                        {
+                            b"Authorization": [
+                                f"users API-Key {cms_api_key}".encode("utf-8")
+                            ],
+                        }
+                    ),
+                )
+                resp_body = await readBody(response)
+                if response.code >= 400:
+                    logger.warning(
+                        "CMS feedback-logs fetch failed (%s): %s",
+                        response.code,
+                        resp_body.decode("utf-8", errors="replace"),
+                    )
+                    return all_docs
+
+                data = json.loads(resp_body)
+                all_docs.extend(data.get("docs", []))
+
+                if not data.get("hasNextPage"):
+                    break
+                page = data.get("nextPage", page + 1)
+
+            return all_docs
+        except Exception as e:
+            logger.warning("Failed to fetch CMS feedback logs for %s: %s", user_id, e)
+            return []
 
     # ---- CMS API helpers ----
 
