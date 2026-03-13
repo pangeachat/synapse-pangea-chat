@@ -7,7 +7,17 @@ from synapse.api.constants import HistoryVisibility
 from synapse.storage.databases.main.room import RoomStore
 
 from synapse_pangea_chat.config import PangeaChatConfig
-from synapse_pangea_chat.public_courses.types import Course, PublicCoursesResponse
+from synapse_pangea_chat.public_courses.course_metadata_cache import (
+    CourseMeta,
+    FilteredCourseMetadataLookupError,
+    get_course_metadata,
+    get_filtered_course_ids,
+)
+from synapse_pangea_chat.public_courses.types import (
+    Course,
+    CourseFilters,
+    PublicCoursesResponse,
+)
 
 # In-memory cache for course preview data
 # Structure: {room_id: (data, timestamp)}
@@ -35,6 +45,10 @@ RESPONSE_STATE_EVENTS: Tuple[str, ...] = (
 )
 
 DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE = "pangea.course_plan"
+
+_FILTERING_WARNING_NONE = ""
+_FILTERING_WARNING_CMS_NOT_CONFIGURED = "Language filters could not be applied: CMS is not configured; returned unfiltered results."
+_FILTERING_WARNING_CMS_LOOKUP_FAILED = "Language filters could not be applied: CMS lookup failed; returned unfiltered results."
 
 
 def _is_cache_valid(timestamp: float) -> bool:
@@ -99,8 +113,11 @@ async def get_public_courses(
     config: PangeaChatConfig,
     limit: int,
     since: Optional[str],
+    filters: Optional[CourseFilters] = None,
 ) -> PublicCoursesResponse:
     logger.debug("Executing public courses query")
+
+    has_filters = bool(filters)
 
     # Clean up expired cache entries periodically
     _cleanup_expired_cache()
@@ -159,55 +176,50 @@ WHERE se.type = ?
     if total_room_count == 0:
         return PublicCoursesResponse(
             chunk=[],
+            filtering_warning=_FILTERING_WARNING_NONE,
             next_batch=None,
             prev_batch=None,
             total_room_count_estimate=0,
         )
 
-    overfetch_limit = limit + 1
-
-    room_ids_query = """
-SELECT room_id FROM (
-    SELECT DISTINCT se.room_id AS room_id
-    FROM state_events se
-    INNER JOIN rooms r ON r.room_id = se.room_id
-    WHERE se.type = ?
-      AND r.is_public = 't'
-) room_ids
-ORDER BY room_id
-OFFSET ?
-LIMIT ?
-    """
-
-    room_rows = await room_store.db_pool.execute(
-        "get_public_courses_room_ids",
-        room_ids_query,
-        required_course_event_type,
-        start_index,
-        overfetch_limit,
-    )
-
-    if not room_rows:
-        # No rooms in this window; compute prev token if applicable and return empty chunk
-        prev_batch = None if start_index <= 0 else str(max(0, start_index - limit))
-        return PublicCoursesResponse(
-            chunk=[],
-            next_batch=None,
-            prev_batch=prev_batch,
-            total_room_count_estimate=total_room_count,
+    if has_filters:
+        return await _get_filtered_public_courses(
+            room_store,
+            config,
+            limit,
+            start_index,
+            total_room_count,
+            required_course_event_type,
+            event_types_with_required,
+            filters,  # type: ignore[arg-type]
         )
 
-    room_ids = [row[0] for row in room_rows]
+    return await _get_unfiltered_public_courses(
+        room_store,
+        config,
+        limit,
+        start_index,
+        total_room_count,
+        required_course_event_type,
+        event_types_with_required,
+    )
 
-    has_next = len(room_ids) > limit
-    display_room_ids = room_ids[:limit]
 
-    courses: List[Course] = []
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
+
+async def _fetch_room_state(
+    room_store: RoomStore,
+    room_ids: List[str],
+    event_types_with_required: List[str],
+) -> Dict[str, RoomStateMap]:
+    """Fetch state events for *room_ids*, using the in-memory cache."""
     rooms_data: Dict[str, RoomStateMap] = {}
     rooms_to_fetch: List[str] = []
 
-    for room_id in display_room_ids:
+    for room_id in room_ids:
         cached = _get_cached_room(room_id)
         if cached is not None:
             rooms_data[room_id] = cached
@@ -262,8 +274,18 @@ ORDER BY e.room_id, e.type, e.state_key, e.origin_server_ts DESC
             rooms_data[room_id] = room_state
             _cache_room_data(room_id, room_state)
 
-    # Fetch room stats and metadata for all display rooms
-    room_stats_placeholders = ",".join(["?" for _ in display_room_ids])
+    return rooms_data
+
+
+async def _fetch_room_stats(
+    room_store: RoomStore,
+    room_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch room stats for *room_ids*."""
+    if not room_ids:
+        return {}
+
+    room_stats_placeholders = ",".join(["?" for _ in room_ids])
     room_stats_query = f"""
 SELECT
     room_id,
@@ -280,84 +302,195 @@ WHERE room_id IN ({room_stats_placeholders})
     room_stats_rows = await room_store.db_pool.execute(
         "get_public_courses_room_stats",
         room_stats_query,
-        *display_room_ids,
+        *room_ids,
     )
 
     room_stats: Dict[str, Dict[str, Any]] = {}
     for row in room_stats_rows:
         (
-            room_id,
+            rid,
             history_visibility,
             guest_access,
             join_rules,
             room_type,
             joined_members,
         ) = row
-        room_stats[room_id] = {
+        room_stats[rid] = {
             "history_visibility": history_visibility,
             "guest_access": guest_access,
             "join_rules": join_rules,
             "room_type": room_type,
             "joined_members": joined_members,
         }
+    return room_stats
 
+
+def _build_course(
+    room_id: str,
+    room_data: RoomStateMap,
+    required_course_event_type: str,
+    stats: Dict[str, Any],
+    meta: Optional[CourseMeta] = None,
+) -> Optional[Course]:
+    """Build a single Course dict from room state + optional CMS metadata."""
+    course_event_state = room_data.get(required_course_event_type)
+    if not course_event_state:
+        return None
+
+    name = None
+    topic = None
+    avatar_url = None
+    canonical_alias = None
+
+    if "m.room.name" in room_data:
+        name = _get_event_content(room_data["m.room.name"]).get("name")
+    if "m.room.topic" in room_data:
+        topic = _get_event_content(room_data["m.room.topic"]).get("topic")
+    if "m.room.avatar" in room_data:
+        avatar_url = _get_event_content(room_data["m.room.avatar"]).get("url")
+    if "m.room.canonical_alias" in room_data:
+        canonical_alias = _get_event_content(room_data["m.room.canonical_alias"]).get(
+            "alias"
+        )
+
+    course_plan_content = _get_event_content(course_event_state)
+    course_id = course_plan_content.get("uuid")
+
+    history_visibility = stats.get("history_visibility")
+    guest_access = stats.get("guest_access")
+    join_rules = stats.get("join_rules")
+    room_type = stats.get("room_type")
+    joined_members = stats.get("joined_members", 0)
+
+    course: Course = {
+        "room_id": room_id,
+        "name": name,
+        "topic": topic,
+        "avatar_url": avatar_url,
+        "canonical_alias": canonical_alias,
+        "course_id": course_id,
+        "num_joined_members": joined_members,
+        "world_readable": history_visibility == HistoryVisibility.WORLD_READABLE,
+        "guest_can_join": guest_access == "can_join",
+        "join_rule": join_rules,
+        "room_type": room_type,
+        "target_language": meta["l2"] if meta else None,
+        "language_of_instructions": meta["l1"] if meta else None,
+        "cefr_level": meta["cefr_level"] if meta else None,
+    }
+    return course
+
+
+def _extract_course_uuid(
+    room_data: RoomStateMap,
+    required_course_event_type: str,
+) -> Optional[str]:
+    """Extract the CMS UUID from a room's course plan state event."""
+    event_state = room_data.get(required_course_event_type)
+    if not event_state:
+        return None
+    return _get_event_content(event_state).get("uuid")
+
+
+def _with_filtering_warning(
+    response: PublicCoursesResponse,
+    warning: str,
+) -> PublicCoursesResponse:
+    response["filtering_warning"] = warning
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Unfiltered path (existing behaviour + language metadata enrichment)
+# ---------------------------------------------------------------------------
+
+
+async def _get_unfiltered_public_courses(
+    room_store: RoomStore,
+    config: PangeaChatConfig,
+    limit: int,
+    start_index: int,
+    total_room_count: int,
+    required_course_event_type: str,
+    event_types_with_required: List[str],
+) -> PublicCoursesResponse:
+    overfetch_limit = limit + 1
+
+    room_ids_query = """
+SELECT room_id FROM (
+    SELECT DISTINCT se.room_id AS room_id
+    FROM state_events se
+    INNER JOIN rooms r ON r.room_id = se.room_id
+    WHERE se.type = ?
+      AND r.is_public = 't'
+) room_ids
+ORDER BY room_id
+OFFSET ?
+LIMIT ?
+    """
+
+    room_rows = await room_store.db_pool.execute(
+        "get_public_courses_room_ids",
+        room_ids_query,
+        required_course_event_type,
+        start_index,
+        overfetch_limit,
+    )
+
+    if not room_rows:
+        prev_batch = None if start_index <= 0 else str(max(0, start_index - limit))
+        return PublicCoursesResponse(
+            chunk=[],
+            filtering_warning=_FILTERING_WARNING_NONE,
+            next_batch=None,
+            prev_batch=prev_batch,
+            total_room_count_estimate=total_room_count,
+        )
+
+    room_ids = [row[0] for row in room_rows]
+    has_next = len(room_ids) > limit
+    display_room_ids = room_ids[:limit]
+
+    rooms_data = await _fetch_room_state(
+        room_store, display_room_ids, event_types_with_required
+    )
+    room_stats = await _fetch_room_stats(room_store, display_room_ids)
+
+    # Collect UUIDs for CMS metadata enrichment
+    uuid_to_room: Dict[str, str] = {}
     for room_id in display_room_ids:
-        room_data = rooms_data.get(room_id)
-        if not room_data:
+        rd = rooms_data.get(room_id)
+        if rd:
+            uuid = _extract_course_uuid(rd, required_course_event_type)
+            if uuid:
+                uuid_to_room[uuid] = room_id
+
+    # Fetch language metadata from CMS (best-effort)
+    cms_meta: Dict[str, CourseMeta] = {}
+    if uuid_to_room and config.cms_base_url and config.cms_service_api_key:
+        cms_meta = await get_course_metadata(
+            list(uuid_to_room.keys()),
+            config.cms_base_url,
+            config.cms_service_api_key,
+            cache_ttl=config.public_courses_cms_cache_ttl_seconds,
+        )
+
+    courses: List[Course] = []
+    for room_id in display_room_ids:
+        rd = rooms_data.get(room_id)
+        if not rd:
             continue
-
-        course_event_state = room_data.get(required_course_event_type)
-        if not course_event_state:
-            continue
-
-        name = None
-        topic = None
-        avatar_url = None
-        canonical_alias = None
-        course_id = None
-
-        if "m.room.name" in room_data:
-            name_content = _get_event_content(room_data["m.room.name"])
-            name = name_content.get("name")
-
-        if "m.room.topic" in room_data:
-            topic_content = _get_event_content(room_data["m.room.topic"])
-            topic = topic_content.get("topic")
-
-        if "m.room.avatar" in room_data:
-            avatar_content = _get_event_content(room_data["m.room.avatar"])
-            avatar_url = avatar_content.get("url")
-
-        if "m.room.canonical_alias" in room_data:
-            alias_content = _get_event_content(room_data["m.room.canonical_alias"])
-            canonical_alias = alias_content.get("alias")
-
-        # Extract course_id from pangea.course_plan state event content
-        course_plan_content = _get_event_content(course_event_state)
-        course_id = course_plan_content.get("uuid")
-
-        # Get room stats data
-        stats = room_stats.get(room_id, {})
-        history_visibility = stats.get("history_visibility")
-        guest_access = stats.get("guest_access")
-        join_rules = stats.get("join_rules")
-        room_type = stats.get("room_type")
-        joined_members = stats.get("joined_members", 0)
-
-        course: Course = {
-            "room_id": room_id,
-            "name": name,
-            "topic": topic,
-            "avatar_url": avatar_url,
-            "canonical_alias": canonical_alias,
-            "course_id": course_id,
-            "num_joined_members": joined_members,
-            "world_readable": history_visibility == HistoryVisibility.WORLD_READABLE,
-            "guest_can_join": guest_access == "can_join",
-            "join_rule": join_rules,
-            "room_type": room_type,
-        }
-        courses.append(course)
+        uuid = _extract_course_uuid(rd, required_course_event_type)
+        meta = cms_meta.get(uuid) if uuid else None
+        course = _build_course(
+            room_id,
+            rd,
+            required_course_event_type,
+            room_stats.get(room_id, {}),
+            meta=meta,
+        )
+        if course:
+            courses.append(course)
 
     next_batch = None
     if has_next and (start_index + limit) < total_room_count:
@@ -367,7 +500,168 @@ WHERE room_id IN ({room_stats_placeholders})
 
     return PublicCoursesResponse(
         chunk=courses,
+        filtering_warning=_FILTERING_WARNING_NONE,
         next_batch=next_batch,
         prev_batch=prev_batch,
         total_room_count_estimate=total_room_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Filtered path (CMS-side filtering, Python-side pagination)
+# ---------------------------------------------------------------------------
+
+
+async def _get_filtered_public_courses(
+    room_store: RoomStore,
+    config: PangeaChatConfig,
+    limit: int,
+    start_index: int,
+    total_room_count: int,
+    required_course_event_type: str,
+    event_types_with_required: List[str],
+    filters: CourseFilters,
+) -> PublicCoursesResponse:
+    # 1. Fetch ALL public course room IDs (no SQL pagination)
+    all_rooms_query = """
+SELECT DISTINCT se.room_id
+FROM state_events se
+INNER JOIN rooms r ON r.room_id = se.room_id
+WHERE se.type = ?
+  AND r.is_public = 't'
+ORDER BY se.room_id
+    """
+
+    all_room_rows = await room_store.db_pool.execute(
+        "get_public_courses_all_room_ids",
+        all_rooms_query,
+        required_course_event_type,
+    )
+
+    if not all_room_rows:
+        return PublicCoursesResponse(
+            chunk=[],
+            filtering_warning=_FILTERING_WARNING_NONE,
+            next_batch=None,
+            prev_batch=None,
+            total_room_count_estimate=0,
+        )
+
+    all_room_ids = [row[0] for row in all_room_rows]
+
+    # 2. Fetch state events for ALL rooms to extract UUIDs
+    rooms_data = await _fetch_room_state(
+        room_store, all_room_ids, event_types_with_required
+    )
+
+    uuid_to_room: Dict[str, str] = {}
+    for room_id in all_room_ids:
+        rd = rooms_data.get(room_id)
+        if rd:
+            uuid = _extract_course_uuid(rd, required_course_event_type)
+            if uuid:
+                uuid_to_room[uuid] = room_id
+
+    if not uuid_to_room:
+        return PublicCoursesResponse(
+            chunk=[],
+            filtering_warning=_FILTERING_WARNING_NONE,
+            next_batch=None,
+            prev_batch=None,
+            total_room_count_estimate=0,
+        )
+
+    # 3. Ask CMS which UUIDs match the filters
+    if not config.cms_base_url or not config.cms_service_api_key:
+        logger.warning(
+            "CMS not configured for language filters; falling back to unfiltered"
+        )
+        return _with_filtering_warning(
+            await _get_unfiltered_public_courses(
+                room_store,
+                config,
+                limit,
+                start_index,
+                total_room_count,
+                required_course_event_type,
+                event_types_with_required,
+            ),
+            _FILTERING_WARNING_CMS_NOT_CONFIGURED,
+        )
+
+    try:
+        matched_meta = await get_filtered_course_ids(
+            list(uuid_to_room.keys()),
+            config.cms_base_url,
+            config.cms_service_api_key,
+            target_language=filters.get("target_language"),
+            language_of_instructions=filters.get("language_of_instructions"),
+            cefr_level=filters.get("cefr_level"),
+        )
+    except FilteredCourseMetadataLookupError:
+        logger.warning("Language-filter CMS lookup failed; falling back to unfiltered")
+        return _with_filtering_warning(
+            await _get_unfiltered_public_courses(
+                room_store,
+                config,
+                limit,
+                start_index,
+                total_room_count,
+                required_course_event_type,
+                event_types_with_required,
+            ),
+            _FILTERING_WARNING_CMS_LOOKUP_FAILED,
+        )
+
+    # Preserve deterministic ordering (same as SQL ORDER BY room_id)
+    matched_room_ids = [
+        uuid_to_room[uuid] for uuid in uuid_to_room if uuid in matched_meta
+    ]
+    # Re-sort by room_id for stable pagination
+    matched_room_ids.sort()
+
+    filtered_total = len(matched_room_ids)
+
+    # 4. Python-side pagination over the filtered set
+    page = matched_room_ids[start_index : start_index + limit]
+
+    if not page:
+        prev_batch = None if start_index <= 0 else str(max(0, start_index - limit))
+        return PublicCoursesResponse(
+            chunk=[],
+            filtering_warning=_FILTERING_WARNING_NONE,
+            next_batch=None,
+            prev_batch=prev_batch,
+            total_room_count_estimate=filtered_total,
+        )
+
+    room_stats = await _fetch_room_stats(room_store, page)
+
+    courses: List[Course] = []
+    for room_id in page:
+        rd = rooms_data.get(room_id)
+        if not rd:
+            continue
+        uuid = _extract_course_uuid(rd, required_course_event_type)
+        meta = matched_meta.get(uuid) if uuid else None
+        course = _build_course(
+            room_id,
+            rd,
+            required_course_event_type,
+            room_stats.get(room_id, {}),
+            meta=meta,
+        )
+        if course:
+            courses.append(course)
+
+    has_next = (start_index + limit) < filtered_total
+    next_batch = str(start_index + limit) if has_next else None
+    prev_batch = None if start_index <= 0 else str(max(0, start_index - limit))
+
+    return PublicCoursesResponse(
+        chunk=courses,
+        filtering_warning=_FILTERING_WARNING_NONE,
+        next_batch=next_batch,
+        prev_batch=prev_batch,
+        total_room_count_estimate=filtered_total,
     )
