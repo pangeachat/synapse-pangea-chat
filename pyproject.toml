@@ -26,7 +26,7 @@ dev = [
   "mypy == 1.6.1",
   # for linting
   "black == 23.10.0",
-  "ruff == 0.1.1",
+  "ruff == 0.15.6",
 ]
 
 [build-system]
