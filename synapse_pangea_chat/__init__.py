@@ -29,6 +29,7 @@ except ImportError as e:
     _export_user_data_import_err = str(e)
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.public_courses import PublicCourses
+from synapse_pangea_chat.register_email import RegisterEmailRequestToken
 from synapse_pangea_chat.room_code import KnockWithCode, RequestRoomCode
 from synapse_pangea_chat.room_preview import (
     PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE,
@@ -143,6 +144,13 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/user_courses",
             resource=self.user_courses_resource,
+        )
+
+        # --- Register Email ---
+        self.register_email_resource = RegisterEmailRequestToken(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/register/email/requestToken",
+            resource=self.register_email_resource,
         )
 
         # --- Limit User Directory ---
@@ -349,6 +357,14 @@ class PangeaChat:
             "user_directory_search_burst_duration_seconds", 60
         )
 
+        # --- register_email config ---
+        register_email_requests_per_burst = config.get(
+            "register_email_requests_per_burst", 5
+        )
+        register_email_burst_duration_seconds = config.get(
+            "register_email_burst_duration_seconds", 60
+        )
+
         return PangeaChatConfig(
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
@@ -378,4 +394,6 @@ class PangeaChat:
             limit_user_directory_filter_search_if_missing_public_attribute=limit_user_directory_filter_search_if_missing_public_attribute,
             user_directory_search_requests_per_burst=user_directory_search_requests_per_burst,
             user_directory_search_burst_duration_seconds=user_directory_search_burst_duration_seconds,
+            register_email_requests_per_burst=register_email_requests_per_burst,
+            register_email_burst_duration_seconds=register_email_burst_duration_seconds,
         )
