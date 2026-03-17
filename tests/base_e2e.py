@@ -45,6 +45,8 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         server_process: Optional[subprocess.Popen] = None
         stdout_thread: Optional[threading.Thread] = None
         stderr_thread: Optional[threading.Thread] = None
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
         try:
             postgres, db_url = await self._start_postgres()
 
@@ -88,6 +90,19 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 "args": dsn_params,
             }
 
+            workspace_root = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..")
+            )
+            template_dir = os.path.join(
+                workspace_root, "synapse-templates", "templates"
+            )
+            if os.path.isdir(template_dir):
+                templates_config = config.get("templates", {})
+                if not isinstance(templates_config, dict):
+                    templates_config = {}
+                templates_config["custom_template_directory"] = template_dir
+                config["templates"] = templates_config
+
             if synapse_config_overrides:
                 for key, value in synapse_config_overrides.items():
                     config[key] = value
@@ -118,18 +133,19 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 text=True,
             )
 
-            def read_output(pipe: Union[IO[str], None]) -> None:
+            def read_output(pipe: Union[IO[str], None], sink: list[str]) -> None:
                 if pipe is None:
                     return
                 for line in iter(pipe.readline, ""):
+                    sink.append(line.rstrip("\n"))
                     logger.debug(line)
                 pipe.close()
 
             stdout_thread = threading.Thread(
-                target=read_output, args=(server_process.stdout,)
+                target=read_output, args=(server_process.stdout, stdout_lines)
             )
             stderr_thread = threading.Thread(
-                target=read_output, args=(server_process.stderr,)
+                target=read_output, args=(server_process.stderr, stderr_lines)
             )
             stdout_thread.start()
             stderr_thread.start()
@@ -151,7 +167,27 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                     total_wait_time += wait_interval
 
             if not server_ready:
-                raise RuntimeError("Synapse server did not start successfully")
+                if server_process.poll() is None:
+                    server_process.terminate()
+                    try:
+                        server_process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        server_process.kill()
+                        server_process.wait(timeout=10)
+
+                if stdout_thread is not None:
+                    stdout_thread.join(timeout=5)
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=5)
+
+                stdout_tail = "\n".join(stdout_lines[-20:])
+                stderr_tail = "\n".join(stderr_lines[-20:])
+                raise RuntimeError(
+                    "Synapse server did not start successfully. "
+                    f"exit_code={server_process.returncode}. "
+                    f"stdout_tail=\n{stdout_tail}\n"
+                    f"stderr_tail=\n{stderr_tail}"
+                )
 
             return (
                 postgres,
@@ -234,7 +270,9 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         self, config_path: str, dir: str, user: str, password: str, admin: bool
     ) -> None:
         register_user_cmd = [
-            "register_new_matrix_user",
+            sys.executable,
+            "-m",
+            "synapse._scripts.register_new_matrix_user",
             f"-c={config_path}",
             f"--user={user}",
             f"--password={password}",

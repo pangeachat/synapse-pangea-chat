@@ -75,3 +75,7 @@ class PangeaChatConfig:
     # --- user_directory_search config ---
     user_directory_search_requests_per_burst: int = 10
     user_directory_search_burst_duration_seconds: int = 60
+
+    # --- invite_by_email config ---
+    invite_by_email_requests_per_burst: int = 5
+    invite_by_email_burst_duration_seconds: int = 60

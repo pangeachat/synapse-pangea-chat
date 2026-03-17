@@ -21,7 +21,9 @@ from synapse.module_api import ModuleApi
 from twisted.internet import defer
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.room_code.burn_admin_code import burn_admin_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
+from synapse_pangea_chat.room_code.get_inviter_user import promote_user_to_admin
 from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
     get_rooms_with_access_code,
 )
@@ -107,10 +109,10 @@ class KnockWithCode(Resource):
                 return
 
             # Get the rooms with the access code
-            room_ids = await get_rooms_with_access_code(
+            matches = await get_rooms_with_access_code(
                 access_code=access_code, room_store=self._datastores.main
             )
-            if room_ids is None:
+            if matches is None:
                 respond_with_json(
                     request,
                     500,
@@ -118,7 +120,7 @@ class KnockWithCode(Resource):
                     send_cors=True,
                 )
                 return
-            if len(room_ids) == 0:
+            if len(matches) == 0:
                 respond_with_json(
                     request,
                     400,
@@ -130,24 +132,40 @@ class KnockWithCode(Resource):
             # Send knock with access code to the rooms as requester
             invited_rooms: List[str] = []
             already_joined_rooms: List[str] = []
-            for room_id in room_ids:
+            for match in matches:
                 try:
                     is_member = await user_is_room_member(
                         api=self._api,
                         user_id=requester_id,
-                        room_id=room_id,
+                        room_id=match.room_id,
                     )
                     if is_member:
-                        already_joined_rooms.append(room_id)
+                        already_joined_rooms.append(match.room_id)
                         continue
                     await invite_user_to_room(
                         api=self._api,
                         user_id=requester_id,
-                        room_id=room_id,
+                        room_id=match.room_id,
                     )
-                    invited_rooms.append(room_id)
+                    invited_rooms.append(match.room_id)
+
+                    # Admin code: promote to admin and burn the code
+                    if match.is_admin_code:
+                        await promote_user_to_admin(
+                            api=self._api,
+                            room_id=match.room_id,
+                            user_to_promote=requester_id,
+                            invite_power=100,
+                        )
+                        await burn_admin_code(
+                            api=self._api,
+                            room_id=match.room_id,
+                            burner_user_id=requester_id,
+                        )
                 except Exception as e:
-                    logger.error(f"Error sending knock with code to {room_id}: {e}")
+                    logger.error(
+                        f"Error sending knock with code to {match.room_id}: {e}"
+                    )
             respond_with_json(
                 request,
                 200,

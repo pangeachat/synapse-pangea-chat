@@ -7,6 +7,7 @@ from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.delete_room import DeleteRoom
+from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
 
 try:
     from synapse_pangea_chat.delete_user import DeleteUser
@@ -93,6 +94,20 @@ class PangeaChat:
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/request_room_code",
             resource=self.request_code_resource,
+        )
+
+        # --- Create Course Space ---
+        self.create_course_space_resource = CreateCourseSpace(api, config)
+        api.register_web_resource(
+            path="/_synapse/client/pangea/v1/create_course_space",
+            resource=self.create_course_space_resource,
+        )
+
+        # --- Invite By Email ---
+        self.invite_by_email_resource = InviteByEmail(api, config)
+        api.register_web_resource(
+            path="/_synapse/client/pangea/v1/invite_by_email",
+            resource=self.invite_by_email_resource,
         )
 
         # --- Delete Room ---
@@ -365,6 +380,14 @@ class PangeaChat:
             "register_email_burst_duration_seconds", 60
         )
 
+        # --- invite_by_email config ---
+        invite_by_email_requests_per_burst = config.get(
+            "invite_by_email_requests_per_burst", 5
+        )
+        invite_by_email_burst_duration_seconds = config.get(
+            "invite_by_email_burst_duration_seconds", 60
+        )
+
         return PangeaChatConfig(
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
@@ -396,4 +419,6 @@ class PangeaChat:
             user_directory_search_burst_duration_seconds=user_directory_search_burst_duration_seconds,
             register_email_requests_per_burst=register_email_requests_per_burst,
             register_email_burst_duration_seconds=register_email_burst_duration_seconds,
+            invite_by_email_requests_per_burst=invite_by_email_requests_per_burst,
+            invite_by_email_burst_duration_seconds=invite_by_email_burst_duration_seconds,
         )

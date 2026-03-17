@@ -3,6 +3,9 @@ EVENT_TYPE_M_ROOM_JOIN_RULES = "m.room.join_rules"
 JOIN_RULE_CONTENT_KEY = "join_rule"
 KNOCK_JOIN_RULE_VALUE = "knock"  # Existing join rule value
 ACCESS_CODE_JOIN_RULE_CONTENT_KEY = "access_code"  # New join rule content key
+ADMIN_ACCESS_CODE_JOIN_RULE_CONTENT_KEY = (
+    "admin_access_code"  # Admin join rule content key (single-use)
+)
 
 # https://spec.matrix.org/v1.11/client-server-api/#mroommember
 EVENT_TYPE_M_ROOM_MEMBER = "m.room.member"
