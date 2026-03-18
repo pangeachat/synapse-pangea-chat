@@ -8,7 +8,7 @@ For Synapse Admin API, Module API, and Matrix spec documentation links, see [syn
 
 Single entry-point class `PangeaChat` (`synapse_pangea_chat/__init__.py`) composes sub-modules. Each sub-module lives in its own sub-package under `synapse_pangea_chat/`.
 
-**Sub-modules**: `public_courses/`, `room_preview/`, `room_code/` ([design](.github/instructions/knock-with-code.instructions.md)), `delete_room/`, `user_activity/` ([design](.github/instructions/user-activity.instructions.md)), `limit_user_directory/` + `user_directory_search/` ([design](.github/instructions/limit-user-directory.instructions.md)), `email_invite/` ([invite_by_email](.github/instructions/invite-by-email.instructions.md), [create_course_space](.github/instructions/create-course-space.instructions.md))
+**Sub-modules**: `public_courses/` ([design](.github/instructions/public-courses.instructions.md)), `room_preview/`, `room_code/` ([design](.github/instructions/knock-with-code.instructions.md)), `delete_room/`, `user_activity/` ([design](.github/instructions/user-activity.instructions.md)), `limit_user_directory/` + `user_directory_search/` ([design](.github/instructions/limit-user-directory.instructions.md)), `email_invite/` ([invite_by_email](.github/instructions/invite-by-email.instructions.md), [create_course_space](.github/instructions/create-course-space.instructions.md))
 
 ## Key Files
 

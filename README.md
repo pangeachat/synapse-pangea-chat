@@ -6,7 +6,7 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 
 | Module                                        | Subpackage                                  | Endpoint                                                  | Description                                       |
 | --------------------------------------------- | ------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------- |
-| [Public Courses](#public-courses)             | `synapse_pangea_chat/`                      | `GET /_synapse/client/unstable/org.pangea/public_courses` | Course catalog with filtering and pagination      |
+| [Public Courses](#public-courses)             | `synapse_pangea_chat/`                      | `GET /_synapse/client/pangea/v1/public_courses`           | Course catalog with filtering and pagination      |
 | [Room Preview](#room-preview)                 | `synapse_pangea_chat/room_preview/`         | `GET /_synapse/client/unstable/org.pangea/room_preview`   | Read room state events without membership         |
 | [Room Code](#room-code)                       | `synapse_pangea_chat/room_code/`            | `POST /_synapse/client/pangea/v1/knock_with_code`         | Secret-code-based room invitations                |
 |                                               |                                             | `GET /_synapse/client/pangea/v1/request_room_code`        | Generate a unique room access code                |
@@ -71,7 +71,9 @@ All config keys are optional and have sensible defaults. The `limit_user_directo
 
 Surface curated course previews via a dedicated HTTP endpoint with built-in filtering and rate limiting.
 
-**Route:** `GET /_synapse/client/unstable/org.pangea/public_courses`
+**Canonical route:** `GET /_synapse/client/pangea/v1/public_courses`
+
+**Compatibility route:** `GET /_synapse/client/unstable/org.pangea/public_courses`
 
 ### Authentication
 
