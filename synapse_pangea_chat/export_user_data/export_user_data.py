@@ -48,6 +48,7 @@ logger = logging.getLogger("synapse.module.synapse_pangea_chat.export_user_data"
 
 SCHEDULE_TABLE = "pangea_export_user_data_schedule"
 VALID_ACTIONS = {"schedule", "cancel", "force", "status"}
+CMS_AUTH_COLLECTION = "service-users"
 
 
 class JsonExfiltrationWriter(ExfiltrationWriter):
@@ -496,7 +497,9 @@ class ExportUserData(Resource):
                     Headers(
                         {
                             b"Authorization": [
-                                f"users API-Key {cms_api_key}".encode("utf-8")
+                                f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
+                                    "utf-8"
+                                )
                             ],
                         }
                     ),
@@ -532,9 +535,12 @@ class ExportUserData(Resource):
         from twisted.web.http_headers import Headers
 
         agent = Agent(reactor)
+        cms_matrix_user_id = await self._cms_resolve_matrix_user_id(
+            user_id, cms_base_url, cms_api_key
+        )
         body_bytes = json.dumps(
             {
-                "user": user_id,
+                "user": cms_matrix_user_id,
                 "status": "pending",
                 "requestedAt": _now_iso(),
             }
@@ -546,7 +552,11 @@ class ExportUserData(Resource):
             Headers(
                 {
                     b"Content-Type": [b"application/json"],
-                    b"Authorization": [f"users API-Key {cms_api_key}".encode("utf-8")],
+                    b"Authorization": [
+                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
+                            "utf-8"
+                        )
+                    ],
                 }
             ),
             _BytesProducer(body_bytes),
@@ -565,6 +575,54 @@ class ExportUserData(Resource):
         if not record_id:
             raise RuntimeError(f"CMS response missing id: {resp_body.decode()}")
         return record_id
+
+    async def _cms_resolve_matrix_user_id(
+        self, user_id: str, cms_base_url: str, cms_api_key: str
+    ) -> str:
+        from twisted.internet import reactor
+        from twisted.web.client import Agent, readBody
+        from twisted.web.http_headers import Headers
+
+        agent = Agent(reactor)
+        encoded_user_id = quote(user_id, safe="")
+
+        response = await agent.request(
+            b"GET",
+            (
+                f"{cms_base_url}/api/matrix-users"
+                f"?where[username][equals]={encoded_user_id}&limit=1"
+            ).encode("utf-8"),
+            Headers(
+                {
+                    b"Authorization": [
+                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
+                            "utf-8"
+                        )
+                    ],
+                }
+            ),
+            None,
+        )
+
+        resp_body = await readBody(response)
+        if response.code >= 400:
+            raise RuntimeError(
+                f"CMS matrix-user lookup failed ({response.code}): "
+                f"{resp_body.decode('utf-8', errors='replace')}"
+            )
+
+        data = json.loads(resp_body)
+        docs = data.get("docs", [])
+        if not docs:
+            raise RuntimeError(f"CMS matrix-user not found for {user_id}")
+
+        matrix_user_id = str(docs[0].get("id", ""))
+        if not matrix_user_id:
+            raise RuntimeError(
+                f"CMS matrix-user lookup returned no id for {user_id}: {resp_body.decode()}"
+            )
+
+        return matrix_user_id
 
     async def _cms_update_export_status(
         self,
@@ -590,7 +648,11 @@ class ExportUserData(Resource):
             Headers(
                 {
                     b"Content-Type": [b"application/json"],
-                    b"Authorization": [f"users API-Key {cms_api_key}".encode("utf-8")],
+                    b"Authorization": [
+                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
+                            "utf-8"
+                        )
+                    ],
                 }
             ),
             _BytesProducer(body_bytes),
@@ -647,7 +709,11 @@ class ExportUserData(Resource):
                             "utf-8"
                         )
                     ],
-                    b"Authorization": [f"users API-Key {cms_api_key}".encode("utf-8")],
+                    b"Authorization": [
+                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
+                            "utf-8"
+                        )
+                    ],
                 }
             ),
             _BytesProducer(multipart_body),

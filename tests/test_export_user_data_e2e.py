@@ -1114,6 +1114,7 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                 )
                 _, admin_token = await self.login_user("admin", "pw1")
                 user_id, _ = await self.login_user("fbuser", "pw2")
+                cms_matrix_user = mock_cms.seed_matrix_user(user_id)
 
                 mock_cms.seed_feedback_logs(
                     user_id,
@@ -1141,6 +1142,10 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                 logs = user_data.get("cms_process_token_feedback_logs", [])
                 self.assertEqual(len(logs), 3)
                 self.assertEqual({doc["id"] for doc in logs}, {"1", "2", "3"})
+                exports = mock_cms.get_exports_for_matrix_user_id(cms_matrix_user["id"])
+                self.assertEqual(len(exports), 1)
+                self.assertEqual(exports[0].get("status"), "complete")
+                self.assertTrue(exports[0].get("filename", "").endswith(".zip"))
             finally:
                 mock_cms.stop()
                 self.stop_synapse(
@@ -1195,6 +1200,7 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                 )
                 _, admin_token = await self.login_user("admin", "pw1")
                 user_id, _ = await self.login_user("nofb", "pw2")
+                cms_matrix_user = mock_cms.seed_matrix_user(user_id)
 
                 requests.post(
                     self._EXPORT_URL,
@@ -1211,6 +1217,9 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                 zip_path = self._zip_path_for_user(export_dir, user_id)
                 user_data = self._read_export_json(zip_path)
                 self.assertEqual(user_data.get("cms_process_token_feedback_logs"), [])
+                exports = mock_cms.get_exports_for_matrix_user_id(cms_matrix_user["id"])
+                self.assertEqual(len(exports), 1)
+                self.assertEqual(exports[0].get("status"), "complete")
             finally:
                 mock_cms.stop()
                 self.stop_synapse(
@@ -1271,6 +1280,7 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                 )
                 _, admin_token = await self.login_user("admin", "pw1")
                 user_id, _ = await self.login_user("pager", "pw2")
+                cms_matrix_user = mock_cms.seed_matrix_user(user_id)
 
                 mock_cms.seed_feedback_logs(
                     user_id,
@@ -1293,6 +1303,9 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                 user_data = self._read_export_json(zip_path)
                 logs = user_data.get("cms_process_token_feedback_logs", [])
                 self.assertEqual(len(logs), 5)
+                exports = mock_cms.get_exports_for_matrix_user_id(cms_matrix_user["id"])
+                self.assertEqual(len(exports), 1)
+                self.assertEqual(exports[0].get("status"), "complete")
             finally:
                 mock_cms.stop()
                 self.stop_synapse(
@@ -1406,6 +1419,7 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                     admin=False,
                 )
                 user_id, user_token = await self.login_user("schedexp", "pw1")
+                cms_matrix_user = mock_cms.seed_matrix_user(user_id)
 
                 mock_cms.seed_feedback_logs(
                     user_id,
@@ -1430,6 +1444,9 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                 user_data = self._read_export_json(zip_path)
                 logs = user_data.get("cms_process_token_feedback_logs", [])
                 self.assertEqual(len(logs), 2)
+                exports = mock_cms.get_exports_for_matrix_user_id(cms_matrix_user["id"])
+                self.assertEqual(len(exports), 1)
+                self.assertEqual(exports[0].get("status"), "complete")
             finally:
                 mock_cms.stop()
                 self.stop_synapse(
