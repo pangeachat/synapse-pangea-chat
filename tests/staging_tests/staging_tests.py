@@ -113,7 +113,7 @@ class StagingSmokeTests(unittest.IsolatedAsyncioTestCase):
     # helper: fetch first public course room_id (or skip)
     async def _first_public_course_room_id(self) -> str:
         resp = await self._get(
-            "/_synapse/client/unstable/org.pangea/public_courses",
+            "/_synapse/client/pangea/v1/public_courses",
             params={"limit": "1"},
         )
         self.assertEqual(resp.status, 200)
@@ -129,13 +129,20 @@ class StagingSmokeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_public_courses_requires_auth(self) -> None:
         """Unauthenticated request → 401."""
-        resp = await self._get(
-            "/_synapse/client/unstable/org.pangea/public_courses", auth=False
-        )
+        resp = await self._get("/_synapse/client/pangea/v1/public_courses", auth=False)
         self.assertEqual(resp.status, 401)
 
     async def test_public_courses_returns_valid_structure(self) -> None:
         """Response contains chunk, next_batch, prev_batch, total_room_count_estimate."""
+        resp = await self._get("/_synapse/client/pangea/v1/public_courses")
+        self.assertEqual(resp.status, 200)
+        data = await resp.json()
+        for key in ("chunk", "next_batch", "prev_batch", "total_room_count_estimate"):
+            self.assertIn(key, data, f"Missing top-level key: {key}")
+        self.assertIsInstance(data["chunk"], list)
+
+    async def test_public_courses_unstable_alias_returns_valid_structure(self) -> None:
+        """Compatibility alias returns the same top-level response shape."""
         resp = await self._get("/_synapse/client/unstable/org.pangea/public_courses")
         self.assertEqual(resp.status, 200)
         data = await resp.json()
@@ -146,7 +153,7 @@ class StagingSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def test_public_courses_course_fields(self) -> None:
         """Every course has the full set of expected keys."""
         resp = await self._get(
-            "/_synapse/client/unstable/org.pangea/public_courses",
+            "/_synapse/client/pangea/v1/public_courses",
             params={"limit": "5"},
         )
         self.assertEqual(resp.status, 200)
@@ -174,7 +181,7 @@ class StagingSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def test_public_courses_pagination(self) -> None:
         """limit / since pagination returns successive pages."""
         resp = await self._get(
-            "/_synapse/client/unstable/org.pangea/public_courses",
+            "/_synapse/client/pangea/v1/public_courses",
             params={"limit": "1"},
         )
         self.assertEqual(resp.status, 200)
@@ -186,7 +193,7 @@ class StagingSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.skipTest("Only one page of courses — pagination not testable")
 
         resp2 = await self._get(
-            "/_synapse/client/unstable/org.pangea/public_courses",
+            "/_synapse/client/pangea/v1/public_courses",
             params={"limit": "1", "since": str(next_batch)},
         )
         self.assertEqual(resp2.status, 200)
@@ -199,7 +206,7 @@ class StagingSmokeTests(unittest.IsolatedAsyncioTestCase):
 
         # Fetch the course_id from public_courses
         resp = await self._get(
-            "/_synapse/client/unstable/org.pangea/public_courses",
+            "/_synapse/client/pangea/v1/public_courses",
             params={"limit": "50"},
         )
         self.assertEqual(resp.status, 200)

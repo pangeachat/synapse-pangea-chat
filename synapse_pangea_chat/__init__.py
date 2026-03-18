@@ -68,6 +68,10 @@ class PangeaChat:
         # --- Public Courses ---
         self.public_courses = PublicCourses(api, config)
         self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/public_courses",
+            resource=self.public_courses,
+        )
+        self._api.register_web_resource(
             path="/_synapse/client/unstable/org.pangea/public_courses",
             resource=self.public_courses,
         )

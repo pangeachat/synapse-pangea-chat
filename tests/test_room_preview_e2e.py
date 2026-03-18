@@ -1910,7 +1910,7 @@ class TestE2E(BaseSynapseE2ETest):
             matching_courses: List[Dict[str, Any]] = []
             for _ in range(10):
                 public_courses_response = requests.get(
-                    f"{self.server_url}/_synapse/client/unstable/org.pangea/public_courses",
+                    f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
                     headers=headers,
                     timeout=30,
                 )
@@ -2089,7 +2089,7 @@ class TestE2E(BaseSynapseE2ETest):
             matching_courses: List[Dict[str, Any]] = []
             for _ in range(10):
                 public_courses_response = requests.get(
-                    f"{self.server_url}/_synapse/client/unstable/org.pangea/public_courses",
+                    f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
                     headers=headers,
                     timeout=30,
                 )
@@ -2219,7 +2219,7 @@ class TestE2E(BaseSynapseE2ETest):
             payload = None
             for _ in range(10):
                 response = requests.get(
-                    f"{self.server_url}/_synapse/client/unstable/org.pangea/public_courses",
+                    f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
                     headers=headers,
                     timeout=30,
                 )
@@ -2331,7 +2331,7 @@ class TestE2E(BaseSynapseE2ETest):
             payload = None
             for _ in range(10):
                 response = requests.get(
-                    f"{self.server_url}/_synapse/client/unstable/org.pangea/public_courses?target_language=es",
+                    f"{self.server_url}/_synapse/client/pangea/v1/public_courses?target_language=es",
                     headers=headers,
                     timeout=30,
                 )
@@ -2559,7 +2559,7 @@ class TestE2E(BaseSynapseE2ETest):
             matching_courses: List[Dict[str, Any]] = []
             for _ in range(10):
                 public_courses_response = requests.get(
-                    f"{self.server_url}/_synapse/client/unstable/org.pangea/public_courses",
+                    f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
                     headers=headers,
                     timeout=30,
                 )
