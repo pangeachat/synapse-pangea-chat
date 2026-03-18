@@ -1070,6 +1070,93 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
 
     # ---- CMS feedback-log tests ----
 
+    async def test_force_export_creates_complete_cms_record_for_related_matrix_user(
+        self,
+    ):
+        """Regression: force export must create a complete CMS user-exports row.
+
+        This covers the staging bug where the export ZIP was produced locally,
+        but the CMS record was never created because the module used the wrong
+        auth collection and sent the Matrix ID instead of the related
+        matrix-users UUID.
+        """
+        mock_cms = MockCmsServer()
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        with tempfile.TemporaryDirectory() as export_dir:
+            try:
+                cms_url = mock_cms.start()
+                (
+                    postgres,
+                    synapse_dir,
+                    config_path,
+                    server_process,
+                    stdout_thread,
+                    stderr_thread,
+                ) = await self.start_test_synapse(
+                    module_config={
+                        "export_user_data_processor_interval_seconds": 60,
+                        "export_user_data_output_dir": export_dir,
+                        "cms_base_url": cms_url,
+                        "cms_service_api_key": "test-key",
+                    }
+                )
+
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="admin",
+                    password="pw1",
+                    admin=True,
+                )
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="cmsrecord",
+                    password="pw2",
+                    admin=False,
+                )
+
+                _, admin_token = await self.login_user("admin", "pw1")
+                user_id, _ = await self.login_user("cmsrecord", "pw2")
+                cms_matrix_user = mock_cms.seed_matrix_user(user_id)
+
+                requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "schedule", "user_id": user_id},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                force = requests.post(
+                    self._EXPORT_URL,
+                    json={"action": "force", "user_id": user_id},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                self.assertEqual(force.status_code, 200)
+                self.assertEqual(self._count_schedules(config_path, user_id), 0)
+
+                zip_path = self._zip_path_for_user(export_dir, user_id)
+                self._read_export_json(zip_path)
+
+                exports = mock_cms.get_exports_for_matrix_user_id(cms_matrix_user["id"])
+                self.assertEqual(len(exports), 1)
+                self.assertEqual(exports[0].get("user"), cms_matrix_user["id"])
+                self.assertEqual(exports[0].get("status"), "complete")
+                self.assertTrue(exports[0].get("filename", "").endswith(".zip"))
+                self.assertEqual(exports[0].get("mimeType"), "application/zip")
+            finally:
+                mock_cms.stop()
+                self.stop_synapse(
+                    server_process=server_process,
+                    stdout_thread=stdout_thread,
+                    stderr_thread=stderr_thread,
+                    synapse_dir=synapse_dir,
+                    postgres=postgres,
+                )
+
     async def test_export_includes_cms_feedback_logs_in_zip(self):
         """Seed 3 feedback logs → admin force export → ZIP contains them."""
         mock_cms = MockCmsServer()
