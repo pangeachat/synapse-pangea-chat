@@ -20,6 +20,7 @@ from synapse.handlers.admin import ExfiltrationWriter
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
+from synapse.media.filepath import MediaFilePaths
 from synapse.module_api import ModuleApi
 from synapse.types import JsonMapping, StateMap
 
@@ -126,8 +127,20 @@ class ExportUserData(Resource):
         self._clock = self._api._hs.get_clock()
         self._datastores = self._api._hs.get_datastores()
         self._admin_handler = self._api._hs.get_admin_handler()
-        self._media_repository = self._api._hs.get_media_repository()
         self._schedule_table_ready = False
+
+        # Build MediaFilePaths directly instead of instantiating the full
+        # MediaRepository. In a workers deployment the main process sets
+        # enable_media_repo=false, which means ContentRepositoryConfig
+        # skips parsing media attributes (max_upload_size, etc.), causing
+        # MediaRepository.__init__ to crash.  We only need the filepath
+        # helper to locate local media files on disk.
+        media_config = self._api._hs.config.media
+        if hasattr(media_config, "media_store_path"):
+            media_store_path = media_config.media_store_path
+        else:
+            media_store_path = os.path.abspath("media_store")
+        self._filepaths = MediaFilePaths(media_store_path)
 
         self._clock.looping_call(
             self._api._hs.run_as_background_process,
@@ -422,9 +435,7 @@ class ExportUserData(Resource):
                     if media_info is None:
                         continue
 
-                    file_path = self._media_repository.filepaths.local_media_filepath(
-                        media_id
-                    )
+                    file_path = self._filepaths.local_media_filepath(media_id)
                     try:
                         with open(file_path, "rb") as f:
                             media_bytes = f.read()
