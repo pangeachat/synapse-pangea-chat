@@ -131,6 +131,56 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                 postgres=postgres,
             )
 
+    async def test_schedule_export_with_media_repo_disabled_still_starts(self):
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                synapse_config_overrides={"enable_media_repo": False}
+            )
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="workerboot",
+                password="pw1",
+                admin=False,
+            )
+            _, access_token = await self.login_user("workerboot", "pw1")
+            user_id = "@workerboot:my.domain.name"
+
+            response = requests.post(
+                self._EXPORT_URL,
+                json={"action": "schedule"},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data["message"], "Export scheduled")
+            self.assertEqual(data["action"], "schedule")
+            self.assertEqual(data["user_id"], user_id)
+            self.assertEqual(self._count_schedules(config_path, user_id), 1)
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
     async def test_schedule_then_cancel(self):
         postgres = None
         synapse_dir = None

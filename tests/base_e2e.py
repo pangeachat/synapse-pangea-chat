@@ -96,12 +96,31 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             template_dir = os.path.join(
                 workspace_root, "synapse-templates", "templates"
             )
+            test_template_dir = os.path.join(synapse_dir, "test-templates")
+            os.makedirs(test_template_dir, exist_ok=True)
+
             if os.path.isdir(template_dir):
-                templates_config = config.get("templates", {})
-                if not isinstance(templates_config, dict):
-                    templates_config = {}
-                templates_config["custom_template_directory"] = template_dir
-                config["templates"] = templates_config
+                for template_name in os.listdir(template_dir):
+                    src = os.path.join(template_dir, template_name)
+                    dst = os.path.join(test_template_dir, template_name)
+                    if os.path.isfile(src):
+                        shutil.copyfile(src, dst)
+
+            invite_templates = {
+                "course_invite.html": "<html><body>{{ app_name }}</body></html>",
+                "course_invite.txt": "{{ app_name }}",
+            }
+            for template_name, template_contents in invite_templates.items():
+                template_path = os.path.join(test_template_dir, template_name)
+                if not os.path.exists(template_path):
+                    with open(template_path, "w", encoding="utf-8") as template_file:
+                        template_file.write(template_contents)
+
+            templates_config = config.get("templates", {})
+            if not isinstance(templates_config, dict):
+                templates_config = {}
+            templates_config["custom_template_directory"] = test_template_dir
+            config["templates"] = templates_config
 
             if synapse_config_overrides:
                 for key, value in synapse_config_overrides.items():
