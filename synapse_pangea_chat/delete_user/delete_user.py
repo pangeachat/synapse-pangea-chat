@@ -38,6 +38,8 @@ from synapse_pangea_chat.delete_user.is_rate_limited import is_rate_limited
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
+CMS_AUTH_COLLECTION = "service-users"
+
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.delete_user")
 
 SCHEDULE_TABLE = "pangea_delete_user_schedule"
@@ -303,7 +305,9 @@ class DeleteUser(Resource):
                 Headers(
                     {
                         b"Authorization": [
-                            f"users API-Key {cms_api_key}".encode("utf-8")
+                            f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
+                                "utf-8"
+                            )
                         ],
                     }
                 ),
