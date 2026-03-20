@@ -45,8 +45,8 @@ EVENT_TYPE_M_ROOM_NAME = "m.room.name"
 EVENT_TYPE_M_ROOM_TOPIC = "m.room.topic"
 EVENT_TYPE_M_ROOM_AVATAR = "m.room.avatar"
 
-# Power level required to use this endpoint
-REQUIRED_POWER_LEVEL = 100
+# Power level required to use this endpoint (moderator level, so the bot at PL 50 can call it)
+REQUIRED_POWER_LEVEL = 50
 
 
 class InviteByEmail(Resource):
@@ -127,7 +127,7 @@ class InviteByEmail(Resource):
                 respond_with_json(
                     request,
                     403,
-                    {"error": "Forbidden — power level 100 required"},
+                    {"error": f"Forbidden — power level {REQUIRED_POWER_LEVEL} required"},
                     send_cors=True,
                 )
                 return
