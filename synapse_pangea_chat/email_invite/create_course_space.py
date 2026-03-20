@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
-from synapse.api.constants import EventTypes, Membership, RoomCreationPreset
+from synapse.api.constants import EventTypes, RoomCreationPreset
 from synapse.api.errors import (
     AuthError,
     InvalidClientCredentialsError,

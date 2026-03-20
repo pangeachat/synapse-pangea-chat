@@ -66,11 +66,12 @@ async def burn_admin_code(api: ModuleApi, room_id: str, burner_user_id: str) -> 
             authenticated_entity=api.server_name,
         )
 
-        event, unpersisted_context = (
-            await event_creation_handler.create_new_client_event(
-                builder=builder,
-                requester=None,
-            )
+        (
+            event,
+            unpersisted_context,
+        ) = await event_creation_handler.create_new_client_event(
+            builder=builder,
+            requester=None,
         )
         context = await unpersisted_context.persist(event)
         await event_creation_handler._persist_events(

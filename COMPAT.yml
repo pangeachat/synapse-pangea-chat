@@ -5,5 +5,5 @@
 # If this file is absent in a given commit, any Synapse version is assumed compatible.
 # Do not lower min_synapse_version without auditing all sub-module imports first.
 
-min_synapse_version: "1.148.0"
-reason: "delete_user uses synapse.util.duration, which does not exist in Synapse < 1.148.0 (confirmed broken on 1.124.0, confirmed working on 1.148.0)"
+min_synapse_version: "1.124.0"
+reason: "delete_user and export_user_data were audited against Synapse 1.124.0; their recurring background jobs now use the older clock.looping_call millisecond interval supported there"

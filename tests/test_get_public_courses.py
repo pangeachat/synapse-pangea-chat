@@ -52,10 +52,12 @@ class TestGetPublicCourses(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, sentinel)
+        await_args = mock_unfiltered.await_args
+        assert await_args is not None
         # args: room_store, config, limit, start_index, total_room_count, ...
-        self.assertEqual(mock_unfiltered.await_args.args[2], 10)
-        self.assertEqual(mock_unfiltered.await_args.args[3], 0)
-        self.assertEqual(mock_unfiltered.await_args.args[4], 3)
+        self.assertEqual(await_args.args[2], 10)
+        self.assertEqual(await_args.args[3], 0)
+        self.assertEqual(await_args.args[4], 3)
         self.assertEqual(result["filtering_warning"], "")
 
     async def test_filtered_path_falls_back_when_cms_not_configured(self) -> None:
