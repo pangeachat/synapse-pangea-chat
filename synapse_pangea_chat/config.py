@@ -79,3 +79,4 @@ class PangeaChatConfig:
     # --- invite_by_email config ---
     invite_by_email_requests_per_burst: int = 5
     invite_by_email_burst_duration_seconds: int = 60
+    app_base_url: str = "https://app.pangea.chat"

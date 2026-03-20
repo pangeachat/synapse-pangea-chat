@@ -127,7 +127,9 @@ class InviteByEmail(Resource):
                 respond_with_json(
                     request,
                     403,
-                    {"error": f"Forbidden — power level {REQUIRED_POWER_LEVEL} required"},
+                    {
+                        "error": f"Forbidden — power level {REQUIRED_POWER_LEVEL} required"
+                    },
                     send_cors=True,
                 )
                 return
@@ -148,7 +150,8 @@ class InviteByEmail(Resource):
                 )
                 return
 
-            join_url = f"https://pangea.chat/#/join_with_link?classcode={access_code}"
+            base = self._config.app_base_url.rstrip("/")
+            join_url = f"{base}/#/join_with_link?classcode={access_code}"
 
             # Send emails
             emailed: List[str] = []
