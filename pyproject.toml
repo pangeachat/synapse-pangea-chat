@@ -18,7 +18,7 @@ dev = [
   "matrix-synapse == 1.124.0",
   "prometheus-client == 0.22.1",
   "tox",
-  "twisted == 24.7.0",
+  "twisted == 25.5.0",
   "aiounittest",
   "aiohttp",
   "psycopg2",
