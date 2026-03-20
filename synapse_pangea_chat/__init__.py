@@ -361,6 +361,9 @@ class PangeaChat:
         invite_by_email_burst_duration_seconds = config.get(
             "invite_by_email_burst_duration_seconds", 60
         )
+        app_base_url = config.get(
+            "app_base_url", "https://app.pangea.chat"
+        )
 
         return PangeaChatConfig(
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
@@ -395,4 +398,5 @@ class PangeaChat:
             register_email_burst_duration_seconds=register_email_burst_duration_seconds,
             invite_by_email_requests_per_burst=invite_by_email_requests_per_burst,
             invite_by_email_burst_duration_seconds=invite_by_email_burst_duration_seconds,
+            app_base_url=app_base_url,
         )
