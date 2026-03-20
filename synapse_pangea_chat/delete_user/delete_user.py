@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict
@@ -28,11 +29,35 @@ if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
 CMS_AUTH_COLLECTION = "service-users"
+_RUN_AS_BG_SUPPORTS_SERVER_NAME = (
+    "server_name" in inspect.signature(run_as_background_process).parameters
+)
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.delete_user")
 
 SCHEDULE_TABLE = "pangea_delete_user_schedule"
 VALID_ACTIONS = {"schedule", "cancel", "force"}
+
+
+class _LoopingCallInterval(int):
+    def as_secs(self) -> float:
+        return int(self) / 1000
+
+    def as_millis(self) -> int:
+        return int(self)
+
+
+def _looping_call_interval_seconds(interval_seconds: int) -> _LoopingCallInterval:
+    # Synapse 1.124.0 expects looping_call intervals in ms integers. Newer
+    # branches call as_secs()/as_millis() on the same value. This int subclass
+    # satisfies both contracts without importing newer Duration helpers.
+    return _LoopingCallInterval(interval_seconds * 1000)
+
+
+def _background_process_args(homeserver: Any, desc: str, func: Any) -> tuple[Any, ...]:
+    if _RUN_AS_BG_SUPPORTS_SERVER_NAME:
+        return (desc, homeserver.hostname, func)
+    return (desc, func)
 
 
 class DeleteUser(Resource):
@@ -52,9 +77,14 @@ class DeleteUser(Resource):
 
         self._clock.looping_call(
             run_as_background_process,
-            self._config.delete_user_processor_interval_seconds * 1000,
-            "pangea_delete_user_process_schedules",
-            self._process_scheduled_deletes,
+            _looping_call_interval_seconds(
+                self._config.delete_user_processor_interval_seconds
+            ),
+            *_background_process_args(
+                self._api._hs,
+                "pangea_delete_user_process_schedules",
+                self._process_scheduled_deletes,
+            ),
         )
 
     def render_POST(self, request: SynapseRequest):

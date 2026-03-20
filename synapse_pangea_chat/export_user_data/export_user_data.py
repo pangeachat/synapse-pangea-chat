@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import logging
@@ -38,6 +39,30 @@ logger = logging.getLogger("synapse.module.synapse_pangea_chat.export_user_data"
 SCHEDULE_TABLE = "pangea_export_user_data_schedule"
 VALID_ACTIONS = {"schedule", "cancel", "force", "status"}
 CMS_AUTH_COLLECTION = "service-users"
+_RUN_AS_BG_SUPPORTS_SERVER_NAME = (
+    "server_name" in inspect.signature(run_as_background_process).parameters
+)
+
+
+class _LoopingCallInterval(int):
+    def as_secs(self) -> float:
+        return int(self) / 1000
+
+    def as_millis(self) -> int:
+        return int(self)
+
+
+def _looping_call_interval_seconds(interval_seconds: int) -> _LoopingCallInterval:
+    # Synapse 1.124.0 expects looping_call intervals in ms integers. Newer
+    # branches call as_secs()/as_millis() on the same value. This int subclass
+    # satisfies both contracts without importing newer Duration helpers.
+    return _LoopingCallInterval(interval_seconds * 1000)
+
+
+def _background_process_args(homeserver: Any, desc: str, func: Any) -> tuple[Any, ...]:
+    if _RUN_AS_BG_SUPPORTS_SERVER_NAME:
+        return (desc, homeserver.hostname, func)
+    return (desc, func)
 
 
 class JsonExfiltrationWriter(ExfiltrationWriter):
@@ -134,9 +159,14 @@ class ExportUserData(Resource):
 
         self._clock.looping_call(
             run_as_background_process,
-            self._config.export_user_data_processor_interval_seconds * 1000,
-            "pangea_export_user_data_process_schedules",
-            self._process_scheduled_exports,
+            _looping_call_interval_seconds(
+                self._config.export_user_data_processor_interval_seconds
+            ),
+            *_background_process_args(
+                self._api._hs,
+                "pangea_export_user_data_process_schedules",
+                self._process_scheduled_exports,
+            ),
         )
 
     def render_POST(self, request: SynapseRequest):
@@ -381,13 +411,7 @@ class ExportUserData(Resource):
         cms_record_id: str | None = None
         try:
             cms_record_id = await self._cms_create_export_record(
-                user_id, cms_base_url, cms_api_key
-            )
-            await self._cms_update_export_status(
-                cms_record_id, "processing", cms_base_url, cms_api_key
-            )
-            await self._cms_upload_zip(
-                cms_record_id, user_id, zip_bytes, cms_base_url, cms_api_key
+                user_id, zip_bytes, cms_base_url, cms_api_key
             )
         except Exception as e:
             logger.warning("CMS upload failed for %s: %s", user_id, e)
@@ -517,7 +541,11 @@ class ExportUserData(Resource):
     # ---- CMS API helpers ----
 
     async def _cms_create_export_record(
-        self, user_id: str, cms_base_url: str, cms_api_key: str
+        self,
+        user_id: str,
+        zip_bytes: bytes,
+        cms_base_url: str,
+        cms_api_key: str,
     ) -> str:
         from twisted.internet import reactor
         from twisted.web.client import Agent, readBody
@@ -527,26 +555,45 @@ class ExportUserData(Resource):
         cms_matrix_user_id = await self._cms_resolve_matrix_user_id(
             user_id, cms_base_url, cms_api_key
         )
-        body_bytes = json.dumps(
+        safe_user_id = user_id.replace("@", "").replace(":", "_")
+        filename = f"export_{safe_user_id}.zip"
+        payload = json.dumps(
             {
                 "user": cms_matrix_user_id,
-                "status": "pending",
+                "status": "complete",
                 "requestedAt": _now_iso(),
             }
         ).encode("utf-8")
+        boundary = b"----PangeaExportBoundary"
+        multipart_body = self._build_multipart_form_body(
+            boundary=boundary,
+            fields=[(b"_payload", payload)],
+            files=[
+                {
+                    "field_name": b"file",
+                    "filename": filename.encode("utf-8"),
+                    "content_type": b"application/zip",
+                    "body": zip_bytes,
+                }
+            ],
+        )
 
         response = await agent.request(
             b"POST",
             f"{cms_base_url}/api/user-exports".encode("utf-8"),
             Headers(
                 {
-                    b"Content-Type": [b"application/json"],
+                    b"Content-Type": [
+                        f"multipart/form-data; boundary={boundary.decode()}".encode(
+                            "utf-8"
+                        )
+                    ],
                     b"Authorization": [
                         f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
                     ],
                 }
             ),
-            _BytesProducer(body_bytes),
+            _BytesProducer(multipart_body),
         )
 
         resp_body = await readBody(response)
@@ -562,6 +609,43 @@ class ExportUserData(Resource):
         if not record_id:
             raise RuntimeError(f"CMS response missing id: {resp_body.decode()}")
         return record_id
+
+    def _build_multipart_form_body(
+        self,
+        *,
+        boundary: bytes,
+        fields: list[tuple[bytes, bytes]],
+        files: list[dict[str, bytes]],
+    ) -> bytes:
+        body_parts: list[bytes] = []
+
+        for field_name, field_value in fields:
+            body_parts.extend(
+                [
+                    b"--" + boundary,
+                    b'Content-Disposition: form-data; name="' + field_name + b'"',
+                    b"",
+                    field_value,
+                ]
+            )
+
+        for file_part in files:
+            body_parts.extend(
+                [
+                    b"--" + boundary,
+                    b'Content-Disposition: form-data; name="'
+                    + file_part["field_name"]
+                    + b'"; filename="'
+                    + file_part["filename"]
+                    + b'"',
+                    b"Content-Type: " + file_part["content_type"],
+                    b"",
+                    file_part["body"],
+                ]
+            )
+
+        body_parts.extend([b"--" + boundary + b"--", b""])
+        return b"\r\n".join(body_parts)
 
     async def _cms_resolve_matrix_user_id(
         self, user_id: str, cms_base_url: str, cms_api_key: str
@@ -645,65 +729,6 @@ class ExportUserData(Resource):
         if response.code >= 400:
             raise RuntimeError(
                 f"CMS update export status failed ({response.code}): "
-                f"{resp_body.decode('utf-8', errors='replace')}"
-            )
-
-    async def _cms_upload_zip(
-        self,
-        record_id: str,
-        user_id: str,
-        zip_bytes: bytes,
-        cms_base_url: str,
-        cms_api_key: str,
-    ) -> None:
-        from twisted.internet import reactor
-        from twisted.web.client import Agent, readBody
-        from twisted.web.http_headers import Headers
-
-        agent = Agent(reactor)
-        boundary = b"----PangeaExportBoundary"
-        safe_user_id = user_id.replace("@", "").replace(":", "_")
-        filename = f"export_{safe_user_id}.zip"
-
-        body_parts = []
-        # status field
-        body_parts.append(b"--" + boundary)
-        body_parts.append(b'Content-Disposition: form-data; name="status"\r\n')
-        body_parts.append(b"complete")
-
-        # file field
-        body_parts.append(b"--" + boundary)
-        body_parts.append(
-            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-            f"Content-Type: application/zip\r\n".encode("utf-8")
-        )
-        body_parts.append(zip_bytes)
-        body_parts.append(b"--" + boundary + b"--")
-
-        multipart_body = b"\r\n".join(body_parts)
-
-        response = await agent.request(
-            b"PATCH",
-            f"{cms_base_url}/api/user-exports/{record_id}".encode("utf-8"),
-            Headers(
-                {
-                    b"Content-Type": [
-                        f"multipart/form-data; boundary={boundary.decode()}".encode(
-                            "utf-8"
-                        )
-                    ],
-                    b"Authorization": [
-                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
-                    ],
-                }
-            ),
-            _BytesProducer(multipart_body),
-        )
-
-        resp_body = await readBody(response)
-        if response.code >= 400:
-            raise RuntimeError(
-                f"CMS upload ZIP failed ({response.code}): "
                 f"{resp_body.decode('utf-8', errors='replace')}"
             )
 

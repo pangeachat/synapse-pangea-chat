@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import os
 import shutil
@@ -6,7 +7,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import warnings
 from typing import IO, Any, Dict, Optional, Tuple, Union
+from unittest.mock import patch
 
 import aiounittest
 import psycopg2
@@ -22,6 +25,53 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
     """Base class for Synapse E2E tests with shared infrastructure methods."""
 
     server_url = "http://localhost:8008"
+
+    def setUp(self) -> None:
+        super().setUp()
+
+        self._resource_warning_context = warnings.catch_warnings(record=True)
+        self._caught_resource_warnings = self._resource_warning_context.__enter__()
+        warnings.simplefilter("always", ResourceWarning)
+
+        original_request = requests.sessions.Session.request
+
+        def request_with_closed_connections(
+            session: requests.sessions.Session,
+            method: str,
+            url: str,
+            **kwargs: Any,
+        ):
+            headers = dict(kwargs.pop("headers", {}) or {})
+            headers.setdefault("Connection", "close")
+            kwargs["headers"] = headers
+            return original_request(session, method, url, **kwargs)
+
+        request_patcher = patch.object(
+            requests.sessions.Session,
+            "request",
+            new=request_with_closed_connections,
+        )
+        request_patcher.start()
+        self.addCleanup(request_patcher.stop)
+
+    def tearDown(self) -> None:
+        gc.collect()
+        resource_warnings = [
+            warning
+            for warning in self._caught_resource_warnings
+            if issubclass(warning.category, ResourceWarning)
+        ]
+        self._resource_warning_context.__exit__(None, None, None)
+        super().tearDown()
+
+        if resource_warnings:
+            warning_messages = "\n".join(
+                f"{warning.filename}:{warning.lineno}: {warning.message}"
+                for warning in resource_warnings
+            )
+            self.fail(
+                "ResourceWarning emitted during E2E test:\n" f"{warning_messages}"
+            )
 
     async def start_test_synapse(
         self,
@@ -169,11 +219,13 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             stdout_thread.start()
             stderr_thread.start()
 
-            max_wait_time = 10
+            max_wait_time = 30
             wait_interval = 1
             total_wait_time = 0
             server_ready = False
             while not server_ready and total_wait_time < max_wait_time:
+                if server_process.poll() is not None:
+                    break
                 try:
                     response = requests.get(f"{self.server_url}/health", timeout=10)
                     if response.status_code == 200:

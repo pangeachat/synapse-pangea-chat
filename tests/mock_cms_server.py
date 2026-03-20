@@ -5,6 +5,7 @@ and user-exports, backed by in-memory storage.
 """
 
 import json
+import re
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -129,13 +130,30 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
 
     def _handle_create_export(self) -> None:
         state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
-        body = self._read_json_body()
+        content_type = self.headers.get("Content-Type", "")
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length else b""
+
+        if not content_type.startswith("multipart/form-data"):
+            self._send_json(400, {"errors": [{"message": "No files were uploaded."}]})
+            return
+
+        parsed = _parse_multipart_export_body(raw_body)
+        if parsed is None:
+            self._send_json(400, {"errors": [{"message": "No files were uploaded."}]})
+            return
+
+        body = parsed["payload"]
         user_id = body.get("user")
         if not isinstance(user_id, str) or not state.has_matrix_user_id(user_id):
             self._send_json(400, {"error": "Invalid matrix user relationship"})
             return
 
-        export_doc = state.create_export(body)
+        export_doc = state.create_export(
+            body,
+            filename=parsed["filename"],
+            mime_type="application/zip",
+        )
         self._send_json(200, {"doc": export_doc})
 
     def _handle_update_export(self, path: str) -> None:
@@ -196,7 +214,13 @@ class _MockCmsState:
         with self._lock:
             return matrix_user_id in self._matrix_users_by_id
 
-    def create_export(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    def create_export(
+        self,
+        body: Dict[str, Any],
+        *,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
         with self._lock:
             export_id = str(uuid.uuid4())
             doc = {
@@ -205,6 +229,10 @@ class _MockCmsState:
                 "status": body.get("status", "pending"),
                 "requestedAt": body.get("requestedAt"),
             }
+            if filename is not None:
+                doc["filename"] = filename
+            if mime_type is not None:
+                doc["mimeType"] = mime_type
             self._exports_by_id[export_id] = doc
             return dict(doc)
 
@@ -300,5 +328,25 @@ class MockCmsServer:
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
         if self._thread:
             self._thread.join(timeout=5)
+        self._server = None
+        self._thread = None
+
+
+def _parse_multipart_export_body(raw_body: bytes) -> Optional[Dict[str, Any]]:
+    decoded_body = raw_body.decode("utf-8", errors="replace")
+
+    payload_match = re.search(
+        r'name="_payload"\r\n\r\n(.*?)\r\n--', decoded_body, re.DOTALL
+    )
+    filename_match = re.search(r'filename="([^"]+)"', decoded_body)
+
+    if payload_match is None or filename_match is None:
+        return None
+
+    return {
+        "payload": json.loads(payload_match.group(1)),
+        "filename": filename_match.group(1),
+    }
