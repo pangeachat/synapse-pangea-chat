@@ -5,7 +5,6 @@ and user-exports, backed by in-memory storage.
 """
 
 import json
-import re
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -336,17 +335,57 @@ class MockCmsServer:
 
 
 def _parse_multipart_export_body(raw_body: bytes) -> Optional[Dict[str, Any]]:
-    decoded_body = raw_body.decode("utf-8", errors="replace")
-
-    payload_match = re.search(
-        r'name="_payload"\r\n\r\n(.*?)\r\n--', decoded_body, re.DOTALL
-    )
-    filename_match = re.search(r'filename="([^"]+)"', decoded_body)
-
-    if payload_match is None or filename_match is None:
+    line_end = raw_body.find(b"\r\n")
+    if line_end == -1:
         return None
 
-    return {
-        "payload": json.loads(payload_match.group(1)),
-        "filename": filename_match.group(1),
-    }
+    boundary = raw_body[:line_end]
+    if not boundary.startswith(b"--"):
+        return None
+
+    payload: Optional[Dict[str, Any]] = None
+    filename: Optional[str] = None
+
+    for part in raw_body.split(boundary):
+        stripped_part = part.strip()
+        if not stripped_part or stripped_part == b"--":
+            continue
+
+        if stripped_part.startswith(b"--"):
+            stripped_part = stripped_part[2:].lstrip(b"\r\n")
+            if not stripped_part:
+                continue
+
+        headers, separator, body = stripped_part.partition(b"\r\n\r\n")
+        if not separator:
+            continue
+
+        content_disposition: Optional[str] = None
+        for header_line in headers.split(b"\r\n"):
+            try:
+                decoded_header = header_line.decode("utf-8")
+            except UnicodeDecodeError:
+                decoded_header = header_line.decode("utf-8", errors="replace")
+
+            if decoded_header.lower().startswith("content-disposition:"):
+                content_disposition = decoded_header
+                break
+
+        if content_disposition is None:
+            continue
+
+        body = body.removesuffix(b"\r\n")
+
+        if 'name="_payload"' in content_disposition:
+            payload = json.loads(body.decode("utf-8"))
+
+        if 'filename="' in content_disposition:
+            filename_start = content_disposition.find('filename="') + len('filename="')
+            filename_end = content_disposition.find('"', filename_start)
+            if filename_end != -1:
+                filename = content_disposition[filename_start:filename_end]
+
+    if payload is None or filename is None:
+        return None
+
+    return {"payload": payload, "filename": filename}
