@@ -15,7 +15,8 @@ dependencies = ["attrs"]
 [project.optional-dependencies]
 dev = [
   # for tests
-  "matrix-synapse",
+  "matrix-synapse == 1.124.0",
+  "prometheus-client == 0.22.1",
   "tox",
   "twisted == 24.7.0",
   "aiounittest",

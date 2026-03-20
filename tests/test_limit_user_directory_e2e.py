@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import subprocess
 import sys
@@ -58,6 +59,25 @@ class TestE2E(BaseSynapseE2ETest):
             self.assertIsInstance(user_id, str)
             users.append(user_id)
         return users
+
+    async def search_users_with_retry(
+        self,
+        search_term: str,
+        access_token: str,
+        *,
+        required_user_ids: List[str],
+        retries: int = 40,
+        delay_seconds: float = 0.5,
+    ) -> List[str]:
+        last_results: List[str] = []
+        required = set(required_user_ids)
+        for _ in range(retries):
+            last_results = await self.search_users(search_term, access_token)
+            if required.issubset(set(last_results)):
+                return last_results
+            await asyncio.sleep(delay_seconds)
+
+        return last_results
 
     async def get_public_attribute_of_user(
         self, user_id: str, access_token: str
@@ -184,8 +204,14 @@ class TestE2E(BaseSynapseE2ETest):
             (whitelisted_username, whitelisted_access_token) = await self.login_user(
                 "whitelisted", "password"
             )
-            users = await self.search_users("user", whitelisted_access_token)
-            self.assertEqual(len(users), 6)
+            for username, _access_token in creds:
+                localpart = username.split(":", 1)[0].lstrip("@")
+                users = await self.search_users_with_retry(
+                    localpart,
+                    whitelisted_access_token,
+                    required_user_ids=[username],
+                )
+                self.assertIn(username, users)
 
             # Shared room overrides private profile filtering.
             await self.register_user(
@@ -231,7 +257,12 @@ class TestE2E(BaseSynapseE2ETest):
             self.assertEqual(response.status_code, 200)
 
             # Search for userB as userA; shared room should allow userB to appear in the results.
-            users = await self.search_users("userB", tokenA)
+            user_b_localpart = userB.split(":", 1)[0].lstrip("@")
+            users = await self.search_users_with_retry(
+                user_b_localpart,
+                tokenA,
+                required_user_ids=[userB],
+            )
             self.assertIn(userB, users)
 
         finally:

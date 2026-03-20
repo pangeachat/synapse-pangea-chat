@@ -49,7 +49,7 @@ class RegisterEmailRequestToken(Resource):
         self._datastores = self._hs.get_datastores()
 
         if self._hs.config.email.can_verify_email:
-            self._registration_mailer = Mailer(
+            self._registration_mailer: Mailer | None = Mailer(
                 hs=self._hs,
                 app_name=self._hs.config.email.email_app_name,
                 template_html=self._hs.config.email.email_registration_template_html,

@@ -21,20 +21,9 @@ from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
 from synapse.media.filepath import MediaFilePaths
+from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import ModuleApi
 from synapse.types import JsonMapping, StateMap
-
-try:
-    from synapse.util.duration import Duration
-except ImportError:
-    import synapse as _synapse
-
-    raise ImportError(
-        f"synapse_pangea_chat.export_user_data requires Synapse >= 1.148.0 "
-        f"(synapse.util.duration is not available in Synapse {_synapse.__version__}). "
-        f"Either upgrade Synapse or pin synapse-pangea-chat to commit 9d9d411 "
-        f"(the last commit before export_user_data was added)."
-    ) from None
 from twisted.internet import defer
 from twisted.web.resource import Resource
 
@@ -144,10 +133,10 @@ class ExportUserData(Resource):
         self._filepaths = MediaFilePaths(media_store_path)
 
         self._clock.looping_call(
-            self._api._hs.run_as_background_process,
-            Duration(seconds=self._config.export_user_data_processor_interval_seconds),
-            desc="pangea_export_user_data_process_schedules",
-            func=self._process_scheduled_exports,
+            run_as_background_process,
+            self._config.export_user_data_processor_interval_seconds * 1000,
+            "pangea_export_user_data_process_schedules",
+            self._process_scheduled_exports,
         )
 
     def render_POST(self, request: SynapseRequest):
@@ -553,9 +542,7 @@ class ExportUserData(Resource):
                 {
                     b"Content-Type": [b"application/json"],
                     b"Authorization": [
-                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
-                            "utf-8"
-                        )
+                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
                     ],
                 }
             ),
@@ -595,9 +582,7 @@ class ExportUserData(Resource):
             Headers(
                 {
                     b"Authorization": [
-                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
-                            "utf-8"
-                        )
+                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
                     ],
                 }
             ),
@@ -649,9 +634,7 @@ class ExportUserData(Resource):
                 {
                     b"Content-Type": [b"application/json"],
                     b"Authorization": [
-                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
-                            "utf-8"
-                        )
+                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
                     ],
                 }
             ),
@@ -710,9 +693,7 @@ class ExportUserData(Resource):
                         )
                     ],
                     b"Authorization": [
-                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
-                            "utf-8"
-                        )
+                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
                     ],
                 }
             ),

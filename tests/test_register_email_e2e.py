@@ -624,6 +624,11 @@ class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
             self.smtp_server.stop()
             self.smtp_server = None
 
+    def _require_smtp_server(self) -> MockSMTPServer:
+        if self.smtp_server is None:
+            raise AssertionError("Mock SMTP server was not started")
+        return self.smtp_server
+
     async def test_happy_path_valid_username_and_email(self) -> None:
         """Valid username + valid email → 200 with sid."""
         postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
@@ -653,9 +658,10 @@ class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
             self.assertTrue(len(body["sid"]) > 0)
 
             # Verify email was actually sent via mock SMTP
+            smtp_server = self._require_smtp_server()
             await asyncio.sleep(1)
             self.assertGreater(
-                len(self.smtp_server.received_emails),
+                len(smtp_server.received_emails),
                 0,
                 "Expected at least one email to be sent via SMTP",
             )
@@ -770,8 +776,9 @@ class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
             self.assertEqual(resp1.status_code, 200, resp1.json())
             sid1 = resp1.json()["sid"]
 
+            smtp_server = self._require_smtp_server()
             await asyncio.sleep(0.5)
-            emails_after_first = len(self.smtp_server.received_emails)
+            emails_after_first = len(smtp_server.received_emails)
 
             # Higher send_attempt should re-send
             resp2 = requests.post(ENDPOINT, json={**base_payload, "send_attempt": 2})
@@ -784,7 +791,7 @@ class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
             # Should have sent an additional email
             await asyncio.sleep(1)
             self.assertGreater(
-                len(self.smtp_server.received_emails),
+                len(smtp_server.received_emails),
                 emails_after_first,
                 "Expected a new email for higher send_attempt",
             )
@@ -883,7 +890,8 @@ class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
                 admin=True,
             )
 
-            emails_before = len(self.smtp_server.received_emails)
+            smtp_server = self._require_smtp_server()
+            emails_before = len(smtp_server.received_emails)
 
             response = requests.post(
                 ENDPOINT,
@@ -901,7 +909,7 @@ class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
             # Verify no email was sent
             await asyncio.sleep(1)
             self.assertEqual(
-                len(self.smtp_server.received_emails),
+                len(smtp_server.received_emails),
                 emails_before,
                 "No email should be sent when username is already taken",
             )
@@ -961,7 +969,8 @@ class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
                 stderr_thread,
             ) = await self._start_synapse_with_email()
 
-            emails_before = len(self.smtp_server.received_emails)
+            smtp_server = self._require_smtp_server()
+            emails_before = len(smtp_server.received_emails)
 
             response = requests.post(
                 ENDPOINT,
@@ -979,7 +988,7 @@ class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
             # Verify no email was sent for invalid usernames.
             await asyncio.sleep(1)
             self.assertEqual(
-                len(self.smtp_server.received_emails),
+                len(smtp_server.received_emails),
                 emails_before,
                 "No email should be sent when username is invalid",
             )

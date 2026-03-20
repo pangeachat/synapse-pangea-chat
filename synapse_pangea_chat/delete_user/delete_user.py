@@ -15,20 +15,9 @@ from synapse.api.errors import (
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
+from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import ModuleApi
 from synapse.types import create_requester
-
-try:
-    from synapse.util.duration import Duration
-except ImportError:
-    import synapse as _synapse
-
-    raise ImportError(
-        f"synapse_pangea_chat.delete_user requires Synapse >= 1.148.0 "
-        f"(synapse.util.duration is not available in Synapse {_synapse.__version__}). "
-        f"Either upgrade Synapse or pin synapse-pangea-chat to commit 9d9d411 "
-        f"(the last commit before delete_user was added)."
-    ) from None
 from twisted.internet import defer
 from twisted.web.resource import Resource
 
@@ -62,10 +51,10 @@ class DeleteUser(Resource):
         self._schedule_table_ready = False
 
         self._clock.looping_call(
-            self._api._hs.run_as_background_process,
-            Duration(seconds=self._config.delete_user_processor_interval_seconds),
-            desc="pangea_delete_user_process_schedules",
-            func=self._process_scheduled_deletes,
+            run_as_background_process,
+            self._config.delete_user_processor_interval_seconds * 1000,
+            "pangea_delete_user_process_schedules",
+            self._process_scheduled_deletes,
         )
 
     def render_POST(self, request: SynapseRequest):

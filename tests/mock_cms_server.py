@@ -11,7 +11,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
-
 EXPECTED_AUTH_SCHEME = "service-users API-Key "
 
 
@@ -241,7 +240,9 @@ class _MockCmsState:
 
             return dict(doc)
 
-    def get_exports_for_matrix_user_id(self, matrix_user_id: str) -> List[Dict[str, Any]]:
+    def get_exports_for_matrix_user_id(
+        self, matrix_user_id: str
+    ) -> List[Dict[str, Any]]:
         with self._lock:
             return [
                 dict(doc)
@@ -279,7 +280,9 @@ class MockCmsServer:
     def seed_matrix_user(self, username: str) -> Dict[str, Any]:
         return self._state.seed_matrix_user(username)
 
-    def get_exports_for_matrix_user_id(self, matrix_user_id: str) -> List[Dict[str, Any]]:
+    def get_exports_for_matrix_user_id(
+        self, matrix_user_id: str
+    ) -> List[Dict[str, Any]]:
         return self._state.get_exports_for_matrix_user_id(matrix_user_id)
 
     def get_remaining_logs(self, user_id: str) -> List[Dict[str, Any]]:

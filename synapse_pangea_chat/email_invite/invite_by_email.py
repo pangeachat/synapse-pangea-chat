@@ -7,7 +7,7 @@ to join a Matrix room via its access code join link.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
