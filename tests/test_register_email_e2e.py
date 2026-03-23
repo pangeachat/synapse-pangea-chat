@@ -1007,6 +1007,7 @@ class TestRegisterEmailRateLimit(BaseSynapseE2ETest):
     """Rate limiting tests for the register email endpoint."""
 
     def setUp(self):
+        super().setUp()
         # Clear rate limit state between tests
         request_log.clear()
 

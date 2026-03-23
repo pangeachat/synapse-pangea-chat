@@ -129,13 +129,30 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
 
     def _handle_create_export(self) -> None:
         state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
-        body = self._read_json_body()
+        content_type = self.headers.get("Content-Type", "")
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length else b""
+
+        if not content_type.startswith("multipart/form-data"):
+            self._send_json(400, {"errors": [{"message": "No files were uploaded."}]})
+            return
+
+        parsed = _parse_multipart_export_body(raw_body)
+        if parsed is None:
+            self._send_json(400, {"errors": [{"message": "No files were uploaded."}]})
+            return
+
+        body = parsed["payload"]
         user_id = body.get("user")
         if not isinstance(user_id, str) or not state.has_matrix_user_id(user_id):
             self._send_json(400, {"error": "Invalid matrix user relationship"})
             return
 
-        export_doc = state.create_export(body)
+        export_doc = state.create_export(
+            body,
+            filename=parsed["filename"],
+            mime_type="application/zip",
+        )
         self._send_json(200, {"doc": export_doc})
 
     def _handle_update_export(self, path: str) -> None:
@@ -196,7 +213,13 @@ class _MockCmsState:
         with self._lock:
             return matrix_user_id in self._matrix_users_by_id
 
-    def create_export(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    def create_export(
+        self,
+        body: Dict[str, Any],
+        *,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
         with self._lock:
             export_id = str(uuid.uuid4())
             doc = {
@@ -205,6 +228,10 @@ class _MockCmsState:
                 "status": body.get("status", "pending"),
                 "requestedAt": body.get("requestedAt"),
             }
+            if filename is not None:
+                doc["filename"] = filename
+            if mime_type is not None:
+                doc["mimeType"] = mime_type
             self._exports_by_id[export_id] = doc
             return dict(doc)
 
@@ -300,5 +327,65 @@ class MockCmsServer:
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
         if self._thread:
             self._thread.join(timeout=5)
+        self._server = None
+        self._thread = None
+
+
+def _parse_multipart_export_body(raw_body: bytes) -> Optional[Dict[str, Any]]:
+    line_end = raw_body.find(b"\r\n")
+    if line_end == -1:
+        return None
+
+    boundary = raw_body[:line_end]
+    if not boundary.startswith(b"--"):
+        return None
+
+    payload: Optional[Dict[str, Any]] = None
+    filename: Optional[str] = None
+
+    for part in raw_body.split(boundary):
+        stripped_part = part.strip()
+        if not stripped_part or stripped_part == b"--":
+            continue
+
+        if stripped_part.startswith(b"--"):
+            stripped_part = stripped_part[2:].lstrip(b"\r\n")
+            if not stripped_part:
+                continue
+
+        headers, separator, body = stripped_part.partition(b"\r\n\r\n")
+        if not separator:
+            continue
+
+        content_disposition: Optional[str] = None
+        for header_line in headers.split(b"\r\n"):
+            try:
+                decoded_header = header_line.decode("utf-8")
+            except UnicodeDecodeError:
+                decoded_header = header_line.decode("utf-8", errors="replace")
+
+            if decoded_header.lower().startswith("content-disposition:"):
+                content_disposition = decoded_header
+                break
+
+        if content_disposition is None:
+            continue
+
+        body = body.removesuffix(b"\r\n")
+
+        if 'name="_payload"' in content_disposition:
+            payload = json.loads(body.decode("utf-8"))
+
+        if 'filename="' in content_disposition:
+            filename_start = content_disposition.find('filename="') + len('filename="')
+            filename_end = content_disposition.find('"', filename_start)
+            if filename_end != -1:
+                filename = content_disposition[filename_start:filename_end]
+
+    if payload is None or filename is None:
+        return None
+
+    return {"payload": payload, "filename": filename}
