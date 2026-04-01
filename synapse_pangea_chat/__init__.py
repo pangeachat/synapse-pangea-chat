@@ -7,6 +7,7 @@ from synapse.module_api import ModuleApi
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.delete_room import DeleteRoom
 from synapse_pangea_chat.delete_user import DeleteUser
+from synapse_pangea_chat.direct_push import DirectPush
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
 from synapse_pangea_chat.export_user_data import ExportUserData
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
@@ -140,6 +141,13 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/register/email/requestToken",
             resource=self.register_email_resource,
+        )
+
+        # --- Direct Push ---
+        self.direct_push_resource = DirectPush(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/send_push",
+            resource=self.direct_push_resource,
         )
 
         # --- Limit User Directory ---
