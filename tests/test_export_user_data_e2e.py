@@ -674,22 +674,15 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(self._count_schedules(config_path, user_id), 1)
 
-            expected_filename = "export_exporter_my.domain.name.zip"
-            zip_path = os.path.join(export_dir, expected_filename)
-            deadline = asyncio.get_running_loop().time() + 15
-            while asyncio.get_running_loop().time() < deadline:
-                if (
-                    self._count_schedules(config_path, user_id) == 0
-                    and os.path.exists(zip_path)
-                    and os.path.getsize(zip_path) > 0
-                ):
-                    break
-                await asyncio.sleep(0.5)
+            # Wait for background processor to pick up and complete the export
+            await asyncio.sleep(8)
 
             # Schedule should be consumed
             self.assertEqual(self._count_schedules(config_path, user_id), 0)
 
             # Verify ZIP file was written to disk
+            expected_filename = "export_exporter_my.domain.name.zip"
+            zip_path = os.path.join(export_dir, expected_filename)
             self.assertTrue(
                 os.path.exists(zip_path),
                 f"Expected export ZIP at {zip_path}, "
