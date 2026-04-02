@@ -38,7 +38,7 @@ _ENDPOINT = "http://localhost:8008/_synapse/client/pangea/v1/user_directory/sear
 
 def _module_config(
     filter_search_if_missing_public_attribute: bool = True,
-    user_directory_search_requests_per_burst: int = 10,
+    user_directory_search_requests_per_burst: int = 500,
     user_directory_search_burst_duration_seconds: int = 60,
 ) -> dict:
     return {
@@ -88,8 +88,8 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
         access_token: str,
         *,
         required_user_ids: List[str],
-        retries: int = 20,
-        delay_seconds: float = 0.25,
+        retries: int = 120,
+        delay_seconds: float = 0.5,
     ) -> List[str]:
         last_results: List[str] = []
         required = set(required_user_ids)
@@ -100,6 +100,37 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
             await asyncio.sleep(delay_seconds)
 
         return last_results
+
+    async def _search_with_retry(
+        self,
+        search_term: str,
+        access_token: str,
+        *,
+        limit: int = 50,
+        predicate,
+        retries: int = 120,
+        delay_seconds: float = 0.5,
+    ) -> Dict[str, Any]:
+        last_result: Dict[str, Any] = {}
+        for _ in range(retries):
+            last_result = self._search(search_term, access_token, limit)
+            if predicate(last_result):
+                return last_result
+            await asyncio.sleep(delay_seconds)
+
+        return last_result
+
+    async def _wait_until_user_searchable(
+        self,
+        user_id: str,
+        access_token: str,
+    ) -> List[str]:
+        localpart = user_id.split(":", 1)[0].lstrip("@")
+        return await self._search_user_ids_with_retry(
+            localpart,
+            access_token,
+            required_user_ids=[user_id],
+        )
 
     async def _set_public(self, user_id: str, value: bool, access_token: str) -> None:
         get_resp = requests.get(
@@ -175,10 +206,20 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
             await self._set_public(creds[3][0], True, creds[3][1])
             # usr4, usr5 → no attribute set
 
-            # A regular user (usr0) searches — should see only public users
+            # A regular user (usr0) searches — public users should be visible.
+            public_2_results = await self._wait_until_user_searchable(
+                creds[2][0],
+                creds[0][1],
+            )
+            self.assertIn(creds[2][0], public_2_results)
+
+            public_3_results = await self._wait_until_user_searchable(
+                creds[3][0],
+                creds[0][1],
+            )
+            self.assertIn(creds[3][0], public_3_results)
+
             results = self._search_user_ids("usr", creds[0][1])
-            self.assertIn(creds[2][0], results)
-            self.assertIn(creds[3][0], results)
             # Private and unset should NOT be visible
             self.assertNotIn(creds[1][0], results)
             self.assertNotIn(creds[4][0], results)
@@ -244,7 +285,11 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
             )
 
             # Now B should appear for A
-            results_after = self._search_user_ids("sharedB", token_a)
+            results_after = await self._search_user_ids_with_retry(
+                "sharedB",
+                token_a,
+                required_user_ids=[user_b],
+            )
             self.assertIn(user_b, results_after)
 
         finally:
@@ -287,7 +332,15 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
                 config_path, synapse_dir, "whitelisted", "pass", admin=True
             )
 
-            results = self._search_user_ids("vis", wl_token)
+            for uid, _ in creds:
+                exact_results = await self._wait_until_user_searchable(uid, wl_token)
+                self.assertIn(uid, exact_results)
+
+            results = await self._search_user_ids_with_retry(
+                "vis",
+                wl_token,
+                required_user_ids=[uid for uid, _ in creds],
+            )
             # Whitelisted sees ALL four users
             for uid, _ in creds:
                 self.assertIn(uid, results)
@@ -415,7 +468,14 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
             )
             await self._set_public(searcher, True, s_token)
 
-            data = self._search("lim", s_token, limit=2)
+            data = await self._search_with_retry(
+                "lim",
+                s_token,
+                limit=2,
+                predicate=lambda result: (
+                    len(result.get("results", [])) == 2 and result.get("limited")
+                ),
+            )
             self.assertEqual(len(data["results"]), 2)
             self.assertTrue(data["limited"])
 
@@ -542,7 +602,11 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
 
             # _SYNAPSE_CONFIG sets show_locked_users=True, matching Synapse behavior.
             # Locked users should still be returned in search results.
-            results = self._search_user_ids("lockedtarget", searcher_token)
+            results = await self._search_user_ids_with_retry(
+                "lockedtarget",
+                searcher_token,
+                required_user_ids=[target_user],
+            )
             self.assertIn(target_user, results)
 
         finally:

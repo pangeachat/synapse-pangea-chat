@@ -166,3 +166,23 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
             "org.matrix.custom.html",
         )
         self.assertEqual(payload["notification"]["devices"][0]["pushkey"], "push-a")
+
+    def test_build_payload_sets_room_id_null_when_omitted(self):
+        handler = _make_handler()
+
+        payload = handler._build_payload(
+            "event-1",
+            {
+                "body": "hello",
+            },
+            {
+                "app_id": "app-a",
+                "pushkey": "push-a",
+                "pushkey_ts": 123,
+                "data": {},
+            },
+        )
+
+        self.assertIn("room_id", payload["notification"])
+        self.assertIsNone(payload["notification"]["room_id"])
+        self.assertEqual(payload["notification"]["content"]["body"], "hello")

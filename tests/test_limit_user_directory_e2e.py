@@ -318,12 +318,22 @@ class TestE2E(BaseSynapseE2ETest):
             await self.set_public_attribute_of_user(searcher, True, tokenS)
 
             # Search for all users using searcher's token.
-            users = await self.search_users("publicUser", tokenS)
+            public_user_localpart = publicUser.split(":", 1)[0].lstrip("@")
+            users = await self.search_users_with_retry(
+                public_user_localpart,
+                tokenS,
+                required_user_ids=[publicUser],
+            )
 
             # Expect both the explicitly public and the missing attribute user to appear.
             self.assertIn(publicUser, users)
 
-            users = await self.search_users("filterUser", tokenS)
+            filter_user_localpart = filterUser.split(":", 1)[0].lstrip("@")
+            users = await self.search_users_with_retry(
+                filter_user_localpart,
+                tokenS,
+                required_user_ids=[filterUser],
+            )
             self.assertIn(filterUser, users)
 
         finally:

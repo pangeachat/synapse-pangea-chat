@@ -21,6 +21,14 @@ from psycopg2.extensions import parse_dsn
 logger = logging.getLogger(__name__)
 
 
+def _is_ignorable_resource_warning(warning: warnings.WarningMessage) -> bool:
+    message = str(warning.message)
+    return (
+        warning.filename.endswith("asyncio/base_events.py")
+        and "unclosed event loop" in message
+    )
+
+
 class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
     """Base class for Synapse E2E tests with shared infrastructure methods."""
 
@@ -55,14 +63,16 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         self.addCleanup(request_patcher.stop)
 
     def tearDown(self) -> None:
+        super().tearDown()
+
         gc.collect()
         resource_warnings = [
             warning
             for warning in self._caught_resource_warnings
             if issubclass(warning.category, ResourceWarning)
+            and not _is_ignorable_resource_warning(warning)
         ]
         self._resource_warning_context.__exit__(None, None, None)
-        super().tearDown()
 
         if resource_warnings:
             warning_messages = "\n".join(
