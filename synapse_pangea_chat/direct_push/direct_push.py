@@ -7,7 +7,11 @@ import time
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from synapse.api.errors import AuthError, SynapseError
+from synapse.api.errors import (
+    AuthError,
+    InvalidClientTokenError,
+    MissingClientTokenError,
+)
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
@@ -18,7 +22,11 @@ from twisted.web.http_headers import Headers
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.direct_push.is_rate_limited import is_rate_limited
-from synapse_pangea_chat.direct_push.types import DeviceStatus, SendPushRequest, SendPushResponse
+from synapse_pangea_chat.direct_push.types import (
+    DeviceStatus,
+    SendPushRequest,
+    SendPushResponse,
+)
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -46,54 +54,84 @@ class DirectPush(Resource):
             requester_id = requester.user.to_string()
 
             if not await self._api.is_user_admin(requester_id):
-                respond_with_json(request, 403, {"error": "Admin access required"}, send_cors=True)
+                respond_with_json(
+                    request, 403, {"error": "Admin access required"}, send_cors=True
+                )
                 return
 
             if is_rate_limited(requester_id, self._config):
-                respond_with_json(request, 429, {"error": "Rate limited"}, send_cors=True)
+                respond_with_json(
+                    request, 429, {"error": "Rate limited"}, send_cors=True
+                )
                 return
 
             body = await self._extract_body_json(request)
             if body is None:
-                respond_with_json(request, 400, {"error": "Invalid JSON"}, send_cors=True)
+                respond_with_json(
+                    request, 400, {"error": "Invalid JSON"}, send_cors=True
+                )
                 return
 
             target_user_id = body.get("user_id")
             if not target_user_id:
-                respond_with_json(request, 400, {"error": "Missing user_id"}, send_cors=True)
+                respond_with_json(
+                    request, 400, {"error": "Missing user_id"}, send_cors=True
+                )
                 return
 
             device_id = body.get("device_id")
             room_id = body.get("room_id")
             if not room_id:
-                respond_with_json(request, 400, {"error": "Missing room_id"}, send_cors=True)
+                respond_with_json(
+                    request, 400, {"error": "Missing room_id"}, send_cors=True
+                )
                 return
 
             body_text = body.get("body")
             if not body_text:
-                respond_with_json(request, 400, {"error": "Missing body"}, send_cors=True)
+                respond_with_json(
+                    request, 400, {"error": "Missing body"}, send_cors=True
+                )
                 return
 
             response = await self._send_push(target_user_id, device_id, body)
             respond_with_json(request, 200, response, send_cors=True)
 
-        except AuthError as e:
-            respond_with_json(request, 401, {"error": str(e)}, send_cors=True)
-        except Exception as e:
+        except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
+            logger.info("Authentication failed: %s", e)
+            respond_with_json(
+                request,
+                401,
+                {"error": "Unauthorized", "errcode": "M_UNAUTHORIZED"},
+                send_cors=True,
+            )
+        except Exception:  # noqa: BLE001
             logger.exception("Error in direct_push endpoint")
-            respond_with_json(request, 500, {"error": "Internal server error"}, send_cors=True)
+            respond_with_json(
+                request, 500, {"error": "Internal server error"}, send_cors=True
+            )
 
-    async def _extract_body_json(self, request: SynapseRequest) -> Optional[Dict[str, Any]]:
+    async def _extract_body_json(
+        self, request: SynapseRequest
+    ) -> Optional[SendPushRequest]:
         try:
             content = request.content.read()
             if not content:
                 return {}
-            return json.loads(content)
+            parsed = json.loads(content)
         except (json.JSONDecodeError, ValueError):
             return None
 
+        if not isinstance(parsed, dict):
+            return None
+
+        return parsed
+
     async def _send_push(
-        self, target_user_id: str, device_id: Optional[str], req_body: Dict[str, Any]
+        self,
+        target_user_id: str,
+        device_id: Optional[str],
+        req_body: SendPushRequest,
     ) -> SendPushResponse:
         pushers = await self._get_pushers(target_user_id, device_id)
 
@@ -109,15 +147,22 @@ class DirectPush(Resource):
         if not pushers:
             return response
 
-        event_id = req_body.get("event_id") or f"push-{int(time.time())}-{secrets.token_hex(6)}"
+        event_id = (
+            req_body.get("event_id")
+            or f"push-{int(time.time())}-{secrets.token_hex(6)}"
+        )
 
         for pusher in pushers:
             device_id_key = pusher.get("device_id", "unknown")
-            status: DeviceStatus = {"sent": False, "app_id": pusher.get("app_id", ""), "pushkey": ""}
+            status: DeviceStatus = {
+                "sent": False,
+                "app_id": pusher.get("app_id", ""),
+                "pushkey": pusher.get("pushkey", ""),
+            }
 
             try:
-                payload = self._build_payload(target_user_id, event_id, req_body, pusher)
-                success = await self._post_to_sygnal(pusher["pushkey"], payload)
+                payload = self._build_payload(event_id, req_body, pusher)
+                success = await self._post_to_sygnal(payload)
 
                 if success:
                     status["sent"] = True
@@ -125,11 +170,13 @@ class DirectPush(Resource):
                 else:
                     response["failed"] += 1
                     status["error"] = "Sygnal returned error"
+                    response["errors"].append(f"{device_id_key}: {status['error']}")
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 response["failed"] += 1
                 status["error"] = str(e)
-                logger.exception(f"Error posting to Sygnal for {device_id_key}")
+                response["errors"].append(f"{device_id_key}: {status['error']}")
+                logger.exception("Error posting to Sygnal for %s", device_id_key)
 
             response["devices"][device_id_key] = status
 
@@ -138,30 +185,29 @@ class DirectPush(Resource):
     async def _get_pushers(
         self, user_id: str, device_id: Optional[str]
     ) -> list[Dict[str, Any]]:
-        try:
-            pushers_iter = await self._datastores.main.get_pushers_by_user_id(user_id)
-            pushers = []
-            async for pusher in pushers_iter:
-                if not pusher.enabled:
-                    continue
-                if device_id and pusher.device_id != device_id:
-                    continue
-                pushers.append(
-                    {
-                        "device_id": pusher.device_id,
-                        "app_id": pusher.app_id,
-                        "pushkey": pusher.pushkey,
-                        "pushkey_ts": pusher.pushkey_ts,
-                        "data": pusher.data,
-                    }
-                )
-            return pushers
-        except Exception as e:
-            logger.exception(f"Error fetching pushers for {user_id}")
-            return []
+        pushers_iter = await self._datastores.main.get_pushers_by_user_id(user_id)
+        pushers = []
+        for pusher in pushers_iter:
+            if not pusher.enabled:
+                continue
+            if device_id and pusher.device_id != device_id:
+                continue
+            pushers.append(
+                {
+                    "device_id": pusher.device_id,
+                    "app_id": pusher.app_id,
+                    "pushkey": pusher.pushkey,
+                    "pushkey_ts": pusher.pushkey_ts,
+                    "data": pusher.data,
+                }
+            )
+        return pushers
 
     def _build_payload(
-        self, user_id: str, event_id: str, req_body: Dict[str, Any], pusher: Dict[str, Any]
+        self,
+        event_id: str,
+        req_body: SendPushRequest,
+        pusher: Dict[str, Any],
     ) -> Dict[str, Any]:
         return {
             "notification": {
@@ -191,7 +237,7 @@ class DirectPush(Resource):
             }
         }
 
-    async def _post_to_sygnal(self, pushkey: str, payload: Dict[str, Any]) -> bool:
+    async def _post_to_sygnal(self, payload: Dict[str, Any]) -> bool:
         try:
             agent = Agent(reactor)
             url = b"https://sygnal.pangea.chat/_matrix/push/v1/notify"
@@ -209,10 +255,10 @@ class DirectPush(Resource):
             await readBody(response)
 
             if response.code >= 400:
-                logger.warning(f"Sygnal returned {response.code}")
+                logger.warning("Sygnal returned %s", response.code)
                 return False
 
             return True
-        except Exception as e:
-            logger.exception(f"Error posting to Sygnal: {e}")
+        except Exception:  # noqa: BLE001
+            logger.exception("Error posting to Sygnal")
             return False

@@ -369,9 +369,18 @@ class PangeaChat:
         invite_by_email_burst_duration_seconds = config.get(
             "invite_by_email_burst_duration_seconds", 60
         )
-        app_base_url = config.get(
-            "app_base_url", "https://app.pangea.chat"
+        app_base_url = config.get("app_base_url", "https://app.pangea.chat")
+
+        # --- send_push config ---
+        send_push_requests_per_burst = config.get("send_push_requests_per_burst", 10)
+        if send_push_requests_per_burst < 1:
+            raise ValueError("send_push_requests_per_burst must be >= 1")
+
+        send_push_burst_duration_seconds = config.get(
+            "send_push_burst_duration_seconds", 1
         )
+        if send_push_burst_duration_seconds < 1:
+            raise ValueError("send_push_burst_duration_seconds must be >= 1")
 
         return PangeaChatConfig(
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
@@ -407,4 +416,6 @@ class PangeaChat:
             invite_by_email_requests_per_burst=invite_by_email_requests_per_burst,
             invite_by_email_burst_duration_seconds=invite_by_email_burst_duration_seconds,
             app_base_url=app_base_url,
+            send_push_requests_per_burst=send_push_requests_per_burst,
+            send_push_burst_duration_seconds=send_push_burst_duration_seconds,
         )
