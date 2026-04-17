@@ -100,6 +100,37 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_get_pushers_falls_back_to_ts_when_pushkey_ts_missing(self):
+        handler = _make_handler()
+        pushers = [
+            SimpleNamespace(
+                enabled=True,
+                device_id="device-a",
+                app_id="app",
+                pushkey="push-a",
+                ts=99,
+                data={"brand": "ios"},
+            )
+        ]
+        handler._datastores.main.get_pushers_by_user_id = AsyncMock(
+            return_value=_iter(pushers)
+        )
+
+        result = await handler._get_pushers("@alice:my.domain.name", None)
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "device_id": "device-a",
+                    "app_id": "app",
+                    "pushkey": "push-a",
+                    "pushkey_ts": 99,
+                    "data": {"brand": "ios"},
+                }
+            ],
+        )
+
     async def test_send_push_tracks_success_and_failures_per_device(self):
         handler = _make_handler()
         handler._get_pushers = AsyncMock(
@@ -166,3 +197,21 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
             "org.matrix.custom.html",
         )
         self.assertEqual(payload["notification"]["devices"][0]["pushkey"], "push-a")
+
+    def test_build_payload_allows_missing_pushkey_ts(self):
+        handler = _make_handler()
+
+        payload = handler._build_payload(
+            "event-1",
+            {
+                "room_id": "!room:test",
+                "body": "hello",
+            },
+            {
+                "app_id": "app-a",
+                "pushkey": "push-a",
+                "data": {},
+            },
+        )
+
+        self.assertIsNone(payload["notification"]["devices"][0]["pushkey_ts"])

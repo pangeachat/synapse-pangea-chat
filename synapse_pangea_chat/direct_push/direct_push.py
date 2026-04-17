@@ -192,12 +192,13 @@ class DirectPush(Resource):
                 continue
             if device_id and pusher.device_id != device_id:
                 continue
+            pushkey_ts = getattr(pusher, "pushkey_ts", getattr(pusher, "ts", None))
             pushers.append(
                 {
                     "device_id": pusher.device_id,
                     "app_id": pusher.app_id,
                     "pushkey": pusher.pushkey,
-                    "pushkey_ts": pusher.pushkey_ts,
+                    "pushkey_ts": pushkey_ts,
                     "data": pusher.data,
                 }
             )
@@ -229,7 +230,7 @@ class DirectPush(Resource):
                     {
                         "app_id": pusher["app_id"],
                         "pushkey": pusher["pushkey"],
-                        "pushkey_ts": pusher["pushkey_ts"],
+                        "pushkey_ts": pusher.get("pushkey_ts"),
                         "data": pusher["data"],
                         "tweaks": {},
                     }
