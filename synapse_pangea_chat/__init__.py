@@ -382,6 +382,13 @@ class PangeaChat:
         if send_push_burst_duration_seconds < 1:
             raise ValueError("send_push_burst_duration_seconds must be >= 1")
 
+        send_push_sygnal_url = config.get("send_push_sygnal_url")
+        if send_push_sygnal_url is not None:
+            if not isinstance(send_push_sygnal_url, str):
+                raise ValueError('Config "send_push_sygnal_url" must be a string')
+            if not send_push_sygnal_url.strip():
+                raise ValueError('Config "send_push_sygnal_url" must not be empty')
+
         return PangeaChatConfig(
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
@@ -418,4 +425,5 @@ class PangeaChat:
             app_base_url=app_base_url,
             send_push_requests_per_burst=send_push_requests_per_burst,
             send_push_burst_duration_seconds=send_push_burst_duration_seconds,
+            send_push_sygnal_url=send_push_sygnal_url,
         )

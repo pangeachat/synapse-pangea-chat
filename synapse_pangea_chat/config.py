@@ -84,3 +84,4 @@ class PangeaChatConfig:
     # --- send_push config ---
     send_push_requests_per_burst: int = 10
     send_push_burst_duration_seconds: int = 1
+    send_push_sygnal_url: Optional[str] = None
