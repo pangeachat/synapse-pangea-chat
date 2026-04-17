@@ -63,8 +63,8 @@ class TestDirectPushE2E(BaseSynapseE2ETest):
                 postgres=postgres,
             )
 
-    async def test_send_push_missing_room_id(self):
-        """Missing room_id returns 400."""
+    async def test_send_push_missing_room_id_is_accepted(self):
+        """Missing room_id still accepts the request."""
         (
             postgres,
             synapse_dir,
@@ -86,7 +86,10 @@ class TestDirectPushE2E(BaseSynapseE2ETest):
                 headers={"Authorization": f"Bearer {admin_token}"},
             )
 
-            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data["attempted"], 0)
+            self.assertEqual(data["sent"], 0)
         finally:
             self.stop_synapse(
                 server_process=server_process,

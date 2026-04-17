@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, TypedDict
 class SendPushRequest(TypedDict, total=False):
     user_id: str
     device_id: Optional[str]
-    room_id: str
+    room_id: Optional[str]
     event_id: str
     body: str
     title: Optional[str]

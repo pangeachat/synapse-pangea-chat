@@ -80,13 +80,6 @@ class DirectPush(Resource):
                 return
 
             device_id = body.get("device_id")
-            room_id = body.get("room_id")
-            if not room_id:
-                respond_with_json(
-                    request, 400, {"error": "Missing room_id"}, send_cors=True
-                )
-                return
-
             body_text = body.get("body")
             if not body_text:
                 respond_with_json(

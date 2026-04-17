@@ -89,7 +89,7 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
         *,
         required_user_ids: List[str],
         retries: int = 20,
-        delay_seconds: float = 0.25,
+        delay_seconds: float = 0.5,
     ) -> List[str]:
         last_results: List[str] = []
         required = set(required_user_ids)
