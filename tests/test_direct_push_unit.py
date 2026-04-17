@@ -9,11 +9,15 @@ from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.direct_push.direct_push import DirectPush
 
 
-def _make_handler() -> DirectPush:
+def _make_handler(
+    send_push_sygnal_url: str | None = "https://sygnal.example.test",
+) -> DirectPush:
     api = MagicMock()
     api._hs.get_auth.return_value = MagicMock()
     api._hs.get_datastores.return_value = MagicMock()
-    return DirectPush(api, MagicMock())
+    config = MagicMock()
+    config.send_push_sygnal_url = send_push_sygnal_url
+    return DirectPush(api, config)
 
 
 def _iter(items):
@@ -28,11 +32,16 @@ class TestDirectPushConfig(unittest.TestCase):
                 "cms_service_api_key": "test-api-key",
                 "send_push_requests_per_burst": 25,
                 "send_push_burst_duration_seconds": 7,
+                "send_push_sygnal_url": "https://sygnal.example.test/_matrix/push/v1/notify",
             }
         )
 
         self.assertEqual(config.send_push_requests_per_burst, 25)
         self.assertEqual(config.send_push_burst_duration_seconds, 7)
+        self.assertEqual(
+            config.send_push_sygnal_url,
+            "https://sygnal.example.test/_matrix/push/v1/notify",
+        )
 
     def test_parse_config_rejects_invalid_send_push_values(self):
         with self.assertRaisesRegex(ValueError, "send_push_requests_per_burst"):
@@ -50,6 +59,15 @@ class TestDirectPushConfig(unittest.TestCase):
                     "cms_base_url": "http://cms.example.test",
                     "cms_service_api_key": "test-api-key",
                     "send_push_burst_duration_seconds": 0,
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, 'Config "send_push_sygnal_url"'):
+            PangeaChat.parse_config(
+                {
+                    "cms_base_url": "http://cms.example.test",
+                    "cms_service_api_key": "test-api-key",
+                    "send_push_sygnal_url": "",
                 }
             )
 
@@ -215,3 +233,28 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(payload["notification"]["devices"][0]["pushkey_ts"])
+
+    async def test_post_to_sygnal_uses_configured_url(self):
+        handler = _make_handler("https://sygnal.custom.test/_matrix/push/v1/notify")
+        fake_response = SimpleNamespace(code=200)
+        fake_agent = MagicMock()
+        fake_agent.request = AsyncMock(return_value=fake_response)
+
+        with (
+            unittest.mock.patch(
+                "synapse_pangea_chat.direct_push.direct_push.Agent",
+                return_value=fake_agent,
+            ),
+            unittest.mock.patch(
+                "synapse_pangea_chat.direct_push.direct_push.readBody",
+                new=AsyncMock(return_value=b"{}"),
+            ),
+        ):
+            result = await handler._post_to_sygnal({"notification": {}})
+
+        self.assertTrue(result)
+        fake_agent.request.assert_awaited_once()
+        self.assertEqual(
+            fake_agent.request.await_args.args[1],
+            b"https://sygnal.custom.test/_matrix/push/v1/notify",
+        )

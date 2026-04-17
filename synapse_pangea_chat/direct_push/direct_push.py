@@ -94,6 +94,15 @@ class DirectPush(Resource):
                 )
                 return
 
+            if not self._config.send_push_sygnal_url:
+                respond_with_json(
+                    request,
+                    500,
+                    {"error": "send_push_sygnal_url is not configured"},
+                    send_cors=True,
+                )
+                return
+
             response = await self._send_push(target_user_id, device_id, body)
             respond_with_json(request, 200, response, send_cors=True)
 
@@ -241,7 +250,7 @@ class DirectPush(Resource):
     async def _post_to_sygnal(self, payload: Dict[str, Any]) -> bool:
         try:
             agent = Agent(reactor)
-            url = b"https://sygnal.pangea.chat/_matrix/push/v1/notify"
+            url = self._config.send_push_sygnal_url.encode("utf-8")
             body_bytes = json.dumps(payload).encode("utf-8")
 
             producer = FileBodyProducer(BytesIO(body_bytes))
