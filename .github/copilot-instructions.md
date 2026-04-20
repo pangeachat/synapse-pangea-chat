@@ -15,3 +15,7 @@ Single entry-point class `PangeaChat` (`synapse_pangea_chat/__init__.py`) compos
 - **Entry point**: `synapse_pangea_chat/__init__.py` — `PangeaChat` class, registers all resources & callbacks
 - **Config**: `synapse_pangea_chat/config.py` — `PangeaChatConfig` (attrs, all keys optional with defaults)
 - **Config parsing**: `PangeaChat.parse_config()` in `__init__.py`
+
+## Feature Docs
+
+- [ensure-direct-message.instructions.md](instructions/ensure-direct-message.instructions.md) — server-admin endpoint for creating or repairing 1:1 DMs and `m.direct`
