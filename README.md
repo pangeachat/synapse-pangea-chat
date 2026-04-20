@@ -12,6 +12,7 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 |                                               |                                             | `GET /_synapse/client/pangea/v1/request_room_code`        | Generate a unique room access code                |
 | [Delete Room](#delete-room)                   | `synapse_pangea_chat/delete_room/`          | `POST /_synapse/client/pangea/v1/delete_room`             | Room deletion for highest-power-level members     |
 | [Delete User](#delete-user)                   | `synapse_pangea_chat/delete_user/`          | `POST /_synapse/client/pangea/v1/delete_user`             | Delete user associations then deactivate account   |
+| [Direct Message](#direct-message)             | `synapse_pangea_chat/direct_message/`       | `POST /_synapse/client/pangea/v1/ensure_direct_message`   | Create or repair a 1:1 DM for two local users     |
 | [Limit User Directory](#limit-user-directory) | `synapse_pangea_chat/limit_user_directory/` | _(spam checker)_                                          | Filter user directory by public profile attribute |
 
 ## Installation
@@ -232,6 +233,32 @@ Expose an endpoint for room admins (members with the highest power level) to kic
 Requester must be a member of the room and have the highest power level.
 
 _Originally: [pangeachat/synapse-delete-room-rest-api](https://github.com/pangeachat/synapse-delete-room-rest-api)_
+
+---
+
+## Direct Message
+
+Create or repair a 1:1 DM between two local users without needing either user's access token.
+
+**Route:** `POST /_synapse/client/pangea/v1/ensure_direct_message`
+
+**Body:** `{ "user_ids": ["@alice:example.com", "@bob:example.com"] }`
+
+Requester must be a Synapse server admin. The endpoint accepts exactly two distinct local user IDs, reuses an existing qualifying DM when possible, and repairs `m.direct` for both users so clients treat the room as a DM.
+
+**Response (200):**
+
+```json
+{
+  "room_id": "!room:example.com",
+  "created": true,
+  "reused": false,
+  "m_direct_updated_for": [
+    "@alice:example.com",
+    "@bob:example.com"
+  ]
+}
+```
 
 ---
 
