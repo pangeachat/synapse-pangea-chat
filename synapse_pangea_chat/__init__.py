@@ -4,6 +4,7 @@ from typing import Any, Dict, Mapping, Tuple
 from synapse.events import EventBase
 from synapse.module_api import ModuleApi
 
+from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.delete_room import DeleteRoom
 from synapse_pangea_chat.delete_user import DeleteUser
@@ -142,6 +143,13 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/register/email/requestToken",
             resource=self.register_email_resource,
+        )
+
+        # --- Assign Room Membership ---
+        self.assign_room_membership_resource = AssignRoomMembership(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/assign_room_membership",
+            resource=self.assign_room_membership_resource,
         )
 
         # --- Direct Message ---
