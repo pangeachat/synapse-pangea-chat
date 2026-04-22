@@ -35,6 +35,14 @@ logger = logging.getLogger("synapse.module.synapse_pangea_chat.direct_push")
 
 
 class DirectPush(Resource):
+    """Admin-only roomless push endpoint.
+
+    This path intentionally bypasses Matrix event persistence so callers can
+    deliver a push payload without attaching it to any room. The tradeoff is
+    that event-driven notification behavior, including normal email delivery,
+    is not triggered automatically by default.
+    """
+
     isLeaf = True
 
     def __init__(self, api: ModuleApi, config: PangeaChatConfig):
