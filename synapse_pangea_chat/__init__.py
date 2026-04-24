@@ -274,6 +274,18 @@ class PangeaChat:
         user_activity_burst_duration_seconds = config.get(
             "user_activity_burst_duration_seconds", 60
         )
+        user_activity_notification_bot_user_id = config.get(
+            "user_activity_notification_bot_user_id"
+        )
+        if user_activity_notification_bot_user_id is not None:
+            if not isinstance(user_activity_notification_bot_user_id, str):
+                raise ValueError(
+                    'Config "user_activity_notification_bot_user_id" must be a string'
+                )
+            if not user_activity_notification_bot_user_id.strip():
+                raise ValueError(
+                    'Config "user_activity_notification_bot_user_id" must not be empty'
+                )
 
         # --- delete_user config ---
         delete_user_requests_per_burst = config.get("delete_user_requests_per_burst", 5)
@@ -419,6 +431,7 @@ class PangeaChat:
             delete_room_burst_duration_seconds=delete_room_burst_duration_seconds,
             user_activity_requests_per_burst=user_activity_requests_per_burst,
             user_activity_burst_duration_seconds=user_activity_burst_duration_seconds,
+            user_activity_notification_bot_user_id=user_activity_notification_bot_user_id,
             delete_user_requests_per_burst=delete_user_requests_per_burst,
             delete_user_burst_duration_seconds=delete_user_burst_duration_seconds,
             delete_user_schedule_delay_seconds=delete_user_schedule_delay_seconds,
