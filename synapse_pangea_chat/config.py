@@ -48,6 +48,9 @@ class PangeaChatConfig:
     # --- user_activity config ---
     user_activity_requests_per_burst: int = 10
     user_activity_burst_duration_seconds: int = 60
+    # Bot user ID used by the notification_cooldown_ms filter to identify bot DM rooms.
+    # Required when using the notification_cooldown_ms query param.
+    user_activity_notification_bot_user_id: Optional[str] = None
 
     # --- delete_user config ---
     delete_user_requests_per_burst: int = 5
