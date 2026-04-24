@@ -44,7 +44,25 @@ class UserActivity(_AdminResourceBase):
     """GET /_synapse/client/pangea/v1/user_activity
 
     Paginated list of local users with activity metadata.
-    Query params: page (int, default 1), limit (int, default 50, max 200).
+
+    Query params:
+      page                   int  (default 1)
+      limit                  int  (default 50, max 200)
+      user_ids               str  comma-separated Matrix user IDs to include
+      course_ids             str  comma-separated room IDs; include only
+                                  members of these course rooms
+      inactive_days          int  return only users whose
+                                  max(last_login_ts, last_message_ts) is older
+                                  than this many days (or who have no activity)
+      notification_cooldown_ms int exclude users who have a p.room.notice from
+                                  the bot in their bot DM room within the last
+                                  N ms. Requires the
+                                  user_activity_notification_bot_user_id module
+                                  config field to be set.
+
+    NOTE: notification_cooldown_ms performs O(N candidates) account-data
+    lookups server-side. Use user_ids or course_ids to narrow the candidate
+    set when possible.
     """
 
     def render_GET(self, request: SynapseRequest):
@@ -68,8 +86,39 @@ class UserActivity(_AdminResourceBase):
 
             page = _int_param(request, b"page", default=1, minimum=1)
             limit = _int_param(request, b"limit", default=50, minimum=1, maximum=200)
+            user_ids = _list_param(request, b"user_ids")
+            course_ids = _list_param(request, b"course_ids")
+            inactive_days = _optional_int_param(request, b"inactive_days", minimum=1)
+            notification_cooldown_ms = _optional_int_param(
+                request, b"notification_cooldown_ms", minimum=1
+            )
 
-            data = await get_users(self._datastores.main, page=page, limit=limit)
+            if notification_cooldown_ms is not None and not (
+                self._config.user_activity_notification_bot_user_id
+            ):
+                respond_with_json(
+                    request,
+                    400,
+                    {
+                        "error": "notification_cooldown_ms requires the "
+                        "user_activity_notification_bot_user_id module "
+                        "config field to be set"
+                    },
+                    send_cors=True,
+                )
+                return
+
+            data = await get_users(
+                self._datastores.main,
+                page=page,
+                limit=limit,
+                user_ids=user_ids,
+                course_ids=course_ids,
+                inactive_days=inactive_days,
+                notification_cooldown_ms=notification_cooldown_ms,
+                bot_user_id=self._config.user_activity_notification_bot_user_id,
+                api=self._api,
+            )
 
             respond_with_json(request, 200, data, send_cors=True)
 
@@ -269,3 +318,32 @@ def _str_param(request: SynapseRequest, name: bytes) -> str | None:
     if isinstance(raw, bytes):
         return raw.decode("utf-8")
     return str(raw)
+
+
+def _list_param(request: SynapseRequest, name: bytes) -> list[str] | None:
+    """Parse a comma-separated multi-value query param.
+
+    Returns None if the param is absent, an empty list if the value is blank,
+    or a list of non-empty stripped strings.
+    """
+    raw = _str_param(request, name)
+    if raw is None:
+        return None
+    return [v.strip() for v in raw.split(",") if v.strip()]
+
+
+def _optional_int_param(
+    request: SynapseRequest,
+    name: bytes,
+    *,
+    minimum: int = 1,
+) -> int | None:
+    """Parse an optional integer query param. Returns None if absent or unparseable."""
+    raw = request.args.get(name, [None])[0]  # type: ignore[arg-type]
+    if raw is None:
+        return None
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        return None
+    return max(minimum, val)

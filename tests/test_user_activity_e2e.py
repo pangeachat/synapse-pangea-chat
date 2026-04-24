@@ -371,3 +371,671 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
                 synapse_dir=synapse_dir,
                 postgres=postgres,
             )
+
+    async def test_user_ids_filter(self):
+        """user_ids param restricts results and totalDocs to the given users."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="user1",
+                password="pw1",
+                admin=False,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="user2",
+                password="pw2",
+                admin=False,
+            )
+            _, admin_token = await self.login_user("admin", "adminpw")
+
+            url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
+            response = requests.get(
+                url,
+                params={"user_ids": "@user1:my.domain.name,@user2:my.domain.name"},
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+
+            returned_ids = {u["user_id"] for u in data["docs"]}
+            self.assertEqual(
+                returned_ids,
+                {"@user1:my.domain.name", "@user2:my.domain.name"},
+            )
+            self.assertEqual(data["totalDocs"], 2)
+            self.assertNotIn("@admin:my.domain.name", returned_ids)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_course_ids_filter(self):
+        """course_ids param returns only members of those course rooms."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="member",
+                password="pw1",
+                admin=False,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="nonmember",
+                password="pw2",
+                admin=False,
+            )
+            _, admin_token = await self.login_user("admin", "adminpw")
+            _, member_token = await self.login_user("member", "pw1")
+
+            # Create a course room
+            course_resp = requests.post(
+                f"{self.server_url}/_matrix/client/v3/createRoom",
+                json={
+                    "preset": "public_chat",
+                    "initial_state": [
+                        {
+                            "type": "pangea.course_plan",
+                            "state_key": "",
+                            "content": {"uuid": "c1"},
+                        },
+                    ],
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(course_resp.status_code, 200)
+            course_room_id = course_resp.json()["room_id"]
+
+            # member joins the course
+            requests.post(
+                f"{self.server_url}/_matrix/client/v3/join/{course_room_id}",
+                headers={"Authorization": f"Bearer {member_token}"},
+                timeout=30,
+            )
+
+            url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
+            response = requests.get(
+                url,
+                params={"course_ids": course_room_id},
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+
+            returned_ids = {u["user_id"] for u in data["docs"]}
+            # admin (creator) and member joined; nonmember did not
+            self.assertIn("@member:my.domain.name", returned_ids)
+            self.assertNotIn("@nonmember:my.domain.name", returned_ids)
+            self.assertEqual(data["totalDocs"], len(returned_ids))
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_user_ids_course_ids_intersection(self):
+        """When both user_ids and course_ids are supplied the result is the intersection."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="userA",
+                password="pwA",
+                admin=False,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="userB",
+                password="pwB",
+                admin=False,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="userC",
+                password="pwC",
+                admin=False,
+            )
+            _, admin_token = await self.login_user("admin", "adminpw")
+            _, token_a = await self.login_user("userA", "pwA")
+            _, token_c = await self.login_user("userC", "pwC")
+
+            # Create course; A and C join, B does not
+            course_resp = requests.post(
+                f"{self.server_url}/_matrix/client/v3/createRoom",
+                json={
+                    "preset": "public_chat",
+                    "initial_state": [
+                        {
+                            "type": "pangea.course_plan",
+                            "state_key": "",
+                            "content": {"uuid": "c2"},
+                        },
+                    ],
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(course_resp.status_code, 200)
+            course_room_id = course_resp.json()["room_id"]
+            requests.post(
+                f"{self.server_url}/_matrix/client/v3/join/{course_room_id}",
+                headers={"Authorization": f"Bearer {token_a}"},
+                timeout=30,
+            )
+            requests.post(
+                f"{self.server_url}/_matrix/client/v3/join/{course_room_id}",
+                headers={"Authorization": f"Bearer {token_c}"},
+                timeout=30,
+            )
+
+            # user_ids = A,B; course has A,C → intersection = A only
+            url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
+            response = requests.get(
+                url,
+                params={
+                    "user_ids": "@userA:my.domain.name,@userB:my.domain.name",
+                    "course_ids": course_room_id,
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+
+            returned_ids = {u["user_id"] for u in data["docs"]}
+            self.assertEqual(returned_ids, {"@userA:my.domain.name"})
+            self.assertEqual(data["totalDocs"], 1)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_inactive_days_filter(self):
+        """inactive_days excludes recently-active users and includes inactive ones."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="inactive_user",
+                password="pw1",
+                admin=False,
+            )
+            _, admin_token = await self.login_user("admin", "adminpw")
+            # Log in as inactive_user to create a user_ips entry, but
+            # inactive_days=1 (threshold = now - 86400000ms) means a just-logged-in
+            # admin will be excluded while inactive_user (no subsequent activity
+            # after login) will also fail the threshold immediately after login.
+            # Instead we use inactive_days=0 equivalent via minimum clamp to 1 day,
+            # and rely on the fact that inactive_user has never sent a message and
+            # a very large inactive_days filter to guarantee the admin's fresh login
+            # would NOT pass.
+            # For a deterministic test we filter by user_ids so we control exactly
+            # which user is checked.
+            _, _inactive_token = await self.login_user("inactive_user", "pw1")
+
+            # Wait for user_ips flush
+            await asyncio.sleep(6)
+
+            # inactive_days=3650 (10 years) — nobody logged in 10 years ago
+            # so both users pass. Verify both are returned when user_ids narrows scope.
+            url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
+            response = requests.get(
+                url,
+                params={
+                    "user_ids": "@inactive_user:my.domain.name",
+                    "inactive_days": "3650",
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            # inactive_user logged in just now → last_login_ts > threshold (10y ago)
+            # so they should be EXCLUDED (not inactive enough)
+            returned_ids = {u["user_id"] for u in data["docs"]}
+            self.assertNotIn("@inactive_user:my.domain.name", returned_ids)
+            self.assertEqual(data["totalDocs"], 0)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_inactive_days_never_active_included(self):
+        """Users with no login or message history are included with inactive_days."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="never_active",
+                password="pw1",
+                admin=False,
+            )
+            # Do NOT log in as never_active — no user_ips or events rows
+            _, admin_token = await self.login_user("admin", "adminpw")
+
+            url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
+            response = requests.get(
+                url,
+                params={
+                    "user_ids": "@never_active:my.domain.name",
+                    "inactive_days": "1",
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            returned_ids = {u["user_id"] for u in data["docs"]}
+            # last_login_ts=0 and last_message_ts=0 both pass the threshold → included
+            self.assertIn("@never_active:my.domain.name", returned_ids)
+            self.assertEqual(data["totalDocs"], 1)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_notification_cooldown_requires_bot_config(self):
+        """notification_cooldown_ms returns 400 when bot user ID is not configured."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+            # No user_activity_notification_bot_user_id in module config
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            _, admin_token = await self.login_user("admin", "adminpw")
+
+            url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
+            response = requests.get(
+                url,
+                params={"notification_cooldown_ms": "60000"},
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn(
+                "user_activity_notification_bot_user_id",
+                response.json().get("error", ""),
+            )
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_notification_cooldown_excludes_recently_notified(self):
+        """Users with a recent p.room.notice in their bot DM are excluded."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            bot_user_id = "@bot:my.domain.name"
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config={
+                    "user_activity_notification_bot_user_id": bot_user_id,
+                }
+            )
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="bot",
+                password="botpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="learner",
+                password="pw1",
+                admin=False,
+            )
+            _, admin_token = await self.login_user("admin", "adminpw")
+            _, bot_token = await self.login_user("bot", "botpw")
+            _, learner_token = await self.login_user("learner", "pw1")
+
+            # Create a DM room between bot and learner
+            dm_resp = requests.post(
+                f"{self.server_url}/_matrix/client/v3/createRoom",
+                json={
+                    "preset": "trusted_private_chat",
+                    "is_direct": True,
+                    "invite": ["@learner:my.domain.name"],
+                },
+                headers={"Authorization": f"Bearer {bot_token}"},
+                timeout=30,
+            )
+            self.assertEqual(dm_resp.status_code, 200)
+            dm_room_id = dm_resp.json()["room_id"]
+
+            # Learner accepts invite
+            requests.post(
+                f"{self.server_url}/_matrix/client/v3/join/{dm_room_id}",
+                headers={"Authorization": f"Bearer {learner_token}"},
+                timeout=30,
+            )
+
+            # Set m.direct account data for learner so the filter can find the DM
+            requests.put(
+                f"{self.server_url}/_matrix/client/v3/user/@learner:my.domain.name/account_data/m.direct",
+                json={bot_user_id: [dm_room_id]},
+                headers={"Authorization": f"Bearer {learner_token}"},
+                timeout=30,
+            )
+
+            # Bot sends a p.room.notice in the DM (simulates a recent notification)
+            send_resp = requests.put(
+                f"{self.server_url}/_matrix/client/v3/rooms/{dm_room_id}"
+                f"/send/p.room.notice/txn-notice-1",
+                json={"body": "Hey there!"},
+                headers={"Authorization": f"Bearer {bot_token}"},
+                timeout=30,
+            )
+            self.assertEqual(send_resp.status_code, 200)
+
+            # Filter with a large cooldown — learner was just notified
+            url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
+            response = requests.get(
+                url,
+                params={
+                    "user_ids": "@learner:my.domain.name",
+                    "notification_cooldown_ms": str(24 * 60 * 60 * 1000),  # 1 day
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            returned_ids = {u["user_id"] for u in data["docs"]}
+            self.assertNotIn("@learner:my.domain.name", returned_ids)
+            self.assertEqual(data["totalDocs"], 0)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_notification_cooldown_includes_expired(self):
+        """Users whose last bot notice is older than the cooldown are included."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            bot_user_id = "@bot:my.domain.name"
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config={
+                    "user_activity_notification_bot_user_id": bot_user_id,
+                }
+            )
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="admin",
+                password="adminpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="bot",
+                password="botpw",
+                admin=True,
+            )
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="learner",
+                password="pw1",
+                admin=False,
+            )
+            _, admin_token = await self.login_user("admin", "adminpw")
+            _, bot_token = await self.login_user("bot", "botpw")
+            _, learner_token = await self.login_user("learner", "pw1")
+
+            # Create DM, learner joins
+            dm_resp = requests.post(
+                f"{self.server_url}/_matrix/client/v3/createRoom",
+                json={
+                    "preset": "trusted_private_chat",
+                    "is_direct": True,
+                    "invite": ["@learner:my.domain.name"],
+                },
+                headers={"Authorization": f"Bearer {bot_token}"},
+                timeout=30,
+            )
+            self.assertEqual(dm_resp.status_code, 200)
+            dm_room_id = dm_resp.json()["room_id"]
+            requests.post(
+                f"{self.server_url}/_matrix/client/v3/join/{dm_room_id}",
+                headers={"Authorization": f"Bearer {learner_token}"},
+                timeout=30,
+            )
+            requests.put(
+                f"{self.server_url}/_matrix/client/v3/user/@learner:my.domain.name/account_data/m.direct",
+                json={bot_user_id: [dm_room_id]},
+                headers={"Authorization": f"Bearer {learner_token}"},
+                timeout=30,
+            )
+
+            # Bot sends a p.room.notice in the DM
+            requests.put(
+                f"{self.server_url}/_matrix/client/v3/rooms/{dm_room_id}"
+                f"/send/p.room.notice/txn-notice-2",
+                json={"body": "Hey there!"},
+                headers={"Authorization": f"Bearer {bot_token}"},
+                timeout=30,
+            )
+
+            # Use a tiny cooldown (1ms) — the notice was sent >1ms ago
+            url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
+            response = requests.get(
+                url,
+                params={
+                    "user_ids": "@learner:my.domain.name",
+                    "notification_cooldown_ms": "1",
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            returned_ids = {u["user_id"] for u in data["docs"]}
+            self.assertIn("@learner:my.domain.name", returned_ids)
+            self.assertEqual(data["totalDocs"], 1)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
