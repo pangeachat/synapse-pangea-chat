@@ -14,6 +14,7 @@ from synapse.api.errors import (
     InvalidClientCredentialsError,
     InvalidClientTokenError,
     MissingClientTokenError,
+    SynapseError,
 )
 from synapse.http import server
 from synapse.http.server import respond_with_json
@@ -99,6 +100,11 @@ class EnsureDirectMessage(Resource):
                     user_ids=canonical_user_ids,
                 )
 
+            power_levels_updated = await self._ensure_admin_power_levels(
+                user_ids=canonical_user_ids,
+                room_id=room_id,
+            )
+
             m_direct_updated_for: list[str] = []
             if await self._ensure_direct_entry(
                 canonical_user_ids[0], canonical_user_ids[1], room_id
@@ -117,6 +123,7 @@ class EnsureDirectMessage(Resource):
                     "created": created,
                     "reused": not created,
                     "m_direct_updated_for": m_direct_updated_for,
+                    "power_levels_updated": power_levels_updated,
                 },
                 send_cors=True,
             )
@@ -260,6 +267,12 @@ class EnsureDirectMessage(Resource):
                 "visibility": "private",
                 "invite": [user_ids[1]],
                 "is_direct": True,
+                "power_level_content_override": {
+                    "users": {
+                        user_ids[0]: 100,
+                        user_ids[1]: 100,
+                    }
+                },
             },
             ratelimit=False,
         )
@@ -312,6 +325,58 @@ class EnsureDirectMessage(Resource):
             action="join",
             ratelimit=False,
         )
+
+    async def _ensure_admin_power_levels(
+        self, user_ids: Sequence[str], room_id: str
+    ) -> bool:
+        """Ensure both users have power level 100 in the room.
+
+        Returns True if a power levels event was sent, False if no change was needed.
+        """
+        state = await self._api.get_room_state(
+            room_id, event_filter=[(EventTypes.PowerLevels, "")]
+        )
+        pl_event = state.get((EventTypes.PowerLevels, ""))
+        current_users: dict = {}
+        existing_content: dict = {}
+        if pl_event is not None:
+            existing_content = dict(pl_event.content)
+            current_users = dict(existing_content.get("users", {}))
+
+        if all(current_users.get(uid, 0) >= 100 for uid in user_ids):
+            return False
+
+        new_users = dict(current_users)
+        for uid in user_ids:
+            new_users[uid] = 100
+        new_content = dict(existing_content)
+        new_content["users"] = new_users
+
+        for sender in user_ids:
+            try:
+                await self._api.create_and_send_event_into_room(
+                    {
+                        "type": EventTypes.PowerLevels,
+                        "state_key": "",
+                        "room_id": room_id,
+                        "sender": sender,
+                        "content": new_content,
+                    }
+                )
+                return True
+            except SynapseError as e:
+                logger.warning(
+                    "Could not send power levels event as %s in room %s: %s",
+                    sender,
+                    room_id,
+                    e,
+                )
+
+        logger.warning(
+            "Failed to update power levels in room %s — neither user had sufficient PL",
+            room_id,
+        )
+        return False
 
     async def _ensure_direct_entry(
         self, user_id: str, counterpart_user_id: str, room_id: str
