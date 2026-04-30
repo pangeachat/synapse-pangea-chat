@@ -12,6 +12,9 @@ from synapse_pangea_chat.direct_message import EnsureDirectMessage
 from synapse_pangea_chat.direct_push import DirectPush
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
 from synapse_pangea_chat.export_user_data import ExportUserData
+from synapse_pangea_chat.grant_instructor_analytics_access import (
+    GrantInstructorAnalyticsAccess,
+)
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.public_courses import PublicCourses
 from synapse_pangea_chat.register_email import RegisterEmailRequestToken
@@ -150,6 +153,15 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/assign_room_membership",
             resource=self.assign_room_membership_resource,
+        )
+
+        # --- Grant Instructor Analytics Access ---
+        self.grant_instructor_analytics_access_resource = (
+            GrantInstructorAnalyticsAccess(api, config)
+        )
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/grant_instructor_analytics_access",
+            resource=self.grant_instructor_analytics_access_resource,
         )
 
         # --- Direct Message ---
