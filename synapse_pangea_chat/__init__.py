@@ -16,6 +16,10 @@ from synapse_pangea_chat.grant_instructor_analytics_access import (
     GrantInstructorAnalyticsAccess,
 )
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
+from synapse_pangea_chat.preview_with_code import (
+    DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
+    PreviewWithCode,
+)
 from synapse_pangea_chat.public_courses import PublicCourses
 from synapse_pangea_chat.register_email import RegisterEmailRequestToken
 from synapse_pangea_chat.room_code import KnockWithCode, RequestRoomCode
@@ -83,6 +87,13 @@ class PangeaChat:
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/request_room_code",
             resource=self.request_code_resource,
+        )
+
+        # --- Preview With Code ---
+        self.preview_with_code_resource = PreviewWithCode(api, config)
+        api.register_web_resource(
+            path="/_synapse/client/pangea/v1/preview_with_code",
+            resource=self.preview_with_code_resource,
         )
 
         # --- Create Course Space ---
@@ -271,6 +282,38 @@ class PangeaChat:
             "knock_with_code_burst_duration_seconds", 60
         )
 
+        # --- preview_with_code config ---
+        preview_with_code_requests_per_burst = config.get(
+            "preview_with_code_requests_per_burst", 5
+        )
+        if (
+            not isinstance(preview_with_code_requests_per_burst, int)
+            or preview_with_code_requests_per_burst < 1
+        ):
+            raise ValueError(
+                "preview_with_code_requests_per_burst must be an integer >= 1"
+            )
+        preview_with_code_burst_duration_seconds = config.get(
+            "preview_with_code_burst_duration_seconds", 60
+        )
+        if (
+            not isinstance(preview_with_code_burst_duration_seconds, int)
+            or preview_with_code_burst_duration_seconds < 1
+        ):
+            raise ValueError(
+                "preview_with_code_burst_duration_seconds must be an integer >= 1"
+            )
+        preview_with_code_state_event_types = config.get(
+            "preview_with_code_state_event_types",
+            list(DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES),
+        )
+        if not isinstance(preview_with_code_state_event_types, list) or not all(
+            isinstance(t, str) for t in preview_with_code_state_event_types
+        ):
+            raise ValueError(
+                "preview_with_code_state_event_types must be a list of strings"
+            )
+
         # --- delete_room config ---
         delete_room_requests_per_burst = config.get(
             "delete_room_requests_per_burst", 10
@@ -439,6 +482,9 @@ class PangeaChat:
             room_preview_requests_per_burst=room_preview_requests_per_burst,
             knock_with_code_requests_per_burst=knock_with_code_requests_per_burst,
             knock_with_code_burst_duration_seconds=knock_with_code_burst_duration_seconds,
+            preview_with_code_requests_per_burst=preview_with_code_requests_per_burst,
+            preview_with_code_burst_duration_seconds=preview_with_code_burst_duration_seconds,
+            preview_with_code_state_event_types=preview_with_code_state_event_types,
             delete_room_requests_per_burst=delete_room_requests_per_burst,
             delete_room_burst_duration_seconds=delete_room_burst_duration_seconds,
             user_activity_requests_per_burst=user_activity_requests_per_burst,
