@@ -41,6 +41,11 @@ class PangeaChatConfig:
     knock_with_code_requests_per_burst: int = 10
     knock_with_code_burst_duration_seconds: int = 60
 
+    # --- preview_with_code config ---
+    preview_with_code_requests_per_burst: int = 5
+    preview_with_code_burst_duration_seconds: int = 60
+    preview_with_code_state_event_types: List[str] = attr.Factory(list)
+
     # --- delete_room config ---
     delete_room_requests_per_burst: int = 10
     delete_room_burst_duration_seconds: int = 60
