@@ -274,9 +274,8 @@ class GrantInstructorAnalyticsAccess(Resource):
             if isinstance(raw_users_power_levels, dict):
                 users_power_levels = dict(raw_users_power_levels)
 
-        if (
-            create_event is not None
-            and create_event.room_version.msc4289_creator_power_enabled
+        if create_event is not None and getattr(
+            create_event.room_version, "msc4289_creator_power_enabled", False
         ):
             creators = create_event.content.get("additional_creators", []) + [
                 create_event.sender
