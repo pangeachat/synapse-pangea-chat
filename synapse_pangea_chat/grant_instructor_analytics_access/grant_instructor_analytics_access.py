@@ -74,22 +74,30 @@ class GrantInstructorAnalyticsAccess(Resource):
                 )
                 return
 
-            course_id = body.get("course_id")
-            if not isinstance(course_id, str) or not self._is_valid_room_id(course_id):
+            mx_course_id = body.get("mx_course_id")
+            if not isinstance(mx_course_id, str) or not self._is_valid_room_id(
+                mx_course_id
+            ):
                 respond_with_json(
                     request,
                     400,
-                    {"error": "'course_id' must be a valid room ID"},
+                    {"error": "'mx_course_id' must be a valid Matrix room ID"},
                     send_cors=True,
                 )
                 return
 
-            room_id = body.get("room_id")
-            if not isinstance(room_id, str) or not self._is_valid_room_id(room_id):
+            mx_analytics_room_id = body.get("mx_analytics_room_id")
+            if not isinstance(mx_analytics_room_id, str) or not self._is_valid_room_id(
+                mx_analytics_room_id
+            ):
                 respond_with_json(
                     request,
                     400,
-                    {"error": "'room_id' must be a valid room ID"},
+                    {
+                        "error": (
+                            "'mx_analytics_room_id' must be a valid Matrix room ID"
+                        )
+                    },
                     send_cors=True,
                 )
                 return
@@ -98,20 +106,20 @@ class GrantInstructorAnalyticsAccess(Resource):
                 caller_membership,
                 _,
             ) = await self._datastores.main.get_local_current_membership_for_user_in_room(
-                requester_id, course_id
+                requester_id, mx_course_id
             )
             if caller_membership != MEMBERSHIP_JOIN:
                 respond_with_json(
                     request,
                     403,
-                    {"error": "Caller is not a joined member of course_id"},
+                    {"error": "Caller is not a joined member of mx_course_id"},
                     send_cors=True,
                 )
                 return
 
             settings_event = (
                 await self._storage_controllers.state.get_current_state_event(
-                    course_id, COURSE_SETTINGS_STATE_EVENT_TYPE, ""
+                    mx_course_id, COURSE_SETTINGS_STATE_EVENT_TYPE, ""
                 )
             )
             if (
@@ -128,12 +136,15 @@ class GrantInstructorAnalyticsAccess(Resource):
 
             target_create_event = (
                 await self._storage_controllers.state.get_current_state_event(
-                    room_id, EventTypes.Create, ""
+                    mx_analytics_room_id, EventTypes.Create, ""
                 )
             )
             if target_create_event is None:
                 respond_with_json(
-                    request, 404, {"error": "Target room not found"}, send_cors=True
+                    request,
+                    404,
+                    {"error": "Analytics room not found"},
+                    send_cors=True,
                 )
                 return
 
@@ -156,7 +167,7 @@ class GrantInstructorAnalyticsAccess(Resource):
                 return
 
             instructor_ids = await self._get_course_instructor_ids(
-                course_id=course_id, caller_id=requester_id
+                mx_course_id=mx_course_id, caller_id=requester_id
             )
 
             instructors_joined: list[dict[str, Any]] = []
@@ -164,7 +175,7 @@ class GrantInstructorAnalyticsAccess(Resource):
             for instructor_id in instructor_ids:
                 try:
                     action = await self._force_join_instructor(
-                        room_id=room_id,
+                        mx_analytics_room_id=mx_analytics_room_id,
                         instructor_id=instructor_id,
                         inviter_id=requester_id,
                     )
@@ -175,7 +186,7 @@ class GrantInstructorAnalyticsAccess(Resource):
                     logger.info(
                         "Failed force-joining %s into %s: %s",
                         instructor_id,
-                        room_id,
+                        mx_analytics_room_id,
                         e,
                     )
                     errors.append(
@@ -189,8 +200,8 @@ class GrantInstructorAnalyticsAccess(Resource):
                 request,
                 200,
                 {
-                    "course_id": course_id,
-                    "room_id": room_id,
+                    "mx_course_id": mx_course_id,
+                    "mx_analytics_room_id": mx_analytics_room_id,
                     "instructors_joined": instructors_joined,
                     "errors": errors,
                 },
@@ -223,10 +234,10 @@ class GrantInstructorAnalyticsAccess(Resource):
         return True
 
     async def _get_course_instructor_ids(
-        self, course_id: str, caller_id: str
+        self, mx_course_id: str, caller_id: str
     ) -> list[str]:
         room_state = await self._api.get_room_state(
-            room_id=course_id,
+            room_id=mx_course_id,
             event_filter=[
                 (EventTypes.Create, ""),
                 (EventTypes.PowerLevels, ""),
@@ -302,13 +313,13 @@ class GrantInstructorAnalyticsAccess(Resource):
         return sorted(user_id for user_id, power in candidates if power == max_power)
 
     async def _force_join_instructor(
-        self, room_id: str, instructor_id: str, inviter_id: str
+        self, mx_analytics_room_id: str, instructor_id: str, inviter_id: str
     ) -> str:
         (
             current_membership,
             _,
         ) = await self._datastores.main.get_local_current_membership_for_user_in_room(
-            instructor_id, room_id
+            instructor_id, mx_analytics_room_id
         )
 
         if current_membership == MEMBERSHIP_JOIN:
@@ -318,14 +329,14 @@ class GrantInstructorAnalyticsAccess(Resource):
             await self._api.update_room_membership(
                 sender=inviter_id,
                 target=instructor_id,
-                room_id=room_id,
+                room_id=mx_analytics_room_id,
                 new_membership=MEMBERSHIP_INVITE,
             )
 
         await self._api.update_room_membership(
             sender=instructor_id,
             target=instructor_id,
-            room_id=room_id,
+            room_id=mx_analytics_room_id,
             new_membership=MEMBERSHIP_JOIN,
         )
         return "joined"

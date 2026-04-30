@@ -17,18 +17,18 @@ Lives in the `grant_instructor_analytics_access/` sub-package.
 ## Contract
 
 - **Auth**: Matrix access token of the student (caller).
-- **Request**: `{ "course_id": "!course:example.com", "room_id": "!analytics:example.com" }`
+- **Request**: `{ "mx_course_id": "!course:example.com", "mx_analytics_room_id": "!analytics:example.com" }`. Both fields are Matrix room IDs (the `mx_` prefix disambiguates them from CMS course-plan UUIDs).
 - **Validation**:
-  - `course_id` and `room_id` must be valid Matrix room IDs.
-  - Caller must be a joined member of `course_id` (403 otherwise).
+  - `mx_course_id` and `mx_analytics_room_id` must be valid Matrix room IDs.
+  - Caller must be a joined member of `mx_course_id` (403 otherwise).
   - Course's `pangea.course_settings` state event (state_key `""`) must have `require_analytics_access: true` (403 otherwise).
-  - Target room's `m.room.create` content must have `type: "p.analytics"` (403 otherwise).
+  - `mx_analytics_room_id`'s `m.room.create` content must have `type: "p.analytics"` (403 otherwise).
   - Caller must be the analytics room creator — the `m.room.create` sender (403 otherwise).
 
 ## Behavior
 
 - Reads the course room's joined-member list, computes effective power level for each (creator → 100 when MSC4289 is on, else `users[user_id]`, else `users_default`), and selects all local non-bot members whose effective power level is **strictly greater** than the caller's. Among those, only the highest-power-level cohort is granted.
-- For each instructor in the resulting set, performs an admin force-join into the analytics room. If the instructor is already joined, the action is `already_joined` and no event is generated. Otherwise the caller (who is the analytics room creator and therefore has invite power) is used as the inviter, then the instructor's own user is used as the sender of the join event.
+- For each instructor in the resulting set, performs an admin force-join into `mx_analytics_room_id`. If the instructor is already joined, the action is `already_joined` and no event is generated. Otherwise the caller (who is the analytics room creator and therefore has invite power) is used as the inviter, then the instructor's own user is used as the sender of the join event.
 - Bot accounts are filtered by user ID pattern: `@bot:*`, `@bot-*:*`, `@*-bot:*`.
 - Federated target users are not supported — `is_mine` filters out non-local users from the candidate set.
 - Partial success is part of the contract. One instructor's failure does not prevent attempts for the remaining instructors.
@@ -42,7 +42,7 @@ A course with no candidate instructors (e.g., the caller is the highest-PL human
 
 ## Non-Goals
 
-- Discovering analytics rooms server-side. The client passes the `room_id` it just created or detected; the server validates and grants.
+- Discovering analytics rooms server-side. The client passes the `mx_analytics_room_id` it just created or detected; the server validates and grants.
 - Language matching. The client decides which analytics room corresponds to the course's target language.
 - Server-side toggle CRUD. The client writes the `pangea.course_settings` state event directly with normal room-power-level checks.
 - Retroactive grants for students who joined before the toggle was flipped on. The pangea-bot operator script `run_grant_instructor_analytics_access.py` remains the manual escape hatch for that case.

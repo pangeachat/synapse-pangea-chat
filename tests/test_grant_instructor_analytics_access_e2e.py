@@ -131,13 +131,16 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             response = requests.post(
                 self._endpoint(),
                 headers=self._headers(student_token),
-                json={"course_id": course_id, "room_id": analytics_room_id},
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                },
             )
 
             self.assertEqual(response.status_code, 200, response.text)
             data = response.json()
-            self.assertEqual(data["course_id"], course_id)
-            self.assertEqual(data["room_id"], analytics_room_id)
+            self.assertEqual(data["mx_course_id"], course_id)
+            self.assertEqual(data["mx_analytics_room_id"], analytics_room_id)
             self.assertEqual(
                 data["instructors_joined"],
                 [{"user_id": teacher_user_id, "action": "joined"}],
@@ -184,7 +187,10 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             first = requests.post(
                 self._endpoint(),
                 headers=self._headers(student_token),
-                json={"course_id": course_id, "room_id": analytics_room_id},
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                },
             )
             self.assertEqual(first.status_code, 200, first.text)
             self.assertEqual(
@@ -195,7 +201,10 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             second = requests.post(
                 self._endpoint(),
                 headers=self._headers(student_token),
-                json={"course_id": course_id, "room_id": analytics_room_id},
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                },
             )
             self.assertEqual(second.status_code, 200, second.text)
             self.assertEqual(
@@ -237,7 +246,10 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             response = requests.post(
                 self._endpoint(),
                 headers=self._headers(student_token),
-                json={"course_id": course_id, "room_id": analytics_room_id},
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                },
             )
 
             self.assertEqual(response.status_code, 403, response.text)
@@ -275,7 +287,10 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             response = requests.post(
                 self._endpoint(),
                 headers=self._headers(student_token),
-                json={"course_id": course_id, "room_id": analytics_room_id},
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                },
             )
 
             self.assertEqual(response.status_code, 403, response.text)
@@ -313,7 +328,10 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             response = requests.post(
                 self._endpoint(),
                 headers=self._headers(student_token),
-                json={"course_id": course_id, "room_id": non_analytics_room_id},
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": non_analytics_room_id,
+                },
             )
 
             self.assertEqual(response.status_code, 403, response.text)
@@ -356,7 +374,10 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             response = requests.post(
                 self._endpoint(),
                 headers=self._headers(student_b_token),
-                json={"course_id": course_id, "room_id": analytics_room_id},
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                },
             )
 
             self.assertEqual(response.status_code, 403, response.text)
@@ -398,7 +419,10 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             response = requests.post(
                 self._endpoint(),
                 headers=self._headers(student_token),
-                json={"course_id": course_id, "room_id": analytics_room_id},
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                },
             )
 
             self.assertEqual(response.status_code, 200, response.text)
@@ -437,7 +461,7 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             missing_course = requests.post(
                 self._endpoint(),
                 headers=self._headers(student_token),
-                json={"room_id": "!something:my.domain.name"},
+                json={"mx_analytics_room_id": "!something:my.domain.name"},
             )
             self.assertEqual(missing_course.status_code, 400, missing_course.text)
 
@@ -445,8 +469,8 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
                 self._endpoint(),
                 headers=self._headers(student_token),
                 json={
-                    "course_id": "not-a-room-id",
-                    "room_id": "!something:my.domain.name",
+                    "mx_course_id": "not-a-room-id",
+                    "mx_analytics_room_id": "!something:my.domain.name",
                 },
             )
             self.assertEqual(invalid_course.status_code, 400, invalid_course.text)
@@ -455,8 +479,8 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
                 self._endpoint(),
                 headers=self._headers(student_token),
                 json={
-                    "course_id": "!something:my.domain.name",
-                    "room_id": "not-a-room-id",
+                    "mx_course_id": "!something:my.domain.name",
+                    "mx_analytics_room_id": "not-a-room-id",
                 },
             )
             self.assertEqual(invalid_room.status_code, 400, invalid_room.text)
@@ -483,8 +507,8 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             response = requests.post(
                 self._endpoint(),
                 json={
-                    "course_id": "!course:my.domain.name",
-                    "room_id": "!analytics:my.domain.name",
+                    "mx_course_id": "!course:my.domain.name",
+                    "mx_analytics_room_id": "!analytics:my.domain.name",
                 },
             )
             self.assertEqual(response.status_code, 401, response.text)
