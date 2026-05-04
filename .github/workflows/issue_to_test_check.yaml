@@ -1,0 +1,11 @@
+name: Issue TO TEST enforcement
+
+on:
+  issues:
+    types: [opened, edited, closed]
+
+jobs:
+  process:
+    uses: pangeachat/.github/.github/workflows/reusable-issue-to-test-check.yaml@main
+    permissions:
+      issues: write
