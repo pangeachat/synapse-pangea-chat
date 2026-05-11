@@ -99,7 +99,7 @@ class KnockWithCode(Resource):
                 or not access_code.isalnum()
                 or not any(char.isdigit() for char in access_code)  # At least one digit
             ):
-                logger.error(f"Invalid 'access_code': {access_code}")
+                logger.warning(f"Invalid 'access_code': {access_code}")
                 respond_with_json(
                     request,
                     400,
