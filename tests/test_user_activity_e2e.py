@@ -577,7 +577,8 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
                 admin=False,
             )
             _, admin_token = await self.login_user("admin", "adminpw")
-            _, token_a = await self.login_user("userA", "pwA")
+            user_a_id, token_a = await self.login_user("userA", "pwA")
+            user_b_id, _ = await self.login_user("userB", "pwB")
             _, token_c = await self.login_user("userC", "pwC")
 
             # Create course; A and C join, B does not
@@ -609,12 +610,12 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
                 timeout=30,
             )
 
-            # user_ids = A,B; course has A,C → intersection = A only
+            # user_ids = A,B; course has A,C -> intersection = A only.
             url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
             response = requests.get(
                 url,
                 params={
-                    "user_ids": "@userA:my.domain.name,@userB:my.domain.name",
+                    "user_ids": f"{user_a_id},{user_b_id}",
                     "course_ids": course_room_id,
                 },
                 headers={"Authorization": f"Bearer {admin_token}"},
@@ -624,7 +625,7 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
             data = response.json()
 
             returned_ids = {u["user_id"] for u in data["docs"]}
-            self.assertEqual(returned_ids, {"@userA:my.domain.name"})
+            self.assertEqual(returned_ids, {user_a_id})
             self.assertEqual(data["totalDocs"], 1)
 
         finally:
@@ -668,28 +669,27 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
                 admin=False,
             )
             _, admin_token = await self.login_user("admin", "adminpw")
-            # Log in as inactive_user to create a user_ips entry, but
-            # inactive_days=1 (threshold = now - 86400000ms) means a just-logged-in
-            # admin will be excluded while inactive_user (no subsequent activity
-            # after login) will also fail the threshold immediately after login.
-            # Instead we use inactive_days=0 equivalent via minimum clamp to 1 day,
-            # and rely on the fact that inactive_user has never sent a message and
-            # a very large inactive_days filter to guarantee the admin's fresh login
-            # would NOT pass.
-            # For a deterministic test we filter by user_ids so we control exactly
-            # which user is checked.
-            _, _inactive_token = await self.login_user("inactive_user", "pw1")
+            inactive_user_id, inactive_token = await self.login_user(
+                "inactive_user", "pw1"
+            )
 
-            # Wait for user_ips flush
-            await asyncio.sleep(6)
+            # Send a real message so the inactivity filter has deterministic
+            # activity data even when Synapse does not flush user_ips in tests.
+            room_id = await self.create_private_room(inactive_token)
+            message_resp = requests.put(
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/test-inactive-days",
+                json={"msgtype": "m.text", "body": "recent activity"},
+                headers={"Authorization": f"Bearer {inactive_token}"},
+                timeout=30,
+            )
+            self.assertEqual(message_resp.status_code, 200)
 
-            # inactive_days=3650 (10 years) — nobody logged in 10 years ago
-            # so both users pass. Verify both are returned when user_ids narrows scope.
+            # inactive_days=3650 (10 years) excludes users with recent messages.
             url = f"{self.server_url}/_synapse/client/pangea/v1/user_activity"
             response = requests.get(
                 url,
                 params={
-                    "user_ids": "@inactive_user:my.domain.name",
+                    "user_ids": inactive_user_id,
                     "inactive_days": "3650",
                 },
                 headers={"Authorization": f"Bearer {admin_token}"},
@@ -697,10 +697,8 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
             )
             self.assertEqual(response.status_code, 200)
             data = response.json()
-            # inactive_user logged in just now → last_login_ts > threshold (10y ago)
-            # so they should be EXCLUDED (not inactive enough)
             returned_ids = {u["user_id"] for u in data["docs"]}
-            self.assertNotIn("@inactive_user:my.domain.name", returned_ids)
+            self.assertNotIn(inactive_user_id, returned_ids)
             self.assertEqual(data["totalDocs"], 0)
 
         finally:

@@ -14,6 +14,7 @@ def _make_config(
     *,
     public_attribute_search_path: str = "profile.user_settings.public",
     whitelist_patterns: list | None = None,
+    candidate_patterns: list | None = None,
     filter_if_missing: bool = True,
 ):
     config = MagicMock()
@@ -22,6 +23,9 @@ def _make_config(
     )
     config.limit_user_directory_whitelist_requester_id_patterns = (
         whitelist_patterns or []
+    )
+    config.limit_user_directory_whitelist_candidate_user_id_patterns = (
+        candidate_patterns or []
     )
     config.limit_user_directory_filter_search_if_missing_public_attribute = (
         filter_if_missing
@@ -284,6 +288,37 @@ class TestWhitelistedRequester(unittest.IsolatedAsyncioTestCase):
 
         result = await handler.check_username_for_spam(
             {"user_id": "@alice:my.server"}, "@bob:my.server"
+        )
+        self.assertTrue(result)
+
+
+class TestWhitelistedCandidate(unittest.IsolatedAsyncioTestCase):
+    """Whitelisted candidate users bypass public-profile and shared-room checks."""
+
+    async def test_whitelisted_candidate_visible_without_public_profile(self):
+        """A configured bot candidate appears even when its public flag is missing."""
+        config = _make_config(
+            candidate_patterns=[r"^@bot:my\.server$"],
+        )
+        api = _make_api(global_account_data=None, shared_room_rows=[])
+        handler = _build_handler(api, config)
+
+        result = await handler.check_username_for_spam(
+            {"user_id": "@bot:my.server"}, "@learner:my.server"
+        )
+        self.assertFalse(result)
+        handler.room_store.db_pool.execute.assert_not_called()
+
+    async def test_non_whitelisted_candidate_still_filtered(self):
+        """The candidate allowlist is exact; other private users stay hidden."""
+        config = _make_config(
+            candidate_patterns=[r"^@bot:my\.server$"],
+        )
+        api = _make_api(global_account_data=None, shared_room_rows=[])
+        handler = _build_handler(api, config)
+
+        result = await handler.check_username_for_spam(
+            {"user_id": "@alice:my.server"}, "@learner:my.server"
         )
         self.assertTrue(result)
 

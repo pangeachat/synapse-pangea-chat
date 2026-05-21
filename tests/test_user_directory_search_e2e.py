@@ -40,12 +40,16 @@ def _module_config(
     filter_search_if_missing_public_attribute: bool = True,
     user_directory_search_requests_per_burst: int = 10,
     user_directory_search_burst_duration_seconds: int = 60,
+    whitelist_candidate_user_id_patterns: List[str] | None = None,
 ) -> dict:
     return {
         "limit_user_directory_public_attribute_search_path": "profile.user_settings.public",
         "limit_user_directory_whitelist_requester_id_patterns": [
             "@whitelisted:my.domain.name"
         ],
+        "limit_user_directory_whitelist_candidate_user_id_patterns": (
+            whitelist_candidate_user_id_patterns or []
+        ),
         "limit_user_directory_filter_search_if_missing_public_attribute": (
             filter_search_if_missing_public_attribute
         ),
@@ -291,6 +295,50 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
             # Whitelisted sees ALL four users
             for uid, _ in creds:
                 self.assertIn(uid, results)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_whitelisted_candidate_visible_without_public_profile(self) -> None:
+        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config=_module_config(
+                    whitelist_candidate_user_id_patterns=[r"^@bot:my\.domain\.name$"],
+                ),
+                synapse_config_overrides=_SYNAPSE_CONFIG,
+            )
+
+            (bot_user, _) = await self._register_and_login(
+                config_path, synapse_dir, "bot", "botpass"
+            )
+            (other_bot_user, _) = await self._register_and_login(
+                config_path, synapse_dir, "botfriend", "botfriendpass"
+            )
+            (_, searcher_token) = await self._register_and_login(
+                config_path, synapse_dir, "candidate_searcher", "pass"
+            )
+
+            results = await self._search_user_ids_with_retry(
+                "bot",
+                searcher_token,
+                required_user_ids=[bot_user],
+            )
+            self.assertIn(bot_user, results)
+            self.assertNotIn(other_bot_user, results)
 
         finally:
             self.stop_synapse(

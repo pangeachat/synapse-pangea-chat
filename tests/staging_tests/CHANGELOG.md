@@ -62,7 +62,8 @@ Consolidated 6 separate Synapse module entries into the single `synapse_pangea_c
 | Auto-Accept | *(no config)* | `auto_accept_invite_worker` | `None` (default) |
 | Limit User Dir | `public_attribute_search_path` | `limit_user_directory_public_attribute_search_path` | `profile.user_settings.public_profile` |
 | Limit User Dir | `filter_search_if_missing_public_attribute` | `limit_user_directory_filter_search_if_missing_public_attribute` | `true` |
-| Limit User Dir | `whitelist_requester_id_patterns` | `limit_user_directory_whitelist_requester_id_patterns` | `['^@bot:staging.pangea.chat$']` |
+| Limit User Dir | `whitelist_requester_id_patterns` | `limit_user_directory_whitelist_requester_id_patterns` | `[]` for normal users; requester bypass remains supported |
+| Limit User Dir | candidate bot allowlist | `limit_user_directory_whitelist_candidate_user_id_patterns` | `['^@bot:staging\\.pangea\\.chat$']` |
 | Public Courses | `public_courses_burst_duration_seconds` | `public_courses_burst_duration_seconds` | 120 |
 | Public Courses | `public_courses_requests_per_burst` | `public_courses_requests_per_burst` | 120 |
 | Public Courses | `course_plan_state_event_type` | `course_plan_state_event_type` | `pangea.course_plan` |
@@ -110,7 +111,7 @@ After deploying to staging, verify each feature still works through the unified 
 
 #### 7. Limit User Directory
 - [ ] User directory search filters users without `profile.user_settings.public_profile`
-- [ ] Bot user (`@bot:staging.pangea.chat`) bypasses the filter (whitelisted)
+- [ ] Bot user (`@bot:staging.pangea.chat`) appears for normal users via candidate allowlist
 - [ ] Users with the public attribute appear in search results normally
 
 #### 8. General
