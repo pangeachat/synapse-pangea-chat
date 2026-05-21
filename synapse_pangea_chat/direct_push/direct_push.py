@@ -5,7 +5,7 @@ import logging
 import secrets
 import time
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, cast
 
 from synapse.api.errors import (
     AuthError,
@@ -127,7 +127,7 @@ class DirectPush(Resource):
         try:
             content = request.content.read()
             if not content:
-                return {}
+                return cast(SendPushRequest, {})
             parsed = json.loads(content)
         except (json.JSONDecodeError, ValueError):
             return None
@@ -135,7 +135,7 @@ class DirectPush(Resource):
         if not isinstance(parsed, dict):
             return None
 
-        return parsed
+        return cast(SendPushRequest, parsed)
 
     async def _send_push(
         self,
@@ -251,7 +251,10 @@ class DirectPush(Resource):
     async def _post_to_sygnal(self, payload: Dict[str, Any]) -> bool:
         try:
             agent = Agent(reactor)
-            url = self._config.send_push_sygnal_url.encode("utf-8")
+            sygnal_url = self._config.send_push_sygnal_url
+            if sygnal_url is None:
+                return False
+            url = sygnal_url.encode("utf-8")
             body_bytes = json.dumps(payload).encode("utf-8")
 
             producer = FileBodyProducer(BytesIO(body_bytes))

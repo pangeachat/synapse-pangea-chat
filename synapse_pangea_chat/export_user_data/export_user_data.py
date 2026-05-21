@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import zipfile
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence, cast
 from urllib.parse import quote
 
 from synapse.api.errors import (
@@ -158,7 +158,7 @@ class ExportUserData(Resource):
         self._filepaths = MediaFilePaths(media_store_path)
 
         self._clock.looping_call(
-            run_as_background_process,
+            cast(Any, run_as_background_process),
             _looping_call_interval_seconds(
                 self._config.export_user_data_processor_interval_seconds
             ),

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from typing import Any, cast
 
 import requests
 
@@ -237,7 +238,7 @@ class TestE2E(BaseSynapseE2ETest):
         }
         response = requests.post(
             create_space_url,
-            json=create_space_data,
+            json=cast(Any, create_space_data),
             headers=headers,
         )
         self.assertEqual(response.status_code, 200)

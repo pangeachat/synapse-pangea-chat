@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast
 from urllib.parse import quote
 
 import psycopg2
@@ -341,7 +341,7 @@ class TestE2E(BaseSynapseE2ETest):
 
         response = requests.post(
             create_room_url,
-            json=create_room_data,
+            json=cast(Any, create_room_data),
             headers=headers,
         )
         self.assertEqual(response.status_code, 200)
@@ -1024,7 +1024,7 @@ class TestE2E(BaseSynapseE2ETest):
 
         response = requests.post(
             create_room_url,
-            json=create_room_data,
+            json=cast(Any, create_room_data),
             headers=headers,
         )
         self.assertEqual(response.status_code, 200)
@@ -1232,7 +1232,7 @@ class TestE2E(BaseSynapseE2ETest):
 
             response = requests.post(
                 create_room_url,
-                json=create_room_data,
+                json=cast(Any, create_room_data),
                 headers=headers,
             )
             self.assertEqual(response.status_code, 200)
@@ -1496,7 +1496,7 @@ class TestE2E(BaseSynapseE2ETest):
 
         response = requests.post(
             create_room_url,
-            json=create_room_data,
+            json=cast(Any, create_room_data),
             headers=headers,
         )
         self.assertEqual(response.status_code, 200)
@@ -1556,7 +1556,7 @@ class TestE2E(BaseSynapseE2ETest):
 
             response = requests.post(
                 create_room_url,
-                json=create_room_data,
+                json=cast(Any, create_room_data),
                 headers=headers,
             )
             self.assertEqual(response.status_code, 200)
@@ -1748,7 +1748,7 @@ class TestE2E(BaseSynapseE2ETest):
 
         response = requests.post(
             create_room_url,
-            json=create_room_data,
+            json=cast(Any, create_room_data),
             headers=headers,
         )
         self.assertEqual(response.status_code, 200)

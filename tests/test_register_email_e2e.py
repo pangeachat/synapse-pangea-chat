@@ -2,7 +2,7 @@ import asyncio
 import logging
 import socket
 import threading
-from typing import List, Optional
+from typing import Any, List, Optional, cast
 
 import requests
 
@@ -732,12 +732,12 @@ class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
             }
 
             # First request
-            resp1 = requests.post(ENDPOINT, json=payload)
+            resp1 = requests.post(ENDPOINT, json=cast(Any, payload))
             self.assertEqual(resp1.status_code, 200, resp1.json())
             sid1 = resp1.json()["sid"]
 
             # Same request again (same send_attempt) — should return same sid
-            resp2 = requests.post(ENDPOINT, json=payload)
+            resp2 = requests.post(ENDPOINT, json=cast(Any, payload))
             self.assertEqual(resp2.status_code, 200, resp2.json())
             sid2 = resp2.json()["sid"]
 
@@ -1075,7 +1075,7 @@ class TestRegisterEmailRateLimit(BaseSynapseE2ETest):
             # First requests should succeed (or fail with username/email errors,
             # but NOT 429)
             for i in range(2):
-                response = requests.post(ENDPOINT, json=payload)
+                response = requests.post(ENDPOINT, json=cast(Any, payload))
                 self.assertNotEqual(
                     response.status_code,
                     429,
@@ -1083,7 +1083,7 @@ class TestRegisterEmailRateLimit(BaseSynapseE2ETest):
                 )
 
             # Next request should be rate limited
-            response = requests.post(ENDPOINT, json=payload)
+            response = requests.post(ENDPOINT, json=cast(Any, payload))
             self.assertEqual(response.status_code, 429)
             body = response.json()
             self.assertEqual(body["errcode"], "M_LIMIT_EXCEEDED")
