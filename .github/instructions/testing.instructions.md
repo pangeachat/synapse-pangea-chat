@@ -23,7 +23,7 @@ This repo uses a different model than the other Python repos — no `.txt` regis
 
 ```bash
 # Integration tests (local Synapse + PostgreSQL)
-python -m unittest discover -s tests -p 'test_*.py'
+python -m unittest discover -s tests -t . -p 'test_*.py'
 
 # Staging smoke-tests (requires .env with SYNAPSE_BASE_URL and SYNAPSE_AUTH_TOKEN)
 python -m unittest tests.staging_tests.staging_tests
@@ -48,7 +48,7 @@ CPPFLAGS="-I/opt/homebrew/opt/openssl@3/include -I/opt/homebrew/opt/libpq/includ
 # Run tests (postgres@17 + UTF-8 locale required at run time, not just install time)
 PATH="/opt/homebrew/opt/postgresql@17/bin:/opt/homebrew/opt/libpq/bin:$PATH" \
 LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
-.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+.venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'
 ```
 
 Why each piece:

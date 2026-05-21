@@ -33,7 +33,7 @@ class LimitUserDirectory:
 
         # Return true to *exclude* the user from the results.
         """
-        # Bypass the filter if the username matches the whitelist pattern.
+        # Bypass the filter if the requester matches the whitelist pattern.
         for (
             pattern
         ) in self._config.limit_user_directory_whitelist_requester_id_patterns:
@@ -41,6 +41,13 @@ class LimitUserDirectory:
                 return False
 
         user_id = user_profile["user_id"]
+
+        # Bypass the filter if the candidate user should be globally visible.
+        for (
+            pattern
+        ) in self._config.limit_user_directory_whitelist_candidate_user_id_patterns:
+            if re.match(pattern, user_id):
+                return False
 
         # For remote users, nothing to do.
         if not self._api.is_mine(user_id):

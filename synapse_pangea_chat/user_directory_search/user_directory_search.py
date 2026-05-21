@@ -118,6 +118,9 @@ class UserDirectorySearch(Resource):
                 whitelist_requester_id_patterns=(
                     self._config.limit_user_directory_whitelist_requester_id_patterns
                 ),
+                whitelist_candidate_user_id_patterns=(
+                    self._config.limit_user_directory_whitelist_candidate_user_id_patterns
+                ),
                 show_locked_users=self._api._hs.config.userdirectory.show_locked_users,
             )
 

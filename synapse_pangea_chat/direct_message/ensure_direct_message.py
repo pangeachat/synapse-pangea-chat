@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence, cast
 
 from synapse.api.constants import (
     AccountDataTypes,
@@ -176,8 +176,9 @@ class EnsureDirectMessage(Resource):
         return canonical_user_ids
 
     async def _find_existing_direct_room(self, user_ids: Sequence[str]) -> str | None:
-        first_user_rooms = await self._datastores.main.get_rooms_for_user(user_ids[0])
-        second_user_rooms = await self._datastores.main.get_rooms_for_user(user_ids[1])
+        store = cast(Any, self._datastores.main)
+        first_user_rooms = await store.get_rooms_for_user(user_ids[0])
+        second_user_rooms = await store.get_rooms_for_user(user_ids[1])
         shared_room_ids = sorted(first_user_rooms.intersection(second_user_rooms))
         if not shared_room_ids:
             return None
@@ -187,7 +188,7 @@ class EnsureDirectMessage(Resource):
         fallback_room_id = None
 
         for room_id in shared_room_ids:
-            members = set(await self._datastores.main.get_users_in_room(room_id))
+            members = set(await store.get_users_in_room(room_id))
             if members != set(user_ids):
                 continue
 

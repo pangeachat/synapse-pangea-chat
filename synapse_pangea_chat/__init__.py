@@ -419,6 +419,21 @@ class PangeaChat:
                     'Config "limit_user_directory_whitelist_requester_id_patterns" must be a list of strings'
                 )
 
+        limit_user_directory_whitelist_candidate_user_id_patterns = config.get(
+            "limit_user_directory_whitelist_candidate_user_id_patterns", []
+        )
+        if not isinstance(
+            limit_user_directory_whitelist_candidate_user_id_patterns, list
+        ):
+            raise ValueError(
+                'Config "limit_user_directory_whitelist_candidate_user_id_patterns" must be a list'
+            )
+        for pattern in limit_user_directory_whitelist_candidate_user_id_patterns:
+            if not isinstance(pattern, str):
+                raise ValueError(
+                    'Config "limit_user_directory_whitelist_candidate_user_id_patterns" must be a list of strings'
+                )
+
         limit_user_directory_filter_search_if_missing_public_attribute = config.get(
             "limit_user_directory_filter_search_if_missing_public_attribute", True
         )
@@ -502,6 +517,7 @@ class PangeaChat:
             cms_service_api_key=cms_service_api_key,
             limit_user_directory_public_attribute_search_path=limit_user_directory_public_attribute_search_path,
             limit_user_directory_whitelist_requester_id_patterns=limit_user_directory_whitelist_requester_id_patterns,
+            limit_user_directory_whitelist_candidate_user_id_patterns=limit_user_directory_whitelist_candidate_user_id_patterns,
             limit_user_directory_filter_search_if_missing_public_attribute=limit_user_directory_filter_search_if_missing_public_attribute,
             user_directory_search_requests_per_burst=user_directory_search_requests_per_burst,
             user_directory_search_burst_duration_seconds=user_directory_search_burst_duration_seconds,

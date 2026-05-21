@@ -92,6 +92,15 @@ _ORDER_BY = """
 _LOCKED_USER_FILTER = "(u.locked IS NULL OR u.locked = FALSE)"
 
 
+# ── candidate allowlist helper ───────────────────────────────────────
+
+
+def _build_candidate_user_id_condition(patterns: List[str]) -> str:
+    if not patterns:
+        return "FALSE"
+    return " OR ".join("d.user_id ~ ?" for _ in patterns)
+
+
 # ── JSON extraction helper ───────────────────────────────────────────
 
 
@@ -128,6 +137,7 @@ async def search_users_db(
     public_attribute_json_path: List[str],
     filter_if_missing_public_attribute: bool,
     whitelist_requester_id_patterns: List[str],
+    whitelist_candidate_user_id_patterns: List[str],
     show_locked_users: bool,
 ) -> Dict[str, Any]:
     """Search the user directory with visibility filtering done in SQL.
@@ -169,6 +179,7 @@ async def search_users_db(
         local_pattern=local_pattern,
         public_attribute_json_path=public_attribute_json_path,
         filter_if_missing_public_attribute=filter_if_missing_public_attribute,
+        whitelist_candidate_user_id_patterns=whitelist_candidate_user_id_patterns,
         show_locked_users=show_locked_users,
     )
 
@@ -230,12 +241,14 @@ async def _search_filtered(
     local_pattern: str,
     public_attribute_json_path: List[str],
     filter_if_missing_public_attribute: bool,
+    whitelist_candidate_user_id_patterns: List[str],
     show_locked_users: bool,
 ) -> Dict[str, Any]:
     """Search with visibility filtering in SQL.
 
     Visibility rules (mirrors ``LimitUserDirectory.check_username_for_spam``):
 
+    * Candidate user-id allowlist: always visible.
     * Remote users (``user_id NOT LIKE '%:<server>'``): always visible.
     * Local + public attribute ``true``: always visible.
     * Local + missing public attribute: behaviour set by config flag.
@@ -243,6 +256,9 @@ async def _search_filtered(
     """
     account_data_type = public_attribute_json_path[0]
     json_expr = _build_json_extraction_expr(public_attribute_json_path)
+    candidate_user_id_condition = _build_candidate_user_id_condition(
+        whitelist_candidate_user_id_patterns
+    )
     locked_where = "" if show_locked_users else f"AND {_LOCKED_USER_FILTER}"
 
     if filter_if_missing_public_attribute:
@@ -267,8 +283,10 @@ async def _search_filtered(
         WHERE d.user_id != ?
                     {locked_where}
           AND (
+            -- Candidate user-id allowlist: always visible
+            {candidate_user_id_condition}
             -- Remote users: always visible
-            d.user_id NOT LIKE ?
+            OR d.user_id NOT LIKE ?
             -- Public attribute is true
             OR LOWER({json_expr}) = 'true'
             -- Missing public attribute
@@ -291,6 +309,7 @@ async def _search_filtered(
         full_query,
         account_data_type,
         requester_id,
+        *whitelist_candidate_user_id_patterns,
         local_pattern,
     ]
 

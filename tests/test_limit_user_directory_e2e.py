@@ -2,7 +2,7 @@ import asyncio
 import logging
 import subprocess
 import sys
-from typing import List, Tuple, Union
+from typing import Any, List, Tuple, Union, cast
 
 import requests
 
@@ -232,7 +232,7 @@ class TestE2E(BaseSynapseE2ETest):
             response = requests.post(
                 create_room_url,
                 headers={"Authorization": f"Bearer {tokenA}"},
-                json=create_room_payload,
+                json=cast(Any, create_room_payload),
             )
             self.assertEqual(response.status_code, 200)
             room_id = response.json()["room_id"]

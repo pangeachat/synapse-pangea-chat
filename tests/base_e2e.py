@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import warnings
-from typing import IO, Any, Dict, Optional, Tuple, Union
+from typing import IO, Any, Dict, Optional, Tuple, Union, cast
 from unittest.mock import patch
 
 import aiounittest
@@ -413,7 +413,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         create_room_data = {"visibility": "private", "preset": "private_chat"}
         response = requests.post(
             create_room_url,
-            json=create_room_data,
+            json=cast(Any, create_room_data),
             headers=headers,
         )
         self.assertEqual(response.status_code, 200)
@@ -435,7 +435,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         }
         response = requests.post(
             create_room_url,
-            json=create_room_data,
+            json=cast(Any, create_room_data),
             headers=headers,
         )
         self.assertEqual(response.status_code, 200)

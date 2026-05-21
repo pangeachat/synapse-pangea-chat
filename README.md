@@ -62,6 +62,8 @@ modules:
       limit_user_directory_filter_search_if_missing_public_attribute: true
       limit_user_directory_whitelist_requester_id_patterns:
         - "^@admin:example.com$"
+      limit_user_directory_whitelist_candidate_user_id_patterns:
+        - "^@bot:example.com$"
 ```
 
 All config keys are optional and have sensible defaults. The `limit_user_directory` spam checker is only activated when `limit_user_directory_public_attribute_search_path` is set.

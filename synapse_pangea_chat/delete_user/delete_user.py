@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, cast
 from urllib.parse import quote
 
 from synapse.api.errors import (
@@ -76,7 +76,7 @@ class DeleteUser(Resource):
         self._schedule_table_ready = False
 
         self._clock.looping_call(
-            run_as_background_process,
+            cast(Any, run_as_background_process),
             _looping_call_interval_seconds(
                 self._config.delete_user_processor_interval_seconds
             ),
