@@ -282,39 +282,16 @@ async def get_room_preview(
         * len(config.room_preview_state_event_types)
     )
 
-    if "sqlite" in database_engine:
-        # SQLite query
-        query = f"""
-            SELECT e.room_id, e.type, e.state_key, ej.json
-            FROM events e
-                JOIN state_events se ON e.event_id = se.event_id
-                JOIN event_json ej ON e.event_id = ej.event_id
-            WHERE
-                e.room_id IN ({room_placeholders})
-                AND e.type IN ({event_type_placeholders})
-                AND se.room_id = e.room_id
-                AND se.type = e.type
-                AND (se.state_key = e.state_key OR (se.state_key IS NULL AND e.state_key IS NULL))
-            ORDER BY e.room_id, e.type, e.state_key, e.origin_server_ts DESC
-        """
-        params = tuple(rooms_to_fetch + config.room_preview_state_event_types)
-
-    else:
-        # PostgreSQL query
-        query = f"""
-            SELECT DISTINCT ON (e.room_id, e.type, e.state_key)
-                   e.room_id, e.type, e.state_key, ej.json
-            FROM events e
-            JOIN state_events se ON e.event_id = se.event_id
-            JOIN event_json ej ON e.event_id = ej.event_id
-            WHERE
-                e.room_id IN ({room_placeholders})
-                AND e.type IN ({event_type_placeholders})
-                AND se.type = e.type
-                AND (se.state_key = e.state_key OR (se.state_key IS NULL AND e.state_key IS NULL))
-            ORDER BY e.room_id, e.type, e.state_key, e.origin_server_ts DESC
-        """
-        params = tuple(rooms_to_fetch + config.room_preview_state_event_types)
+    query = f"""
+        SELECT cse.room_id, cse.type, cse.state_key, ej.json
+        FROM current_state_events cse
+        JOIN event_json ej ON cse.event_id = ej.event_id
+        WHERE
+            cse.room_id IN ({room_placeholders})
+            AND cse.type IN ({event_type_placeholders})
+        ORDER BY cse.room_id, cse.type, cse.state_key
+    """
+    params = tuple(rooms_to_fetch + config.room_preview_state_event_types)
 
     rows = await room_store.db_pool.execute(
         "get_room_preview_state_events",
