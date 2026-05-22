@@ -1187,7 +1187,7 @@ class TestE2E(BaseSynapseE2ETest):
                 f"{self.server_url}/_synapse/client/unstable/org.pangea/room_preview"
             )
             previews = []
-            for headers in (learner_headers, admin_headers):
+            for headers in (admin_headers, learner_headers):
                 response = requests.get(
                     room_preview_url,
                     params={"rooms": activity_room_id},
@@ -1211,6 +1211,94 @@ class TestE2E(BaseSynapseE2ETest):
                     summaries["vi"]["content"]["summary"]["summary"],
                     "current Vietnamese summary",
                 )
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_room_preview_activity_summary_respects_config(self):
+        """Activity summaries are omitted unless configured for room_preview."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config={
+                    "room_preview_state_event_types": ["pangea.activity_plan"]
+                },
+            )
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="summary_writer",
+                password="writer_pw",
+                admin=False,
+            )
+            _, token = await self.login_user("summary_writer", "writer_pw")
+            headers = {"Authorization": f"Bearer {token}"}
+            create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
+
+            room_response = requests.post(
+                create_room_url,
+                json={
+                    "visibility": "private",
+                    "preset": "private_chat",
+                    "initial_state": [
+                        {
+                            "type": "pangea.activity_plan",
+                            "state_key": "",
+                            "content": {"activity_id": "config-gated-summary"},
+                        }
+                    ],
+                    "name": "Config Gated Summary Activity",
+                },
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(room_response.status_code, 200)
+            room_id = room_response.json()["room_id"]
+            room_id_path = quote(room_id, safe="")
+
+            summary_response = requests.put(
+                f"{self.server_url}/_matrix/client/v3/rooms/"
+                f"{room_id_path}/state/pangea.activity_summary/en",
+                json={
+                    "summary": {
+                        "participants": [],
+                        "summary": "configured-out summary",
+                    }
+                },
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(summary_response.status_code, 200)
+
+            preview_response = requests.get(
+                f"{self.server_url}/_synapse/client/unstable/org.pangea/room_preview",
+                params={"rooms": room_id},
+                headers=headers,
+                timeout=30,
+            )
+            self.assertEqual(preview_response.status_code, 200)
+            room_data = preview_response.json()["rooms"][room_id]
+
+            self.assertIn("pangea.activity_plan", room_data)
+            self.assertNotIn("pangea.activity_summary", room_data)
 
         finally:
             self.stop_synapse(
