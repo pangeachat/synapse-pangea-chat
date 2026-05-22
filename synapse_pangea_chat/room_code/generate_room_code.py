@@ -2,6 +2,7 @@ import random
 import string
 
 
+# Planned improvement tracked at pangeachat/security#73 (private).
 def generate_access_code() -> str:
     """Generate 7 character alphanumeric access code with at least one digit."""
 
