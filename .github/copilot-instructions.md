@@ -15,9 +15,3 @@ Single entry-point class `PangeaChat` (`synapse_pangea_chat/__init__.py`) compos
 - **Entry point**: `synapse_pangea_chat/__init__.py` — `PangeaChat` class, registers all resources & callbacks
 - **Config**: `synapse_pangea_chat/config.py` — `PangeaChatConfig` (attrs, all keys optional with defaults)
 - **Config parsing**: `PangeaChat.parse_config()` in `__init__.py`
-
-## Feature Docs
-
-- [assign-room-membership.instructions.md](instructions/assign-room-membership.instructions.md) — server-admin endpoint for assigning local users to rooms without caller membership
-- [direct-push.instructions.md](instructions/direct-push.instructions.md) — server-admin endpoint for roomless lower-level push delivery without Matrix event persistence
-- [ensure-direct-message.instructions.md](instructions/ensure-direct-message.instructions.md) — server-admin endpoint for creating or repairing 1:1 DMs and `m.direct`
