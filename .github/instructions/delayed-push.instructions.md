@@ -10,16 +10,16 @@ Delayed push is an optional Synapse-module-only policy for normal Matrix HTTP pu
 ## Contract
 
 - Applies only to normal Synapse `HttpPusher` notifications. DirectPush, email pushers, and badge-only receipt updates remain unchanged.
-- Uses Synapse's per-user presence state as `state == "online" OR currently_active == true`. Unavailable, offline with `currently_active == false`, disabled presence, or presence lookup failure all send normally.
+- Uses Synapse's per-user presence `state == "online"` as the only active-user signal. Unavailable, offline even with stale `currently_active == true`, disabled presence, or presence lookup failure all send normally.
 - Read wins over every other state: if Synapse no longer returns a deferred event as unread, no notification is sent.
-- Unread events for online-or-currently-active users defer at the configured interval until the user becomes inactive or the event reaches the configured max age.
+- Unread events for online users defer at the configured interval until the user becomes offline/unavailable or the event reaches the configured max age.
 - The max delay clock is measured from the event origin timestamp, not from first deferral.
 - Deferral intentionally keeps the pusher cursor unchanged and accepts head-of-line blocking for that user's HTTP pusher/device. Other users and non-HTTP push paths are not blocked.
 - Fail open: delayed-push decision errors log and send normally.
 
 ## Synapse private API requirement
 
-This feature monkey-patches Synapse's private `HttpPusher` processing path. Keep it disabled by default and require an exact audited Synapse version when enabling it. Every Synapse upgrade must audit `synapse.push.httppusher.HttpPusher._unsafe_process`, `_start_processing`, pusher cursor advancement, and presence `state`/`currently_active` semantics before widening the allowed version.
+This feature monkey-patches Synapse's private `HttpPusher` processing path. Keep it disabled by default and require an exact audited Synapse version when enabling it. Every Synapse upgrade must audit `synapse.push.httppusher.HttpPusher._unsafe_process`, `_start_processing`, pusher cursor advancement, and presence `state` semantics before widening the allowed version.
 
 ## Rollout
 
