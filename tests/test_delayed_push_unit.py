@@ -56,12 +56,17 @@ class FakeReactor:
 
 
 class FakePresenceHandler:
-    def __init__(self, active: bool = True, error: Exception | None = None):
+    def __init__(
+        self,
+        active: bool = True,
+        state: str = "online",
+        error: Exception | None = None,
+    ):
         if error is not None:
             self.current_state_for_user = AsyncMock(side_effect=error)
         else:
             self.current_state_for_user = AsyncMock(
-                return_value=SimpleNamespace(currently_active=active)
+                return_value=SimpleNamespace(state=state, currently_active=active)
             )
 
 
@@ -70,6 +75,7 @@ class FakeHomeServer:
         self,
         *,
         active: bool = True,
+        presence_state: str | None = None,
         presence_enabled: bool = True,
         track_presence: bool = True,
         presence_error: Exception | None = None,
@@ -81,7 +87,13 @@ class FakeHomeServer:
             )
         )
         self.reactor = FakeReactor()
-        self.presence_handler = FakePresenceHandler(active, presence_error)
+        if presence_state is None:
+            presence_state = "online" if active else "offline"
+        self.presence_handler = FakePresenceHandler(
+            active,
+            presence_state,
+            presence_error,
+        )
 
     def get_reactor(self):
         return self.reactor
@@ -238,7 +250,43 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
             pusher.clock.time_msec() + 60_000,
         )
 
-    async def test_unsafe_process_sends_when_user_is_inactive(self):
+    async def test_unsafe_process_defers_user_who_is_online_but_not_currently_active(
+        self,
+    ):
+        pusher = FakePusher(active=False, event_age_ms=1_000)
+        pusher.hs = FakeHomeServer(active=False, presence_state="online")
+
+        with patch(
+            "synapse_pangea_chat.delayed_push.delayed_push.httppusher.opentracing.start_active_span",
+            return_value=nullcontext(),
+        ):
+            await _pangea_delayed_push_unsafe_process(pusher)
+
+        self.assertEqual(pusher.last_stream_ordering, 1)
+        pusher._process_one.assert_not_awaited()
+        pusher.store.update_pusher_last_stream_ordering_and_success.assert_not_awaited()
+        self.assertEqual(len(pusher.hs.reactor.calls), 1)
+
+    async def test_unsafe_process_defers_user_who_is_offline_but_currently_active(
+        self,
+    ):
+        pusher = FakePusher(active=True, event_age_ms=1_000)
+        pusher.hs = FakeHomeServer(active=True, presence_state="offline")
+
+        with patch(
+            "synapse_pangea_chat.delayed_push.delayed_push.httppusher.opentracing.start_active_span",
+            return_value=nullcontext(),
+        ):
+            await _pangea_delayed_push_unsafe_process(pusher)
+
+        self.assertEqual(pusher.last_stream_ordering, 1)
+        pusher._process_one.assert_not_awaited()
+        pusher.store.update_pusher_last_stream_ordering_and_success.assert_not_awaited()
+        self.assertEqual(len(pusher.hs.reactor.calls), 1)
+
+    async def test_unsafe_process_sends_when_user_is_not_online_or_currently_active(
+        self,
+    ):
         pusher = FakePusher(active=False, event_age_ms=1_000)
 
         with patch(

@@ -276,7 +276,7 @@ Requester must be a Synapse server admin. The endpoint accepts exactly two disti
 
 Optionally delays normal Matrix HTTP push notifications while the target user is actively using Synapse. This is disabled by default because it monkey-patches Synapse's private `HttpPusher` internals and must be re-audited for every Synapse version upgrade.
 
-When enabled, normal HTTP pushers reschedule unread notifications for currently-active users at the configured delay interval. If the event is read before the next check, Synapse's unread push-action query drops it and no notification is sent. If the user becomes inactive or the event reaches `max_delay_ms` age, the pusher sends normally. DirectPush, email pushers, and badge-only receipt updates are unchanged.
+When enabled, normal HTTP pushers reschedule unread notifications for users whose Synapse presence state is `online` or `currently_active` at the configured delay interval. If the event is read before the next check, Synapse's unread push-action query drops it and no notification is sent. If the user becomes inactive or the event reaches `max_delay_ms` age, the pusher sends normally. DirectPush, email pushers, and badge-only receipt updates are unchanged.
 
 ### Config
 
