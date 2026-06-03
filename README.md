@@ -13,6 +13,7 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 | [Delete Room](#delete-room)                   | `synapse_pangea_chat/delete_room/`          | `POST /_synapse/client/pangea/v1/delete_room`             | Room deletion for highest-power-level members     |
 | [Delete User](#delete-user)                   | `synapse_pangea_chat/delete_user/`          | `POST /_synapse/client/pangea/v1/delete_user`             | Delete user associations then deactivate account   |
 | [Direct Message](#direct-message)             | `synapse_pangea_chat/direct_message/`       | `POST /_synapse/client/pangea/v1/ensure_direct_message`   | Create or repair a 1:1 DM for two local users     |
+| [Delayed Push](#delayed-push)                 | `synapse_pangea_chat/delayed_push/`         | _(HttpPusher monkey patch)_                               | Delay HTTP pushes while users are active          |
 | [Limit User Directory](#limit-user-directory) | `synapse_pangea_chat/limit_user_directory/` | _(spam checker)_                                          | Filter user directory by public profile attribute |
 
 ## Installation
@@ -64,6 +65,13 @@ modules:
         - "^@admin:example.com$"
       limit_user_directory_whitelist_candidate_user_id_patterns:
         - "^@bot:example.com$"
+
+      # --- Delayed Push (disabled by default) ---
+      delayed_push:
+        enabled: false
+        delay_ms: 60000
+        max_delay_ms: 600000
+        require_synapse_version: "1.124.0"
 ```
 
 All config keys are optional and have sensible defaults. The `limit_user_directory` spam checker is only activated when `limit_user_directory_public_attribute_search_path` is set.
@@ -261,6 +269,23 @@ Requester must be a Synapse server admin. The endpoint accepts exactly two disti
   ]
 }
 ```
+
+---
+
+## Delayed Push
+
+Optionally delays normal Matrix HTTP push notifications while the target user is actively using Synapse. This is disabled by default because it monkey-patches Synapse's private `HttpPusher` internals and must be re-audited for every Synapse version upgrade.
+
+When enabled, normal HTTP pushers reschedule unread notifications for currently-active users at the configured delay interval. If the event is read before the next check, Synapse's unread push-action query drops it and no notification is sent. If the user becomes inactive or the event reaches `max_delay_ms` age, the pusher sends normally. DirectPush, email pushers, and badge-only receipt updates are unchanged.
+
+### Config
+
+| Key                                      | Type | Default | Description |
+| ---------------------------------------- | ---- | ------- | ----------- |
+| `delayed_push.enabled`                   | bool | `false` | Enables the HttpPusher monkey patch |
+| `delayed_push.delay_ms`                  | int  | `60000` | Recheck interval while the user remains active |
+| `delayed_push.max_delay_ms`              | int  | `600000` | Maximum event age before sending even if still active |
+| `delayed_push.require_synapse_version`   | str  | `1.124.0` | Exact audited Synapse version required when enabled |
 
 ---
 

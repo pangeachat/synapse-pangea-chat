@@ -6,6 +6,7 @@ from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
 from synapse_pangea_chat.config import PangeaChatConfig
+from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delete_room import DeleteRoom
 from synapse_pangea_chat.delete_user import DeleteUser
 from synapse_pangea_chat.direct_message import EnsureDirectMessage
@@ -53,6 +54,9 @@ class PangeaChat:
     def __init__(self, config: PangeaChatConfig, api: ModuleApi):
         self._api = api
         self._config = config
+
+        # --- Delayed Push ---
+        configure_delayed_push(config)
 
         # --- Public Courses ---
         self.public_courses = PublicCourses(api, config)
@@ -487,6 +491,46 @@ class PangeaChat:
             if not send_push_sygnal_url.strip():
                 raise ValueError('Config "send_push_sygnal_url" must not be empty')
 
+        # --- delayed_push config ---
+        delayed_push = config.get("delayed_push", {})
+        if delayed_push is None:
+            delayed_push = {}
+        if not isinstance(delayed_push, dict):
+            raise ValueError('Config "delayed_push" must be an object')
+
+        delayed_push_enabled = delayed_push.get("enabled", False)
+        if not isinstance(delayed_push_enabled, bool):
+            raise ValueError('Config "delayed_push.enabled" must be a boolean')
+
+        delayed_push_delay_ms = delayed_push.get("delay_ms", 60_000)
+        if not isinstance(delayed_push_delay_ms, int) or delayed_push_delay_ms < 1:
+            raise ValueError('Config "delayed_push.delay_ms" must be an integer >= 1')
+
+        delayed_push_max_delay_ms = delayed_push.get("max_delay_ms", 600_000)
+        if (
+            not isinstance(delayed_push_max_delay_ms, int)
+            or delayed_push_max_delay_ms < 1
+        ):
+            raise ValueError(
+                'Config "delayed_push.max_delay_ms" must be an integer >= 1'
+            )
+        if delayed_push_max_delay_ms < delayed_push_delay_ms:
+            raise ValueError(
+                'Config "delayed_push.max_delay_ms" must be >= delayed_push.delay_ms'
+            )
+
+        delayed_push_require_synapse_version = delayed_push.get(
+            "require_synapse_version", "1.124.0"
+        )
+        if not isinstance(delayed_push_require_synapse_version, str):
+            raise ValueError(
+                'Config "delayed_push.require_synapse_version" must be a string'
+            )
+        if not delayed_push_require_synapse_version.strip():
+            raise ValueError(
+                'Config "delayed_push.require_synapse_version" must not be empty'
+            )
+
         return PangeaChatConfig(
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
@@ -529,4 +573,8 @@ class PangeaChat:
             send_push_requests_per_burst=send_push_requests_per_burst,
             send_push_burst_duration_seconds=send_push_burst_duration_seconds,
             send_push_sygnal_url=send_push_sygnal_url,
+            delayed_push_enabled=delayed_push_enabled,
+            delayed_push_delay_ms=delayed_push_delay_ms,
+            delayed_push_max_delay_ms=delayed_push_max_delay_ms,
+            delayed_push_require_synapse_version=delayed_push_require_synapse_version,
         )

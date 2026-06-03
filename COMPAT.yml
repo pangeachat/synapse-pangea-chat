@@ -6,4 +6,4 @@
 # Do not lower min_synapse_version without auditing all sub-module imports first.
 
 min_synapse_version: "1.124.0"
-reason: "delete_user and export_user_data were audited against Synapse 1.124.0; their recurring background jobs now use the older clock.looping_call millisecond interval supported there"
+reason: "delete_user, export_user_data, and delayed_push were audited against Synapse 1.124.0; delayed_push also enforces an exact runtime version guard before monkey-patching HttpPusher internals"
