@@ -230,7 +230,7 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         reset_delayed_push_patch_for_tests()
 
-    async def test_unsafe_process_defers_active_user_without_advancing_cursor(self):
+    async def test_unsafe_process_defers_online_user_without_advancing_cursor(self):
         pusher = FakePusher(active=True, event_age_ms=1_000)
 
         with patch(
@@ -267,7 +267,7 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
         pusher.store.update_pusher_last_stream_ordering_and_success.assert_not_awaited()
         self.assertEqual(len(pusher.hs.reactor.calls), 1)
 
-    async def test_unsafe_process_defers_user_who_is_offline_but_currently_active(
+    async def test_unsafe_process_sends_when_user_is_offline_but_currently_active(
         self,
     ):
         pusher = FakePusher(active=True, event_age_ms=1_000)
@@ -279,12 +279,12 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
         ):
             await _pangea_delayed_push_unsafe_process(pusher)
 
-        self.assertEqual(pusher.last_stream_ordering, 1)
-        pusher._process_one.assert_not_awaited()
-        pusher.store.update_pusher_last_stream_ordering_and_success.assert_not_awaited()
-        self.assertEqual(len(pusher.hs.reactor.calls), 1)
+        pusher._process_one.assert_awaited_once_with(pusher.push_action)
+        self.assertEqual(pusher.last_stream_ordering, 5)
+        pusher.store.update_pusher_last_stream_ordering_and_success.assert_awaited_once()
+        self.assertEqual(pusher.hs.reactor.calls, [])
 
-    async def test_unsafe_process_sends_when_user_is_not_online_or_currently_active(
+    async def test_unsafe_process_sends_when_user_is_offline_and_not_currently_active(
         self,
     ):
         pusher = FakePusher(active=False, event_age_ms=1_000)

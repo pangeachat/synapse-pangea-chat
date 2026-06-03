@@ -274,10 +274,10 @@ async def _should_defer_push_action(self: Any, push_action: Any) -> bool:
         _clear_delayed_push_state(self)
         return False
 
-    if not await _user_is_online_or_currently_active(self):
+    if not await _user_is_online(self):
         logger.info(
             "Pangea delayed push sending event %s for user %s because user is not "
-            "online or currently active",
+            "online",
             push_action.event_id,
             self.user_id,
         )
@@ -296,7 +296,7 @@ async def _should_defer_push_action(self: Any, push_action: Any) -> bool:
     return True
 
 
-async def _user_is_online_or_currently_active(self: Any) -> bool:
+async def _user_is_online(self: Any) -> bool:
     server_config = getattr(getattr(self.hs, "config", None), "server", None)
     if getattr(server_config, "presence_enabled", True) is False:
         return False
@@ -305,9 +305,7 @@ async def _user_is_online_or_currently_active(self: Any) -> bool:
 
     presence_handler = self.hs.get_presence_handler()
     state = await presence_handler.current_state_for_user(self.user_id)
-    return getattr(state, "state", None) == "online" or bool(
-        getattr(state, "currently_active", False)
-    )
+    return getattr(state, "state", None) == "online"
 
 
 def _schedule_delayed_push(
