@@ -1,7 +1,9 @@
 import asyncio
 import logging
 
+import psycopg2
 import requests
+import yaml
 
 from .base_e2e import BaseSynapseE2ETest
 
@@ -15,6 +17,67 @@ logging.basicConfig(
 
 
 class TestUserActivityE2E(BaseSynapseE2ETest):
+    def _db_args_from_config(self, config_path: str) -> dict:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file)
+        return config["database"]["args"]
+
+    def _replace_last_login_ts(
+        self,
+        config_path: str,
+        user_id: str,
+        timestamp_ms: int | None,
+    ) -> None:
+        db_args = self._db_args_from_config(config_path)
+        with psycopg2.connect(**db_args) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM user_ips WHERE user_id = %s", (user_id,))
+                if timestamp_ms is not None:
+                    cursor.execute(
+                        """
+                        INSERT INTO user_ips (
+                            user_id, access_token, device_id, ip, user_agent, last_seen
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            user_id,
+                            f"test-access-token:{user_id}",
+                            None,
+                            "127.0.0.1",
+                            "test-user-activity-sort",
+                            timestamp_ms,
+                        ),
+                    )
+
+    def _set_event_origin_server_ts(
+        self,
+        config_path: str,
+        event_id: str,
+        timestamp_ms: int,
+    ) -> None:
+        db_args = self._db_args_from_config(config_path)
+        with psycopg2.connect(**db_args) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE events SET origin_server_ts = %s WHERE event_id = %s",
+                    (timestamp_ms, event_id),
+                )
+                self.assertEqual(cursor.rowcount, 1)
+
+    def _user_activity_docs(
+        self,
+        admin_token: str,
+        params: dict[str, str],
+    ) -> list[dict]:
+        response = requests.get(
+            f"{self.server_url}/_synapse/client/pangea/v1/user_activity",
+            params=params,
+            headers={"Authorization": f"Bearer {admin_token}"},
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["docs"]
+
     async def test_user_activity_requires_admin(self):
         """Non-admin users should get 403 from the user_activity endpoint."""
         postgres = None
@@ -119,6 +182,261 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
             user_ids = [u["user_id"] for u in data["docs"]]
             self.assertIn("@admin:my.domain.name", user_ids)
             self.assertIn("@user1:my.domain.name", user_ids)
+
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_user_activity_sorting_and_latest_activity_pagination(self):
+        """Sort params order users globally before pagination and expose the sort key."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            for username, password, admin in [
+                ("admin", "adminpw", True),
+                ("loginonly", "pw1", False),
+                ("messageonly", "pw2", False),
+                ("both", "pw3", False),
+                ("never", "pw4", False),
+                ("tie", "pw5", False),
+            ]:
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user=username,
+                    password=password,
+                    admin=admin,
+                )
+
+            admin_id, admin_token = await self.login_user("admin", "adminpw")
+            loginonly_id, _ = await self.login_user("loginonly", "pw1")
+            messageonly_id, messageonly_token = await self.login_user(
+                "messageonly", "pw2"
+            )
+            both_id, both_token = await self.login_user("both", "pw3")
+            never_id = "@never:my.domain.name"
+            tie_id, _ = await self.login_user("tie", "pw5")
+
+            messageonly_room_id = await self.create_private_room(messageonly_token)
+            messageonly_response = requests.put(
+                f"{self.server_url}/_matrix/client/v3/rooms/{messageonly_room_id}"
+                "/send/m.room.message/txn-messageonly-sort",
+                json={"msgtype": "m.text", "body": "message-only activity"},
+                headers={"Authorization": f"Bearer {messageonly_token}"},
+                timeout=30,
+            )
+            self.assertEqual(messageonly_response.status_code, 200)
+            messageonly_event_id = messageonly_response.json()["event_id"]
+
+            both_room_id = await self.create_private_room(both_token)
+            both_response = requests.put(
+                f"{self.server_url}/_matrix/client/v3/rooms/{both_room_id}"
+                "/send/m.room.message/txn-both-sort",
+                json={"msgtype": "m.text", "body": "both login and message"},
+                headers={"Authorization": f"Bearer {both_token}"},
+                timeout=30,
+            )
+            self.assertEqual(both_response.status_code, 200)
+            both_event_id = both_response.json()["event_id"]
+
+            # Seed deterministic activity facts. This avoids relying on Synapse's
+            # periodic user_ips flush timing while still exercising the real HTTP
+            # endpoint and real Postgres-backed queries.
+            self._replace_last_login_ts(config_path, admin_id, 1_000)
+            self._replace_last_login_ts(config_path, loginonly_id, 3_000)
+            self._replace_last_login_ts(config_path, messageonly_id, None)
+            self._set_event_origin_server_ts(config_path, messageonly_event_id, 7_000)
+            self._replace_last_login_ts(config_path, both_id, 9_000)
+            self._set_event_origin_server_ts(config_path, both_event_id, 5_000)
+            self._replace_last_login_ts(config_path, tie_id, 7_000)
+            self._replace_last_login_ts(config_path, never_id, None)
+
+            sorted_user_ids = ",".join(
+                [loginonly_id, messageonly_id, both_id, never_id, tie_id]
+            )
+            expected_latest_activity = {
+                both_id: 9_000,
+                loginonly_id: 3_000,
+                messageonly_id: 7_000,
+                never_id: 0,
+                tie_id: 7_000,
+            }
+
+            default_docs = self._user_activity_docs(
+                admin_token,
+                {"user_ids": sorted_user_ids},
+            )
+            self.assertEqual(
+                [doc["user_id"] for doc in default_docs],
+                [both_id, loginonly_id, messageonly_id, never_id, tie_id],
+            )
+            self.assertEqual(
+                {doc["user_id"]: doc["latest_activity_ts"] for doc in default_docs},
+                expected_latest_activity,
+            )
+
+            user_id_desc_docs = self._user_activity_docs(
+                admin_token,
+                {
+                    "user_ids": sorted_user_ids,
+                    "sort_by": "user_id",
+                    "sort_order": "desc",
+                },
+            )
+            self.assertEqual(
+                [doc["user_id"] for doc in user_id_desc_docs],
+                [tie_id, never_id, messageonly_id, loginonly_id, both_id],
+            )
+
+            last_login_desc_docs = self._user_activity_docs(
+                admin_token,
+                {
+                    "user_ids": sorted_user_ids,
+                    "sort_by": "last_login_ts",
+                    "sort_order": "desc",
+                },
+            )
+            self.assertEqual(
+                [doc["user_id"] for doc in last_login_desc_docs],
+                [both_id, tie_id, loginonly_id, messageonly_id, never_id],
+            )
+
+            last_message_desc_docs = self._user_activity_docs(
+                admin_token,
+                {
+                    "user_ids": sorted_user_ids,
+                    "sort_by": "last_message_ts",
+                    "sort_order": "desc",
+                },
+            )
+            self.assertEqual(
+                [doc["user_id"] for doc in last_message_desc_docs],
+                [messageonly_id, both_id, loginonly_id, never_id, tie_id],
+            )
+
+            latest_desc_docs = self._user_activity_docs(
+                admin_token,
+                {
+                    "user_ids": sorted_user_ids,
+                    "sort_by": "latest_activity",
+                    "sort_order": "desc",
+                },
+            )
+            self.assertEqual(
+                [doc["user_id"] for doc in latest_desc_docs],
+                [both_id, messageonly_id, tie_id, loginonly_id, never_id],
+            )
+            self.assertEqual(
+                [doc["latest_activity_ts"] for doc in latest_desc_docs],
+                [9_000, 7_000, 7_000, 3_000, 0],
+            )
+
+            latest_asc_docs = self._user_activity_docs(
+                admin_token,
+                {
+                    "user_ids": sorted_user_ids,
+                    "sort_by": "latest_activity",
+                    "sort_order": "asc",
+                },
+            )
+            self.assertEqual(
+                [doc["user_id"] for doc in latest_asc_docs],
+                [never_id, loginonly_id, messageonly_id, tie_id, both_id],
+            )
+
+            page_response = requests.get(
+                f"{self.server_url}/_synapse/client/pangea/v1/user_activity",
+                params={
+                    "user_ids": sorted_user_ids,
+                    "sort_by": "latest_activity",
+                    "sort_order": "desc",
+                    "limit": "2",
+                    "page": "2",
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(page_response.status_code, 200, page_response.text)
+            page_data = page_response.json()
+            self.assertEqual(page_data["page"], 2)
+            self.assertEqual(page_data["limit"], 2)
+            self.assertEqual(page_data["totalDocs"], 5)
+            self.assertEqual(page_data["maxPage"], 3)
+            self.assertEqual(
+                [doc["user_id"] for doc in page_data["docs"]],
+                [tie_id, loginonly_id],
+            )
+
+            unfiltered_page_1 = requests.get(
+                f"{self.server_url}/_synapse/client/pangea/v1/user_activity",
+                params={
+                    "sort_by": "latest_activity",
+                    "sort_order": "desc",
+                    "limit": "3",
+                    "page": "1",
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(unfiltered_page_1.status_code, 200, unfiltered_page_1.text)
+            unfiltered_page_1_data = unfiltered_page_1.json()
+            self.assertEqual(unfiltered_page_1_data["totalDocs"], 6)
+            self.assertEqual(
+                [doc["user_id"] for doc in unfiltered_page_1_data["docs"]],
+                [both_id, messageonly_id, tie_id],
+            )
+
+            unfiltered_page_2 = requests.get(
+                f"{self.server_url}/_synapse/client/pangea/v1/user_activity",
+                params={
+                    "sort_by": "latest_activity",
+                    "sort_order": "desc",
+                    "limit": "3",
+                    "page": "2",
+                },
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(unfiltered_page_2.status_code, 200, unfiltered_page_2.text)
+            self.assertEqual(
+                [doc["user_id"] for doc in unfiltered_page_2.json()["docs"]],
+                [loginonly_id, admin_id, never_id],
+            )
+
+            invalid_sort_response = requests.get(
+                f"{self.server_url}/_synapse/client/pangea/v1/user_activity",
+                params={"user_ids": sorted_user_ids, "sort_by": "unknown"},
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(invalid_sort_response.status_code, 400)
+            self.assertIn("sort_by", invalid_sort_response.json()["error"])
+
+            invalid_order_response = requests.get(
+                f"{self.server_url}/_synapse/client/pangea/v1/user_activity",
+                params={"user_ids": sorted_user_ids, "sort_order": "newest"},
+                headers={"Authorization": f"Bearer {admin_token}"},
+                timeout=30,
+            )
+            self.assertEqual(invalid_order_response.status_code, 400)
+            self.assertIn("sort_order", invalid_order_response.json()["error"])
 
         finally:
             self.stop_synapse(
