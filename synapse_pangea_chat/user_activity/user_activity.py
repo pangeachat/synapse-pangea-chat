@@ -19,7 +19,13 @@ from synapse_pangea_chat.user_activity.get_course_activities import (
     get_course_activities,
 )
 from synapse_pangea_chat.user_activity.get_user_courses import get_user_courses
-from synapse_pangea_chat.user_activity.get_users import get_users
+from synapse_pangea_chat.user_activity.get_users import (
+    DEFAULT_USER_ACTIVITY_SORT_BY,
+    DEFAULT_USER_ACTIVITY_SORT_ORDER,
+    USER_ACTIVITY_SORT_BY_VALUES,
+    USER_ACTIVITY_SORT_ORDER_VALUES,
+    get_users,
+)
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -59,6 +65,9 @@ class UserActivity(_AdminResourceBase):
                                   N ms. Requires the
                                   user_activity_notification_bot_user_id module
                                   config field to be set.
+      sort_by               str  user_id|last_login_ts|last_message_ts|
+                                  latest_activity (default user_id)
+      sort_order            str  asc|desc (default asc)
 
     NOTE: notification_cooldown_ms performs O(N candidates) account-data
     lookups server-side. Use user_ids or course_ids to narrow the candidate
@@ -92,6 +101,40 @@ class UserActivity(_AdminResourceBase):
             notification_cooldown_ms = _optional_int_param(
                 request, b"notification_cooldown_ms", minimum=1
             )
+            sort_by = _enum_param(
+                request,
+                b"sort_by",
+                default=DEFAULT_USER_ACTIVITY_SORT_BY,
+                allowed=USER_ACTIVITY_SORT_BY_VALUES,
+            )
+            if sort_by is None:
+                respond_with_json(
+                    request,
+                    400,
+                    {
+                        "error": "Invalid sort_by. Expected one of: "
+                        + ", ".join(sorted(USER_ACTIVITY_SORT_BY_VALUES))
+                    },
+                    send_cors=True,
+                )
+                return
+            sort_order = _enum_param(
+                request,
+                b"sort_order",
+                default=DEFAULT_USER_ACTIVITY_SORT_ORDER,
+                allowed=USER_ACTIVITY_SORT_ORDER_VALUES,
+            )
+            if sort_order is None:
+                respond_with_json(
+                    request,
+                    400,
+                    {
+                        "error": "Invalid sort_order. Expected one of: "
+                        + ", ".join(sorted(USER_ACTIVITY_SORT_ORDER_VALUES))
+                    },
+                    send_cors=True,
+                )
+                return
 
             if notification_cooldown_ms is not None and not (
                 self._config.user_activity_notification_bot_user_id
@@ -118,6 +161,8 @@ class UserActivity(_AdminResourceBase):
                 notification_cooldown_ms=notification_cooldown_ms,
                 bot_user_id=self._config.user_activity_notification_bot_user_id,
                 api=self._api,
+                sort_by=sort_by,
+                sort_order=sort_order,
             )
 
             respond_with_json(request, 200, data, send_cors=True)
@@ -330,6 +375,22 @@ def _list_param(request: SynapseRequest, name: bytes) -> list[str] | None:
     if raw is None:
         return None
     return [v.strip() for v in raw.split(",") if v.strip()]
+
+
+def _enum_param(
+    request: SynapseRequest,
+    name: bytes,
+    *,
+    default: str,
+    allowed: set[str],
+) -> str | None:
+    raw = _str_param(request, name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in allowed:
+        return value
+    return None
 
 
 def _optional_int_param(

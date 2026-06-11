@@ -14,7 +14,7 @@ Three Synapse module endpoints that power the re-engagement system. Called by th
 
 - **Auth:** Matrix bearer token, server admin required (403 if not admin)
 - **Rate limiting:** None (admin-only, no rate limiting)
-- **Query params:** `page` (int, default 1), `limit` (int, default 50, max 200)
+- **Query params:** `page` (int, default 1), `limit` (int, default 50, max 200), `sort_by` (`user_id`, `last_login_ts`, `last_message_ts`, or `latest_activity`; default `user_id`), `sort_order` (`asc` or `desc`; default `asc`)
 
 **Response:**
 
@@ -25,7 +25,8 @@ Three Synapse module endpoints that power the re-engagement system. Called by th
       "user_id": "@alice:example.com",
       "display_name": "Alice",
       "last_login_ts": 1700000000000,
-      "last_message_ts": 1700000000000
+      "last_message_ts": 1700000000000,
+      "latest_activity_ts": 1700000000000
     }
   ],
   "page": 1,
@@ -35,7 +36,7 @@ Three Synapse module endpoints that power the re-engagement system. Called by th
 }
 ```
 
-User docs contain only basic activity metadata. Course memberships are available via the `user_courses` endpoint below.
+User docs contain only basic activity metadata. `latest_activity_ts` is `max(last_login_ts, last_message_ts)`. Defaults preserve historical `user_id` ascending order; callers that need recently active users should request `sort_by=latest_activity&sort_order=desc` so sorting happens before pagination. Course memberships are available via the `user_courses` endpoint below.
 
 ### 2. User Courses (paginated)
 
@@ -124,8 +125,9 @@ Splitting into three endpoints lets the bot:
 ### Users queries (`get_users.py`)
 
 1. **Count** — Total active (non-deactivated, non-guest) users.
-2. **Users + last login** — CTE pre-aggregates `user_ips` then JOINs, `LIMIT/OFFSET` for pagination.
-3. **Last message per user** — `events` table scoped with `WHERE sender IN (...)`.
+2. **Users + last login** — CTE pre-aggregates `user_ips`, applies requested `sort_by`/`sort_order`, then `LIMIT/OFFSET` for pagination when message timestamps are not needed before pagination.
+3. **Last message per user** — `events` table is scoped with `WHERE sender IN (...)` for default/user-login ordering, or pre-aggregated before pagination when callers sort/filter by `last_message_ts` or `latest_activity`.
+4. **Latest activity** — `latest_activity_ts` is always returned as `max(last_login_ts, last_message_ts)`; `sort_by=latest_activity` sorts globally before pagination.
 
 ### User Courses queries (`get_user_courses.py`)
 
