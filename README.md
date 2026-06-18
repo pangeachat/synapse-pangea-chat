@@ -254,7 +254,7 @@ Create or repair a 1:1 DM between two local users without needing either user's 
 
 **Body:** `{ "user_ids": ["@alice:example.com", "@bob:example.com"] }`
 
-Requester must be a Synapse server admin. The endpoint accepts exactly two distinct local user IDs, reuses an existing qualifying DM when possible, and repairs `m.direct` for both users so clients treat the room as a DM.
+Requester must be a Synapse server admin. The endpoint accepts exactly two distinct local user IDs, reuses an existing qualifying DM when possible, and repairs `m.direct`/power levels only when needed so clients treat the room as a DM. A valid existing DM returns as `valid_existing_noop` without write-side calls.
 
 **Response (200):**
 
@@ -266,7 +266,9 @@ Requester must be a Synapse server admin. The endpoint accepts exactly two disti
   "m_direct_updated_for": [
     "@alice:example.com",
     "@bob:example.com"
-  ]
+  ],
+  "power_levels_updated": false,
+  "action": "created_room"
 }
 ```
 

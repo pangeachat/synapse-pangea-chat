@@ -74,6 +74,7 @@ class TestEnsureDirectMessageE2E(BaseSynapseE2ETest):
             data = response.json()
             self.assertTrue(data["created"])
             self.assertFalse(data["reused"])
+            self.assertEqual(data["action"], "created_room")
             room_id = data["room_id"]
 
             alice_joined = requests.get(
@@ -101,6 +102,7 @@ class TestEnsureDirectMessageE2E(BaseSynapseE2ETest):
             )
             self.assertEqual(bob_m_direct.status_code, 200)
             self.assertIn(room_id, bob_m_direct.json()[alice_user_id])
+
         finally:
             self.stop_synapse(
                 server_process=server_process,
@@ -333,6 +335,7 @@ class TestEnsureDirectMessageE2E(BaseSynapseE2ETest):
             self.assertFalse(data["created"])
             self.assertTrue(data["reused"])
             self.assertTrue(data["power_levels_updated"])
+            self.assertEqual(data["action"], "repaired_membership_or_power")
 
             pl_after = requests.get(
                 f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state/m.room.power_levels",

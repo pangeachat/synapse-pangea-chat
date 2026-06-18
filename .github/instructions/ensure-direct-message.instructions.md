@@ -1,5 +1,5 @@
 ---
-applyTo: "synapse_pangea_chat/direct_message/**,synapse_pangea_chat/__init__.py,tests/test_direct_message_e2e.py"
+applyTo: "synapse_pangea_chat/direct_message/**,synapse_pangea_chat/__init__.py,tests/test_direct_message_e2e.py,tests/test_direct_message_unit.py"
 ---
 
 # Ensure Direct Message — Synapse Module
@@ -19,14 +19,15 @@ Lives in the `direct_message/` sub-package.
 - **Validation**:
   - `user_ids` must be an array of exactly 2 entries.
   - Both entries must be distinct local user IDs.
-- **Response**: Returns the DM room ID plus whether the room was created or reused, and whether `m.direct` was updated for each participant.
+- **Response**: Returns the DM room ID plus whether the room was created or reused, whether `m.direct` was updated for each participant, whether power levels were updated, and an `action` classifier for metrics/logging: `valid_existing_noop`, `repaired_account_data`, `repaired_membership_or_power`, or `created_room`.
 
 ## Behavior
 
 The endpoint guarantees a client-usable DM for the exact two local users in `user_ids`.
 
-- If an existing 1:1 DM already exists for that pair, reuse it.
-- If a reusable room exists but is missing `m.direct` for one or both users, repair `m.direct` for both users.
+- If an existing 1:1 DM already exists for that pair and already has correct `m.direct` entries and admin power levels, return it as `valid_existing_noop` without write-side calls.
+- If a reusable room exists but is missing `m.direct` for one or both users, repair only the missing `m.direct` entries.
+- If a reusable room exists but one participant lacks required power, send only the required power-level repair event.
 - If no reusable room exists, create a private direct room for the pair and then write `m.direct` for both users.
 - The result must behave as a DM in clients from both participants' perspectives, not just the caller's.
 
@@ -41,6 +42,7 @@ The endpoint guarantees a client-usable DM for the exact two local users in `use
 - `m.direct` is part of the contract, not a best-effort side effect.
 - The endpoint must ensure the room appears in both users' `m.direct` account data under the other participant's user ID.
 - Repair is additive: preserve unrelated `m.direct` entries.
+- Do not rewrite unchanged `m.direct`; no-op ensures should avoid account-data writes.
 
 ## Intended Use
 
