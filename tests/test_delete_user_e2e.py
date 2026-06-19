@@ -5,7 +5,6 @@ import yaml
 from psycopg2 import connect
 
 from .base_e2e import BaseSynapseE2ETest
-from .mock_cms_server import MockCmsServer
 
 
 class TestDeleteUserE2E(BaseSynapseE2ETest):
