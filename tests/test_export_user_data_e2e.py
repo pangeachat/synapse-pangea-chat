@@ -1068,7 +1068,6 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                     postgres=postgres,
                 )
 
-
     async def test_force_export_creates_complete_cms_record_for_related_matrix_user(
         self,
     ):
@@ -1222,4 +1221,3 @@ class TestExportUserDataE2E(BaseSynapseE2ETest):
                     synapse_dir=synapse_dir,
                     postgres=postgres,
                 )
-

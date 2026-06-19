@@ -492,7 +492,6 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
                 postgres=postgres,
             )
 
-
     async def test_delete_user_succeeds_when_cms_unavailable(self):
         """Dead CMS URL → account still deactivated."""
         postgres = None
@@ -555,4 +554,3 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
                 synapse_dir=synapse_dir,
                 postgres=postgres,
             )
-
