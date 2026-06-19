@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import inspect
-import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, cast
-from urllib.parse import quote
 
 from synapse.api.errors import (
     AuthError,
@@ -28,7 +26,6 @@ from synapse_pangea_chat.delete_user.is_rate_limited import is_rate_limited
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
-CMS_AUTH_COLLECTION = "service-users"
 _RUN_AS_BG_SUPPORTS_SERVER_NAME = (
     "server_name" in inspect.signature(run_as_background_process).parameters
 )
@@ -228,9 +225,6 @@ class DeleteUser(Resource):
                     "user_id": target_user_id,
                     "deleted_external_ids": delete_result["deleted_external_ids"],
                     "deleted_threepids": delete_result["deleted_threepids"],
-                    "deleted_cms_feedback_logs": delete_result[
-                        "deleted_cms_feedback_logs"
-                    ],
                 },
                 send_cors=True,
             )
@@ -281,8 +275,6 @@ class DeleteUser(Resource):
                 threepid.address,
             )
 
-        deleted_cms_feedback_logs = await self._cms_delete_token_feedback_logs(user_id)
-
         await self._deactivate_account_handler.deactivate_account(
             user_id=user_id,
             erase_data=True,
@@ -293,58 +285,7 @@ class DeleteUser(Resource):
         return {
             "deleted_external_ids": len(external_ids),
             "deleted_threepids": len(threepids),
-            "deleted_cms_feedback_logs": deleted_cms_feedback_logs,
         }
-
-    async def _cms_delete_token_feedback_logs(self, user_id: str) -> int:
-        """Bulk-delete all feedback logs for *user_id* from CMS.
-
-        Returns number of deleted docs, or 0 on failure (non-blocking).
-        """
-        cms_base_url = self._config.cms_base_url
-        cms_api_key = self._config.cms_service_api_key
-        if not cms_base_url or not cms_api_key:
-            return 0
-
-        try:
-            from twisted.internet import reactor
-            from twisted.web.client import Agent, readBody
-            from twisted.web.http_headers import Headers
-
-            agent = Agent(reactor)
-            encoded_uid = quote(user_id, safe="")
-            url = (
-                f"{cms_base_url}/api/process-token-feedback-logs"
-                f"?where[req.user_id][equals]={encoded_uid}"
-            ).encode("utf-8")
-
-            response = await agent.request(
-                b"DELETE",
-                url,
-                Headers(
-                    {
-                        b"Authorization": [
-                            f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
-                                "utf-8"
-                            )
-                        ],
-                    }
-                ),
-            )
-            resp_body = await readBody(response)
-            if response.code >= 400:
-                logger.warning(
-                    "CMS feedback-logs delete failed (%s): %s",
-                    response.code,
-                    resp_body.decode("utf-8", errors="replace"),
-                )
-                return 0
-
-            data = json.loads(resp_body)
-            return len(data.get("docs", []))
-        except Exception as e:
-            logger.warning("Failed to delete CMS feedback logs for %s: %s", user_id, e)
-            return 0
 
     async def _ensure_schedule_table(self) -> None:
         if self._schedule_table_ready:

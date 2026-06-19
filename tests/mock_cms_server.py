@@ -1,7 +1,7 @@
 """Mock CMS HTTP server for E2E tests.
 
-Implements Payload-compatible routes for process-token-feedback-logs
-and user-exports, backed by in-memory storage.
+Implements Payload-compatible routes for matrix-users and user-exports,
+backed by in-memory storage.
 """
 
 import json
@@ -46,19 +46,8 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
         if not self._require_service_user_auth():
             return
         parsed = urlparse(self.path)
-        if parsed.path == "/api/process-token-feedback-logs":
-            self._handle_get_feedback_logs(parsed.query)
-        elif parsed.path == "/api/matrix-users":
+        if parsed.path == "/api/matrix-users":
             self._handle_get_matrix_users(parsed.query)
-        else:
-            self._send_json(404, {"error": "Not found"})
-
-    def do_DELETE(self) -> None:
-        if not self._require_service_user_auth():
-            return
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/process-token-feedback-logs":
-            self._handle_delete_feedback_logs(parsed.query)
         else:
             self._send_json(404, {"error": "Not found"})
 
@@ -79,43 +68,6 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
             self._handle_update_export(parsed.path)
         else:
             self._send_json(404, {"error": "Not found"})
-
-    # --- feedback-logs handlers ---
-
-    def _handle_get_feedback_logs(self, query_string: str) -> None:
-        qs = parse_qs(query_string)
-        user_id = qs.get("where[req.user_id][equals]", [None])[0]
-        page = int(qs.get("page", ["1"])[0])
-        limit = int(qs.get("limit", ["100"])[0])
-
-        state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
-        all_logs = state.get_logs(user_id) if user_id else []
-
-        start = (page - 1) * limit
-        end = start + limit
-        page_docs = all_logs[start:end]
-        has_next = end < len(all_logs)
-
-        self._send_json(
-            200,
-            {
-                "docs": page_docs,
-                "totalDocs": len(all_logs),
-                "hasNextPage": has_next,
-                "nextPage": page + 1 if has_next else None,
-                "page": page,
-                "limit": limit,
-            },
-        )
-
-    def _handle_delete_feedback_logs(self, query_string: str) -> None:
-        qs = parse_qs(query_string)
-        user_id = qs.get("where[req.user_id][equals]", [None])[0]
-
-        state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
-        deleted = state.delete_logs(user_id) if user_id else []
-
-        self._send_json(200, {"docs": deleted})
 
     def _handle_get_matrix_users(self, query_string: str) -> None:
         qs = parse_qs(query_string)
@@ -178,18 +130,13 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
 
 
 class _MockCmsState:
-    """Thread-safe in-memory store for feedback logs, matrix users, and exports."""
+    """Thread-safe in-memory store for matrix users and exports."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._logs: Dict[str, List[Dict[str, Any]]] = {}
         self._matrix_users_by_username: Dict[str, Dict[str, Any]] = {}
         self._matrix_users_by_id: Dict[str, Dict[str, Any]] = {}
         self._exports_by_id: Dict[str, Dict[str, Any]] = {}
-
-    def seed(self, user_id: str, logs: List[Dict[str, Any]]) -> None:
-        with self._lock:
-            self._logs.setdefault(user_id, []).extend(logs)
 
     def seed_matrix_user(self, username: str) -> Dict[str, Any]:
         with self._lock:
@@ -277,21 +224,6 @@ class _MockCmsState:
                 if doc.get("user") == matrix_user_id
             ]
 
-    def get_logs(self, user_id: Optional[str]) -> List[Dict[str, Any]]:
-        with self._lock:
-            if user_id is None:
-                return []
-            return list(self._logs.get(user_id, []))
-
-    def delete_logs(self, user_id: Optional[str]) -> List[Dict[str, Any]]:
-        with self._lock:
-            if user_id is None:
-                return []
-            return self._logs.pop(user_id, [])
-
-    def get_remaining_logs(self, user_id: str) -> List[Dict[str, Any]]:
-        return self.get_logs(user_id)
-
 
 class MockCmsServer:
     """Start/stop a mock CMS HTTP server on a random port."""
@@ -301,9 +233,6 @@ class MockCmsServer:
         self._server: Optional[HTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
-    def seed_feedback_logs(self, user_id: str, logs: List[Dict[str, Any]]) -> None:
-        self._state.seed(user_id, logs)
-
     def seed_matrix_user(self, username: str) -> Dict[str, Any]:
         return self._state.seed_matrix_user(username)
 
@@ -311,9 +240,6 @@ class MockCmsServer:
         self, matrix_user_id: str
     ) -> List[Dict[str, Any]]:
         return self._state.get_exports_for_matrix_user_id(matrix_user_id)
-
-    def get_remaining_logs(self, user_id: str) -> List[Dict[str, Any]]:
-        return self._state.get_remaining_logs(user_id)
 
     def start(self) -> str:
         """Start the server and return its base URL (e.g. http://127.0.0.1:PORT)."""
