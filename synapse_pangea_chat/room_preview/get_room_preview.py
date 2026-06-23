@@ -11,9 +11,16 @@ from synapse_pangea_chat.room_preview.constants import (
     EVENT_TYPE_M_ROOM_MEMBER,
     JOIN_RULE_CONTENT_KEY,
     MEMBERSHIP_CONTENT_KEY,
+    PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE,
     PANGEA_ACTIVITY_ROLE_STATE_EVENT_TYPE,
     PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
 )
+
+# Reference keys safe to expose for pangea.activity_plan in the unauthenticated
+# room preview. Under activities-v2 the event carries only a reference, but
+# legacy rooms still embed the full plan body (title, description, goals, vocab,
+# media) in this state event; only the reference is exposed publicly.
+ACTIVITY_PLAN_PREVIEW_KEYS = ("activity_id", "version_id", "source_course_id")
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -96,6 +103,30 @@ def _filter_join_rules_content(event_data: Dict[str, Any]) -> Dict[str, Any]:
         filtered_content[JOIN_RULE_CONTENT_KEY] = content[JOIN_RULE_CONTENT_KEY]
 
     # Create a copy of the event data with filtered content
+    filtered_event = event_data.copy()
+    filtered_event["content"] = filtered_content
+
+    return filtered_event
+
+
+def _filter_activity_plan_content(event_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Project pangea.activity_plan content to the safe reference keys for the
+    unauthenticated preview (mirrors _filter_join_rules_content).
+
+    Legacy activity rooms embed the full plan body in this state event; only the
+    reference (activity_id, version_id, source_course_id) is ever exposed in the
+    public preview, never the activity body, goals, or media.
+    """
+    if not isinstance(event_data, dict):
+        return event_data
+
+    content = event_data.get("content", {})
+    if not isinstance(content, dict):
+        return event_data
+
+    filtered_content = {
+        key: content[key] for key in ACTIVITY_PLAN_PREVIEW_KEYS if key in content
+    }
     filtered_event = event_data.copy()
     filtered_event["content"] = filtered_content
 
@@ -330,6 +361,10 @@ async def get_room_preview(
         # Filter m.room.join_rules content to only include join_rule key
         if event_type == EVENT_TYPE_M_ROOM_JOIN_RULES:
             event_data = _filter_join_rules_content(event_data)
+        # Project pangea.activity_plan to its safe reference keys so a legacy
+        # room's embedded plan body never reaches the unauthenticated preview.
+        elif event_type == PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE:
+            event_data = _filter_activity_plan_content(event_data)
 
         fetched_room_data[room_id][event_type][key] = event_data
 

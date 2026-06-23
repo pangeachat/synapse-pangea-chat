@@ -350,26 +350,20 @@ class TestE2E(BaseSynapseE2ETest):
         # Add additional state events
         state_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state"
 
-        # Add pangea.activity_plan state event
+        # Add pangea.activity_plan state event. This simulates a legacy room
+        # that embeds the full plan body alongside the reference keys; the
+        # preview must project it to only the reference (activity_id,
+        # version_id, source_course_id) and strip the embedded body.
         activity_plan_data = {
-            "plan_id": "plan123",
+            "activity_id": "act-123",
+            "version_id": "0123456789abcdef0123456789abcdef",
+            "source_course_id": "!course:my.domain.name",
+            # Embedded body (legacy) — must NOT appear in the public preview.
             "title": "Weekly Team Standup",
             "description": "Regular team sync meeting to discuss progress and blockers",
             "activities": [
-                {
-                    "id": "activity1",
-                    "name": "Progress Updates",
-                    "duration": 15,
-                    "type": "discussion",
-                },
-                {
-                    "id": "activity2",
-                    "name": "Blockers Review",
-                    "duration": 10,
-                    "type": "problem_solving",
-                },
+                {"id": "activity1", "name": "Progress Updates"},
             ],
-            "total_duration": 25,
             "created_by": "@admin_user:my.domain.name",
         }
 
@@ -487,23 +481,26 @@ class TestE2E(BaseSynapseE2ETest):
                         f"Event type {event_type} should contain 'content' field in full Matrix event",
                     )
 
-                    # For pangea.activity_plan, verify it has the expected content fields
+                    # For pangea.activity_plan, the preview must expose ONLY the
+                    # reference keys and strip the embedded plan body.
                     if event_type == "pangea.activity_plan":
-                        # Access the content field within the full Matrix event
                         content = full_event.get("content", {})
-                        expected_fields = [
-                            "plan_id",
-                            "title",
-                            "description",
-                            "activities",
-                            "total_duration",
-                            "created_by",
-                        ]
-                        for field in expected_fields:
+                        for field in ("activity_id", "version_id", "source_course_id"):
                             self.assertIn(
                                 field,
                                 content,
-                                f"Activity plan content should contain field '{field}'",
+                                f"Activity plan preview should keep reference field '{field}'",
+                            )
+                        for leaked in (
+                            "title",
+                            "description",
+                            "activities",
+                            "created_by",
+                        ):
+                            self.assertNotIn(
+                                leaked,
+                                content,
+                                f"Activity plan preview must NOT leak body field '{leaked}'",
                             )
 
                     # Verify there are no empty string state keys when using "default"
