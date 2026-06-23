@@ -39,9 +39,15 @@ Two admin-adjacent Pangea endpoints extend Synapse with controlled account lifec
 
 ## Side Effects
 
-- `delete_user` must deactivate the Matrix account and remove related CMS feedback-log artifacts when configured.
-- `export_user_data` must produce a complete export payload, including CMS feedback logs when available, and degrade gracefully when CMS is unavailable.
+- `delete_user` deactivates the Matrix account. The deletion does not reach CMS user data today; the erase cascade below is the durable design that closes that gap.
+- `export_user_data` produces a complete export payload from Synapse-side data and degrades gracefully when CMS is unavailable.
 - Failures in optional downstream cleanup or upload work must not silently disable the endpoint itself.
+
+## CMS Erase Cascade (PII on deletion)
+
+On account deletion, a CMS-native erase cascade removes the user's PII held in handler collections: it deletes the rating-comment text and redacts other user-authored text in those collections. The erase step is idempotent and decoupled from — and ordered before — the irreversible Synapse deactivation, so a CMS outage can't wedge the deletion retry loop while PII still lingers (a wedged retry against a dead CMS would otherwise leave PII undeleted with no path forward). The erase endpoint lives in CMS; this module calls it.
+
+Export reciprocally includes the user's rating-ledger rows. The generated export artifact has a 30-day retention and is cascade-deleted when the user is deleted, so a stale export can't outlive the account it describes.
 
 ## Registration
 
