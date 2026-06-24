@@ -1,7 +1,7 @@
 # Plan: Direct Push Endpoint on Synapse Module
 
 - Date: 2026-03-31
-- Repo: `synapse-pangea-chat-modules`
+- Repo: `synapse-pangea-chat`
 - Scope decided here:
   - Add an admin-only HTTP endpoint in the Synapse module for immediate push delivery without creating any Matrix event.
   - Treat this as a Synapse-module and Sygnal delivery design, with only a short client-implications section.
