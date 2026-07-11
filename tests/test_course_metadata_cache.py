@@ -145,9 +145,16 @@ class TestGetFilteredCourseIds(unittest.IsolatedAsyncioTestCase):
         _meta_cache.clear()
 
     @patch("synapse_pangea_chat.public_courses.course_metadata_cache._cms_get")
-    async def test_passes_filters_to_cms(self, mock_cms_get: AsyncMock) -> None:
+    async def test_cefr_delegated_languages_filtered_module_side(
+        self, mock_cms_get: AsyncMock
+    ) -> None:
+        # Language filters must NOT reach CMS as `equals` clauses — exact
+        # equality drops regionally-tagged courses (issue #53). Only the
+        # exact-valued CEFR filter is delegated; languages are matched
+        # module-side by base language.
         mock_cms_get.return_value = [
             {"id": "uuid-1", "l2": "es", "originalL1": "en", "cefrLevel": "A1"},
+            {"id": "uuid-2", "l2": "fr", "originalL1": "en", "cefrLevel": "A1"},
         ]
         result = await get_filtered_course_ids(
             ["uuid-1", "uuid-2"],
@@ -162,8 +169,8 @@ class TestGetFilteredCourseIds(unittest.IsolatedAsyncioTestCase):
 
         call_args = mock_cms_get.call_args
         params = call_args[1].get("query_params") or call_args[0][2]
-        self.assertEqual(params["where[l2][equals]"], "es")
-        self.assertEqual(params["where[originalL1][equals]"], "en")
+        self.assertNotIn("where[l2][equals]", params)
+        self.assertNotIn("where[originalL1][equals]", params)
         self.assertEqual(params["where[cefrLevel][equals]"], "A1")
         self.assertEqual(params["limit"], "2")
         self.assertEqual(params["depth"], "0")
@@ -171,8 +178,37 @@ class TestGetFilteredCourseIds(unittest.IsolatedAsyncioTestCase):
         self.assertIn("uuid-2", params["where[id][in]"])
 
     @patch("synapse_pangea_chat.public_courses.course_metadata_cache._cms_get")
+    async def test_base_language_matches_regional_l2(
+        self, mock_cms_get: AsyncMock
+    ) -> None:
+        # The issue-#53 repro at unit level: `es` must match `es-ES`, and
+        # a regional filter must match across the base language.
+        mock_cms_get.return_value = [
+            {"id": "uuid-1", "l2": "es-ES", "originalL1": "en", "cefrLevel": "A1"},
+            {"id": "uuid-2", "l2": "es", "originalL1": "en", "cefrLevel": "A1"},
+            {"id": "uuid-3", "l2": "fr", "originalL1": "en", "cefrLevel": "A1"},
+        ]
+        result = await get_filtered_course_ids(
+            ["uuid-1", "uuid-2", "uuid-3"],
+            "https://cms.test",
+            "api-key-123",
+            target_language="es",
+        )
+        self.assertEqual(sorted(result), ["uuid-1", "uuid-2"])
+
+        _meta_cache.clear()
+        result = await get_filtered_course_ids(
+            ["uuid-1", "uuid-2", "uuid-3"],
+            "https://cms.test",
+            "api-key-123",
+            target_language="es-MX",
+        )
+        self.assertEqual(sorted(result), ["uuid-1", "uuid-2"])
+
+    @patch("synapse_pangea_chat.public_courses.course_metadata_cache._cms_get")
     async def test_partial_filters(self, mock_cms_get: AsyncMock) -> None:
         mock_cms_get.return_value = [
+            {"id": "uuid-1", "l2": "es", "originalL1": "en", "cefrLevel": "B1"},
             {"id": "uuid-2", "l2": "fr", "originalL1": "en", "cefrLevel": "B1"},
         ]
         result = await get_filtered_course_ids(
@@ -182,10 +218,11 @@ class TestGetFilteredCourseIds(unittest.IsolatedAsyncioTestCase):
             target_language="fr",
         )
         self.assertEqual(len(result), 1)
+        self.assertIn("uuid-2", result)
 
         call_args = mock_cms_get.call_args
         params = call_args[1].get("query_params") or call_args[0][2]
-        self.assertEqual(params["where[l2][equals]"], "fr")
+        self.assertNotIn("where[l2][equals]", params)
         self.assertNotIn("where[originalL1][equals]", params)
         self.assertNotIn("where[cefrLevel][equals]", params)
 
