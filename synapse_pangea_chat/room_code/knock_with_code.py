@@ -27,9 +27,16 @@ from synapse_pangea_chat.room_code.get_inviter_user import promote_user_to_admin
 from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
     get_rooms_with_access_code,
 )
+from synapse_pangea_chat.room_code.constants import (
+    ERRCODE_BANNED_FROM_ROOM,
+    MEMBERSHIP_BAN,
+    MEMBERSHIP_JOIN,
+)
 from synapse_pangea_chat.room_code.invite_user_to_room import invite_user_to_room
 from synapse_pangea_chat.room_code.is_rate_limited import is_rate_limited
-from synapse_pangea_chat.room_code.user_is_room_member import user_is_room_member
+from synapse_pangea_chat.room_code.user_is_room_member import (
+    get_user_room_membership,
+)
 
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.room_code.knock_with_code"
@@ -132,15 +139,23 @@ class KnockWithCode(Resource):
             # Send knock with access code to the rooms as requester
             invited_rooms: List[str] = []
             already_joined_rooms: List[str] = []
+            banned_rooms: List[str] = []
             for match in matches:
                 try:
-                    is_member = await user_is_room_member(
+                    membership = await get_user_room_membership(
                         api=self._api,
                         user_id=requester_id,
                         room_id=match.room_id,
                     )
-                    if is_member:
+                    if membership == MEMBERSHIP_JOIN:
                         already_joined_rooms.append(match.room_id)
+                        continue
+                    if membership == MEMBERSHIP_BAN:
+                        # Inviting a banned user would be rejected by
+                        # Synapse anyway; surface it distinctly instead of
+                        # letting the failure look like a nonexistent code
+                        # (issue #127 / client#6820).
+                        banned_rooms.append(match.room_id)
                         continue
                     await invite_user_to_room(
                         api=self._api,
@@ -166,6 +181,20 @@ class KnockWithCode(Resource):
                     logger.error(
                         f"Error sending knock with code to {match.room_id}: {e}"
                     )
+            if banned_rooms and not invited_rooms and not already_joined_rooms:
+                # The code was valid but every matched room has banned the
+                # user — a distinct failure, not a nonexistent code.
+                respond_with_json(
+                    request,
+                    403,
+                    {
+                        "errcode": ERRCODE_BANNED_FROM_ROOM,
+                        "error": "You are banned from the course for this code",
+                        "banned": banned_rooms,
+                    },
+                    send_cors=True,
+                )
+                return
             respond_with_json(
                 request,
                 200,
@@ -173,6 +202,7 @@ class KnockWithCode(Resource):
                     "message": f"Invited {requester_id}",
                     "rooms": invited_rooms,
                     "already_joined": already_joined_rooms,
+                    "banned": banned_rooms,
                 },
                 send_cors=True,
             )

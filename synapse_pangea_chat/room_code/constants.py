@@ -14,6 +14,12 @@ MEMBERSHIP_CONTENT_KEY = "membership"  # existing membership content key
 MEMBERSHIP_KNOCK = "knock"  # existing membership value
 MEMBERSHIP_INVITE = "invite"  # existing membership value
 MEMBERSHIP_JOIN = "join"  # existing membership value
+MEMBERSHIP_BAN = "ban"  # existing membership value
+
+# Pangea-custom errcode: the presented code matched room(s) the user is
+# banned from. Lets the client show a ban-specific message instead of the
+# generic "code doesn't exist" failure (issue #127 / client#6820).
+ERRCODE_BANNED_FROM_ROOM = "ORG.PANGEA.BANNED_FROM_ROOM"
 
 # https://spec.matrix.org/v1.11/client-server-api/#mroompower_levels
 EVENT_TYPE_M_ROOM_POWER_LEVELS = "m.room.power_levels"
