@@ -19,6 +19,7 @@ Public course discovery endpoint for course catalog surfaces in clients and oper
 - Rate limiting behavior is shared across both routes.
 - Query params and response schema must stay identical across aliases.
 - Filtering behavior is defined by the shared `PublicCourses` resource and must not diverge by path.
+- Language filters (`target_language`, `language_of_instructions`) match by BASE language: `es` matches courses whose CMS `l2`/`originalL1` is `es`, `es-ES`, or `es-MX`, and vice versa — the same exact-or-base rule as the bot's supported-L2 checks. Exact CMS equality drops regionally-tagged courses and empties the list (issue #53). CEFR filtering stays exact.
 
 ## Compatibility
 

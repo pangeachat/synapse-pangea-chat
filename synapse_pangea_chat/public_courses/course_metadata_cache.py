@@ -97,23 +97,35 @@ async def _cms_get(
 
 def _build_where_params(
     course_uuids: List[str],
-    target_language: Optional[str] = None,
-    language_of_instructions: Optional[str] = None,
     cefr_level: Optional[str] = None,
 ) -> Dict[str, str]:
-    """Build Payload CMS ``where`` query parameters."""
+    """Build Payload CMS ``where`` query parameters.
+
+    Language filters are deliberately NOT pushed to CMS: course ``l2`` /
+    ``originalL1`` values may carry regional tags (``es-ES``) while
+    clients filter by base code (``es``), and CMS ``equals`` would drop
+    those courses — on staging this made the filtered course list come
+    back empty (issue #53). Language matching happens module-side via
+    ``_language_matches``; only exact-valued filters (CEFR) stay in the
+    CMS query.
+    """
     params: Dict[str, str] = {
         "where[id][in]": ",".join(course_uuids),
         "limit": str(len(course_uuids)),
         "depth": "0",
     }
-    if target_language:
-        params["where[l2][equals]"] = target_language
-    if language_of_instructions:
-        params["where[originalL1][equals]"] = language_of_instructions
     if cefr_level:
         params["where[cefrLevel][equals]"] = cefr_level
     return params
+
+
+def _language_matches(candidate: str, filter_value: str) -> bool:
+    """Base-language match: ``es`` matches ``es``, ``es-ES``, ``es-MX``
+    (and vice versa). Same rule as the bot's supported-L2 checks —
+    exact matches and base-language matches both count."""
+    if not candidate or not filter_value:
+        return False
+    return candidate.split("-")[0].lower() == filter_value.split("-")[0].lower()
 
 
 async def get_course_metadata(
@@ -172,22 +184,31 @@ async def get_filtered_course_ids(
 ) -> Dict[str, CourseMeta]:
     """Return metadata only for courses matching the given filters.
 
-    Delegates filtering to CMS via ``where`` clauses so only matching
-    documents are returned.  Results are cached per-UUID for later
-    unfiltered lookups.
+    Exact-valued filters (CEFR) are delegated to CMS ``where`` clauses;
+    language filters are applied module-side with base-language matching
+    (see ``_build_where_params`` / ``_language_matches``, issue #53).
+    Results are cached per-UUID for later unfiltered lookups.
     """
     if not course_uuids:
         return {}
 
     try:
-        params = _build_where_params(
-            course_uuids,
-            target_language=target_language,
-            language_of_instructions=language_of_instructions,
-            cefr_level=cefr_level,
-        )
+        params = _build_where_params(course_uuids, cefr_level=cefr_level)
         docs = await _cms_get(cms_base_url, cms_api_key, params)
-        return _parse_docs(docs)
+        parsed = _parse_docs(docs)
+        if target_language:
+            parsed = {
+                uuid: meta
+                for uuid, meta in parsed.items()
+                if _language_matches(meta["l2"], target_language)
+            }
+        if language_of_instructions:
+            parsed = {
+                uuid: meta
+                for uuid, meta in parsed.items()
+                if _language_matches(meta["l1"], language_of_instructions)
+            }
+        return parsed
     except Exception as exc:
         logger.warning(
             "Failed to fetch filtered course metadata from CMS",

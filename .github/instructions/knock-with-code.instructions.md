@@ -33,8 +33,10 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 3. Query Synapse DB for rooms whose `m.room.join_rules` state event contains a matching `access_code` (case-insensitive). Uses the latest state event per room.
 4. For each matched room:
    - If user is already a member → add to `already_joined` list.
+   - If user is BANNED from the room → add to `banned` list, skip the invite (Synapse would reject it; without this the failure is indistinguishable from a nonexistent code — issue #127 / client#6820).
    - Otherwise → find a room member with invite power, issue `update_room_membership(invite)` on their behalf.
-5. Return `{ rooms: [...invited], already_joined: [...], rateLimited: false }`.
+5. If the code matched rooms but the user is banned from ALL of them (nothing invited, nothing already joined) → respond `403` with `{ errcode: "ORG.PANGEA.BANNED_FROM_ROOM", error: ..., banned: [...] }` so the client can show a ban-specific message.
+6. Otherwise return `{ rooms: [...invited], already_joined: [...], banned: [...], rateLimited: false }`.
 
 **Client impact**: The invite arrives via `/sync`. The client's sync listener must suppress the invite dialog when the code flow is already handling the join — see "Space invite priority" in [joining-courses.instructions.md](../../../client/.github/instructions/joining-courses.instructions.md).
 

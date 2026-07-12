@@ -478,6 +478,76 @@ class TestE2E(BaseSynapseE2ETest):
                 postgres=postgres,
             )
 
+    async def test_e2e_knock_with_code_banned_user_gets_distinct_error(self) -> None:
+        """A banned user presenting a valid code must get a ban-specific
+        403 (ORG.PANGEA.BANNED_FROM_ROOM), not a response indistinguishable
+        from a nonexistent code (issue #127 / client#6820)."""
+        postgres = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        synapse_dir = None
+        try:
+            access_code = "bandcd1"
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+            for user in ("test1", "test2"):
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user=user,
+                    password="123123123",
+                    admin=True,
+                )
+            _, user_1_access_token = await self.login_user(
+                user="test1", password="123123123"
+            )
+            user_2_id, user_2_access_token = await self.login_user(
+                user="test2", password="123123123"
+            )
+
+            room_id = await self.create_private_room(user_1_access_token)
+            await self.set_room_knockable_with_code(
+                room_id=room_id,
+                access_token=user_1_access_token,
+                access_code=access_code,
+            )
+
+            # Ban user 2 from the room
+            ban_response = requests.post(
+                f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/ban",
+                json={"user_id": user_2_id, "reason": "test ban"},
+                headers={"Authorization": f"Bearer {user_1_access_token}"},
+                timeout=10,
+            )
+            self.assertEqual(ban_response.status_code, 200)
+
+            # Banned user presents the (valid) code
+            response = requests.post(
+                "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code",
+                json={"access_code": access_code},
+                headers={"Authorization": f"Bearer {user_2_access_token}"},
+                timeout=10,
+            )
+            self.assertEqual(response.status_code, 403)
+            body = response.json()
+            self.assertEqual(body["errcode"], "ORG.PANGEA.BANNED_FROM_ROOM")
+            self.assertEqual(body["banned"], [room_id])
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
     async def get_access_token_without_access_code(self):
         get_access_token_url = (
             "http://localhost:8008/_synapse/client/pangea/v1/request_room_code"

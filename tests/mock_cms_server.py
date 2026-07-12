@@ -42,10 +42,28 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
 
     # --- routing ---
 
+    def _require_any_api_key_auth(self) -> bool:
+        """Accept any `<collection> API-Key <key>` scheme.
+
+        The public_courses module authenticates as `users API-Key ...`
+        while the export flow uses `service-users API-Key ...`; routes
+        used by both only care that an API key is presented.
+        """
+        auth_header = self.headers.get("Authorization", "")
+        if " API-Key " not in auth_header:
+            self._send_json(401, {"error": "Unauthorized"})
+            return False
+        return True
+
     def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/course-plans":
+            if not self._require_any_api_key_auth():
+                return
+            self._handle_get_course_plans(parsed.query)
+            return
         if not self._require_service_user_auth():
             return
-        parsed = urlparse(self.path)
         if parsed.path == "/api/matrix-users":
             self._handle_get_matrix_users(parsed.query)
         else:
@@ -75,6 +93,34 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
 
         state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
         docs = state.get_matrix_users(username)
+        self._send_json(200, {"docs": docs})
+
+    def _handle_get_course_plans(self, query_string: str) -> None:
+        """Payload-compatible course-plans query.
+
+        Implements the operators the public_courses module sends:
+        `where[id][in]`, `where[l2][equals]`, `where[originalL1][equals]`,
+        `where[cefrLevel][equals]` — with Payload's exact-equality
+        semantics, so tests exercise the real CMS behavior.
+        """
+        qs = parse_qs(query_string)
+
+        def _single(key: str) -> Optional[str]:
+            return qs.get(key, [None])[0]
+
+        ids_param = _single("where[id][in]")
+        ids = ids_param.split(",") if ids_param else []
+        filters = {
+            "l2": _single("where[l2][equals]"),
+            "originalL1": _single("where[originalL1][equals]"),
+            "cefrLevel": _single("where[cefrLevel][equals]"),
+        }
+
+        state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
+        docs = state.get_course_plans(ids)
+        for field, value in filters.items():
+            if value is not None:
+                docs = [d for d in docs if d.get(field) == value]
         self._send_json(200, {"docs": docs})
 
     # --- user-exports handlers ---
@@ -137,6 +183,7 @@ class _MockCmsState:
         self._matrix_users_by_username: Dict[str, Dict[str, Any]] = {}
         self._matrix_users_by_id: Dict[str, Dict[str, Any]] = {}
         self._exports_by_id: Dict[str, Dict[str, Any]] = {}
+        self._course_plans_by_id: Dict[str, Dict[str, Any]] = {}
 
     def seed_matrix_user(self, username: str) -> Dict[str, Any]:
         with self._lock:
@@ -148,6 +195,32 @@ class _MockCmsState:
             self._matrix_users_by_username[username] = doc
             self._matrix_users_by_id[doc["id"]] = doc
             return dict(doc)
+
+    def seed_course_plan(
+        self,
+        l2: str,
+        original_l1: str = "en",
+        cefr_level: str = "A1",
+        title: str = "Test course",
+    ) -> Dict[str, Any]:
+        doc = {
+            "id": str(uuid.uuid4()),
+            "l2": l2,
+            "originalL1": original_l1,
+            "cefrLevel": cefr_level,
+            "title": title,
+        }
+        with self._lock:
+            self._course_plans_by_id[doc["id"]] = doc
+        return dict(doc)
+
+    def get_course_plans(self, ids: List[str]) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                dict(self._course_plans_by_id[i])
+                for i in ids
+                if i in self._course_plans_by_id
+            ]
 
     def get_matrix_users(self, username: Optional[str]) -> List[Dict[str, Any]]:
         with self._lock:
@@ -235,6 +308,17 @@ class MockCmsServer:
 
     def seed_matrix_user(self, username: str) -> Dict[str, Any]:
         return self._state.seed_matrix_user(username)
+
+    def seed_course_plan(
+        self,
+        l2: str,
+        original_l1: str = "en",
+        cefr_level: str = "A1",
+        title: str = "Test course",
+    ) -> Dict[str, Any]:
+        return self._state.seed_course_plan(
+            l2, original_l1=original_l1, cefr_level=cefr_level, title=title
+        )
 
     def get_exports_for_matrix_user_id(
         self, matrix_user_id: str
