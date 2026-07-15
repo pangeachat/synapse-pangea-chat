@@ -35,6 +35,10 @@ logger = logging.getLogger("synapse.module.synapse_pangea_chat.delete_user")
 SCHEDULE_TABLE = "pangea_delete_user_schedule"
 VALID_ACTIONS = {"schedule", "cancel", "force"}
 
+# A scheduled delete is retried at most this many times before the schedule
+# is dropped as terminally failed.
+MAX_SCHEDULE_ATTEMPTS = 5
+
 
 class _LoopingCallInterval(int):
     def as_secs(self) -> float:
@@ -299,8 +303,17 @@ class DeleteUser(Resource):
                     execute_at_ms BIGINT NOT NULL,
                     requested_at_ms BIGINT NOT NULL,
                     requested_by TEXT NOT NULL,
-                    requested_by_admin BOOLEAN NOT NULL DEFAULT FALSE
+                    requested_by_admin BOOLEAN NOT NULL DEFAULT FALSE,
+                    attempts INTEGER NOT NULL DEFAULT 0
                 )
+                """
+            )
+            # Migrate pre-existing installs that created the table without
+            # the attempts column.
+            txn.execute(
+                f"""
+                ALTER TABLE {SCHEDULE_TABLE}
+                ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0
                 """
             )
             txn.execute(
@@ -322,19 +335,22 @@ class DeleteUser(Resource):
         execute_at_ms: int,
         requested_by: str,
         requested_by_admin: bool,
+        attempts: int = 0,
     ) -> None:
         def _upsert(txn: Any) -> None:
             txn.execute(
                 f"""
                 INSERT INTO {SCHEDULE_TABLE}
-                    (user_id, execute_at_ms, requested_at_ms, requested_by, requested_by_admin)
-                VALUES (%s, %s, %s, %s, %s)
+                    (user_id, execute_at_ms, requested_at_ms, requested_by,
+                     requested_by_admin, attempts)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id)
                 DO UPDATE SET
                     execute_at_ms = EXCLUDED.execute_at_ms,
                     requested_at_ms = EXCLUDED.requested_at_ms,
                     requested_by = EXCLUDED.requested_by,
-                    requested_by_admin = EXCLUDED.requested_by_admin
+                    requested_by_admin = EXCLUDED.requested_by_admin,
+                    attempts = EXCLUDED.attempts
                 """,
                 (
                     user_id,
@@ -342,6 +358,7 @@ class DeleteUser(Resource):
                     self._clock.time_msec(),
                     requested_by,
                     requested_by_admin,
+                    attempts,
                 ),
             )
 
@@ -395,13 +412,19 @@ class DeleteUser(Resource):
                 f"""
                 DELETE FROM {SCHEDULE_TABLE}
                 WHERE execute_at_ms <= %s
-                RETURNING user_id, requested_by_admin
+                RETURNING user_id, requested_by, requested_by_admin, attempts
                 """,
                 (now_ms,),
             )
             rows = txn.fetchall()
             return [
-                {"user_id": row[0], "requested_by_admin": bool(row[1])} for row in rows
+                {
+                    "user_id": row[0],
+                    "requested_by": row[1],
+                    "requested_by_admin": bool(row[2]),
+                    "attempts": int(row[3] or 0),
+                }
+                for row in rows
             ]
 
         return await self._datastores.main.db_pool.runInteraction(
@@ -422,9 +445,30 @@ class DeleteUser(Resource):
                     by_admin=bool(schedule["requested_by_admin"]),
                 )
             except Exception as e:
-                logger.error(
-                    "Failed to process scheduled delete for %s: %s",
+                attempts = int(schedule.get("attempts") or 0) + 1
+                # A 404 means the user row is already gone; retrying can
+                # never succeed, so fail the schedule immediately.
+                permanently_failed = isinstance(e, SynapseError) and e.code == 404
+                if permanently_failed or attempts >= MAX_SCHEDULE_ATTEMPTS:
+                    logger.error(
+                        "Scheduled delete for %s failed terminally after "
+                        "%d attempt(s) (%s), giving up: %s",
+                        user_id,
+                        attempts,
+                        (
+                            "permanent error"
+                            if permanently_failed
+                            else "max attempts reached"
+                        ),
+                        e,
+                    )
+                    continue
+                logger.warning(
+                    "Failed to process scheduled delete for %s "
+                    "(attempt %d of %d), will retry: %s",
                     user_id,
+                    attempts,
+                    MAX_SCHEDULE_ATTEMPTS,
                     e,
                 )
                 retry_at_ms = (
@@ -434,6 +478,7 @@ class DeleteUser(Resource):
                 await self._upsert_schedule(
                     user_id=user_id,
                     execute_at_ms=retry_at_ms,
-                    requested_by=user_id,
+                    requested_by=schedule.get("requested_by") or user_id,
                     requested_by_admin=bool(schedule["requested_by_admin"]),
+                    attempts=attempts,
                 )

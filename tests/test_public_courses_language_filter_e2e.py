@@ -20,9 +20,7 @@ from tests.base_e2e import BaseSynapseE2ETest
 from tests.mock_cms_server import MockCmsServer
 
 COURSE_PLAN_EVENT_TYPE = "pangea.course_plan"
-PUBLIC_COURSES_URL = (
-    "http://localhost:8008/_synapse/client/pangea/v1/public_courses"
-)
+PUBLIC_COURSES_URL = "http://localhost:8008/_synapse/client/pangea/v1/public_courses"
 
 
 class TestPublicCoursesLanguageFilterE2E(BaseSynapseE2ETest):
@@ -49,9 +47,7 @@ class TestPublicCoursesLanguageFilterE2E(BaseSynapseE2ETest):
         self.assertEqual(response.status_code, 200)
         return response.json()["room_id"]
 
-    def _get_courses(
-        self, access_token: str, **params: str
-    ) -> Dict[str, Any]:
+    def _get_courses(self, access_token: str, **params: str) -> Dict[str, Any]:
         response = requests.get(
             PUBLIC_COURSES_URL,
             params={"limit": "20", **params},
@@ -127,9 +123,7 @@ class TestPublicCoursesLanguageFilterE2E(BaseSynapseE2ETest):
                 f"target_language=es should match l2 es AND es-ES; got "
                 f"{titles(filtered)}",
             )
-            languages = sorted(
-                c["target_language"] for c in filtered["chunk"]
-            )
+            languages = sorted(c["target_language"] for c in filtered["chunk"])
             self.assertEqual(languages, ["es", "es-ES"])
 
             # Regional filter also matches across the base language.
@@ -139,9 +133,7 @@ class TestPublicCoursesLanguageFilterE2E(BaseSynapseE2ETest):
             # A different language stays excluded.
             french = self._get_courses(access_token, target_language="fr")
             self.assertEqual(len(french["chunk"]), 1)
-            self.assertEqual(
-                french["chunk"][0]["target_language"], "fr"
-            )
+            self.assertEqual(french["chunk"][0]["target_language"], "fr")
         finally:
             mock_cms.stop()
             self.stop_synapse(

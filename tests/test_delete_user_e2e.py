@@ -87,6 +87,41 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
         finally:
             conn.close()
 
+    def _insert_schedule(
+        self, config_path: str, user_id: str, execute_at_ms: int
+    ) -> None:
+        db_args = self._db_args_from_config(config_path)
+        conn = connect(**db_args)
+        try:
+            conn.autocommit = True
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                INSERT INTO {self._SCHEDULE_TABLE}
+                    (user_id, execute_at_ms, requested_at_ms, requested_by, requested_by_admin)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (user_id, execute_at_ms, 1, user_id, False),
+            )
+            cursor.close()
+        finally:
+            conn.close()
+
+    def _schedule_table_exists(self, config_path: str) -> bool:
+        db_args = self._db_args_from_config(config_path)
+        conn = connect(**db_args)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
+                (self._SCHEDULE_TABLE,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            return row is not None
+        finally:
+            conn.close()
+
     def _count_schedules(self, config_path: str, user_id: str) -> int:
         db_args = self._db_args_from_config(config_path)
         conn = connect(**db_args)
@@ -482,6 +517,68 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
                 },
             )
             self.assertNotEqual(login_response.status_code, 200)
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_scheduled_delete_for_missing_user_stops_retrying(self):
+        """Schedule for an already-deleted user must fail terminally, not retry forever.
+
+        Regression test for the staging incident where a schedule for a user
+        whose row was already gone retried every processor interval for days
+        with "404: No row found (users)".
+        """
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config={
+                    "delete_user_processor_interval_seconds": 1,
+                }
+            )
+
+            # Wait for the background processor loop to create the schedule
+            # table, then plant a due schedule for a user that does not exist.
+            for _ in range(30):
+                if self._schedule_table_exists(config_path):
+                    break
+                await asyncio.sleep(1)
+            else:
+                self.fail("Schedule table was never created")
+
+            ghost_user_id = "@ghostuser:my.domain.name"
+            self._insert_schedule(config_path, ghost_user_id, execute_at_ms=1)
+            self.assertEqual(self._count_schedules(config_path, ghost_user_id), 1)
+
+            # The schedule must be dropped as terminally failed. Without
+            # bounded retries the row is re-inserted every cycle forever.
+            for _ in range(30):
+                if self._count_schedules(config_path, ghost_user_id) == 0:
+                    break
+                await asyncio.sleep(1)
+            else:
+                self.fail("Schedule for missing user was still being retried")
+
+            # It must stay gone across further processor cycles (i.e. it was
+            # not re-inserted by another retry).
+            await asyncio.sleep(3)
+            self.assertEqual(self._count_schedules(config_path, ghost_user_id), 0)
         finally:
             self.stop_synapse(
                 server_process=server_process,
