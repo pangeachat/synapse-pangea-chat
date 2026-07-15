@@ -36,6 +36,7 @@ Two admin-adjacent Pangea endpoints extend Synapse with controlled account lifec
 - Scheduled work is processed asynchronously on a recurring background loop.
 - The scheduling mechanism must preserve existing behavior across supported Synapse versions, including short test-time intervals.
 - Repeated force runs should be idempotent at the API contract level: callers receive a successful operation rather than a route-level failure when the feature is enabled.
+- Delete retries are bounded, never infinite. Each delete schedule persists an attempt counter; after a small fixed number of failed attempts (5) the schedule is dropped as terminally failed with one final error log naming the user and the terminal reason. Failures that can never succeed on retry (a 404: the user row is already gone) terminate the schedule on the first attempt. A terminally failed schedule holds no state — a fresh `schedule` or `force` request starts over cleanly.
 
 ## Side Effects
 
