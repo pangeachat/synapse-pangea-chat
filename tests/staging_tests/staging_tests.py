@@ -133,11 +133,11 @@ class StagingSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 401)
 
     async def test_public_courses_returns_valid_structure(self) -> None:
-        """Response contains chunk, next_batch, prev_batch, total_room_count_estimate."""
+        """Response contains chunk, next_batch, total_room_count_estimate."""
         resp = await self._get("/_synapse/client/pangea/v1/public_courses")
         self.assertEqual(resp.status, 200)
         data = await resp.json()
-        for key in ("chunk", "next_batch", "prev_batch", "total_room_count_estimate"):
+        for key in ("chunk", "next_batch", "total_room_count_estimate"):
             self.assertIn(key, data, f"Missing top-level key: {key}")
         self.assertIsInstance(data["chunk"], list)
 
@@ -146,7 +146,7 @@ class StagingSmokeTests(unittest.IsolatedAsyncioTestCase):
         resp = await self._get("/_synapse/client/unstable/org.pangea/public_courses")
         self.assertEqual(resp.status, 200)
         data = await resp.json()
-        for key in ("chunk", "next_batch", "prev_batch", "total_room_count_estimate"):
+        for key in ("chunk", "next_batch", "total_room_count_estimate"):
             self.assertIn(key, data, f"Missing top-level key: {key}")
         self.assertIsInstance(data["chunk"], list)
 

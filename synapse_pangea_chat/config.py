@@ -23,6 +23,10 @@ class PangeaChatConfig:
     public_courses_requests_per_burst: int = 120
     course_plan_state_event_type: Optional[str] = None
     public_courses_cms_cache_ttl_seconds: int = 5
+    # One-time repair of existing pangea.course_plan events (add l2, normalise
+    # the plan id key). Off by default: the operator turns it on, deploys,
+    # watches the summary log, and turns it off again.
+    public_courses_backfill_l2: bool = False
 
     # --- room_preview config ---
     room_preview_state_event_types: List[str] = attr.Factory(list)

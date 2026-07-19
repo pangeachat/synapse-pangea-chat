@@ -16,7 +16,10 @@ from twisted.internet import defer
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.config import PangeaChatConfig
-from synapse_pangea_chat.public_courses.get_public_courses import get_public_courses
+from synapse_pangea_chat.public_courses.get_public_courses import (
+    InvalidCatalogParamError,
+    get_public_courses,
+)
 from synapse_pangea_chat.public_courses.is_rate_limited import (
     RateLimitError,
     is_rate_limited,
@@ -79,7 +82,9 @@ class PublicCourses(Resource):
                 else:
                     since_value = str(candidate)
 
-            # Parse optional language / CEFR filter params
+            # Parse the optional target-language filter. There are no
+            # language_of_instructions / cefr_level filters: serving them would
+            # put a CMS lookup back on the read path.
             filters = CourseFilters()
 
             def _str_param(key: str) -> Optional[str]:
@@ -97,12 +102,6 @@ class PublicCourses(Resource):
             tl = _str_param("target_language")
             if tl:
                 filters["target_language"] = tl
-            loi = _str_param("language_of_instructions")
-            if loi:
-                filters["language_of_instructions"] = loi
-            cl = _str_param("cefr_level")
-            if cl:
-                filters["cefr_level"] = cl
 
             public_courses = await get_public_courses(
                 self._datastores.main,
@@ -123,6 +122,16 @@ class PublicCourses(Resource):
                 request,
                 429,
                 {"error": "Rate limited"},
+                send_cors=True,
+            )
+        except InvalidCatalogParamError as e:
+            # A cursor or filter the catalog cannot honor. Answering 200 with a
+            # head-of-catalog or unfiltered page would look like a valid answer
+            # to the request the caller actually made.
+            respond_with_json(
+                request,
+                400,
+                {"error": e.message, "errcode": "M_INVALID_PARAM"},
                 send_cors=True,
             )
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:

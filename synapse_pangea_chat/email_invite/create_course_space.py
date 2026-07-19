@@ -64,6 +64,30 @@ DEFAULT_SPACE_POWER_LEVELS: Dict[str, Any] = {
 PANGEA_COURSE_PLAN_STATE_EVENT_TYPE = "pangea.course_plan"
 
 
+def build_course_plan_content(
+    course_plan_id: Any, target_language: Any
+) -> Dict[str, Any]:
+    """Content for the ``pangea.course_plan`` state event of a new space.
+
+    The plan id goes under ``uuid`` and, when the caller knows it, the course's
+    target language under ``l2``. Both are read by the public course catalog —
+    a space with no ``l2`` is excluded from every language-filtered browse once
+    it is published (see public-courses.instructions.md).
+
+    ``target_language`` is optional and taken from the request body, never
+    fetched: this endpoint does not call the CMS, and all details arrive in the
+    request (see create-course-space.instructions.md). A caller that omits it
+    still gets a valid course space; the one-time ``l2`` backfill repairs it
+    later. ``l2`` is omitted entirely rather than written empty, because the
+    catalog treats an empty value as absent and a key that is sometimes null
+    and sometimes missing is two shapes for one state.
+    """
+    content: Dict[str, Any] = {"uuid": course_plan_id}
+    if isinstance(target_language, str) and target_language.strip():
+        content["l2"] = target_language.strip()
+    return content
+
+
 class CreateCourseSpace(Resource):
     isLeaf = True
 
@@ -118,6 +142,10 @@ class CreateCourseSpace(Resource):
             course_plan_id = body.get("course_plan_id", "")
             image_url = body.get("image_url")
 
+            course_plan_content = build_course_plan_content(
+                course_plan_id, body.get("target_language")
+            )
+
             # Generate two unique access codes
             student_code = await self._generate_unique_code()
             if student_code is None:
@@ -155,9 +183,7 @@ class CreateCourseSpace(Resource):
                 {
                     "type": PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
                     "state_key": "",
-                    "content": {
-                        "course_plan_id": course_plan_id,
-                    },
+                    "content": course_plan_content,
                 },
             ]
 
