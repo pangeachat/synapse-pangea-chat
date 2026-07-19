@@ -68,7 +68,7 @@ def _make_backfill(
     # Only sender *selection* is stubbed; the real _write_repair builds and
     # sends the event, so the content under assertion is the content the
     # module would really write.
-    backfill._select_state_sender = AsyncMock(  # type: ignore[attr-defined]
+    backfill._select_state_sender = AsyncMock(  # type: ignore[method-assign]
         return_value=sender
     )
 

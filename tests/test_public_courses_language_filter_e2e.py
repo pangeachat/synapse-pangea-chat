@@ -38,7 +38,7 @@ class TestPublicCoursesLanguageFilterE2E(BaseSynapseE2ETest):
         the catalog does not check.
         """
         headers = {"Authorization": f"Bearer {access_token}"}
-        initial_state = []
+        initial_state: List[Dict[str, Any]] = []
         if plan_content is not None:
             initial_state.append(
                 {
