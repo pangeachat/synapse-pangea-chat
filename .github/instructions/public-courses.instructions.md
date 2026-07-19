@@ -31,9 +31,16 @@ to Matrix state is what keeps it one rule, applied the same way whether or not a
 filter is passed. Two code paths that each decided eligibility separately are how the
 catalog came to disagree with itself.
 
-The plan id is read from `uuid`, falling back to `course_plan_id` — spaces created
-server-side write the latter. Only current room state counts, so a room that once had
-a course plan and no longer does is not a course.
+The plan id is read from `uuid`, falling back to `course_plan_id`. Everything now
+writes `uuid`; the fallback is for rooms created before that and is what the one-time
+backfill normalises. Only current room state counts, so a room that once had a course
+plan and no longer does is not a course.
+
+The id is a `quest-plans` row id — that is what a course space pins (see the
+cross-repo [quests and learning objectives](../../../.github/.github/instructions/quests-and-learning-objectives.instructions.md)
+spec). Anything resolving a plan id against the CMS asks `quest-plans` first; the
+retired v1 `course-plans` collection is only a fallback for rooms old enough to
+reference it.
 
 ## Language
 

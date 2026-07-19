@@ -63,9 +63,11 @@ DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE = "pangea.course_plan"
 
 DEFAULT_LIMIT = 10
 
-# The plan id is read from these content keys, in this order. Spaces created
-# server-side by create_course_space write ``course_plan_id``; everything else
-# writes ``uuid``. This tuple is the single definition of that rule: the SQL
+# The plan id is read from these content keys, in this order. Everything writes
+# ``uuid`` now, including create_course_space; ``course_plan_id`` is what older
+# spaces carry and what the one-time backfill normalises away. Keep the fallback
+# regardless — it costs nothing and old rooms outlive the writer that made them.
+# This tuple is the single definition of that rule: the SQL
 # below is generated from it, and anything outside the read path that needs to
 # know whether a room is a course imports ``extract_plan_id`` rather than
 # restating the keys. Two copies of this rule are how the catalog came to

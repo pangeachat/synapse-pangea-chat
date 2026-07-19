@@ -18,6 +18,30 @@ from urllib.parse import urlencode
 # collection name is part of the Authorization scheme Payload expects.
 CMS_AUTH_COLLECTION = "service-users"
 
+# Where a course's target language lives, newest content model first.
+#
+# Course rooms reference v3 ``quest-plans`` — a quest id returns ZERO docs from
+# the v1 ``course-plans`` collection, so querying only v1 makes the backfill a
+# silent no-op for every real course. Legacy rooms may still hold a v1 id, so
+# both are tried and the ids that resolve in the first are not re-asked.
+#
+# The two collections spell the language differently: v3 keeps generation
+# inputs under ``req``, v1 has a flat ``l2``.
+_PLAN_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("quest-plans", ("req", "target_language")),
+    ("course-plans", ("l2",)),
+)
+
+
+def _dig(doc: Dict[str, Any], path: Sequence[str]) -> Any:
+    value: Any = doc
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.public_courses.course_plan_l2_lookup"
 )
@@ -27,7 +51,8 @@ class CoursePlanLookupError(RuntimeError):
     """The CMS could not be asked. Distinct from 'the CMS has no such plan'."""
 
 
-async def _cms_get_course_plans(
+async def _cms_get_plans(
+    collection: str,
     plan_ids: Sequence[str],
     cms_base_url: str,
     cms_api_key: str,
@@ -45,7 +70,7 @@ async def _cms_get_course_plans(
             "depth": "0",
         }
     )
-    url = f"{cms_base_url}/api/course-plans?{query}"
+    url = f"{cms_base_url}/api/{collection}?{query}"
 
     response = await agent.request(
         b"GET",
@@ -63,7 +88,7 @@ async def _cms_get_course_plans(
     body = await readBody(response)
     if response.code >= 400:
         raise CoursePlanLookupError(
-            f"CMS course-plans lookup failed ({response.code}): "
+            f"CMS {collection} lookup failed ({response.code}): "
             f"{body.decode('utf-8', errors='replace')}"
         )
 
@@ -71,7 +96,7 @@ async def _cms_get_course_plans(
     docs = data.get("docs", [])
     if not isinstance(docs, list):
         raise CoursePlanLookupError(
-            f"CMS course-plans lookup returned no docs list: {docs!r}"
+            f"CMS {collection} lookup returned no docs list: {docs!r}"
         )
     return docs
 
@@ -95,16 +120,21 @@ async def fetch_plan_languages(
     if not unique_ids:
         return {}
 
-    docs = await _cms_get_course_plans(unique_ids, cms_base_url, cms_api_key)
-
     languages: Dict[str, str] = {}
-    for doc in docs:
-        if not isinstance(doc, dict):
-            continue
-        plan_id = doc.get("id")
-        l2 = doc.get("l2")
-        if not plan_id or not isinstance(l2, str) or not l2.strip():
-            continue
-        languages[str(plan_id)] = l2.strip()
+    outstanding = list(unique_ids)
+
+    for collection, language_path in _PLAN_SOURCES:
+        if not outstanding:
+            break
+        docs = await _cms_get_plans(collection, outstanding, cms_base_url, cms_api_key)
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            plan_id = doc.get("id")
+            l2 = _dig(doc, language_path)
+            if not plan_id or not isinstance(l2, str) or not l2.strip():
+                continue
+            languages[str(plan_id)] = l2.strip()
+        outstanding = [plan_id for plan_id in outstanding if plan_id not in languages]
 
     return languages
