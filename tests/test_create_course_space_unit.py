@@ -12,6 +12,7 @@ import unittest
 from typing import Any
 
 from synapse_pangea_chat.email_invite.create_course_space import (
+    build_admin_join_url,
     build_course_plan_content,
 )
 from synapse_pangea_chat.public_courses.get_public_courses import (
@@ -134,6 +135,39 @@ class TestCatalogReadsWhatWeWrite(unittest.TestCase):
         content = build_course_plan_content("", "es")
 
         self.assertIsNone(extract_plan_id(content))
+
+
+class TestBuildAdminJoinUrl(unittest.TestCase):
+    def test_uses_the_configured_app_host_not_a_hardcoded_one(self) -> None:
+        """The host follows ``app_base_url`` (ansible sets it per env).
+
+        The bug this pins: a hardcoded ``pangea.chat`` handed every staging
+        course a production join link. Staging config resolves to the staging
+        app host and prod to the prod one.
+        """
+        self.assertEqual(
+            build_admin_join_url("https://app.staging.pangea.chat", "04wpy5e"),
+            "https://app.staging.pangea.chat/04wpy5e",
+        )
+        self.assertEqual(
+            build_admin_join_url("https://app.pangea.chat", "abc123x"),
+            "https://app.pangea.chat/abc123x",
+        )
+
+    def test_emits_the_short_code_form_not_the_classcode_route(self) -> None:
+        """External form is ``<app>/<code>`` — the CloudFront 302 source — not
+        the client's internal ``/#/join_with_link?classcode=`` spelling."""
+        url = build_admin_join_url("https://app.pangea.chat", "xyz789q")
+
+        self.assertNotIn("join_with_link", url)
+        self.assertNotIn("classcode", url)
+        self.assertTrue(url.endswith("/xyz789q"))
+
+    def test_trailing_slash_on_base_is_not_doubled(self) -> None:
+        self.assertEqual(
+            build_admin_join_url("https://app.pangea.chat/", "code42x"),
+            "https://app.pangea.chat/code42x",
+        )
 
 
 if __name__ == "__main__":
