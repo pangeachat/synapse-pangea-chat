@@ -88,6 +88,19 @@ def build_course_plan_content(
     return content
 
 
+def build_admin_join_url(app_base_url: str, access_code: str) -> str:
+    """Admin join link for a newly created course space.
+
+    The external form is the CloudFront short code ``<app>/<code>`` — a 302 to
+    the client's ``/join_with_link?classcode=`` route, which the client is the
+    sole producer of (see deep-linking.instructions.md). Built on the
+    environment's app host from ``app_base_url`` (ansible sets it per env:
+    ``app.pangea.chat`` in prod, ``app.staging.pangea.chat`` on staging), never
+    a hardcoded host — a staging course must not hand out a prod link.
+    """
+    return f"{app_base_url.rstrip('/')}/{access_code}"
+
+
 class CreateCourseSpace(Resource):
     isLeaf = True
 
@@ -233,10 +246,9 @@ class CreateCourseSpace(Resource):
                 except Exception as e:
                     logger.warning(f"Failed to set room avatar: {e}")
 
-            # Build admin join URL (same format the client uses for class links)
-            admin_join_url = (
-                f"https://pangea.chat/#/join_with_link?classcode={admin_code}"
-            )
+            # Build admin join URL — short code on the env's app host, never a
+            # hardcoded host (see build_admin_join_url).
+            admin_join_url = build_admin_join_url(self._config.app_base_url, admin_code)
 
             # TODO: Send invite email to teacher via invite_by_email
             # (placeholder — invite_by_email endpoint is a separate session)
