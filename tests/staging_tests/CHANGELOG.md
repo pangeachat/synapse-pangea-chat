@@ -76,7 +76,7 @@ After deploying to staging, verify each feature still works through the unified 
 
 #### 1. Public Courses — `GET /_synapse/client/pangea/v1/public_courses`
 - Compatibility alias: `GET /_synapse/client/unstable/org.pangea/public_courses`
-- [ ] Authenticated request returns a list of public courses with `chunk`, `next_batch`, `prev_batch`, `total_room_count_estimate`
+- [ ] Authenticated request returns a list of public courses with `chunk`, `next_batch`, `total_room_count_estimate` (there is no `prev_batch`)
 - [ ] Each course has: `room_id`, `name`, `topic`, `avatar_url`, `canonical_alias`, `course_id`, `num_joined_members`, `world_readable`, `guest_can_join`, `join_rule`, `room_type`
 - [ ] `course_id` matches the `uuid` field from the room's `pangea.course_plan` state event
 - [ ] Pagination works (`?limit=N&since=M`)

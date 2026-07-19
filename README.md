@@ -92,15 +92,17 @@ Requires a valid Matrix access token; unauthenticated calls return `401 M_UNAUTH
 
 ### Query Parameters
 
-| Name                       | Type    | Default | Description                                                              |
-| -------------------------- | ------- | ------- | ------------------------------------------------------------------------ |
-| `limit`                    | integer | `10`    | Maximum number of courses to return                                      |
-| `since`                    | string  | `None`  | Pagination token returned by a previous call                             |
-| `target_language`          | string  | `None`  | Filter by target language (CMS `l2` field, e.g. `es`)                    |
-| `language_of_instructions` | string  | `None`  | Filter by language of instructions (CMS `originalL1` field, e.g. `en`)   |
-| `cefr_level`               | string  | `None`  | Filter by CEFR level (CMS `cefrLevel` field, e.g. `A1`, `B2`)           |
+| Name              | Type    | Default | Description                                                                 |
+| ----------------- | ------- | ------- | --------------------------------------------------------------------------- |
+| `limit`           | integer | `10`    | Maximum number of courses to return                                         |
+| `since`           | string  | `None`  | Pagination cursor (`next_batch`) returned by a previous call                |
+| `target_language` | string  | `None`  | Filter by target language, read from `l2` on `pangea.course_plan` (e.g. `es`) |
 
-When any filter parameter is provided, the endpoint queries Payload CMS to match course plans against the filters. This requires `cms_base_url` and `cms_service_api_key` to be configured. If CMS is missing/misconfigured or unavailable, the endpoint falls back to the previous unfiltered behavior.
+`target_language` matches on **base language**: `es` matches `es`, `es-ES`, and `es-MX`, and the reverse. A room with no `l2` appears when no filter is passed and is excluded when one is.
+
+There is no CMS call on the read path — the target language is carried on the room's own course-plan state event. There are no `language_of_instructions` or `cefr_level` filters; a client that wants a course's L1 or CEFR level reads them from the course plan it already fetches to render the card.
+
+Filtering happens **before** pagination, so a page is full unless the catalog is exhausted and a non-null `next_batch` means more results genuinely exist. `next_batch` is a keyset cursor (the last room id of the page); a legacy decimal `since` from an older client is still accepted as an offset for one request.
 
 ### Response
 
@@ -118,27 +120,25 @@ When any filter parameter is provided, the endpoint queries Payload CMS to match
       "guest_can_join": false,
       "join_rule": null,
       "room_type": null,
-      "target_language": "es",
-      "language_of_instructions": "en",
-      "cefr_level": "A1"
+      "course_id": "5f0c…",
+      "target_language": "es"
     }
   ],
-  "filtering_warning": "",
-  "next_batch": "10",
-  "prev_batch": null,
+  "next_batch": "!lastRoomOnThisPage:example.org",
   "total_room_count_estimate": 23
 }
 ```
 
-`filtering_warning` is empty when filtering behavior succeeded (or no filters were requested). If language filters were requested but CMS is unavailable/misconfigured, the endpoint still returns normal unfiltered results and sets `filtering_warning` to a non-empty message.
+`next_batch` is `null` on the last page.
 
 ### Room Selection Criteria
 
-Returns only rooms where **all** of the following are true:
+A room appears in the catalog if, and only if, **both** of the following are true:
 
-1. `rooms.is_public` is true.
-2. The room emits the required course plan state event (default `pangea.course_plan`).
-3. The endpoint can fetch the latest preview state events in a single consolidated query.
+1. `rooms.is_public` is true (it is published in the public room directory).
+2. Its **current** room state carries the course-plan state event (default `pangea.course_plan`) with a plan id — read from `uuid`, falling back to `course_plan_id`.
+
+Nothing else is checked: not member count, not join rule, and not the contents of the quest. A quest with zero missions is a published course and appears. Because only current state is consulted, a room that once had a course plan and no longer does is not a course.
 
 ---
 
@@ -371,7 +371,6 @@ synapse_pangea_chat/
 ├── config.py                    # Unified PangeaChatConfig
 ├── public_courses.py            # Public courses endpoint
 ├── get_public_courses.py        # Public courses query logic
-├── course_metadata_cache.py     # CMS language metadata cache
 ├── is_rate_limited.py           # Public courses rate limiter
 ├── types.py                     # Shared types
 ├── room_preview/                # Room preview module

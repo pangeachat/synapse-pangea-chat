@@ -13,6 +13,10 @@ The public course catalog behind Browse — where a learner finds a course to jo
 - Both routes serve the same resource and return identical payloads. New callers use
   the canonical route.
 - Matrix bearer auth. Rate limiting is shared across both routes.
+- A malformed cursor, or a filter value that cannot be honored, is refused with
+  `400 M_INVALID_PARAM` — never served as an empty page or as unfiltered
+  results. Both would answer a question the caller did not ask, with nothing in
+  the response to say so.
 
 ## What appears
 

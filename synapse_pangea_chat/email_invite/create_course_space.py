@@ -118,6 +118,22 @@ class CreateCourseSpace(Resource):
             course_plan_id = body.get("course_plan_id", "")
             image_url = body.get("image_url")
 
+            # The course-plan state event carries the plan id under ``uuid``
+            # and, when the caller knows it, the course's target language as
+            # ``l2``. Both are read by the public course catalog — a space with
+            # no ``l2`` is excluded from every language-filtered browse once it
+            # is published (see public-courses.instructions.md).
+            #
+            # ``target_language`` is optional and taken from the body, never
+            # fetched: this endpoint does not call the CMS, and all details
+            # arrive in the request (see create-course-space.instructions.md).
+            # A caller that omits it still gets a valid course space; the one
+            # time ``l2`` backfill repairs it later.
+            course_plan_content: Dict[str, Any] = {"uuid": course_plan_id}
+            target_language = body.get("target_language")
+            if isinstance(target_language, str) and target_language.strip():
+                course_plan_content["l2"] = target_language.strip()
+
             # Generate two unique access codes
             student_code = await self._generate_unique_code()
             if student_code is None:
@@ -155,9 +171,7 @@ class CreateCourseSpace(Resource):
                 {
                     "type": PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
                     "state_key": "",
-                    "content": {
-                        "course_plan_id": course_plan_id,
-                    },
+                    "content": course_plan_content,
                 },
             ]
 
