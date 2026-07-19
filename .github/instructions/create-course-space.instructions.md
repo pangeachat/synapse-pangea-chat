@@ -15,7 +15,8 @@ Lives in the `email_invite/` sub-package alongside `invite_by_email`.
 ### Contract
 
 - **Auth**: Bearer token (bot user). Choreo logs in with bot credentials from AWS Secrets Manager.
-- **Input**: Course plan ID, title, description, image URL, teacher email, optional extra email template vars. Endpoint does **not** fetch from CMS — all details passed in body.
+- **Input**: Course plan ID, title, description, image URL, teacher email, target language, optional extra email template vars. Endpoint does **not** fetch from CMS — all details passed in body.
+  - **Target language must be an IETF code** (`es`), never a display name (`Spanish`). It is stored as `l2` on the space's course-plan state event and the public course catalog matches it by base language, so a display name matches nothing — and it is sticky, because the one-time `l2` backfill treats any non-empty value as already correct. It is optional: a space created without it is valid and gets repaired by that backfill, which is the only reason omitting it is safe. See [public-courses](public-courses.instructions.md).
 - **Output**: Room ID, student access code, admin access code, admin join URL (same format the client already uses for class links — see [joining-courses](../../../client/.github/instructions/joining-courses.instructions.md) Route 1).
 
 ### What it does
