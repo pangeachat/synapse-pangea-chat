@@ -13,11 +13,15 @@ Discovery used to enumerate every room under each joined course space from the c
 
 ## What it does
 
-Given the caller's joined course spaces (and, optionally, a single activity), the endpoint returns preview data for **only** the activity-session rooms under those spaces, in the **same shape as [room_preview](room-preview.instructions.md)**. It is a thin front on the room-preview reader — space to children to activity filter to the existing preview projection — and `room_preview` itself is unchanged, still serving per-room previews (invited sessions, chat details).
+This module takes the following query parameters as input:
+1. A required, comma-separated list of spaceIDs for which to return child activity sessions (?rooms)
+2. An options activityID to filter by (?activity)
 
-- **Optional activity scope.** An activity id narrows the result to that activity's sessions (the start page's case); without it, every activity session under the spaces is returned (the map's case).
-- **A session is a child room carrying a `pangea.activity_plan`.** That state event is where the preview already reads the activity id, so the filter costs no extra read.
-- **Direct children only.** Sessions are direct `m.space.child` of the course space. The endpoint returns **all** such children that pass the filter, regardless of the space-child suggestion flag — a launcher-added session must always surface. (This differs from the course chats list, which honors suggestion status for chats.)
+The endpoint returns preview data for **only** the activity-session rooms under those spaces, in the **same shape as [room_preview](room-preview.instructions.md)**. It is a thin front on the room-preview reader — space to children to activity filter to the existing preview projection — and `room_preview` itself is unchanged, still serving per-room previews (invited sessions, chat details).
+
+- **Optional activity scope.** An activity id narrows the result to that activity's sessions (the start page's case); without it, every activity session under the spaces is returned (the map's case). This includes finished and abandoned sessions, which accumulate over a semester. Filtering for joinable activities is done client-side. We may need to revisit this can course sizes increase.
+- **A session is a child room carrying a `pangea.activity_plan`.** That state event is where the preview already reads the activity id, so the filter costs no extra read. The session filter reads pangea.activity_plan independently of the config-driven room_preview_state_event_types list, so a config-trimmed deploy doesn't silently break the map.
+- **Direct children only.** Sessions are direct `m.space.child` of the course space. The endpoint returns **all** such children that pass the filter, regardless of the space-child suggestion flag — a launcher-added session must always surface. Do not return children that have been removed from the parent space.
 
 ## Access
 
