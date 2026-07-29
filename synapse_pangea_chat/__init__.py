@@ -4,6 +4,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from synapse.events import EventBase
 from synapse.module_api import ModuleApi
 
+from synapse_pangea_chat.activity_session_previews import ActivitySessionPreviews
 from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.delayed_push import configure_delayed_push
@@ -88,6 +89,15 @@ class PangeaChat:
         # Register reactive cache invalidation callback for room preview
         self._api.register_third_party_rules_callbacks(
             on_new_event=self._on_new_event_room_preview,
+        )
+
+        # --- Activity Session Previews ---
+        # Space-scoped session discovery: a thin front on the room_preview
+        # reader (shares its cache, invalidation, and rate limiter).
+        self.activity_session_previews_resource = ActivitySessionPreviews(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/activity_session_previews",
+            resource=self.activity_session_previews_resource,
         )
 
         # --- Room Code ---
