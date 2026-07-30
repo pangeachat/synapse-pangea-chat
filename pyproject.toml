@@ -22,6 +22,7 @@ dev = [
   "aiounittest",
   "aiohttp",
   "psycopg2",
+  "requests",
   "testing.postgresql",
   # for type checking
   "mypy == 1.6.1",
