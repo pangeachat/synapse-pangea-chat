@@ -8,6 +8,7 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 | --------------------------------------------- | ------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------- |
 | [Public Courses](#public-courses)             | `synapse_pangea_chat/`                      | `GET /_synapse/client/pangea/v1/public_courses`           | Course catalog with filtering and pagination      |
 | [Room Preview](#room-preview)                 | `synapse_pangea_chat/room_preview/`         | `GET /_synapse/client/unstable/org.pangea/room_preview`   | Read room state events without membership         |
+| [Activity Session Previews](#activity-session-previews) | `synapse_pangea_chat/activity_session_previews/` | `GET /_synapse/client/pangea/v1/activity_session_previews` | Previews of activity-session rooms under the caller's course spaces |
 | [Room Code](#room-code)                       | `synapse_pangea_chat/room_code/`            | `POST /_synapse/client/pangea/v1/knock_with_code`         | Secret-code-based room invitations                |
 |                                               |                                             | `GET /_synapse/client/pangea/v1/request_room_code`        | Generate a unique room access code                |
 | [Delete Room](#delete-room)                   | `synapse_pangea_chat/delete_room/`          | `POST /_synapse/client/pangea/v1/delete_room`             | Room deletion for highest-power-level members     |
@@ -189,6 +190,27 @@ Included for rooms containing `pangea.activity_roles` (activity rooms) or `pange
 In-memory cache with 1-minute TTL. Cache is reactively invalidated when relevant state events change.
 
 _Originally: [pangeachat/synapse-room-preview](https://github.com/pangeachat/synapse-room-preview)_
+
+---
+
+## Activity Session Previews
+
+Space-scoped activity-session discovery: previews of the activity-session child rooms under the caller's joined course spaces, in the same response shape as [Room Preview](#room-preview). Design: [activity-session-previews.instructions.md](.github/instructions/activity-session-previews.instructions.md).
+
+**Route:** `GET /_synapse/client/pangea/v1/activity_session_previews`
+
+### Query Parameters
+
+| Name       | Type   | Default   | Description                                      |
+| ---------- | ------ | --------- | ------------------------------------------------ |
+| `rooms`    | string | _(empty)_ | Comma-delimited list of course-space room IDs    |
+| `activity` | string | _(none)_  | Optional activity ID to narrow the sessions to   |
+
+### Behavior
+
+- The caller must be a **joined member** of each requested space; non-member spaces are silently dropped.
+- A session is a direct `m.space.child` carrying a `pangea.activity_plan` state event; removed children (no valid `via`) are excluded, and the suggested flag is ignored.
+- Response shape, content filtering, membership summary, caching, and rate limiting are inherited from [Room Preview](#room-preview) — this endpoint is a thin front on the same reader.
 
 ---
 
