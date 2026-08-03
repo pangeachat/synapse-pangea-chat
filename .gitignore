@@ -16,4 +16,9 @@ CLAUDE.md
 .mcp.json.generated_by_sync
 # Claude Code per-session local state (worktrees, scheduled-task locks,
 # settings.local.json) — agent-only, not source.
-.claude/
+# Claude Code local worktrees + scratch (never commit), but track the team hook
+# registration — settings.json is sync-generated (harness-sync.instructions.md in
+# pangeachat/.github) and a fresh clone needs it before any session can regenerate it.
+.claude/*
+!.claude/settings.json
+!.claude/settings.json.generated_by_sync
