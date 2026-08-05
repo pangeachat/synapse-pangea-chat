@@ -14,6 +14,7 @@ from synapse_pangea_chat.direct_message import EnsureDirectMessage
 from synapse_pangea_chat.direct_push import DirectPush
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
 from synapse_pangea_chat.export_user_data import ExportUserData
+from synapse_pangea_chat.find_user_by_email import FindUserByEmail
 from synapse_pangea_chat.grant_instructor_analytics_access import (
     GrantInstructorAnalyticsAccess,
 )
@@ -152,6 +153,13 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/export_user_data",
             resource=self.export_user_data_resource,
+        )
+
+        # --- Find User By Email ---
+        self.find_user_by_email_resource = FindUserByEmail(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/find_user_by_email",
+            resource=self.find_user_by_email_resource,
         )
 
         # --- User Activity ---
@@ -479,6 +487,28 @@ class PangeaChat:
             "user_directory_search_burst_duration_seconds", 60
         )
 
+        # --- find_user_by_email config ---
+        find_user_by_email_requests_per_burst = config.get(
+            "find_user_by_email_requests_per_burst", 10
+        )
+        if (
+            not isinstance(find_user_by_email_requests_per_burst, int)
+            or find_user_by_email_requests_per_burst < 1
+        ):
+            raise ValueError(
+                "find_user_by_email_requests_per_burst must be an integer >= 1"
+            )
+        find_user_by_email_burst_duration_seconds = config.get(
+            "find_user_by_email_burst_duration_seconds", 60
+        )
+        if (
+            not isinstance(find_user_by_email_burst_duration_seconds, int)
+            or find_user_by_email_burst_duration_seconds < 1
+        ):
+            raise ValueError(
+                "find_user_by_email_burst_duration_seconds must be an integer >= 1"
+            )
+
         # --- register_email config ---
         register_email_requests_per_burst = config.get(
             "register_email_requests_per_burst", 5
@@ -589,6 +619,8 @@ class PangeaChat:
             limit_user_directory_filter_search_if_missing_public_attribute=limit_user_directory_filter_search_if_missing_public_attribute,
             user_directory_search_requests_per_burst=user_directory_search_requests_per_burst,
             user_directory_search_burst_duration_seconds=user_directory_search_burst_duration_seconds,
+            find_user_by_email_requests_per_burst=find_user_by_email_requests_per_burst,
+            find_user_by_email_burst_duration_seconds=find_user_by_email_burst_duration_seconds,
             register_email_requests_per_burst=register_email_requests_per_burst,
             register_email_burst_duration_seconds=register_email_burst_duration_seconds,
             invite_by_email_requests_per_burst=invite_by_email_requests_per_burst,

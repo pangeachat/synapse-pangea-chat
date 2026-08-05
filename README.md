@@ -13,6 +13,7 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 |                                               |                                             | `GET /_synapse/client/pangea/v1/request_room_code`        | Generate a unique room access code                |
 | [Delete Room](#delete-room)                   | `synapse_pangea_chat/delete_room/`          | `POST /_synapse/client/pangea/v1/delete_room`             | Room deletion for highest-power-level members     |
 | [Delete User](#delete-user)                   | `synapse_pangea_chat/delete_user/`          | `POST /_synapse/client/pangea/v1/delete_user`             | Delete user associations then deactivate account   |
+| [Find User By Email](#find-user-by-email)     | `synapse_pangea_chat/find_user_by_email/`   | `POST /_synapse/client/pangea/v1/find_user_by_email`      | Server-admin lookup of the account holding an email |
 | [Direct Message](#direct-message)             | `synapse_pangea_chat/direct_message/`       | `POST /_synapse/client/pangea/v1/ensure_direct_message`   | Create or repair a 1:1 DM for two local users     |
 | [Delayed Push](#delayed-push)                 | `synapse_pangea_chat/delayed_push/`         | _(HttpPusher monkey patch)_                               | Delay HTTP pushes while users are active          |
 | [Limit User Directory](#limit-user-directory) | `synapse_pangea_chat/limit_user_directory/` | _(spam checker)_                                          | Filter user directory by public profile attribute |
@@ -58,6 +59,10 @@ modules:
       delete_user_burst_duration_seconds: 60 # default: 60
       delete_user_schedule_delay_seconds: 604800 # default: 7 days
       delete_user_processor_interval_seconds: 60 # default: 60
+
+      # --- Find User By Email ---
+      find_user_by_email_requests_per_burst: 10 # default: 10
+      find_user_by_email_burst_duration_seconds: 60 # default: 60
 
       # --- Limit User Directory (disabled when path is null) ---
       limit_user_directory_public_attribute_search_path: "profile.user_settings.public"
@@ -349,6 +354,40 @@ Behavior by action:
   "execute_at_ms": 1762790400000
 }
 ```
+
+---
+
+## Find User By Email
+
+Resolve an email address to the local account that has it bound. Synapse's admin user search matches only the user-ID localpart and display name, so it cannot answer this. Design: [find-user-by-email.instructions.md](.github/instructions/find-user-by-email.instructions.md).
+
+**Route:** `POST /_synapse/client/pangea/v1/find_user_by_email`
+
+**Server admins only** — non-admin callers get `403`, whether or not the address matches. POST rather than GET so the address is not written into access logs.
+
+**Body:**
+
+```json
+{ "address": "person@school.edu" }
+```
+
+**Response (200):**
+
+```json
+{
+  "address": "person@school.edu",
+  "results": [
+    {
+      "user_id": "@jdoe:example.com",
+      "address": "person@school.edu",
+      "display_name": "Jane Doe",
+      "deactivated": false
+    }
+  ]
+}
+```
+
+Matching is case-insensitive and whole-address only — no domain or substring search. An address with no live account returns an empty `results`, not a 404. Synapse removes threepid bindings when an account is deactivated, so an empty result means "no live account", not "never registered".
 
 ---
 
