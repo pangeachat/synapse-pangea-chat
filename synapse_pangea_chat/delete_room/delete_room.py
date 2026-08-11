@@ -20,7 +20,11 @@ from twisted.web.resource import Resource
 from synapse_pangea_chat.delete_room.cleanup_space_relationships import (
     cleanup_space_relationships,
 )
-from synapse_pangea_chat.delete_room.constants import MEMBERSHIP_LEAVE
+from synapse_pangea_chat.delete_room.constants import (
+    MEMBERSHIP_LEAVE,
+    ROOM_DELETED_CONTENT_KEY,
+    ROOM_DELETED_REASON,
+)
 from synapse_pangea_chat.delete_room.extract_body_json import extract_body_json
 from synapse_pangea_chat.delete_room.get_room_members import get_room_members
 from synapse_pangea_chat.delete_room.is_rate_limited import is_rate_limited
@@ -114,7 +118,14 @@ class DeleteRoom(Resource):
                     # Only works for local users; remote members can't be
                     # removed from here (accepted: single-homeserver deployment)
                     await self._api.update_room_membership(
-                        user, user, room_id, MEMBERSHIP_LEAVE
+                        user,
+                        user,
+                        room_id,
+                        MEMBERSHIP_LEAVE,
+                        content={
+                            "reason": ROOM_DELETED_REASON,
+                            ROOM_DELETED_CONTENT_KEY: True,
+                        },
                     )
                 except Exception as e:
                     logger.warning(
