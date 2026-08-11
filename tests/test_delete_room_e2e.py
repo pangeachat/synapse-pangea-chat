@@ -86,7 +86,7 @@ class TestE2E(BaseSynapseE2ETest):
                 json={"room_id": room_id},
                 headers={"Authorization": f"Bearer {tokens['user2']}"},
             )
-            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.status_code, 403)
             self.assertIn("highest power level", response.json().get("error", ""))
             # Room creator deletes (should succeed)
             response = requests.post(

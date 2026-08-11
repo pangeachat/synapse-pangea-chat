@@ -23,9 +23,8 @@ async def cleanup_space_relationships(
         room_id: The ID of the room being deleted
         sender_user_id: The user ID to use as the sender for the cleanup events
 
-    This function:
-    1. Removes m.space.parent events from the deleted room
-    2. Removes m.space.child events from parent spaces that reference the deleted room
+    Removes m.space.child events from parent spaces that reference the deleted
+    room. The room's own m.space.parent events go away with the purge.
     """
     try:
         # Step 1: Get all m.space.parent events from the deleted room
@@ -82,34 +81,6 @@ async def cleanup_space_relationships(
                 )
                 # Continue with other parent spaces even if one fails
                 continue
-
-        # Step 3: Remove m.space.parent events from the deleted room
-        # This happens automatically when the room is purged, but we can be explicit
-        for state_event in space_parent_events.values():
-            if state_event.type == EVENT_TYPE_M_SPACE_PARENT:
-                try:
-                    logger.info(
-                        "Removing m.space.parent event for %s from room %s",
-                        state_event.state_key,
-                        room_id,
-                    )
-                    await api.create_and_send_event_into_room(
-                        {
-                            "type": EVENT_TYPE_M_SPACE_PARENT,
-                            "state_key": state_event.state_key,
-                            "room_id": room_id,
-                            "sender": sender_user_id,
-                            "content": {},  # Empty content removes the state
-                        }
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Failed to remove m.space.parent event from room %s: %s",
-                        room_id,
-                        e,
-                    )
-                    # Continue with other events even if one fails
-                    continue
 
     except Exception as e:
         logger.error(

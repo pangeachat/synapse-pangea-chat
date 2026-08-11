@@ -1,5 +1,5 @@
 ---
-applyTo: "synapse_pangea_chat/delete_user/**,synapse_pangea_chat/export_user_data/**,synapse_pangea_chat/__init__.py,tests/test_delete_user_e2e.py,tests/test_export_user_data_e2e.py,tests/test_export_user_data_unit.py"
+applyTo: "synapse_pangea_chat/delete_room/**,tests/test_delete_room_e2e.py,tests/test_delete_room_unit.py"
 ---
 
 # Delete Room — Synapse Module
@@ -28,7 +28,7 @@ Space link cleanup, best effort. The room's child link in each parent space is r
 
 Every joined local member leaves the room. Members on other homeservers cannot be removed this way; this is accepted because deployment is effectively single-homeserver.
 
-All local room data is purged. The purge runs inside the request, so large rooms respond slowly. Accepted at current scale.
+All local room data is purged — but not immediately. The purge is scheduled for days later (`delete_room_purge_delay_seconds`, default 7 days) through Synapse's durable task scheduler. The delay exists so the leave events survive long enough for members' clients to sync them; an immediate purge deletes the leaves before delivery, and those clients then show the deleted room forever. Clients offline for longer than the whole window can still miss the leave — accepted, and tunable via the delay. If a local user rejoins during the window, the scheduled purge fails safe instead of deleting the room out from under them.
 
 Deletion does not block the room from returning through federation or re-creation — the same accepted single-homeserver risk. Because deletion is irreversible, every success is logged with the requester and room id.
 

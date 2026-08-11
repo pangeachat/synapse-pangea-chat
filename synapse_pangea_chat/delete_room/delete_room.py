@@ -9,6 +9,7 @@ from synapse.api.errors import (
     InvalidClientTokenError,
     MissingClientTokenError,
 )
+from synapse.handlers.pagination import PURGE_ROOM_ACTION_NAME
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
@@ -41,8 +42,8 @@ class DeleteRoom(Resource):
         self._api = api
         self._config = config
         self._auth = self._api._hs.get_auth()
-        self._datastores = self._api._hs.get_datastores()
-        self._pagination_handler = self._api._hs.get_pagination_handler()
+        self._task_scheduler = self._api._hs.get_task_scheduler()
+        self._clock = self._api._hs.get_clock()
 
     def render_POST(self, request: SynapseRequest):
         defer.ensureDeferred(self._async_render_POST(request))
@@ -88,8 +89,8 @@ class DeleteRoom(Resource):
             if not is_member:
                 respond_with_json(
                     request,
-                    400,
-                    {"error": "Bad request. Not a member of the room"},
+                    403,
+                    {"error": "Forbidden. Not a member of the room"},
                     send_cors=True,
                 )
                 return
@@ -98,8 +99,8 @@ class DeleteRoom(Resource):
             if not await user_has_highest_power_level(self._api, requester_id, room_id):
                 respond_with_json(
                     request,
-                    400,
-                    {"error": "Bad request. Not the highest power level"},
+                    403,
+                    {"error": "Forbidden. Not the highest power level"},
                     send_cors=True,
                 )
 
@@ -110,16 +111,33 @@ class DeleteRoom(Resource):
 
             for user in room_members_ids:
                 try:
-                    # Try to use the module API for all users, both local and remote
+                    # Only works for local users; remote members can't be
+                    # removed from here (accepted: single-homeserver deployment)
                     await self._api.update_room_membership(
                         user, user, room_id, MEMBERSHIP_LEAVE
                     )
                 except Exception as e:
-                    logger.error(
+                    logger.warning(
                         "Failed to remove membership for %s in %s: %s", user, room_id, e
                     )
 
-            await self._pagination_handler.purge_room(room_id, force=True)
+            # Defer the purge so the leave events stay available for members'
+            # clients to sync; without force, the purge fails safe if a local
+            # user rejoins during the delay window
+            await self._task_scheduler.schedule_task(
+                PURGE_ROOM_ACTION_NAME,
+                resource_id=room_id,
+                timestamp=self._clock.time_msec()
+                + self._config.delete_room_purge_delay_seconds * 1000,
+            )
+
+            logger.info(
+                "Room %s deleted by %s (%d members removed, purge in %ds)",
+                room_id,
+                requester_id,
+                len(room_members_ids),
+                self._config.delete_room_purge_delay_seconds,
+            )
 
             respond_with_json(
                 request,
