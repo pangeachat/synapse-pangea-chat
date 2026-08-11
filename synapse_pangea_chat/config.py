@@ -53,6 +53,7 @@ class PangeaChatConfig:
     # --- delete_room config ---
     delete_room_requests_per_burst: int = 10
     delete_room_burst_duration_seconds: int = 60
+    delete_room_purge_delay_seconds: int = 604800  # 7 days
 
     # --- user_activity config ---
     user_activity_requests_per_burst: int = 10

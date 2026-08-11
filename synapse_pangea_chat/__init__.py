@@ -356,6 +356,9 @@ class PangeaChat:
         delete_room_burst_duration_seconds = config.get(
             "delete_room_burst_duration_seconds", 60
         )
+        delete_room_purge_delay_seconds = config.get(
+            "delete_room_purge_delay_seconds", 604800
+        )
 
         # --- user_activity config ---
         user_activity_requests_per_burst = config.get(
@@ -600,6 +603,7 @@ class PangeaChat:
             preview_with_code_state_event_types=preview_with_code_state_event_types,
             delete_room_requests_per_burst=delete_room_requests_per_burst,
             delete_room_burst_duration_seconds=delete_room_burst_duration_seconds,
+            delete_room_purge_delay_seconds=delete_room_purge_delay_seconds,
             user_activity_requests_per_burst=user_activity_requests_per_burst,
             user_activity_burst_duration_seconds=user_activity_burst_duration_seconds,
             user_activity_notification_bot_user_id=user_activity_notification_bot_user_id,

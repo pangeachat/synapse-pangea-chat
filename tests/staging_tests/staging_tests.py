@@ -394,12 +394,12 @@ class StagingSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 403)
 
     async def test_delete_room_non_member(self) -> None:
-        """Deleting a room user is not a member of → 400."""
+        """Deleting a room user is not a member of → 403."""
         resp = await self._post(
             "/_synapse/client/pangea/v1/delete_room",
             json={"room_id": "!nonexistent000:staging.pangea.chat"},
         )
-        self.assertEqual(resp.status, 400)
+        self.assertEqual(resp.status, 403)
 
     async def test_delete_room_missing_room_id(self) -> None:
         """Missing room_id in body → 400."""
