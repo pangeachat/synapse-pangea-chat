@@ -26,7 +26,7 @@ The client hides delete buttons from non-admins and in direct chats, but the ser
 
 Space link cleanup, best effort. The room's child link in each parent space is removed, sent as the requester. If the requester lacks permission in a parent space, the failure is logged and deletion continues — a leftover child link in the space is accepted rather than blocking deletion.
 
-Every joined local member leaves the room. Members on other homeservers cannot be removed this way; this is accepted because deployment is effectively single-homeserver.
+Every joined local member leaves the room. Each leave is a self-leave (sender is the member) whose content carries `"pangea.room_deleted": true` and a fixed English `reason` — the marker is how clients tell "this room was deleted" apart from a voluntary leave, which is otherwise byte-identical (a kick is already distinguishable by its sender). Delivery of the marker is only as reliable as delivery of the leave itself (see the purge delay below). Members on other homeservers cannot be removed this way; this is accepted because deployment is effectively single-homeserver.
 
 All local room data is purged — but not immediately. The purge is scheduled for days later (`delete_room_purge_delay_seconds`, default 7 days) through Synapse's durable task scheduler. The delay exists so the leave events survive long enough for members' clients to sync them; an immediate purge deletes the leaves before delivery, and those clients then show the deleted room forever. Clients offline for longer than the whole window can still miss the leave — accepted, and tunable via the delay. If a local user rejoins during the window, the scheduled purge fails safe instead of deleting the room out from under them.
 

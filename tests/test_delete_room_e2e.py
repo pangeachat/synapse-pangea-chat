@@ -106,6 +106,20 @@ class TestE2E(BaseSynapseE2ETest):
                 joined_rooms = resp.json().get("joined_rooms", [])
                 self.assertEqual(len(joined_rooms), 0)
 
+            # Assert the leave events carry the room-deleted marker so clients
+            # can tell deletion apart from a voluntary leave (client#8237)
+            for remove_user in ["user2", "user3"]:
+                member_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/m.room.member/@{remove_user}:my.domain.name"
+                resp = requests.get(
+                    member_url,
+                    headers={"Authorization": f"Bearer {tokens[remove_user]}"},
+                )
+                self.assertEqual(resp.status_code, 200)
+                content = resp.json()
+                self.assertEqual(content.get("membership"), "leave")
+                self.assertTrue(content.get("pangea.room_deleted"))
+                self.assertEqual(content.get("reason"), "This space has been deleted")
+
             # "roomadmin" creates another private room and invite anotheradmin
             room_id = await self.create_private_room(admin_token)
             for admin in ["anotheradmin"]:
