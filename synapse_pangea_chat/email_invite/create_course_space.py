@@ -27,6 +27,7 @@ from synapse.types import create_requester
 from twisted.internet import defer
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.email_invite.build_join_url import build_join_url
 from synapse_pangea_chat.room_code.constants import (
     ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
     ADMIN_ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
@@ -86,19 +87,6 @@ def build_course_plan_content(
     if isinstance(target_language, str) and target_language.strip():
         content["l2"] = target_language.strip()
     return content
-
-
-def build_admin_join_url(app_base_url: str, access_code: str) -> str:
-    """Admin join link for a newly created course space.
-
-    The external form is the CloudFront short code ``<app>/<code>`` — a 302 to
-    the client's ``/join_with_link?classcode=`` route, which the client is the
-    sole producer of (see deep-linking.instructions.md). Built on the
-    environment's app host from ``app_base_url`` (ansible sets it per env:
-    ``app.pangea.chat`` in prod, ``app.staging.pangea.chat`` on staging), never
-    a hardcoded host — a staging course must not hand out a prod link.
-    """
-    return f"{app_base_url.rstrip('/')}/{access_code}"
 
 
 class CreateCourseSpace(Resource):
@@ -247,8 +235,8 @@ class CreateCourseSpace(Resource):
                     logger.warning(f"Failed to set room avatar: {e}")
 
             # Build admin join URL — short code on the env's app host, never a
-            # hardcoded host (see build_admin_join_url).
-            admin_join_url = build_admin_join_url(self._config.app_base_url, admin_code)
+            # hardcoded host (see build_join_url).
+            admin_join_url = build_join_url(self._config.app_base_url, admin_code)
 
             # TODO: Send invite email to teacher via invite_by_email
             # (placeholder — invite_by_email endpoint is a separate session)
