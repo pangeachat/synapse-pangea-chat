@@ -25,6 +25,7 @@ from synapse.module_api import ModuleApi
 from twisted.internet import defer
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.email_invite.build_join_url import build_join_url
 from synapse_pangea_chat.room_code.constants import (
     ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
     EVENT_TYPE_M_ROOM_JOIN_RULES,
@@ -150,8 +151,7 @@ class InviteByEmail(Resource):
                 )
                 return
 
-            base = self._config.app_base_url.rstrip("/")
-            join_url = f"{base}/#/join_with_link?classcode={access_code}"
+            join_url = build_join_url(self._config.app_base_url, access_code)
 
             # Send emails
             emailed: List[str] = []
