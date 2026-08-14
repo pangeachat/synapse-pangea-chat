@@ -49,6 +49,7 @@ modules:
       # --- Room Code ---
       knock_with_code_requests_per_burst: 10 # default: 10
       knock_with_code_burst_duration_seconds: 60 # default: 60
+      room_code_index_enabled: true # default: true — off reverts code lookup to a full join-rules scan
 
       # --- Delete Room ---
       delete_room_requests_per_burst: 10 # default: 10

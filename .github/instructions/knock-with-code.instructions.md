@@ -52,7 +52,19 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 
 Access codes live in the `content.access_code` field of the room's `m.room.join_rules` state event. This is a Pangea-custom extension — the Matrix spec does not define this field. The code is set client-side when a course admin creates or configures a course.
 
-The `get_rooms_with_access_code` query reads directly from the Synapse event tables (`events` + `state_events` + `event_json`) with DB-engine-specific JSON extraction (PostgreSQL `jsonb` / SQLite `json_extract`).
+**The join-rules state event is the only source of truth for a code.** Nothing else may be treated as authoritative — see the index below.
+
+## Code Lookup
+
+Four surfaces resolve a code to rooms through `get_rooms_with_access_code`: `knock_with_code`, `preview_with_code`, `request_room_code`, and `create_course_space`.
+
+Reading every room's join rules to find one code costs O(total rooms) per request, on Synapse's shared database. That is what made code entry ~12 s at 50 VU on staging and break at 150 (issue #163), degrading `/sync` and message send for every user along with it. Lookup latency must not scale with the homeserver's room count.
+
+So a module-owned table maps code → room, maintained by the `on_new_event` third-party-rules hook (the same hook the room-preview cache uses) and seeded once at startup for rooms that predate it. Three rules govern it:
+
+- **The index narrows; state decides.** A hit is a candidate list, not an answer. The matched rooms' current join rules are re-read and the code compared before anything is returned. A stale row therefore costs a wasted probe and can never invite someone into the wrong room, or into a room whose code has changed or whose admin code was burned.
+- **A partial index is never consulted.** Until the startup backfill records that it finished, every lookup uses the full scan. Deploying the index is a speedup, never a window in which class codes stop resolving.
+- **The scan stays.** `room_code_index_enabled: false` reverts all four surfaces to it. It is slow, not wrong, which is what makes it a usable escape hatch — and the way to repair an index suspected of having drifted, since there is no in-place rebuild.
 
 ---
 

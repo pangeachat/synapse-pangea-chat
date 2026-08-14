@@ -27,6 +27,12 @@ from synapse_pangea_chat.public_courses import PublicCourses
 from synapse_pangea_chat.public_courses.backfill_l2 import PublicCoursesL2Backfill
 from synapse_pangea_chat.register_email import RegisterEmailRequestToken
 from synapse_pangea_chat.room_code import KnockWithCode, RequestRoomCode
+from synapse_pangea_chat.room_code.access_code_backfill import RoomAccessCodeBackfill
+from synapse_pangea_chat.room_code.access_code_index import (
+    configure_access_code_index,
+    is_join_rules_event,
+    record_join_rules_event,
+)
 from synapse_pangea_chat.room_preview import (
     PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE,
     PANGEA_ACTIVITY_ROLE_STATE_EVENT_TYPE,
@@ -57,6 +63,7 @@ class PangeaChat:
     def __init__(self, config: PangeaChatConfig, api: ModuleApi):
         self._api = api
         self._config = config
+        self._datastores = api._hs.get_datastores()
 
         # --- Delayed Push ---
         configure_delayed_push(config)
@@ -87,9 +94,10 @@ class PangeaChat:
             resource=self.room_preview_resource,
         )
 
-        # Register reactive cache invalidation callback for room preview
+        # One on_new_event callback, two reactive consumers: the room preview
+        # cache and the room-code index.
         self._api.register_third_party_rules_callbacks(
-            on_new_event=self._on_new_event_room_preview,
+            on_new_event=self._on_new_event,
         )
 
         # --- Activity Session Previews ---
@@ -102,6 +110,13 @@ class PangeaChat:
         )
 
         # --- Room Code ---
+        # The lookup index has to be armed before any code endpoint can serve a
+        # request, and its backfill seeds the rooms that predate it. Until that
+        # backfill finishes, lookups fall back to the full join-rules scan.
+        configure_access_code_index(config.room_code_index_enabled)
+        self.room_access_code_backfill = RoomAccessCodeBackfill(api, config)
+        self.room_access_code_backfill.schedule()
+
         self.knock_with_code_resource = KnockWithCode(api, config)
         self.request_code_resource = RequestRoomCode(api, config)
         api.register_web_resource(
@@ -237,23 +252,39 @@ class PangeaChat:
                 resource=self.user_directory_search_resource,
             )
 
-    async def _on_new_event_room_preview(
+    async def _on_new_event(
         self,
         event: EventBase,
         _: Mapping[Tuple[str, str], EventBase],
     ) -> None:
+        """Fan a newly persisted event out to the reactive consumers."""
+        if not event.is_state():
+            return
+
+        self._on_new_event_room_preview(event)
+        await self._on_new_event_room_code_index(event)
+
+    def _on_new_event_room_preview(self, event: EventBase) -> None:
         """
         Handle new events to reactively invalidate room preview cache
         when relevant state events change.
         """
-        if not event.is_state():
-            return
-
         if event.type not in self._config.set_room_preview_state_event_types:
             return
 
-        room_id = event.room_id
-        invalidate_room_cache(room_id)
+        invalidate_room_cache(event.room_id)
+
+    async def _on_new_event_room_code_index(self, event: EventBase) -> None:
+        """Keep the access-code lookup table in step with join-rules changes."""
+        if not is_join_rules_event(event.type):
+            return
+
+        await record_join_rules_event(
+            store=self._datastores.main,
+            room_id=event.room_id,
+            state_key=event.state_key,
+            content=event.content,
+        )
 
     @staticmethod
     def parse_config(config: Dict[str, Any]) -> PangeaChatConfig:
@@ -316,6 +347,10 @@ class PangeaChat:
         knock_with_code_burst_duration_seconds = config.get(
             "knock_with_code_burst_duration_seconds", 60
         )
+
+        room_code_index_enabled = config.get("room_code_index_enabled", True)
+        if not isinstance(room_code_index_enabled, bool):
+            raise ValueError('Config "room_code_index_enabled" must be a boolean')
 
         # --- preview_with_code config ---
         preview_with_code_requests_per_burst = config.get(
@@ -598,6 +633,7 @@ class PangeaChat:
             room_preview_requests_per_burst=room_preview_requests_per_burst,
             knock_with_code_requests_per_burst=knock_with_code_requests_per_burst,
             knock_with_code_burst_duration_seconds=knock_with_code_burst_duration_seconds,
+            room_code_index_enabled=room_code_index_enabled,
             preview_with_code_requests_per_burst=preview_with_code_requests_per_burst,
             preview_with_code_burst_duration_seconds=preview_with_code_burst_duration_seconds,
             preview_with_code_state_event_types=preview_with_code_state_event_types,

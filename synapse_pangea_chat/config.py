@@ -44,6 +44,10 @@ class PangeaChatConfig:
     # --- room_code config ---
     knock_with_code_requests_per_burst: int = 10
     knock_with_code_burst_duration_seconds: int = 60
+    # Module-owned access-code lookup table (issue #163). On by default; the
+    # off switch reverts every code endpoint to the full join-rules scan, which
+    # is correct but O(total rooms) per call.
+    room_code_index_enabled: bool = True
 
     # --- preview_with_code config ---
     preview_with_code_requests_per_burst: int = 5
