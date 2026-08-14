@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -44,9 +45,10 @@ async def get_users(
                                is older than this many days, or who have no activity
       notification_cooldown_ms - exclude users who have a p.room.notice from
                                bot_user_id in their bot DM room within the last N ms.
-                               Requires api and bot_user_id to be set.
-                               WARNING: performs O(N candidates) account-data lookups
-                               when no user_ids/course_ids narrow the set.
+                               Requires api and bot_user_id to be set. Resolved with
+                               two set-based queries regardless of candidate count,
+                               then applied as a SQL exclusion so counting and
+                               pagination stay in the database.
 
     Sort params are opt-in and non-breaking. Defaults preserve the historical
     user_id ascending order. latest_activity means max(last_login_ts,
@@ -108,7 +110,22 @@ async def get_users(
     # else id_filter remains None → no ID filter
 
     # ------------------------------------------------------------------
-    # Step 2 — build shared WHERE clause and CTE fragments
+    # Step 2 — resolve recently-notified exclusions
+    # ------------------------------------------------------------------
+    # Resolved up front as a set so the cooldown becomes an ordinary SQL
+    # predicate. That keeps COUNT and LIMIT/OFFSET in the database instead of
+    # forcing a full candidate fetch and in-Python pagination.
+    excluded_user_ids: Set[str] = set()
+    if notification_cooldown_ms is not None:
+        excluded_user_ids = await _recently_notified_user_ids(
+            room_store=room_store,
+            api=api,
+            bot_user_id=bot_user_id,
+            cooldown_threshold_ms=int(time.time() * 1000) - notification_cooldown_ms,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 3 — build shared WHERE clause and CTE fragments
     # ------------------------------------------------------------------
     # inactive_days threshold: epoch-ms before which last activity must fall
     inactivity_threshold_ms: Optional[int] = None
@@ -139,6 +156,11 @@ async def get_users(
                 " AND COALESCE(lm.last_message_ts, 0) < ?"
             )
             args.extend([inactivity_threshold_ms, inactivity_threshold_ms])
+
+        if excluded_user_ids:
+            excluded_placeholders = ",".join(["?" for _ in excluded_user_ids])
+            clauses.append(f"u.name NOT IN ({excluded_placeholders})")
+            args.extend(sorted(excluded_user_ids))  # sort for stable query plans
 
         if clauses:
             return " AND " + " AND ".join(clauses), args
@@ -171,160 +193,89 @@ async def get_users(
     """
 
     # ------------------------------------------------------------------
-    # Path A — no notification_cooldown_ms: SQL handles count + pagination
+    # Step 4 — count + page entirely in SQL
     # ------------------------------------------------------------------
-    if notification_cooldown_ms is None:
-        extra_where, filter_args = _build_extra_where()
-
-        if needs_inactive_ctes:
-            count_query = f"""
-            {_activity_ctes()}
-            SELECT COUNT(*)
-            FROM users u
-            LEFT JOIN last_logins ll ON ll.user_id = u.name
-            LEFT JOIN last_messages lm ON lm.sender = u.name
-            WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
-            """
-        else:
-            count_query = f"""
-            SELECT COUNT(*)
-            FROM users u
-            WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
-            """
-
-        count_rows = await room_store.db_pool.execute(
-            "get_users_count", count_query, *filter_args
-        )
-        total_docs: int = count_rows[0][0] if count_rows else 0
-
-        max_page = max(1, math.ceil(total_docs / limit))
-        if page < 1:
-            page = 1
-        if page > max_page:
-            page = max_page
-        offset = (page - 1) * limit
-
-        needs_message_before_pagination = needs_inactive_ctes or sort_by in {
-            "last_message_ts",
-            "latest_activity",
-        }
-
-        if needs_message_before_pagination:
-            users_query = f"""
-            {_activity_ctes()}
-            SELECT
-                u.name AS user_id,
-                p.displayname AS display_name,
-                COALESCE(ll.last_login_ts, 0) AS last_login_ts,
-                COALESCE(lm.last_message_ts, 0) AS last_message_ts,
-                GREATEST(
-                    COALESCE(ll.last_login_ts, 0),
-                    COALESCE(lm.last_message_ts, 0)
-                ) AS latest_activity_ts
-            FROM users u
-            LEFT JOIN profiles p ON p.full_user_id = u.name
-            LEFT JOIN last_logins ll ON ll.user_id = u.name
-            LEFT JOIN last_messages lm ON lm.sender = u.name
-            WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
-            ORDER BY {_sql_order_by(sort_by, sort_order)}
-            LIMIT ? OFFSET ?
-            """
-            user_rows = await room_store.db_pool.execute(
-                "get_users_page", users_query, *filter_args, limit, offset
-            )
-            users = [_user_from_activity_row(row) for row in user_rows]
-        else:
-            users_query = f"""
-            {_login_cte()}
-            SELECT
-                u.name AS user_id,
-                p.displayname AS display_name,
-                COALESCE(ll.last_login_ts, 0) AS last_login_ts
-            FROM users u
-            LEFT JOIN profiles p ON p.full_user_id = u.name
-            LEFT JOIN last_logins ll ON ll.user_id = u.name
-            WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
-            ORDER BY {_sql_login_only_order_by(sort_by, sort_order)}
-            LIMIT ? OFFSET ?
-            """
-            user_rows = await room_store.db_pool.execute(
-                "get_users_page", users_query, *filter_args, limit, offset
-            )
-            users = [_user_from_login_row(row) for row in user_rows]
-            await _attach_page_last_messages(room_store, users)
-
-        return {
-            "docs": users,
-            "page": page,
-            "limit": limit,
-            "totalDocs": total_docs,
-            "maxPage": max_page,
-        }
-
-    # ------------------------------------------------------------------
-    # Path B — notification_cooldown_ms: full-scan then per-user filter
-    # ------------------------------------------------------------------
-    # 1. Fetch all matching candidate user docs (SQL-filtered, no LIMIT)
     extra_where, filter_args = _build_extra_where()
 
-    candidates_query = f"""
-    {_activity_ctes()}
-    SELECT
-        u.name AS user_id,
-        p.displayname AS display_name,
-        COALESCE(ll.last_login_ts, 0) AS last_login_ts,
-        COALESCE(lm.last_message_ts, 0) AS last_message_ts,
-        GREATEST(
-            COALESCE(ll.last_login_ts, 0),
-            COALESCE(lm.last_message_ts, 0)
-        ) AS latest_activity_ts
-    FROM users u
-    LEFT JOIN profiles p ON p.full_user_id = u.name
-    LEFT JOIN last_logins ll ON ll.user_id = u.name
-    LEFT JOIN last_messages lm ON lm.sender = u.name
-    WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
-    ORDER BY {_sql_order_by(sort_by, sort_order)}
-    """
+    if needs_inactive_ctes:
+        count_query = f"""
+        {_activity_ctes()}
+        SELECT COUNT(*)
+        FROM users u
+        LEFT JOIN last_logins ll ON ll.user_id = u.name
+        LEFT JOIN last_messages lm ON lm.sender = u.name
+        WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
+        """
+    else:
+        count_query = f"""
+        SELECT COUNT(*)
+        FROM users u
+        WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
+        """
 
-    candidate_rows = await room_store.db_pool.execute(
-        "get_users_candidates", candidates_query, *filter_args
+    count_rows = await room_store.db_pool.execute(
+        "get_users_count", count_query, *filter_args
     )
-    candidate_users = [_user_from_activity_row(row) for row in candidate_rows]
+    total_docs: int = count_rows[0][0] if count_rows else 0
 
-    # 2. Filter by notification cooldown
-    cooldown_threshold_ms = int(time.time() * 1000) - notification_cooldown_ms
-    filtered_users: List[Dict[str, Any]] = []
-
-    for user in candidate_users:
-        uid = user["user_id"]
-        recently_notified = await _user_recently_notified(
-            room_store=room_store,
-            api=api,
-            user_id=uid,
-            bot_user_id=bot_user_id,
-            cooldown_threshold_ms=cooldown_threshold_ms,
-        )
-        if not recently_notified:
-            filtered_users.append(user)
-
-    filtered_users = _sort_user_docs(
-        filtered_users,
-        sort_by=sort_by,
-        sort_order=sort_order,
-    )
-
-    # 3. Paginate in Python now that we have the exact filtered list
-    total_docs = len(filtered_users)
     max_page = max(1, math.ceil(total_docs / limit))
     if page < 1:
         page = 1
     if page > max_page:
         page = max_page
+    offset = (page - 1) * limit
 
-    page_users = filtered_users[(page - 1) * limit : page * limit]
+    needs_message_before_pagination = needs_inactive_ctes or sort_by in {
+        "last_message_ts",
+        "latest_activity",
+    }
+
+    if needs_message_before_pagination:
+        users_query = f"""
+        {_activity_ctes()}
+        SELECT
+            u.name AS user_id,
+            p.displayname AS display_name,
+            COALESCE(ll.last_login_ts, 0) AS last_login_ts,
+            COALESCE(lm.last_message_ts, 0) AS last_message_ts,
+            GREATEST(
+                COALESCE(ll.last_login_ts, 0),
+                COALESCE(lm.last_message_ts, 0)
+            ) AS latest_activity_ts
+        FROM users u
+        LEFT JOIN profiles p ON p.full_user_id = u.name
+        LEFT JOIN last_logins ll ON ll.user_id = u.name
+        LEFT JOIN last_messages lm ON lm.sender = u.name
+        WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
+        ORDER BY {_sql_order_by(sort_by, sort_order)}
+        LIMIT ? OFFSET ?
+        """
+        user_rows = await room_store.db_pool.execute(
+            "get_users_page", users_query, *filter_args, limit, offset
+        )
+        users = [_user_from_activity_row(row) for row in user_rows]
+    else:
+        users_query = f"""
+        {_login_cte()}
+        SELECT
+            u.name AS user_id,
+            p.displayname AS display_name,
+            COALESCE(ll.last_login_ts, 0) AS last_login_ts
+        FROM users u
+        LEFT JOIN profiles p ON p.full_user_id = u.name
+        LEFT JOIN last_logins ll ON ll.user_id = u.name
+        WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
+        ORDER BY {_sql_login_only_order_by(sort_by, sort_order)}
+        LIMIT ? OFFSET ?
+        """
+        user_rows = await room_store.db_pool.execute(
+            "get_users_page", users_query, *filter_args, limit, offset
+        )
+        users = [_user_from_login_row(row) for row in user_rows]
+        await _attach_page_last_messages(room_store, users)
 
     return {
-        "docs": page_users,
+        "docs": users,
         "page": page,
         "limit": limit,
         "totalDocs": total_docs,
@@ -332,57 +283,90 @@ async def get_users(
     }
 
 
-async def _user_recently_notified(
+async def _recently_notified_user_ids(
     *,
     room_store: RoomStore,
     api: Optional[ModuleApi],
-    user_id: str,
     bot_user_id: Optional[str],
     cooldown_threshold_ms: int,
-) -> bool:
-    """Return True if the user has a p.room.notice from bot_user_id in their
-    bot DM room with an origin_server_ts > cooldown_threshold_ms.
+) -> Set[str]:
+    """Return local users notified by bot_user_id since cooldown_threshold_ms.
 
-    Returns False (do not exclude) when api/bot_user_id are None or when no
-    bot DM rooms are found.
+    A user counts as notified when bot_user_id sent a p.room.notice newer than
+    the threshold into a room the user lists under bot_user_id in their m.direct
+    account data.
+
+    Two queries total, independent of how many users are being considered:
+    the notice lookup is scoped by sender and timestamp (so it never scans the
+    whole events table), and it runs first because an empty result makes the
+    account-data read unnecessary.
+
+    Returns an empty set (exclude nobody) when api or bot_user_id are unset.
     """
     if api is None or not bot_user_id:
-        return False
+        return set()
 
-    try:
-        m_direct = await api.account_data_manager.get_global(user_id, "m.direct")
-    except Exception:
-        logger.debug(
-            "Could not fetch m.direct account data for %s, treating as not notified",
-            user_id,
-        )
-        return False
-
-    if not m_direct:
-        return False
-
-    bot_dm_rooms: List[str] = m_direct.get(bot_user_id, [])
-    if not bot_dm_rooms:
-        return False
-
-    placeholders = ",".join(["?" for _ in bot_dm_rooms])
-    query = f"""
-        SELECT 1
-        FROM events e
-        WHERE e.room_id IN ({placeholders})
-          AND e.sender = ?
-          AND e.type = 'p.room.notice'
-          AND e.origin_server_ts > ?
-        LIMIT 1
-    """
-    rows = await room_store.db_pool.execute(
-        "get_users_recent_bot_notice",
-        query,
-        *bot_dm_rooms,
+    notified_room_rows = await room_store.db_pool.execute(
+        "get_users_recent_bot_notice_rooms",
+        """
+        SELECT DISTINCT room_id
+        FROM events
+        WHERE sender = ?
+          AND type = 'p.room.notice'
+          AND origin_server_ts > ?
+        """,
         bot_user_id,
         cooldown_threshold_ms,
     )
-    return bool(rows)
+    notified_rooms: Set[str] = {row[0] for row in notified_room_rows}
+    if not notified_rooms:
+        return set()
+
+    direct_rows = await room_store.db_pool.execute(
+        "get_users_direct_account_data",
+        """
+        SELECT user_id, content
+        FROM account_data
+        WHERE account_data_type = 'm.direct'
+        """,
+    )
+
+    notified_users: Set[str] = set()
+    for user_id, content in direct_rows:
+        bot_rooms = _bot_dm_rooms(user_id, content, bot_user_id)
+        if any(room_id in notified_rooms for room_id in bot_rooms):
+            notified_users.add(user_id)
+    return notified_users
+
+
+def _bot_dm_rooms(user_id: str, content: Any, bot_user_id: str) -> List[str]:
+    """Return the room IDs a user lists under bot_user_id in m.direct content.
+
+    Unparsable or unexpectedly shaped account data yields no rooms, which means
+    the user is not excluded — matching the previous per-user lookup, which
+    treated a failed fetch as "not notified".
+    """
+    if not content:
+        return []
+    if isinstance(content, (str, bytes, bytearray)):
+        try:
+            parsed = json.loads(content)
+        except (TypeError, ValueError):
+            logger.debug(
+                "Could not parse m.direct account data for %s, treating as not notified",
+                user_id,
+            )
+            return []
+    else:
+        parsed = content
+
+    if not isinstance(parsed, dict):
+        return []
+
+    bot_rooms = parsed.get(bot_user_id)
+    if not isinstance(bot_rooms, list):
+        return []
+    return [room_id for room_id in bot_rooms if isinstance(room_id, str)]
 
 
 def _sql_order_by(sort_by: str, sort_order: str) -> str:
@@ -470,29 +454,3 @@ async def _attach_page_last_messages(
             int(user.get("last_login_ts") or 0),
             int(user.get("last_message_ts") or 0),
         )
-
-
-def _sort_user_docs(
-    users: List[Dict[str, Any]],
-    *,
-    sort_by: str,
-    sort_order: str,
-) -> List[Dict[str, Any]]:
-    if sort_by == "user_id":
-        return sorted(
-            users,
-            key=lambda user: str(user["user_id"]),
-            reverse=sort_order == "desc",
-        )
-
-    value_key = "latest_activity_ts" if sort_by == "latest_activity" else sort_by
-    reverse_primary = sort_order == "desc"
-    return sorted(
-        users,
-        key=lambda user: (
-            -int(user.get(value_key) or 0)
-            if reverse_primary
-            else int(user.get(value_key) or 0),
-            str(user["user_id"]),
-        ),
-    )
