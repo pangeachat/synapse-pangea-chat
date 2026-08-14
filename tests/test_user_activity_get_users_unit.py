@@ -43,9 +43,9 @@ class _FakeRoomStore:
         self.db_pool = _FakeDbPool(responses)
 
 
-def _direct_account_data_rows(user_count: int) -> List[Tuple[str, str]]:
+def _direct_account_data_rows(user_count: int) -> List[Tuple[Any, ...]]:
     """One m.direct row per user; the first user is in the notified room."""
-    rows: List[Tuple[str, str]] = [
+    rows: List[Tuple[Any, ...]] = [
         (
             "@notified:my.domain.name",
             json.dumps({BOT_USER_ID: [NOTIFIED_ROOM_ID]}),
