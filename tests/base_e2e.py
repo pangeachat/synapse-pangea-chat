@@ -83,6 +83,28 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 "ResourceWarning emitted during E2E test:\n" f"{warning_messages}"
             )
 
+    def _assert_server_port_free(self) -> None:
+        """Fail fast if something else already serves ``server_url``.
+
+        The readiness poll below only asks whether *something* answers /health.
+        A foreign homeserver on the same port satisfies it, after which the whole
+        test runs against that server instead of the one under test — module
+        routes come back 404 M_UNRECOGNIZED and read as a broken endpoint rather
+        than an occupied port. Checking first turns that into a clear message.
+        """
+        try:
+            requests.get(f"{self.server_url}/health", timeout=5)
+        except requests.exceptions.RequestException:
+            return  # nothing listening, which is what we want
+
+        self.fail(
+            f"{self.server_url} is already served by another process, so this "
+            "test would silently run against it instead of the Synapse it "
+            "starts. Stop whatever holds that port (a local-stack Synapse in "
+            "Docker/Colima is the usual culprit) and re-run.\n"
+            "Find it with: lsof -nP -iTCP:8008 -sTCP:LISTEN"
+        )
+
     async def start_test_synapse(
         self,
         *,
@@ -100,6 +122,8 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
 
         Returns (postgres, synapse_dir, config_path, server_process, stdout_thread, stderr_thread).
         """
+        self._assert_server_port_free()
+
         postgres: Optional[testing.postgresql.Postgresql] = None
         synapse_dir: Optional[str] = None
         server_process: Optional[subprocess.Popen] = None
