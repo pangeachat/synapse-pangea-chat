@@ -10,6 +10,7 @@ from typing import List
 
 from synapse.api.errors import (
     AuthError,
+    Codes,
     InvalidClientCredentialsError,
     InvalidClientTokenError,
     MissingClientTokenError,
@@ -21,6 +22,7 @@ from synapse.module_api import ModuleApi
 from twisted.internet import defer
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.blocked_join_gate import is_blocked_by_room_admin
 from synapse_pangea_chat.room_code.burn_admin_code import burn_admin_code
 from synapse_pangea_chat.room_code.constants import (
     ERRCODE_BANNED_FROM_ROOM,
@@ -140,6 +142,10 @@ class KnockWithCode(Resource):
             invited_rooms: List[str] = []
             already_joined_rooms: List[str] = []
             banned_rooms: List[str] = []
+            # Rooms where a room admin has blocked the requester. Never
+            # returned to the client — the refusal must not reveal the block
+            # (see blocked-join-gate.instructions.md).
+            blocked_rooms: List[str] = []
             for match in matches:
                 try:
                     membership = await get_user_room_membership(
@@ -156,6 +162,14 @@ class KnockWithCode(Resource):
                         # letting the failure look like a nonexistent code
                         # (issue #127 / client#6820).
                         banned_rooms.append(match.room_id)
+                        continue
+                    if (
+                        self._config.blocked_join_gate_enabled
+                        and await is_blocked_by_room_admin(
+                            self._api, match.room_id, requester_id
+                        )
+                    ):
+                        blocked_rooms.append(match.room_id)
                         continue
                     await invite_user_to_room(
                         api=self._api,
@@ -192,6 +206,22 @@ class KnockWithCode(Resource):
                         "error": "You are banned from the course for this code",
                         "banned": banned_rooms,
                     },
+                    send_cors=True,
+                )
+                return
+            if (
+                blocked_rooms
+                and not invited_rooms
+                and not already_joined_rooms
+                and not banned_rooms
+            ):
+                # Every matched room refused the requester because an admin
+                # blocked them. Generic forbidden on purpose: no reason, no
+                # errcode of its own, no room list.
+                respond_with_json(
+                    request,
+                    403,
+                    {"errcode": Codes.FORBIDDEN, "error": "Forbidden"},
                     send_cors=True,
                 )
                 return
