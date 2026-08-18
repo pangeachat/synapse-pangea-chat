@@ -4,7 +4,7 @@ Design: .github/instructions/blocked-join-gate.instructions.md
 """
 
 import logging
-from typing import Callable, Set
+from typing import Set
 
 from synapse.module_api import ModuleApi
 
@@ -25,23 +25,23 @@ logger = logging.getLogger(
 
 
 async def is_blocked_by_room_admin(api: ModuleApi, room_id: str, user_id: str) -> bool:
-    """True when any joined admin (power level >= 100) of ``room_id`` has
-    ``user_id`` on their block (Matrix ignore) list."""
+    """True when every joined admin (power level >= 100) of ``room_id`` has
+    ``user_id`` on their block (Matrix ignore) list. A room with no joined
+    admin never blocks."""
     ignorers = await _users_ignoring(api, user_id)
     if not ignorers:
         # The common case: nobody has blocked this user, so no room state
         # is read at all.
         return False
 
-    power_level_of = await _power_level_lookup(api, room_id)
-    for candidate in ignorers:
-        if power_level_of(candidate) < ADMIN_POWER_LEVEL:
-            continue
-        if await _is_joined(api, room_id, candidate):
-            logger.info(
-                "Refusing %s entry to %s: blocked by room admin", user_id, room_id
-            )
-            return True
+    admins = await _joined_admins(api, room_id)
+    if not admins:
+        return False
+    if admins <= ignorers:
+        logger.info(
+            "Refusing %s entry to %s: blocked by every room admin", user_id, room_id
+        )
+        return True
     return False
 
 
@@ -54,8 +54,8 @@ async def _users_ignoring(api: ModuleApi, user_id: str) -> Set[str]:
     return set(await store.ignored_by(user_id))  # type: ignore[call-arg, arg-type, misc]
 
 
-async def _power_level_lookup(api: ModuleApi, room_id: str) -> Callable[[str], int]:
-    """Return a function giving any user's power level in the room."""
+async def _joined_admins(api: ModuleApi, room_id: str) -> Set[str]:
+    """Currently joined members whose power level is at least ADMIN_POWER_LEVEL."""
     state = await api.get_room_state(
         room_id=room_id,
         event_filter=[
@@ -68,13 +68,46 @@ async def _power_level_lookup(api: ModuleApi, room_id: str) -> Callable[[str], i
         # Per the auth rules a room with no power-levels event gives its
         # creator power level 100 and everyone else 0.
         create = state.get((EVENT_TYPE_M_ROOM_CREATE, ""))
-        creator = create.sender if create is not None else None
-        return lambda user: ADMIN_POWER_LEVEL if user == creator else 0
+        candidates: Set[str] = {create.sender} if create is not None else set()
+    else:
+        content = power_levels.content
+        users = content.get(USERS_POWER_LEVEL_KEY) or {}
+        users_default = _as_int(content.get(USERS_DEFAULT_POWER_LEVEL_KEY), 0)
+        if users_default >= ADMIN_POWER_LEVEL:
+            # Everyone not explicitly demoted is an admin: enumerate members.
+            demoted = {
+                user
+                for user, level in users.items()
+                if _as_int(level, 0) < ADMIN_POWER_LEVEL
+            }
+            return {
+                user
+                for user in await _joined_members(api, room_id)
+                if user not in demoted
+            }
+        candidates = {
+            user
+            for user, level in users.items()
+            if _as_int(level, 0) >= ADMIN_POWER_LEVEL
+        }
 
-    content = power_levels.content
-    users = content.get(USERS_POWER_LEVEL_KEY) or {}
-    users_default = _as_int(content.get(USERS_DEFAULT_POWER_LEVEL_KEY), 0)
-    return lambda user: _as_int(users.get(user), users_default)
+    joined: Set[str] = set()
+    for user in candidates:
+        if await _is_joined(api, room_id, user):
+            joined.add(user)
+    return joined
+
+
+async def _joined_members(api: ModuleApi, room_id: str) -> Set[str]:
+    state = await api.get_room_state(
+        room_id=room_id, event_filter=[(EVENT_TYPE_M_ROOM_MEMBER, None)]
+    )
+    return {
+        event.state_key
+        for event in state.values()
+        if event.type == EVENT_TYPE_M_ROOM_MEMBER
+        and event.content.get(MEMBERSHIP_CONTENT_KEY) == MEMBERSHIP_JOIN
+    }
 
 
 async def _is_joined(api: ModuleApi, room_id: str, user_id: str) -> bool:

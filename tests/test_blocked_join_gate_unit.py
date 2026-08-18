@@ -67,6 +67,11 @@ def _make_api(
                     event_type, state_key, {"creator": creator}
                 )
                 result[(event_type, state_key)].sender = creator
+            elif event_type == "m.room.member" and state_key is None:
+                for user, membership in memberships.items():
+                    result[(event_type, user)] = _state_event(
+                        event_type, user, {"membership": membership}
+                    )
             elif event_type == "m.room.member" and state_key in memberships:
                 result[(event_type, state_key)] = _state_event(
                     event_type, state_key, {"membership": memberships[state_key]}
@@ -82,7 +87,7 @@ class TestIsBlockedByRoomAdmin(unittest.IsolatedAsyncioTestCase):
         api = _make_api(power_users={ADMIN: 100}, memberships={ADMIN: "join"})
         self.assertFalse(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
 
-    async def test_ignored_by_joined_admin(self) -> None:
+    async def test_ignored_by_the_only_admin(self) -> None:
         api = _make_api(
             ignored_by={ADMIN},
             power_users={ADMIN: 100},
@@ -90,13 +95,29 @@ class TestIsBlockedByRoomAdmin(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
 
-    async def test_ignored_by_any_of_several_admins(self) -> None:
+    async def test_ignored_by_every_admin(self) -> None:
+        api = _make_api(
+            ignored_by={ADMIN, OTHER_ADMIN, MEMBER},
+            power_users={ADMIN: 100, OTHER_ADMIN: 100},
+            memberships={ADMIN: "join", OTHER_ADMIN: "join", MEMBER: "join"},
+        )
+        self.assertTrue(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
+
+    async def test_ignored_by_only_some_admins_does_not_block(self) -> None:
         api = _make_api(
             ignored_by={OTHER_ADMIN},
             power_users={ADMIN: 100, OTHER_ADMIN: 100},
             memberships={ADMIN: "join", OTHER_ADMIN: "join"},
         )
-        self.assertTrue(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
+        self.assertFalse(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
+
+    async def test_room_with_no_joined_admin_never_blocks(self) -> None:
+        api = _make_api(
+            ignored_by={ADMIN, MEMBER},
+            power_users={ADMIN: 100},
+            memberships={ADMIN: "leave", MEMBER: "join"},
+        )
+        self.assertFalse(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
 
     async def test_ignored_by_non_admin_member_does_not_block(self) -> None:
         api = _make_api(
@@ -106,25 +127,33 @@ class TestIsBlockedByRoomAdmin(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
 
-    async def test_ignored_by_admin_who_left_does_not_block(self) -> None:
-        # Power levels still list them at 100, but they are no longer a member.
+    async def test_admin_who_left_does_not_count(self) -> None:
+        # ADMIN left but is still listed at 100; only OTHER_ADMIN counts, and
+        # they block the requester, so the room blocks.
         api = _make_api(
-            ignored_by={ADMIN},
+            ignored_by={OTHER_ADMIN},
             power_users={ADMIN: 100, OTHER_ADMIN: 100},
             memberships={ADMIN: "leave", OTHER_ADMIN: "join"},
         )
-        self.assertFalse(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
+        self.assertTrue(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
 
-    async def test_ignored_by_user_with_no_power_entry_uses_users_default(
+    async def test_users_default_at_admin_level_makes_every_member_an_admin(
         self,
     ) -> None:
         api = _make_api(
             ignored_by={MEMBER},
-            power_users={},
+            power_users={ADMIN: 50},  # explicitly demoted below admin
             users_default=100,
-            memberships={MEMBER: "join"},
+            memberships={ADMIN: "join", MEMBER: "join"},
         )
         self.assertTrue(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
+        api = _make_api(
+            ignored_by={MEMBER},
+            power_users={},
+            users_default=100,
+            memberships={ADMIN: "join", MEMBER: "join"},
+        )
+        self.assertFalse(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
 
     async def test_no_power_levels_event_falls_back_to_room_creator(self) -> None:
         api = _make_api(
@@ -175,9 +204,9 @@ class TestBlockedJoinGateCallbacks(unittest.IsolatedAsyncioTestCase):
             Codes.FORBIDDEN,
         )
 
-    async def test_invite_from_other_admin_does_not_override_block(self) -> None:
+    async def test_pending_invite_does_not_override_block(self) -> None:
         api = _make_api(
-            ignored_by={ADMIN},
+            ignored_by={ADMIN, OTHER_ADMIN},
             power_users={ADMIN: 100, OTHER_ADMIN: 100},
             memberships={ADMIN: "join", OTHER_ADMIN: "join"},
         )
