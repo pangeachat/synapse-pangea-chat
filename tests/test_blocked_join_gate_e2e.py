@@ -40,7 +40,9 @@ class TestBlockedJoinGateE2E(BaseSynapseE2ETest):
             f"{self.server_url}/_matrix/client/v3/user/{user_id}"
             "/account_data/m.ignored_user_list"
         )
-        body = {"ignored_users": {ignored_id: {} for ignored_id in ignored}}
+        body: Dict[str, Any] = {
+            "ignored_users": {ignored_id: {} for ignored_id in ignored}
+        }
         response = requests.put(url, json=body, headers=self._headers(token))
         self.assertEqual(response.status_code, 200, response.text)
 
