@@ -113,6 +113,6 @@ class PangeaChatConfig:
     delayed_push_require_synapse_version: str = "1.124.0"
 
     # --- blocked_join_gate config ---
-    # Refuse knocks/joins from users any room admin has blocked. Off switch
+    # Refuse knocks/joins from users every room admin has blocked. Off switch
     # only; the rule itself is fixed by design.
     blocked_join_gate_enabled: bool = True

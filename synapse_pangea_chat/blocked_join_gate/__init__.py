@@ -1,4 +1,4 @@
-"""Blocked join gate — refuse knocks and joins from a user any admin of the
+"""Blocked join gate — refuse knocks and joins from a user every admin of the
 room has blocked.
 
 Design: .github/instructions/blocked-join-gate.instructions.md
@@ -48,8 +48,8 @@ class BlockedJoinGate:
         self, user_id: str, room_id: str, is_invited: bool
     ) -> Union[Codes, Literal["NOT_SPAM"]]:
         """Joins — direct, restricted, or accepting an invite. ``is_invited``
-        is deliberately ignored: an invite from a non-blocking admin does not
-        override another admin's block."""
+        is deliberately ignored: a pending invite does not override a block
+        by every admin."""
         # Synapse skips this callback for server admins and for the room
         # creator's initial join, which is fine: neither is a join request.
         if await is_blocked_by_room_admin(self._api, room_id, user_id):

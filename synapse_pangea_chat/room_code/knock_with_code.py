@@ -142,7 +142,7 @@ class KnockWithCode(Resource):
             invited_rooms: List[str] = []
             already_joined_rooms: List[str] = []
             banned_rooms: List[str] = []
-            # Rooms where a room admin has blocked the requester. Never
+            # Rooms where every admin has blocked the requester. Never
             # returned to the client — the refusal must not reveal the block
             # (see blocked-join-gate.instructions.md).
             blocked_rooms: List[str] = []
@@ -215,8 +215,8 @@ class KnockWithCode(Resource):
                 and not already_joined_rooms
                 and not banned_rooms
             ):
-                # Every matched room refused the requester because an admin
-                # blocked them. Generic forbidden on purpose: no reason, no
+                # Every matched room refused the requester because its admins
+                # all blocked them. Generic forbidden on purpose: no reason, no
                 # errcode of its own, no room list.
                 respond_with_json(
                     request,

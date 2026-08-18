@@ -1,11 +1,11 @@
 ---
 applyTo: "synapse_pangea_chat/blocked_join_gate/**,synapse_pangea_chat/room_code/**,tests/test_blocked_join_gate*"
-description: "Server-side refusal of knocks and joins from a user any admin of the room has blocked — what counts as blocked, which entry paths are gated, and why the requester gets a generic error."
+description: "Server-side refusal of knocks and joins from a user every admin of the room has blocked — what counts as blocked, which entry paths are gated, and why the requester gets a generic error."
 ---
 
 # Blocked Join Gate
 
-When a room admin has blocked a user, that user must not be able to knock on or join the admin's room. Synapse does not enforce this on its own, so the module does. Tracked in [#92](https://github.com/pangeachat/synapse-pangea-chat/issues/92).
+When every admin of a room has blocked a user, that user must not be able to knock on or join the room. Synapse does not enforce this on its own, so the module does. Tracked in [#92](https://github.com/pangeachat/synapse-pangea-chat/issues/92).
 
 - **Client-side joining flow**: [joining-courses.instructions.md](../../../client/.github/instructions/joining-courses.instructions.md)
 - **Code-based entry** (also gated here): [knock-with-code.instructions.md](knock-with-code.instructions.md)
@@ -18,12 +18,12 @@ Doing the refusal in the admin's client would only work while an admin is online
 
 ## Rule
 
-**A membership request into a room is refused if any admin of that room has blocked the requester.**
+**A membership request into a room is refused if every admin of that room has blocked the requester.** One admin who has not blocked them is enough to let the request through — the admins as a group, not any one of them, decide. A room with no joined admin never refuses on this rule.
 
 | Term | Meaning |
 |---|---|
 | Blocked | The requester appears in the admin's `m.ignored_user_list` (the client's block list). |
-| Admin | A room member whose power level is at least 100 — the same notion the client uses to decide who may accept or deny knocks. Lower-powered members' block lists have no effect. |
+| Admin | A currently joined room member whose power level is at least 100 — the same notion the client uses to decide who may accept or deny knocks. Lower-powered members' block lists have no effect, and neither do those of admins who have left. |
 | Membership request | The requester asking to enter: a Matrix knock, a direct join (public or restricted rooms), a join in response to an invite, or the code-based entry below. |
 
 The predicate is one shared function, `is_blocked_by_room_admin(user_id, room_id)`, so every entry path gives the same answer.
@@ -33,10 +33,10 @@ The predicate is one shared function, `is_blocked_by_room_admin(user_id, room_id
 | Path | How the gate applies |
 |---|---|
 | Matrix knock | Refused before the knock event is stored, so admins never see it in the knock queue. |
-| Direct join / join after invite | Refused via Synapse's join check (`user_may_join_room`). An invite from a *non-blocking* admin does not override the rule; blocked by any admin means blocked. |
-| knock_with_code | The endpoint skips the server-side invite for any matched room where the requester is blocked, treating it like the existing banned-room branch. If every matched room is skipped for this reason the endpoint responds 403. |
+| Direct join / join after invite | Refused via Synapse's join check (`user_may_join_room`). A pending invite does not override the rule: if every admin has since blocked the requester, accepting the invite is refused too. |
+| knock_with_code | The endpoint skips the server-side invite for any matched room whose admins have all blocked the requester, treating it like the existing banned-room branch. If every matched room is skipped for this reason the endpoint responds 403. |
 
-Existing membership is out of scope: a member who is later blocked by an admin stays in the room until an admin removes them. The gate governs entry only.
+Existing membership is out of scope: a member who is later blocked by the admins stays in the room until an admin removes them. The gate governs entry only.
 
 ## What the requester sees
 
@@ -45,7 +45,7 @@ The refusal is a generic forbidden error with no reason and no distinct error co
 ## Design decisions
 
 - **Refuse, don't auto-deny.** The alternative — let the knock land, then have the module deny it as an admin — creates extra membership events, needs an admin identity to act as, and can race a real admin's decision. Vetoing at the hook is one code path with nothing for admins to see.
-- **"Who blocks this user" comes from Synapse's own ignore index** (`ignored_by`), then intersected with the room's admins. One cached lookup per request rather than reading each admin's account data. This reaches past the public module API; it is the same trade the room-code endpoint already makes for its state queries and is called out in code.
+- **"Who blocks this user" comes from Synapse's own ignore index** (`ignored_by`), then compared against the room's joined admins. One cached lookup per request rather than reading each admin's account data, and when nobody blocks the requester no room state is read at all. This reaches past the public module API; it is the same trade the room-code endpoint already makes for its state queries and is called out in code.
 - **Configurable off switch.** A single boolean in the module config, default on, so the gate can be disabled from Ansible without a code deploy.
 
 ## Key Files

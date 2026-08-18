@@ -162,6 +162,15 @@ class TestBlockedJoinGateE2E(BaseSynapseE2ETest):
                     self.assertTrue(await self.accept_room_invitation(room_id, tok))
                 await self.set_power_level(room_id, owner_token, coadmin_id, 100)
 
+            def deny_knock(room_id: str) -> None:
+                # Owner denies the knock so the requester is back to no
+                # membership before the next scenario.
+                requests.post(
+                    f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/kick",
+                    json={"user_id": requester_id},
+                    headers=self._headers(owner_token),
+                )
+
             # --- A non-admin's block does not gate anything ---
             await self.set_ignore_list(member_token, member_id, [requester_id])
             self.assertEqual(
@@ -169,16 +178,19 @@ class TestBlockedJoinGateE2E(BaseSynapseE2ETest):
                 200,
                 "knock should pass when only a PL-0 member blocks the requester",
             )
-            # Owner denies the knock so the requester is back to no membership.
-            requests.post(
-                f"{self.server_url}/_matrix/client/v3/rooms/{knock_room}/kick",
-                json={"user_id": requester_id},
-                headers=self._headers(owner_token),
-            )
-            await self.set_ignore_list(member_token, member_id, [])
+            deny_knock(knock_room)
 
-            # --- coadmin (not the owner) blocks the requester ---
+            # --- Only one of two admins blocks: still not gated ---
             await self.set_ignore_list(coadmin_token, coadmin_id, [requester_id])
+            self.assertEqual(
+                self.knock(knock_room, requester_token).status_code,
+                200,
+                "knock should pass while another admin has not blocked",
+            )
+            deny_knock(knock_room)
+
+            # --- Every admin blocks the requester ---
+            await self.set_ignore_list(owner_token, owner_id, [requester_id])
 
             # Knock: refused before it lands, no knock membership recorded.
             self.assert_generic_forbidden(self.knock(knock_room, requester_token))
@@ -190,7 +202,7 @@ class TestBlockedJoinGateE2E(BaseSynapseE2ETest):
             self.assert_generic_forbidden(self.join(public_room, requester_token))
             self.assertIsNone(self.membership(public_room, requester_id, owner_token))
 
-            # Invite from a non-blocking admin does not override the block.
+            # A pending invite does not override the block.
             self.assertTrue(
                 await self.invite_user_to_room(public_room, requester_id, owner_token)
             )
@@ -207,7 +219,7 @@ class TestBlockedJoinGateE2E(BaseSynapseE2ETest):
             self.assertNotIn("rooms", response.json())
             self.assertIsNone(self.membership(code_room, requester_id, owner_token))
 
-            # --- coadmin un-blocks: every path opens again ---
+            # --- One admin un-blocks: every path opens again ---
             await self.set_ignore_list(coadmin_token, coadmin_id, [])
             self.assertEqual(self.knock(knock_room, requester_token).status_code, 200)
             self.assertEqual(self.join(public_room, requester_token).status_code, 200)
