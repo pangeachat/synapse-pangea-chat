@@ -13,6 +13,7 @@ from synapse_pangea_chat.delete_user import DeleteUser
 from synapse_pangea_chat.direct_message import EnsureDirectMessage
 from synapse_pangea_chat.direct_push import DirectPush
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
+from synapse_pangea_chat.email_policy import EmailPolicy
 from synapse_pangea_chat.export_user_data import ExportUserData
 from synapse_pangea_chat.find_user_by_email import FindUserByEmail
 from synapse_pangea_chat.grant_instructor_analytics_access import (
@@ -189,6 +190,13 @@ class PangeaChat:
             path="/_synapse/client/pangea/v1/register/email/requestToken",
             resource=self.register_email_resource,
         )
+
+        # --- Email Address Policy ---
+        # Homeserver-wide, so Synapse's own registration endpoint is covered
+        # too, not only the Pangea route registered above.
+        self.email_policy: Optional[EmailPolicy] = None
+        if config.email_policy_enabled:
+            self.email_policy = EmailPolicy(config, api)
 
         # --- Assign Room Membership ---
         self.assign_room_membership_resource = AssignRoomMembership(api, config)
@@ -520,6 +528,11 @@ class PangeaChat:
             "register_email_burst_duration_seconds", 60
         )
 
+        # --- email_policy config ---
+        email_policy_enabled = config.get("email_policy_enabled", True)
+        if not isinstance(email_policy_enabled, bool):
+            raise ValueError("email_policy_enabled must be a boolean")
+
         # --- invite_by_email config ---
         invite_by_email_requests_per_burst = config.get(
             "invite_by_email_requests_per_burst", 5
@@ -627,6 +640,7 @@ class PangeaChat:
             find_user_by_email_burst_duration_seconds=find_user_by_email_burst_duration_seconds,
             register_email_requests_per_burst=register_email_requests_per_burst,
             register_email_burst_duration_seconds=register_email_burst_duration_seconds,
+            email_policy_enabled=email_policy_enabled,
             invite_by_email_requests_per_burst=invite_by_email_requests_per_burst,
             invite_by_email_burst_duration_seconds=invite_by_email_burst_duration_seconds,
             app_base_url=app_base_url,

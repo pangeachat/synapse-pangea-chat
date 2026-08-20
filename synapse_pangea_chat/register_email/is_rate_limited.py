@@ -10,22 +10,43 @@ from typing import Dict, List
 
 request_log: Dict[str, List[float]] = {}
 
+_last_sweep: float = 0.0
+
 
 def is_rate_limited(ip: str, config: PangeaChatConfig) -> bool:
     current_time = time.time()
+    window = config.register_email_burst_duration_seconds
 
-    if ip not in request_log:
-        request_log[ip] = []
+    _sweep_quiet_ips(current_time, window)
 
-    request_log[ip] = [
+    timestamps = [
         timestamp
-        for timestamp in request_log[ip]
-        if current_time - timestamp <= config.register_email_burst_duration_seconds
+        for timestamp in request_log.get(ip, [])
+        if current_time - timestamp <= window
     ]
+    request_log[ip] = timestamps
 
-    if len(request_log[ip]) >= config.register_email_requests_per_burst:
+    if len(timestamps) >= config.register_email_requests_per_burst:
         return True
 
-    request_log[ip].append(current_time)
+    timestamps.append(current_time)
 
     return False
+
+
+def _sweep_quiet_ips(current_time: float, window: float) -> None:
+    """Drop IPs with nothing left inside the window.
+
+    The route is unauthenticated, so without this the log keeps a key for every
+    IP that ever reached it, for the lifetime of the process. Sweeping once per
+    window rather than per request keeps the cost off the hot path.
+    """
+    global _last_sweep
+
+    if current_time - _last_sweep < window:
+        return
+    _last_sweep = current_time
+
+    for logged_ip, timestamps in list(request_log.items()):
+        if all(current_time - timestamp > window for timestamp in timestamps):
+            del request_log[logged_ip]

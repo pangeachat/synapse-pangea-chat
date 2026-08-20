@@ -88,6 +88,11 @@ class PangeaChatConfig:
     register_email_requests_per_burst: int = 5
     register_email_burst_duration_seconds: int = 60
 
+    # --- email_policy config ---
+    # Refuse email addresses Pangea will not mail. Off switch only; the rule
+    # itself is fixed by design.
+    email_policy_enabled: bool = True
+
     # --- user_directory_search config ---
     user_directory_search_requests_per_burst: int = 10
     user_directory_search_burst_duration_seconds: int = 60
