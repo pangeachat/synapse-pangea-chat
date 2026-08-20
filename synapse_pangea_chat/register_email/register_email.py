@@ -20,6 +20,7 @@ from synapse.util.threepids import check_3pid_allowed, validate_email
 from twisted.internet import defer
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.email_policy import is_valid_email_address
 from synapse_pangea_chat.register_email.is_rate_limited import is_rate_limited
 
 logger = logging.getLogger(
@@ -168,6 +169,22 @@ class RegisterEmailRequestToken(Resource):
                 )
                 return
 
+            # The homeserver-wide policy callback below refuses this address
+            # too, but its refusal cannot say why. Running the same check here
+            # first is what lets the app tell the learner their address is
+            # malformed rather than that their domain is not authorized.
+            if not is_valid_email_address(email):
+                respond_with_json(
+                    request,
+                    400,
+                    {
+                        "errcode": "M_INVALID_PARAM",
+                        "error": "Invalid email address",
+                    },
+                    send_cors=True,
+                )
+                return
+
             if not await check_3pid_allowed(
                 self._hs, "email", email, registration=True
             ):
@@ -181,6 +198,13 @@ class RegisterEmailRequestToken(Resource):
                     send_cors=True,
                 )
                 return
+
+            # Limits how often one address may be mailed, which the module's
+            # own per-IP burst above cannot do. Raises LimitExceededError,
+            # answered as a 429 by the SynapseError handler below.
+            await self._identity_handler.ratelimit_request_token_requests(
+                request, "email", email
+            )
 
             existing_user_id = await self._datastores.main.get_user_id_by_threepid(
                 "email", email

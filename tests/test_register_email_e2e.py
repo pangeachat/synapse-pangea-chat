@@ -23,6 +23,10 @@ logging.basicConfig(
 )
 
 ENDPOINT = "http://localhost:8008/_synapse/client/pangea/v1/register/email/requestToken"
+# Synapse's own registration endpoint, reachable independently of the Pangea
+# route above. Covering it is the reason the address policy is a homeserver-wide
+# callback rather than a check inside the Pangea endpoint.
+BUILTIN_ENDPOINT = "http://localhost:8008/_matrix/client/v3/register/email/requestToken"
 
 
 class MockSMTPServer:
@@ -593,11 +597,8 @@ class TestRegisterEmailE2ENoEmailConfig(BaseSynapseE2ETest):
             )
 
 
-class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
-    """Tests for the register email endpoint WITH email configured.
-
-    Uses a mock SMTP server to capture outgoing emails.
-    """
+class EmailConfiguredSynapseMixin:
+    """Starts the test homeserver with a mock SMTP server attached."""
 
     smtp_server: Optional[MockSMTPServer] = None
 
@@ -628,6 +629,15 @@ class TestRegisterEmailE2EWithEmailConfig(BaseSynapseE2ETest):
         if self.smtp_server is None:
             raise AssertionError("Mock SMTP server was not started")
         return self.smtp_server
+
+
+class TestRegisterEmailE2EWithEmailConfig(
+    EmailConfiguredSynapseMixin, BaseSynapseE2ETest
+):
+    """Tests for the register email endpoint WITH email configured.
+
+    Uses a mock SMTP server to capture outgoing emails.
+    """
 
     async def test_happy_path_valid_username_and_email(self) -> None:
         """Valid username + valid email → 200 with sid."""
@@ -1088,6 +1098,151 @@ class TestRegisterEmailRateLimit(BaseSynapseE2ETest):
             body = response.json()
             self.assertEqual(body["errcode"], "M_LIMIT_EXCEEDED")
         finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+
+class TestRegisterEmailAddressPolicy(EmailConfiguredSynapseMixin, BaseSynapseE2ETest):
+    """The address policy, on both endpoints that can send a verification email.
+
+    Design: .github/instructions/email-address-policy.instructions.md
+    """
+
+    def _make_email_synapse_config(self, smtp_port: int) -> dict:
+        config = super()._make_email_synapse_config(smtp_port)
+        # The built-in endpoint answers 403 "registration is disabled" before it
+        # ever reaches the policy, so registration has to be open to test it.
+        config["enable_registration"] = True
+        config["registrations_require_3pid"] = ["email"]
+        return config
+
+    async def test_pangea_endpoint_refuses_address_and_sends_nothing(self) -> None:
+        """`a@b` is the address the old presence-and-"@" check let through."""
+        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self._start_synapse_with_email()
+
+            smtp_server = self._require_smtp_server()
+            emails_before = len(smtp_server.received_emails)
+
+            response = requests.post(
+                ENDPOINT,
+                json={
+                    "username": "policyuser",
+                    "client_secret": "s3cr3t",
+                    "email": "a@b",
+                    "send_attempt": 1,
+                },
+            )
+
+            self.assertEqual(response.status_code, 400, response.text)
+            # Malformed, not "domain not authorized" — the Pangea endpoint runs
+            # the policy itself so the app can say which it was.
+            self.assertEqual(response.json()["errcode"], "M_INVALID_PARAM")
+
+            await asyncio.sleep(1)
+            self.assertEqual(
+                len(smtp_server.received_emails),
+                emails_before,
+                "No email should be sent for an address failing the policy",
+            )
+        finally:
+            self._stop_smtp()
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_builtin_endpoint_refuses_address_and_sends_nothing(self) -> None:
+        """The path the app does not use, and the reason for the callback."""
+        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self._start_synapse_with_email()
+
+            smtp_server = self._require_smtp_server()
+            emails_before = len(smtp_server.received_emails)
+
+            response = requests.post(
+                BUILTIN_ENDPOINT,
+                json={
+                    "client_secret": "s3cr3t",
+                    "email": "a@b",
+                    "send_attempt": 1,
+                },
+            )
+
+            self.assertEqual(response.status_code, 403, response.text)
+            self.assertEqual(response.json()["errcode"], "M_THREEPID_DENIED")
+
+            await asyncio.sleep(1)
+            self.assertEqual(
+                len(smtp_server.received_emails),
+                emails_before,
+                "No email should be sent for an address failing the policy",
+            )
+        finally:
+            self._stop_smtp()
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_builtin_endpoint_still_sends_for_a_good_address(self) -> None:
+        """The control: the callback refuses junk, not everything."""
+        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self._start_synapse_with_email()
+
+            smtp_server = self._require_smtp_server()
+            emails_before = len(smtp_server.received_emails)
+
+            response = requests.post(
+                BUILTIN_ENDPOINT,
+                json={
+                    "client_secret": "s3cr3t",
+                    "email": "builtin-learner@example.com",
+                    "send_attempt": 1,
+                },
+            )
+
+            self.assertEqual(response.status_code, 200, response.text)
+
+            await asyncio.sleep(1)
+            self.assertGreater(len(smtp_server.received_emails), emails_before)
+        finally:
+            self._stop_smtp()
             self.stop_synapse(
                 server_process=server_process,
                 stdout_thread=stdout_thread,
