@@ -6,6 +6,7 @@ from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.activity_session_previews import ActivitySessionPreviews
 from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
+from synapse_pangea_chat.blocked_join_gate import BlockedJoinGate
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delete_room import DeleteRoom
@@ -220,6 +221,10 @@ class PangeaChat:
             path="/_synapse/client/pangea/v1/ensure_direct_message",
             resource=self.ensure_direct_message_resource,
         )
+
+        # --- Blocked Join Gate ---
+        if config.blocked_join_gate_enabled:
+            self.blocked_join_gate = BlockedJoinGate(config, api)
 
         # --- Direct Push ---
         self.direct_push_resource = DirectPush(api, config)
@@ -560,6 +565,11 @@ class PangeaChat:
             if not send_push_sygnal_url.strip():
                 raise ValueError('Config "send_push_sygnal_url" must not be empty')
 
+        # --- blocked_join_gate config ---
+        blocked_join_gate_enabled = config.get("blocked_join_gate_enabled", True)
+        if not isinstance(blocked_join_gate_enabled, bool):
+            raise ValueError('Config "blocked_join_gate_enabled" must be a boolean')
+
         # --- delayed_push config ---
         delayed_push = config.get("delayed_push", {})
         if delayed_push is None:
@@ -651,4 +661,5 @@ class PangeaChat:
             delayed_push_delay_ms=delayed_push_delay_ms,
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,
             delayed_push_require_synapse_version=delayed_push_require_synapse_version,
+            blocked_join_gate_enabled=blocked_join_gate_enabled,
         )
