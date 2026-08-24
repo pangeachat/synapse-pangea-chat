@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import zipfile
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence, cast
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Sequence, cast
 from urllib.parse import quote
 
 from synapse.api.errors import (
@@ -85,9 +85,14 @@ class JsonExfiltrationWriter(ExfiltrationWriter):
             "media_ids": [],
         }
 
-    def write_events(self, room_id: str, events: List[EventBase]) -> None:
+    def write_events(self, room_id: str, events: Sequence[Any]) -> None:
+        # Synapse >=1.150 passes FilteredEvent wrappers (the event plus a
+        # per-user membership annotation); 1.124 passes EventBase directly.
+        # Unwrap by capability, per the compatibility contract.
         room = self._data["rooms"].setdefault(room_id, {})
-        room.setdefault("events", []).extend(e.get_pdu_json() for e in events)
+        room.setdefault("events", []).extend(
+            getattr(e, "event", e).get_pdu_json() for e in events
+        )
 
     def write_state(
         self, room_id: str, event_id: str, state: StateMap[EventBase]
@@ -164,8 +169,11 @@ class ExportUserData(Resource):
 
         self._clock.looping_call(
             cast(Any, run_as_background_process),
-            _looping_call_interval_seconds(
-                self._config.export_user_data_processor_interval_seconds
+            cast(
+                Any,
+                _looping_call_interval_seconds(
+                    self._config.export_user_data_processor_interval_seconds
+                ),
             ),
             *_background_process_args(
                 self._api._hs,

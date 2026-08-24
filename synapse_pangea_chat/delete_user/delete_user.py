@@ -78,8 +78,11 @@ class DeleteUser(Resource):
 
         self._clock.looping_call(
             cast(Any, run_as_background_process),
-            _looping_call_interval_seconds(
-                self._config.delete_user_processor_interval_seconds
+            cast(
+                Any,
+                _looping_call_interval_seconds(
+                    self._config.delete_user_processor_interval_seconds
+                ),
             ),
             *_background_process_args(
                 self._api._hs,

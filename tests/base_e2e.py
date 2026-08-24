@@ -206,6 +206,18 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             templates_config["custom_template_directory"] = test_template_dir
             config["templates"] = templates_config
 
+            # Synapse 1.126 flipped room_list_publication_rules to deny-all.
+            # Deployment pins the pre-1.126 allow-all rule explicitly
+            # (pangeachat/ansible#235); the test homeserver mirrors it, and
+            # this doubles as the canary for course discovery, which requires
+            # rooms to be publishable to the room directory.
+            config["room_list_publication_rules"] = [{"action": "allow"}]
+
+            # Synapse 1.159 added rc_room_creation (default: 1 room/min,
+            # burst 10) — far below what the suite creates. Unknown key on
+            # 1.124, where Synapse ignores it.
+            config["rc_room_creation"] = {"per_second": 1000, "burst_count": 1000}
+
             if synapse_config_overrides:
                 for key, value in synapse_config_overrides.items():
                     config[key] = value

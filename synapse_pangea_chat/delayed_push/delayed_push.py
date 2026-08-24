@@ -134,9 +134,14 @@ async def _pangea_delayed_push_unsafe_process(self: Any) -> None:
     """HttpPusher._unsafe_process with Pangea active-user deferral.
 
     This is a private Synapse API monkey patch. It intentionally mirrors Synapse
-    v1.124.0's HttpPusher._unsafe_process, adding one pre-_process_one decision
+    v1.159.0's HttpPusher._unsafe_process, adding one pre-_process_one decision
     point that may reschedule the pusher without advancing last_stream_ordering.
     """
+    # Not importable on every audited Synapse version; only reachable once the
+    # exact-version guard has passed.
+    from synapse.metrics import SERVER_NAME_LABEL
+    from synapse.util.duration import Duration
+
     config = _get_delayed_push_config(self)
     if _delayed_push_pending(self, config):
         return
@@ -181,72 +186,76 @@ async def _pangea_delayed_push_unsafe_process(self: Any) -> None:
                 return
 
             processed = await self._process_one(push_action)
-            if processed:
-                httppusher.http_push_processed_counter.inc()
+
+        if processed:
+            httppusher.http_push_processed_counter.labels(
+                **{SERVER_NAME_LABEL: self.server_name}
+            ).inc()
+            self.backoff_delay = HttpPusher.INITIAL_BACKOFF_SEC
+            self.last_stream_ordering = push_action.stream_ordering
+            pusher_still_exists = (
+                await self.store.update_pusher_last_stream_ordering_and_success(
+                    self.app_id,
+                    self.pushkey,
+                    self.user_id,
+                    self.last_stream_ordering,
+                    self.clock.time_msec(),
+                )
+            )
+            if not pusher_still_exists:
+                # The pusher has been deleted while we were processing, so
+                # lets just stop and return.
+                self.on_stop()
+                return
+
+            if self.failing_since:
+                self.failing_since = None
+                await self.store.update_pusher_failing_since(
+                    self.app_id, self.pushkey, self.user_id, self.failing_since
+                )
+        else:
+            httppusher.http_push_failed_counter.labels(
+                **{SERVER_NAME_LABEL: self.server_name}
+            ).inc()
+            if not self.failing_since:
+                self.failing_since = self.clock.time_msec()
+                await self.store.update_pusher_failing_since(
+                    self.app_id, self.pushkey, self.user_id, self.failing_since
+                )
+
+            if (
+                self.failing_since
+                and self.failing_since
+                < self.clock.time_msec() - HttpPusher.GIVE_UP_AFTER_MS
+            ):
+                # we really only give up so that if the URL gets
+                # fixed, we don't suddenly deliver a load
+                # of old notifications.
+                logger.warning(
+                    "Giving up on a notification to user %s, pushkey %s",
+                    self.user_id,
+                    self.pushkey,
+                )
                 self.backoff_delay = HttpPusher.INITIAL_BACKOFF_SEC
                 self.last_stream_ordering = push_action.stream_ordering
-                pusher_still_exists = (
-                    await self.store.update_pusher_last_stream_ordering_and_success(
-                        self.app_id,
-                        self.pushkey,
-                        self.user_id,
-                        self.last_stream_ordering,
-                        self.clock.time_msec(),
-                    )
+                await self.store.update_pusher_last_stream_ordering(
+                    self.app_id,
+                    self.pushkey,
+                    self.user_id,
+                    self.last_stream_ordering,
                 )
-                if not pusher_still_exists:
-                    # The pusher has been deleted while we were processing, so
-                    # lets just stop and return.
-                    self.on_stop()
-                    return
-
-                if self.failing_since:
-                    self.failing_since = None
-                    await self.store.update_pusher_failing_since(
-                        self.app_id, self.pushkey, self.user_id, self.failing_since
-                    )
+                self.failing_since = None
+                await self.store.update_pusher_failing_since(
+                    self.app_id, self.pushkey, self.user_id, self.failing_since
+                )
             else:
-                httppusher.http_push_failed_counter.inc()
-                if not self.failing_since:
-                    self.failing_since = self.clock.time_msec()
-                    await self.store.update_pusher_failing_since(
-                        self.app_id, self.pushkey, self.user_id, self.failing_since
-                    )
-
-                if (
-                    self.failing_since
-                    and self.failing_since
-                    < self.clock.time_msec() - HttpPusher.GIVE_UP_AFTER_MS
-                ):
-                    # we really only give up so that if the URL gets
-                    # fixed, we don't suddenly deliver a load
-                    # of old notifications.
-                    logger.warning(
-                        "Giving up on a notification to user %s, pushkey %s",
-                        self.user_id,
-                        self.pushkey,
-                    )
-                    self.backoff_delay = HttpPusher.INITIAL_BACKOFF_SEC
-                    self.last_stream_ordering = push_action.stream_ordering
-                    await self.store.update_pusher_last_stream_ordering(
-                        self.app_id,
-                        self.pushkey,
-                        self.user_id,
-                        self.last_stream_ordering,
-                    )
-                    self.failing_since = None
-                    await self.store.update_pusher_failing_since(
-                        self.app_id, self.pushkey, self.user_id, self.failing_since
-                    )
-                else:
-                    logger.info("Push failed: delaying for %ds", self.backoff_delay)
-                    self.timed_call = self.hs.get_reactor().callLater(
-                        self.backoff_delay, self.on_timer
-                    )
-                    self.backoff_delay = min(
-                        self.backoff_delay * 2, self.MAX_BACKOFF_SEC
-                    )
-                    break
+                logger.info("Push failed: delaying for %ds", self.backoff_delay)
+                self.timed_call = self.hs.get_clock().call_later(
+                    Duration(seconds=self.backoff_delay),
+                    self.on_timer,
+                )
+                self.backoff_delay = min(self.backoff_delay * 2, self.MAX_BACKOFF_SEC)
+                break
 
 
 async def _should_defer_push_action(self: Any, push_action: Any) -> bool:
@@ -316,14 +325,18 @@ def _schedule_delayed_push(
     if config is None:
         return
 
+    from synapse.util.duration import Duration
+
     _cancel_existing_timed_call(self)
-    delay_seconds = config.delayed_push_delay_ms / 1000
     self._pangea_delayed_push_event_id = push_action.event_id
     self._pangea_delayed_push_stream_ordering = push_action.stream_ordering
     self._pangea_delayed_push_until_ms = (
         self.clock.time_msec() + config.delayed_push_delay_ms
     )
-    self.timed_call = self.hs.get_reactor().callLater(delay_seconds, self.on_timer)
+    self.timed_call = self.hs.get_clock().call_later(
+        Duration(milliseconds=config.delayed_push_delay_ms),
+        self.on_timer,
+    )
 
 
 def _cancel_existing_timed_call(self: Any) -> None:

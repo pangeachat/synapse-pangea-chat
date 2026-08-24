@@ -10,6 +10,7 @@ changes who controls the room.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any, Dict, Optional, Set
 
 from synapse.api.constants import EventTypes
@@ -90,7 +91,11 @@ async def select_state_sender(
         return None
 
     power_levels_content: Optional[Dict[str, Any]] = None
-    if power_levels_event is not None and isinstance(power_levels_event.content, dict):
+    # Mapping, not dict: Synapse >=1.159 Rust-backed events expose .content as
+    # a non-dict Mapping (nested values are still plain dicts).
+    if power_levels_event is not None and isinstance(
+        power_levels_event.content, Mapping
+    ):
         power_levels_content = dict(power_levels_event.content)
 
     required_power = required_power_for_state_event(power_levels_content, event_type)

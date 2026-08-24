@@ -115,4 +115,4 @@ class PangeaChatConfig:
     delayed_push_enabled: bool = False
     delayed_push_delay_ms: int = 60_000
     delayed_push_max_delay_ms: int = 600_000
-    delayed_push_require_synapse_version: str = "1.124.0"
+    delayed_push_require_synapse_version: str = "1.159.0"

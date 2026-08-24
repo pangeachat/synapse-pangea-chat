@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from synapse.api.errors import StoreError
@@ -49,7 +50,9 @@ class TestJsonExfiltrationWriter(unittest.TestCase):
         self.writer = JsonExfiltrationWriter()
 
     def test_write_events(self):
-        event = MagicMock()
+        # spec'd: a real EventBase has no .event attribute, and the writer's
+        # FilteredEvent unwrap must not trip over a mock's phantom one.
+        event = MagicMock(spec=["get_pdu_json"])
         event.get_pdu_json.return_value = {"type": "m.room.message", "content": {}}
         self.writer.write_events("!room:example.com", [event])
         result = self.writer.finished()
@@ -59,10 +62,23 @@ class TestJsonExfiltrationWriter(unittest.TestCase):
             "m.room.message",
         )
 
+    def test_write_events_unwraps_filtered_event_wrappers(self):
+        # Synapse >=1.150 passes FilteredEvent (event + membership annotation)
+        # instead of EventBase; the writer must export the inner event's PDU.
+        inner = MagicMock(spec=["get_pdu_json"])
+        inner.get_pdu_json.return_value = {"type": "m.room.message", "content": {}}
+        wrapper = SimpleNamespace(event=inner, membership="join")
+        self.writer.write_events("!room:example.com", [wrapper])
+        result = self.writer.finished()
+        self.assertEqual(
+            result["rooms"]["!room:example.com"]["events"],
+            [{"type": "m.room.message", "content": {}}],
+        )
+
     def test_write_events_multiple_rooms(self):
-        event1 = MagicMock()
+        event1 = MagicMock(spec=["get_pdu_json"])
         event1.get_pdu_json.return_value = {"room": "1"}
-        event2 = MagicMock()
+        event2 = MagicMock(spec=["get_pdu_json"])
         event2.get_pdu_json.return_value = {"room": "2"}
         self.writer.write_events("!a:x", [event1])
         self.writer.write_events("!b:x", [event2])

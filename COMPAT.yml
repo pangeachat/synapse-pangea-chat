@@ -6,4 +6,4 @@
 # Do not lower min_synapse_version without auditing all sub-module imports first.
 
 min_synapse_version: "1.124.0"
-reason: "delete_user, export_user_data, and delayed_push were audited against Synapse 1.124.0; delayed_push also enforces an exact runtime version guard before monkey-patching HttpPusher internals"
+reason: "Module code is compatible with Synapse 1.124.0 through 1.159.0 (capability-gated shims; full test suite green on both pins). delayed_push is the exception: its monkey-patched HttpPusher body mirrors 1.159.0 and enforces an exact runtime version guard, so it must stay disabled on any other version. Raise min_synapse_version to 1.159.0 once the whole fleet is upgraded."

@@ -5,6 +5,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import synapse
+
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.delayed_push.delayed_push import (
     _pangea_delayed_push_start_processing,
@@ -45,12 +47,15 @@ class FakeDelayedCall:
         self.cancelled = True
 
 
-class FakeReactor:
+class FakeSynapseClock:
+    """Mirrors synapse.util.Clock.call_later on Synapse >=1.159, which takes a
+    Duration and returns a wrapper with active()/cancel()."""
+
     def __init__(self):
         self.calls = []
 
-    def callLater(self, delay_seconds, callback):
-        delayed_call = FakeDelayedCall(delay_seconds, callback)
+    def call_later(self, duration, callback):
+        delayed_call = FakeDelayedCall(duration.as_secs(), callback)
         self.calls.append(delayed_call)
         return delayed_call
 
@@ -86,7 +91,7 @@ class FakeHomeServer:
                 track_presence=track_presence,
             )
         )
-        self.reactor = FakeReactor()
+        self.clock = FakeSynapseClock()
         if presence_state is None:
             presence_state = "online" if active else "offline"
         self.presence_handler = FakePresenceHandler(
@@ -95,8 +100,8 @@ class FakeHomeServer:
             presence_error,
         )
 
-    def get_reactor(self):
-        return self.reactor
+    def get_clock(self):
+        return self.clock
 
     def get_presence_handler(self):
         return self.presence_handler
@@ -109,6 +114,7 @@ class FakePusher:
         self.app_display_name = "App"
         self.pushkey = "pushkey"
         self.name = "@alice:example.test/app/pushkey"
+        self.server_name = "example.test"
         self.last_stream_ordering = 1
         self.max_stream_ordering = 10
         self.backoff_delay = 1
@@ -153,7 +159,7 @@ class TestDelayedPushConfig(unittest.TestCase):
         self.assertFalse(config.delayed_push_enabled)
         self.assertEqual(config.delayed_push_delay_ms, 60_000)
         self.assertEqual(config.delayed_push_max_delay_ms, 600_000)
-        self.assertEqual(config.delayed_push_require_synapse_version, "1.124.0")
+        self.assertEqual(config.delayed_push_require_synapse_version, "1.159.0")
 
     def test_parse_config_includes_delayed_push_overrides(self):
         config = PangeaChat.parse_config(
@@ -206,9 +212,9 @@ class TestDelayedPushPatch(unittest.TestCase):
 
         with patch(
             "synapse_pangea_chat.delayed_push.delayed_push.synapse.__version__",
-            "1.125.0",
+            "1.124.0",
         ):
-            with self.assertRaisesRegex(ValueError, "audited for Synapse 1.124.0"):
+            with self.assertRaisesRegex(ValueError, "audited for Synapse 1.159.0"):
                 configure_delayed_push(config)
 
     def test_configure_delayed_push_patches_when_version_matches(self):
@@ -216,7 +222,7 @@ class TestDelayedPushPatch(unittest.TestCase):
 
         with patch(
             "synapse_pangea_chat.delayed_push.delayed_push.synapse.__version__",
-            "1.124.0",
+            "1.159.0",
         ):
             configure_delayed_push(config)
 
@@ -226,6 +232,16 @@ class TestDelayedPushPatch(unittest.TestCase):
         self.assertIs(HttpPusher._pangea_delayed_push_config, config)
 
 
+AUDITED_SYNAPSE_VERSION = "1.159.0"
+
+
+@unittest.skipUnless(
+    synapse.__version__ == AUDITED_SYNAPSE_VERSION,
+    "the patched HttpPusher body mirrors Synapse "
+    f"{AUDITED_SYNAPSE_VERSION} internals; on any other version the module "
+    "refuses to enable delayed_push (exact-version guard), so the body is "
+    "only testable on the audited version",
+)
 class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         reset_delayed_push_patch_for_tests()
@@ -242,8 +258,8 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pusher.last_stream_ordering, 1)
         pusher._process_one.assert_not_awaited()
         pusher.store.update_pusher_last_stream_ordering_and_success.assert_not_awaited()
-        self.assertEqual(len(pusher.hs.reactor.calls), 1)
-        self.assertEqual(pusher.hs.reactor.calls[0].delay_seconds, 60)
+        self.assertEqual(len(pusher.hs.clock.calls), 1)
+        self.assertEqual(pusher.hs.clock.calls[0].delay_seconds, 60)
         self.assertEqual(pusher._pangea_delayed_push_event_id, "$event")
         self.assertEqual(
             pusher._pangea_delayed_push_until_ms,
@@ -265,7 +281,7 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pusher.last_stream_ordering, 1)
         pusher._process_one.assert_not_awaited()
         pusher.store.update_pusher_last_stream_ordering_and_success.assert_not_awaited()
-        self.assertEqual(len(pusher.hs.reactor.calls), 1)
+        self.assertEqual(len(pusher.hs.clock.calls), 1)
 
     async def test_unsafe_process_sends_when_user_is_offline_but_currently_active(
         self,
@@ -282,7 +298,7 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
         pusher._process_one.assert_awaited_once_with(pusher.push_action)
         self.assertEqual(pusher.last_stream_ordering, 5)
         pusher.store.update_pusher_last_stream_ordering_and_success.assert_awaited_once()
-        self.assertEqual(pusher.hs.reactor.calls, [])
+        self.assertEqual(pusher.hs.clock.calls, [])
 
     async def test_unsafe_process_sends_when_user_is_offline_and_not_currently_active(
         self,
@@ -298,7 +314,7 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
         pusher._process_one.assert_awaited_once_with(pusher.push_action)
         self.assertEqual(pusher.last_stream_ordering, 5)
         pusher.store.update_pusher_last_stream_ordering_and_success.assert_awaited_once()
-        self.assertEqual(pusher.hs.reactor.calls, [])
+        self.assertEqual(pusher.hs.clock.calls, [])
 
     async def test_unsafe_process_sends_when_max_delay_reached(self):
         pusher = FakePusher(active=True, event_age_ms=600_000)
@@ -311,7 +327,7 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
 
         pusher._process_one.assert_awaited_once_with(pusher.push_action)
         self.assertEqual(pusher.last_stream_ordering, 5)
-        self.assertEqual(pusher.hs.reactor.calls, [])
+        self.assertEqual(pusher.hs.clock.calls, [])
 
     async def test_unsafe_process_fails_open_when_presence_lookup_errors(self):
         pusher = FakePusher(active=True, event_age_ms=1_000)

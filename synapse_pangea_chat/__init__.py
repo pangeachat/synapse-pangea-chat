@@ -589,7 +589,7 @@ class PangeaChat:
             )
 
         delayed_push_require_synapse_version = delayed_push.get(
-            "require_synapse_version", "1.124.0"
+            "require_synapse_version", "1.159.0"
         )
         if not isinstance(delayed_push_require_synapse_version, str):
             raise ValueError(
