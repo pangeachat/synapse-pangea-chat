@@ -61,7 +61,7 @@ Why each piece:
 
 ## CI
 
-Code style is enforced via `tox -e check_codestyle` (black + ruff). Tests are run locally — no GitHub Actions test workflow.
+CI runs three jobs on every push to main and every PR: code style (`tox -e check_codestyle`), types (`tox -e check_types`), and the full unit & integration suite (`run-tests`) — the same `unittest discover` command as local runs, against the runner's preinstalled PostgreSQL. Staging smoke-tests still run only locally/manually.
 
 ## Manual Testing
 
