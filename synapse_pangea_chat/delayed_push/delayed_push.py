@@ -11,6 +11,14 @@ from twisted.internet.error import AlreadyCalled, AlreadyCancelled
 logger = logging.getLogger(__name__)
 
 
+AUDITED_SYNAPSE_VERSION = "1.159.0"
+"""The exact Synapse version whose private HttpPusher internals the patched
+body below mirrors. A property of this commit's code, not of configuration:
+the config's require_synapse_version can only confirm this value, never select
+a different one, so a stale inventory claim cannot boot the patch against
+internals it was not audited for."""
+
+
 _ORIGINAL_UNSAFE_PROCESS_ATTR = "_pangea_delayed_push_original_unsafe_process"
 _ORIGINAL_START_PROCESSING_ATTR = "_pangea_delayed_push_original_start_processing"
 _PATCHED_ATTR = "_pangea_delayed_push_patched"
@@ -69,11 +77,21 @@ def reset_delayed_push_patch_for_tests() -> None:
 
 
 def _require_audited_synapse_version(required_version: str) -> None:
-    actual_version = getattr(synapse, "__version__", "")
-    if actual_version != required_version:
+    if required_version != AUDITED_SYNAPSE_VERSION:
+        raise ValueError(
+            "delayed_push is enabled with "
+            f"require_synapse_version={required_version!r}, but this "
+            "synapse-pangea-chat commit's patch body was audited for Synapse "
+            f"{AUDITED_SYNAPSE_VERSION}. Update the config to confirm the "
+            "audited version, or disable delayed_push"
+        )
+    # synapse.__version__ can carry a git suffix ("1.159.0 (b=main,abc1234)")
+    # when the install sits inside a git checkout; compare the base version.
+    actual_version = getattr(synapse, "__version__", "") or ""
+    if actual_version.split(" ")[0] != AUDITED_SYNAPSE_VERSION:
         raise ValueError(
             "delayed_push is enabled but this synapse-pangea-chat commit was "
-            f"audited for Synapse {required_version}; running Synapse "
+            f"audited for Synapse {AUDITED_SYNAPSE_VERSION}; running Synapse "
             f"{actual_version or 'unknown'}"
         )
 

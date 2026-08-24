@@ -80,11 +80,15 @@ version.
 ## Deployment constraints
 
 - **`delayed_push` moves in lockstep on staging.** This commit's patched body
-  runs only on 1.159.0. Staging currently enables `delayed_push` with
-  `require_synapse_version: "1.124.0"` in its inventory — deploying this module
-  commit to staging *without* bumping Synapse and that config value in the same
-  Ansible run would boot a 1.159-shaped body on 1.124 and break push
-  processing. Production has no `delayed_push` block and is unaffected.
+  runs only on 1.159.0, and the guard pins that as a code constant
+  (`AUDITED_SYNAPSE_VERSION` in `delayed_push/delayed_push.py`): the config's
+  `require_synapse_version` can only confirm it, never select another version.
+  Staging currently enables `delayed_push` with `require_synapse_version:
+  "1.124.0"` in its inventory — deploying this module commit to staging
+  *without* bumping Synapse and that config value in the same Ansible run makes
+  Synapse **refuse to boot**, with an error naming the mismatch (a loud deploy
+  failure, by design, instead of a healthy-looking server with broken push
+  processing). Production has no `delayed_push` block and is unaffected.
 - **`rc_room_creation` needs an inventory override** in both environments —
   the new upstream default (1 room/min, burst 10) is below real course-creation
   and bot room-creation bursts.

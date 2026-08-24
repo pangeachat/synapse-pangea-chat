@@ -8,6 +8,7 @@ from synapse_pangea_chat.activity_session_previews import ActivitySessionPreview
 from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.delayed_push import configure_delayed_push
+from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 from synapse_pangea_chat.delete_room import DeleteRoom
 from synapse_pangea_chat.delete_user import DeleteUser
 from synapse_pangea_chat.direct_message import EnsureDirectMessage
@@ -589,7 +590,7 @@ class PangeaChat:
             )
 
         delayed_push_require_synapse_version = delayed_push.get(
-            "require_synapse_version", "1.159.0"
+            "require_synapse_version", AUDITED_SYNAPSE_VERSION
         )
         if not isinstance(delayed_push_require_synapse_version, str):
             raise ValueError(

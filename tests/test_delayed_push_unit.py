@@ -9,6 +9,7 @@ import synapse
 
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.delayed_push.delayed_push import (
+    AUDITED_SYNAPSE_VERSION,
     _pangea_delayed_push_start_processing,
     _pangea_delayed_push_unsafe_process,
     configure_delayed_push,
@@ -217,6 +218,24 @@ class TestDelayedPushPatch(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "audited for Synapse 1.159.0"):
                 configure_delayed_push(config)
 
+    def test_configure_delayed_push_rejects_config_contradicting_code_audit(self):
+        # The misdeploy scenario: a stale inventory claims an audit of an older
+        # Synapse, and the running server matches that claim — but this
+        # commit's patch body doesn't. Must fail at boot, not at first push.
+        config = PangeaChat.parse_config(
+            _base_config(enabled=True, require_synapse_version="1.124.0")
+        )
+
+        with patch(
+            "synapse_pangea_chat.delayed_push.delayed_push.synapse.__version__",
+            "1.124.0",
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "audited for Synapse " f"{AUDITED_SYNAPSE_VERSION}".replace(".", r"\."),
+            ):
+                configure_delayed_push(config)
+
     def test_configure_delayed_push_patches_when_version_matches(self):
         config = PangeaChat.parse_config(_base_config(enabled=True))
 
@@ -232,11 +251,9 @@ class TestDelayedPushPatch(unittest.TestCase):
         self.assertIs(HttpPusher._pangea_delayed_push_config, config)
 
 
-AUDITED_SYNAPSE_VERSION = "1.159.0"
-
-
 @unittest.skipUnless(
-    synapse.__version__ == AUDITED_SYNAPSE_VERSION,
+    # base version: __version__ carries a git suffix inside a git checkout
+    synapse.__version__.split(" ")[0] == AUDITED_SYNAPSE_VERSION,
     "the patched HttpPusher body mirrors Synapse "
     f"{AUDITED_SYNAPSE_VERSION} internals; on any other version the module "
     "refuses to enable delayed_push (exact-version guard), so the body is "

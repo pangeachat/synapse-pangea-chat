@@ -13,6 +13,8 @@ from typing import List, Optional
 
 import attr
 
+from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
+
 
 @attr.s(auto_attribs=True, frozen=True)
 class PangeaChatConfig:
@@ -115,4 +117,4 @@ class PangeaChatConfig:
     delayed_push_enabled: bool = False
     delayed_push_delay_ms: int = 60_000
     delayed_push_max_delay_ms: int = 600_000
-    delayed_push_require_synapse_version: str = "1.159.0"
+    delayed_push_require_synapse_version: str = AUDITED_SYNAPSE_VERSION
