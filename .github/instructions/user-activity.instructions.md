@@ -4,7 +4,7 @@ applyTo: "synapse_pangea_chat/user_activity/**"
 
 # User Activity Endpoints
 
-Three Synapse module endpoints that power the re-engagement system. Called by the [bot engagement script](../../../bot/.github/instructions/initiate.engagement.instructions.md).
+Three Synapse module endpoints that power the re-engagement system. Called by the [bot engagement script](../../../pangea-bot/.github/instructions/initiate.engagement.instructions.md).
 
 ## Endpoints
 
@@ -149,7 +149,7 @@ All `events` table queries are scoped to specific user IDs via `WHERE sender IN 
 
 ## Bot-Side Consumer
 
-The [engagement script](../../../bot/.github/instructions/initiate.engagement.instructions.md) in `pangea-bot`:
+The [engagement script](../../../pangea-bot/.github/instructions/initiate.engagement.instructions.md) in `pangea-bot`:
 
 1. Paginates through all users via `user_activity`
 2. For each inactive user, fetches their courses via `user_courses` — picks the first course (most recently active)
