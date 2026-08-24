@@ -1,12 +1,8 @@
-name: Linting
+name: CI
 on:
   push:
     branches: ["main"]
   pull_request:
-
-# Integration tests require a local PostgreSQL + Synapse instance
-# (via testing.postgresql + BaseSynapseE2ETest). Run them locally
-# before merging — see testing.instructions.md.
 
 permissions:
   contents: read
@@ -33,3 +29,30 @@ jobs:
           python-version: "3.x"
       - run: python -m pip install tox
       - run: tox -e check_types
+
+  run-tests:
+    name: Unit & integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          # Pinned minor: matrix-synapse ships abi3 wheels, but a new Python
+          # minor can still break transitive deps — bump deliberately.
+          python-version: "3.13"
+          cache: "pip"
+      - name: Install package with dev extras
+        run: |
+          python -m pip install -e ".[dev]"
+          # synapse 1.124.0 still imports pkg_resources, dropped in setuptools 81
+          python -m pip install "setuptools<81"
+      - name: Run test suite
+        # The E2E base class (tests/base_e2e.py) boots a real Synapse against a
+        # throwaway PostgreSQL from testing.postgresql, which needs the server
+        # binaries (initdb + postgres) on PATH. The runner image ships them
+        # under /usr/lib/postgresql/<major>/bin without exposing them on PATH.
+        run: |
+          PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)
+          PATH="$PG_BIN:$PATH" LC_ALL=C.UTF-8 LANG=C.UTF-8 \
+            python -m unittest discover -s tests -t . -p 'test_*.py'
