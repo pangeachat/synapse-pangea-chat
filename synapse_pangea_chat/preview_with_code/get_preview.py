@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from synapse.module_api import ModuleApi
@@ -13,9 +14,12 @@ logger = logging.getLogger(
 
 
 def _content_dict(event: Any) -> Dict[str, Any]:
+    # Synapse >=1.159 events are Rust-backed: .content is a Mapping
+    # (builtins.JsonObject) that is not a dict subclass; nested values
+    # materialize as plain dicts. Synapse 1.124 returns a plain dict.
     content = getattr(event, "content", None)
-    if isinstance(content, dict):
-        return content
+    if isinstance(content, Mapping):
+        return dict(content)
     return {}
 
 

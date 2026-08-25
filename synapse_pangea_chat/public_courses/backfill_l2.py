@@ -79,6 +79,22 @@ START_DELAY_SECONDS = 60.0
 # and may be taken over. Refreshed once per batch.
 LEASE_STALE_AFTER_MS = 10 * 60 * 1000
 
+
+class _SecondsInterval(float):
+    """Seconds value accepted by every audited Clock contract.
+
+    Synapse 1.124 Clock.call_later/sleep take plain seconds; 1.159 takes a
+    Duration and calls as_secs()/as_millis() on it. A float subclass with both
+    methods satisfies each without importing newer Duration helpers.
+    """
+
+    def as_secs(self) -> float:
+        return float(self)
+
+    def as_millis(self) -> int:
+        return int(float(self) * 1000)
+
+
 _RUN_AS_BG_SUPPORTS_SERVER_NAME = (
     "server_name" in inspect.signature(run_as_background_process).parameters
 )
@@ -169,7 +185,7 @@ class PublicCoursesL2Backfill:
     def schedule(self) -> None:
         """Arrange for exactly one run, shortly after startup."""
         self._clock.call_later(
-            START_DELAY_SECONDS,
+            cast(Any, _SecondsInterval(START_DELAY_SECONDS)),
             cast(Any, run_as_background_process),
             *_background_process_args(
                 self._hs,
@@ -473,7 +489,9 @@ class PublicCoursesL2Backfill:
 
                 if len(batch) < BATCH_SIZE:
                     break
-                await self._clock.sleep(PAUSE_BETWEEN_BATCHES_SECONDS)
+                await self._clock.sleep(
+                    cast(Any, _SecondsInterval(PAUSE_BETWEEN_BATCHES_SECONDS))
+                )
         finally:
             await self._release_lease(claimed_by)
 
