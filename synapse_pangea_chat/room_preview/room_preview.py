@@ -11,8 +11,8 @@ from synapse.api.errors import (
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
+from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
-from twisted.internet import defer
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.room_preview.get_room_preview import get_room_preview
@@ -35,7 +35,7 @@ class RoomPreview(Resource):
         self._datastores = self._api._hs.get_datastores()
 
     def render_GET(self, request: SynapseRequest):
-        defer.ensureDeferred(self._async_render_GET(request))
+        run_in_background(self._async_render_GET, request)
         return server.NOT_DONE_YET
 
     async def _async_render_GET(self, request: SynapseRequest):

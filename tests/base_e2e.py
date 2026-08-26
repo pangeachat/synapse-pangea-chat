@@ -131,6 +131,10 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         stderr_thread: Optional[threading.Thread] = None
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
+        # Exposed so tests can assert on server log output (e.g. the
+        # logcontext-leak regression test).
+        self.server_stdout_lines = stdout_lines
+        self.server_stderr_lines = stderr_lines
         try:
             postgres, db_url = await self._start_postgres()
 

@@ -13,9 +13,9 @@ from synapse.api.errors import (
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
+from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from synapse.types import RoomID
-from twisted.internet import defer
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
@@ -56,7 +56,7 @@ class GrantInstructorAnalyticsAccess(Resource):
         self._storage_controllers = self._api._hs.get_storage_controllers()
 
     def render_POST(self, request: SynapseRequest):
-        defer.ensureDeferred(self._async_render_POST(request))
+        run_in_background(self._async_render_POST, request)
         return server.NOT_DONE_YET
 
     async def _async_render_POST(self, request: SynapseRequest):

@@ -13,11 +13,11 @@ from synapse.api.errors import SynapseError
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
+from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from synapse.push.mailer import Mailer
 from synapse.util.stringutils import assert_valid_client_secret, random_string
 from synapse.util.threepids import check_3pid_allowed, validate_email
-from twisted.internet import defer
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_policy import is_valid_email_address
@@ -60,7 +60,7 @@ class RegisterEmailRequestToken(Resource):
             self._registration_mailer = None
 
     def render_POST(self, request: SynapseRequest):
-        defer.ensureDeferred(self._async_render_POST(request))
+        run_in_background(self._async_render_POST, request)
         return server.NOT_DONE_YET
 
     async def _async_render_POST(self, request: SynapseRequest):
