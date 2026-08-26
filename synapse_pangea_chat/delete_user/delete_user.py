@@ -14,10 +14,10 @@ from synapse.api.errors import (
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
+from synapse.logging.context import run_in_background
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import ModuleApi
 from synapse.types import create_requester
-from twisted.internet import defer
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.delete_room.extract_body_json import extract_body_json
@@ -92,7 +92,7 @@ class DeleteUser(Resource):
         )
 
     def render_POST(self, request: SynapseRequest):
-        defer.ensureDeferred(self._async_render_POST(request))
+        run_in_background(self._async_render_POST, request)
         return server.NOT_DONE_YET
 
     async def _async_render_POST(self, request: SynapseRequest):

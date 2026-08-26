@@ -17,8 +17,8 @@ from synapse.api.errors import (
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
+from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
-from twisted.internet import defer
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.room_code.burn_admin_code import burn_admin_code
@@ -54,7 +54,7 @@ class KnockWithCode(Resource):
         self._datastores = self._api._hs.get_datastores()
 
     def render_POST(self, request: SynapseRequest):
-        defer.ensureDeferred(self._async_render_POST(request))
+        run_in_background(self._async_render_POST, request)
         return server.NOT_DONE_YET
 
     async def _async_render_POST(self, request: SynapseRequest):
