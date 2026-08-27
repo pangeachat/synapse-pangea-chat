@@ -5,6 +5,7 @@ homeserver. Design: .github/instructions/blocked-join-gate.instructions.md
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from synapse.api.errors import Codes
@@ -13,6 +14,7 @@ from synapse.module_api import NOT_SPAM
 from synapse_pangea_chat.blocked_join_gate import (
     BlockedJoinGate,
     is_blocked_by_room_admin,
+    server_initiated_entry,
 )
 
 ROOM = "!room:example.com"
@@ -38,6 +40,7 @@ def _make_api(
     memberships: dict[str, str] | None = None,
     creator: str = ADMIN,
     has_power_levels: bool = True,
+    creator_power: bool = False,
 ) -> MagicMock:
     """Build a mock ModuleApi whose room state and ignore index are canned.
 
@@ -63,10 +66,14 @@ def _make_api(
                     {"users": power_users, "users_default": users_default},
                 )
             elif event_type == "m.room.create":
-                result[(event_type, state_key)] = _state_event(
-                    event_type, state_key, {"creator": creator}
+                create = _state_event(event_type, state_key, {"creator": creator})
+                create.sender = creator
+                # Explicit room_version: a bare MagicMock attribute would make
+                # the creator-power getattr truthy in every test.
+                create.room_version = SimpleNamespace(
+                    msc4289_creator_power_enabled=creator_power
                 )
-                result[(event_type, state_key)].sender = creator
+                result[(event_type, state_key)] = create
             elif event_type == "m.room.member" and state_key is None:
                 for user, membership in memberships.items():
                     result[(event_type, user)] = _state_event(
@@ -137,23 +144,46 @@ class TestIsBlockedByRoomAdmin(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
 
-    async def test_users_default_at_admin_level_makes_every_member_an_admin(
-        self,
-    ) -> None:
+    async def test_users_default_at_admin_level_fails_open(self) -> None:
+        # Every-member-is-admin is a hostile-shaped config; the gate allows
+        # rather than enumerate the room's membership.
         api = _make_api(
-            ignored_by={MEMBER},
-            power_users={ADMIN: 50},  # explicitly demoted below admin
-            users_default=100,
-            memberships={ADMIN: "join", MEMBER: "join"},
-        )
-        self.assertTrue(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
-        api = _make_api(
-            ignored_by={MEMBER},
+            ignored_by={ADMIN, MEMBER},
             power_users={},
             users_default=100,
             memberships={ADMIN: "join", MEMBER: "join"},
         )
         self.assertFalse(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
+
+    async def test_more_candidates_than_bound_fails_open(self) -> None:
+        crowd = {f"@fake{i}:example.com": 100 for i in range(30)}
+        api = _make_api(
+            ignored_by=set(crowd),
+            power_users=crowd,
+            memberships={u: "join" for u in crowd},
+        )
+        self.assertFalse(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
+
+    async def test_creator_power_room_counts_creator_as_admin(self) -> None:
+        # Room v12: creator holds power without a power-levels users entry.
+        # The listed admin blocks, the creator does not — request allowed.
+        api = _make_api(
+            ignored_by={OTHER_ADMIN},
+            power_users={OTHER_ADMIN: 100},
+            memberships={ADMIN: "join", OTHER_ADMIN: "join"},
+            creator=ADMIN,
+            creator_power=True,
+        )
+        self.assertFalse(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
+        # Creator blocks too — request refused.
+        api = _make_api(
+            ignored_by={ADMIN, OTHER_ADMIN},
+            power_users={OTHER_ADMIN: 100},
+            memberships={ADMIN: "join", OTHER_ADMIN: "join"},
+            creator=ADMIN,
+            creator_power=True,
+        )
+        self.assertTrue(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
 
     async def test_no_power_levels_event_falls_back_to_room_creator(self) -> None:
         api = _make_api(
@@ -267,6 +297,33 @@ class TestBlockedJoinGateCallbacks(unittest.IsolatedAsyncioTestCase):
         event.room_id = ROOM
         event.sender = ADMIN
         event.membership = "knock"
+        event.is_state.return_value = True
+        self.assertEqual(await gate.check_event_allowed(event, {}), (True, None))
+
+    async def test_server_initiated_join_is_exempt(self) -> None:
+        api = _make_api(
+            ignored_by={ADMIN}, power_users={ADMIN: 100}, memberships={ADMIN: "join"}
+        )
+        gate = self._gate(api)
+        with server_initiated_entry():
+            self.assertEqual(
+                await gate.user_may_join_room(REQUESTER, ROOM, is_invited=True),
+                NOT_SPAM,
+            )
+        # Outside the context the same join is refused again.
+        self.assertEqual(
+            await gate.user_may_join_room(REQUESTER, ROOM, is_invited=True),
+            Codes.FORBIDDEN,
+        )
+
+    async def test_member_event_without_membership_key_passes(self) -> None:
+        api = _make_api(
+            ignored_by={ADMIN}, power_users={ADMIN: 100}, memberships={ADMIN: "join"}
+        )
+        gate = self._gate(api)
+        event = _state_event("m.room.member", REQUESTER, {})
+        event.room_id = ROOM
+        event.sender = REQUESTER
         event.is_state.return_value = True
         self.assertEqual(await gate.check_event_allowed(event, {}), (True, None))
 

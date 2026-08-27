@@ -140,6 +140,14 @@ class TestBlockedJoinGateE2E(BaseSynapseE2ETest):
                     password=PASSWORD,
                     admin=False,
                 )
+            # Server admin for the assign_room_membership exemption scenario.
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="sysadmin",
+                password=PASSWORD,
+                admin=True,
+            )
             owner_id, owner_token = await self.login_user("owner", PASSWORD)
             coadmin_id, coadmin_token = await self.login_user("coadmin", PASSWORD)
             member_id, member_token = await self.login_user("member", PASSWORD)
@@ -220,6 +228,30 @@ class TestBlockedJoinGateE2E(BaseSynapseE2ETest):
             self.assertNotIn("banned", response.json())
             self.assertNotIn("rooms", response.json())
             self.assertIsNone(self.membership(code_room, requester_id, owner_token))
+
+            # --- Server-initiated entry is exempt while every admin blocks ---
+            sysadmin_id, sysadmin_token = await self.login_user("sysadmin", PASSWORD)
+            response = requests.post(
+                f"{self.server_url}/_synapse/client/pangea/v1/assign_room_membership",
+                json={
+                    "room_id": public_room,
+                    "user_ids": [requester_id],
+                    "force_join": True,
+                },
+                headers=self._headers(sysadmin_token),
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(
+                self.membership(public_room, requester_id, owner_token),
+                "join",
+                "orchestrated force-join must bypass the gate",
+            )
+            # Put the requester back outside for the un-block scenario below.
+            requests.post(
+                f"{self.server_url}/_matrix/client/v3/rooms/{public_room}/leave",
+                json={},
+                headers=self._headers(requester_token),
+            )
 
             # --- One admin un-blocks: every path opens again ---
             await self.set_ignore_list(coadmin_token, coadmin_id, [])

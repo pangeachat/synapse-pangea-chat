@@ -15,3 +15,7 @@ EVENT_TYPE_M_ROOM_CREATE = "m.room.create"
 # The client treats power level >= 100 as "admin" — the people who can accept
 # or deny knocks. Only their block lists gate entry.
 ADMIN_POWER_LEVEL = 100
+
+# A room naming more admin candidates than this is hostile-shaped, not a real
+# course; the gate fails open rather than scan an attacker-sized admin list.
+MAX_ADMIN_CANDIDATES = 25

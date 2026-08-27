@@ -23,8 +23,8 @@ Doing the refusal in the admin's client would only work while an admin is online
 | Term | Meaning |
 |---|---|
 | Blocked | The requester appears in the admin's `m.ignored_user_list` (the client's block list). |
-| Admin | A currently joined room member whose power level is at least 100 — the same notion the client uses to decide who may accept or deny knocks. Lower-powered members' block lists have no effect, and neither do those of admins who have left. |
-| Membership request | The requester asking to enter: a Matrix knock, a direct join (public or restricted rooms), a join in response to an invite, or the code-based entry below. |
+| Admin | A currently joined room member whose power level is at least 100 — the same notion the client uses to decide who may accept or deny knocks. Lower-powered members' block lists have no effect, and neither do those of admins who have left. In room versions where the creator holds power without a power-levels entry, the creator counts as an admin. |
+| Membership request | The requester asking to enter: a Matrix knock, a direct join (public or restricted rooms), a join in response to an invite, or the code-based entry below. A join performed by our own server-side orchestration (activity role assignment, instructor analytics access) is not a membership request and is not gated — those flows act on the room's behalf, and refusing them mid-sequence would strand the user with an invite they can never accept. |
 
 The predicate is one shared function, `is_blocked_by_room_admin(user_id, room_id)`, so every entry path gives the same answer.
 
@@ -47,6 +47,7 @@ The refusal is a generic forbidden error with no reason and no distinct error co
 - **Refuse, don't auto-deny.** The alternative — let the knock land, then have the module deny it as an admin — creates extra membership events, needs an admin identity to act as, and can race a real admin's decision. Vetoing at the hook is one code path with nothing for admins to see.
 - **"Who blocks this user" comes from Synapse's own ignore index** (`ignored_by`), then compared against the room's joined admins. One cached lookup per request rather than reading each admin's account data, and when nobody blocks the requester no room state is read at all. This reaches past the public module API; it is the same trade the room-code endpoint already makes for its state queries and is called out in code.
 - **Configurable off switch.** A single boolean in the module config, default on, so the gate can be disabled from Ansible without a code deploy.
+- **Fail open on hostile-shaped rooms.** A room whose power levels name more than a small bound of admin candidates (or make every member an admin) is not a real course; the gate allows rather than paying an unbounded membership scan an attacker could shape. The gate is a courtesy, so failing open is always the safe direction.
 
 ## Key Files
 

@@ -13,6 +13,7 @@ from synapse_pangea_chat.blocked_join_gate.constants import (
     EVENT_TYPE_M_ROOM_CREATE,
     EVENT_TYPE_M_ROOM_MEMBER,
     EVENT_TYPE_M_ROOM_POWER_LEVELS,
+    MAX_ADMIN_CANDIDATES,
     MEMBERSHIP_CONTENT_KEY,
     MEMBERSHIP_JOIN,
     USERS_DEFAULT_POWER_LEVEL_KEY,
@@ -64,50 +65,57 @@ async def _joined_admins(api: ModuleApi, room_id: str) -> Set[str]:
         ],
     )
     power_levels = state.get((EVENT_TYPE_M_ROOM_POWER_LEVELS, ""))
+    create = state.get((EVENT_TYPE_M_ROOM_CREATE, ""))
     if power_levels is None:
         # Per the auth rules a room with no power-levels event gives its
         # creator power level 100 and everyone else 0.
-        create = state.get((EVENT_TYPE_M_ROOM_CREATE, ""))
         candidates: Set[str] = {create.sender} if create is not None else set()
     else:
         content = power_levels.content
         users = content.get(USERS_POWER_LEVEL_KEY) or {}
         users_default = _as_int(content.get(USERS_DEFAULT_POWER_LEVEL_KEY), 0)
         if users_default >= ADMIN_POWER_LEVEL:
-            # Everyone not explicitly demoted is an admin: enumerate members.
-            demoted = {
-                user
-                for user, level in users.items()
-                if _as_int(level, 0) < ADMIN_POWER_LEVEL
-            }
-            return {
-                user
-                for user in await _joined_members(api, room_id)
-                if user not in demoted
-            }
+            # Every member is an admin — a hostile-shaped config, not a real
+            # course. Fail open rather than enumerate the whole membership.
+            logger.warning(
+                "blocked_join_gate: %s has users_default >= %d; allowing",
+                room_id,
+                ADMIN_POWER_LEVEL,
+            )
+            return set()
         candidates = {
             user
             for user, level in users.items()
             if _as_int(level, 0) >= ADMIN_POWER_LEVEL
         }
 
+    # In room versions with creator power (MSC4289, room v12+) the creator
+    # holds admin power without a power-levels entry; missing them here would
+    # let the listed admins alone refuse against the design's all-admins rule.
+    if create is not None and getattr(
+        create.room_version, "msc4289_creator_power_enabled", False
+    ):
+        candidates.add(create.sender)
+        additional = create.content.get("additional_creators")
+        if isinstance(additional, list):
+            candidates.update(u for u in additional if isinstance(u, str))
+
+    if len(candidates) > MAX_ADMIN_CANDIDATES:
+        # An attacker can stuff arbitrarily many admin entries into a room
+        # they control; a real course has a handful. Fail open past the bound.
+        logger.warning(
+            "blocked_join_gate: %s names %d admin candidates (bound %d); allowing",
+            room_id,
+            len(candidates),
+            MAX_ADMIN_CANDIDATES,
+        )
+        return set()
+
     joined: Set[str] = set()
     for user in candidates:
         if await _is_joined(api, room_id, user):
             joined.add(user)
     return joined
-
-
-async def _joined_members(api: ModuleApi, room_id: str) -> Set[str]:
-    state = await api.get_room_state(
-        room_id=room_id, event_filter=[(EVENT_TYPE_M_ROOM_MEMBER, None)]
-    )
-    return {
-        event.state_key
-        for event in state.values()
-        if event.type == EVENT_TYPE_M_ROOM_MEMBER
-        and event.content.get(MEMBERSHIP_CONTENT_KEY) == MEMBERSHIP_JOIN
-    }
 
 
 async def _is_joined(api: ModuleApi, room_id: str, user_id: str) -> bool:
