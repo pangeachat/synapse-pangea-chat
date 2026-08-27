@@ -2,6 +2,7 @@ import asyncio
 import logging
 import subprocess
 import sys
+import uuid
 from typing import Any, List, Tuple, Union, cast
 
 import requests
@@ -66,17 +67,32 @@ class TestE2E(BaseSynapseE2ETest):
         access_token: str,
         *,
         required_user_ids: List[str],
-        # The user-directory updater is asynchronous; on a loaded CI runner 20s
-        # was observed to be insufficient (run 33079600680), so bound at 90s.
         retries: int = 180,
         delay_seconds: float = 0.5,
+        nudge_room_id: Union[str, None] = None,
     ) -> List[str]:
+        """Poll until all required users appear in the search results.
+
+        Synapse's user-directory updater only runs when a new event fires the
+        notifier; a transiently failed run leaves the shared-rooms tables stale
+        until the next event, and polling alone never creates one (observed as
+        90s of empty results in CI, runs 33079600680 / 33094403617). When
+        nudge_room_id is set, send a message into that room between polls to
+        re-kick the updater.
+        """
         last_results: List[str] = []
         required = set(required_user_ids)
         for _ in range(retries):
             last_results = await self.search_users(search_term, access_token)
             if required.issubset(set(last_results)):
                 return last_results
+            if nudge_room_id is not None:
+                requests.put(
+                    f"http://localhost:8008/_matrix/client/v3/rooms/{nudge_room_id}"
+                    f"/send/m.room.message/{uuid.uuid4().hex}",
+                    json={"msgtype": "m.text", "body": "nudge directory updater"},
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
             await asyncio.sleep(delay_seconds)
 
         return last_results
@@ -264,6 +280,7 @@ class TestE2E(BaseSynapseE2ETest):
                 user_b_localpart,
                 tokenA,
                 required_user_ids=[userB],
+                nudge_room_id=room_id,
             )
             self.assertIn(userB, users)
 
