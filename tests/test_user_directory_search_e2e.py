@@ -6,7 +6,8 @@ instance with the ``PangeaChat`` module loaded.
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Tuple
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
@@ -92,15 +93,32 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
         access_token: str,
         *,
         required_user_ids: List[str],
-        retries: int = 20,
+        retries: int = 180,
         delay_seconds: float = 0.5,
+        nudge_room_id: Optional[str] = None,
     ) -> List[str]:
+        """Poll until all required users appear in the search results.
+
+        Synapse's user-directory updater only runs when a new event fires the
+        notifier; a transiently failed run leaves the shared-rooms tables stale
+        until the next event, and polling alone never creates one (observed as
+        90s of empty results in the sibling spam-checker test, CI runs
+        33079600680 / 33094403617). When nudge_room_id is set, send a message
+        into that room between polls to re-kick the updater.
+        """
         last_results: List[str] = []
         required = set(required_user_ids)
         for _ in range(retries):
             last_results = self._search_user_ids(search_term, access_token)
             if required.issubset(set(last_results)):
                 return last_results
+            if nudge_room_id is not None:
+                requests.put(
+                    f"http://localhost:8008/_matrix/client/v3/rooms/{nudge_room_id}"
+                    f"/send/m.room.message/{uuid.uuid4().hex}",
+                    json={"msgtype": "m.text", "body": "nudge directory updater"},
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
             await asyncio.sleep(delay_seconds)
 
         return last_results
@@ -248,7 +266,12 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
             )
 
             # Now B should appear for A
-            results_after = self._search_user_ids("sharedB", token_a)
+            results_after = await self._search_user_ids_with_retry(
+                "sharedB",
+                token_a,
+                required_user_ids=[user_b],
+                nudge_room_id=room_id,
+            )
             self.assertIn(user_b, results_after)
 
         finally:
