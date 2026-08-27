@@ -92,7 +92,10 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
         access_token: str,
         *,
         required_user_ids: List[str],
-        retries: int = 20,
+        # The user-directory updater is asynchronous; on a loaded CI runner 20s
+        # was observed to be insufficient for the sibling spam-checker test
+        # (run 33079600680), so bound at 90s.
+        retries: int = 180,
         delay_seconds: float = 0.5,
     ) -> List[str]:
         last_results: List[str] = []

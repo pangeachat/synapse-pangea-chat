@@ -66,7 +66,9 @@ class TestE2E(BaseSynapseE2ETest):
         access_token: str,
         *,
         required_user_ids: List[str],
-        retries: int = 40,
+        # The user-directory updater is asynchronous; on a loaded CI runner 20s
+        # was observed to be insufficient (run 33079600680), so bound at 90s.
+        retries: int = 180,
         delay_seconds: float = 0.5,
     ) -> List[str]:
         last_results: List[str] = []
@@ -318,12 +320,16 @@ class TestE2E(BaseSynapseE2ETest):
             await self.set_public_attribute_of_user(searcher, True, tokenS)
 
             # Search for all users using searcher's token.
-            users = await self.search_users("publicUser", tokenS)
+            users = await self.search_users_with_retry(
+                "publicUser", tokenS, required_user_ids=[publicUser]
+            )
 
             # Expect both the explicitly public and the missing attribute user to appear.
             self.assertIn(publicUser, users)
 
-            users = await self.search_users("filterUser", tokenS)
+            users = await self.search_users_with_retry(
+                "filterUser", tokenS, required_user_ids=[filterUser]
+            )
             self.assertIn(filterUser, users)
 
         finally:
