@@ -15,7 +15,7 @@ from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
-from synapse.types import RoomID
+from synapse.types import RoomID, UserID
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
@@ -29,10 +29,15 @@ logger = logging.getLogger(
 
 MEMBERSHIP_INVITE = "invite"
 MEMBERSHIP_JOIN = "join"
+MEMBERSHIP_KNOCK = "knock"
 
 COURSE_SETTINGS_STATE_EVENT_TYPE = "pangea.course_settings"
 REQUIRE_ANALYTICS_ACCESS_KEY = "require_analytics_access"
 ANALYTICS_ROOM_TYPE = "p.analytics"
+# Marks the invite half of a force-join as analytics plumbing. Clients set a
+# push rule that silences member events carrying it, so an instructor is not
+# notified about an invite that is joined a moment later anyway.
+ANALYTICS_INVITE_REASON = "p.analytics_request"
 
 
 def _is_probable_bot_user_id(user_id: str) -> bool:
@@ -102,6 +107,19 @@ class GrantInstructorAnalyticsAccess(Resource):
                 )
                 return
 
+            mx_instructor_id = body.get("mx_instructor_id")
+            if mx_instructor_id is not None and (
+                not isinstance(mx_instructor_id, str)
+                or not self._is_valid_user_id(mx_instructor_id)
+            ):
+                respond_with_json(
+                    request,
+                    400,
+                    {"error": "'mx_instructor_id' must be a valid Matrix user ID"},
+                    send_cors=True,
+                )
+                return
+
             (
                 caller_membership,
                 _,
@@ -113,23 +131,6 @@ class GrantInstructorAnalyticsAccess(Resource):
                     request,
                     403,
                     {"error": "Caller is not a joined member of mx_course_id"},
-                    send_cors=True,
-                )
-                return
-
-            settings_event = (
-                await self._storage_controllers.state.get_current_state_event(
-                    mx_course_id, COURSE_SETTINGS_STATE_EVENT_TYPE, ""
-                )
-            )
-            if (
-                settings_event is None
-                or settings_event.content.get(REQUIRE_ANALYTICS_ACCESS_KEY) is not True
-            ):
-                respond_with_json(
-                    request,
-                    403,
-                    {"error": "Course does not require analytics access"},
                     send_cors=True,
                 )
                 return
@@ -166,9 +167,48 @@ class GrantInstructorAnalyticsAccess(Resource):
                 )
                 return
 
+            if mx_instructor_id is not None:
+                # Consent gate: the student is answering an instructor's standing
+                # request, and that request IS a knock on this analytics room, so
+                # the knock is the consent record the grant rides on. The
+                # course-level toggle is beside the point here.
+                if not await self._has_knocked(mx_analytics_room_id, mx_instructor_id):
+                    respond_with_json(
+                        request,
+                        403,
+                        {"error": "Instructor has not requested analytics access"},
+                        send_cors=True,
+                    )
+                    return
+            else:
+                settings_event = (
+                    await self._storage_controllers.state.get_current_state_event(
+                        mx_course_id, COURSE_SETTINGS_STATE_EVENT_TYPE, ""
+                    )
+                )
+                if (
+                    settings_event is None
+                    or settings_event.content.get(REQUIRE_ANALYTICS_ACCESS_KEY)
+                    is not True
+                ):
+                    respond_with_json(
+                        request,
+                        403,
+                        {"error": "Course does not require analytics access"},
+                        send_cors=True,
+                    )
+                    return
+
+            # Both gates grant the same course-wide instructor cohort: a course
+            # usually has more than one teacher, only one of them has to ask, and
+            # leaving the others un-joined just reproduces the stuck-pending bug
+            # one teacher over. The instructor who asked is added on top, since
+            # they may sit below the cohort's power level.
             instructor_ids = await self._get_course_instructor_ids(
                 mx_course_id=mx_course_id, caller_id=requester_id
             )
+            if mx_instructor_id is not None and mx_instructor_id not in instructor_ids:
+                instructor_ids = sorted([*instructor_ids, mx_instructor_id])
 
             instructors_joined: list[dict[str, Any]] = []
             errors: list[dict[str, str]] = []
@@ -232,6 +272,22 @@ class GrantInstructorAnalyticsAccess(Resource):
         except Exception:
             return False
         return True
+
+    def _is_valid_user_id(self, user_id: str) -> bool:
+        try:
+            UserID.from_string(user_id)
+        except Exception:
+            return False
+        return True
+
+    async def _has_knocked(self, room_id: str, user_id: str) -> bool:
+        member_event = await self._storage_controllers.state.get_current_state_event(
+            room_id, EventTypes.Member, user_id
+        )
+        return (
+            member_event is not None
+            and member_event.content.get("membership") == MEMBERSHIP_KNOCK
+        )
 
     async def _get_course_instructor_ids(
         self, mx_course_id: str, caller_id: str
@@ -330,6 +386,7 @@ class GrantInstructorAnalyticsAccess(Resource):
                 target=instructor_id,
                 room_id=mx_analytics_room_id,
                 new_membership=MEMBERSHIP_INVITE,
+                content={"reason": ANALYTICS_INVITE_REASON},
             )
 
         await self._api.update_room_membership(

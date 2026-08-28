@@ -75,10 +75,39 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
                     "type": "p.analytics",
                     "lang_code": "es",
                 },
+                # Analytics rooms are knock-joinable in production: that is how a
+                # teacher asks a student for access.
+                "initial_state": [
+                    {
+                        "type": "m.room.join_rules",
+                        "state_key": "",
+                        "content": {"join_rule": "knock"},
+                    }
+                ],
             },
         )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["room_id"]
+
+    async def _knock_room(self, room_id: str, access_token: str, reason: str) -> None:
+        room_id_path = quote(room_id, safe="")
+        response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/knock/{room_id_path}",
+            headers=self._headers(access_token),
+            json={"reason": reason},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    async def _membership(
+        self, room_id: str, user_id: str, access_token: str
+    ) -> str | None:
+        response = requests.get(
+            self._member_state_url(room_id, user_id),
+            headers=self._headers(access_token),
+        )
+        if response.status_code != 200:
+            return None
+        return response.json().get("membership")
 
     async def _join_room(self, room_id: str, access_token: str) -> None:
         response = requests.post(
@@ -212,6 +241,178 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
                 [{"user_id": teacher_user_id, "action": "already_joined"}],
             )
             self.assertEqual(second.json()["errors"], [])
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_consent_grants_the_whole_instructor_cohort(self):
+        (
+            postgres,
+            synapse_dir,
+            config_path,
+            server_process,
+            stdout_thread,
+            stderr_thread,
+        ) = await self.start_test_synapse()
+
+        try:
+            await self.register_user(config_path, synapse_dir, "teacher", "pw", False)
+            await self.register_user(config_path, synapse_dir, "ta", "pw", False)
+            await self.register_user(config_path, synapse_dir, "classmate", "pw", False)
+            await self.register_user(config_path, synapse_dir, "student", "pw", False)
+            teacher_user_id, teacher_token = await self.login_user("teacher", "pw")
+            ta_user_id, ta_token = await self.login_user("ta", "pw")
+            classmate_user_id, classmate_token = await self.login_user(
+                "classmate", "pw"
+            )
+            _, student_token = await self.login_user("student", "pw")
+
+            # Optional-analytics course: the module's own toggle gate is OFF.
+            course_id = await self._create_course_space(
+                teacher_token, require_analytics_access=False
+            )
+            await self._join_room(course_id, ta_token)
+            await self._set_user_power_level(course_id, ta_user_id, 50, teacher_token)
+            await self._join_room(course_id, classmate_token)
+            await self._join_room(course_id, student_token)
+            analytics_room_id = await self._create_analytics_room(student_token)
+
+            # The TA asks — a real course role, but below the teacher's power
+            # level, so the cohort computation on its own would leave them out.
+            await self._knock_room(analytics_room_id, ta_token, course_id)
+
+            response = requests.post(
+                self._endpoint(),
+                headers=self._headers(student_token),
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                    "mx_instructor_id": ta_user_id,
+                },
+            )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["errors"], [])
+            self.assertEqual(
+                sorted(
+                    entry["user_id"] for entry in response.json()["instructors_joined"]
+                ),
+                sorted([teacher_user_id, ta_user_id]),
+            )
+
+            # The one who asked gets in even though the cohort excludes them.
+            self.assertEqual(
+                await self._membership(analytics_room_id, ta_user_id, student_token),
+                "join",
+            )
+            # The rest of the teaching staff comes with them: only one teacher
+            # has to ask, or the co-teachers stay stuck pending on the dashboard.
+            self.assertEqual(
+                await self._membership(
+                    analytics_room_id, teacher_user_id, student_token
+                ),
+                "join",
+            )
+            # A fellow learner is not staff and is never swept in.
+            self.assertIsNone(
+                await self._membership(
+                    analytics_room_id, classmate_user_id, student_token
+                ),
+            )
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_403_when_named_instructor_has_not_knocked(self):
+        (
+            postgres,
+            synapse_dir,
+            config_path,
+            server_process,
+            stdout_thread,
+            stderr_thread,
+        ) = await self.start_test_synapse()
+
+        try:
+            await self.register_user(config_path, synapse_dir, "teacher", "pw", False)
+            await self.register_user(config_path, synapse_dir, "student", "pw", False)
+            teacher_user_id, teacher_token = await self.login_user("teacher", "pw")
+            _, student_token = await self.login_user("student", "pw")
+
+            course_id = await self._create_course_space(
+                teacher_token, require_analytics_access=False
+            )
+            await self._join_room(course_id, student_token)
+            analytics_room_id = await self._create_analytics_room(student_token)
+
+            response = requests.post(
+                self._endpoint(),
+                headers=self._headers(student_token),
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                    "mx_instructor_id": teacher_user_id,
+                },
+            )
+
+            self.assertEqual(response.status_code, 403, response.text)
+            self.assertIsNone(
+                await self._membership(
+                    analytics_room_id, teacher_user_id, student_token
+                ),
+            )
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_400_for_invalid_instructor_id(self):
+        (
+            postgres,
+            synapse_dir,
+            config_path,
+            server_process,
+            stdout_thread,
+            stderr_thread,
+        ) = await self.start_test_synapse()
+
+        try:
+            await self.register_user(config_path, synapse_dir, "teacher", "pw", False)
+            await self.register_user(config_path, synapse_dir, "student", "pw", False)
+            _, teacher_token = await self.login_user("teacher", "pw")
+            _, student_token = await self.login_user("student", "pw")
+
+            course_id = await self._create_course_space(
+                teacher_token, require_analytics_access=False
+            )
+            await self._join_room(course_id, student_token)
+            analytics_room_id = await self._create_analytics_room(student_token)
+
+            response = requests.post(
+                self._endpoint(),
+                headers=self._headers(student_token),
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                    "mx_instructor_id": "not-a-user-id",
+                },
+            )
+
+            self.assertEqual(response.status_code, 400, response.text)
         finally:
             self.stop_synapse(
                 server_process=server_process,
