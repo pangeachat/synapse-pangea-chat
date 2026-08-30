@@ -15,9 +15,15 @@ Runs in the send path and can reject a message before it appears, so everything 
 
 - **Phone numbers** — the `phonenumbers` library (libphonenumber port), matching valid numbers only. Bare national formats match for the configured regions; international `+CC` formats match regardless. A bare year or house count does not trip it.
 - **Street addresses** — an in-repo pattern requiring house number, name words, and a street-suffix word. English-centric by design; no city/zip-only matching.
-- **Profanity** — the `better-profanity` wordlist. Also English-centric.
+- **Profanity** — a curated per-language wordlist covering the languages our learners use, matched through an evasion-resistant normalizer (case, diacritics, leetspeak and homoglyph folding, invisible characters, elongation, and letters spaced apart all reduce to the same needle). An English-only wordlist was the first implementation and was blind in 23 of our 24 full-support languages.
 
-The English bias is accepted: Tier 1 exists chiefly to stop minors sharing contact details and to catch drive-by profanity instantly; the multilingual backstop is Tier 2. A failure inside Tier 1 allows the message (fail open, logged) — a moderation bug must never block all sends.
+The address pattern stays English-centric, with Tier 2 as its backstop. A failure inside Tier 1 allows the message (fail open, logged) — a moderation bug must never block all sends.
+
+### What Tier 1 deliberately does not block
+
+Because Tier 1 blocks before a message is sent, a false positive silences an innocent learner, which is worse than a miss that Tier 2 can still catch. Terms whose ordinary meaning is common therefore stay out of the blocking wordlist and are left to Tier 2's contextual judgement — animal words used as insults (Malay *babi*, Danish *svin*), body or object words (Polish *pedał*, a bicycle pedal), place and people names (the country Niger, Italian *Troia*), scientific vocabulary (*Homo* sapiens), and medical terms (Dutch *kanker*). The reason for each exclusion is recorded alongside the test corpus, which is also where a benign word wrongly caught by a needle is allowlisted.
+
+One collision cannot be resolved by exclusion: stripping diacritics merges Slovak *pica* (a typography unit) with Czech and Slovak *píča* (a common slur). We block it, accepting the rare false positive on the typography term. Revisit if a real learner report shows the benign use.
 
 ## Tier 2 — LLM moderation (redacts after)
 

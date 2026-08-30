@@ -6,9 +6,9 @@ right outcome is to never let it appear, even briefly: contact details a
 minor might share (phone numbers, street addresses) and wordlist profanity.
 
 Package choices and their limits are recorded in
-.github/instructions/moderation.instructions.md — notably the address regex
-and profanity wordlist are English-centric by design; Tier 2 (LLM, redact
-after) is the multilingual backstop.
+.github/instructions/moderation.instructions.md. Profanity is matched across
+all our learner languages (see `profanity.py`); the address pattern remains
+English-centric, with Tier 2 as its backstop.
 """
 
 import logging
@@ -16,7 +16,10 @@ import re
 from typing import Iterable, Optional
 
 import phonenumbers
-from better_profanity import Profanity
+
+from synapse_pangea_chat.moderation.profanity import (
+    contains_profanity as _contains_profanity_multilingual,
+)
 
 logger = logging.getLogger(
     "synapse.modules.synapse_pangea_chat.moderation.tier1_prefilter"
@@ -39,9 +42,6 @@ _ADDRESS_RE = re.compile(
     r"\b\d{1,5}\s+(?:[A-Za-z][a-z'.-]*\s+){1,4}(?:" + _STREET_SUFFIXES + r")\.?\b",
     re.IGNORECASE,
 )
-
-# Module-level singleton: loading the wordlist is file I/O; do it once.
-_profanity = Profanity()
 
 
 def contains_phone_number(text: str, regions: Iterable[str]) -> bool:
@@ -67,7 +67,7 @@ def contains_street_address(text: str) -> bool:
 
 
 def contains_profanity(text: str) -> bool:
-    return _profanity.contains_profanity(text)
+    return _contains_profanity_multilingual(text)
 
 
 def check_text(text: str, phone_regions: Iterable[str]) -> Optional[str]:

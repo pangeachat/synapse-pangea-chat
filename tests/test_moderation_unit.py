@@ -116,10 +116,30 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(event_type="m.room.topic", content={"topic": "415-555-2671"})
         self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
 
-    async def test_image_message_skipped(self) -> None:
+    async def test_image_caption_is_moderated(self) -> None:
+        """A caption is text the reader sees, so it is checked like any
+        message (red-team finding: captions bypassed both tiers)."""
         mod = _moderation(_config())
-        event = FakeEvent(content={"msgtype": "m.image", "body": "415-555-2671.jpg"})
+        event = FakeEvent(content={"msgtype": "m.image", "body": "call 415-555-2671"})
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_benign_image_filename_passes(self) -> None:
+        mod = _moderation(_config())
+        event = FakeEvent(content={"msgtype": "m.image", "body": "beach-photo.jpg"})
         self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
+
+    async def test_formatted_body_is_moderated(self) -> None:
+        """The HTML twin can carry the payload while `body` looks innocuous."""
+        mod = _moderation(_config())
+        event = FakeEvent(
+            content={
+                "msgtype": "m.text",
+                "body": "ok",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "<b>call 415-555-2671</b>",
+            }
+        )
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
 
     async def test_edit_moderates_replacement_text(self) -> None:
         mod = _moderation(_config())

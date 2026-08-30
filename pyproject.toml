@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 
 classifiers = ["License :: OSI Approved :: Apache Software License"]
 
-dependencies = ["attrs", "phonenumbers", "better-profanity"]
+dependencies = ["attrs", "phonenumbers"]
 
 [project.optional-dependencies]
 dev = [
