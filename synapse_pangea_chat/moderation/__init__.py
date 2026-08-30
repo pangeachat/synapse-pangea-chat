@@ -41,6 +41,13 @@ from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TY
 logger = logging.getLogger("synapse.modules.synapse_pangea_chat.moderation")
 
 _TEXTUAL_MSGTYPES = ("m.text", "m.emote", "m.notice")
+# Media messages carry a caption (or filename) in `body`, which readers see
+# exactly like message text — so it is moderated too. Without this, any
+# abusive text sent as an image caption bypassed both tiers entirely.
+_CAPTION_MSGTYPES = ("m.image", "m.video", "m.file", "m.audio")
+# Tags are stripped from `formatted_body`; a message whose plain `body` is
+# innocuous can carry the real payload in its HTML twin.
+_HTML_TAGS = re.compile(r"<[^>]+>")
 
 
 class ChatModeration:
@@ -79,12 +86,17 @@ class ChatModeration:
         new_content = content.get("m.new_content")
         if isinstance(new_content, dict):
             content = new_content
-        if content.get("msgtype") not in _TEXTUAL_MSGTYPES:
+        if content.get("msgtype") not in _TEXTUAL_MSGTYPES + _CAPTION_MSGTYPES:
             return None
+        parts = []
         body = content.get("body")
-        if not isinstance(body, str) or not body.strip():
-            return None
-        return body
+        if isinstance(body, str) and body.strip():
+            parts.append(body)
+        formatted = content.get("formatted_body")
+        if isinstance(formatted, str) and formatted.strip():
+            parts.append(_HTML_TAGS.sub(" ", formatted))
+        text = "\n".join(parts).strip()
+        return text or None
 
     def _is_exempt_sender(self, sender: str) -> bool:
         return any(p.match(sender) for p in self._exempt_patterns)
