@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from synapse.api.constants import EventTypes
 from synapse.module_api import ModuleApi
@@ -45,14 +46,7 @@ async def is_analytics_room(api: ModuleApi, room_id: str) -> bool:
     )
 
 
-async def ensure_analytics_invite_push_rule(api: ModuleApi, user_id: str) -> None:
-    """Give `user_id` the push rule that silences analytics invites.
-
-    Idempotent. Installing it server-side is what makes the suppression hold for
-    an account that has never run a client version that writes the rule itself.
-    """
-    store = api._hs.get_datastores().main
-
+async def _has_analytics_invite_push_rule(store: Any, user_id: str) -> bool:
     existing = await store.db_pool.simple_select_one_onecol(
         table="push_rules",
         keyvalues={"user_name": user_id, "rule_id": _NAMESPACED_PUSH_RULE_ID},
@@ -60,15 +54,39 @@ async def ensure_analytics_invite_push_rule(api: ModuleApi, user_id: str) -> Non
         allow_none=True,
         desc="analytics_invite_push_rule_exists",
     )
-    if existing is not None:
+    return existing is not None
+
+
+async def ensure_analytics_invite_push_rule(api: ModuleApi, user_id: str) -> None:
+    """Give `user_id` the push rule that silences analytics invites.
+
+    Idempotent, including against a concurrent install. Doing this server-side is
+    what makes the suppression hold for an account that has never run a client
+    version that writes the rule itself.
+    """
+    store = api._hs.get_datastores().main
+
+    if await _has_analytics_invite_push_rule(store, user_id):
         return
 
-    await store.add_push_rule(
-        user_id=user_id,
-        rule_id=_NAMESPACED_PUSH_RULE_ID,
-        priority_class=_OVERRIDE_PRIORITY_CLASS,
-        conditions=_PUSH_RULE_CONDITIONS,
-        actions=_PUSH_RULE_ACTIONS,
-    )
+    try:
+        await store.add_push_rule(
+            user_id=user_id,
+            rule_id=_NAMESPACED_PUSH_RULE_ID,
+            priority_class=_OVERRIDE_PRIORITY_CLASS,
+            conditions=_PUSH_RULE_CONDITIONS,
+            actions=_PUSH_RULE_ACTIONS,
+        )
+    except Exception:
+        # A whole class joining at once grants the same instructor many times
+        # over, concurrently. `push_rules` is unique on (user_name, rule_id), and
+        # the row lock Synapse takes while inserting cannot cover an account that
+        # has no rows yet — which is precisely the never-ran-the-client account
+        # this install exists for. Losing that race means the rule is there,
+        # which is the outcome we wanted; anything else is a real failure.
+        if not await _has_analytics_invite_push_rule(store, user_id):
+            raise
+        return
+
     api._hs.get_push_rules_handler().notify_user(user_id)
     logger.info("Installed analytics invite push rule for %s", user_id)

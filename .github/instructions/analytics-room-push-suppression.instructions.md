@@ -30,7 +30,9 @@ The client still installs the same rule under the same id, which is harmless —
 
 Both invite paths into an analytics room, because both are how an instructor gets access: the grant endpoint ([grant-instructor-analytics-access](grant-instructor-analytics-access.instructions.md)) and the admin force-join ([assign-room-membership](assign-room-membership.instructions.md)), which the bot's retroactive-grant operator script uses.
 
-A failed rule install is not swallowed. It surfaces the same way any other per-user failure in those endpoints does, so a silently unprotected instructor is not a possible outcome.
+Installing the rule is a prerequisite of the invite, not a step beside it, so a failure there stops the grant rather than letting an unprotected invite through. The one failure that is *not* treated as a failure is losing a race to a concurrent install: the rule then exists, which is the outcome that was wanted.
+
+The cost of that ordering is that a genuinely failed install costs the student their grant. Those failures are reported per instructor in the endpoint's `errors`, and **a caller that ignores `errors` turns them into silent data loss** — a student whose instructor never joined, with a `200` on the wire. Anything calling these endpoints is expected to read `errors`, not just the status code.
 
 ## Rejected: a module-wide invite guard
 
