@@ -30,6 +30,7 @@ Lives in the `assign_room_membership/` sub-package.
 - `force_join: true`
   - ensure each target user is joined.
   - if the room's join rules require it, the endpoint may invite first and then complete the join.
+  - if the room is an analytics room, apply [analytics room push suppression](analytics-room-push-suppression.instructions.md) before inviting. The bot's retroactive-grant script reaches analytics rooms through this path, so it needs the same guarantee the grant endpoint gives.
 - Partial success is part of the contract. One user's failure must not prevent attempts for the remaining users.
 
 ## Per-User Results

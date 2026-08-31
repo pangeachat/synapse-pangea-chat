@@ -18,6 +18,11 @@ from synapse.module_api import ModuleApi
 from synapse.types import RoomID
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.analytics_push_suppression import (
+    ANALYTICS_INVITE_REASON,
+    ensure_analytics_invite_push_rule,
+    is_analytics_room,
+)
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 
 if TYPE_CHECKING:
@@ -257,11 +262,19 @@ class AssignRoomMembership(Resource):
         if inviter_user_id is None:
             raise RuntimeError("No local joined inviter with sufficient power")
 
+        # An analytics room must never notify, and the bot's retroactive-grant
+        # script reaches analytics rooms through this endpoint.
+        content: dict[str, Any] | None = None
+        if await is_analytics_room(self._api, room_id):
+            await ensure_analytics_invite_push_rule(self._api, user_id)
+            content = {"reason": ANALYTICS_INVITE_REASON}
+
         await self._api.update_room_membership(
             sender=inviter_user_id,
             target=user_id,
             room_id=room_id,
             new_membership=MEMBERSHIP_INVITE,
+            content=content,
         )
 
     async def _join_user_as_admin(
