@@ -21,6 +21,15 @@ MEMBERSHIP_BAN = "ban"  # existing membership value
 # generic "code doesn't exist" failure (issue #127 / client#6820).
 ERRCODE_BANNED_FROM_ROOM = "ORG.PANGEA.BANNED_FROM_ROOM"
 
+# Pangea-custom errcode: a well-formed code matched no room. Paired with a
+# 404 so clients can tell "the code doesn't exist" from a malformed request
+# (issue #197 / client#8693).
+ERRCODE_CODE_NOT_FOUND = "ORG.PANGEA.CODE_NOT_FOUND"
+
+# Pangea-custom errcode: the code matched room(s) but every server-side
+# invite failed — nothing was joined, nothing was invited (issue #197).
+ERRCODE_INVITE_FAILED = "ORG.PANGEA.INVITE_FAILED"
+
 # https://spec.matrix.org/v1.11/client-server-api/#mroompower_levels
 EVENT_TYPE_M_ROOM_POWER_LEVELS = "m.room.power_levels"
 INVITE_POWER_LEVEL_KEY = "invite"  # existing power level key

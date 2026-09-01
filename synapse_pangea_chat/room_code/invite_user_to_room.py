@@ -13,13 +13,18 @@ logger = logging.getLogger(
 )
 
 
+class NoInviterAvailableError(Exception):
+    """No local joined member could be found (or promoted) to issue the
+    invite. Raised instead of returning silently so the caller counts the
+    room as failed rather than invited (issue #197)."""
+
+
 async def invite_user_to_room(api: ModuleApi, user_id: str, room_id: str) -> None:
     # Get a user with permission to invite
     logger.info(f"Getting inviter user for room {room_id}")
     inviter_user = await get_inviter_user(api=api, room_id=room_id)
     if inviter_user is None:
-        logger.warning(f"No inviter user found for room {room_id}")
-        return
+        raise NoInviterAvailableError(f"No inviter user found for room {room_id}")
     inviter_user_id = inviter_user.to_string()
     logger.info(f"Inviter user for room {room_id}: {inviter_user_id}")
     content = {MEMBERSHIP_CONTENT_KEY: MEMBERSHIP_INVITE}

@@ -1,21 +1,27 @@
 import random
-import string
+
+# Codes get handwritten on whiteboards and retyped by students, so the
+# generation alphabet excludes every character pair that transcription
+# confuses: 0/o, 1/i/l, q/g, t/y (all observed in the 2026-08-31 classroom
+# burst, issue #197). Validation elsewhere still accepts the full
+# [a-zA-Z0-9] set, so codes issued before this change keep working.
+UNAMBIGUOUS_LETTERS = "abcdefhjkmnprsuvwxz"
+UNAMBIGUOUS_DIGITS = "23456789"
 
 
 def generate_access_code() -> str:
-    """Generate 7 character alphanumeric access code with at least one digit."""
+    """Generate 7 character alphanumeric access code with at least one digit,
+    drawn from the unambiguous alphabet above."""
 
-    # Generate a random digit (0-9)
-    digit = random.choice(string.digits)
+    # Ensure at least one digit by picking it explicitly
+    digit = random.choice(UNAMBIGUOUS_DIGITS)
 
-    # Generate the rest of the characters (alphanumeric, but excluding digits for now)
-    alphanumeric_chars = random.choices(string.ascii_letters + string.digits, k=6)
+    # Generate the rest of the characters
+    chars = random.choices(UNAMBIGUOUS_LETTERS + UNAMBIGUOUS_DIGITS, k=6)
 
-    # Ensure at least one number is in the code by inserting the digit at a random position
-    alphanumeric_chars.append(digit)
+    chars.append(digit)
 
     # Shuffle the list to randomize the position of the digit
-    random.shuffle(alphanumeric_chars)
+    random.shuffle(chars)
 
-    # Convert the list to a string, make it uppercase, and return the result
-    return "".join(alphanumeric_chars).lower()
+    return "".join(chars)

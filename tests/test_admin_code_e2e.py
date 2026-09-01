@@ -318,10 +318,14 @@ class TestAdminCodeE2E(BaseSynapseE2ETest):
             )
             self.assertTrue(burned, "Admin code should be burned after first use")
 
-            # Second teacher tries same admin code — should fail (code burned)
+            # Second teacher tries same admin code — should fail (code burned).
+            # A burned code no longer matches any room, so it answers the
+            # code-not-found 404 (issue #197).
             response2 = await self.knock_with_code(admin_code, teacher2_token)
-            self.assertEqual(response2.status_code, 400, response2.text)
-            self.assertIn("No rooms found", response2.json().get("error", ""))
+            self.assertEqual(response2.status_code, 404, response2.text)
+            self.assertEqual(
+                response2.json().get("errcode"), "ORG.PANGEA.CODE_NOT_FOUND"
+            )
 
         finally:
             self.stop_synapse(

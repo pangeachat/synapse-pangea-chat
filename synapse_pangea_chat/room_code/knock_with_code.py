@@ -24,9 +24,17 @@ from twisted.web.resource import Resource
 from synapse_pangea_chat.room_code.burn_admin_code import burn_admin_code
 from synapse_pangea_chat.room_code.constants import (
     ERRCODE_BANNED_FROM_ROOM,
+    ERRCODE_CODE_NOT_FOUND,
+    ERRCODE_INVITE_FAILED,
     MEMBERSHIP_BAN,
     MEMBERSHIP_JOIN,
 )
+
+try:
+    import sentry_sdk  # type: ignore[import-not-found]
+except ImportError:
+    # Sentry is an optional Synapse extra; without it captures are no-ops.
+    sentry_sdk = None
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.get_inviter_user import promote_user_to_admin
 from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
@@ -41,6 +49,14 @@ from synapse_pangea_chat.room_code.user_is_room_member import (
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.room_code.knock_with_code"
 )
+
+
+def _capture_exception(e: Exception) -> None:
+    # respond_with_json paths never propagate to Synapse's request-level
+    # Sentry capture, so failures this handler absorbs must be captured
+    # explicitly or they are invisible (issue #197).
+    if sentry_sdk is not None:
+        sentry_sdk.capture_exception(e)
 
 
 class KnockWithCode(Resource):
@@ -128,10 +144,17 @@ class KnockWithCode(Resource):
                 )
                 return
             if len(matches) == 0:
+                # 404, not 400: the request is well-formed — the code just
+                # doesn't exist. The errcode lets clients show a "check the
+                # code with your teacher" message and log it distinctly
+                # (issue #197 / client#8693).
                 respond_with_json(
                     request,
-                    400,
-                    {"error": f"No rooms found with the access code: {access_code}"},
+                    404,
+                    {
+                        "errcode": ERRCODE_CODE_NOT_FOUND,
+                        "error": f"No rooms found with the access code: {access_code}",
+                    },
                     send_cors=True,
                 )
                 return
@@ -140,6 +163,7 @@ class KnockWithCode(Resource):
             invited_rooms: List[str] = []
             already_joined_rooms: List[str] = []
             banned_rooms: List[str] = []
+            failed_rooms: List[str] = []
             for match in matches:
                 try:
                     membership = await get_user_room_membership(
@@ -178,9 +202,16 @@ class KnockWithCode(Resource):
                             burner_user_id=requester_id,
                         )
                 except Exception as e:
+                    # A failed room must not block the others, but it must
+                    # not vanish either: capture it, and count it so an
+                    # all-rooms-failed code doesn't answer 200-with-empty-
+                    # lists, which clients render as "code not found"
+                    # (issue #197).
+                    failed_rooms.append(match.room_id)
                     logger.error(
                         f"Error sending knock with code to {match.room_id}: {e}"
                     )
+                    _capture_exception(e)
             if banned_rooms and not invited_rooms and not already_joined_rooms:
                 # The code was valid but every matched room has banned the
                 # user — a distinct failure, not a nonexistent code.
@@ -191,6 +222,21 @@ class KnockWithCode(Resource):
                         "errcode": ERRCODE_BANNED_FROM_ROOM,
                         "error": "You are banned from the course for this code",
                         "banned": banned_rooms,
+                    },
+                    send_cors=True,
+                )
+                return
+            if failed_rooms and not invited_rooms and not already_joined_rooms:
+                # The code was valid but every invite failed — a server-side
+                # problem (no eligible inviter, rate limiting, ...), not a
+                # nonexistent code.
+                respond_with_json(
+                    request,
+                    500,
+                    {
+                        "errcode": ERRCODE_INVITE_FAILED,
+                        "error": "Failed to invite to any room matching the code",
+                        "failed": failed_rooms,
                     },
                     send_cors=True,
                 )
@@ -222,6 +268,7 @@ class KnockWithCode(Resource):
 
         except Exception as e:
             logger.error(f"Error processing request: {e}")
+            _capture_exception(e)
             respond_with_json(
                 request,
                 500,
