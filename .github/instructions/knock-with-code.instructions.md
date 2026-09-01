@@ -29,14 +29,17 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 **Logic**:
 
 1. Rate-limit check (configurable burst window per user).
-2. Validate code format: exactly 7 chars, alphanumeric, at least one digit.
+2. Validate code format: exactly 7 chars, alphanumeric, at least one digit. A malformed code responds `400`.
 3. Query Synapse DB for rooms whose `m.room.join_rules` state event contains a matching `access_code` (case-insensitive). Uses the latest state event per room.
-4. For each matched room:
+4. A well-formed code that matches no room responds `404` with `{ errcode: "ORG.PANGEA.CODE_NOT_FOUND" }`. 404 and not 400 because the request is fine — the code doesn't exist; the errcode lets the client tell a wrong code (an expected user mistake, shown as "check the code") apart from a malformed request (a client bug). A whole classroom mistyping one board-written code produced the 2026-08-31 burst that motivated this split (issue #197 / client#8693).
+5. For each matched room:
    - If user is already a member → add to `already_joined` list.
    - If user is BANNED from the room → add to `banned` list, skip the invite (Synapse would reject it; without this the failure is indistinguishable from a nonexistent code — issue #127 / client#6820).
    - Otherwise → find a room member with invite power, issue `update_room_membership(invite)` on their behalf.
-5. If the code matched rooms but the user is banned from ALL of them (nothing invited, nothing already joined) → respond `403` with `{ errcode: "ORG.PANGEA.BANNED_FROM_ROOM", error: ..., banned: [...] }` so the client can show a ban-specific message.
-6. Otherwise return `{ rooms: [...invited], already_joined: [...], banned: [...], rateLimited: false }`.
+   - An invite that fails — including a room with no eligible inviter — is added to a `failed` list and captured to Sentry. Failures must not block the other matched rooms, but they must not vanish either: the endpoint's own error responses never propagate to Synapse's request-level capture, so an uncaptured failure here is invisible.
+6. If the code matched rooms but the user is banned from ALL of them (nothing invited, nothing already joined) → respond `403` with `{ errcode: "ORG.PANGEA.BANNED_FROM_ROOM", error: ..., banned: [...] }` so the client can show a ban-specific message.
+7. If every matched room failed (nothing invited, nothing already joined, nothing banned) → respond `500` with `{ errcode: "ORG.PANGEA.INVITE_FAILED", failed: [...] }`. Before this rule, an all-rooms-failed code answered 200 with empty lists, which clients render as "code not found" — hiding a server-side problem behind a user-error message.
+8. Otherwise return `{ rooms: [...invited], already_joined: [...], banned: [...] }`.
 
 **Client impact**: The invite arrives via `/sync`. The client's sync listener must suppress the invite dialog when the code flow is already handling the join — see "Space invite priority" in [joining-courses.instructions.md](../../../client/.github/instructions/joining-courses.instructions.md).
 
@@ -45,6 +48,8 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 **Auth**: Bearer token.
 
 **Logic**: Generate a unique 7-char alphanumeric code, verify it doesn't collide with any existing room's code (up to 10 retries), and return `{ access_code: "..." }`. The client stores this code in the room's `m.room.join_rules` state event under the `access_code` key.
+
+**Generation alphabet**: codes are written on whiteboards and retyped by students, so generation excludes every transcription-confusable character — `0/o`, `1/i/l`, `q/g`, `t/y` (all observed in the 2026-08-31 classroom burst, issue #197). Validation still accepts the full alphanumeric set, so codes issued before this decision keep working. The at-least-one-digit rule is unchanged — it is what distinguishes a code from a literal route in the client's URL grammar.
 
 ---
 
@@ -58,7 +63,7 @@ The `get_rooms_with_access_code` query reads directly from the Synapse event tab
 
 ## Invite Mechanics
 
-The server needs a real user with invite power to issue the invite (Synapse's `update_room_membership` requires a sender). [`get_inviter_user`](../../synapse_pangea_chat/room_code/get_inviter_user.py) finds a joined member whose power level meets the room's invite threshold. If no such user exists, the invite silently fails for that room.
+The server needs a real user with invite power to issue the invite (Synapse's `update_room_membership` requires a sender). [`get_inviter_user`](../../synapse_pangea_chat/room_code/get_inviter_user.py) finds a joined member whose power level meets the room's invite threshold. If no such user exists, the room counts as failed (`NoInviterAvailableError`) and follows the failed-room handling above — it is never reported as invited.
 
 ---
 

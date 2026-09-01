@@ -548,6 +548,121 @@ class TestE2E(BaseSynapseE2ETest):
                 postgres=postgres,
             )
 
+    async def test_e2e_knock_with_unmatched_code_returns_404(self) -> None:
+        """A well-formed code that matches no room must answer 404 with
+        ORG.PANGEA.CODE_NOT_FOUND — not a bare 400, which clients cannot
+        tell from a malformed request (issue #197 / client#8693)."""
+        postgres = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        synapse_dir = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="test1",
+                password="123123123",
+                admin=True,
+            )
+            _, user_1_access_token = await self.login_user(
+                user="test1", password="123123123"
+            )
+
+            response = requests.post(
+                "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code",
+                json={"access_code": "zzz9zzz"},
+                headers={"Authorization": f"Bearer {user_1_access_token}"},
+                timeout=10,
+            )
+            self.assertEqual(response.status_code, 404)
+            body = response.json()
+            self.assertEqual(body["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
+
+            # A malformed code (no digit) still answers 400, unchanged.
+            await self.knock_with_invalid_code(user_1_access_token)
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_e2e_code_of_fully_left_room_answers_404(self) -> None:
+        """When every local member has left a coded room, Synapse drops the
+        room from the current-state the code query reads, so the code answers
+        404 CODE_NOT_FOUND — the correct user story for a dead course
+        ("that code doesn't work, check with your teacher"). Pinned here so a
+        future change to the match query doesn't silently turn this into the
+        all-invites-failed 500 path (issue #197); that path is unit-tested in
+        test_knock_with_code_unit.py."""
+        postgres = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        synapse_dir = None
+        try:
+            access_code = "empty9r"
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+            for user in ("test1", "test2"):
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user=user,
+                    password="123123123",
+                    admin=True,
+                )
+            _, user_1_access_token = await self.login_user(
+                user="test1", password="123123123"
+            )
+            _, user_2_access_token = await self.login_user(
+                user="test2", password="123123123"
+            )
+
+            room_id = await self.create_private_room(user_1_access_token)
+            await self.set_room_knockable_with_code(
+                room_id=room_id,
+                access_token=user_1_access_token,
+                access_code=access_code,
+            )
+            # The creator leaves: the room keeps its code but has no joined
+            # member left to issue invites on behalf of.
+            await self.leave_room(room_id, user_1_access_token)
+
+            response = requests.post(
+                "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code",
+                json={"access_code": access_code},
+                headers={"Authorization": f"Bearer {user_2_access_token}"},
+                timeout=10,
+            )
+            self.assertEqual(response.status_code, 404, response.text)
+            self.assertEqual(response.json()["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
     async def get_access_token_without_access_code(self):
         get_access_token_url = (
             "http://localhost:8008/_synapse/client/pangea/v1/request_room_code"
