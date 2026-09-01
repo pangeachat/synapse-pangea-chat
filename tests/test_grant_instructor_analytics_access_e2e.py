@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 
 import requests
@@ -88,6 +89,35 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
         )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["room_id"]
+
+    def _push_rule_url(self) -> str:
+        return (
+            f"{self.server_url}"
+            f"/_matrix/client/v3/pushrules/global/override/p.rule.analytics_invite"
+        )
+
+    def _messages_url(self, room_id: str) -> str:
+        room_id_path = quote(room_id, safe="")
+        return (
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}"
+            f"/messages?dir=b&limit=50"
+        )
+
+    async def _invite_reason(
+        self, room_id: str, user_id: str, reader_token: str
+    ) -> str | None:
+        response = requests.get(
+            self._messages_url(room_id), headers=self._headers(reader_token)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        for event in response.json()["chunk"]:
+            if (
+                event.get("type") == "m.room.member"
+                and event.get("state_key") == user_id
+                and event.get("content", {}).get("membership") == "invite"
+            ):
+                return event["content"].get("reason")
+        return None
 
     async def _knock_room(self, room_id: str, access_token: str, reason: str) -> None:
         room_id_path = quote(room_id, safe="")
@@ -182,6 +212,169 @@ class TestGrantInstructorAnalyticsAccessE2E(BaseSynapseE2ETest):
             )
             self.assertEqual(membership.status_code, 200, membership.text)
             self.assertEqual(membership.json()["membership"], "join")
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_grant_silences_the_invite_it_generates(self):
+        """The invite that precedes the force-join must not notify the instructor.
+
+        Both halves are asserted: the marker on the event, and the override rule
+        on the instructor's account. The instructor here has never run a client,
+        so the rule can only have come from the server.
+        """
+        (
+            postgres,
+            synapse_dir,
+            config_path,
+            server_process,
+            stdout_thread,
+            stderr_thread,
+        ) = await self.start_test_synapse()
+
+        try:
+            await self.register_user(config_path, synapse_dir, "teacher", "pw", False)
+            await self.register_user(config_path, synapse_dir, "student", "pw", False)
+            teacher_user_id, teacher_token = await self.login_user("teacher", "pw")
+            _, student_token = await self.login_user("student", "pw")
+
+            course_id = await self._create_course_space(
+                teacher_token, require_analytics_access=True
+            )
+            await self._join_room(course_id, student_token)
+            analytics_room_id = await self._create_analytics_room(student_token)
+
+            before = requests.get(
+                self._push_rule_url(), headers=self._headers(teacher_token)
+            )
+            self.assertEqual(before.status_code, 404, before.text)
+
+            response = requests.post(
+                self._endpoint(),
+                headers=self._headers(student_token),
+                json={
+                    "mx_course_id": course_id,
+                    "mx_analytics_room_id": analytics_room_id,
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+            after = requests.get(
+                self._push_rule_url(), headers=self._headers(teacher_token)
+            )
+            self.assertEqual(after.status_code, 200, after.text)
+            rule = after.json()
+            self.assertEqual(rule["actions"], ["dont_notify"])
+            self.assertIn(
+                {
+                    "kind": "event_match",
+                    "key": "content.reason",
+                    "pattern": "p.analytics_request",
+                },
+                rule["conditions"],
+            )
+
+            self.assertEqual(
+                await self._invite_reason(
+                    analytics_room_id, teacher_user_id, student_token
+                ),
+                "p.analytics_request",
+            )
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_concurrent_grants_all_join_the_instructor(self):
+        """A whole class joining at once must not drop any student's grant.
+
+        Every student grants the same instructor concurrently, and the instructor
+        starts with no push rules at all — the account state where the rule
+        install has no existing row to lock against, so the installs collide.
+        Losing that race must not abort the membership change it precedes.
+        """
+        (
+            postgres,
+            synapse_dir,
+            config_path,
+            server_process,
+            stdout_thread,
+            stderr_thread,
+        ) = await self.start_test_synapse(
+            synapse_config_overrides={
+                # Concurrency is the thing under test; without this the limiter
+                # rejects the burst first and the race never runs.
+                "rc_message": {"per_second": 1000, "burst_count": 1000},
+                "rc_invites": {
+                    "per_room": {"per_second": 1000, "burst_count": 1000},
+                    "per_user": {"per_second": 1000, "burst_count": 1000},
+                },
+                "rc_joins": {
+                    "local": {"per_second": 1000, "burst_count": 1000},
+                    "remote": {"per_second": 1000, "burst_count": 1000},
+                },
+                "rc_login": {
+                    "address": {"per_second": 1000, "burst_count": 1000},
+                    "account": {"per_second": 1000, "burst_count": 1000},
+                    "failed_attempts": {"per_second": 1000, "burst_count": 1000},
+                },
+            }
+        )
+
+        student_count = 6
+        try:
+            await self.register_user(config_path, synapse_dir, "teacher", "pw", False)
+            teacher_user_id, teacher_token = await self.login_user("teacher", "pw")
+            course_id = await self._create_course_space(
+                teacher_token, require_analytics_access=True
+            )
+
+            students = []
+            for index in range(student_count):
+                name = f"student{index}"
+                await self.register_user(config_path, synapse_dir, name, "pw", False)
+                _, token = await self.login_user(name, "pw")
+                await self._join_room(course_id, token)
+                students.append((token, await self._create_analytics_room(token)))
+
+            def grant(student: tuple[str, str]):
+                token, analytics_room_id = student
+                return requests.post(
+                    self._endpoint(),
+                    headers=self._headers(token),
+                    json={
+                        "mx_course_id": course_id,
+                        "mx_analytics_room_id": analytics_room_id,
+                    },
+                )
+
+            with ThreadPoolExecutor(max_workers=student_count) as pool:
+                responses = list(pool.map(grant, students))
+
+            for response in responses:
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["errors"], [], response.text)
+
+            for token, analytics_room_id in students:
+                self.assertEqual(
+                    await self._membership(analytics_room_id, teacher_user_id, token),
+                    "join",
+                    f"instructor missing from {analytics_room_id}",
+                )
+
+            rule = requests.get(
+                self._push_rule_url(), headers=self._headers(teacher_token)
+            )
+            self.assertEqual(rule.status_code, 200, rule.text)
         finally:
             self.stop_synapse(
                 server_process=server_process,

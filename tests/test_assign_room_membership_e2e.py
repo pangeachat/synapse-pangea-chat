@@ -23,6 +23,48 @@ class TestAssignRoomMembershipE2E(BaseSynapseE2ETest):
             f"/state/m.room.member/{user_id_path}"
         )
 
+    def _push_rule_url(self) -> str:
+        return (
+            f"{self.server_url}"
+            f"/_matrix/client/v3/pushrules/global/override/p.rule.analytics_invite"
+        )
+
+    def _messages_url(self, room_id: str) -> str:
+        room_id_path = quote(room_id, safe="")
+        return (
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}"
+            f"/messages?dir=b&limit=50"
+        )
+
+    async def _create_analytics_room(self, owner_token: str) -> str:
+        response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/createRoom",
+            headers=self._headers(owner_token),
+            json={
+                "visibility": "private",
+                "preset": "private_chat",
+                "creation_content": {"type": "p.analytics", "lang_code": "es"},
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["room_id"]
+
+    async def _invite_reason(
+        self, room_id: str, user_id: str, reader_token: str
+    ) -> str | None:
+        response = requests.get(
+            self._messages_url(room_id), headers=self._headers(reader_token)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        for event in response.json()["chunk"]:
+            if (
+                event.get("type") == "m.room.member"
+                and event.get("state_key") == user_id
+                and event.get("content", {}).get("membership") == "invite"
+            ):
+                return event["content"].get("reason")
+        return None
+
     def _ban_url(self, room_id: str) -> str:
         room_id_path = quote(room_id, safe="")
         return f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/ban"
@@ -210,6 +252,88 @@ class TestAssignRoomMembershipE2E(BaseSynapseE2ETest):
             )
             self.assertEqual(bob_joined.status_code, 200)
             self.assertIn(room_id, bob_joined.json()["joined_rooms"])
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_force_join_silences_the_invite_for_analytics_rooms_only(self):
+        """The bot's retroactive-grant script reaches analytics rooms this way.
+
+        An ordinary room is the control: it must not gain the marker or the rule,
+        so the suppression cannot leak into real invites.
+        """
+        (
+            postgres,
+            synapse_dir,
+            config_path,
+            server_process,
+            stdout_thread,
+            stderr_thread,
+        ) = await self.start_test_synapse()
+
+        try:
+            await self.register_user(config_path, synapse_dir, "admin", "pw", True)
+            await self.register_user(config_path, synapse_dir, "student", "pw", False)
+            await self.register_user(config_path, synapse_dir, "teacher", "pw", False)
+            _, admin_token = await self.login_user("admin", "pw")
+            _, student_token = await self.login_user("student", "pw")
+            teacher_user_id, teacher_token = await self.login_user("teacher", "pw")
+
+            ordinary_room_id = await self.create_private_room(student_token)
+            analytics_room_id = await self._create_analytics_room(student_token)
+
+            ordinary = requests.post(
+                self._endpoint(),
+                headers=self._headers(admin_token),
+                json={
+                    "room_id": ordinary_room_id,
+                    "user_ids": [teacher_user_id],
+                    "force_join": True,
+                },
+            )
+            self.assertEqual(ordinary.status_code, 200, ordinary.text)
+
+            self.assertIsNone(
+                await self._invite_reason(
+                    ordinary_room_id, teacher_user_id, student_token
+                )
+            )
+            control = requests.get(
+                self._push_rule_url(), headers=self._headers(teacher_token)
+            )
+            self.assertEqual(control.status_code, 404, control.text)
+
+            analytics = requests.post(
+                self._endpoint(),
+                headers=self._headers(admin_token),
+                json={
+                    "room_id": analytics_room_id,
+                    "user_ids": [teacher_user_id],
+                    "force_join": True,
+                },
+            )
+            self.assertEqual(analytics.status_code, 200, analytics.text)
+            self.assertEqual(
+                analytics.json()["results"],
+                [{"user_id": teacher_user_id, "success": True, "action": "joined"}],
+            )
+
+            self.assertEqual(
+                await self._invite_reason(
+                    analytics_room_id, teacher_user_id, student_token
+                ),
+                "p.analytics_request",
+            )
+            rule_response = requests.get(
+                self._push_rule_url(), headers=self._headers(teacher_token)
+            )
+            self.assertEqual(rule_response.status_code, 200, rule_response.text)
+            self.assertEqual(rule_response.json()["actions"], ["dont_notify"])
         finally:
             self.stop_synapse(
                 server_process=server_process,

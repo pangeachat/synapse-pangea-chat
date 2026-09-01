@@ -18,6 +18,11 @@ from synapse.module_api import ModuleApi
 from synapse.types import RoomID, UserID
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.analytics_push_suppression import (
+    ANALYTICS_INVITE_REASON,
+    ANALYTICS_ROOM_TYPE,
+    ensure_analytics_invite_push_rule,
+)
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 
 if TYPE_CHECKING:
@@ -33,11 +38,6 @@ MEMBERSHIP_KNOCK = "knock"
 
 COURSE_SETTINGS_STATE_EVENT_TYPE = "pangea.course_settings"
 REQUIRE_ANALYTICS_ACCESS_KEY = "require_analytics_access"
-ANALYTICS_ROOM_TYPE = "p.analytics"
-# Marks the invite half of a force-join as analytics plumbing. Clients set a
-# push rule that silences member events carrying it, so an instructor is not
-# notified about an invite that is joined a moment later anyway.
-ANALYTICS_INVITE_REASON = "p.analytics_request"
 
 
 def _is_probable_bot_user_id(user_id: str) -> bool:
@@ -381,6 +381,7 @@ class GrantInstructorAnalyticsAccess(Resource):
             return "already_joined"
 
         if current_membership != MEMBERSHIP_INVITE:
+            await ensure_analytics_invite_push_rule(self._api, instructor_id)
             await self._api.update_room_membership(
                 sender=inviter_id,
                 target=instructor_id,
