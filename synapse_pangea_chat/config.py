@@ -118,3 +118,21 @@ class PangeaChatConfig:
     delayed_push_delay_ms: int = 60_000
     delayed_push_max_delay_ms: int = 600_000
     delayed_push_require_synapse_version: str = AUDITED_SYNAPSE_VERSION
+
+    # --- moderation config (server-side, trust-and-safety) ---
+    # Both tiers ship dark: nothing runs until an operator enables a tier.
+    moderation_tier1_enabled: bool = False
+    # Regions whose NATIONAL phone formats are matched bare (international
+    # +CC formats match regardless).
+    moderation_tier1_phone_regions: List[str] = attr.Factory(lambda: ["US"])
+    moderation_tier2_enabled: bool = False
+    # Choreographer base URL (e.g. https://api.staging.pangea.chat) and the
+    # Matrix access token of the moderation service account — /choreo/moderate
+    # accepts any valid token on this homeserver.
+    moderation_choreo_base_url: Optional[str] = None
+    moderation_choreo_access_token: Optional[str] = None
+    # Senders never moderated (regex, full user id) — set the bot users here:
+    # bot content is already governed upstream, and Tier 2 redacting the
+    # bot's own replies would fight the orchestrator.
+    moderation_exempt_user_id_patterns: List[str] = attr.Factory(list)
+    moderation_redaction_reason_prefix: str = "Removed by Pangea content moderation"

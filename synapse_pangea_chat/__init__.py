@@ -21,6 +21,7 @@ from synapse_pangea_chat.grant_instructor_analytics_access import (
     GrantInstructorAnalyticsAccess,
 )
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
+from synapse_pangea_chat.moderation import ChatModeration
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
     PreviewWithCode,
@@ -228,6 +229,13 @@ class PangeaChat:
             path="/_synapse/client/pangea/v1/send_push",
             resource=self.direct_push_resource,
         )
+
+        # --- Server-side chat moderation ---
+        # Constructed only when a tier is enabled: construction is what
+        # registers the callbacks, so dark config stays truly dark.
+        self.chat_moderation: Optional[ChatModeration] = None
+        if config.moderation_tier1_enabled or config.moderation_tier2_enabled:
+            self.chat_moderation = ChatModeration(api, config)
 
         # --- Limit User Directory ---
         if config.limit_user_directory_public_attribute_search_path is not None:
@@ -601,6 +609,81 @@ class PangeaChat:
                 'Config "delayed_push.require_synapse_version" must not be empty'
             )
 
+        # --- moderation config ---
+        moderation = config.get("moderation", {})
+        if moderation is None:
+            moderation = {}
+        if not isinstance(moderation, dict):
+            raise ValueError('Config "moderation" must be an object')
+
+        moderation_tier1_enabled = moderation.get("tier1_enabled", False)
+        if not isinstance(moderation_tier1_enabled, bool):
+            raise ValueError('Config "moderation.tier1_enabled" must be a boolean')
+
+        moderation_tier1_phone_regions = moderation.get("tier1_phone_regions", ["US"])
+        if not isinstance(moderation_tier1_phone_regions, list) or not all(
+            isinstance(r, str) and r.strip() for r in moderation_tier1_phone_regions
+        ):
+            raise ValueError(
+                'Config "moderation.tier1_phone_regions" must be a list of '
+                "non-empty strings"
+            )
+
+        moderation_tier2_enabled = moderation.get("tier2_enabled", False)
+        if not isinstance(moderation_tier2_enabled, bool):
+            raise ValueError('Config "moderation.tier2_enabled" must be a boolean')
+
+        moderation_choreo_base_url = moderation.get("choreo_base_url", None)
+        moderation_choreo_access_token = moderation.get("choreo_access_token", None)
+        if moderation_tier2_enabled:
+            # Refuse a half-configured Tier 2 at startup rather than failing
+            # (open, hence silently) on every message later.
+            if (
+                not isinstance(moderation_choreo_base_url, str)
+                or not moderation_choreo_base_url.strip()
+            ):
+                raise ValueError(
+                    'Config "moderation.choreo_base_url" is required when '
+                    "moderation.tier2_enabled is true"
+                )
+            if (
+                not isinstance(moderation_choreo_access_token, str)
+                or not moderation_choreo_access_token.strip()
+            ):
+                raise ValueError(
+                    'Config "moderation.choreo_access_token" is required when '
+                    "moderation.tier2_enabled is true"
+                )
+
+        moderation_exempt_user_id_patterns = moderation.get(
+            "exempt_user_id_patterns", []
+        )
+        if not isinstance(moderation_exempt_user_id_patterns, list) or not all(
+            isinstance(pat, str) for pat in moderation_exempt_user_id_patterns
+        ):
+            raise ValueError(
+                'Config "moderation.exempt_user_id_patterns" must be a list of strings'
+            )
+        for pat in moderation_exempt_user_id_patterns:
+            try:
+                re.compile(pat)
+            except re.error as e:
+                raise ValueError(
+                    f'Config "moderation.exempt_user_id_patterns" entry {pat!r} '
+                    f"is not a valid regex: {e}"
+                )
+
+        moderation_redaction_reason_prefix = moderation.get(
+            "redaction_reason_prefix", "Removed by Pangea content moderation"
+        )
+        if (
+            not isinstance(moderation_redaction_reason_prefix, str)
+            or not moderation_redaction_reason_prefix.strip()
+        ):
+            raise ValueError(
+                'Config "moderation.redaction_reason_prefix" must be a non-empty string'
+            )
+
         return PangeaChatConfig(
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
@@ -652,4 +735,11 @@ class PangeaChat:
             delayed_push_delay_ms=delayed_push_delay_ms,
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,
             delayed_push_require_synapse_version=delayed_push_require_synapse_version,
+            moderation_tier1_enabled=moderation_tier1_enabled,
+            moderation_tier1_phone_regions=moderation_tier1_phone_regions,
+            moderation_tier2_enabled=moderation_tier2_enabled,
+            moderation_choreo_base_url=moderation_choreo_base_url,
+            moderation_choreo_access_token=moderation_choreo_access_token,
+            moderation_exempt_user_id_patterns=moderation_exempt_user_id_patterns,
+            moderation_redaction_reason_prefix=moderation_redaction_reason_prefix,
         )
