@@ -23,6 +23,7 @@ from synapse_pangea_chat.analytics_push_suppression import (
     ensure_analytics_invite_push_rule,
     is_analytics_room,
 )
+from synapse_pangea_chat.blocked_join_gate import server_initiated_entry
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 
 if TYPE_CHECKING:
@@ -298,12 +299,15 @@ class AssignRoomMembership(Resource):
                 room_id=room_id,
             )
 
-        await self._api.update_room_membership(
-            sender=user_id,
-            target=user_id,
-            room_id=room_id,
-            new_membership=MEMBERSHIP_JOIN,
-        )
+        # Orchestrated join, not a membership request — exempt from the
+        # blocked join gate (blocked-join-gate.instructions.md).
+        with server_initiated_entry():
+            await self._api.update_room_membership(
+                sender=user_id,
+                target=user_id,
+                room_id=room_id,
+                new_membership=MEMBERSHIP_JOIN,
+            )
 
     async def _get_local_inviter_user_id(self, room_id: str) -> str | None:
         room_state = await self._api.get_room_state(
