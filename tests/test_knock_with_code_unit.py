@@ -39,6 +39,9 @@ class TestKnockWithCodeResponses(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value={"access_code": CODE}),
             ),
             patch(f"{MODULE}.get_user_room_membership", AsyncMock(return_value=None)),
+            # Collaborator, not under test here; its own behavior is pinned in
+            # test_blocked_join_gate_unit.
+            patch(f"{MODULE}.is_blocked_by_room_admin", AsyncMock(return_value=False)),
         ]
         for p in patches:
             p.start()
@@ -95,6 +98,25 @@ class TestKnockWithCodeResponses(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["rooms"], [ROOM_2])
         self.assertEqual(body["already_joined"], [])
         self.assertEqual(body["banned"], [])
+
+    async def test_every_room_blocked_answers_generic_403(self) -> None:
+        # All matched rooms refuse via the blocked join gate: a bare
+        # M_FORBIDDEN with no room list, so the refusal reveals nothing
+        # (blocked-join-gate.instructions.md).
+        matches = [RoomCodeMatch(room_id=ROOM_1, is_admin_code=False)]
+        invite = AsyncMock()
+        with (
+            patch(
+                f"{MODULE}.get_rooms_with_access_code", AsyncMock(return_value=matches)
+            ),
+            patch(f"{MODULE}.is_blocked_by_room_admin", AsyncMock(return_value=True)),
+            patch(f"{MODULE}.invite_user_to_room", invite),
+        ):
+            await _handler()._async_render_POST(MagicMock())
+        status, body = self._response()
+        self.assertEqual(status, 403)
+        self.assertEqual(body, {"errcode": "M_FORBIDDEN", "error": "Forbidden"})
+        invite.assert_not_called()
 
 
 if __name__ == "__main__":
