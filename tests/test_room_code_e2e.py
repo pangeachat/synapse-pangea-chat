@@ -548,6 +548,83 @@ class TestE2E(BaseSynapseE2ETest):
                 postgres=postgres,
             )
 
+    async def test_e2e_knock_with_code_already_invited_user_gets_room(self) -> None:
+        """A user already invited to the room (a re-clicked link, a second
+        device, a knock racing the client's join) must get the room back in
+        `rooms` so their own /join proceeds — not a second invite whose
+        failure hid the room from every list (issue #148)."""
+        postgres = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        synapse_dir = None
+        try:
+            access_code = "invcde1"
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+            for user in ("test1", "test2"):
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user=user,
+                    password="123123123",
+                    admin=True,
+                )
+            _, user_1_access_token = await self.login_user(
+                user="test1", password="123123123"
+            )
+            user_2_id, user_2_access_token = await self.login_user(
+                user="test2", password="123123123"
+            )
+
+            room_id = await self.create_private_room(user_1_access_token)
+            await self.set_room_knockable_with_code(
+                room_id=room_id,
+                access_token=user_1_access_token,
+                access_code=access_code,
+            )
+
+            # User 1 invites user 2 directly; user 2 then presents the code
+            # while that invite is still pending.
+            self.assertTrue(
+                await self.invite_user_to_room(
+                    room_id=room_id,
+                    user_id=user_2_id,
+                    access_token=user_1_access_token,
+                )
+            )
+            response = requests.post(
+                "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code",
+                json={"access_code": access_code},
+                headers={"Authorization": f"Bearer {user_2_access_token}"},
+                timeout=10,
+            )
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertEqual(body["rooms"], [room_id])
+            self.assertEqual(body["already_joined"], [])
+
+            # The client's own join succeeds for an invited user.
+            self.assertTrue(
+                await self.accept_room_invitation(
+                    room_id=room_id, access_token=user_2_access_token
+                )
+            )
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
     async def test_e2e_knock_with_unmatched_code_returns_404(self) -> None:
         """A well-formed code that matches no room must answer 404 with
         ORG.PANGEA.CODE_NOT_FOUND — not a bare 400, which clients cannot
