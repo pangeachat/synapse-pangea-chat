@@ -35,6 +35,7 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 5. For each matched room:
    - If user is already a member → add to `already_joined` list.
    - If user is BANNED from the room → add to `banned` list, skip the invite (Synapse would reject it; without this the failure is indistinguishable from a nonexistent code — issue #127 / client#6820).
+   - If user is already INVITED → add to `rooms` without issuing a second invite. The client's own `/join` succeeds for an invited user, so the flow is idempotent across link re-clicks, a second device, and a knock racing the client's join (issue #148).
    - Otherwise → find a room member with invite power, issue `update_room_membership(invite)` on their behalf.
    - An invite that fails — including a room with no eligible inviter — is added to a `failed` list and captured to Sentry. Failures must not block the other matched rooms, but they must not vanish either: the endpoint's own error responses never propagate to Synapse's request-level capture, so an uncaptured failure here is invisible.
 6. If the code matched rooms but the user is banned from ALL of them (nothing invited, nothing already joined) → respond `403` with `{ errcode: "ORG.PANGEA.BANNED_FROM_ROOM", error: ..., banned: [...] }` so the client can show a ban-specific message.

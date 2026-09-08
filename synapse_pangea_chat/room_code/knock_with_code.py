@@ -29,6 +29,7 @@ from synapse_pangea_chat.room_code.constants import (
     ERRCODE_CODE_NOT_FOUND,
     ERRCODE_INVITE_FAILED,
     MEMBERSHIP_BAN,
+    MEMBERSHIP_INVITE,
     MEMBERSHIP_JOIN,
 )
 
@@ -195,11 +196,17 @@ class KnockWithCode(Resource):
                     ):
                         blocked_rooms.append(match.room_id)
                         continue
-                    await invite_user_to_room(
-                        api=self._api,
-                        user_id=requester_id,
-                        room_id=match.room_id,
-                    )
+                    if membership != MEMBERSHIP_INVITE:
+                        # An already-invited user holds the invite the
+                        # endpoint exists to issue; re-inviting is at best
+                        # redundant and at worst a failure that hid the room
+                        # from every list. Return it in `rooms` so the
+                        # client's own /join proceeds (issue #148).
+                        await invite_user_to_room(
+                            api=self._api,
+                            user_id=requester_id,
+                            room_id=match.room_id,
+                        )
                     invited_rooms.append(match.room_id)
 
                     # Admin code: promote to admin and burn the code

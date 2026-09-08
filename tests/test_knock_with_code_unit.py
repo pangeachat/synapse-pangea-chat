@@ -99,6 +99,30 @@ class TestKnockWithCodeResponses(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["already_joined"], [])
         self.assertEqual(body["banned"], [])
 
+    async def test_invite_pending_room_is_returned_without_a_second_invite(
+        self,
+    ) -> None:
+        # A user already invited to the room holds what the endpoint issues;
+        # the room comes back in `rooms` (the client's own /join succeeds for
+        # an invited user) and no second invite is sent (issue #148).
+        matches = [RoomCodeMatch(room_id=ROOM_1, is_admin_code=False)]
+        invite = AsyncMock()
+        with (
+            patch(
+                f"{MODULE}.get_rooms_with_access_code", AsyncMock(return_value=matches)
+            ),
+            patch(
+                f"{MODULE}.get_user_room_membership", AsyncMock(return_value="invite")
+            ),
+            patch(f"{MODULE}.invite_user_to_room", invite),
+        ):
+            await _handler()._async_render_POST(MagicMock())
+        status, body = self._response()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["rooms"], [ROOM_1])
+        self.assertEqual(body["already_joined"], [])
+        invite.assert_not_called()
+
     async def test_every_room_blocked_answers_generic_403(self) -> None:
         # All matched rooms refuse via the blocked join gate: a bare
         # M_FORBIDDEN with no room list, so the refusal reveals nothing
