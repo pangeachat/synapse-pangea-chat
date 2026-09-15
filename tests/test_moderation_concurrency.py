@@ -53,6 +53,8 @@ from synapse_pangea_chat.moderation.compat import (
     background_process_args,
 )
 
+from .moderation_doubles import MetricReader
+
 # The markers Synapse emits when a logcontext is mishandled. `logcontext_error`
 # routes all of them through `synapse.logging.context` at WARNING, and
 # `background_process_metrics` adds the fourth. A test that asserts only on
@@ -188,36 +190,6 @@ class FakeClock:
     def fire_looping(self) -> None:
         for f, _interval, args in list(self.looping):
             f(*args)
-
-
-class MetricReader:
-    """Reads a metric's value, by name, out of the default registry.
-
-    By name and not by reaching into a collector's private `_value`: the
-    assertion a test wants to make is "an operator scraping this server sees
-    the drop", and the only thing that establishes that is the sample the
-    registry exposes.
-    """
-
-    def __init__(self) -> None:
-        from prometheus_client import REGISTRY
-
-        self._registry = REGISTRY
-        self._base: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float] = {}
-
-    def _read(self, name: str, **labels: str) -> float:
-        value = self._registry.get_sample_value(name, labels or None)
-        return 0.0 if value is None else float(value)
-
-    def snapshot(self, name: str, **labels: str) -> None:
-        self._base[(name, tuple(sorted(labels.items())))] = self._read(name, **labels)
-
-    def delta(self, name: str, **labels: str) -> float:
-        key = (name, tuple(sorted(labels.items())))
-        return self._read(name, **labels) - self._base.get(key, 0.0)
-
-    def value(self, name: str, **labels: str) -> float:
-        return self._read(name, **labels)
 
 
 class _LogcontextWatch:

@@ -32,6 +32,7 @@ from typing import (
     Iterable,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -177,6 +178,29 @@ _TAG_ALIASES = {"image": "img"}
 # comment the spec says it is puts the two back in agreement.
 _ABRUPT_COMMENTS = re.compile(r"<!--?>")
 
+# `<![` is a MARKED SECTION to Python's parser and a BOGUS COMMENT to HTML5,
+# and the difference is how much text disappears.
+#
+# HTML5's markup-declaration-open state takes `[CDATA[` as a CDATA section only
+# when the adjusted current node is a foreign element; in an HTML body it is a
+# parse error and a bogus comment, which ends at the FIRST `>`. Everything
+# after that `>` - the `]]>` included - is displayed. Python's parser instead
+# swallows the whole section up to `]]>`, so `<![CDATA[>call 415-555-2671]]>`
+# was a phone number to every reader and nothing at all to the extractor, and
+# an UNTERMINATED section swallowed the rest of the message.
+#
+# The previous fix recovered the remainder inside `unknown_decl` and parsed it
+# with a nested parser, one per section - which is a stack frame and a full
+# re-parse per section. 300 nested sections, about 4 KB, raised `RecursionError`
+# out of extraction and took the whole event with it, plain body included.
+#
+# Rewriting `<![` so the parser reaches its own bogus-comment branch is the
+# same reading with no recursion at all: one flat parse, whatever the nesting.
+# The inserted character is invisible either way - a bogus comment is not
+# displayed - and it cannot create `<!--` or `<!doctype`.
+_MARKED_SECTIONS = re.compile(r"<!\[")
+_BOGUS_COMMENT_OPEN = "<!q["
+
 
 class _DisplayedText(HTMLParser):
     """Reduces `formatted_body` to the characters a reader actually sees.
@@ -209,20 +233,58 @@ class _DisplayedText(HTMLParser):
         # of tree context that gets both right.
         self._open_blocks: List[str] = []
         self._table_depth = 0
+        # Foster parenting. Character data that appears inside a table but
+        # outside a cell is moved OUT by an HTML5 tree builder and displayed
+        # immediately BEFORE the table, in order - so
+        # `<table>41<tr><td>notes</td></tr>5-555-2671</table>` reads as
+        # `415-555-2671` followed by a one-cell table. Read in source order,
+        # with the cell breaks between them, it was `41 notes 5-555-2671` and
+        # the number a reader sees was shown to neither tier.
+        #
+        # Collected per table and added as an EXTRA surface rather than
+        # replacing the in-place reading: that is this module's standing rule
+        # for an ambiguous rendering, and it means the repair can only ever
+        # add text, never remove some. It is not a tree builder - it is the
+        # one rule that moves displayed characters somewhere else.
+        self._cell_depth = 0
+        self._fostered: List[str] = []
+        self._fostered_runs: List[str] = []
 
     def handle_data(self, data: str) -> None:
-        if not self._invisible:
-            self._parts.append(data)
+        if self._invisible:
+            return
+        self._parts.append(data)
+        if self._table_depth > 0 and self._cell_depth == 0:
+            self._fostered.append(data)
+
+    def _end_table(self) -> None:
+        run = "".join(self._fostered).strip()
+        self._fostered = []
+        if run:
+            self._fostered_runs.append(run)
 
     def _breaks_line(self, tag: str) -> bool:
         if tag in _BLOCK_LEVEL_TAGS:
+            return True
+        if tag == "table":
+            # A table is always a block box, and unlike `td` it cannot be
+            # ignored: `<table>` opens a table wherever it appears. Two
+            # adjacent tables render one above the other, so their contents
+            # do not join - `<table>41</table><table>5-555-2671</table>` is
+            # not a phone number on screen and must not be one here.
             return True
         return self._table_depth > 0 and tag in _TABLE_CELL_TAGS
 
     def _handle_tag(self, tag: str, attrs: Sequence[Tuple[str, Optional[str]]]) -> None:
         tag = _TAG_ALIASES.get(tag, tag)
         if tag == "table":
+            # A nested table starts its own fostered run: text belonging to
+            # the outer table must not be joined to text belonging to the
+            # inner one, because they are displayed in different places.
+            self._end_table()
             self._table_depth += 1
+        elif self._table_depth > 0 and tag in _TABLE_CELL_TAGS:
+            self._cell_depth += 1
         if self._breaks_line(tag):
             self._open_blocks.append(tag)
             self._parts.append("\n")
@@ -269,6 +331,9 @@ class _DisplayedText(HTMLParser):
             self._invisible = False
         if tag == "table" and self._table_depth > 0:
             self._table_depth -= 1
+            self._end_table()
+        elif self._table_depth > 0 and tag in _TABLE_CELL_TAGS and self._cell_depth > 0:
+            self._cell_depth -= 1
         # Only a tag that actually opened a block closes one. An unmatched
         # `</div>` is ignored by HTML5, and a newline there split a displayed
         # number in two.
@@ -278,35 +343,14 @@ class _DisplayedText(HTMLParser):
                     break
             self._parts.append("\n")
 
-    def unknown_decl(self, data: str) -> None:
-        """A `<![CDATA[...]]>` section, which is displayed text outside SVG.
-
-        HTML5 has no CDATA in an HTML body: `<!` followed by anything that is
-        not `--` or `DOCTYPE` becomes a bogus comment that ends at the FIRST
-        `>`, so everything after that `>` is on screen. Python's parser instead
-        swallows the whole section up to `]]>`, which made
-        `<![CDATA[>call 415-555-2671]]>` invisible to both tiers and a phone
-        number to every reader.
-
-        The recovered remainder is PARSED, not appended. Appending it raw put
-        `call &#52;15-555-2671` and `call 4<b>1</b>5-555-2671` in front of the
-        rules as literal markup, while a reader saw a phone number in both.
-        """
-        _, separator, displayed = data.partition(">")
-        if not separator or self._invisible:
-            return
-        # Parsed, not appended raw, and with the terminator HTML5 also shows.
-        # Python's parser consumed the section up to `]]>`; a renderer ended
-        # the bogus comment at the first `>` and displayed everything after it,
-        # the `]]>` included.
-        nested = _DisplayedText()
-        nested.feed(f"{displayed}]]>")
-        nested.close()
-        self._parts.append("".join(nested._parts))
-        self.attribute_text.extend(nested.attribute_text)
+    def close(self) -> None:
+        super().close()
+        # An unclosed `<table>` still displays its fostered text.
+        self._end_table()
 
     def result(self) -> str:
-        return "".join(self._parts + ["\n" + a for a in self.attribute_text])
+        extra = self._fostered_runs + self.attribute_text
+        return "".join(self._parts + ["\n" + text for text in extra])
 
 
 def _displayed_text(formatted: str) -> str:
@@ -324,10 +368,27 @@ def _displayed_text(formatted: str) -> str:
     # deleted text a renderer displays, mangled doctype-shaped text inside an
     # `alt` value, and recursed once per declaration.
     prepared = formatted.replace("\x00", "\ufffd")
+    prepared = _ABRUPT_COMMENTS.sub("<!---->", prepared)
+    prepared = _MARKED_SECTIONS.sub(_BOGUS_COMMENT_OPEN, prepared)
     parser = _DisplayedText()
-    parser.feed(_ABRUPT_COMMENTS.sub("<!---->", prepared))
+    parser.feed(prepared)
     parser.close()
     return parser.result()
+
+
+class _Extracted(NamedTuple):
+    """What extraction found, and whether it found all of it.
+
+    Two fields because "no text" and "we could not read the text" are
+    different facts with different correct responses, and collapsing them into
+    `Optional[str]` is what let a parser failure skip both tiers silently.
+    """
+
+    #: The displayed text, or None when there is none to moderate.
+    text: Optional[str]
+    #: True when some displayed surface could not be read. The message is
+    #: still checked on whatever WAS read; this says the check is partial.
+    incomplete: bool
 
 
 class ChatModeration:
@@ -464,8 +525,8 @@ class ChatModeration:
     # Shared filters
     # ------------------------------------------------------------------
 
-    def _extract_text(self, event: EventBase) -> Optional[str]:
-        """The moderatable text of a message event, or None to skip it.
+    def _extract_text(self, event: EventBase) -> "_Extracted":
+        """The moderatable text of a message event, and whether it is all of it.
 
         The rule, and the only rule: **what the rules see is never less than
         what a reader sees.** Extraction that returns a subset of the displayed
@@ -495,9 +556,22 @@ class ChatModeration:
         tiers: `{"msgtype": "m.text", "body": "<payload>", "m.new_content": {}}`
         has no relation, is displayed as `<payload>` by every client, and
         extracted as nothing at all.
+
+        **A failure to READ is not a finding of NOTHING**, and returning the
+        two the same way is the same class `tier1_prefilter.check_text` names
+        for the rules, one layer up. A `formatted_body` that broke the parser
+        used to take the whole event with it - including the plain `body` that
+        had already been read and said `call 415-555-2671` - and both tiers
+        then saw a message with no text, which is a bypass any sender can
+        trigger on every message and which nothing counted.
+
+        So every surface, and every field within a surface, is read on its
+        own: one that fails costs its own text and nothing else, and the
+        result says so. The caller counts the shortfall and Tier 2 still gets
+        the message - an unknown is escalated, never dropped quietly.
         """
         if event.type != "m.room.message":
-            return None
+            return _Extracted(None, False)
         # `Mapping`, not `dict`: event content is not guaranteed to be a plain
         # dict. Synapse builds events through a Rust type whose `content` is a
         # `JsonObject`, and a homeserver running with `use_frozen_dicts: true`
@@ -507,7 +581,10 @@ class ChatModeration:
         # says nothing.
         content = event.content or {}
         if not isinstance(content, Mapping):
-            return None
+            # A content we cannot even index is a content we cannot read, and
+            # a client that renders it renders something. Reported as an
+            # unknown rather than as an empty message.
+            return _Extracted(None, True)
 
         surfaces: List[Mapping[str, Any]] = [content]
         new_content = content.get("m.new_content")
@@ -515,10 +592,27 @@ class ChatModeration:
             surfaces.append(new_content)
 
         parts: List[str] = []
+        incomplete = False
         for surface in surfaces:
-            parts.extend(_surface_text(surface))
+            try:
+                surface_parts, surface_incomplete = _surface_text(surface)
+            except Exception as exc:
+                reraise_if_cancelled(exc)
+                # Type and site, never the message: a reader that failed on a
+                # message body routinely quotes that body back.
+                incomplete = True
+                logger.warning(
+                    "moderation could not read a surface of %s at %s (%s); "
+                    "the rest of the event is still checked",
+                    event.event_id,
+                    error_site(exc),
+                    type(exc).__name__,
+                )
+                continue
+            parts.extend(surface_parts)
+            incomplete = incomplete or surface_incomplete
         text = "\n".join(parts).strip()
-        return text or None
+        return _Extracted(text or None, incomplete)
 
     def _is_exempt_sender(self, sender: str) -> bool:
         # Whole-string, both ends. A prefix match here exempted any sender
@@ -536,8 +630,17 @@ class ChatModeration:
 
     async def check_event_for_spam(self, event: EventBase) -> Union[str, Codes, bool]:
         try:
-            text = self._extract_text(event)
-            if text is None or self._is_exempt_sender(event.sender):
+            if self._is_exempt_sender(event.sender):
+                return NOT_SPAM
+            extracted = self._extract_text(event)
+            if extracted.incomplete:
+                # Counted before the verdict, and whatever the verdict turns
+                # out to be: this says "there was displayed text we could not
+                # read", which is true of a message that then passes every
+                # rule as much as of one that trips one.
+                metrics.record_extraction_incomplete("tier1")
+            text = extracted.text
+            if text is None:
                 return NOT_SPAM
             reason = check_text(text, self._config.moderation_tier1_phone_regions)
             if reason is not None:
@@ -591,8 +694,18 @@ class ChatModeration:
             # worker this callback's entire cost should be one boolean.
             if not self._tier2_active or self._dispatcher is None:
                 return
-            text = self._extract_text(event)
-            if text is None or self._is_exempt_sender(event.sender):
+            if self._is_exempt_sender(event.sender):
+                return
+            extracted = self._extract_text(event)
+            if extracted.incomplete:
+                metrics.record_extraction_incomplete("tier2")
+            text = extracted.text
+            if text is None:
+                if extracted.incomplete:
+                    # The message had displayed text and we could not read any
+                    # of it, so there is nothing to ask the service about. A
+                    # counted drop, not a message that passed.
+                    metrics.record_drop("extraction_failed")
                 return
             if self._room_has_activity_plan(state_events):
                 # The conversation orchestrator owns moderation in activity
@@ -613,6 +726,12 @@ class ChatModeration:
             # only cost of a failure here is a missed check — logged by type
             # and site rather than as a traceback, for the reason given on
             # the Tier-1 handler above.
+            #
+            # Counted as well as logged. Fail-open must not mean fail-silent:
+            # a message that never reached the queue is a message that will
+            # not be checked, and it looked identical to a clean one on every
+            # dashboard an operator has.
+            metrics.record_drop("dispatch_error")
             logger.warning(
                 "tier2 dispatch failed for %s at %s (%s)",
                 event.event_id,
@@ -817,26 +936,59 @@ _ATTACHMENT_MSGTYPES = frozenset({"m.file", "m.image", "m.video", "m.audio"})
 _HTML_FORMAT = "org.matrix.custom.html"
 
 
-def _surface_text(surface: Mapping[str, Any]) -> List[str]:
-    """Every displayed string carried by one content surface."""
-    parts: List[str] = list(_field_text(surface.get("body")))
+def _surface_text(surface: Mapping[str, Any]) -> Tuple[List[str], bool]:
+    """Every displayed string carried by one content surface, and whether any
+    of them could not be read.
+
+    Field by field, each inside its own guard, because a surface has three
+    independent readings and a failure in one says nothing about the others.
+    The `formatted_body` reader is a parser running over attacker-chosen
+    input; when it gives up, the plain `body` beside it is still perfectly
+    readable and is still what most clients show. Losing it was the bypass.
+    """
+    parts: List[str] = []
+    incomplete = False
+    for reader in (_body_field, _filename_field, _formatted_field):
+        try:
+            parts.extend(reader(surface))
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            incomplete = True
+            logger.warning(
+                "moderation could not read the %s of a message surface at "
+                "%s (%s); the other fields are still checked",
+                reader.__name__.removesuffix("_field"),
+                error_site(exc),
+                type(exc).__name__,
+            )
+    return parts, incomplete
+
+
+def _body_field(surface: Mapping[str, Any]) -> List[str]:
+    return _field_text(surface.get("body"))
+
+
+def _filename_field(surface: Mapping[str, Any]) -> List[str]:
     # `isinstance` first: a `msgtype` that is a list or an object is unhashable,
     # and the set-membership test then raises `TypeError` out of extraction -
     # which the fail-open handler catches, discarding the outer body that had
     # already been read. A malformed field must not cost the message its check.
     msgtype = surface.get("msgtype")
     if isinstance(msgtype, str) and msgtype in _ATTACHMENT_MSGTYPES:
-        parts.extend(_field_text(surface.get("filename")))
+        return _field_text(surface.get("filename"))
+    return []
+
+
+def _formatted_field(surface: Mapping[str, Any]) -> List[str]:
     formatted = surface.get("formatted_body")
     if (
-        surface.get("format") == _HTML_FORMAT
-        and isinstance(formatted, str)
-        and formatted.strip()
+        surface.get("format") != _HTML_FORMAT
+        or not isinstance(formatted, str)
+        or not formatted.strip()
     ):
-        displayed = _displayed_text(formatted)
-        if displayed.strip():
-            parts.append(displayed)
-    return parts
+        return []
+    displayed = _displayed_text(formatted)
+    return [displayed] if displayed.strip() else []
 
 
 def _field_text(body: Any) -> List[str]:

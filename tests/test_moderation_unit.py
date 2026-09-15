@@ -65,7 +65,7 @@ from synapse_pangea_chat.moderation.tier1_prefilter import (
 )
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
 
-from .moderation_doubles import EventStoreDouble, HomeServerDouble
+from .moderation_doubles import EventStoreDouble, HomeServerDouble, MetricReader
 from .moderation_doubles import module_api as module_api_double
 
 
@@ -200,6 +200,16 @@ def _config(**overrides: Any) -> PangeaChatConfig:
 
 def _moderation(config: PangeaChatConfig) -> ChatModeration:
     return ChatModeration(_module_api(), config)
+
+
+def _tier2_config(**overrides: Any) -> PangeaChatConfig:
+    return _config(
+        moderation_tier1_enabled=False,
+        moderation_tier2_enabled=True,
+        moderation_choreo_base_url="http://choreo.invalid",
+        moderation_choreo_access_token="syt_test",
+        **overrides,
+    )
 
 
 def _tier2_module(
@@ -517,13 +527,7 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         return ModerationJob(**fields)
 
     def _tier2_config(self, **overrides: Any) -> PangeaChatConfig:
-        return _config(
-            moderation_tier1_enabled=False,
-            moderation_tier2_enabled=True,
-            moderation_choreo_base_url="http://choreo.invalid",
-            moderation_choreo_access_token="syt_test",
-            **overrides,
-        )
+        return _tier2_config(**overrides)
 
     def _verdict(self, **overrides: Any) -> AsyncMock:
         """An autospec of the real `moderate_text`, not a bare `AsyncMock`.
@@ -821,6 +825,207 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         send = cast(AsyncMock, api.create_and_send_event_into_room)
         assert send.await_args is not None
         self.assertTrue(send.await_args.args[0]["content"]["reason"].endswith("sexual"))
+
+
+class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase):
+    """ "We could not read this" and "there is nothing here" are different
+    facts, and the extractor used to report them the same way.
+
+    This is the class `tier1_prefilter.check_text` already names for the RULES
+    - a partial failure converted into a clean negative - reappearing one
+    layer up, in the extraction that feeds them. A single `formatted_body`
+    that breaks the parser discarded the plain `body` that had already been
+    read, returned "no text", and skipped BOTH tiers with nothing counted: a
+    bypass any sender can trigger on every message, invisible on every
+    dashboard.
+    """
+
+    _BOMB = "<![CDATA[>" * 300 + "call 415-555-2671" + "]]>" * 300
+
+    async def test_a_payload_that_breaks_the_parser_still_reaches_tier_1(self) -> None:
+        """The reproduction. ~4 KB of nested CDATA sections; the recovered
+        remainder was parsed by a nested parser per section, so 300 of them
+        was 300 frames of recursion. `RecursionError` left the whole event
+        unmoderated even though the plain body had already been read and says
+        `call 415-555-2671`."""
+        mod = _moderation(_config())
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "call 415-555-2671",
+                "format": "org.matrix.custom.html",
+                "formatted_body": self._BOMB,
+            }
+        )
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    def test_the_renderer_no_longer_recurses_per_section(self) -> None:
+        """Fixed at the mechanism, not by catching the error: HTML5 has no
+        CDATA in an HTML body, so `<![` opens a bogus comment that ends at the
+        first `>` and everything after it is text. Reading it that way is both
+        correct and flat."""
+        self.assertIn("call 415-555-2671", _displayed_text(self._BOMB))
+        self.assertEqual(
+            _displayed_text("<![CDATA[>call 415-555-2671]]>"),
+            "call 415-555-2671]]>",
+        )
+        # An unterminated section was a second way to lose the text outright:
+        # Python's parser waits for a `]]>` that never arrives.
+        self.assertIn(
+            "call 415-555-2671", _displayed_text("<![CDATA[>call 415-555-2671")
+        )
+
+    async def test_a_surface_that_cannot_be_read_does_not_cost_the_others(
+        self,
+    ) -> None:
+        """The class, asserted against a renderer that simply explodes, so it
+        holds for whatever the next unparseable payload turns out to be."""
+        mod = _moderation(_config())
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "call 415-555-2671",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "<b>hello</b>",
+            }
+        )
+        with patch(
+            "synapse_pangea_chat.moderation._displayed_text",
+            side_effect=RecursionError("boom"),
+        ):
+            self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_a_surface_that_cannot_be_read_is_counted(self) -> None:
+        """Fail-open must not mean fail-silent. An unreadable surface is an
+        unknown, and an uncounted unknown is indistinguishable from a clean
+        message on every dashboard an operator has."""
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_extraction_incomplete_total", tier="tier1")
+        mod = _moderation(_config())
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "an ordinary sentence",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "<b>hello</b>",
+            }
+        )
+        with patch(
+            "synapse_pangea_chat.moderation._displayed_text",
+            side_effect=RecursionError("boom"),
+        ):
+            self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
+        self.assertEqual(
+            reader.delta("pangea_moderation_extraction_incomplete_total", tier="tier1"),
+            1.0,
+            "an unreadable surface went uncounted",
+        )
+
+    async def test_an_unreadable_surface_still_reaches_tier_2(self) -> None:
+        """Escalation is the other half. Tier 1 cannot ask anybody; Tier 2
+        can, and a message we could not fully read is exactly the one that
+        needs the tier that reads it in context."""
+        homeserver = HomeServerDouble()
+        mod = _tier2_module(self, _module_api(homeserver), _tier2_config())
+        dispatcher = mod._dispatcher
+        assert dispatcher is not None
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "an ordinary sentence",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "<b>hello</b>",
+            }
+        )
+        with patch(
+            "synapse_pangea_chat.moderation._displayed_text",
+            side_effect=RecursionError("boom"),
+        ):
+            await mod.on_new_event(event, {})
+        self.assertEqual(dispatcher.queue_depth, 1)
+
+    async def test_an_event_with_no_readable_text_at_all_is_counted(self) -> None:
+        """The floor of the rule: when nothing could be read, Tier 2 has
+        nothing to ask about - and that is a DROP, which is counted, not a
+        message that passed."""
+        reader = MetricReader()
+        reader.snapshot(
+            "pangea_moderation_tier2_dropped_total", cause="extraction_failed"
+        )
+        homeserver = HomeServerDouble()
+        mod = _tier2_module(self, _module_api(homeserver), _tier2_config())
+        event = _event(content={"msgtype": "m.text", "body": "hello"})
+        with patch(
+            "synapse_pangea_chat.moderation._surface_text",
+            side_effect=RuntimeError("boom"),
+        ):
+            await mod.on_new_event(event, {})
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="extraction_failed"
+            ),
+            1.0,
+        )
+
+    async def test_a_dispatch_failure_is_counted(self) -> None:
+        """The same rule at the dispatch boundary: `on_new_event` swallowed
+        every exception and returned, so a message that never reached the
+        queue was reported nowhere."""
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier2_dropped_total", cause="dispatch_error")
+        homeserver = HomeServerDouble()
+        mod = _tier2_module(self, _module_api(homeserver), _tier2_config())
+        with patch.object(
+            mod, "_room_has_activity_plan", side_effect=RuntimeError("boom")
+        ):
+            await mod.on_new_event(_event("hello there"), {})
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="dispatch_error"
+            ),
+            1.0,
+        )
+
+
+class TestTableRepair(unittest.IsolatedAsyncioTestCase):
+    """Text inside a table but outside a cell is DISPLAYED BEFORE THE TABLE.
+
+    HTML5 calls it foster parenting, and it is not an obscure corner: it is
+    what every browser does with `<table>41<tr><td>notes</td></tr>5-555-2671`,
+    which reads as `415-555-2671` followed by a one-cell table. The extractor
+    returned `41\n\nnotes\n\n5-555-2671` - source order, with the cell
+    breaks between - so the number a reader sees was never shown to either
+    tier. Same rule as every other case in this file: what the rules see is
+    never less than what a reader sees.
+    """
+
+    FOSTERED = "<table>41<tr><td>notes</td></tr>5-555-2671</table>"
+
+    def test_the_fostered_run_is_moderated_as_one_string(self) -> None:
+        self.assertIn("415-555-2671", _displayed_text(self.FOSTERED))
+
+    def test_cell_text_is_still_separated(self) -> None:
+        """The repair adds a surface; it does not join cells that render
+        apart, which would invent a number out of two columns."""
+        cells = _displayed_text("<table><tr><td>415</td><td>5552671</td></tr></table>")
+        self.assertNotIn("4155552671", cells)
+
+    def test_two_tables_do_not_run_together(self) -> None:
+        first = "<table>41</table>"
+        second = "<table>5-555-2671</table>"
+        self.assertNotIn("415-555-2671", _displayed_text(first + second))
+
+    async def test_the_displayed_number_blocks_before_send(self) -> None:
+        mod = _moderation(_config())
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "look",
+                "format": "org.matrix.custom.html",
+                "formatted_body": self.FOSTERED,
+            }
+        )
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
 
 
 class TestExtraction(unittest.IsolatedAsyncioTestCase):

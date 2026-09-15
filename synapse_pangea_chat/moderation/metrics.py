@@ -47,10 +47,24 @@ def _get_or_create(
     return collector_class(name, documentation, list(labelnames), **kwargs)
 
 
-# Tier 1's own counters are deliberately absent. Declaring a metric nothing
-# increments publishes a series that reads as a steady zero - which an
+# Tier 1's own verdict counters are deliberately absent. Declaring a metric
+# nothing increments publishes a series that reads as a steady zero - which an
 # operator cannot tell from "the thing never happens", and which is worse than
 # no series at all. They belong to the change that instruments the pre-filter.
+
+# --- Extraction ----------------------------------------------------------
+
+EXTRACTION_INCOMPLETE = _get_or_create(
+    Counter,
+    "pangea_moderation_extraction_incomplete_total",
+    "Messages whose displayed text could not be read in full, by tier. The "
+    "message was still checked on whatever text WAS read.",
+    ["tier"],
+)
+
+# Both tiers, because the same message is read twice and either read can fail
+# on its own - and an operator needs to know which tier is blind.
+EXTRACTION_TIERS = frozenset({"tier1", "tier2"})
 
 # --- Tier 2 queue and dispatch -------------------------------------------
 
@@ -185,6 +199,14 @@ DROP_CAUSES = frozenset(
         "handler_error",
         # The job was cancelled after a worker picked it up.
         "cancelled",
+        # Nothing readable could be extracted, so there was nothing to ask
+        # about. NOT the same as a message with no text: this one had text and
+        # we could not read it.
+        "extraction_failed",
+        # `on_new_event` raised before the job reached the queue. It fails
+        # open by contract, and an uncounted failure there was a message that
+        # vanished between the notifier and the queue with nothing to show.
+        "dispatch_error",
     }
 )
 
@@ -216,6 +238,18 @@ def record_drop(cause: str, count: int = 1) -> None:
     if cause not in DROP_CAUSES:
         raise ValueError(f"unknown moderation drop cause {cause!r}")
     TIER2_DROPPED.labels(cause=cause).inc(count)
+
+
+def record_extraction_incomplete(tier: str) -> None:
+    """Count a message whose displayed text could not be read in full.
+
+    Raises on an unknown tier for the same reason `record_drop` does: this
+    counter exists to make an unknown visible, and an unknown filed under a
+    label nobody alerts on is still invisible.
+    """
+    if tier not in EXTRACTION_TIERS:
+        raise ValueError(f"unknown moderation extraction tier {tier!r}")
+    EXTRACTION_INCOMPLETE.labels(tier=tier).inc()
 
 
 def record_check(outcome: str) -> None:

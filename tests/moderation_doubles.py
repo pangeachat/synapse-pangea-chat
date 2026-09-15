@@ -8,7 +8,7 @@ same idea one level up.
 """
 
 from types import SimpleNamespace
-from typing import Any, Callable, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 from unittest.mock import create_autospec
 
 from synapse.module_api import ModuleApi
@@ -191,3 +191,33 @@ def module_api(
     api._hs = homeserver if homeserver is not None else HomeServerDouble()
     api.should_run_background_tasks.return_value = run_background_tasks
     return cast(ModuleApi, api)
+
+
+class MetricReader:
+    """Reads a metric's value, by name, out of the default registry.
+
+    By name and not by reaching into a collector's private `_value`: the
+    assertion a test wants to make is "an operator scraping this server sees
+    the drop", and the only thing that establishes that is the sample the
+    registry exposes.
+    """
+
+    def __init__(self) -> None:
+        from prometheus_client import REGISTRY
+
+        self._registry = REGISTRY
+        self._base: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float] = {}
+
+    def _read(self, name: str, **labels: str) -> float:
+        value = self._registry.get_sample_value(name, labels or None)
+        return 0.0 if value is None else float(value)
+
+    def snapshot(self, name: str, **labels: str) -> None:
+        self._base[(name, tuple(sorted(labels.items())))] = self._read(name, **labels)
+
+    def delta(self, name: str, **labels: str) -> float:
+        key = (name, tuple(sorted(labels.items())))
+        return self._read(name, **labels) - self._base.get(key, 0.0)
+
+    def value(self, name: str, **labels: str) -> float:
+        return self._read(name, **labels)
