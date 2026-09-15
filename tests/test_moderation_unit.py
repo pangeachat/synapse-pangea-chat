@@ -234,9 +234,11 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
 
     async def test_activity_room_skipped(self) -> None:
         mod = _moderation(self._tier2_config())
-        mod._check_and_redact = AsyncMock()  # type: ignore[method-assign]
         state = {(PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE, ""): MagicMock()}
-        with patch("synapse_pangea_chat.moderation.run_as_background_process") as bg:
+        with (
+            patch.object(ChatModeration, "_check_and_redact", AsyncMock()),
+            patch("synapse_pangea_chat.moderation.run_as_background_process") as bg,
+        ):
             await mod.on_new_event(_event("you suck"), state)
             bg.assert_not_called()
 

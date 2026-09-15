@@ -9,9 +9,23 @@ gate (the mock accepts any non-empty token).
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, List
+from typing import Any, List, Tuple
 
 FLAG_MARKER = "FLAGME"
+
+
+class _RecordingHTTPServer(HTTPServer):
+    """An `HTTPServer` that owns the list of texts the handler has seen.
+
+    The handler reaches its server through `self.server`, which the stdlib
+    types as `socketserver.BaseServer`, so bolting the attribute onto a plain
+    `HTTPServer` needed a type suppression at every use. Declaring it on a
+    subclass needs none.
+    """
+
+    def __init__(self, address: Tuple[str, int], handler: Any) -> None:
+        super().__init__(address, handler)
+        self.seen_texts: List[str] = []
 
 
 class _MockModerationHandler(BaseHTTPRequestHandler):
@@ -19,7 +33,11 @@ class _MockModerationHandler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self) -> None:  # noqa: N802 - http.server API
-        server: "MockModerationServer" = self.server  # type: ignore[assignment]
+        # Runtime-checked narrowing rather than a suppression: `self.server`
+        # is typed as the base server, and this handler is only ever attached
+        # to the subclass above.
+        assert isinstance(self.server, _RecordingHTTPServer)
+        server = self.server
         if self.path != "/choreo/moderate":
             self._send(404, {"detail": "not found"})
             return
@@ -52,13 +70,12 @@ class _MockModerationHandler(BaseHTTPRequestHandler):
 
 class MockModerationServer:
     def __init__(self) -> None:
-        self._httpd = HTTPServer(("127.0.0.1", 0), _MockModerationHandler)
-        self._httpd.seen_texts = []  # type: ignore[attr-defined]
+        self._httpd = _RecordingHTTPServer(("127.0.0.1", 0), _MockModerationHandler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
 
     @property
     def seen_texts(self) -> List[str]:
-        return self._httpd.seen_texts  # type: ignore[attr-defined]
+        return self._httpd.seen_texts
 
     @property
     def base_url(self) -> str:
