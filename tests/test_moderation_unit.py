@@ -1575,6 +1575,36 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
             "a disclosure was removed and nothing said so",
         )
 
+    async def test_a_failure_to_report_is_not_a_failed_redaction(self) -> None:
+        """The report runs after a redaction that LANDED, so it must not be
+        inside the handler that reads an exception as a failed send:
+        releasing the claim and counting a failure on a redaction that
+        already happened would leave the message down and the table saying
+        nobody took it down."""
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier2_redaction_failed_total", cause="other")
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("harassment")):
+            with patch.object(
+                mod, "_warn_if_preserved_meanwhile", side_effect=RuntimeError("boom")
+            ):
+                with self.assertRaises(RuntimeError):
+                    await mod._check_and_redact(self._job())
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_redaction_failed_total", cause="other"
+            ),
+            0.0,
+            "a landed redaction was counted as a failure",
+        )
+        row = db_pool.connection.execute(
+            f"SELECT disposition FROM {DISPOSITION_TABLE} WHERE event_id = ?",
+            (self._job().event_id,),
+        ).fetchone()
+        self.assertEqual(row, ("redacted",), "the claim was released after a send")
+
     async def test_an_ordinary_redaction_is_not_reported_as_one(self) -> None:
         """The other half: the report has to mean something, so an ordinary
         redaction must not raise it."""

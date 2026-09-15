@@ -916,7 +916,6 @@ class ChatModeration:
                 }
             )
             metrics.TIER2_REDACTIONS.labels(category=category).inc()
-            await self._warn_if_preserved_meanwhile(job)
         except Exception as exc:
             reraise_if_cancelled(exc)
             # A redaction send can fail for reasons that are ordinary rather
@@ -951,6 +950,12 @@ class ChatModeration:
                 error_site(exc),
                 type(exc).__name__,
             )
+            return
+        # OUTSIDE the try, and deliberately: anything that raised in here
+        # while inside it would be read as a failed send, and the module would
+        # release a claim and count a failure on a redaction that had already
+        # landed.
+        await self._warn_if_preserved_meanwhile(job)
 
     def _record_matcher_agreement(
         self, job: ModerationJob, result: Optional[Mapping[str, Any]]
