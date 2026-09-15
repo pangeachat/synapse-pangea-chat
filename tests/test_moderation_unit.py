@@ -978,6 +978,48 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
         cast(AsyncMock, first_api.create_and_send_event_into_room).assert_awaited_once()
         cast(AsyncMock, second_api.create_and_send_event_into_room).assert_not_awaited()
 
+    async def test_a_written_off_job_cannot_redact_after_shutdown(self) -> None:
+        """The redaction path's own refusal, asserted at the point of action.
+
+        The dispatcher cancels an abandoned worker, but `CancelledError` is an
+        `Exception` and every handler in this module catches those by design.
+        So the last line is here: once the drain has ended, no verdict sends
+        anything into a room.
+        """
+        reader = MetricReader()
+        reader.snapshot(
+            "pangea_moderation_tier2_redaction_skipped_total", cause="shutdown"
+        )
+        api, homeserver = self._pair()
+        mod = self._module(api, homeserver)
+        assert mod._dispatcher is not None
+        mod._dispatcher._drained = True
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_redaction_skipped_total", cause="shutdown"
+            ),
+            1.0,
+        )
+
+    async def test_a_disclosure_is_still_recorded_on_the_way_down(self) -> None:
+        """A preserve can only ever keep a message up, so shutting down is not
+        a reason to lose it: a restart that does not know why a message was
+        left standing is a restart that can redact it."""
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        assert mod._dispatcher is not None
+        mod._dispatcher._drained = True
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job())
+        rows = db_pool.connection.execute(
+            f"SELECT disposition FROM {DISPOSITION_TABLE}"
+        ).fetchall()
+        self.assertEqual(rows, [("preserved",)])
+
     async def test_a_failed_send_gives_the_claim_back(self) -> None:
         """A claim that outlived a failed send would turn a transient failure
         - the sender is briefly unable to send - into a permanent one: the

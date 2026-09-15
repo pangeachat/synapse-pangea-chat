@@ -437,6 +437,21 @@ class Tier2Dispatcher:
             )
 
     @property
+    def actions_permitted(self) -> bool:
+        """May a job still act on a room?
+
+        False from the moment the drain ENDS - not from the moment it starts.
+        A drain is for finishing the work, so a job that completes inside the
+        window must still be able to send its redaction; a job the drain wrote
+        off must not, and cancelling it is not enough on its own to guarantee
+        that. `CancelledError` IS an `Exception`, and every handler in this
+        module has a broad `except` by design, so a handler can absorb the
+        cancellation and carry on. The redaction path asks this before it
+        sends anything, which is a check no exception can swallow.
+        """
+        return not self._drained
+
+    @property
     def queue_depth(self) -> int:
         return len(self._queue)
 
@@ -578,15 +593,44 @@ class Tier2Dispatcher:
                 "deadline",
                 len(abandoned),
             )
-            # Forgotten as well as counted. The jobs themselves keep running -
-            # nothing here can stop a coroutine mid-`await` - but they have
-            # been accounted for, and leaving their ids in `_running` would
-            # make a second shutdown wait on them again and count them again.
+            # Forgotten as well as counted, so a second shutdown does not
+            # wait on them again and count them again.
             for event_id in abandoned:
                 self._running.discard(event_id)
                 self._inflight.discard(event_id)
             metrics.TIER2_INFLIGHT.set(len(self._running))
+        # STOPPED, and not merely written off. Clearing the accounting and
+        # walking away left the coroutines running: the drain reported the job
+        # abandoned and returned, and the job then woke up, read the database
+        # and sent a redaction into a room after the homeserver had been told
+        # moderation was finished. Cancelling the worker ends it at whatever
+        # `await` it is sitting on.
+        #
+        # `_finish_drain` runs first so `actions_permitted` is already false
+        # by the time a cancelled coroutine resumes: cancellation is the
+        # mechanism and the flag is the guarantee, because a handler that
+        # catches `Exception` catches `CancelledError` with it.
         self._finish_drain()
+        self._cancel_workers()
+
+    def _cancel_workers(self) -> None:
+        # Under `PreserveLoggingContext`, for the same reason `_wake_one` is:
+        # cancelling a Deferred RESUMES the coroutine awaiting it, right here,
+        # and that coroutine restores its own context as it goes. Without the
+        # wrapper the caller's context is handed to the worker and lost - the
+        # leak class of commit 33f7ead, and on Synapse 1.159 a leak that
+        # happens inside a timer permanently kills the timer.
+        with PreserveLoggingContext():
+            for index, worker in enumerate(self._workers):
+                if worker is None or worker.called:
+                    continue
+                try:
+                    worker.cancel()
+                except Exception:
+                    # A canceller that raises must not stop the rest being
+                    # cancelled, and there is nothing useful to do about it
+                    # here: the process is on its way down.
+                    logger.warning("tier2 worker %d could not be cancelled", index)
 
     def _finish_drain(self) -> None:
         if not self._drained:

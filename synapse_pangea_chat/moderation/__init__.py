@@ -776,6 +776,10 @@ class ChatModeration:
             # and a redaction removes it from the room while telling nobody.
             # So the verdict is kept and the message is left standing.
             #
+            # Recorded even on the way down, unlike a redaction: writing the
+            # protection down can only ever keep a message up, and a shutdown
+            # that loses it is a restart that does not know why.
+            #
             # RECORDED, and recorded before anything else: the decision has to
             # outlive this job, this process and this instance, because a
             # second verdict on the same event used to redact what the first
@@ -872,6 +876,20 @@ class ChatModeration:
         does not fail towards carrying on, for the reason in
         `moderation.disposition`.
         """
+        if self._dispatcher is not None and not self._dispatcher.actions_permitted:
+            # The drain has ended and this job was written off. Nothing here
+            # can stop a coroutine mid-`await`, and the cancellation that
+            # tries to is catchable by every broad `except` in this module -
+            # so the last line is a check at the point of action, which no
+            # exception can swallow.
+            metrics.record_redaction_skip("shutdown")
+            logger.warning(
+                "tier2 will not redact %s in %s: moderation has already shut "
+                "down and this check was written off",
+                job.event_id,
+                job.room_id,
+            )
+            return False
         if self._disposition is None:
             return True
         claim = await self._disposition.claim_redaction(

@@ -986,6 +986,79 @@ class DispatcherTestCase(unittest.TestCase):
             drained.called, "an unbounded wait is worse than an abandoned one"
         )
 
+    def test_an_abandoned_job_does_not_act_after_shutdown_returned(self) -> None:
+        """Abandoning the ACCOUNTING is not abandoning the WORK.
+
+        The drain wrote the job off, reported it and returned - and then the
+        coroutine, which nothing had stopped, woke up and carried on: a
+        database read and a redaction sent into a room, after the homeserver
+        had been told moderation was done. A shutdown that has returned must
+        not be able to change a room.
+        """
+        self.dispatcher.start()
+        self.handler.hold = True
+        self._drain()
+        self.dispatcher.enqueue(self._job("$stuck"))
+        self._drain()
+        drained = start_worker(self.dispatcher.shutdown)
+        self._drain()
+        self.clock.advance(6.0)
+        self.assertTrue(drained.called, "the drain never finished")
+        self.assertNotIn("$stuck", self.handler.finished)
+
+        # The verdict arrives after the deadline, which is the case the
+        # reproduction used: hold a verdict, shut down, advance past the drain
+        # deadline, then release it.
+        self.handler.release_all()
+        self._drain()
+        self.assertNotIn(
+            "$stuck",
+            self.handler.finished,
+            "an abandoned job carried on and acted after shutdown returned",
+        )
+
+    def test_a_handler_that_swallows_cancellation_is_still_stopped(self) -> None:
+        """Cancellation is the mechanism and it is not the guarantee.
+
+        `CancelledError` IS an `Exception`, so a handler with a broad `except`
+        can absorb it and carry on - which is exactly what this module's own
+        fail-open handlers are written to do. The dispatcher therefore also
+        REFUSES work once the drain has ended, and that refusal is what the
+        redaction path consults before it sends anything.
+        """
+        self.dispatcher.start()
+        self.handler.hold = True
+        self.handler.swallow_cancel = True
+        self._drain()
+        self.dispatcher.enqueue(self._job("$stubborn"))
+        self._drain()
+        start_worker(self.dispatcher.shutdown)
+        self._drain()
+        self.clock.advance(6.0)
+        self.assertFalse(
+            self.dispatcher.actions_permitted,
+            "a drain that has ended still permitted work to act on a room",
+        )
+
+    def test_actions_are_permitted_while_a_drain_is_still_running(self) -> None:
+        """The refusal is on the END of the drain, not on its start. A job
+        that finishes inside the drain window must still be able to redact -
+        draining means finishing the work, not abandoning it."""
+        self.dispatcher.start()
+        self.handler.hold = True
+        self._drain()
+        self.dispatcher.enqueue(self._job("$inflight"))
+        self._drain()
+        start_worker(self.dispatcher.shutdown)
+        self._drain()
+        self.assertTrue(
+            self.dispatcher.actions_permitted,
+            "a job still inside the drain window was refused",
+        )
+        self.handler.release_all()
+        self._drain()
+        self.assertIn("$inflight", self.handler.finished)
+
     def test_abandoned_work_is_counted_once_and_then_forgotten(self) -> None:
         # Abandoning has to clear the accounting as well as report it. Leaving
         # the ids in `_running` makes a second shutdown wait on jobs that have

@@ -240,6 +240,9 @@ REDACTION_SKIP_CAUSES = frozenset(
         # disclosure, protected by an earlier verdict, that a later one wanted
         # to take down.
         "preserved",
+        # The drain has ended, so this job was written off before it got
+        # here. A shutdown that has returned must not change a room.
+        "shutdown",
         # The disposition table could not be read, so we cannot establish that
         # this event was NOT preserved. The one place this module refuses to
         # act on an unknown rather than carrying on - see
