@@ -249,6 +249,28 @@ class TestTheCorpusAndTheClassificationAgree(unittest.TestCase):
         self.assertGreater(checked, 30, "most evasion spellings are listed terms")
 
 
+class TestTheTier2AllowlistHolds(unittest.TestCase):
+    """The words the Tier 2 matcher exempts by name, asserted directly.
+
+    Every other assertion about Tier 2 runs over the negative controls, and a
+    control can be excused by marking it. This cannot: it reads the allowlist
+    out of `curation_decisions` and requires the bare word to pass, so
+    breaking the allowlist fails here whatever is marked elsewhere.
+    """
+
+    def test_every_allowlisted_word_passes_the_tier2_matcher(self) -> None:
+        allowlist = _corpus()["curation_decisions"]["allowlist"]
+        self.assertTrue(allowlist)
+        for word, reason in allowlist.items():
+            with self.subTest(word=word):
+                self.assertTrue(reason.strip(), "an exemption states its reason")
+                self.assertFalse(
+                    contains_profanity(word),
+                    f"{word!r} is allowlisted and the Tier 2 matcher flags it",
+                )
+                self.assertFalse(matches_tier1(word))
+
+
 class TestTier1StillBlocksProfanity(unittest.TestCase):
     """The other half of the bargain. Permissive must not mean inert: if the
     universal set were emptied, every test above would pass and Tier 1 would
@@ -415,10 +437,12 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
         for entry in universal_terms():
             if not entry["tier1"] or entry["review"]["basis"] != "native_review":
                 continue
+            reviewer = str(entry["review"].get("by", "")).strip()
             with self.subTest(term=entry["term"]):
+                self.assertTrue(reviewer, "a native review has to name its reviewer")
                 self.assertNotIn(
                     "curator",
-                    str(entry["review"].get("by", "")),
+                    reviewer,
                     "the curator is not a native reviewer of anything but English",
                 )
                 self.assertTrue(str(entry["review"].get("date", "")).strip())
@@ -715,6 +739,19 @@ class TestTheMatchingRules(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
+    def test_a_list_of_letters_is_not_an_evasion(self) -> None:
+        """`Press C, U, N, T to continue` is how a keyboard prompt is
+        written, and `Tôi đang học các chữ cái C, U, N, T` is a learner
+        naming them. A run of single letters rejoins across whitespace and
+        nothing else - a comma is not part of a word."""
+        for text in (
+            "Press C, U, N, T to continue.",
+            "Tôi đang học các chữ cái C, U, N, T.",
+            "Я запишу буквы х. У. Й.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(matches_tier1(text))
+
     def test_only_letters_of_an_alphabet_are_treated_as_fragments(self) -> None:
         """Asserted on the rule itself, because no term written in one of
         those scripts is in Tier 1 today - there is no reviewer for one - so
@@ -764,6 +801,19 @@ class TestTheMatchingRules(unittest.TestCase):
         self.assertFalse(
             matches_tier1("Tôi đang tập viết chữ pê. Đê là chữ tiếp theo.")
         )
+        # And on a phrase that IS in Tier 1 today, because `pe de` is not, and
+        # an assertion about a term nobody matches protects nothing.
+        live = [
+            entry
+            for entry in universal_terms()
+            if entry["tier1"] and entry["match"] == "phrase"
+        ]
+        self.assertTrue(live, "no phrase term left to exercise the rule")
+        for entry in live:
+            words = entry["term"].split()
+            with self.subTest(term=entry["term"]):
+                self.assertTrue(matches_tier1(" ".join(words)))
+                self.assertFalse(matches_tier1(". ".join(words)))
 
     def test_letters_split_apart_are_still_caught(self) -> None:
         for text in ("f u c k you", "f.u.c.k", "fuuuuck"):

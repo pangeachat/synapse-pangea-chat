@@ -48,6 +48,7 @@
    "La puta de sol és molt forta avui.",
    "We bought a faggot for dinner.",
    "The hoer removed the weeds.",
+   "Press C, U, N, T to continue.",
    "くその木を観察しました。",
    "김 씨 발이 아파요.",
    "2016년은 병신(丙申)년입니다.",
@@ -294,6 +295,13 @@
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Dutch 'hoer' is on the Tier 2 list and the English word is spelled the same.",
      "tier2_reason": "term_is_on_the_tier2_list"
+    },
+    {
+     "sentence": "Press C, U, N, T to continue.",
+     "why_benign": "A keyboard prompt naming four letters. A comma is not part of a word, so a run of single letters must not rejoin across one.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "tier2_rejoins_fragments",
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher rejoins short fragments without asking what separated them."
     }
    ]
   },

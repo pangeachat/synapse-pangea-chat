@@ -316,7 +316,7 @@ def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
 
     - across PUNCTUATION, fragments of one or two characters rejoin, which is
       what recovers `f*ck` and `k.u.r.v.a`;
-    - across a SPACE, only single characters of an ALPHABET rejoin. A space
+    - across WHITESPACE ALONE, only single characters of an ALPHABET rejoin. A space
       is a real word boundary, and in the scripts where one character is a
       whole syllable it separates ordinary words: `민수 씨 발 아파요?` is
       "Minsu, does your foot hurt?", and rejoining its syllables makes a
@@ -361,7 +361,12 @@ def _joinable(span: Span, run: List[str]) -> bool:
         return False
     if not span.after_space:
         return len(span.text) <= _FRAGMENT_LEN
-    return len(span.text) == 1 and (not run or len(run[-1]) == 1)
+    # Whitespace and nothing else. `C, U, N, T` is how a list of letters is
+    # written - "press C, U, N, T to continue" - and a comma is not part of a
+    # word, so a run does not continue over one.
+    return (
+        span.after_space_only and len(span.text) == 1 and (not run or len(run[-1]) == 1)
+    )
 
 
 def _alphabetic(token: str) -> bool:
