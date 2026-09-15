@@ -11,6 +11,21 @@ person only through the database, under authorisation.
 The tests capture the ROOT logger rather than the module's own. A leak that
 arrives through a dependency's logger, or through an exception Synapse logs
 on our behalf, is the same leak, and a module-scoped capture cannot see it.
+
+Two channels these tests deliberately do NOT cover, because no module can
+close them:
+
+- Synapse's global `LoggingContextFilter` sets `requester` and
+  `authenticated_entity` on EVERY log record emitted inside a request's
+  logging context, ours included. The default formatter prints neither, but
+  a structured-logging sink serialises the whole record.
+- Synapse logs some authorisation failures itself, with the Matrix ID, before
+  raising - `handle_new_client_event`'s "Denying new event" among them.
+
+Both are homeserver-wide properties of Synapse's request logging rather than
+anything this module writes, and they are recorded as limits in
+moderation.instructions.md. The rule the tests enforce is the one the module
+can keep: nothing IT passes to a logger carries a Matrix ID or message text.
 """
 
 import logging
@@ -46,11 +61,28 @@ class _CapturingHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             self.seen.append(record.getMessage())
-        except Exception:  # pragma: no cover - a broken format string
+        except Exception:
             self.seen.append(str(record.msg))
         self.seen.append(repr(record.args))
         if record.exc_info is not None:
             self.seen.append(logging.Formatter().formatException(record.exc_info))
+        # Anything the module attached with `extra=` lands in the record's
+        # __dict__ and never appears in the formatted message, so a leak
+        # through that door would be invisible to the two lines above.
+        # Synapse's own LoggingContextFilter also writes `requester` and
+        # `authenticated_entity` here on every record raised inside a
+        # request - see the module docstring; that is not ours to remove,
+        # and it is not set in these tests, which have no logcontext.
+        self.seen.append(
+            repr(
+                {
+                    key: value
+                    for key, value in record.__dict__.items()
+                    if key
+                    not in logging.LogRecord("", 0, "", 0, "", None, None).__dict__
+                }
+            )
+        )
 
 
 class FakeEvent:

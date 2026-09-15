@@ -52,6 +52,8 @@ One collision cannot be resolved by exclusion: stripping diacritics merges Slova
 
 Fires after an event persists, from a background task so event persistence never waits on HTTP. It calls the choreographer's shared moderation handler (the org doc's single engine rule) authenticated as a dedicated moderation service account — the endpoint accepts any valid token on this homeserver. Category names are normalized onto the orchestrator's flag vocabulary so both moderation paths speak one language.
 
+Both tiers read an edit's replacement text from `m.new_content` when it is present, testing for any `Mapping` rather than for `dict`: Synapse's Rust event type and a homeserver running `use_frozen_dicts: true` both hand modules content that is not a plain dict, and a `dict` test on either would silently stop moderating every edit.
+
 **Disposition is self-redaction: the redaction is sent as the offending sender.** The module send path enforces normal room power levels, and no service user is a member of every room — but a sender may always redact their own message, so self-redaction works in every room, DMs included. The moderation reason rides on the redaction event, prefixed so clients and audits can tell moderation redactions from ordinary ones. (This corrects the org doc's assumption that the module send path is privileged; it is not.)
 
 Tier 2 skips rooms carrying an activity-plan state event: the conversation orchestrator already moderates activity sessions, and a second check would double-redact and double-spend. Every failure in the check-and-redact path is logged and fails open, mirroring the choreo handler's own contract.
@@ -67,6 +69,13 @@ A redaction that cannot be sent is caught inside `_check_and_redact` rather than
 Exceptions are the channel that is easy to miss. `logger.exception` prints the exception's own message, and a library that fails on a message body routinely quotes that body back, so no moderation handler logs a traceback. Each logs the exception's type and the `file:line` that raised it, which is what identifies a bug, and nothing that came from the message.
 
 Rule identifiers name the **rule**, not the category of personal data it looks for, for the same reason: `rule=phone_number` beside a room id is an assertion about what a specific message contained.
+
+### What this rule does not reach
+
+The rule governs what the module passes to a logger. Two channels sit outside it, both properties of Synapse's request logging rather than of this module, and an operator should know about them before turning on structured logging:
+
+- Synapse's global `LoggingContextFilter` sets `requester` and `authenticated_entity` — the sender's Matrix ID — on **every** log record emitted inside a request's logging context, including every record this module writes. The shipped `precise` formatter prints `%(request)s`, the request id, and neither of those fields; a structured-logging sink or a custom format string that names them would emit the Matrix ID beside every moderation line.
+- Synapse logs some authorisation failures itself, with the Matrix ID, before raising — `handle_new_client_event`'s "Denying new event … User &lt;mxid&gt; not in room …" is the one a failed self-redaction hits. Catching the exception stops the second record (the background-process traceback); it cannot stop the first.
 
 ## Deliberately out of scope here
 

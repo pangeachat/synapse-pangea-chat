@@ -2,6 +2,7 @@
 filtering logic). No Synapse process — ModuleApi is mocked."""
 
 import unittest
+from types import MappingProxyType
 from typing import Any, Dict, List, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -294,6 +295,26 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         ):
             await mod._check_and_redact(_event("hi"), "hi")
         api.create_and_send_event_into_room.assert_not_awaited()
+
+
+class TestEditContentExtraction(unittest.IsolatedAsyncioTestCase):
+    async def test_replacement_text_is_read_from_any_mapping(self) -> None:
+        """Event content is not guaranteed to be a plain dict - Synapse's Rust
+        event type and `use_frozen_dicts: true` both hand modules other
+        mappings - and an `isinstance(..., dict)` test on one of those would
+        silently stop moderating the replacement text of every edit."""
+        mod = _moderation(_config())
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "* a harmless correction",
+                "m.new_content": MappingProxyType(
+                    {"msgtype": "m.text", "body": "call me: 415-555-2671"}
+                ),
+                "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
+            }
+        )
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
 
 
 class TestExemptGlobContainer(unittest.TestCase):

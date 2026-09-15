@@ -132,8 +132,14 @@ class ChatModeration:
         if event.type != "m.room.message":
             return None
         content = event.content or {}
-        new_content = content.get("m.new_content")
-        if isinstance(new_content, dict):
+        # `Mapping`, not `dict`: event content is not guaranteed to be a plain
+        # dict. Synapse builds events through a Rust type whose `content` is a
+        # `JsonObject`, and a homeserver running with `use_frozen_dicts: true`
+        # hands modules `immutabledict` values. An `isinstance(..., dict)`
+        # test on either returns False, which would silently stop moderating
+        # the replacement text of every edit - a bypass that fails open and
+        # says nothing.
+        if isinstance(new_content := content.get("m.new_content"), Mapping):
             content = new_content
         if content.get("msgtype") not in _TEXTUAL_MSGTYPES + _CAPTION_MSGTYPES:
             return None
