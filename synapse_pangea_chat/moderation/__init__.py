@@ -467,13 +467,13 @@ class ChatModeration:
         or by replication; in a monolith there is one process and the flag is
         true there.
 
-        What it does NOT give is idempotency across two instances that both
-        have `run_background_tasks` set. That is a misconfiguration, and it is
-        not detectable from inside either process - two independent processes,
-        two independent in-memory sets, no shared claim and nothing in a
-        redaction's response that says the other one happened. Closing it needs
-        a durable claim table, which is separate work; claiming it is closed
-        here would be false.
+        Two instances that both have `run_background_tasks` set is still a
+        misconfiguration and still not detectable from inside either process -
+        two independent processes, two independent in-memory sets. What it no
+        longer costs is a duplicated redaction: `moderation.disposition` holds
+        the claim in the database, so the second instance finds the event
+        already decided and skips it. The guard is what stops N workers making
+        N moderation CALLS; the table is what stops them sending N redactions.
 
         The invariant is made observable rather than asserted: a
         `pangea_moderation_tier2_active` gauge is 1 here and 0 elsewhere, so
@@ -995,20 +995,21 @@ class ChatModeration:
           id at a time - and there is no `await` between this read and the
           send that follows it, on a single-threaded reactor. So the send only
           ever happens on an event that a fresh read said was not redacted.
-        - **Across processes it is best-effort**, and so is this check. Two
-          instances both configured to run background tasks could both read an
-          unredacted event before either sends. That is a misconfiguration the
-          `should_run_background_tasks` guard exists to prevent and that no
-          in-memory state can detect; see `_start_tier2`.
+        - **Across processes the guarantee is the disposition claim**, not
+          this check. Two instances could both read an unredacted event here
+          before either sends; only one of them holds the claim
+          `_may_redact` took, and the other returned before reaching this
+          function. See `moderation.disposition`.
 
         A read that fails is a skip, not a redaction. Moderation fails open,
         and the precondition for sending is a read that SAID the event is
         still there - not the absence of an answer.
 
-        The cost of a duplicate, for scale: Synapse accepts a second redaction
+        The cost of a duplicate, for scale, and the reason this stayed a
+        guard rather than becoming a lock: Synapse accepts a second redaction
         of an already-redacted event and creates a second redaction event. No
         further content is lost; the damage is noise in the DAG and a second
-        notification. That is why this is a guard rather than a lock.
+        notification.
         """
         try:
             store = self._api._hs.get_datastores().main

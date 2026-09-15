@@ -390,17 +390,15 @@ class Tier2Dispatcher:
             # cancellation. An id left behind does not just leak: it
             # permanently blocks that event from ever being moderated again.
             #
-            # The limit, stated rather than discovered: on the cancellation
-            # path the claim is released while a redaction this job had
-            # already submitted may still be committing, so a redelivery of
-            # the same event could be admitted, re-read a target that is not
-            # yet redacted, and send a second redaction. Nothing in production
-            # cancels a worker - the drain abandons rather than cancels, the
-            # supervisor restarts rather than cancels, and the client's
-            # deadlines cancel the HTTP request and not the worker - so the
-            # window is not reachable today. Closing it for good needs a
-            # durable claim that outlives the process, which is the same thing
-            # cross-instance idempotency needs and is tracked with it.
+            # The window this used to leave open - a cancelled job releasing
+            # the in-memory claim while a redaction it had already submitted
+            # was still committing, so a redelivery could send a second one -
+            # is closed elsewhere: `moderation.disposition` takes a durable
+            # claim before any redaction and the row outlives the process, so
+            # a redelivery finds the event already claimed. This set is what
+            # keeps two jobs for one event off the queue at once; it is no
+            # longer the only thing standing between one message and two
+            # redactions.
             self._running.discard(job.event_id)
             self._inflight.discard(job.event_id)
             metrics.TIER2_INFLIGHT.set(len(self._running))
