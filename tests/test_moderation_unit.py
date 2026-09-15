@@ -1618,6 +1618,7 @@ class _FakeAgent:
         self.clock: Optional[Clock] = None
         self.cancelled = False
         self.canceller_raises = False
+        self.canceller_is_bare = False
         # Whatever the request Deferred was fired with, recorded before the
         # client's own callbacks consume it.
         self.source_results: List[Any] = []
@@ -1648,6 +1649,12 @@ class _FakeAgent:
             self.cancelled = True
             if self.canceller_raises:
                 raise RuntimeError("canceller blew up")
+            if self.canceller_is_bare:
+                # And the other real shape: a canceller that fires nothing, so
+                # twisted errbacks with a bare `CancelledError`. Synapse's
+                # proxy CONNECT waits on a Deferred with no canceller at all,
+                # which is exactly this.
+                return
             self.response.transport.aborted = True
             deferred.errback(
                 ResponseNeverReceived([Failure(ConnectionAborted("aborted"))])
@@ -1938,6 +1945,36 @@ class TestChoreoClient(unittest.TestCase):
         # And the late arrival changes nothing.
         clock.advance(REQUEST_TIMEOUT_SECONDS * 4)
         self.assertEqual(len(results), 1)
+
+    def test_a_deadline_is_a_timeout_even_when_teardown_cancels_bare(
+        self,
+    ) -> None:
+        """Our own deadline must never look like somebody stopping the worker.
+
+        Some teardowns errback the source with a bare `CancelledError` rather
+        than a transport error - Synapse's proxy CONNECT waits on a Deferred
+        with no canceller, so cancelling the request there produces exactly
+        that. Forwarded to the caller it reached the cancellation rule, which
+        killed the worker and never told the breaker anything: a stalled proxy
+        then looked like a healthy endpoint with a shrinking pool.
+        """
+        clock = Clock()
+        response = _FakeResponse()
+        agent = _FakeAgent(response, headers_after=REQUEST_TIMEOUT_SECONDS * 10)
+        agent.clock = clock
+        agent.canceller_is_bare = True
+        _deferred, results = self._call(agent, clock)
+        clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        self.assertEqual(len(results), 1)
+        error = results[0].value
+        self.assertNotIsInstance(
+            error,
+            defer.CancelledError,
+            "our own deadline was reported as a cancellation, which stops the "
+            "worker instead of counting a failure",
+        )
+        self.assertIsInstance(error, ModerationCheckError)
+        self.assertEqual(error.kind, "timeout")
 
     def test_a_config_error_status_is_not_relabelled_by_a_stalled_body(
         self,

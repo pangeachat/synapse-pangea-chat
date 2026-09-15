@@ -46,6 +46,27 @@ while the request Deferred is a real one with a real canceller, so a deadline
 here aborts the connection instead of merely giving up on it. The cost is
 Synapse's `outgoing_requests_counter`, which this module replaces with its own
 latency histogram and outcome counter.
+
+**Two limits of the HTTPS-proxy path, which no choice of client avoids.** Both
+are properties of `synapse.http.proxyagent` / `connectproxyclient`, reached
+identically through `SimpleHttpClient.request`, and both are recorded here
+rather than left to be rediscovered:
+
+- During proxy CONNECT the agent waits on `HTTPProxiedClientFactory.on_connection`,
+  a Deferred with **no canceller**. Our deadline therefore ends the wait
+  without closing the proxy socket, so a proxy that accepts connections and
+  stalls the CONNECT leaks one socket per check. The deadline still bounds the
+  check, the breaker still opens on the resulting timeouts, and the drop is
+  counted - what is not bounded is the socket.
+- `HTTPConnectSetupClient.handleStatus` logs the CONNECT **reason phrase
+  verbatim** at DEBUG on `synapse.http.connectproxyclient`, which is outside
+  this module's logger namespace and so outside its scrubbing. A hostile or
+  compromised HTTPS proxy replying `HTTP/1.1 200 @alice:example.org` gets that
+  string into the log of a deployment running that logger at DEBUG.
+
+Neither is reachable without an HTTPS proxy configured for outbound requests.
+A deployment that uses one should keep `synapse.http.connectproxyclient` above
+DEBUG; fixing either properly belongs upstream.
 """
 
 import json
@@ -530,6 +551,18 @@ async def _with_deadline(
     # caller saw a moderation failure, absorbed it by contract, and never
     # learned it had been asked to stop.
     cancelling = [False]
+    # Set while OUR OWN deadline is expiring, and read by `_forward` for the
+    # same reason as `cancelling` - but against the opposite mistake.
+    # `_expire` tears the exchange down, and some teardowns errback the source
+    # with a bare `CancelledError`: Synapse's proxy CONNECT waits on a
+    # Deferred with no canceller, so `request.cancel()` there produces exactly
+    # that. Forwarded, it reached `reraise_if_cancelled`, which treated our
+    # own timeout as somebody stopping the worker - the worker died, the
+    # breaker never saw the failure, and a stalled proxy looked like a healthy
+    # endpoint with a shrinking pool. Suppressing the forward means only
+    # `_expire`'s own errback can fire `own`, so a deadline is a timeout
+    # whatever the teardown produced.
+    expiring = [False]
 
     def _on_cancel(_own: "defer.Deferred[Any]") -> None:
         # Cancellation has to end the EXCHANGE, not just our wait. Without a
@@ -542,7 +575,7 @@ async def _with_deadline(
     own: "defer.Deferred[Any]" = defer.Deferred(_on_cancel)
 
     def _forward(result: Any) -> Any:
-        if not own.called and not cancelling[0]:
+        if not own.called and not cancelling[0] and not expiring[0]:
             own.callback(result)
         # The source's result is consumed here; returning None stops twisted
         # reporting an unhandled failure on a source we have finished with -
@@ -553,6 +586,7 @@ async def _with_deadline(
 
     def _expire() -> None:
         timed_out[0] = True
+        expiring[0] = True
         _from_reactor(teardown)
         if own.called:
             return
