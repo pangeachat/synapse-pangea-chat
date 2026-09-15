@@ -631,7 +631,12 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
                 mod = ChatModeration(api, self._tier2_config())
                 captured = _CapturingRecords()
                 root = logging.getLogger()
+                previous_level = root.level
                 root.addHandler(captured)
+                # DEBUG, because the production line that names the category
+                # is INFO and the root logger defaults to WARNING - a capture
+                # that cannot see the record proves nothing about it.
+                root.setLevel(logging.DEBUG)
                 try:
                     with patch(
                         "synapse_pangea_chat.moderation.moderate_text",
@@ -640,6 +645,8 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
                         await mod._check_and_redact(_event("x"), "x")
                 finally:
                     root.removeHandler(captured)
+                    root.setLevel(previous_level)
+                self.assertTrue(captured.seen, "nothing was logged at all")
                 send = cast(AsyncMock, api.create_and_send_event_into_room)
                 assert send.await_args is not None
                 reason = send.await_args.args[0]["content"]["reason"]
@@ -1050,13 +1057,47 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
             "hellovisible",
         )
 
-    def test_the_doctype_scan_is_linear(self) -> None:
-        """The predecessor was a regex with alternation over quoted runs, and
-        it backtracked quadratically: over a second on a 40 KB body of
-        unterminated openers, synchronously, in the pre-persist send path."""
+    def test_a_doctype_ends_where_html5_ends_it(self) -> None:
+        """A `>` inside a quoted public identifier DOES end the doctype - an
+        abrupt-doctype-public-identifier parse error - so the text after it is
+        on screen. A quote-aware scan that read to the closing quote deleted
+        displayed text, mangled doctype-shaped text inside an `alt` value, and
+        recursed once per declaration; Python's own parser already agrees with
+        the spec here."""
+        self.assertIn(
+            "call 415-555-2671",
+            _displayed_text('<!DOCTYPE html PUBLIC "a>call 415-555-2671">hello'),
+        )
+        self.assertIn(
+            "<!DOCTYPE x>", _displayed_text('<img alt="<!DOCTYPE x>" src="y">')
+        )
+
+    def test_many_declarations_do_not_stall_or_recurse(self) -> None:
+        """Both failure modes the preprocessing had: a regex with alternation
+        over quoted runs backtracked quadratically, and the hand-written scan
+        that replaced it recursed once per declaration and raised
+        `RecursionError` at about 1,200 - which the fail-open handler then
+        turned into an unmoderated message."""
         start = time.monotonic()
+        _displayed_text("<!DOCTYPE html>" * 4000)
         _displayed_text("<!DOCTYPE " * 4000)
         self.assertLess(time.monotonic() - start, 0.5)
+
+    def test_a_nul_becomes_a_replacement_character(self) -> None:
+        """HTML5 replaces U+0000 with U+FFFD rather than dropping it, so a NUL
+        between digits is a replacement character on screen and not a phone
+        number. Deleting it joined the digits and invented the match."""
+        self.assertEqual(
+            _displayed_text("call 41\x005-555-2671"), "call 41\ufffd5-555-2671"
+        )
+
+    def test_a_non_numeric_list_start_is_not_displayed(self) -> None:
+        """A non-numeric `start` is ignored and the list renders its ordinary
+        markers, so the value is on screen nowhere."""
+        self.assertNotIn(
+            "415-555-2671",
+            _displayed_text('<ol start="call 415-555-2671"><li>x</li></ol>'),
+        )
 
     def test_block_tags_separate_and_inline_tags_do_not(self) -> None:
         """The two halves of "what the reader sees", asserted on the renderer
@@ -1139,7 +1180,6 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
             "<![CDATA[>call 4<b>1</b>5-555-2671]]>",
             "call 41</td>5-555-2671",
             "call 41<td>5-555-2671",
-            "call 41\x005-555-2671",
             '<image src="mxc://x/y" alt="call 415-555-2671">',
             'call <img src="mxc://x/y" alt="415">-555-2671',
         ):
@@ -1189,12 +1229,6 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "body": "hello",
                 "format": "org.matrix.custom.html",
                 "formatted_body": '<![CDATA[>hello<b alt="415-555-2671"></b>]]>',
-            },
-            {
-                "msgtype": "m.text",
-                "body": "hello",
-                "format": "org.matrix.custom.html",
-                "formatted_body": ('<!DOCTYPE html PUBLIC "a>call 415-555-2671">hello'),
             },
         ]
         for content in cases:
@@ -1639,9 +1673,7 @@ class TestChoreoClient(unittest.TestCase):
         clock = Clock()
         agent = _FakeAgent(_FakeResponse(body=self.PAYLOAD.encode()))
         _deferred, results = self._call(agent, clock)
-        error = results[0].value
-        self.assertIsNone(error.__cause__)
-        self.assertIsNone(error.__context__)
+        self._assert_chain_severed(error := results[0].value)
         self.assertNotIn(self.PAYLOAD, self._everything_reachable_from(error))
 
     def test_a_transport_failure_carries_no_exception_chain_either(self) -> None:
@@ -1654,8 +1686,7 @@ class TestChoreoClient(unittest.TestCase):
         _deferred, results = self._call(agent, clock)
         error = results[0].value
         self.assertIsInstance(error, ModerationCheckError)
-        self.assertIsNone(error.__cause__)
-        self.assertIsNone(error.__context__)
+        self._assert_chain_severed(error)
         self.assertNotIn(self.PAYLOAD, self._everything_reachable_from(error))
 
     def test_a_rule_failure_carries_no_chain_either(self) -> None:
@@ -1672,8 +1703,7 @@ class TestChoreoClient(unittest.TestCase):
             with self.assertRaises(Tier1RuleError) as caught:
                 check_text("call me", ["US"])
         error = caught.exception
-        self.assertIsNone(error.__cause__)
-        self.assertIsNone(error.__context__)
+        self._assert_chain_severed(error)
         self.assertNotIn(payload, self._everything_reachable_from(error))
 
     def test_an_undecodable_body_does_not_escape_the_module(self) -> None:
@@ -1690,6 +1720,33 @@ class TestChoreoClient(unittest.TestCase):
         error = results[0].value
         self.assertIsInstance(error, ModerationCheckError)
         self.assertNotIn("@alice:example.org", self._everything_reachable_from(error))
+
+    @staticmethod
+    def _real_chain(error: BaseException) -> Tuple[Any, Any]:
+        """`(__cause__, __context__)` read from `BaseException`'s own slots.
+
+        `vars(BaseException)` rather than attribute access on the class,
+        because mypy narrows `BaseException.__context__` to the VALUE type -
+        it is a descriptor, and the descriptor is what has to be invoked here.
+        """
+        slots = vars(BaseException)
+        return (
+            slots["__cause__"].__get__(error, type(error)),
+            slots["__context__"].__get__(error, type(error)),
+        )
+
+    def _assert_chain_severed(self, error: BaseException) -> None:
+        """Read through `BaseException`'s own descriptors, not the instance.
+
+        A subclass can shadow `__context__` with a property returning None,
+        which hides the chain from an ordinary read while the real slot still
+        holds the original - and an earlier revision of this branch did
+        exactly that. An assertion on `error.__context__` accepts the mask;
+        this one does not.
+        """
+        cause, context = self._real_chain(error)
+        self.assertIsNone(cause)
+        self.assertIsNone(context)
 
     @staticmethod
     def _everything_reachable_from(error: BaseException) -> str:
@@ -1709,7 +1766,12 @@ class TestChoreoClient(unittest.TestCase):
                     )
                 )
             )
-            current = current.__cause__ or current.__context__
+            # Through the base descriptors, for the reason in
+            # `_assert_chain_severed`.
+            slots = vars(BaseException)
+            current = slots["__cause__"].__get__(current, type(current)) or slots[
+                "__context__"
+            ].__get__(current, type(current))
         return "\n".join(seen)
 
 

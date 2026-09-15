@@ -37,6 +37,7 @@ and is recorded as a limit in moderation.instructions.md.
 import contextlib
 import importlib
 import logging
+import logging.handlers
 import pkgutil
 import unittest
 from types import SimpleNamespace
@@ -137,6 +138,15 @@ class _CapturingHandler(logging.Handler):
             exception = record.exc_info[1]
             if exception is not None:
                 self.seen.append(_exception_chain(exception))
+        # An exception can also arrive inside an `extra`, or as a value in a
+        # mapping-style argument, where a bare `repr` shows the message but
+        # not what hangs off the object - a `JSONDecodeError` carries its
+        # whole input on `.doc`.
+        for value in list(record.__dict__.values()) + list(
+            (record.args or {}).values() if isinstance(record.args, dict) else ()
+        ):
+            if isinstance(value, BaseException):
+                self.seen.append(_exception_chain(value))
         # Anything attached with `extra=`, and everything Synapse's global
         # log-record factory attaches, lands in the record's __dict__ and never
         # appears in the formatted message - so a leak through that door would
@@ -516,6 +526,27 @@ class ModerationLogContextTestCase(unittest.IsolatedAsyncioTestCase):
             await mod.check_event_for_spam(_event(CANARY_TEXT))
         self.assertScrubbed()
 
+    async def test_a_buffered_handler_target_is_scrubbed_too(self) -> None:
+        """A `MemoryHandler` re-runs its TARGET's filters when it flushes, and
+        Synapse's shipped logging configuration uses exactly that
+        buffer-to-target shape - so a target carrying `LoggingContextFilter`
+        put the requester back on a record that had already passed a scrubbed
+        buffer."""
+        target = _CapturingHandler()
+        target.addFilter(LoggingContextFilter())
+        buffered = logging.handlers.MemoryHandler(1, target=target)
+        root = logging.getLogger()
+        root.addHandler(buffered)
+        self.addCleanup(root.removeHandler, buffered)
+        with _synapse_request_logcontext():
+            mod = ChatModeration(_module_api(), _config())
+            await mod.check_event_for_spam(_event(CANARY_TEXT))
+        buffered.flush()
+        self.assertTrue(target.records, "the buffer never reached its target")
+        captured = "\n".join(target.seen)
+        for canary in (CANARY_SENDER, CANARY_LOCALPART, CANARY_TEXT):
+            self.assertNotIn(canary, captured)
+
     async def test_a_handler_on_a_child_logger_is_scrubbed_too(self) -> None:
         """Walking upwards covers the handlers a record PROPAGATES to. A
         handler attached directly to `moderation.tier1_prefilter` is not on
@@ -649,6 +680,22 @@ class ModerationLoggerCoverageTestCase(unittest.TestCase):
                 f"{name} has no identity scrubber; use " "log_safety.scrubbing_logger",
             )
         self.assertTrue(checked, "no loggers were found, so nothing was checked")
+        # And every logger the package modules hold must BE one of those: a
+        # module that switches to `logging.getLogger(__name__)` gets a name
+        # outside the walked namespace, and the walk alone would not notice.
+        for info in pkgutil.iter_modules(moderation_package.__path__):
+            module = importlib.import_module(
+                f"{moderation_package.__name__}.{info.name}"
+            )
+            for attribute, value in vars(module).items():
+                if isinstance(value, logging.Logger):
+                    self.assertIn(
+                        value.name,
+                        checked,
+                        f"{module.__name__}.{attribute} logs through "
+                        f"{value.name!r}, which is outside the moderation "
+                        "logger namespace and so outside the scrubber",
+                    )
 
     def test_an_adapter_over_an_unscrubbed_logger_is_caught(self) -> None:
         """The check has to be able to fail on the shape it exists for."""

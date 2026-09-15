@@ -164,10 +164,22 @@ def scrub_reachable_handlers(logger: logging.Logger) -> None:
     """
     for target in _reachable_loggers(logger):
         for handler in target.handlers:
-            if not any(
-                isinstance(f, _IdentityScrubbingFilter) for f in handler.filters
-            ):
-                handler.addFilter(_IdentityScrubbingFilter(only_prefix=_PACKAGE_LOGGER))
+            _scrub_handler(handler)
+
+
+def _scrub_handler(handler: logging.Handler) -> None:
+    """Attach the scrubber to `handler`, and to whatever it forwards to.
+
+    A `MemoryHandler` re-runs its TARGET's filters in `target.handle(record)`,
+    and Synapse's shipped logging configuration uses exactly that buffer-to-
+    target shape - so a target carrying `LoggingContextFilter` put the
+    requester back on a record that had already passed a scrubbed buffer.
+    """
+    if not any(isinstance(f, _IdentityScrubbingFilter) for f in handler.filters):
+        handler.addFilter(_IdentityScrubbingFilter(only_prefix=_PACKAGE_LOGGER))
+    forwarded = getattr(handler, "target", None)
+    if isinstance(forwarded, logging.Handler):
+        _scrub_handler(forwarded)
 
 
 def _reachable_loggers(logger: logging.Logger) -> List[logging.Logger]:

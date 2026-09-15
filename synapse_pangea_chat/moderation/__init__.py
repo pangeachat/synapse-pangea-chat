@@ -169,7 +169,6 @@ _TAG_ALIASES = {"image": "img"}
 # at all to the extractor. Rewriting the abrupt form into the well-formed empty
 # comment the spec says it is puts the two back in agreement.
 _ABRUPT_COMMENTS = re.compile(r"<!--?>")
-_DOCTYPE_OPENER = "<!doctype"
 
 
 class _DisplayedText(HTMLParser):
@@ -235,6 +234,10 @@ class _DisplayedText(HTMLParser):
         for name, value in seen.items():
             if not value:
                 continue
+            if (tag, name) == ("ol", "start") and not value.strip("+-").isdigit():
+                # A non-numeric `start` is ignored and the list renders with
+                # its ordinary markers, so the value is on screen nowhere.
+                continue
             if (tag, name) in _INLINE_ATTRIBUTES:
                 self._parts.append(value)
             elif (tag, name) in _OUT_OF_FLOW_ATTRIBUTES:
@@ -299,41 +302,21 @@ class _DisplayedText(HTMLParser):
         return "".join(self._parts + ["\n" + a for a in self.attribute_text])
 
 
-def _without_doctype(formatted: str) -> str:
-    """Drop a doctype, whose quoted strings may contain `>`.
-
-    HTML5 keeps reading a doctype to its real end; Python's parser stops at the
-    first `>` and hands the remainder back as text nobody sees. A regex with
-    alternation over quoted runs expresses that and backtracks quadratically on
-    a long run of unterminated openers - measured at over a second on a 40 KB
-    body, in the pre-persist send path, which is a worse problem than the false
-    positive it was fixing. This is a single left-to-right scan instead.
-    """
-    lowered = formatted.lower()
-    start = lowered.find(_DOCTYPE_OPENER)
-    if start == -1:
-        return formatted
-    index = start + len(_DOCTYPE_OPENER)
-    quote = ""
-    while index < len(formatted):
-        character = formatted[index]
-        if quote:
-            if character == quote:
-                quote = ""
-        elif character in "\"'":
-            quote = character
-        elif character == ">":
-            return formatted[:start] + _without_doctype(formatted[index + 1 :])
-        index += 1
-    # An unterminated doctype runs to the end of the input, and so does HTML5's.
-    return formatted[:start]
-
-
 def _displayed_text(formatted: str) -> str:
     """The reader-visible text of an HTML body, never less than it displays."""
-    # U+0000 is ignored by an HTML5 tokenizer in text, so `call 41\x005-...`
-    # is one number on screen. Left in, it split the number in two.
-    prepared = _without_doctype(formatted.replace("\x00", ""))
+    # HTML5 REPLACES U+0000 with U+FFFD rather than dropping it, so
+    # `call 41<NUL>5-...` is not a phone number on screen - it has a
+    # replacement character in the middle of it. Deleting the NUL instead
+    # joined the digits and invented a match, and inside a tag name it turned
+    # an unknown element into a real `script` and hid its contents.
+    #
+    # There is no doctype preprocessing here, and its absence is deliberate. A
+    # `>` inside a quoted public or system identifier DOES end the doctype
+    # under HTML5 (abrupt-doctype-public-identifier), which is exactly what
+    # Python's parser already does - so the quote-aware scan that was here
+    # deleted text a renderer displays, mangled doctype-shaped text inside an
+    # `alt` value, and recursed once per declaration.
+    prepared = formatted.replace("\x00", "\ufffd")
     parser = _DisplayedText()
     parser.feed(_ABRUPT_COMMENTS.sub("<!---->", prepared))
     parser.close()
