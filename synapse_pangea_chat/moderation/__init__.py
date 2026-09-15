@@ -23,12 +23,14 @@ Design doc: .github/instructions/moderation.instructions.md (repo-level) and
 the org trust-and-safety doc it descends from.
 """
 
+import inspect
 import logging
 import re
 from typing import Any, Mapping, Optional, Tuple, Union
 
 from synapse.api.errors import Codes
 from synapse.events import EventBase
+from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import NOT_SPAM, ModuleApi
 
 from synapse_pangea_chat.moderation.choreo_client import (
@@ -39,6 +41,26 @@ from synapse_pangea_chat.moderation.tier1_prefilter import check_text
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
 
 logger = logging.getLogger("synapse.modules.synapse_pangea_chat.moderation")
+
+# Synapse 1.159 inserted `server_name` as the second positional parameter of
+# `run_as_background_process`; 1.124 has no such parameter. Calling the 1.124
+# shape on 1.159 passes the coroutine function as `server_name` and the event
+# as `func`, which raises a TypeError that `on_new_event`'s fail-open handler
+# swallows - Tier 2 silently never runs. COMPAT.yml requires both pins, so
+# the call is adapted rather than pinned, using the pattern already in
+# delete_user.py, export_user_data.py and backfill_l2.py. Deduplicating the
+# four copies into a shared module is tracked separately; adding a fourth
+# copy that drifts is the failure this comment exists to prevent.
+_RUN_AS_BG_SUPPORTS_SERVER_NAME = (
+    "server_name" in inspect.signature(run_as_background_process).parameters
+)
+
+
+def _background_process_args(homeserver: Any, desc: str, func: Any) -> Tuple[Any, ...]:
+    if _RUN_AS_BG_SUPPORTS_SERVER_NAME:
+        return (desc, homeserver.hostname, func)
+    return (desc, func)
+
 
 _TEXTUAL_MSGTYPES = ("m.text", "m.emote", "m.notice")
 # Media messages carry a caption (or filename) in `body`, which readers see
@@ -145,13 +167,12 @@ class ChatModeration:
                 # The conversation orchestrator owns moderation in activity
                 # rooms; checking here would double-moderate.
                 return
-            from synapse.metrics.background_process_metrics import (
-                run_as_background_process,
-            )
-
             run_as_background_process(
-                "pangea_moderation_tier2",
-                self._check_and_redact,
+                *_background_process_args(
+                    self._api._hs,
+                    "pangea_moderation_tier2",
+                    self._check_and_redact,
+                ),
                 event,
                 text,
             )

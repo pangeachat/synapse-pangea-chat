@@ -2,10 +2,11 @@
 filtering logic). No Synapse process — ModuleApi is mocked."""
 
 import unittest
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse.api.errors import Codes
+from synapse.events import EventBase
 from synapse.module_api import NOT_SPAM
 
 from synapse_pangea_chat import PangeaChat
@@ -39,6 +40,16 @@ class FakeEvent:
             self.content = {}
         else:
             self.content = {"msgtype": msgtype, "body": body}
+
+
+def _event(*args: Any, **kwargs: Any) -> EventBase:
+    """A stand-in carrying only the surfaces the module reads.
+
+    The cast states that intent; building a real `EventBase` would drag in an
+    event store for no gain, and the callbacks under test read `type`,
+    `sender`, `room_id`, `event_id` and `content` and nothing else.
+    """
+    return cast(EventBase, FakeEvent(*args, **kwargs))
 
 
 def _config(**overrides: Any) -> PangeaChatConfig:
@@ -93,14 +104,14 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
     async def test_clean_message_not_spam(self) -> None:
         mod = _moderation(_config())
         self.assertEqual(
-            await mod.check_event_for_spam(FakeEvent("hola, ¿cómo estás?")),
+            await mod.check_event_for_spam(_event("hola, ¿cómo estás?")),
             NOT_SPAM,
         )
 
     async def test_phone_number_forbidden(self) -> None:
         mod = _moderation(_config())
         self.assertEqual(
-            await mod.check_event_for_spam(FakeEvent("call me: 415-555-2671")),
+            await mod.check_event_for_spam(_event("call me: 415-555-2671")),
             Codes.FORBIDDEN,
         )
 
@@ -108,30 +119,30 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
         mod = _moderation(
             _config(moderation_exempt_user_id_patterns=[r"@bot.*:example\.org"])
         )
-        event = FakeEvent("call me: 415-555-2671", sender="@bot:example.org")
+        event = _event("call me: 415-555-2671", sender="@bot:example.org")
         self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
 
     async def test_non_message_event_skipped(self) -> None:
         mod = _moderation(_config())
-        event = FakeEvent(event_type="m.room.topic", content={"topic": "415-555-2671"})
+        event = _event(event_type="m.room.topic", content={"topic": "415-555-2671"})
         self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
 
     async def test_image_caption_is_moderated(self) -> None:
         """A caption is text the reader sees, so it is checked like any
         message (red-team finding: captions bypassed both tiers)."""
         mod = _moderation(_config())
-        event = FakeEvent(content={"msgtype": "m.image", "body": "call 415-555-2671"})
+        event = _event(content={"msgtype": "m.image", "body": "call 415-555-2671"})
         self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
 
     async def test_benign_image_filename_passes(self) -> None:
         mod = _moderation(_config())
-        event = FakeEvent(content={"msgtype": "m.image", "body": "beach-photo.jpg"})
+        event = _event(content={"msgtype": "m.image", "body": "beach-photo.jpg"})
         self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
 
     async def test_formatted_body_is_moderated(self) -> None:
         """The HTML twin can carry the payload while `body` looks innocuous."""
         mod = _moderation(_config())
-        event = FakeEvent(
+        event = _event(
             content={
                 "msgtype": "m.text",
                 "body": "ok",
@@ -143,7 +154,7 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
 
     async def test_edit_moderates_replacement_text(self) -> None:
         mod = _moderation(_config())
-        event = FakeEvent(
+        event = _event(
             content={
                 "msgtype": "m.text",
                 "body": "* innocuous",
@@ -159,7 +170,7 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
             side_effect=RuntimeError("boom"),
         ):
             self.assertEqual(
-                await mod.check_event_for_spam(FakeEvent("anything")), NOT_SPAM
+                await mod.check_event_for_spam(_event("anything")), NOT_SPAM
             )
 
 
@@ -177,25 +188,21 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         mod = _moderation(self._tier2_config())
         mod._check_and_redact = AsyncMock()  # type: ignore[method-assign]
         state = {(PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE, ""): MagicMock()}
-        with patch(
-            "synapse.metrics.background_process_metrics.run_as_background_process"
-        ) as bg:
-            await mod.on_new_event(FakeEvent("you suck"), state)
+        with patch("synapse_pangea_chat.moderation.run_as_background_process") as bg:
+            await mod.on_new_event(_event("you suck"), state)
             bg.assert_not_called()
 
     async def test_plain_room_dispatches(self) -> None:
         mod = _moderation(self._tier2_config())
-        with patch(
-            "synapse.metrics.background_process_metrics.run_as_background_process"
-        ) as bg:
-            await mod.on_new_event(FakeEvent("you suck"), {})
+        with patch("synapse_pangea_chat.moderation.run_as_background_process") as bg:
+            await mod.on_new_event(_event("you suck"), {})
             bg.assert_called_once()
 
     async def test_flagged_result_redacts_as_sender(self) -> None:
         api = MagicMock()
         api.create_and_send_event_into_room = AsyncMock()
         mod = ChatModeration(api, self._tier2_config())
-        event = FakeEvent("threatening text", sender="@offender:example.org")
+        event = _event("threatening text", sender="@offender:example.org")
         with patch(
             "synapse_pangea_chat.moderation.moderate_text",
             AsyncMock(
@@ -208,7 +215,9 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         ):
             await mod._check_and_redact(event, "threatening text")
         api.create_and_send_event_into_room.assert_awaited_once()
-        sent = api.create_and_send_event_into_room.await_args.args[0]
+        await_args = api.create_and_send_event_into_room.await_args
+        assert await_args is not None
+        sent = await_args.args[0]
         self.assertEqual(sent["type"], "m.room.redaction")
         self.assertEqual(sent["sender"], "@offender:example.org")
         self.assertEqual(sent["redacts"], event.event_id)
@@ -223,7 +232,7 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
             "synapse_pangea_chat.moderation.moderate_text",
             AsyncMock(return_value={"flagged": False, "evaluated": True}),
         ):
-            await mod._check_and_redact(FakeEvent("hi"), "hi")
+            await mod._check_and_redact(_event("hi"), "hi")
         api.create_and_send_event_into_room.assert_not_awaited()
 
     async def test_moderation_outage_fails_open(self) -> None:
@@ -236,7 +245,7 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
             "synapse_pangea_chat.moderation.moderate_text",
             AsyncMock(side_effect=ModerationCheckError("down")),
         ):
-            await mod._check_and_redact(FakeEvent("hi"), "hi")
+            await mod._check_and_redact(_event("hi"), "hi")
         api.create_and_send_event_into_room.assert_not_awaited()
 
 

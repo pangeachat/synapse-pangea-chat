@@ -63,7 +63,12 @@ class MockModerationServer:
     @property
     def base_url(self) -> str:
         host, port = self._httpd.server_address[:2]
-        return f"http://{host}:{port}"
+        # `server_address` is only `str` for AF_INET/AF_INET6; the annotation
+        # admits bytes, and formatting bytes would yield a b'...' host.
+        hostname = (
+            host.decode("ascii") if isinstance(host, (bytes, bytearray)) else str(host)
+        )
+        return f"http://{hostname}:{port}"
 
     def start(self) -> "MockModerationServer":
         self._thread.start()
