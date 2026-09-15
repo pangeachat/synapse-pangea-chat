@@ -1619,6 +1619,7 @@ class _FakeAgent:
         self.cancelled = False
         self.canceller_raises = False
         self.canceller_is_bare = False
+        self.canceller_raises_base = False
         # Whatever the request Deferred was fired with, recorded before the
         # client's own callbacks consume it.
         self.source_results: List[Any] = []
@@ -1649,6 +1650,11 @@ class _FakeAgent:
             self.cancelled = True
             if self.canceller_raises:
                 raise RuntimeError("canceller blew up")
+            if self.canceller_raises_base:
+                # A `BaseException`, which is what an `except Exception` guard
+                # is supposed to let past - so it is the one thing that can
+                # leave the deadline's teardown frame.
+                raise KeyboardInterrupt("interrupted mid-teardown")
             if self.canceller_is_bare:
                 # And the other real shape: a canceller that fires nothing, so
                 # twisted errbacks with a bare `CancelledError`. Synapse's
@@ -1975,6 +1981,24 @@ class TestChoreoClient(unittest.TestCase):
         )
         self.assertIsInstance(error, ModerationCheckError)
         self.assertEqual(error.kind, "timeout")
+
+    def test_a_teardown_that_escapes_still_settles_the_deadline(self) -> None:
+        """The deadline suppresses every later result once it starts, so it
+        MUST finish. A teardown that leaves the frame without the errback
+        running parks the caller with its deadline spent and every subsequent
+        result discarded - a check that can no longer complete by any route.
+        """
+        clock = Clock()
+        response = _FakeResponse()
+        agent = _FakeAgent(response, headers_after=REQUEST_TIMEOUT_SECONDS * 10)
+        agent.clock = clock
+        agent.canceller_raises_base = True
+        _deferred, results = self._call(agent, clock)
+        self.assertEqual(results, [])
+        with self.assertRaises(KeyboardInterrupt):
+            clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        self.assertEqual(len(results), 1, "the check was left unable to finish")
+        results[0].trap(ModerationCheckError)
 
     def test_a_config_error_status_is_not_relabelled_by_a_stalled_body(
         self,

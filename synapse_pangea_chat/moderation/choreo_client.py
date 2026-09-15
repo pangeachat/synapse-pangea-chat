@@ -65,11 +65,18 @@ rather than left to be rediscovered:
   string into the log of a deployment running that logger at DEBUG.
 
 Neither is reachable without an HTTPS proxy configured for outbound requests.
-A deployment that uses one should keep `synapse.http.connectproxyclient` above
-DEBUG; fixing either properly belongs upstream.
+The second is closed here, in `install_proxy_log_guard`, by filtering that one
+record out before any handler sees it - a logging filter needs no change to
+Synapse. The first is not: closing it means supplying this module's own CONNECT
+endpoint and factory so the handshake Deferred has a canceller, which is a
+re-implementation of Synapse's proxy client carrying its TLS verification and
+IP policy with it. That is a real fix and it is available; it is out of
+proportion to a transport change, and it is recorded here as a deliberate
+scope decision rather than as an impossibility.
 """
 
 import json
+import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from synapse.logging.context import PreserveLoggingContext, make_deferred_yieldable
@@ -587,11 +594,18 @@ async def _with_deadline(
     def _expire() -> None:
         timed_out[0] = True
         expiring[0] = True
-        _from_reactor(teardown)
-        if own.called:
-            return
-        with PreserveLoggingContext():
-            own.errback(ModerationCheckError(message, KIND_TIMEOUT))
+        try:
+            _from_reactor(teardown)
+        finally:
+            # In a `finally`, because `expiring` has already suppressed the
+            # forward by this point: if the teardown gets out of this frame
+            # without the errback running, the caller is parked with its
+            # deadline spent AND every later result discarded - a check that
+            # can no longer complete by any route. Ending the wait is the
+            # guarantee; the teardown is best-effort under it.
+            if not own.called:
+                with PreserveLoggingContext():
+                    own.errback(ModerationCheckError(message, KIND_TIMEOUT))
 
     try:
         timer: Any = clock.call_later(
@@ -646,8 +660,15 @@ def _from_reactor(action: Callable[[], None]) -> None:
     try:
         with PreserveLoggingContext():
             action()
-    except Exception as error:
-        reraise_if_cancelled(error)
+    except Exception:
+        # `reraise_if_cancelled` is deliberately NOT called here, and this is
+        # the one place in the module where that is right. This runs from a
+        # reactor callback: there is no coroutine in this frame for a
+        # cancellation to stop, and letting one out would abandon the caller
+        # mid-deadline rather than ending its wait. The rule's own criterion
+        # says the same thing - it applies to handlers wrapping an `await`,
+        # and there is none here.
+        #
         # silent-ok: the deadline has already been recorded by the caller's
         # `timed_out` flag, and the awaiting coroutine ends either way - by
         # the teardown that did work, or by the deadline the caller applies.
@@ -807,3 +828,56 @@ class ChoreoChecker:
             kind or "unmapped",
             type(exc).__name__,
         )
+
+
+# The exact format string `HTTPConnectSetupClient.handleStatus` logs. Matching
+# on it is deliberate and so is its fragility: if a Synapse upgrade changes the
+# string, the guard stops matching and `test_the_proxy_log_guard_matches_the
+# _installed_synapse` fails, which is a failure somebody sees. Matching more
+# loosely - every record from that logger - would drop connection diagnostics
+# an operator needs, to protect against one of them.
+_PROXY_STATUS_LOG_FORMAT = "Got Status: %s %s %s"
+_PROXY_LOGGER_NAME = "synapse.http.connectproxyclient"
+
+
+class _ProxyStatusFilter(logging.Filter):
+    """Keeps a proxy's own CONNECT reason phrase out of the log.
+
+    `HTTPConnectSetupClient.handleStatus` logs the status line **verbatim** at
+    DEBUG, and the reason phrase is a string the proxy chooses: an HTTPS proxy
+    replying `HTTP/1.1 200 @alice:example.org` puts that Matrix ID into the log
+    of any deployment running this logger at DEBUG. It is reached identically
+    through every Synapse HTTP client, so the transport choice does not avoid
+    it - but a logging filter is ours to install and needs no change to
+    Synapse.
+
+    The record is redacted rather than dropped, so an operator debugging a
+    proxy still sees that a status arrived and what its code was. Only the
+    phrase the proxy wrote is removed.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.msg != _PROXY_STATUS_LOG_FORMAT:
+            return True
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 3:
+            status, _message, version = args
+            record.args = (status, b"<redacted>", version)
+        else:
+            record.args = ()
+            record.msg = "Got Status: <redacted>"
+        return True
+
+
+def install_proxy_log_guard() -> None:
+    """Attach `_ProxyStatusFilter`, once, to Synapse's proxy client logger.
+
+    A filter on the LOGGER rather than on a handler: a handler's filters run
+    only for that handler, and the deployment owns its handlers. Idempotent,
+    because Tier 2 may be constructed more than once in a process - the test
+    suite does exactly that.
+    """
+    proxy_logger = logging.getLogger(_PROXY_LOGGER_NAME)
+    if any(isinstance(f, _ProxyStatusFilter) for f in proxy_logger.filters):
+        return
+    proxy_logger.addFilter(_ProxyStatusFilter())

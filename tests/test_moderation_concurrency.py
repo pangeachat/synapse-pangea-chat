@@ -1605,3 +1605,74 @@ def _calls_the_rule_first(handler: Any) -> bool:
             and statement.value.func.id == "reraise_if_cancelled"
         )
     return False
+
+
+class ProxyLogGuardTestCase(unittest.TestCase):
+    """The CONNECT reason phrase is a string a proxy chooses, and Synapse logs
+    it verbatim at DEBUG on a logger outside this module's namespace."""
+
+    def setUp(self) -> None:
+        from synapse_pangea_chat.moderation.choreo_client import (
+            _PROXY_LOGGER_NAME,
+            install_proxy_log_guard,
+        )
+
+        install_proxy_log_guard()
+        self.logger = logging.getLogger(_PROXY_LOGGER_NAME)
+        self.records: List[str] = []
+        self.handler = _CollectingHandler(self.records)
+        self.handler.setLevel(logging.DEBUG)
+        self.logger.addHandler(self.handler)
+        self._previous = self.logger.level
+        self.logger.setLevel(logging.DEBUG)
+        self.addCleanup(self.logger.setLevel, self._previous)
+        self.addCleanup(self.logger.removeHandler, self.handler)
+
+    def test_a_hostile_reason_phrase_does_not_reach_a_handler(self) -> None:
+        self.logger.debug(
+            "Got Status: %s %s %s", b"200", b"@alice:example.org", b"HTTP/1.1"
+        )
+        self.assertTrue(self.records, "the record never reached the handler")
+        joined = "\n".join(self.records)
+        self.assertNotIn("@alice:example.org", joined)
+        # The status itself survives: an operator debugging a proxy still
+        # needs to see that a status arrived, and which one.
+        self.assertIn("200", joined)
+
+    def test_other_records_from_that_logger_are_untouched(self) -> None:
+        self.logger.debug("Connecting to %s:%d", "proxy.example.org", 8080)
+        self.assertIn("proxy.example.org", "\n".join(self.records))
+
+    def test_the_guard_matches_the_installed_synapse(self) -> None:
+        """The guard matches one exact format string. If a Synapse upgrade
+        changes it the guard silently stops working, so the coupling is
+        asserted rather than hoped for."""
+        import inspect
+
+        from synapse.http import connectproxyclient
+
+        from synapse_pangea_chat.moderation.choreo_client import (
+            _PROXY_STATUS_LOG_FORMAT,
+        )
+
+        source = inspect.getsource(connectproxyclient.HTTPConnectSetupClient)
+        self.assertIn(
+            f'logger.debug("{_PROXY_STATUS_LOG_FORMAT}"',
+            source,
+            "Synapse's CONNECT status log line has changed, so the filter "
+            "that keeps a proxy's reason phrase out of the log no longer "
+            "matches it",
+        )
+
+    def test_installing_twice_adds_one_filter(self) -> None:
+        from synapse_pangea_chat.moderation.choreo_client import (
+            _ProxyStatusFilter,
+            install_proxy_log_guard,
+        )
+
+        install_proxy_log_guard()
+        install_proxy_log_guard()
+        self.assertEqual(
+            sum(1 for f in self.logger.filters if isinstance(f, _ProxyStatusFilter)),
+            1,
+        )

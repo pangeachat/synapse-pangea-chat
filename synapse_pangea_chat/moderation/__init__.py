@@ -45,7 +45,10 @@ from synapse.module_api import NOT_SPAM, ModuleApi
 
 from synapse_pangea_chat.moderation import metrics
 from synapse_pangea_chat.moderation.breaker import CircuitBreaker
-from synapse_pangea_chat.moderation.choreo_client import ChoreoChecker
+from synapse_pangea_chat.moderation.choreo_client import (
+    ChoreoChecker,
+    install_proxy_log_guard,
+)
 from synapse_pangea_chat.moderation.compat import reraise_if_cancelled
 from synapse_pangea_chat.moderation.dispatch import ModerationJob, Tier2Dispatcher
 from synapse_pangea_chat.moderation.exempt import (
@@ -409,6 +412,10 @@ class ChatModeration:
         it". A WARNING on every non-background worker would fire in a HEALTHY
         deployment and train operators to ignore it.
         """
+        # Installed on every instance that has Tier 2 enabled, not only the
+        # one that runs it: the guard protects a log, and the log belongs to
+        # the process rather than to the worker pool.
+        install_proxy_log_guard()
         self._tier2_active = bool(self._api.should_run_background_tasks())
         metrics.TIER2_ACTIVE.set(1 if self._tier2_active else 0)
         if not self._tier2_active:
