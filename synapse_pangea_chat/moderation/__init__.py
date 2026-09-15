@@ -181,6 +181,13 @@ _TABLE_CELL_TAGS = frozenset({"caption", "td", "th", "tr"})
 # `tr` as a cell meant `<table>41<tr><td>notes</td>5-555-2671</tr></table>` -
 # `415-555-2671` on screen - collected only the `41`.
 _TABLE_CONTENT_TAGS = frozenset({"caption", "td", "th"})
+# Tags that IMPLICITLY close an open cell. HTML5 inserts the end tag for you:
+# a second `<td>` closes the first, and a row or section boundary closes
+# whatever cell is open. Counting cells instead of tracking one open cell
+# meant `<table>41<td>notes<td>x</tr>5-555-2671</table>` never came back out
+# of a cell, so the `5-555-2671` a reader sees before the table was collected
+# by nothing.
+_CLOSES_A_CELL = frozenset({"caption", "td", "th", "tr", "tbody", "thead", "tfoot"})
 # HTML5 parses `<image>` as `img`, so its alternative text is displayed.
 _TAG_ALIASES = {"image": "img"}
 
@@ -213,8 +220,12 @@ _ABRUPT_COMMENTS = re.compile(r"<!--?>")
 # same reading with no recursion at all: one flat parse, whatever the nesting.
 # The inserted character is invisible either way - a bogus comment is not
 # displayed - and it cannot create `<!--` or `<!doctype`.
+#
+# Three characters in and three out, so nothing downstream shifts: the
+# rewrite is visible only inside an ATTRIBUTE value, which is displayed text,
+# and a substitution there changes one character rather than adding one.
 _MARKED_SECTIONS = re.compile(r"<!\[")
-_BOGUS_COMMENT_OPEN = "<!q["
+_BOGUS_COMMENT_OPEN = "<!x"
 
 
 class _DisplayedText(HTMLParser):
@@ -261,7 +272,7 @@ class _DisplayedText(HTMLParser):
         # for an ambiguous rendering, and it means the repair can only ever
         # add text, never remove some. It is not a tree builder - it is the
         # one rule that moves displayed characters somewhere else.
-        self._cell_depth = 0
+        self._in_a_cell = False
         self._fostered: List[str] = []
         self._fostered_runs: List[str] = []
 
@@ -269,10 +280,11 @@ class _DisplayedText(HTMLParser):
         if self._invisible:
             return
         self._parts.append(data)
-        if self._table_depth > 0 and self._cell_depth == 0:
+        if self._table_depth > 0 and not self._in_a_cell:
             self._fostered.append(data)
 
     def _end_table(self) -> None:
+        self._in_a_cell = False
         fostered, self._fostered = self._fostered, []
         for run in "".join(fostered).split("\n"):
             if run.strip():
@@ -298,8 +310,8 @@ class _DisplayedText(HTMLParser):
             # inner one, because they are displayed in different places.
             self._end_table()
             self._table_depth += 1
-        elif self._table_depth > 0 and tag in _TABLE_CONTENT_TAGS:
-            self._cell_depth += 1
+        elif self._table_depth > 0 and tag in _CLOSES_A_CELL:
+            self._in_a_cell = tag in _TABLE_CONTENT_TAGS
         if self._breaks_line(tag):
             self._open_blocks.append(tag)
             self._parts.append("\n")
@@ -360,12 +372,8 @@ class _DisplayedText(HTMLParser):
         if tag == "table" and self._table_depth > 0:
             self._table_depth -= 1
             self._end_table()
-        elif (
-            self._table_depth > 0
-            and tag in _TABLE_CONTENT_TAGS
-            and self._cell_depth > 0
-        ):
-            self._cell_depth -= 1
+        elif self._table_depth > 0 and tag in _CLOSES_A_CELL:
+            self._in_a_cell = False
         # Only a tag that actually opened a block closes one. An unmatched
         # `</div>` is ignored by HTML5, and a newline there split a displayed
         # number in two.
@@ -799,6 +807,14 @@ class ChatModeration:
     async def _check_and_redact(self, job: ModerationJob) -> None:
         if self._checker is None:
             return
+        if len(job.text) > MATCHER_MAX_CHARS:
+            # `/choreo/moderate` truncates its input, so a longer message gets
+            # a verdict about its PREFIX and the remainder is judged by
+            # nothing. Counted for the same reason every other partial look is:
+            # "we did not read all of this" must not be reported as a clean
+            # message. Chunking past the truncation is ADR-8b and is not this
+            # change; making the gap visible is.
+            metrics.TIER2_TRUNCATED.inc()
         result = await self._checker.check(job.text)
         self._record_matcher_agreement(job, result)
         if result is None:

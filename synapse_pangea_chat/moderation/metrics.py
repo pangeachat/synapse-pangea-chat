@@ -123,6 +123,13 @@ TIER2_REDACTION_SKIPPED = _get_or_create(
     ["cause"],
 )
 
+TIER2_TRUNCATED = _get_or_create(
+    Counter,
+    "pangea_moderation_tier2_truncated_total",
+    "Messages longer than the moderation endpoint reads. The verdict covers "
+    "the prefix only; the remainder was sent and never judged.",
+)
+
 MATCHER_AGREEMENT = _get_or_create(
     Counter,
     "pangea_moderation_tier2_matcher_agreement_total",

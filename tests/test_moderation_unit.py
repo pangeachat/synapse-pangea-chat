@@ -1110,6 +1110,18 @@ class TestTheDeterministicMatcherIsAMeasuredSignal(unittest.IsolatedAsyncioTestC
             reader.delta(self.METRIC, service="clean", matcher="error"), 1.0
         )
 
+    async def test_a_message_the_endpoint_truncates_is_counted(self) -> None:
+        """A verdict about the prefix of a message is not a verdict about the
+        message. Chunking past the endpoint's truncation is separate work;
+        what must not happen meanwhile is that the gap is invisible."""
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier2_truncated_total")
+        await self._run(self._clean(), "a" * (MATCHER_MAX_CHARS + 1))
+        self.assertEqual(reader.delta("pangea_moderation_tier2_truncated_total"), 1.0)
+        reader.snapshot("pangea_moderation_tier2_truncated_total")
+        await self._run(self._clean(), "a" * MATCHER_MAX_CHARS)
+        self.assertEqual(reader.delta("pangea_moderation_tier2_truncated_total"), 0.0)
+
     async def test_the_matcher_reads_exactly_what_the_endpoint_reads(self) -> None:
         """`/choreo/moderate` truncates its input, so a matcher reading past
         the cut would report a disagreement that is an artifact of the cut.
@@ -1804,6 +1816,40 @@ class TestTableRepair(unittest.IsolatedAsyncioTestCase):
         apart, which would invent a number out of two columns."""
         cells = _displayed_text("<table><tr><td>415</td><td>5552671</td></tr></table>")
         self.assertNotIn("4155552671", cells)
+
+    def test_a_cell_left_open_still_closes(self) -> None:
+        """HTML5 inserts the end tag for you: a second `<td>` closes the
+        first, and a row boundary closes whatever cell is open. Counting
+        cells instead of tracking one meant a table with implied end tags
+        never came back out of a cell, and the number before it was collected
+        by nothing."""
+        for formatted in (
+            "<table>41<td>notes<td>x</tr>5-555-2671</table>",
+            "<table><tbody><tr><td>a</td></tr></tbody>41<tr><td>b</td></tr>"
+            "5-555-2671</table>",
+        ):
+            with self.subTest(formatted=formatted):
+                self.assertIn("415-555-2671", _displayed_text(formatted))
+
+    def test_a_row_start_is_not_a_cell_start(self) -> None:
+        """Text directly inside a row or a table section is inside no cell at
+        all, and HTML5 foster-parents it like any other.
+
+        Asserted by COUNTING, because the in-place reading already contains
+        this number: a run that is contiguous in the source is contiguous
+        there whether or not it was collected, so `assertIn` passes on a
+        collector that never ran. The fostered surface adds the second copy.
+        """
+        for formatted in (
+            "<table><tr>415-555-2671<td>a</td></tr></table>",
+            "<table><tbody>415-555-2671<tr><td>a</td></tr></tbody></table>",
+        ):
+            with self.subTest(formatted=formatted):
+                self.assertEqual(
+                    _displayed_text(formatted).count("415-555-2671"),
+                    2,
+                    "the row's own text was not foster-parented",
+                )
 
     def test_a_row_is_not_a_cell(self) -> None:
         """Text between a `</td>` and its `</tr>` is outside every cell, and
