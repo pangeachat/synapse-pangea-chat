@@ -13,9 +13,9 @@ from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.moderation import ChatModeration, _normalize_category
 from synapse_pangea_chat.moderation.tier1_prefilter import (
-    REASON_PHONE_NUMBER,
+    REASON_CONTACT_DETAILS,
+    REASON_LOCATION_DETAILS,
     REASON_PROFANITY,
-    REASON_STREET_ADDRESS,
     check_text,
 )
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
@@ -70,19 +70,19 @@ def _moderation(config: PangeaChatConfig) -> ChatModeration:
 class TestTier1Prefilter(unittest.TestCase):
     def test_us_phone_number_blocks(self) -> None:
         self.assertEqual(
-            check_text("call me at (415) 555-2671", ["US"]), REASON_PHONE_NUMBER
+            check_text("call me at (415) 555-2671", ["US"]), REASON_CONTACT_DETAILS
         )
 
     def test_international_phone_blocks_regardless_of_region(self) -> None:
         self.assertEqual(
             check_text("mon numéro est +33 6 12 34 56 78", ["US"]),
-            REASON_PHONE_NUMBER,
+            REASON_CONTACT_DETAILS,
         )
 
     def test_street_address_blocks(self) -> None:
         self.assertEqual(
             check_text("meet me at 42 Maple Street after class", ["US"]),
-            REASON_STREET_ADDRESS,
+            REASON_LOCATION_DETAILS,
         )
 
     def test_profanity_blocks(self) -> None:

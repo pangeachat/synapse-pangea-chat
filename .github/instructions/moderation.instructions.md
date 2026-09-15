@@ -19,6 +19,15 @@ Runs in the send path and can reject a message before it appears, so everything 
 
 The address pattern stays English-centric, with Tier 2 as its backstop. A failure inside Tier 1 allows the message (fail open, logged) — a moderation bug must never block all sends.
 
+Each check has a rule identifier, which is what appears in logs:
+
+| Rule identifier | The check that fired |
+|---|---|
+| `contact_details` | phone numbers |
+| `location_details` | street addresses |
+| `profanity` | the wordlist |
+
+
 ### What Tier 1 deliberately does not block
 
 Because Tier 1 blocks before a message is sent, a false positive silences an innocent learner, which is worse than a miss that Tier 2 can still catch. Terms whose ordinary meaning is common therefore stay out of the blocking wordlist and are left to Tier 2's contextual judgement — animal words used as insults (Malay *babi*, Danish *svin*), body or object words (Polish *pedał*, a bicycle pedal), place and people names (the country Niger, Italian *Troia*), scientific vocabulary (*Homo* sapiens), and medical terms (Dutch *kanker*). The reason for each exclusion is recorded alongside the test corpus, which is also where a benign word wrongly caught by a needle is allowlisted.
@@ -32,6 +41,16 @@ Fires after an event persists, from a background task so event persistence never
 **Disposition is self-redaction: the redaction is sent as the offending sender.** The module send path enforces normal room power levels, and no service user is a member of every room — but a sender may always redact their own message, so self-redaction works in every room, DMs included. The moderation reason rides on the redaction event, prefixed so clients and audits can tell moderation redactions from ordinary ones. (This corrects the org doc's assumption that the module send path is privileged; it is not.)
 
 Tier 2 skips rooms carrying an activity-plan state event: the conversation orchestrator already moderates activity sessions, and a second check would double-redact and double-spend. Every failure in the check-and-redact path is logged and fails open, mirroring the choreo handler's own contract.
+
+## What a moderation log line may contain
+
+A moderation log record is not an ordinary diagnostic: it states that a particular person tripped a content filter, and it says something about what they wrote. Application logs are not an access-controlled store, they are shipped to aggregators, and they outlive the decision by months. So the module holds to one rule: **no Matrix ID and no message text ever reaches a log handler.**
+
+What a line does carry is a room id, an event id where one exists, the rule identifier from the table above, and a `sender_digest`. The digest is a keyed hash of the Matrix ID with a key generated once per process: an operator chasing a false positive can see that the same sender tripped a rule repeatedly, and the value cannot be turned back into a Matrix ID — not even by enumerating the homeserver's users, which a plain hash would allow. Correlation stops at the process boundary on purpose; anything longer-lived is a behavioural record of a named person and belongs in the database, behind authorisation. An event id resolves to its sender the same way.
+
+Exceptions are the channel that is easy to miss. `logger.exception` prints the exception's own message, and a library that fails on a message body routinely quotes that body back, so no moderation handler logs a traceback. Each logs the exception's type and the `file:line` that raised it, which is what identifies a bug, and nothing that came from the message.
+
+Rule identifiers name the **rule**, not the category of personal data it looks for, for the same reason: `rule=phone_number` beside a room id is an assertion about what a specific message contained.
 
 ## Deliberately out of scope here
 

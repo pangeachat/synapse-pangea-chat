@@ -17,6 +17,7 @@ from typing import Iterable, Optional
 
 import phonenumbers
 
+from synapse_pangea_chat.moderation.log_safety import error_site
 from synapse_pangea_chat.moderation.profanity import (
     contains_profanity as _contains_profanity_multilingual,
 )
@@ -25,9 +26,17 @@ logger = logging.getLogger(
     "synapse.modules.synapse_pangea_chat.moderation.tier1_prefilter"
 )
 
-# Reason codes surfaced in logs (never user-visible text).
-REASON_PHONE_NUMBER = "phone_number"
-REASON_STREET_ADDRESS = "street_address"
+# Rule identifiers, surfaced in logs and never in user-visible text.
+#
+# These name the RULE, not the personal data the rule looks for, and that is
+# deliberate. A log line reading `rule=phone_number` next to a room id is not
+# a neutral diagnostic: it asserts what a particular message contained, which
+# is the kind of record this module keeps out of plaintext logs. The rule
+# family is what an operator debugging a false positive actually needs, and
+# there is one rule per family, so nothing is lost - the mapping from
+# identifier to check is in moderation.instructions.md.
+REASON_CONTACT_DETAILS = "contact_details"
+REASON_LOCATION_DETAILS = "location_details"
 REASON_PROFANITY = "profanity"
 
 # Conservative street-address shape: a 1-5 digit house number, one to four
@@ -55,10 +64,21 @@ def contains_phone_number(text: str, regions: Iterable[str]) -> bool:
         try:
             if any(phonenumbers.PhoneNumberMatcher(text, region)):
                 return True
-        except Exception:  # pragma: no cover - defensive: library quirk
+        except Exception as exc:  # pragma: no cover - defensive: library quirk
             # silent-ok: fail-open per tier contract; logged for visibility,
             # and Tier 2 still sees the message.
-            logger.warning("phone matcher failed for region %s", region, exc_info=True)
+            #
+            # The exception's TYPE and the line that raised it are logged; its
+            # message and traceback are not. A parsing library that fails on a
+            # message body routinely quotes that body back in the error, so
+            # `exc_info=True` here would put message text into the log by a
+            # route no review of our own format strings would catch.
+            logger.warning(
+                "phone matcher failed for region %s at %s (%s)",
+                region,
+                error_site(exc),
+                type(exc).__name__,
+            )
     return False
 
 
@@ -73,9 +93,9 @@ def contains_profanity(text: str) -> bool:
 def check_text(text: str, phone_regions: Iterable[str]) -> Optional[str]:
     """Return a reason code when the text trips a Tier 1 rule, else None."""
     if contains_phone_number(text, phone_regions):
-        return REASON_PHONE_NUMBER
+        return REASON_CONTACT_DETAILS
     if contains_street_address(text):
-        return REASON_STREET_ADDRESS
+        return REASON_LOCATION_DETAILS
     if contains_profanity(text):
         return REASON_PROFANITY
     return None

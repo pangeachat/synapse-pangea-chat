@@ -37,6 +37,11 @@ from synapse_pangea_chat.moderation.choreo_client import (
     ModerationCheckError,
     moderate_text,
 )
+from synapse_pangea_chat.moderation.log_safety import (
+    error_site,
+    new_digest_key,
+    sender_digest,
+)
 from synapse_pangea_chat.moderation.tier1_prefilter import check_text
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
 
@@ -83,6 +88,9 @@ class ChatModeration:
         self._exempt_patterns = [
             re.compile(p) for p in config.moderation_exempt_user_id_patterns
         ]
+        # Keyed per instance so a Matrix ID cannot be recovered from a log
+        # line by enumeration; see moderation.log_safety.
+        self._log_digest_key = new_digest_key()
 
         if config.moderation_tier1_enabled:
             api.register_spam_checker_callbacks(
@@ -123,6 +131,10 @@ class ChatModeration:
     def _is_exempt_sender(self, sender: str) -> bool:
         return any(p.match(sender) for p in self._exempt_patterns)
 
+    def _sender_digest(self, sender: str) -> str:
+        """A log-safe stand-in for a sender's Matrix ID."""
+        return sender_digest(sender, self._log_digest_key)
+
     # ------------------------------------------------------------------
     # Tier 1 — deterministic pre-filter (blocks before persist)
     # ------------------------------------------------------------------
@@ -134,18 +146,32 @@ class ChatModeration:
                 return NOT_SPAM
             reason = check_text(text, self._config.moderation_tier1_phone_regions)
             if reason is not None:
+                # No Matrix ID and no message text: this record says that
+                # somebody in this room tripped this rule, which is what an
+                # operator needs, and stops short of saying who or what. The
+                # blocked event is never persisted, so there is no event id
+                # to give either; the digest is what links repeated blocks
+                # from one sender within this process.
                 logger.info(
-                    "tier1 blocked event from %s in %s (reason=%s)",
-                    event.sender,
+                    "tier1 blocked an event in %s (rule=%s, sender_digest=%s)",
                     event.room_id,
                     reason,
+                    self._sender_digest(event.sender),
                 )
                 return Codes.FORBIDDEN
             return NOT_SPAM
-        except Exception:
+        except Exception as exc:
             # silent-ok: fail-open by contract — a moderation bug must never
             # block all sends; the failure is logged and Tier 2 still runs.
-            logger.exception("tier1 pre-filter failed; allowing event")
+            #
+            # Type and site, not `logger.exception`: the traceback ends with
+            # the exception's own message, and anything raised while matching
+            # a message body is liable to quote that body.
+            logger.warning(
+                "tier1 pre-filter failed at %s (%s); allowing event",
+                error_site(exc),
+                type(exc).__name__,
+            )
             return NOT_SPAM
 
     # ------------------------------------------------------------------
@@ -176,10 +202,17 @@ class ChatModeration:
                 event,
                 text,
             )
-        except Exception:
+        except Exception as exc:
             # silent-ok: fail-open by contract; observe-only hook, so the
-            # only cost of a failure here is a missed check — logged.
-            logger.exception("tier2 dispatch failed for %s", event.event_id)
+            # only cost of a failure here is a missed check — logged by type
+            # and site rather than as a traceback, for the reason given on
+            # the Tier-1 handler above.
+            logger.warning(
+                "tier2 dispatch failed for %s at %s (%s)",
+                event.event_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
 
     @staticmethod
     def _room_has_activity_plan(
