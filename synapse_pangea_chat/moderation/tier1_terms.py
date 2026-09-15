@@ -77,6 +77,10 @@ class TermRecord(TypedDict, total=False):
     tier1: bool
     reason: str
     note: str
+    #: Present only on a promoted term: the positive evidence for promoting
+    #: it. `basis` is one of `not_a_word_in_any_orthography`,
+    #: `curator_attested` or `native_review`.
+    review: Dict[str, str]
     collisions: Dict[str, float]
     adjudication: Dict[str, object]
 
@@ -336,6 +340,8 @@ def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
     # Punctuation gaps only, for the same reason as above.
     return any(
         not right.after_space
+        and _alphabetic(left.text)
+        and _alphabetic(right.text)
         and (len(left.text) <= _FRAGMENT_LEN or len(right.text) <= _FRAGMENT_LEN)
         and left.text + right.text in needles
         for left, right in zip(spans, spans[1:])
@@ -343,10 +349,20 @@ def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
 
 
 def _joinable(span: Span, run: List[str]) -> bool:
+    """Only letters of an alphabet ever rejoin.
+
+    In Hangul, kana and the abugidas one character is a word, and punctuation
+    between two of them is ordinary punctuation: `민수 씨,발 아파요?` is still
+    "Minsu, does your foot hurt?" with a comma in it. So the alphabet rule
+    applies to both kinds of gap, and the length allowance only to the
+    punctuation one.
+    """
+    if not _alphabetic(span.text):
+        return False
     if not span.after_space:
         return len(span.text) <= _FRAGMENT_LEN
-    return (
-        len(span.text) == 1
-        and _is_letter_of_an_alphabet(span.text)
-        and (not run or (len(run[-1]) == 1 and _is_letter_of_an_alphabet(run[-1])))
-    )
+    return len(span.text) == 1 and (not run or len(run[-1]) == 1)
+
+
+def _alphabetic(token: str) -> bool:
+    return bool(token) and all(_is_letter_of_an_alphabet(char) for char in token)

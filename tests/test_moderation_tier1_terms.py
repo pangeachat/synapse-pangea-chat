@@ -18,6 +18,7 @@ from synapse_pangea_chat.moderation.profanity import contains_profanity
 from synapse_pangea_chat.moderation.tier1_prefilter import REASON_PROFANITY, check_text
 from synapse_pangea_chat.moderation.tier1_terms import (
     TermRecord,
+    _is_letter_of_an_alphabet,
     matches_phrase,
     matches_tier1,
     needle,
@@ -96,13 +97,19 @@ _WORDFREQ_LANG = {"sr": "sh"}
 _LARGE_LIST_THRESHOLD = 3.0
 _SMALL_LIST_THRESHOLD = 0.01
 
-_REASONS_FOR_TIER1 = {"no_collision_measured", "collision_adjudicated"}
+_REASONS_FOR_TIER1 = {"reviewed", "collision_adjudicated"}
+_REVIEW_BASES = {
+    "not_a_word_in_any_orthography",
+    "curator_attested",
+    "native_review",
+}
 _REASONS_FOR_TIER2 = {
     "benign_homograph",
     "benign_sense_in_own_language",
     "mention_not_use",
     "register",
     "romanization",
+    "awaiting_review",
     "no_word_boundary",
     "too_short",
     "unadjudicated",
@@ -111,6 +118,17 @@ _REASONS_FOR_TIER2 = {
 
 def _corpus() -> Dict[str, Any]:
     return json.loads(_CORPUS_PATH.read_text(encoding="utf-8"))
+
+
+def _policy() -> Dict[str, Any]:
+    return json.loads(
+        (
+            Path(__file__).parents[1]
+            / "synapse_pangea_chat"
+            / "moderation"
+            / "tier1_universal.json"
+        ).read_text(encoding="utf-8")
+    )["_policy"]
 
 
 def _controls() -> List[Dict[str, str]]:
@@ -169,6 +187,24 @@ class TestTheTier2FlagMarkerIsARecordedList(unittest.TestCase):
     to say it is recorded in `curation_decisions`, so adding one is an edit to
     the decisions record rather than a field quietly dropped onto a case."""
 
+    TIER2_LAXNESS = {
+        "term_is_on_the_tier2_list",
+        "tier2_folds_diacritics",
+        "tier2_rejoins_fragments",
+        "tier2_substring_matches_cjk",
+        "tier2_joins_a_phrase_across_any_separator",
+    }
+
+    def test_each_marker_names_a_known_tier2_mechanism(self) -> None:
+        """Not free text. Tier 2 is lax in five specific ways, and a control
+        excused from its assertion has to point at one of them - so excusing
+        a regression means claiming a mechanism that is not what happened."""
+        for case in _controls():
+            if case.get("tier2_matcher") != "flags":
+                continue
+            with self.subTest(sentence=case["sentence"]):
+                self.assertIn(case.get("tier2_reason"), self.TIER2_LAXNESS)
+
     def test_only_the_recorded_sentences_carry_the_marker(self) -> None:
         corpus = _corpus()
         allowed = set(corpus["curation_decisions"]["tier2_known_flags"])
@@ -185,6 +221,34 @@ class TestTheTier2FlagMarkerIsARecordedList(unittest.TestCase):
         )
 
 
+class TestTheCorpusAndTheClassificationAgree(unittest.TestCase):
+    """Two recorded descriptions of the same decision have to match.
+
+    Removing `n1gger` from the loaded core and changing only its corpus tier
+    to 2 kept the whole suite green, while the classification still called it
+    universal. The corpus records what happens; the classification records
+    what was decided; this asserts they say the same thing.
+    """
+
+    def test_each_evasion_case_agrees_with_its_classification(self) -> None:
+        classified = {entry["term"]: entry for entry in universal_terms()}
+        checked = 0
+        for lang in _corpus()["languages"]:
+            for case in lang["evasions"]:
+                entry = classified.get(case["term"])
+                if entry is None:
+                    continue  # an evasion spelling that is not itself listed
+                checked += 1
+                with self.subTest(term=case["term"]):
+                    self.assertEqual(
+                        case["tier"] == 1,
+                        bool(entry["tier1"]),
+                        f"the corpus and tier1_universal.json disagree about "
+                        f"{case['term']!r}",
+                    )
+        self.assertGreater(checked, 30, "most evasion spellings are listed terms")
+
+
 class TestTier1StillBlocksProfanity(unittest.TestCase):
     """The other half of the bargain. Permissive must not mean inert: if the
     universal set were emptied, every test above would pass and Tier 1 would
@@ -193,60 +257,55 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
     MUST_BLOCK = [
         ("you are a fucking idiot", "en"),
         ("motherfucker", "en"),
-        ("du bist ein Arschloch", "de"),
-        ("va te faire enculé", "fr"),
-        ("kurwa, co za dzień", "pl"),
-        ("иди на хуй", "ru"),
-        ("씨발 진짜", "ko"),
-        ("Ets un fill de puta.", "ca"),
+        ("what a cunt", "en"),
+        ("du 4rschloch", "de"),
+        ("h1jo de puta", "es"),
+        ("v1ttu", "fi"),
+        ("бл9дь", "ru"),
+        ("n1gger", "en"),
     ]
 
-    def test_chinese_and_japanese_have_no_tier1_coverage(self) -> None:
-        """Stated as a test because it is a product fact, not an oversight.
+    def test_everything_tier1_stopped_blocking_is_caught_by_tier2(self) -> None:
+        """The whole bargain, asserted over the whole corpus.
 
-        Both scripts write without word spacing, so a Tier 1 needle has no
-        boundary to respect and fires inside ordinary sentences. Every term
-        of theirs is Tier 2's, and Tier 2 still catches them.
+        Tier 1 now blocks plain words in English only, because English is the
+        only language anyone on this change can attest. That is a large
+        recall loss at the blocking tier, and it is acceptable only because
+        Tier 2 catches every one of them - which is what this asserts, case
+        by case, rather than assuming.
         """
-        for lang in _corpus()["languages"]:
-            if lang["lang_code"] not in ("ja", "zh"):
-                continue
-            for case in lang["profanities"]:
-                with self.subTest(lang=lang["lang_code"], term=case["term"]):
-                    self.assertEqual(case["tier"], 2)
-                    self.assertTrue(contains_profanity(case["sentence"]))
-
-    def test_tier1_still_covers_most_of_the_corpus(self) -> None:
-        """The sentinels above are eight sentences; this is the whole corpus.
-
-        Demoting terms one at a time until Tier 1 is empty would keep every
-        false-positive test green, and each step would look reasonable. The
-        floor makes the aggregate visible: dropping below it is a deliberate
-        edit to this number, in a diff a reviewer reads.
-        """
-        cases = [
-            case for lang in _corpus()["languages"] for case in lang["profanities"]
-        ]
-        blocked = [case for case in cases if case["tier"] == 1]
-        self.assertGreaterEqual(
-            len(blocked),
-            90,
-            f"Tier 1 now blocks only {len(blocked)} of {len(cases)} corpus "
-            f"profanity sentences",
-        )
-        covered = {
-            lang["lang_code"]
+        moved = [
+            case
             for lang in _corpus()["languages"]
-            for case in lang["profanities"]
+            for kind in ("profanities", "evasions")
+            for case in lang[kind]
+            if case["tier"] == 2
+        ]
+        self.assertGreater(len(moved), 100, "the corpus still has cases to check")
+        for case in moved:
+            text = case.get("sentence", case["term"])
+            with self.subTest(term=case["term"]):
+                self.assertFalse(matches_tier1(text))
+                self.assertTrue(
+                    contains_profanity(text),
+                    f"{case['term']!r} left Tier 1 and Tier 2 does not catch it",
+                )
+
+    def test_the_evasion_spellings_are_still_rejected_before_send(self) -> None:
+        """Obfuscated spellings are the one thing Tier 1 can block in every
+        language without a reviewer, because a digit inside a word is not an
+        orthography anywhere. If that stopped working, the blocking tier
+        would be English-only in practice as well as in principle."""
+        caught = [
+            case
+            for lang in _corpus()["languages"]
+            for case in lang["evasions"]
             if case["tier"] == 1
-        }
-        self.assertGreaterEqual(
-            len(covered),
-            28,
-            "every language except the two written without word spacing keeps "
-            f"some Tier 1 coverage; these do not: "
-            f"{sorted({lang['lang_code'] for lang in _corpus()['languages']} - covered)}",
-        )
+        ]
+        self.assertGreaterEqual(len(caught), 20)
+        for case in caught:
+            with self.subTest(term=case["term"]):
+                self.assertTrue(matches_tier1(case["term"]))
 
     def test_real_profanity_is_still_rejected_before_send(self) -> None:
         for text, lang in self.MUST_BLOCK:
@@ -291,11 +350,91 @@ class TestEveryTermIsClassified(unittest.TestCase):
         """An empty core passes every false-positive test in this file. It is
         also the state D1 forbids: Tier 1 exists, so it must carry something."""
         universal = [e for e in universal_terms() if e["tier1"]]
-        self.assertGreater(len(universal), 100)
-        covered = {lang for entry in universal for lang in entry["langs"]}
-        self.assertGreaterEqual(
-            len(covered), 25, "the universal set has to span our languages"
+        self.assertGreater(len(universal), 20)
+        self.assertTrue(
+            any(entry["review"]["basis"] == "curator_attested" for entry in universal),
+            "an obfuscation-only core would block `n1gger` and not `nigger`",
         )
+
+
+class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
+    """The rule that closed the class three rounds of review kept reopening.
+
+    A term used to reach Tier 1 by not being objected to: no measurable
+    frequency elsewhere, therefore universal. Adversarial review then found
+    `faggot` (a British dish), `hoer` (one who hoes), Greek `kariola` (a bed),
+    Turkish `kaltak` (a saddle frame), Portuguese `viado` (striped fabric),
+    Korean `byeongsin` (the year 丙申) and `Chuj` (a Mayan language) among
+    terms that scored zero in every language the gate could measure. Absence
+    of a score is not evidence, so promotion now requires some.
+    """
+
+    def test_every_promoted_term_records_its_evidence(self) -> None:
+        for entry in universal_terms():
+            if not entry["tier1"]:
+                continue
+            with self.subTest(term=entry["term"]):
+                review = entry.get("review")
+                self.assertIsNotNone(review, "promoted with no review record")
+                assert review is not None
+                self.assertIn(review["basis"], _REVIEW_BASES)
+                note = review.get("note", "")
+                assert isinstance(note, str)
+                self.assertTrue(note.strip())
+
+    def test_the_obfuscation_basis_is_verified_not_asserted(self) -> None:
+        """`not_a_word_in_any_orthography` means the needle carries a digit,
+        and that is checked in both directions: the basis cannot be claimed
+        for an ordinary word, and an ordinary word cannot be promoted by
+        claiming it."""
+        for entry in universal_terms():
+            if not entry["tier1"]:
+                continue
+            has_digit = any(char.isdigit() for char in needle(entry["term"]))
+            claims = entry["review"]["basis"] == "not_a_word_in_any_orthography"
+            with self.subTest(term=entry["term"]):
+                self.assertEqual(claims, has_digit)
+
+    def test_curator_attestation_is_limited_to_the_recorded_words(self) -> None:
+        """The curator speaks one of the thirty languages. The words they
+        attest are listed in the policy, so a new one is an edit a reviewer
+        sees next to the sentence saying how little that attestation covers."""
+        policy = _policy()
+        self.assertEqual(policy["curator_languages"], ["en"])
+        attested = {
+            needle(entry["term"])
+            for entry in universal_terms()
+            if entry["tier1"] and entry["review"]["basis"] == "curator_attested"
+        }
+        self.assertEqual(attested, set(policy["curator_attested"]))
+        for word in attested:
+            with self.subTest(word=word):
+                self.assertTrue(word.isascii() and word.isalpha())
+
+    def test_a_native_review_names_a_reviewer(self) -> None:
+        for entry in universal_terms():
+            if not entry["tier1"] or entry["review"]["basis"] != "native_review":
+                continue
+            with self.subTest(term=entry["term"]):
+                self.assertNotIn(
+                    "curator",
+                    str(entry["review"].get("by", "")),
+                    "the curator is not a native reviewer of anything but English",
+                )
+                self.assertTrue(str(entry["review"].get("date", "")).strip())
+
+    def test_the_languages_tier1_carries_terms_for_are_recorded(self) -> None:
+        """Adding a language to Tier 1 is a review task. Recording the list
+        makes it one somebody signs for, rather than a side effect."""
+        carried = sorted(
+            {
+                lang
+                for entry in universal_terms()
+                if entry["tier1"]
+                for lang in entry["langs"]
+            }
+        )
+        self.assertEqual(carried, _policy()["tier1_languages"])
 
 
 class TestTheCollisionGate(unittest.TestCase):
@@ -367,8 +506,13 @@ class TestTheCollisionGate(unittest.TestCase):
         self.assertEqual(needle_floor("хуй"), 3)
         self.assertEqual(needle_floor("씨발"), 2)
         self.assertTrue(
-            floors[4] and floors[3] and floors[2],
-            "every floor is exercised by real terms, so none of them is dead",
+            floors[4] and floors[3],
+            "the alphabet floors are exercised by real terms",
+        )
+        self.assertEqual(
+            floors[2],
+            [],
+            "nothing written in a script without word spacing is in Tier 1",
         )
 
     def test_recorded_needles_match_what_the_matcher_computes(self) -> None:
@@ -498,8 +642,9 @@ class TestTheMatchingRules(unittest.TestCase):
     its mechanism, so a regression says which rule came back."""
 
     def test_a_needle_does_not_match_a_word_that_starts_with_it(self) -> None:
+        self.assertFalse(matches_tier1("Fuckery is a word in some dictionaries"))
         self.assertFalse(matches_tier1("Мы изучаем хуйский язык."))
-        self.assertTrue(matches_tier1("иди на хуй"))
+        self.assertTrue(matches_tier1("fuck off"))
 
     def test_a_multi_word_term_does_not_match_inside_a_word(self) -> None:
         self.assertFalse(matches_tier1("Pedestrian crossing is ahead"))
@@ -544,8 +689,11 @@ class TestTheMatchingRules(unittest.TestCase):
         self.assertEqual(needle("খানকির"), "খানকির")
 
     def test_diacritics_do_not_merge_two_different_words(self) -> None:
+        """Asserted on the normalizer, so it does not depend on which terms
+        happen to be promoted: `pica` and `píča` must stay two words."""
         self.assertFalse(matches_tier1("Pica je jednotka v typografii"))
-        self.assertTrue(matches_tier1("Nadával jej do piče."))
+        self.assertNotEqual(needle("pica"), needle("píča"))
+        self.assertEqual(needle("fücking"), "fücking")
 
     def test_a_short_needle_does_not_match_an_ordinary_word(self) -> None:
         self.assertFalse(matches_tier1("Merg cu tine"))
@@ -563,9 +711,25 @@ class TestTheMatchingRules(unittest.TestCase):
         for text in ("김 씨 발이 아파요", "민수 씨 발 아파요?", "개 새 끼"):
             with self.subTest(text=text):
                 self.assertFalse(matches_tier1(text))
-        for text in ("f u c k you", "п и ч к а", "f*cking hell"):
+        for text in ("f u c k you", "n 1 g g e r", "c.u.n.t"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
+
+    def test_only_letters_of_an_alphabet_are_treated_as_fragments(self) -> None:
+        """Asserted on the rule itself, because no term written in one of
+        those scripts is in Tier 1 today - there is no reviewer for one - so
+        an end-to-end assertion would pass with the rule deleted, and would
+        keep passing until the day somebody adds a Korean term back.
+
+        Punctuation is not proof of an evasion either: `민수 씨,발 아파요?` is
+        the same ordinary sentence with a comma in it.
+        """
+        for char in ("f", "z", "х", "α"):
+            with self.subTest(char=char):
+                self.assertTrue(_is_letter_of_an_alphabet(char))
+        for char in ("씨", "발", "ね", "妈", "र", "ة"):
+            with self.subTest(char=char):
+                self.assertFalse(_is_letter_of_an_alphabet(char))
 
     def test_tier1_never_matches_inside_a_word(self) -> None:
         """Tier 1 does not substring-match at all, which is why Chinese and

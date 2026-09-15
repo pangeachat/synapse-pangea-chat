@@ -172,8 +172,18 @@ def _strip_diacritics(text: str) -> str:
 
 def _decorated_script(char: str) -> bool:
     """True for the scripts where a combining mark is an accent on a letter
-    rather than a letter in its own right."""
-    return ord(char) < 0x0590 or 0x1E00 <= ord(char) < 0x2000
+    rather than a letter in its own right.
+
+    Latin, Greek and Cyrillic, and Arabic: the harakat are optional
+    vocalization, normally left out, so `يا شَرْمُوطَة` has to reduce to the
+    unvocalized form the wordlist carries. Devanagari, Bengali and Hangul are
+    the other case - there the marks are letters, and dropping them merged
+    `रोड` with `रंडी`."""
+    return (
+        ord(char) < 0x0590
+        or 0x0600 <= ord(char) <= 0x06FF
+        or 0x1E00 <= ord(char) < 0x2000
+    )
 
 
 def _fold(text: str) -> str:

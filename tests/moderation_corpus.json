@@ -74,7 +74,7 @@
      "term": "fill de puta",
      "sentence": "Ets un fill de puta.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "puta",
@@ -86,13 +86,13 @@
      "term": "merda",
      "sentence": "Ves-te'n a la merda.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "maricó",
      "sentence": "L'han insultat dient-li maricó.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -126,7 +126,8 @@
      "sentence": "La puta de sol és molt forta avui.",
      "why_benign": "Retired control, restored. Whatever its register, Tier 1 must not block it: Serbian 'puta' is the ordinary word for 'times' (zipf 5.72), so 'puta' has a benign homograph in a supported language and cannot be a Tier 1 term.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'puta' is on the Tier 2 list, which is the recall-oriented one."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'puta' is on the Tier 2 list, which is the recall-oriented one.",
+     "tier2_reason": "term_is_on_the_tier2_list"
     }
    ]
   },
@@ -138,31 +139,31 @@
      "term": "Arschloch",
      "sentence": "Du bist ein Arschloch.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "Hurensohn",
      "sentence": "Hau ab, du Hurensohn.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "Scheiße",
      "sentence": "Was für eine Scheiße!",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "Fotze",
      "sentence": "Er beschimpfte sie als Fotze.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "Schwuchtel",
      "sentence": "Sie nannten ihn eine Schwuchtel.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -176,13 +177,13 @@
      "term": "H u r e n s o h n",
      "base_term": "Hurensohn",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "Scheisse",
      "base_term": "Scheiße",
      "technique": "character substitution",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -284,13 +285,15 @@
      "sentence": "We bought a faggot for dinner.",
      "why_benign": "A faggot is a British dish of seasoned offal meatballs (Oxford Learner's Dictionary). The slur and the food are the same word, and only context separates them.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the slur and the food are the same word, and Tier 2 carries the full wordlist."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the slur and the food are the same word, and Tier 2 carries the full wordlist.",
+     "tier2_reason": "term_is_on_the_tier2_list"
     },
     {
      "sentence": "The hoer removed the weeds.",
      "why_benign": "'Hoer' - one who hoes - is in Merriam-Webster, and the frequency lists score it 0.0. A term can collide with ordinary vocabulary and leave no trace in the data the gate measures.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Dutch 'hoer' is on the Tier 2 list and the English word is spelled the same."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Dutch 'hoer' is on the Tier 2 list and the English word is spelled the same.",
+     "tier2_reason": "term_is_on_the_tier2_list"
     }
    ]
   },
@@ -302,7 +305,7 @@
      "term": "hijo de puta",
      "sentence": "Eres un hijo de puta.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "puta",
@@ -314,19 +317,19 @@
      "term": "maricón",
      "sentence": "Lo insultaron llamándolo maricón.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "coño",
      "sentence": "¡Qué coño haces!",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "joder",
      "sentence": "¡Joder, déjame en paz!",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -340,13 +343,13 @@
      "term": "m a r i c ó n",
      "base_term": "maricón",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "maricon",
      "base_term": "maricón",
      "technique": "diacritic stripping",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -376,31 +379,31 @@
      "term": "fils de pute",
      "sentence": "Espèce de fils de pute.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "salope",
      "sentence": "Il l'a harcelée en la traitant de salope.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "enculé",
      "sentence": "Dégage, enculé.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "putain",
      "sentence": "Putain, laisse-moi tranquille !",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "pédé",
      "sentence": "Ils l'ont insulté en disant pédé.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -414,7 +417,7 @@
      "term": "e n c u l é",
      "base_term": "enculé",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "pede",
@@ -450,25 +453,25 @@
      "term": "figlio di puttana",
      "sentence": "Sei un figlio di puttana.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "cazzo",
      "sentence": "Che cazzo fai?",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "stronzo",
      "sentence": "Vattene, stronzo.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "frocio",
      "sentence": "Lo hanno insultato chiamandolo frocio.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -482,13 +485,13 @@
      "term": "s t r o n z o",
      "base_term": "stronzo",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "froccio",
      "base_term": "frocio",
      "technique": "doubled consonant",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -570,7 +573,8 @@
      "sentence": "くその木を観察しました。",
      "why_benign": "Retired control, restored. くそ is substring-matched in a script without word spacing, so it fires inside any compound that contains it, and it also carries the ordinary sense 'dung'.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Japanese has no word spacing, so Tier 2 substring-matches くそ inside the compound."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Japanese has no word spacing, so Tier 2 substring-matches くそ inside the compound.",
+     "tier2_reason": "tier2_substring_matches_cjk"
     }
    ]
   },
@@ -582,13 +586,13 @@
      "term": "씨발",
      "sentence": "씨발, 당장 꺼져.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "개새끼",
      "sentence": "이 개새끼야, 그만해.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "병신",
@@ -608,7 +612,7 @@
      "term": "ㅆㅂ",
      "base_term": "씨발",
      "technique": "initial-consonant abbreviation",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "개 새 끼",
@@ -644,19 +648,22 @@
      "sentence": "김 씨 발이 아파요.",
      "why_benign": "Korean for 'Mr Kim's foot hurts'. Rejoining fragments across spaces turned the ordinary words 씨 and 발이 into a slur; a space is a real word boundary, and Korean words either side of one are routinely one syllable long.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher rejoins short fragments without asking what separated them."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher rejoins short fragments without asking what separated them.",
+     "tier2_reason": "tier2_rejoins_fragments"
     },
     {
      "sentence": "2016년은 병신(丙申)년입니다.",
      "why_benign": "병신 is also 丙申, a year of the sexagenary cycle, written in ordinary Korean dates.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 병신 is on the Tier 2 list; the calendar sense is the collision."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 병신 is on the Tier 2 list; the calendar sense is the collision.",
+     "tier2_reason": "term_is_on_the_tier2_list"
     },
     {
      "sentence": "민수 씨 발 아파요?",
      "why_benign": "Korean for 'Minsu, does your foot hurt?'. 씨 is an honorific and 발 is a foot; both are whole words, and one Hangul syllable is never the fragment of a letter-by-letter evasion.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher rejoins short fragments without asking what separated them, which in Korean is most sentences."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher rejoins short fragments without asking what separated them, which in Korean is most sentences.",
+     "tier2_reason": "tier2_rejoins_fragments"
     }
    ]
   },
@@ -668,19 +675,19 @@
      "term": "filho da puta",
      "sentence": "Você é um filho da puta.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "caralho",
      "sentence": "Que caralho você está fazendo?",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "viado",
      "sentence": "Ele foi perseguido e chamado de viado.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "puta",
@@ -706,7 +713,7 @@
      "term": "c a r a l h o",
      "base_term": "caralho",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "v1ado",
@@ -742,25 +749,25 @@
      "term": "блядь",
      "sentence": "Блядь, оставь меня в покое.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "хуй",
      "sentence": "Иди на хуй.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "пидор",
      "sentence": "Его оскорбили словом «пидор».",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "ебать",
      "sentence": "Ебать, что здесь случилось?",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -804,19 +811,19 @@
      "term": "đụ má",
      "sentence": "Đụ má, tránh xa tao ra.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "địt mẹ",
      "sentence": "Địt mẹ mày, im đi.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "con đĩ",
      "sentence": "Cô ấy bị xúc phạm là con đĩ.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "đồ chó",
@@ -828,7 +835,7 @@
      "term": "pê đê",
      "sentence": "Họ gọi cậu ấy là pê đê để chế giễu.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -872,7 +879,8 @@
      "sentence": "Tôi đang tập viết chữ pê. Đê là chữ tiếp theo.",
      "why_benign": "Vietnamese for 'I am practising the letter P. Đ is the next one'. A phrase term must not form across a full stop.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher joins a phrase across any separator, because it also has to catch an evasion written with punctuation inside it."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher joins a phrase across any separator, because it also has to catch an evasion written with punctuation inside it.",
+     "tier2_reason": "tier2_joins_a_phrase_across_any_separator"
     }
    ]
   },
@@ -952,13 +960,15 @@
      "sentence": "做完体操，你妈妈来接你。",
      "why_benign": "Chinese for 'after gymnastics your mother comes to pick you up'. Substring-matching the whole message with its punctuation removed spanned the clause boundary and produced 操你妈.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher substring-matches over the whole message with its punctuation removed."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher substring-matches over the whole message with its punctuation removed.",
+     "tier2_reason": "tier2_substring_matches_cjk"
     },
     {
      "sentence": "这套体操你妈妈会做吗？",
      "why_benign": "Chinese for 'can your mother do this gymnastics routine?'. 操你妈 is spread across 体操 / 你 / 妈妈 - Chinese has no word spacing, so a substring needle has no boundary to respect.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher substring-matches Chinese without word boundaries."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher substring-matches Chinese without word boundaries.",
+     "tier2_reason": "tier2_substring_matches_cjk"
     }
    ]
   },
@@ -970,19 +980,19 @@
      "term": "كس أمك",
      "sentence": "ابتعد عني يا كس أمك.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "شرموطة",
      "sentence": "شتمها ووصفها بأنها شرموطة.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "منيوك",
      "sentence": "اخرس يا منيوك.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "خول",
@@ -994,7 +1004,7 @@
      "term": "ابن القحبة",
      "sentence": "أنت ابن القحبة.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -1002,7 +1012,7 @@
      "term": "koss omak",
      "base_term": "كس أمك",
      "technique": "Latin-script transliteration",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "ش ر م و ط ة",
@@ -1044,25 +1054,25 @@
      "term": "মাদারচোদ",
      "sentence": "তুই একটা মাদারচোদ।",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "খানকির পোলা",
      "sentence": "দূর হ, খানকির পোলা।",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "চোদনা",
      "sentence": "ওকে চোদনা বলে গালি দিয়েছে।",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "মাগী",
      "sentence": "তাকে মাগী বলে অপমান করা হয়েছে।",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -1106,19 +1116,19 @@
      "term": "zmrd",
      "sentence": "Vypadni, ty zmrde.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "čurák",
      "sentence": "Jsi úplný čurák.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "píča",
      "sentence": "Nadával jí do píči.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "kurva",
@@ -1138,13 +1148,13 @@
      "term": "curak",
      "base_term": "čurák",
      "technique": "diacritic stripping",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "p 1 c a",
      "base_term": "píča",
      "technique": "spacing, leetspeak, and diacritic stripping",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "k.u.r.v.a",
@@ -1192,7 +1202,7 @@
      "term": "røvhul",
      "sentence": "Du er et røvhul.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -1200,13 +1210,13 @@
      "term": "f*cking",
      "base_term": "fucking",
      "technique": "character replacement",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "r o v h u l",
      "base_term": "røvhul",
      "technique": "spacing and diacritic stripping",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1236,25 +1246,25 @@
      "term": "γαμώ",
      "sentence": "Γαμώ, πάλι άργησα.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "πουτάνα",
      "sentence": "Την παρενόχλησαν λέγοντάς την πουτάνα.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "αρχίδι",
      "sentence": "Είσαι μεγάλο αρχίδι.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "πούστης",
      "sentence": "Τον έβρισαν λέγοντάς τον πούστη.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -1262,13 +1272,13 @@
      "term": "π ο υ τ ά ν α",
      "base_term": "πουτάνα",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "πουστης",
      "base_term": "πούστης",
      "technique": "diacritic stripping",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1298,19 +1308,19 @@
      "term": "vittu",
      "sentence": "Vittu, jätä minut rauhaan.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "perkele",
      "sentence": "Perkele, taas se hajosi.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "saatana",
      "sentence": "Painu pois, saatana.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "huora",
@@ -1330,7 +1340,7 @@
      "term": "p e r k e l e",
      "base_term": "perkele",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "hu0ra",
@@ -1366,19 +1376,19 @@
      "term": "मादरचोद",
      "sentence": "तू मादरचोद है।",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "बहनचोद",
      "sentence": "भाग यहाँ से, बहनचोद।",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "चूतिया",
      "sentence": "मुझे चूतिया मत समझ।",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "रंडी",
@@ -1398,13 +1408,13 @@
      "term": "b3henchod",
      "base_term": "बहनचोद",
      "technique": "Latin transliteration and leetspeak",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "चू ति या",
      "base_term": "चूतिया",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1424,7 +1434,8 @@
      "sentence": "रंडी नामक एक पुराना स्थान संदर्भ में आया।",
      "why_benign": "Retired control, restored. A place name is an ordinary thing for a learner to cite; only context separates naming from abuse, and Tier 1 has none.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the slur is present as a proper name; only context separates naming from abuse."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the slur is present as a proper name; only context separates naming from abuse.",
+     "tier2_reason": "term_is_on_the_tier2_list"
     },
     {
      "sentence": "रोड पर ट्रैफिक है",
@@ -1452,7 +1463,7 @@
      "term": "fasz",
      "sentence": "Mekkora fasz vagy.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "ribanc",
@@ -1472,7 +1483,7 @@
      "term": "g3ci",
      "base_term": "geci",
      "technique": "leetspeak",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "k.u.r.v.a",
@@ -1504,7 +1515,8 @@
      "sentence": "Kurva nevű településről olvastunk egy régi térképen.",
      "why_benign": "Retired control, restored. Indonesian and Malay 'kurva' is the ordinary word for a curve (zipf 3.68), so the term carries a benign homograph in a supported language.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'kurva' is on the Tier 2 list; the place name is the collision."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'kurva' is on the Tier 2 list; the place name is the collision.",
+     "tier2_reason": "term_is_on_the_tier2_list"
     }
    ]
   },
@@ -1522,7 +1534,7 @@
      "term": "kontol",
      "sentence": "Dasar kontol, diam kau.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "memek",
@@ -1534,13 +1546,13 @@
      "term": "lonte",
      "sentence": "Dia dilecehkan dengan sebutan lonte.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "bencong",
      "sentence": "Mereka mengejeknya dengan kata bencong.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -1548,13 +1560,13 @@
      "term": "b4ngsat",
      "base_term": "bangsat",
      "technique": "leetspeak",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "k o n t o l",
      "base_term": "kontol",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "l0nte",
@@ -1584,7 +1596,8 @@
      "sentence": "Saya membeli tepung Pondan untuk membuat kue.",
      "why_benign": "Pondan is a national baking-mix brand, so the word appears in ordinary shopping and cooking talk.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'pondan' is on the Tier 2 list and the brand name is spelled the same."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'pondan' is on the Tier 2 list and the brand name is spelled the same.",
+     "tier2_reason": "term_is_on_the_tier2_list"
     }
    ]
   },
@@ -1596,13 +1609,13 @@
      "term": "pukimak",
      "sentence": "Diamlah, pukimak.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "lancau",
      "sentence": "Lancau betul perangai kau.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "jalang",
@@ -1628,7 +1641,7 @@
      "term": "p0ndan",
      "base_term": "pondan",
      "technique": "leetspeak",
-     "tier": 2
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1658,7 +1671,7 @@
      "term": "klootzak",
      "sentence": "Ga weg, klootzak.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "hoer",
@@ -1678,7 +1691,7 @@
      "term": "k l o o t z a k",
      "base_term": "klootzak",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1708,19 +1721,19 @@
      "term": "kurwa",
      "sentence": "Kurwa, zostaw mnie w spokoju.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "chuj",
      "sentence": "Spadaj, chuju.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "pierdolić",
      "sentence": "Przestań pierdolić.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "cipa",
@@ -1734,13 +1747,13 @@
      "term": "k u r w a",
      "base_term": "kurwa",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "chvj",
      "base_term": "chuj",
      "technique": "character substitution",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1760,7 +1773,8 @@
      "sentence": "Cipka to zdrobnienie spotykane w słownikach anatomii.",
      "why_benign": "Retired control, restored. A diminutive with a benign colloquial sense (a kitten, a chick), and a dictionary citation besides.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'cipka' is on the Tier 2 list."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'cipka' is on the Tier 2 list.",
+     "tier2_reason": "term_is_on_the_tier2_list"
     }
    ]
   },
@@ -1772,25 +1786,25 @@
      "term": "muie",
      "sentence": "Muie ție, pleacă de aici.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "pizdă",
      "sentence": "A insultat-o spunându-i pizdă.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "futut",
      "sentence": "Ce joc futut!",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "poponar",
      "sentence": "L-au insultat spunându-i poponar.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -1798,13 +1812,13 @@
      "term": "m u i e",
      "base_term": "muie",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "pizda",
      "base_term": "pizdă",
      "technique": "diacritic stripping",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "p0ponar",
@@ -1834,7 +1848,8 @@
      "sentence": "Merg cu tine",
      "why_benign": "Romanian for 'I go with you'. 'cu' is the ordinary Romanian preposition 'with' at zipf 7.05 - the single most frequent collision in the whole wordlist.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Portuguese 'cu' is on the Tier 2 list and Romanian 'cu' is the same two letters."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Portuguese 'cu' is on the Tier 2 list and Romanian 'cu' is the same two letters.",
+     "tier2_reason": "term_is_on_the_tier2_list"
     }
    ]
   },
@@ -1864,13 +1879,13 @@
      "term": "jebať",
      "sentence": "Choď sa jebať.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "buzerant",
      "sentence": "Šikanovali ho slovom buzerant.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -1890,7 +1905,7 @@
      "term": "b u z e r a n t",
      "base_term": "buzerant",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1910,13 +1925,15 @@
      "sentence": "Pica je jednotka používaná v typografii.",
      "why_benign": "Retired control, restored. 'Pica' is a typographic unit in Slovak and an ordinary word in Catalan (4.10), Portuguese (3.96) and Spanish (3.76); only diacritic stripping merged it with the slur 'píča'.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Tier 2 folds diacritics, so 'pica' still reaches 'píča' there."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Tier 2 folds diacritics, so 'pica' still reaches 'píča' there.",
+     "tier2_reason": "tier2_folds_diacritics"
     },
     {
      "sentence": "Pica je jednotka v typografii",
      "why_benign": "The same collision in a shorter sentence, kept as a permanent control so the diacritic-stripping merge cannot return unnoticed.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Tier 2 folds diacritics, so 'pica' still reaches 'píča' there."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Tier 2 folds diacritics, so 'pica' still reaches 'píča' there.",
+     "tier2_reason": "tier2_folds_diacritics"
     }
    ]
   },
@@ -1928,7 +1945,7 @@
      "term": "јебем ти матер",
      "sentence": "Јебем ти матер, губи се.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "пичка",
@@ -1946,13 +1963,13 @@
      "term": "говно",
      "sentence": "Ти си говно од човека.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "педер",
      "sentence": "Вређали су га речју педер.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -1960,19 +1977,19 @@
      "term": "jebem ti mater",
      "base_term": "јебем ти матер",
      "technique": "Latin-script transliteration",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "п и ч к а",
      "base_term": "пичка",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "p3der",
      "base_term": "педер",
      "technique": "Latin transliteration and leetspeak",
-     "tier": 2
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1992,7 +2009,8 @@
      "sentence": "Курац је наведен као вулгаран термин у речнику.",
      "why_benign": "Retired control, restored. A dictionary citation is a mention, not a use, and no deterministic rule tells the two apart; that judgement is Tier 2's.",
      "tier2_matcher": "flags",
-     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the term is quoted, and a mention reads exactly like a use to a wordlist."
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the term is quoted, and a mention reads exactly like a use to a wordlist.",
+     "tier2_reason": "term_is_on_the_tier2_list"
     }
    ]
   },
@@ -2004,31 +2022,31 @@
      "term": "orospu çocuğu",
      "sentence": "Defol, orospu çocuğu.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "siktir",
      "sentence": "Siktir git buradan.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "amına koyayım",
      "sentence": "Amına koyayım, yine bozuldu.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "ibne",
      "sentence": "Onu ibne diyerek aşağıladılar.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "kaltak",
      "sentence": "Kadına kaltak diyerek hakaret etti.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -2042,13 +2060,13 @@
      "term": "s i k t i r",
      "base_term": "siktir",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "amina koyayim",
      "base_term": "amına koyayım",
      "technique": "diacritic stripping",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -2078,25 +2096,25 @@
      "term": "блядь",
      "sentence": "Блядь, залиш мене в спокої.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "хуй",
      "sentence": "Іди на хуй.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "підор",
      "sentence": "Його ображали словом «підор».",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "їбати",
      "sentence": "Їбати, що тут сталося?",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -2140,31 +2158,31 @@
      "term": "ماں چود",
      "sentence": "دفع ہو جا، ماں چود۔",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "بہن چود",
      "sentence": "خاموش ہو جا، بہن چود۔",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "چوتیا",
      "sentence": "مجھے چوتیا مت سمجھو۔",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "رنڈی",
      "sentence": "اسے رنڈی کہہ کر ذلیل کیا گیا۔",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "کھسرا",
      "sentence": "اسے کھسرا کہہ کر چھیڑا گیا۔",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -2178,7 +2196,7 @@
      "term": "bhen ch0d",
      "base_term": "بہن چود",
      "technique": "Latin transliteration and leetspeak",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "چ و ت ی ا",
