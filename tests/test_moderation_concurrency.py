@@ -1092,6 +1092,57 @@ class DispatcherTestCase(unittest.TestCase):
         self._drain()
         self.assertIn("$inflight", self.handler.finished)
 
+    def test_an_abandoned_job_is_not_counted_twice(self) -> None:
+        """Abandoning counts the job as `drain_timeout` and then cancels the
+        worker - and the cancellation used to count it again as `cancelled`,
+        so one lost message read as two on the dashboard the drop counter
+        exists for."""
+        self.dispatcher.start()
+        self.handler.hold = True
+        self._drain()
+        self.dispatcher.enqueue(self._job("$stuck"))
+        self._drain()
+        self.reader.snapshot("pangea_moderation_tier2_dropped_total", cause="cancelled")
+        self.reader.snapshot(
+            "pangea_moderation_tier2_dropped_total", cause="drain_timeout"
+        )
+        start_worker(self.dispatcher.shutdown)
+        self._drain()
+        self.clock.advance(6.0)
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="drain_timeout"
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="cancelled"
+            ),
+            0.0,
+            "the abandoned job was counted a second time",
+        )
+
+    def test_an_enqueue_that_raises_is_counted(self) -> None:
+        """`enqueue` is the outermost fail-open handler on the notifier's
+        path, and it is the one thing that stops the exception reaching the
+        caller's own counter - so it has to count the drop itself."""
+        self.dispatcher.start()
+        self._drain()
+        self.reader.snapshot(
+            "pangea_moderation_tier2_dropped_total", cause="dispatch_error"
+        )
+        with patch.object(
+            self.dispatcher, "_enqueue", side_effect=RuntimeError("boom")
+        ):
+            self.assertFalse(self.dispatcher.enqueue(self._job("$e")))
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="dispatch_error"
+            ),
+            1.0,
+        )
+
     def test_abandoned_work_is_counted_once_and_then_forgotten(self) -> None:
         # Abandoning has to clear the accounting as well as report it. Leaving
         # the ids in `_running` makes a second shutdown wait on jobs that have

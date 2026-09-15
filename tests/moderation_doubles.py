@@ -8,6 +8,7 @@ same idea one level up.
 """
 
 import sqlite3
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 from unittest.mock import create_autospec
@@ -131,22 +132,46 @@ class StoredEvent:
         self.internal_metadata = SimpleNamespace(is_redacted=lambda: redacted)
 
 
+@lru_cache(maxsize=1)
+def sqlite_engine() -> Any:
+    """Synapse's real SQLite engine, for its real `convert_param_style`.
+
+    A REAL instance and not the unbound method: a stand-in for the converter
+    is exactly the thing the previous double got wrong, so this file must not
+    contain one.
+    """
+    from synapse.storage.engines.sqlite import Sqlite3Engine
+
+    return Sqlite3Engine({"args": {"database": ":memory:"}})
+
+
 class _TransactionDouble:
     """`LoggingTransaction`, reduced to what a module's SQL actually uses.
 
     SQLite rather than a dictionary, on purpose. A dictionary double proves
     that the store was called; it proves nothing about the statement, so a
-    typo, a missing column or a conflict clause Postgres rejects would pass
-    every test and fail on the first real message. Synapse's own transaction
-    rewrites `%s` into `?` for SQLite (`Sqlite3Engine.convert_param_style`),
-    so the double does the same and the module writes one dialect.
+    typo, a missing column or a conflict clause an engine rejects would pass
+    every test and fail on the first real message.
+
+    **The SQL is run VERBATIM.** An earlier version of this double rewrote
+    `%s` into `?` before executing, which is not what Synapse does:
+    `Sqlite3Engine.convert_param_style` returns the SQL unchanged and only
+    `PostgresEngine` rewrites (`?` into `%s`). The rewrite repaired the
+    module's statements on the way past, so Postgres-only SQL passed every
+    test here and would have raised `OperationalError: near "%"` on the first
+    message of a SQLite deployment. A double that fixes the code it is testing
+    is not a test.
     """
 
     def __init__(self, connection: "sqlite3.Connection") -> None:
         self._cursor = connection.cursor()
 
     def execute(self, sql: str, args: Any = ()) -> None:
-        self._cursor.execute(sql.replace("%s", "?"), tuple(args))
+        # Through Synapse's OWN converter, not through a hand-written stand-in
+        # for it. That is the coupling the previous double got wrong, and the
+        # only way this file can be right about it is to call the same code
+        # the real transaction calls.
+        self._cursor.execute(sqlite_engine().convert_param_style(sql), tuple(args))
 
     def fetchone(self) -> Any:
         return self._cursor.fetchone()
@@ -193,9 +218,14 @@ class EventStoreDouble:
         self.error: Optional[Exception] = None
         self.reads: List[str] = []
         self.db_pool = DbPoolDouble()
+        #: Called on every read, so a test can assert the ORDER of the
+        #: re-read against the disposition claim.
+        self.on_read: Optional[Callable[[], None]] = None
 
     async def get_event(self, event_id: str, allow_none: bool = False) -> Any:
         self.reads.append(event_id)
+        if self.on_read is not None:
+            self.on_read()
         if self.error is not None:
             raise self.error
         if self.missing:

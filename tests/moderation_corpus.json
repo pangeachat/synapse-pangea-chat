@@ -253,7 +253,8 @@
      "term": "c u n t",
      "base_term": "cunt",
      "technique": "inserted spaces",
-     "tier": 1
+     "tier": 2,
+     "tier_note": "demoted: a rejoined run blocks pre-send only when it carries a digit, because nothing else separates a spelt-out evasion from a spelling lesson - see tier1_terms._matches_split_word"
     },
     {
      "term": "n1gger",

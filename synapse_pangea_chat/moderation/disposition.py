@@ -33,14 +33,18 @@ timestamp. Never the sender's Matrix ID and never a word of the message: this
 is a safeguarding record, read by people, and ADR-7c says what belongs in one.
 
 The shape follows `delete_user.pangea_delete_user_schedule` - a module-owned
-table created on first use through `db_pool.runInteraction`, with `%s`
-placeholders, which Synapse's transaction rewrites for SQLite and passes
-through for Postgres.
+table created on first use through `db_pool.runInteraction`.
+
+**Placeholders are `?`, which is Synapse's canonical style and not Postgres's.**
+`Sqlite3Engine.convert_param_style` returns the SQL UNCHANGED and
+`PostgresEngine.convert_param_style` rewrites `?` into `%s`, so a module that
+writes `%s` runs on Postgres and raises `OperationalError: near "%"` on
+SQLite - which an end-to-end test that only ever boots Postgres cannot see.
 """
 
 import uuid
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from synapse_pangea_chat.moderation import metrics
 from synapse_pangea_chat.moderation.compat import reraise_if_cancelled
@@ -88,25 +92,55 @@ _CREATE_TABLE_SQL = """
     )
 """
 
-_INSERT_SQL = """
+# The redaction claim. `DO NOTHING`, so an event already decided keeps its
+# decision and the caller is told whose it is.
+_CLAIM_SQL = """
     INSERT INTO pangea_moderation_disposition
         (event_id, room_id, disposition, category, decided_at_ms, claim_id)
-    VALUES (%s, %s, %s, %s, %s, %s)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT (event_id) DO NOTHING
+"""
+
+# The preserve. `DO UPDATE`, and the asymmetry with the claim above is the
+# whole point: **preserving always wins the row.** A redaction claim is
+# PROVISIONAL - it is released when the send does not happen - so a preserve
+# that arrived while one was outstanding and did nothing would be lost the
+# moment the claim was released, and the next verdict would redact the
+# disclosure. Preserving is final in the other direction: nothing overwrites
+# a `preserved` row, which is what the `WHERE` clause says.
+_PRESERVE_SQL = """
+    INSERT INTO pangea_moderation_disposition
+        (event_id, room_id, disposition, category, decided_at_ms, claim_id)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT (event_id) DO UPDATE SET
+        disposition = excluded.disposition,
+        category = excluded.category,
+        decided_at_ms = excluded.decided_at_ms,
+        claim_id = excluded.claim_id
+    WHERE pangea_moderation_disposition.disposition <> 'preserved'
 """
 
 _SELECT_SQL = """
     SELECT disposition, claim_id FROM pangea_moderation_disposition
-    WHERE event_id = %s
+    WHERE event_id = ?
 """
 
+# Scoped to OUR claim by id as well as by disposition. A release must never
+# remove a `preserved` row, and it must never remove another instance's claim:
+# a delete on the event id alone would do both.
 _DELETE_CLAIM_SQL = """
     DELETE FROM pangea_moderation_disposition
-    WHERE event_id = %s AND disposition = %s
+    WHERE event_id = ? AND disposition = ? AND claim_id = ?
 """
 
 #: Every statement above, for the drift test.
-STATEMENTS = (_CREATE_TABLE_SQL, _INSERT_SQL, _SELECT_SQL, _DELETE_CLAIM_SQL)
+STATEMENTS = (
+    _CREATE_TABLE_SQL,
+    _CLAIM_SQL,
+    _PRESERVE_SQL,
+    _SELECT_SQL,
+    _DELETE_CLAIM_SQL,
+)
 
 
 class DispositionStore:
@@ -116,6 +150,13 @@ class DispositionStore:
         self._hs = homeserver
         self._table_ready = False
         self._remembered: "OrderedDict[str, None]" = OrderedDict()
+        # Preserves whose durable write has not landed. NOT bounded, and
+        # deliberately: this holds only the decisions the database refused,
+        # every one of them is retried on the next operation, and dropping one
+        # to save memory would drop the guarantee it carries. While the
+        # database is refusing writes it is also refusing the claim reads, so
+        # nothing is being redacted anyway.
+        self._pending: Dict[str, Tuple[str, str]] = {}
 
     # ------------------------------------------------------------------
     # Schema
@@ -148,22 +189,51 @@ class DispositionStore:
     ) -> bool:
         """Record that this event must never be redacted. Idempotent.
 
-        `ON CONFLICT DO NOTHING`, so the FIRST decision stands: a preserve
-        that arrives twice is one row, and nothing can overwrite a row that
-        already says preserved. Returns whether the durable write landed - the
-        caller counts a failure, because a guarantee that is not on disk is
-        not durable and an operator has to be able to see that.
+        **It takes the row from an outstanding redaction claim**, which a
+        plain `DO NOTHING` did not: a claim is provisional and is released
+        when the send does not happen, so a preserve that arrived while one
+        was outstanding wrote nothing, reported success, and was gone the
+        moment the claim was released - and the next verdict redacted the
+        disclosure. Nothing overwrites a `preserved` row in the other
+        direction.
+
+        Returns whether the durable write landed. A write that failed is
+        remembered and RETRIED on the next operation, because the alternative
+        is a guarantee that lives only in this process's memory until the row
+        happens to be written by somebody.
         """
         # Remembered first and unconditionally. If the write below fails this
         # is all that stands between the disclosure and the next verdict in
         # this process, and it must not depend on the write succeeding.
         self._remember(event_id)
+        self._pending[event_id] = (room_id, category)
+        return await self._flush_pending(event_id)
+
+    async def _flush_pending(self, event_id: Optional[str] = None) -> bool:
+        """Write the preserves that have not landed yet.
+
+        Called before every claim as well as on the preserve itself, so a
+        database that was briefly unavailable cannot leave a disclosure
+        unprotected once it comes back: the claim that would redact it writes
+        the preserve first and then loses the row to it.
+        """
+        if not self._pending:
+            return True
+        ok = True
+        for pending_id, (room_id, category) in list(self._pending.items()):
+            if await self._write_preserve(pending_id, room_id, category):
+                self._pending.pop(pending_id, None)
+            elif event_id is None or pending_id == event_id:
+                ok = False
+        return ok
+
+    async def _write_preserve(self, event_id: str, room_id: str, category: str) -> bool:
         try:
             await self._ensure_table()
 
-            def _insert(txn: Any) -> None:
+            def _preserve(txn: Any) -> None:
                 txn.execute(
-                    _INSERT_SQL,
+                    _PRESERVE_SQL,
                     (
                         event_id,
                         room_id,
@@ -175,7 +245,7 @@ class DispositionStore:
                 )
 
             await self._pool().runInteraction(
-                "pangea_moderation_record_disposition", _insert
+                "pangea_moderation_record_disposition", _preserve
             )
             return True
         except Exception as exc:
@@ -186,8 +256,8 @@ class DispositionStore:
             metrics.TIER2_DISPOSITION_WRITE_FAILED.inc()
             logger.error(
                 "tier2 could not record the preserved disposition for %s in %s "
-                "at %s (%s); the message stays up but a restart will not know "
-                "why",
+                "at %s (%s); the message stays up and the write will be "
+                "retried, but a restart before it lands will not know why",
                 event_id,
                 room_id,
                 error_site(exc),
@@ -197,12 +267,14 @@ class DispositionStore:
 
     async def claim_redaction(
         self, *, event_id: str, room_id: str, category: str
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, str]]:
         """Take the right to redact this event, or find out who has it.
 
-        Returns `GRANTED`, `PRESERVED`, `REDACTED`, or **None for "we could
-        not find out"**. Three outcomes plus an unknown, because two would
-        force the caller to guess and the wrong guess deletes a disclosure.
+        Returns `(outcome, claim_id)` where outcome is `GRANTED`, `PRESERVED`
+        or `REDACTED`, or **None for "we could not find out"**. Three outcomes
+        plus an unknown, because two would force the caller to guess and the
+        wrong guess deletes a disclosure. The claim id goes back to the caller
+        so a release can be scoped to the claim it is giving back.
 
         **One atomic write, not a read and then a write.** A read-then-redact
         has a window: two verdicts on the same event, in two instances, both
@@ -220,7 +292,15 @@ class DispositionStore:
         two redactions for one message.
         """
         if event_id in self._remembered:
-            return PRESERVED
+            return (PRESERVED, "")
+        # Preserves the database refused earlier are written FIRST, so a
+        # database that was briefly unavailable cannot leave a disclosure
+        # unprotected once it comes back: the row exists before this claim
+        # asks for it, and the claim then loses to it. A flush that fails
+        # means we still cannot establish the dispositions we hold, which is
+        # an unknown, which is never a redaction.
+        if not await self._flush_pending():
+            return None
         try:
             await self._ensure_table()
 
@@ -228,7 +308,7 @@ class DispositionStore:
 
             def _claim(txn: Any) -> Any:
                 txn.execute(
-                    _INSERT_SQL,
+                    _CLAIM_SQL,
                     (
                         event_id,
                         room_id,
@@ -265,28 +345,33 @@ class DispositionStore:
             # Remembered on the way back so a repeat verdict on a hot event
             # does not pay for a second read.
             self._remember(event_id)
-            return PRESERVED
+            return (PRESERVED, "")
         # Did THIS call insert the row, or was it already there? `rowcount`
         # after an `ON CONFLICT DO NOTHING` would answer it directly and is
         # not portable enough to rely on across the two engines and the two
         # Synapse pins this module supports, so the row carries the id of the
         # claim that wrote it. A random id and nothing derived from the room,
         # the sender or the text.
-        return GRANTED if row[1] == claim_id else REDACTED
+        return (GRANTED, claim_id) if row[1] == claim_id else (REDACTED, "")
 
-    async def release_redaction_claim(self, event_id: str) -> None:
-        """Give the claim back when the redaction did not happen.
+    async def release_redaction_claim(self, event_id: str, claim_id: str) -> None:
+        """Give OUR claim back when the redaction did not happen.
 
         A claim that outlives a failed send would block every later attempt on
         an event that is still standing - turning a transient send failure
-        into a permanent one. Only a `redacted` claim is released; a
-        `preserved` row is never removed by anything.
+        into a permanent one.
+
+        Scoped by claim id as well as by disposition, so a release cannot
+        remove a `preserved` row that took the claim's place in the meantime,
+        and cannot remove a claim another instance is holding.
         """
+        if not claim_id:
+            return
         try:
             await self._ensure_table()
 
             def _release(txn: Any) -> None:
-                txn.execute(_DELETE_CLAIM_SQL, (event_id, REDACTED))
+                txn.execute(_DELETE_CLAIM_SQL, (event_id, REDACTED, claim_id))
 
             await self._pool().runInteraction(
                 "pangea_moderation_release_redaction_claim", _release

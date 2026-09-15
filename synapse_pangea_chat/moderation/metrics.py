@@ -66,6 +66,13 @@ EXTRACTION_INCOMPLETE = _get_or_create(
 # on its own - and an operator needs to know which tier is blind.
 EXTRACTION_TIERS = frozenset({"tier1", "tier2"})
 
+TIER1_FAILED = _get_or_create(
+    Counter,
+    "pangea_moderation_tier1_failed_total",
+    "Messages Tier 1 could not evaluate at all. It fails open, so the send "
+    "went through unchecked by the blocking tier; Tier 2 still sees it.",
+)
+
 # --- Tier 2 queue and dispatch -------------------------------------------
 
 TIER2_ENQUEUED = _get_or_create(

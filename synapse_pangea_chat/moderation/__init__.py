@@ -36,11 +36,13 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TypeGuard,
     Union,
 )
 
 from synapse.api.errors import AuthError, Codes, SynapseError
 from synapse.events import EventBase
+from synapse.logging.context import run_in_background
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import NOT_SPAM, ModuleApi
 
@@ -173,6 +175,12 @@ _INVISIBLE_ELEMENTS = frozenset({"script", "style"})
 # Cells break the line, but only inside a table: outside one HTML5 ignores them
 # entirely, and a newline there split a displayed number in half.
 _TABLE_CELL_TAGS = frozenset({"caption", "td", "th", "tr"})
+# The tags that actually HOLD content inside a table. `tr` is not one: text
+# between a `</td>` and its `</tr>` is outside every cell, and HTML5 foster-
+# parents it out of the table exactly like text before the first row. Reading
+# `tr` as a cell meant `<table>41<tr><td>notes</td>5-555-2671</tr></table>` -
+# `415-555-2671` on screen - collected only the `41`.
+_TABLE_CONTENT_TAGS = frozenset({"caption", "td", "th"})
 # HTML5 parses `<image>` as `img`, so its alternative text is displayed.
 _TAG_ALIASES = {"image": "img"}
 
@@ -265,10 +273,10 @@ class _DisplayedText(HTMLParser):
             self._fostered.append(data)
 
     def _end_table(self) -> None:
-        run = "".join(self._fostered).strip()
-        self._fostered = []
-        if run:
-            self._fostered_runs.append(run)
+        fostered, self._fostered = self._fostered, []
+        for run in "".join(fostered).split("\n"):
+            if run.strip():
+                self._fostered_runs.append(run.strip())
 
     def _breaks_line(self, tag: str) -> bool:
         if tag in _BLOCK_LEVEL_TAGS:
@@ -290,11 +298,24 @@ class _DisplayedText(HTMLParser):
             # inner one, because they are displayed in different places.
             self._end_table()
             self._table_depth += 1
-        elif self._table_depth > 0 and tag in _TABLE_CELL_TAGS:
+        elif self._table_depth > 0 and tag in _TABLE_CONTENT_TAGS:
             self._cell_depth += 1
         if self._breaks_line(tag):
             self._open_blocks.append(tag)
             self._parts.append("\n")
+            if tag in _BLOCK_LEVEL_TAGS:
+                # A real block boundary breaks the FOSTERED run too. Foster
+                # parenting moves the characters out of the table; it does
+                # not merge two block boxes into one line, so
+                # `<table><div>415</div><div>5552671</div></table>` is two
+                # blocks before the table and not the phone number
+                # `4155552671` - which Tier 1 blocked, on a message where no
+                # reader sees it.
+                #
+                # A row or cell tag is NOT such a boundary: those elements
+                # move into the table, and the characters foster-parented
+                # past them are contiguous on screen.
+                self._fostered.append("\n")
         if self._invisible:
             # Attributes inside script or style source are not markup and are
             # displayed by nothing.
@@ -339,7 +360,11 @@ class _DisplayedText(HTMLParser):
         if tag == "table" and self._table_depth > 0:
             self._table_depth -= 1
             self._end_table()
-        elif self._table_depth > 0 and tag in _TABLE_CELL_TAGS and self._cell_depth > 0:
+        elif (
+            self._table_depth > 0
+            and tag in _TABLE_CONTENT_TAGS
+            and self._cell_depth > 0
+        ):
             self._cell_depth -= 1
         # Only a tag that actually opened a block closes one. An unmatched
         # `</div>` is ignored by HTML5, and a newline there split a displayed
@@ -678,9 +703,16 @@ class ChatModeration:
             # silent-ok: fail-open by contract — a moderation bug must never
             # block all sends; the failure is logged and Tier 2 still runs.
             #
+            # Counted as well as logged: a message the blocking tier could not
+            # look at is an unknown, and an uncounted unknown reads exactly
+            # like a clean message on every dashboard an operator has. The
+            # per-surface counter above cannot see this one - it is raised
+            # before or around the extraction that increments it.
+            #
             # Type and site, not `logger.exception`: the traceback ends with
             # the exception's own message, and anything raised while matching
             # a message body is liable to quote that body.
+            metrics.TIER1_FAILED.inc()
             logger.warning(
                 "tier1 pre-filter failed at %s (%s); allowing event",
                 error_site(exc),
@@ -778,7 +810,23 @@ class ChatModeration:
 
         if not result.get("flagged"):
             return
-        categories = result.get("categories") or ()
+        categories = result.get("categories")
+        if not _usable_categories(categories):
+            # A flagged verdict we cannot read the categories of is a verdict
+            # we cannot act on, and the safe reading of "we do not know what
+            # this is" is the same as the safe reading of self-harm: leave the
+            # message standing. The client validates the response at the
+            # transport boundary as well; this is the check at the point of
+            # DECISION, which is the one that cannot be bypassed by a caller
+            # that got its verdict some other way.
+            metrics.TIER2_SUPPRESSED.labels(category=UNNAMED_CATEGORY).inc()
+            logger.info(
+                "tier2 flagged event %s in %s with no usable category; "
+                "preserved, not redacted",
+                job.event_id,
+                job.room_id,
+            )
+            return
         category = _summarize_categories(categories)
         if _should_preserve(categories):
             # Deleting a disclosure of self-harm is itself a harm: the learner
@@ -809,10 +857,15 @@ class ChatModeration:
                 category,
             )
             return
-        if not await self._may_redact(job, category):
-            return
+        # The ORDER matters. The re-read comes first and the claim second, so
+        # there is no `await` between taking the claim and sending: a claim
+        # taken and then abandoned at an await - a cancellation, a shutdown -
+        # is a row that says `redacted` on a message that is still standing,
+        # and nothing after it would ever take that message down.
         if not await self._is_still_redactable(job):
-            await self._release_claim(job)
+            return
+        claim = await self._may_redact(job, category)
+        if claim is None:
             return
         logger.info(
             "tier2 flagged event %s in %s (category=%s); redacting",
@@ -856,7 +909,13 @@ class ChatModeration:
             # Escalating the legitimate ones is separate work; today the
             # message stays up and the failure is counted and visible, which
             # is what the previous behaviour was missing.
-            await self._release_claim(job)
+            #
+            # Released through `run_in_background`, so a CANCELLATION reaches
+            # this line and still gives the claim back: awaiting the release
+            # inside a coroutine that is being cancelled would be cancelled
+            # with it, and the row would say `redacted` forever on a message
+            # nobody had redacted.
+            self._release_claim(job, claim)
             metrics.record_redaction_failure(_redaction_failure_cause(exc))
             logger.warning(
                 "tier2 redaction failed for %s in %s at %s (%s); message stays",
@@ -918,8 +977,10 @@ class ChatModeration:
             event_id=job.event_id, room_id=job.room_id, category=category
         )
 
-    async def _may_redact(self, job: ModerationJob, category: str) -> bool:
+    async def _may_redact(self, job: ModerationJob, category: str) -> Optional[str]:
         """Claim the right to redact this event, or decline.
+
+        Returns the claim id when the claim was granted, and None otherwise.
 
         Asked before every redaction, and not only when this verdict happens
         to be a self-harm one: the verdict that arrives second is by
@@ -944,15 +1005,13 @@ class ChatModeration:
                 job.event_id,
                 job.room_id,
             )
-            return False
+            return None
         if self._disposition is None:
-            return True
-        claim = await self._disposition.claim_redaction(
+            return ""
+        claimed = await self._disposition.claim_redaction(
             event_id=job.event_id, room_id=job.room_id, category=category
         )
-        if claim == GRANTED:
-            return True
-        if claim is None:
+        if claimed is None:
             metrics.record_redaction_skip("disposition_unknown")
             logger.warning(
                 "tier2 will not redact %s in %s: its disposition could not be "
@@ -960,8 +1019,11 @@ class ChatModeration:
                 job.event_id,
                 job.room_id,
             )
-            return False
-        if claim == PRESERVED:
+            return None
+        outcome, claim_id = claimed
+        if outcome == GRANTED:
+            return claim_id
+        if outcome == PRESERVED:
             metrics.record_redaction_skip("preserved")
             logger.info(
                 "tier2 will not redact %s in %s: it carries a preserved "
@@ -969,19 +1031,27 @@ class ChatModeration:
                 job.event_id,
                 job.room_id,
             )
-            return False
+            return None
         metrics.record_redaction_skip("already_redacted")
-        return False
+        return None
 
-    async def _release_claim(self, job: ModerationJob) -> None:
+    def _release_claim(self, job: ModerationJob, claim_id: str) -> None:
         """Hand the claim back when no redaction was sent.
 
         Without this a send that failed for an ordinary reason - the sender
         left the room, the room raised its redaction level - would leave the
         event claimed forever, so nothing could ever take it down.
+
+        Detached with `run_in_background` rather than awaited, and that is the
+        point: the caller may be being CANCELLED, and awaiting here would be
+        cancelled with it, leaving the row saying `redacted` on a message
+        nobody redacted. A detached call still runs.
         """
-        if self._disposition is not None:
-            await self._disposition.release_redaction_claim(job.event_id)
+        if self._disposition is None or not claim_id:
+            return
+        run_in_background(
+            self._disposition.release_redaction_claim, job.event_id, claim_id
+        )
 
     async def _is_still_redactable(self, job: ModerationJob) -> bool:
         """Re-read the target immediately before sending the redaction.
@@ -1218,6 +1288,22 @@ def _normalize_category(category: Any) -> str:
     return category.split("/", 1)[0].replace("-", "_")
 
 
+def _usable_categories(categories: Any) -> TypeGuard[List[str]]:
+    """Can a redaction decision be taken on this category list at all?
+
+    A non-empty list of strings, and nothing else. `categories: null` is a
+    PRESENT key with an unusable value and `result.get(...) or ()` read it as
+    an empty list, which summarised to `flagged` and redacted - so a response
+    that failed to name its category could delete a disclosure of self-harm,
+    which is the one thing this feature must never do.
+    """
+    return (
+        isinstance(categories, list)
+        and bool(categories)
+        and all(isinstance(category, str) for category in categories)
+    )
+
+
 def _should_preserve(categories: Iterable[Any]) -> bool:
     """True when any recognised category says to leave the message standing.
 
@@ -1235,7 +1321,27 @@ def _should_preserve(categories: Iterable[Any]) -> bool:
     does not happen, which stays true until somebody is notified — see
     `_check_and_redact`.
     """
-    return any(_normalize_category(c) in PRESERVE_CATEGORIES for c in categories)
+    return any(_preserves(category) for category in categories)
+
+
+def _preserves(category: Any) -> bool:
+    """Does this one category name say "leave the message standing"?
+
+    The documented vocabulary first, and then the PREFIX, because the
+    vocabulary check alone had a hole the provider can open on its own: a
+    category we do not recognise normalises to `other`, and `other` redacts -
+    so `self-harm/invented`, a sub-category added upstream after our fixture
+    was pinned, would have deleted a disclosure. A name we do not know that
+    is nonetheless plainly self-harm is treated as self-harm; the cost is a
+    redaction that does not happen, and the alternative cost is the one thing
+    this feature must never do.
+    """
+    if _normalize_category(category) in PRESERVE_CATEGORIES:
+        return True
+    if not isinstance(category, str):
+        return False
+    head = category.casefold().split("/", 1)[0].replace("-", "_")
+    return head in PRESERVE_CATEGORIES
 
 
 def _summarize_categories(categories: Iterable[Any]) -> str:

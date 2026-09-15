@@ -41,9 +41,19 @@ evidence for each - is data, in `tier1_universal.json`, gated by
 import json
 import re
 import unicodedata
+from collections import deque
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, FrozenSet, List, NamedTuple, Sequence, Set, TypedDict
+from typing import (
+    Deque,
+    Dict,
+    FrozenSet,
+    List,
+    NamedTuple,
+    Sequence,
+    Set,
+    TypedDict,
+)
 
 _UNIVERSAL_PATH = Path(__file__).with_name("tier1_universal.json")
 
@@ -310,100 +320,117 @@ def _is_letter_of_an_alphabet(char: str) -> bool:
 
 
 def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
-    """One word typed with its letters split apart (`f u c k`, `fu.cking`).
+    """One word typed with its letters split apart (`p 1 c a`, `n 1 g g e r`).
 
-    Two rules, because the two kinds of gap mean different things:
+    **A rejoined run may block only if it contains a DIGIT**, and that is the
+    whole rule. It is the same evidence standard the promotion policy already
+    uses for a Tier-1 term - `not_a_word_in_any_orthography` - applied to the
+    rejoining rather than to the wordlist: no orthography of the thirty
+    supported languages puts a digit inside a word, so a run that carries one
+    can only be a deliberately obfuscated spelling.
 
-    - across WHITESPACE ALONE, only single characters of an ALPHABET rejoin. A
-      space is a real word boundary, and in the scripts where one character is
-      a whole syllable it separates ordinary words: `민수 씨 발 아파요?` is
-      "Minsu, does your foot hurt?", and rejoining its syllables makes a
-      slur. Spaced-out evasions in those scripts are Tier 2's.
-    - across PUNCTUATION, fragments of one or two characters rejoin - but only
-      into a run that is SHAPED LIKE A BROKEN WORD rather than like a list.
-      See `_is_a_split_word`.
+    Everything else is ambiguous and Tier 1 does not act on it. Rejoining
+    letters is indistinguishable from reading a word out letter by letter,
+    which is a first-week classroom exercise here, and every separator we
+    tried to use as the signal produced an ordinary sentence:
 
-    The rejoined run must equal a needle outright. Searching the whole
-    separatorless message instead is how an ordinary sentence picks up a
-    needle it never contained.
+    - `Press C,U,N,T to continue.` was blocked while `Press C, U, N, T to
+      continue.` passed - the same sentence typed two ways.
+    - `The letters are C U N T.` is a spelling lesson with no punctuation at
+      all, so "punctuation means a list" does not separate them either.
+    - `The symbols are Cu,N,T.` is a chemistry lesson, and `Open cu.nt in
+      your editor.` is a filename, so "a piece longer than one letter means a
+      broken word" does not separate them.
+
+    Tier 2 reads the message in context and judges all of them.
+
+    Bounded as well as narrowed: a run is capped at the longest needle, so
+    this is linear in the message. Before the cap, a 60 KB message of spaced
+    single characters took **4.6 seconds** inline in the send path, because
+    the run grew without limit and was copied on every token.
     """
-    run: List[Span] = []
+    limit = _longest_needle(frozenset(needles))
+    if not limit:
+        return False
+    run: Deque[Span] = deque()
+    run_length = 0
+    run_digits = 0
     for span in spans:
-        if _joinable(span, [piece.text for piece in run]):
+        if _joinable(span, run[-1].text if run else ""):
             run.append(span)
-            continue
-        if _run_matches(run, needles):
-            return True
-        run = [span] if len(span.text) <= _FRAGMENT_LEN else []
-    if _run_matches(run, needles):
-        return True
-    # One split point, with a long remainder: `fu.cking` -> `fu` + `cking`.
-    # Punctuation gaps only, and the same word-shape rule: two single letters
-    # either side of a comma are two letters, not a word with a comma in it.
+            run_length += len(span.text)
+            run_digits += _digit_count(span.text)
+        else:
+            run.clear()
+            run_length = 0
+            run_digits = 0
+            if len(span.text) <= _FRAGMENT_LEN:
+                run.append(span)
+                run_length = len(span.text)
+                run_digits = _digit_count(span.text)
+        while run_length > limit and run:
+            dropped = run.popleft()
+            run_length -= len(dropped.text)
+            run_digits -= _digit_count(dropped.text)
+        if run_digits and len(run) >= 2:
+            if "".join(piece.text for piece in run) in needles:
+                return True
+    # One split point, with a long remainder: `n1g ger` -> `n1g` + `ger`. The
+    # digit rule again, for the same reason.
     return any(
         not right.after_space
-        and _alphabetic(left.text)
-        and _alphabetic(right.text)
+        and _alphanumeric(left.text)
+        and _alphanumeric(right.text)
         and (len(left.text) <= _FRAGMENT_LEN or len(right.text) <= _FRAGMENT_LEN)
-        and max(len(left.text), len(right.text)) > 1
+        and _digit_count(left.text) + _digit_count(right.text)
         and left.text + right.text in needles
         for left, right in zip(spans, spans[1:])
     )
 
 
-def _run_matches(run: Sequence[Span], needles: Set[str]) -> bool:
-    if len(run) < 2 or not _is_a_split_word(run):
-        return False
-    return "".join(span.text for span in run) in needles
+def _digit_count(token: str) -> int:
+    return sum(1 for char in token if char.isdigit())
 
 
-def _is_a_split_word(run: Sequence[Span]) -> bool:
-    """Is this run one word broken apart, or a list of letters?
-
-    Tier 1 blocks before persist, so it may only act on the one it can tell
-    apart, and this is where the two shapes separate:
-
-    - Every internal gap is WHITESPACE. A space is a word boundary, so a word
-      written with spaces inside it - `f u c k`, `c u n t` - was never a list
-      of separate words, and Tier 1 rejoins it.
-    - A gap contains PUNCTUATION. Then the run is one word only if a piece of
-      it is longer than a single letter: `fu.cking` is `fu` + `cking`, and no
-      lesson spells a word out that way.
-
-    A run of single letters separated by punctuation - `C,U,N,T`, `k.u.r.v.a`,
-    `c.u.n.t` - is structurally identical to a spelling exercise, which is a
-    first-week activity on a language-learning platform. `Press C,U,N,T to
-    continue` was `M_FORBIDDEN` and `Press C, U, N, T to continue` was not,
-    which is the same sentence typed two ways. There is no signal inside the
-    run that separates the evasion from the lesson, so Tier 1 judges neither
-    and Tier 2, which reads the message in context, judges both.
-    """
-    internal_gaps = [span.gap for span in run[1:]]
-    if all(gap and gap.isspace() for gap in internal_gaps):
-        return True
-    return any(len(span.text) > 1 for span in run)
+@lru_cache(maxsize=4)
+def _longest_needle(needles: FrozenSet[str]) -> int:
+    """The longest thing a rejoining could equal. A run past it cannot match,
+    so this is what keeps the scan linear."""
+    return max((len(needle_text) for needle_text in needles), default=0)
 
 
-def _joinable(span: Span, run: List[str]) -> bool:
-    """Only letters of an alphabet ever rejoin.
+def _joinable(span: Span, previous: str) -> bool:
+    """Only characters of an alphabet ever rejoin.
 
     In Hangul, kana and the abugidas one character is a word, and punctuation
     between two of them is ordinary punctuation: `민수 씨,발 아파요?` is still
     "Minsu, does your foot hurt?" with a comma in it. So the alphabet rule
     applies to both kinds of gap, and the length allowance only to the
     punctuation one.
+
+    `previous` is the run's last fragment, not the run: reading it as a list
+    meant rebuilding that list on every token, which is what made a long
+    message quadratic.
     """
-    if not _alphabetic(span.text):
+    if not _alphanumeric(span.text):
         return False
     if not span.after_space:
         return len(span.text) <= _FRAGMENT_LEN
     # Whitespace and nothing else. `C, U, N, T` is how a list of letters is
-    # written - "press C, U, N, T to continue" - and a comma is not part of a
-    # word, so a run does not continue over one.
+    # written and a comma is not part of a word, so a run does not continue
+    # over one.
     return (
-        span.after_space_only and len(span.text) == 1 and (not run or len(run[-1]) == 1)
+        span.after_space_only
+        and len(span.text) == 1
+        and (not previous or len(previous) == 1)
     )
 
 
-def _alphabetic(token: str) -> bool:
+def _alphanumeric(token: str) -> bool:
+    """A character of an alphabet, or a digit.
+
+    Digits count, and they have to: the only rejoining Tier 1 acts on is one
+    that contains a digit, so a matcher that refused to carry digits through a
+    run could never produce one.
+    """
     return bool(token) and all(_is_letter_of_an_alphabet(char) for char in token)

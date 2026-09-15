@@ -209,6 +209,13 @@ class Tier2Dispatcher:
             reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract. A moderation queue that could
             # raise into the notifier would make a moderation bug an outage.
+            #
+            # Counted as well as logged, for the same reason every other
+            # refusal here is: this message will not be checked, and an
+            # uncounted one is a silent drop whichever door it left by. The
+            # caller's own handler cannot count it - this clause is what stops
+            # the exception reaching it.
+            metrics.record_drop("dispatch_error")
             logger.warning(
                 "tier2 enqueue failed for %s at %s (%s)",
                 job.event_id,
@@ -367,7 +374,13 @@ class Tier2Dispatcher:
             # Counted on the way past - the message was accepted and will not
             # be checked, and an uncounted one is a silent drop whichever door
             # it left by - and then re-raised rather than absorbed.
-            reraise_if_cancelled(exc, lambda: metrics.record_drop("cancelled"))
+            #
+            # UNLESS the drain already wrote this job off, which is now the
+            # ordinary way a cancellation arrives: abandoning counts it as
+            # `drain_timeout` and removes it from `_running`, so counting it
+            # again here as `cancelled` made one lost message two on the
+            # dashboard.
+            reraise_if_cancelled(exc, lambda: self._count_cancelled(job))
             # silent-ok: fail-open by contract, and the loop has to survive.
             # A worker that dies leaves the pool one short for the life of
             # the process, and `run_as_background_process` swallows what
@@ -403,6 +416,10 @@ class Tier2Dispatcher:
             self._inflight.discard(job.event_id)
             metrics.TIER2_INFLIGHT.set(len(self._running))
             self._notify_drained()
+
+    def _count_cancelled(self, job: ModerationJob) -> None:
+        if job.event_id in self._running:
+            metrics.record_drop("cancelled")
 
     def _supervise(self) -> None:
         """Restart any worker that is no longer running.

@@ -369,7 +369,7 @@ def _short_token_runs(
     message rather than quadratic, which matters because this runs on every
     Tier-2 message and a 60 KB message of short tokens is a legal one.
     """
-    limit = _max_needle_length()
+    prefixes = _needle_prefixes()
     runs: List[str] = []
     count = len(tokens)
     for start in range(count):
@@ -381,7 +381,12 @@ def _short_token_runs(
             if len(token) > max_len:
                 break
             joined += token
-            if len(joined) > limit:
+            if joined not in prefixes:
+                # A window that is not a prefix of any needle can never become
+                # one, so the scan abandons it here. Without this every start
+                # ran to the longest needle whatever the message said: a
+                # 10,000-character message of short tokens cost ~88 ms of
+                # reactor time, on a single-threaded reactor, per message.
                 break
             if index - start + 1 >= min_run:
                 runs.append(joined)
@@ -389,9 +394,17 @@ def _short_token_runs(
 
 
 @lru_cache(maxsize=1)
-def _max_needle_length() -> int:
-    """The longest needle any rejoining could equal. Cached with the wordlist,
-    and floored so an empty bucket cannot switch the scan off."""
-    terms = _terms()
-    lengths = [len(needle) for bucket in terms.values() for needle in bucket]
-    return max(lengths, default=_MIN_PREFIX_NEEDLE_LEN)
+def _needle_prefixes() -> Set[str]:
+    """Every prefix of every needle a rejoining could equal.
+
+    The same device `tier1_terms._prefixes` uses on the phrase scan, and for
+    the same reason: it turns "how long could this window get" into "can this
+    window still become a match", which is what makes the scan proportional to
+    the message rather than to the wordlist.
+    """
+    return {
+        needle[:length]
+        for bucket in _terms().values()
+        for needle in bucket
+        for length in range(1, len(needle) + 1)
+    }

@@ -20,6 +20,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 import traceback
 import unittest
@@ -60,7 +61,11 @@ from synapse_pangea_chat.moderation.choreo_client import (
     moderate_text,
 )
 from synapse_pangea_chat.moderation.dispatch import ModerationJob
-from synapse_pangea_chat.moderation.disposition import DISPOSITION_TABLE, STATEMENTS
+from synapse_pangea_chat.moderation.disposition import (
+    DISPOSITION_TABLE,
+    STATEMENTS,
+    DispositionStore,
+)
 from synapse_pangea_chat.moderation.tier1_prefilter import (
     REASON_CONTACT_DETAILS,
     REASON_PROFANITY,
@@ -75,6 +80,7 @@ from .moderation_doubles import (
     HomeServerDouble,
     MetricReader,
     http_client_double,
+    sqlite_engine,
 )
 from .moderation_doubles import module_api as module_api_double
 
@@ -905,12 +911,108 @@ class TestTier2RefusesToRunThroughAProxy(unittest.TestCase):
         with self.assertRaises(ModerationProxyUnsupportedError):
             ChatModeration(api, _tier2_config())
 
+    def test_a_proxy_configuration_we_cannot_read_is_not_a_bypass(self) -> None:
+        """`no_proxy` is honoured through the agent's OWN saved configuration,
+        because that is what the request will consult. Reading the current
+        environment instead reads a different source from the one that
+        decides, and the two can disagree in both directions.
+
+        Asserted on the helper, because the agent shape that produces the
+        disagreement is one the constructor refuses for a second reason too -
+        and a test that cannot tell the two refusals apart does not establish
+        this one.
+        """
+        from synapse_pangea_chat.moderation.choreo_client import _bypasses_proxy
+
+        without_config = SimpleNamespace(
+            http_proxy_endpoint=None, https_proxy_endpoint=object()
+        )
+        with patch.dict(os.environ, {"no_proxy": "choreo.example.org"}):
+            self.assertFalse(
+                _bypasses_proxy(without_config, "choreo.example.org"),
+                "a bypass was read out of the environment rather than out of "
+                "the configuration the request will use",
+            )
+        with_config = SimpleNamespace(
+            http_proxy_endpoint=None,
+            https_proxy_endpoint=object(),
+            proxy_config=SimpleNamespace(
+                get_proxies_dictionary=lambda: {
+                    "https": "http://proxy.invalid:8080",
+                    "no": "choreo.example.org",
+                }
+            ),
+        )
+        self.assertTrue(_bypasses_proxy(with_config, "choreo.example.org"))
+        self.assertFalse(_bypasses_proxy(with_config, "elsewhere.example.org"))
+
     def test_tier_1_only_deployments_are_unaffected(self) -> None:
         """The leak is Tier 2's transport. A homeserver running the pre-filter
         alone has no outbound call to proxy."""
         api = self._api_with_proxy(https_proxy="http://proxy.invalid:8080")
         module = ChatModeration(api, _config(moderation_tier1_enabled=True))
         self.assertIsNone(module._dispatcher)
+
+
+class TestTheDispositionSqlRunsOnBothEngines(unittest.TestCase):
+    """The table is the self-harm guarantee, so its SQL has to run everywhere
+    Synapse runs.
+
+    `Sqlite3Engine.convert_param_style` returns the SQL UNCHANGED and
+    `PostgresEngine.convert_param_style` rewrites `?` into `%s`, so `?` is
+    Synapse's canonical style and `%s` is Postgres-only. A module written in
+    `%s` runs on Postgres and raises `OperationalError: near "%"` on SQLite -
+    which an end-to-end test that only ever boots Postgres cannot see, and
+    which would mean a SQLite deployment records no preservation decisions and
+    grants no redaction claims at all.
+    """
+
+    def test_the_statements_actually_run_on_sqlite(self) -> None:
+        """Run, not inspect: create the table, insert a row, read it back and
+        delete it, through the converter Synapse would use."""
+        import sqlite3
+
+        from synapse_pangea_chat.moderation.disposition import (
+            _CLAIM_SQL,
+            _CREATE_TABLE_SQL,
+            _DELETE_CLAIM_SQL,
+            _PRESERVE_SQL,
+            _SELECT_SQL,
+        )
+
+        def run(sql: str, args: Tuple[Any, ...] = ()) -> Any:
+            return connection.execute(sqlite_engine().convert_param_style(sql), args)
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        run(_CREATE_TABLE_SQL)
+        run(_CLAIM_SQL, ("$e", "!r", "redacted", "harassment", 1, "claim"))
+        self.assertEqual(run(_SELECT_SQL, ("$e",)).fetchone(), ("redacted", "claim"))
+        # A preserve takes the row from an outstanding claim ...
+        run(_PRESERVE_SQL, ("$e", "!r", "preserved", "self_harm", 2, "keep"))
+        self.assertEqual(run(_SELECT_SQL, ("$e",)).fetchone(), ("preserved", "keep"))
+        # ... and a later claim cannot take it back.
+        run(_CLAIM_SQL, ("$e", "!r", "redacted", "harassment", 3, "other"))
+        self.assertEqual(run(_SELECT_SQL, ("$e",)).fetchone(), ("preserved", "keep"))
+        # Nor can releasing the claim it displaced remove it.
+        run(_DELETE_CLAIM_SQL, ("$e", "redacted", "claim"))
+        self.assertEqual(run(_SELECT_SQL, ("$e",)).fetchone(), ("preserved", "keep"))
+        # And a release only ever removes its OWN claim.
+        run(_CLAIM_SQL, ("$f", "!r", "redacted", "harassment", 4, "mine"))
+        run(_DELETE_CLAIM_SQL, ("$f", "redacted", "somebody-else"))
+        self.assertIsNotNone(run(_SELECT_SQL, ("$f",)).fetchone())
+        run(_DELETE_CLAIM_SQL, ("$f", "redacted", "mine"))
+        self.assertIsNone(run(_SELECT_SQL, ("$f",)).fetchone())
+
+    def test_every_statement_converts_cleanly_for_postgres(self) -> None:
+        from synapse.storage.engines.postgres import PostgresEngine
+
+        engine = PostgresEngine({"args": {}})
+        for statement in STATEMENTS:
+            with self.subTest(statement=statement.split()[0]):
+                converted = engine.convert_param_style(statement)
+                self.assertNotIn("?", converted)
+                self.assertEqual(statement.count("?"), converted.count("%s"), converted)
 
 
 class TestTheDeterministicMatcherIsAMeasuredSignal(unittest.IsolatedAsyncioTestCase):
@@ -1021,6 +1123,86 @@ class TestTheDeterministicMatcherIsAMeasuredSignal(unittest.IsolatedAsyncioTestC
             0.0,
             "the matcher read past what the endpoint was given",
         )
+
+
+class TestAnUnusableVerdictIsNoVerdict(unittest.IsolatedAsyncioTestCase):
+    """A response we cannot read is not a clean message.
+
+    Every value here steers a redaction, and the one category that must never
+    be redacted is the one a malformed response makes invisible.
+    """
+
+    def _module(self) -> Tuple[ModuleApi, ChatModeration]:
+        api = _module_api(HomeServerDouble())
+        return api, _tier2_module(self, api, _tier2_config())
+
+    def _job(self) -> ModerationJob:
+        return ModerationJob(
+            event_id="$evt1",
+            room_id="!room:example.org",
+            sender="@learner:example.org",
+            text="x",
+            enqueued_at=0.0,
+        )
+
+    async def test_a_malformed_response_never_redacts(self) -> None:
+        for payload in (
+            # `categories: null` is a PRESENT key with an unusable value, and
+            # reading it as absent made this a flagged verdict with no
+            # category - which redacts, including when the category the
+            # service meant to send was self-harm.
+            {"flagged": True, "categories": None},
+            # The caller tests `evaluated is False`, so a non-bool read as
+            # "the provider evaluated this", which is the one thing the field
+            # exists to say it did not do.
+            {"flagged": False, "categories": [], "evaluated": 0},
+            {"flagged": False, "categories": [], "evaluated": "false"},
+        ):
+            with self.subTest(payload=payload):
+                api, mod = self._module()
+                verdict = create_autospec(moderate_text)
+                verdict.return_value = payload
+                with patch(MODERATE_TEXT, verdict):
+                    await mod._check_and_redact(self._job())
+                cast(
+                    AsyncMock, api.create_and_send_event_into_room
+                ).assert_not_awaited()
+
+    def test_the_transport_refuses_a_response_it_cannot_read(self) -> None:
+        """At the transport boundary as well as at the decision, because the
+        two protect different things: this one stops an unusable value being
+        treated as a verdict at all, including `evaluated`, which no later
+        check looks at."""
+        from synapse_pangea_chat.moderation.choreo_client import _validated_result
+
+        for payload in (
+            {"flagged": True, "categories": None},
+            {"flagged": False, "categories": [], "evaluated": 0},
+            {"flagged": False, "categories": [], "evaluated": "false"},
+            {"flagged": False, "categories": [], "evaluated": 1},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ModerationCheckError):
+                    _validated_result(payload)
+        self.assertFalse(
+            _validated_result({"flagged": False, "categories": [], "evaluated": True})[
+                "flagged"
+            ]
+        )
+
+    async def test_an_unrecognised_self_harm_category_still_preserves(self) -> None:
+        """A sub-category the provider adds after our fixture was pinned
+        normalises to `other`, and `other` redacts - so the vocabulary check
+        alone let the provider open the one hole this feature must not have."""
+        api, mod = self._module()
+        verdict = create_autospec(moderate_text)
+        verdict.return_value = {
+            "flagged": True,
+            "categories": ["self-harm/invented-next-year"],
+        }
+        with patch(MODERATE_TEXT, verdict):
+            await mod._check_and_redact(self._job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
 
 
 class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
@@ -1150,6 +1332,40 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
         cast(AsyncMock, second_api.create_and_send_event_into_room).assert_not_awaited()
         cast(AsyncMock, first_api.create_and_send_event_into_room).assert_not_awaited()
 
+    async def test_the_claim_is_a_single_transaction(self) -> None:
+        """The structural half of the concurrency guarantee, and the half a
+        test double can actually establish.
+
+        The end-to-end test below shows the ORDER of two decisions; it cannot
+        show that a read and a write are atomic, because the double runs each
+        interaction to completion on one connection - so replacing the claim
+        with a read followed by a write leaves it green. What makes the claim
+        atomic is that it is ONE interaction, which is what this asserts: no
+        `await` can interleave inside a single `runInteraction`, so a
+        refactor that splits it fails here.
+        """
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job())
+        claims = [name for name in db_pool.interactions if "claim_redaction" in name]
+        self.assertEqual(len(claims), 1, db_pool.interactions)
+        from synapse_pangea_chat.moderation.disposition import (
+            _CLAIM_SQL,
+            _SELECT_SQL,
+        )
+
+        source = inspect.getsource(DispositionStore.claim_redaction)
+        self.assertIn("_CLAIM_SQL", source)
+        self.assertIn("_SELECT_SQL", source)
+        self.assertEqual(
+            source.count("runInteraction"),
+            1,
+            "the claim must take its row and read it back in ONE transaction",
+        )
+        self.assertTrue(_CLAIM_SQL and _SELECT_SQL)
+
     async def test_two_instances_do_not_both_redact_one_message(self) -> None:
         """The claim is what the in-flight set could never be: shared. Two
         instances both configured to run background tasks used to send two
@@ -1241,6 +1457,89 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
         send = cast(AsyncMock, api.create_and_send_event_into_room)
         redacted = [call.args[0]["redacts"] for call in send.await_args_list]
         self.assertEqual(redacted, ["$edit"])
+
+    async def test_a_preserve_takes_the_row_from_an_outstanding_claim(
+        self,
+    ) -> None:
+        """Instance A claims `$e` and its send fails; while the claim is
+        outstanding, B preserves `$e`; A releases. B's preserve did nothing
+        under `ON CONFLICT DO NOTHING`, so releasing the claim left an empty
+        table and the next verdict redacted the disclosure."""
+        db_pool = DbPoolDouble()
+        api_a, hs_a = self._pair(db_pool)
+        api_b, hs_b = self._pair(db_pool)
+        api_c, hs_c = self._pair(db_pool)
+        a, b, c = (
+            self._module(api_a, hs_a),
+            self._module(api_b, hs_b),
+            self._module(api_c, hs_c),
+        )
+        # A is held INSIDE the send, so its claim is genuinely outstanding
+        # when B preserves. Sequencing the two coroutines any other way lets
+        # B's preserve land before A's claim, which is the case that was
+        # already safe and proves nothing.
+        claimed = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _held_send(*_args: Any, **_kwargs: Any) -> Any:
+            claimed.set()
+            await release.wait()
+            raise RuntimeError("the sender has left the room")
+
+        cast(AsyncMock, api_a.create_and_send_event_into_room).side_effect = _held_send
+        with patch(self.MODERATE, self._verdict("harassment")):
+            claiming = asyncio.ensure_future(a._check_and_redact(self._job()))
+            await claimed.wait()
+            with patch(self.MODERATE, self._verdict("self-harm/intent")):
+                await b._check_and_redact(self._job())
+            release.set()
+            await claiming
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await c._check_and_redact(self._job())
+        cast(AsyncMock, api_c.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_a_preserve_the_database_refused_is_written_later(self) -> None:
+        """A write that failed left the protection in this process's memory
+        and nowhere else, so another instance - or this one after a restart -
+        redacted the disclosure as soon as the database came back. The
+        preserve is retried, and it is retried BEFORE any claim is granted."""
+        db_pool = DbPoolDouble()
+        api_a, hs_a = self._pair(db_pool)
+        api_b, hs_b = self._pair(db_pool)
+        a, b = self._module(api_a, hs_a), self._module(api_b, hs_b)
+        db_pool.error = RuntimeError("database is unhappy")
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await a._check_and_redact(self._job())
+        db_pool.error = None
+        # A's next operation flushes what the database refused ...
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await a._check_and_redact(self._job("$other"))
+        # ... so a second instance that knows nothing finds the row.
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await b._check_and_redact(self._job())
+        cast(AsyncMock, api_b.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_a_claim_is_taken_with_no_await_before_the_send(self) -> None:
+        """A claim taken and then abandoned at an `await` is a row saying
+        `redacted` on a message that is still standing, which nothing would
+        ever take down. The re-read happens first, so the claim and the send
+        are adjacent."""
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        order: List[str] = []
+        homeserver.store.on_read = lambda: order.append("re-read")
+        original = db_pool.runInteraction
+
+        async def _record(desc: str, *args: Any, **kwargs: Any) -> Any:
+            if "claim" in desc:
+                order.append("claim")
+            return await original(desc, *args, **kwargs)
+
+        db_pool.runInteraction = _record  # type: ignore[method-assign]
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job())
+        self.assertEqual(order, ["re-read", "claim"])
 
     async def test_an_unreadable_disposition_never_redacts(self) -> None:
         """The one place this module does NOT fail towards action. If we
@@ -1405,6 +1704,18 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
             "an unreadable surface went uncounted",
         )
 
+    async def test_a_tier_1_failure_is_counted(self) -> None:
+        """The blocking tier failing open is a message it did not look at,
+        and an uncounted unknown reads exactly like a clean one. The
+        per-surface counter cannot see this: the failure is raised around the
+        extraction that increments it."""
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier1_failed_total")
+        mod = _moderation(_config())
+        with patch.object(mod, "_extract_text", side_effect=RuntimeError("boom")):
+            self.assertEqual(await mod.check_event_for_spam(_event("hello")), NOT_SPAM)
+        self.assertEqual(reader.delta("pangea_moderation_tier1_failed_total"), 1.0)
+
     async def test_an_unreadable_surface_still_reaches_tier_2(self) -> None:
         """Escalation is the other half. Tier 1 cannot ask anybody; Tier 2
         can, and a message we could not fully read is exactly the one that
@@ -1493,6 +1804,22 @@ class TestTableRepair(unittest.IsolatedAsyncioTestCase):
         apart, which would invent a number out of two columns."""
         cells = _displayed_text("<table><tr><td>415</td><td>5552671</td></tr></table>")
         self.assertNotIn("4155552671", cells)
+
+    def test_a_row_is_not_a_cell(self) -> None:
+        """Text between a `</td>` and its `</tr>` is outside every cell, and
+        HTML5 foster-parents it exactly like text before the first row."""
+        self.assertIn(
+            "415-555-2671",
+            _displayed_text("<table>41<tr><td>notes</td>5-555-2671</tr></table>"),
+        )
+
+    def test_the_repair_does_not_invent_a_number_across_blocks(self) -> None:
+        """The expensive direction. Foster parenting moves the characters out
+        of the table; it does not merge two block boxes into one line, and a
+        number invented out of two blocks is a Tier-1 block on a message
+        nobody can read that way."""
+        displayed = _displayed_text("<table><div>415</div><div>5552671</div></table>")
+        self.assertNotIn("4155552671", displayed)
 
     def test_two_tables_do_not_run_together(self) -> None:
         first = "<table>41</table>"

@@ -278,3 +278,31 @@ class TestCorpusIntegrity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheMatcherScanIsBounded(unittest.TestCase):
+    """The Tier-2 matcher now runs on every Tier-2 message, inside a worker on
+    the single-threaded reactor, so what it costs on attacker-chosen input is
+    a property of the homeserver and not of the matcher.
+
+    Asserted as an INVARIANT rather than as a time: every rejoining the scan
+    produces is a prefix of some needle. That is what makes the scan
+    proportional to the message instead of to the wordlist - without it, a
+    10,000-character message of short tokens cost about 88 ms of reactor
+    time, per message, because every starting token ran a window out to the
+    longest needle whatever the message said.
+    """
+
+    def test_every_rejoining_could_still_become_a_needle(self) -> None:
+        from synapse_pangea_chat.moderation.profanity import (
+            _needle_prefixes,
+            _short_token_runs,
+        )
+
+        prefixes = _needle_prefixes()
+        tokens = ["a", "b", "c", "d", "e", "f", "u", "c", "k", "x", "y"] * 40
+        runs = _short_token_runs(tokens)
+        self.assertTrue(runs, "the scan produced nothing to check")
+        for run in runs:
+            with self.subTest(run=run):
+                self.assertIn(run, prefixes)

@@ -10,6 +10,7 @@ back the other way.
 
 import importlib.util
 import json
+import time
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -867,7 +868,7 @@ class TestTheMatchingRules(unittest.TestCase):
         for text in ("김 씨 발이 아파요", "민수 씨 발 아파요?", "개 새 끼"):
             with self.subTest(text=text):
                 self.assertFalse(matches_tier1(text))
-        for text in ("c u n t you", "n 1 g g e r", "cu.nt"):
+        for text in ("n 1 g g e r", "n1.gger", "p 1 c a"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -902,20 +903,40 @@ class TestTheMatchingRules(unittest.TestCase):
         """The other half of the bargain. Tier 1 cannot tell a spelt-out
         evasion from a spelt-out lesson, so it judges neither - and the tier
         that reads the message in context judges both."""
-        for text in ("f.u.c.k", "c.u.n.t", "Spell it back to me: F,U,C,K."):
+        for text in (
+            "f.u.c.k",
+            "c.u.n.t",
+            "c u n t",
+            "cu.nt",
+            "Spell it back to me: F,U,C,K.",
+        ):
             with self.subTest(text=text):
                 self.assertTrue(contains_profanity(text))
 
-    def test_a_broken_word_is_still_an_evasion(self) -> None:
-        """What separates a broken word from a list of letters is that a
-        broken word has a piece longer than one letter in it: `f*ck` is
-        `f` + `ck`, and no lesson spells a word out that way."""
-        for text in ("f*ck", "fu.cking"):
+    def test_the_rejoin_scan_stays_linear_in_the_message(self) -> None:
+        """Tier 1 runs INLINE IN THE SEND PATH on a single-threaded reactor,
+        so a quadratic scan is not a slow test, it is every user's send
+        stalling. A 60 KB message of spaced single characters took 4.6
+        seconds: the run grew without limit and was rebuilt on every token.
+
+        The bound is generous on purpose - this is a regression guard for a
+        complexity class, not a benchmark - and the fixed version is about
+        0.06s, so a hundredfold margin still catches the class coming back.
+        """
+        message = "a " * 30000
+        started = time.perf_counter()
+        self.assertFalse(matches_tier1(message))
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+    def test_only_a_digit_rejoins_a_run_before_send(self) -> None:
+        """The one thing that separates an evasion from a lesson: no
+        orthography of the thirty supported languages puts a digit inside a
+        word, so a rejoined run carrying one can only be a deliberately
+        obfuscated spelling. It is the same evidence standard the promotion
+        policy already applies to a term."""
+        for text in ("p 1 c a", "n 1 g g e r", "n1.gger", "p.1.c.a"):
             with self.subTest(text=text):
-                self.assertTrue(contains_profanity(text))
-        # A piece longer than a letter is what says "one word, broken" rather
-        # than "letters, listed", and Tier 1 still blocks that shape.
-        self.assertTrue(matches_tier1("cu.nt"))
+                self.assertTrue(matches_tier1(text))
 
     def test_only_letters_of_an_alphabet_are_treated_as_fragments(self) -> None:
         """Asserted on the rule itself, because no term written in one of
@@ -989,7 +1010,7 @@ class TestTheMatchingRules(unittest.TestCase):
         spelling lessons it is indistinguishable from - see
         `test_a_list_of_letters_is_not_an_evasion`.
         """
-        for text in ("c u n t you", "n 1 g g e r", "cuuuunt"):
+        for text in ("n 1 g g e r", "p.1.c.a", "cuuuunt"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 

@@ -199,12 +199,19 @@ def _bypasses_proxy(proxied: Any, host: str) -> bool:
     """
     if not host:
         return False
+    config = getattr(proxied, "proxy_config", None)
+    if config is None or not hasattr(config, "get_proxies_dictionary"):
+        # No configuration we can read means no bypass we can establish, and
+        # an unestablished bypass is not one. Falling back to the environment
+        # here was reading a DIFFERENT source from the one the request will
+        # use, which can disagree in both directions.
+        return False
     try:
         from synapse.http.proxyagent import proxy_bypass_environment
 
-        config = getattr(proxied, "proxy_config", None)
-        proxies = config.get_proxies_dictionary() if config is not None else None
-        return bool(proxy_bypass_environment(host, proxies=proxies))
+        return bool(
+            proxy_bypass_environment(host, proxies=config.get_proxies_dictionary())
+        )
     except Exception:
         return False
 
@@ -429,14 +436,26 @@ def _validated_result(result: Any) -> Dict[str, Any]:
         raise ModerationCheckError(
             "moderation endpoint returned a non-boolean flagged", KIND_SHAPE
         )
-    categories = result.get("categories")
-    if categories is not None and (
-        not isinstance(categories, list)
-        or not all(isinstance(category, str) for category in categories)
+    if "categories" in result and (
+        not isinstance(result["categories"], list)
+        or not all(isinstance(category, str) for category in result["categories"])
     ):
+        # `in`, not `get(...) is not None`: `categories: null` is a PRESENT
+        # key with an unusable value, and reading it as absent turned
+        # `{"flagged": true, "categories": null}` into a flagged verdict with
+        # no category - which redacts, including when the category the service
+        # meant to send was self-harm.
         raise ModerationCheckError(
             "moderation endpoint returned categories that are not a list of strings",
             KIND_SHAPE,
+        )
+    if "evaluated" in result and not isinstance(result["evaluated"], bool):
+        # The caller tests `evaluated is False`, so a non-bool - `0`, `"false"`
+        # - read as "the provider evaluated this", which is the one thing the
+        # field exists to tell us it did not do. A value we cannot read is no
+        # verdict, not a clean one.
+        raise ModerationCheckError(
+            "moderation endpoint returned a non-boolean evaluated", KIND_SHAPE
         )
     return result
 
