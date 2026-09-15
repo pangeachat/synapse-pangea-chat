@@ -441,6 +441,17 @@ class TestParseConfig(unittest.TestCase):
                         }
                     )
 
+    def test_empty_phone_region_list_is_refused(self) -> None:
+        """The matcher iterates the region list, so an empty list silently
+        turns the phone rule off - international numbers included."""
+        with self.assertRaises(ValueError):
+            PangeaChat.parse_config(
+                {
+                    **self.BASE,
+                    "moderation": {"tier1_enabled": True, "tier1_phone_regions": []},
+                }
+            )
+
     def test_match_everything_glob_parses_with_a_warning(self) -> None:
         """EX-5. Exempting everyone is the operator's call to make; the
         warning is what makes it a deliberate one."""

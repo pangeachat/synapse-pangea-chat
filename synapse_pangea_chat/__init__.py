@@ -642,6 +642,19 @@ class PangeaChat:
                 'Config "moderation.tier1_phone_regions" must be a list of '
                 "non-empty strings"
             )
+        if not moderation_tier1_phone_regions:
+            # The matcher iterates the region list, so an empty list runs it
+            # zero times and turns the phone rule off entirely - including for
+            # international +CC numbers, which the docs say match regardless
+            # of region, because libphonenumber still needs a region argument
+            # to be given one. There is no way to express "international only"
+            # here, so an empty list can only be a mistake, and a Tier-1 rule
+            # must not switch itself off quietly.
+            raise ValueError(
+                'Config "moderation.tier1_phone_regions" must name at least '
+                "one region; an empty list disables phone matching entirely, "
+                "including international formats"
+            )
 
         moderation_tier2_enabled = moderation.get("tier2_enabled", False)
         if not isinstance(moderation_tier2_enabled, bool):
