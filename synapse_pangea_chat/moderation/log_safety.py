@@ -9,7 +9,7 @@ handler. What does reach one is a room id, an event id, a rule identifier
 and the digest below - enough to chase a false positive, and resolvable to a
 person only through the database, under authorisation.
 
-Two channels need closing, and only one of them is a log call we write:
+Three channels need closing, and only one of them is a log call we write:
 
 - The arguments we pass. `sender_digest` is the substitute for a Matrix ID.
 - The exceptions we let escape. `logger.exception` prints the exception's
@@ -17,11 +17,20 @@ Two channels need closing, and only one of them is a log call we write:
   body back ("cannot parse '<the message>'"). `error_site` keeps what makes
   such a failure debuggable - which line raised, and what type - without the
   message the traceback would have carried.
+- The attributes Synapse attaches for us. `one_time_logging_setup` installs a
+  log-record FACTORY that runs `LoggingContextFilter` over every record the
+  process creates, so a record emitted inside a request context carries
+  `requester` and `authenticated_entity` - the sender's Matrix ID - whether or
+  not our format string mentions them. The default formatter prints neither,
+  which is why this channel is easy to miss; a structured sink serialises the
+  whole record and prints both. `scrubbing_logger` closes it.
 """
 
 import hashlib
+import logging
 import os
 import secrets
+from typing import Tuple
 
 # 6 bytes is 12 hex characters: short enough to read in a log line, wide
 # enough that two senders colliding within one process is not a practical
@@ -48,6 +57,66 @@ def sender_digest(sender: str, key: bytes) -> str:
     return hashlib.blake2b(
         sender.encode("utf-8"), key=key, digest_size=_DIGEST_BYTES
     ).hexdigest()
+
+
+# The attributes `synapse.logging.context.LoggingContextFilter` copies off the
+# in-flight request onto EVERY record, of which these name or locate the person
+# the record is about. They are replaced rather than deleted: a deployment is
+# free to configure a formatter that references `%(requester)s`, and deleting
+# the attribute would turn a privacy fix into a KeyError in the logging system.
+#
+# The rest of what the filter sets - `request`, `server_name`, `site_tag`,
+# `method`, `url`, `protocol` - names an endpoint and a request, not a person,
+# and is what makes a record traceable, so it is left alone. `url` is the one
+# judgement call in that list: Synapse has already redacted credentials out of
+# it, and the paths a moderation record is created under
+# (`/rooms/{roomId}/send/...`) carry a room id rather than a Matrix ID.
+_IDENTITY_RECORD_ATTRS: Tuple[str, ...] = (
+    "requester",
+    "authenticated_entity",
+    "ip_address",
+    "user_agent",
+)
+
+REDACTED = "<redacted:pangea-moderation>"
+
+
+class _IdentityScrubbingFilter(logging.Filter):
+    """Removes the request identity Synapse attaches to records we emit.
+
+    Attached to a LOGGER rather than to a handler, and that placement is the
+    point: `Logger.handle` runs the logger's own filters before `callHandlers`
+    walks the ancestor chain, so one filter covers every handler the record
+    could reach, including the root handlers a deployment configures and any
+    structured sink hanging off them.
+
+    It cannot cover records this module did not create - Synapse logging an
+    authorisation failure on our behalf is Synapse's record, on Synapse's
+    logger. That is why `_check_and_redact` refuses to let an exception escape
+    at all rather than relying on this.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        for attr in _IDENTITY_RECORD_ATTRS:
+            if getattr(record, attr, None) is not None:
+                setattr(record, attr, REDACTED)
+        return True
+
+
+def scrubbing_logger(name: str) -> logging.Logger:
+    """The module's `logging.getLogger`, with the identity scrubber attached.
+
+    Every logger in the moderation package is obtained through this function.
+    A logger's filters apply only to records logged THROUGH that logger -
+    `callHandlers` inherits ancestors' handlers, never their filters - so
+    attaching the scrubber to the package's top logger alone would leave every
+    sub-module's records unscrubbed. Routing all of them through one factory is
+    what makes that impossible to get wrong by adding a file.
+    """
+    logger = logging.getLogger(name)
+    if not any(isinstance(f, _IdentityScrubbingFilter) for f in logger.filters):
+        logger.addFilter(_IdentityScrubbingFilter())
+    return logger
 
 
 def error_site(exc: BaseException) -> str:

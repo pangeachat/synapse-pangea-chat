@@ -24,9 +24,8 @@ the org trust-and-safety doc it descends from.
 """
 
 import inspect
-import logging
-import re
-from typing import Any, Mapping, Optional, Tuple, Union
+from html.parser import HTMLParser
+from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from synapse.api.errors import Codes
 from synapse.events import EventBase
@@ -46,12 +45,13 @@ from synapse_pangea_chat.moderation.exempt import (
 from synapse_pangea_chat.moderation.log_safety import (
     error_site,
     new_digest_key,
+    scrubbing_logger,
     sender_digest,
 )
 from synapse_pangea_chat.moderation.tier1_prefilter import check_text
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
 
-logger = logging.getLogger("synapse.modules.synapse_pangea_chat.moderation")
+logger = scrubbing_logger("synapse.modules.synapse_pangea_chat.moderation")
 
 # Synapse 1.159 inserted `server_name` as the second positional parameter of
 # `run_as_background_process`; 1.124 has no such parameter. Calling the 1.124
@@ -78,9 +78,107 @@ _TEXTUAL_MSGTYPES = ("m.text", "m.emote", "m.notice")
 # exactly like message text — so it is moderated too. Without this, any
 # abusive text sent as an image caption bypassed both tiers entirely.
 _CAPTION_MSGTYPES = ("m.image", "m.video", "m.file", "m.audio")
-# Tags are stripped from `formatted_body`; a message whose plain `body` is
-# innocuous can carry the real payload in its HTML twin.
-_HTML_TAGS = re.compile(r"<[^>]+>")
+_MODERATED_MSGTYPES = frozenset(_TEXTUAL_MSGTYPES + _CAPTION_MSGTYPES)
+
+# The relation type that makes an event a replacement. Per the Matrix spec a
+# replacement is `m.relates_to.rel_type == "m.replace"` and nothing else; the
+# mere presence of an `m.new_content` key means nothing, and no client renders
+# `m.new_content` without the relation.
+_REPLACE_REL_TYPE = "m.replace"
+
+# Tags that produce a visual break when a client renders `formatted_body`.
+# Everything else is inline, and inline elements concatenate with no gap: the
+# displayed text of `4<b>1</b>5` is `415`, so that is the string the rules see.
+_BLOCK_LEVEL_TAGS = frozenset(
+    {
+        "blockquote",
+        "br",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "hr",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "table",
+        "td",
+        "th",
+        "tr",
+        "ul",
+    }
+)
+# Attribute values a client puts on screen. `alt` is rendered whenever an
+# inline image does not load, and both are read aloud by screen readers, so
+# text parked there is text a reader receives. `href` is deliberately NOT in
+# this set: clients show the link's TEXT, and a URL full of digits is a
+# plausible false positive for the phone rule. Recorded as a limit in
+# .github/instructions/moderation.instructions.md.
+_DISPLAYED_ATTRIBUTES = frozenset({"alt", "title"})
+
+
+class _DisplayedText(HTMLParser):
+    """Reduces `formatted_body` to the characters a reader actually sees.
+
+    A regex (`<[^>]+>`) was the previous implementation and it fails in both
+    directions. It deletes `< b and call ...` — ordinary text containing a
+    less-than sign — as though it were a tag, which drops displayed text; and,
+    because it never decodes entities, `&#52;15-555-2671` reaches the rules as
+    an entity string while the reader sees a phone number. A real parser fixes
+    both, and fixes them in the order ADR-8a(ii) requires: the tag scanner runs
+    over the raw text first, so `&lt;I will kill you&gt;` becomes the visible
+    text `<I will kill you>` rather than being decoded into a tag and deleted.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: List[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    def _handle_tag(self, tag: str, attrs: Sequence[Tuple[str, Optional[str]]]) -> None:
+        if tag in _BLOCK_LEVEL_TAGS:
+            self._parts.append("\n")
+        for name, value in attrs:
+            if name in _DISPLAYED_ATTRIBUTES and value:
+                self._parts.append(f"\n{value}\n")
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        self._handle_tag(tag, attrs)
+
+    def handle_startendtag(
+        self, tag: str, attrs: List[Tuple[str, Optional[str]]]
+    ) -> None:
+        self._handle_tag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _BLOCK_LEVEL_TAGS:
+            self._parts.append("\n")
+
+    def result(self) -> str:
+        return "".join(self._parts)
+
+
+def _displayed_text(formatted: str) -> str:
+    """The reader-visible text of an HTML body, never less than it displays."""
+    parser = _DisplayedText()
+    parser.feed(formatted)
+    parser.close()
+    text = parser.result()
+    # An unterminated tag at the end of the string is consumed and discarded by
+    # the parser, as a sanitiser would discard it. Its raw tail is appended all
+    # the same: over-reading text nobody sees can only cost a false positive on
+    # malformed HTML, while under-reading is the bypass this whole function
+    # exists to prevent, and the two are not symmetric.
+    last_open = formatted.rfind("<")
+    if last_open != -1 and ">" not in formatted[last_open:]:
+        text = f"{text}\n{formatted[last_open + 1:]}"
+    return text
 
 
 class ChatModeration:
@@ -127,11 +225,26 @@ class ChatModeration:
     def _extract_text(self, event: EventBase) -> Optional[str]:
         """The moderatable text of a message event, or None to skip it.
 
-        Handles edits by preferring m.new_content (the replacement text is
-        what readers will see)."""
+        The rule, and the only rule: **what the rules see is never less than
+        what a reader sees.** Extraction that returns a subset of the displayed
+        text is not a missed detection, it is a bypass any sender can trigger
+        on every message, so where the displayed text is ambiguous the union of
+        the candidate surfaces is moderated. Over-reading costs a false
+        positive on one message; under-reading costs the tier.
+
+        An edit therefore ADDS a surface rather than replacing one (ADR-8a(0)).
+        Both are displayed: modern clients render `m.new_content`, older ones
+        render the outer `body` fallback (conventionally `* <new text>`), so
+        choosing between them leaves whichever was not chosen unmoderated.
+
+        And `m.new_content` is only a replacement when `m.relates_to.rel_type`
+        says so. Preferring it on presence alone was a total bypass of both
+        tiers: `{"msgtype": "m.text", "body": "<payload>", "m.new_content": {}}`
+        has no relation, is displayed as `<payload>` by every client, and
+        extracted as nothing at all.
+        """
         if event.type != "m.room.message":
             return None
-        content = event.content or {}
         # `Mapping`, not `dict`: event content is not guaranteed to be a plain
         # dict. Synapse builds events through a Rust type whose `content` is a
         # `JsonObject`, and a homeserver running with `use_frozen_dicts: true`
@@ -139,17 +252,27 @@ class ChatModeration:
         # test on either returns False, which would silently stop moderating
         # the replacement text of every edit - a bypass that fails open and
         # says nothing.
-        if isinstance(new_content := content.get("m.new_content"), Mapping):
-            content = new_content
-        if content.get("msgtype") not in _TEXTUAL_MSGTYPES + _CAPTION_MSGTYPES:
+        content = event.content or {}
+        if not isinstance(content, Mapping):
             return None
-        parts = []
-        body = content.get("body")
-        if isinstance(body, str) and body.strip():
-            parts.append(body)
-        formatted = content.get("formatted_body")
-        if isinstance(formatted, str) and formatted.strip():
-            parts.append(_HTML_TAGS.sub(" ", formatted))
+
+        surfaces: List[Mapping[str, Any]] = [content]
+        new_content = content.get("m.new_content")
+        if _is_replacement(content) and isinstance(new_content, Mapping):
+            surfaces.append(new_content)
+
+        # The msgtype gate is satisfied by ANY displayed surface. Reading it
+        # from one surface only is the same bypass in miniature: an edit whose
+        # `m.new_content` omits `msgtype` would have skipped the whole event,
+        # outer fallback body included.
+        if not any(
+            surface.get("msgtype") in _MODERATED_MSGTYPES for surface in surfaces
+        ):
+            return None
+
+        parts: List[str] = []
+        for surface in surfaces:
+            parts.extend(_surface_text(surface))
         text = "\n".join(parts).strip()
         return text or None
 
@@ -269,8 +392,7 @@ class ChatModeration:
 
         if not result.get("flagged"):
             return
-        categories = result.get("categories") or []
-        category = _normalize_category(categories[0]) if categories else "flagged"
+        category = _summarize_categories(result.get("categories") or ())
         logger.info(
             "tier2 flagged event %s in %s (category=%s); redacting",
             event.event_id,
@@ -320,9 +442,95 @@ class ChatModeration:
             )
 
 
-def _normalize_category(category: str) -> str:
-    """Map an OpenAI moderation category name onto the orchestrator's flag
-    vocabulary where the two overlap (`self-harm/intent` -> `self_harm`),
-    passing through normalized names otherwise, so both moderation code
-    paths speak one vocabulary."""
+def _is_replacement(content: Mapping[str, Any]) -> bool:
+    """True when the event's own relation declares it a replacement.
+
+    Tier 1 trusts the event's `rel_type` and nothing more, because deciding
+    whether the relation is VALID - target exists, same room, same sender -
+    needs a database read, and the send path cannot afford one (ADR-8a). The
+    price is a known false positive: a bogus replacement relation makes us read
+    `m.new_content` on an event no client renders that way. That direction is
+    safe; the reverse is the bypass this function exists to close.
+    """
+    relates_to = content.get("m.relates_to")
+    return (
+        isinstance(relates_to, Mapping)
+        and relates_to.get("rel_type") == _REPLACE_REL_TYPE
+    )
+
+
+def _surface_text(surface: Mapping[str, Any]) -> List[str]:
+    """Every displayed string carried by one content surface."""
+    parts: List[str] = []
+    body = surface.get("body")
+    if isinstance(body, str) and body.strip():
+        parts.append(body)
+    formatted = surface.get("formatted_body")
+    if isinstance(formatted, str) and formatted.strip():
+        displayed = _displayed_text(formatted)
+        if displayed.strip():
+            parts.append(displayed)
+    return parts
+
+
+# The provider's documented category vocabulary, and the whole of it. A
+# category name is a string chosen by a service we do not run; it reaches a log
+# line and the redaction reason that lands in a room, so it is checked against
+# this list rather than trusted. A response of
+# `{"flagged": true, "categories": ["@alice:example.org"]}` otherwise logs that
+# Matrix ID verbatim and writes it into a room, and
+# `["<the message body>"]` does the same for a message body - by a route no
+# review of our own format strings would find, because our format string is
+# `category=%s` and looks harmless.
+_PROVIDER_CATEGORIES = frozenset(
+    {
+        "harassment",
+        "harassment/threatening",
+        "hate",
+        "hate/threatening",
+        "illicit",
+        "illicit/violent",
+        "self-harm",
+        "self-harm/instructions",
+        "self-harm/intent",
+        "sexual",
+        "sexual/minors",
+        "violence",
+        "violence/graphic",
+    }
+)
+# Where an unrecognised category lands: a bounded constant, never the string
+# the service sent. Per ADR-7b this is what makes an unknown category a
+# non-event for logs, for metric cardinality and for the redaction reason.
+UNKNOWN_CATEGORY = "other"
+# Used when the service flags a message and names no category at all.
+UNNAMED_CATEGORY = "flagged"
+
+
+def _normalize_category(category: Any) -> str:
+    """Map a provider category name onto the orchestrator's flag vocabulary.
+
+    `self-harm/intent` -> `self_harm`, so both moderation code paths speak one
+    vocabulary. Anything outside the documented list - including anything that
+    is not a string - becomes `other`, and the value the service sent is
+    discarded here rather than carried one frame further.
+    """
+    if not isinstance(category, str) or category not in _PROVIDER_CATEGORIES:
+        return UNKNOWN_CATEGORY
     return category.split("/", 1)[0].replace("-", "_")
+
+
+def _summarize_categories(categories: Iterable[Any]) -> str:
+    """One safe category label for a verdict's category list.
+
+    The first RECOGNISED category wins, so a list whose first entry is junk -
+    the shape an injected value takes - does not cost us the real finding that
+    follows it.
+    """
+    fallback: Optional[str] = None
+    for category in categories:
+        normalized = _normalize_category(category)
+        if normalized != UNKNOWN_CATEGORY:
+            return normalized
+        fallback = UNKNOWN_CATEGORY
+    return fallback or UNNAMED_CATEGORY

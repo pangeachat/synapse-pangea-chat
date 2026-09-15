@@ -11,18 +11,17 @@ all our learner languages (see `profanity.py`); the address pattern remains
 English-centric, with Tier 2 as its backstop.
 """
 
-import logging
 import re
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional, Tuple
 
 import phonenumbers
 
-from synapse_pangea_chat.moderation.log_safety import error_site
+from synapse_pangea_chat.moderation.log_safety import error_site, scrubbing_logger
 from synapse_pangea_chat.moderation.profanity import (
     contains_profanity as _contains_profanity_multilingual,
 )
 
-logger = logging.getLogger(
+logger = scrubbing_logger(
     "synapse.modules.synapse_pangea_chat.moderation.tier1_prefilter"
 )
 
@@ -97,27 +96,12 @@ def contains_phone_number(text: str, regions: Iterable[str]) -> bool:
     Numbers written with an international prefix (+33 6...) match under any
     region, so the region list only needs to cover the national formats our
     users are likely to type bare (configured per deployment).
+
+    Exceptions are NOT caught here. A rule that cannot answer must say so; see
+    `check_text` for why swallowing one was a security defect rather than
+    defensive programming.
     """
-    for region in regions:
-        try:
-            if any(phonenumbers.PhoneNumberMatcher(text, region)):
-                return True
-        except Exception as exc:  # pragma: no cover - defensive: library quirk
-            # silent-ok: fail-open per tier contract; logged for visibility,
-            # and Tier 2 still sees the message.
-            #
-            # The exception's TYPE and the line that raised it are logged; its
-            # message and traceback are not. A parsing library that fails on a
-            # message body routinely quotes that body back in the error, so
-            # `exc_info=True` here would put message text into the log by a
-            # route no review of our own format strings would catch.
-            logger.warning(
-                "phone matcher failed for region %s at %s (%s)",
-                region,
-                error_site(exc),
-                type(exc).__name__,
-            )
-    return False
+    return any(any(phonenumbers.PhoneNumberMatcher(text, region)) for region in regions)
 
 
 def contains_street_address(text: str) -> bool:
@@ -128,12 +112,64 @@ def contains_profanity(text: str) -> bool:
     return _contains_profanity_multilingual(text)
 
 
+class Tier1RuleError(Exception):
+    """A Tier 1 rule could not complete, so the tier has no verdict.
+
+    Carries a rule identifier and nothing else: the text that broke the rule is
+    exactly what must not travel with the exception (ADR-10).
+    """
+
+
+# The rules, in the order they are asked, each paired with the reason it
+# returns. A table rather than a chain of `if`s so that the failure policy
+# below is applied to every rule by construction, and a rule added later gets
+# it without anybody remembering to.
+_RULES: Tuple[Tuple[str, Callable[[str, Iterable[str]], bool]], ...] = (
+    (
+        REASON_CONTACT_DETAILS,
+        lambda text, regions: contains_phone_number(text, regions),
+    ),
+    (REASON_LOCATION_DETAILS, lambda text, _regions: contains_street_address(text)),
+    (REASON_PROFANITY, lambda text, _regions: contains_profanity(text)),
+)
+
+
 def check_text(text: str, phone_regions: Iterable[str]) -> Optional[str]:
-    """Return a reason code when the text trips a Tier 1 rule, else None."""
-    if contains_phone_number(text, phone_regions):
-        return REASON_CONTACT_DETAILS
-    if contains_street_address(text):
-        return REASON_LOCATION_DETAILS
-    if contains_profanity(text):
-        return REASON_PROFANITY
+    """Return a reason code when the text trips a Tier 1 rule, else None.
+
+    Raises `Tier1RuleError` when any rule fails to complete. That is the whole
+    of the failure policy, and it is deliberately blunt: **a tier with a broken
+    rule has no verdict at all.**
+
+    The predecessor caught the phone matcher's exception inside
+    `contains_phone_number` and returned `False`, which is not the same thing
+    as "no phone number here" - it is "we do not know" wearing the answer's
+    clothes. `check_text` then went on to the address rule and returned
+    `Codes.FORBIDDEN`, so a message was REJECTED on the strength of a Tier 1
+    run that had already failed, in a tier whose entire contract is that a
+    failure lets the message through. Converting a partial failure into a clean
+    negative is the class; the table above and this raise are the fix for all
+    of it rather than for the phone rule alone.
+
+    The caller's handler logs the failure and returns NOT_SPAM, and Tier 2
+    still sees the message.
+    """
+    regions = list(phone_regions)
+    for reason, rule in _RULES:
+        try:
+            hit = rule(text, regions)
+        except Exception as exc:
+            # Type and site, never the message or a traceback: a matcher that
+            # fails on a message body routinely quotes that body back.
+            logger.warning(
+                "tier1 rule %s failed at %s (%s); the whole tier fails open",
+                reason,
+                error_site(exc),
+                type(exc).__name__,
+            )
+            # `from None` suppresses the chain, so nothing downstream that
+            # logs an exception can print the original library message.
+            raise Tier1RuleError(reason) from None
+        if hit:
+            return reason
     return None
