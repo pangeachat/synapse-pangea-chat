@@ -4,47 +4,54 @@ POST {base_url}/choreo/moderate with a Matrix bearer token (the endpoint is
 `has_matrix_account`-gated — any valid token on this homeserver; deployments
 configure a dedicated moderation service account's token).
 
-**The transport is Synapse's own shared client**, reached as
-`ModuleApi.http_client`. That replaces a `twisted.web.client.Agent(reactor)`
+**The transport is Synapse's own shared, pooled agent**, reached as
+`ModuleApi.http_client.agent`. That replaces a `twisted.web.client.Agent(reactor)`
 built per request, which the repo copied from
 `public_courses/course_plan_l2_lookup.py` - a convention that is itself the
 bug. `Agent(reactor)` with no explicit pool constructs
 `HTTPConnectionPool(reactor, False)`: **non-persistent**, whatever twisted's
-own prose says, so every message paid a fresh TCP and TLS handshake. Synapse's
-client owns a pool sized `max(100 * cache_factor, 5)` per host with a
-two-minute cached-connection timeout, is a `@cache_in_self` singleton shared
-with the rest of the process, carries proxy configuration and the IP
-block/allow list, and increments Synapse's `outgoing_requests_counter`.
+own prose says, so every message paid a fresh TCP and TLS handshake. Synapse
+builds its agent over a pool sized `max(100 * cache_factor, 5)` per host with a
+two-minute cached-connection timeout, on a `@cache_in_self` client shared with
+the rest of the process, carrying the proxy configuration and the IP
+block/allow list.
 
-**`request()`, and deliberately not `post_json_get_json`.** The convenience
-method cannot meet this module's two hard requirements. It reads the body with
-`twisted.web.client.readBody`, which has no size cap and - as its own
-docstring says - **no timeout at all on reading the response body**; a peer
-that sends headers and then dribbles would leave a check pending forever, one
-per message, with nothing logged because nothing has failed. And it logs the
-request body: `logger.debug("HTTP POST %s -> %s", json_str, uri)` puts every
-moderated message into `synapse.http.client` at DEBUG. `request()` does
-neither - it logs only the method and a redacted URI, and because Synapse asks
-treq for an unbuffered response it hands back the raw `IResponse`, so the
-bounded, deadline-enforced, connection-tearing body reader below stays exactly
-as it was.
+**The agent and NOT `SimpleHttpClient`'s own `post_json_get_json` or
+`request`.** Both were tried and both are disqualified, for three separate
+reasons that are properties of that class rather than of how it is called:
 
-**The one cost of the choice, stated rather than discovered later.**
-`SimpleHttpClient.request` wraps its own request in `timeout_deferred`, whose
-returned Deferred is created with no canceller, so cancelling it from outside
-does not reach the socket. Our deadline therefore ends *our* wait during the
-header phase without aborting the connection; that connection is reclaimed by
-Synapse's own 60-second request timeout and the pool's 120-second cached
-connection timeout instead of by us. It is bounded and it is one connection.
-Once the response headers are in hand the body phase is ours again, and there
-the deadline does tear the connection down - which is the phase that had no
-bound of any kind and the reason this reader exists.
+1. `post_json_get_json` reads the body with `twisted.web.client.readBody`,
+   which has no size cap and - as its own docstring says - **no timeout at all
+   on reading the response body**. A peer that sends headers and then dribbles
+   would leave a check pending forever, one per message, with nothing logged
+   because nothing has failed. It also logs the request body:
+   `logger.debug("HTTP POST %s -> %s", json_str, uri)` puts every moderated
+   message into `synapse.http.client` at DEBUG.
+2. `request()` wraps its request in its own `timeout_deferred`, whose returned
+   Deferred is built with **no canceller**, so cancelling it from outside stops
+   our wait and never reaches the socket. A response arriving after our
+   deadline is then discarded with no body consumer attached, so the connection
+   never returns to the idle pool and the pool's cached-connection timeout
+   never applies to it. Those accumulate.
+3. `request()`'s own `except` clause logs `e.args[0]`. A malformed status line
+   produces a twisted `ResponseFailed` **carrying the bytes off the wire**, so
+   a peer that replies `HTTP/1.1 not-a-code @alice:example.org` gets that
+   Matrix ID written to `synapse.http.client` by Synapse, through a route no
+   format string of ours mentions. The same line raises `IndexError` on an
+   argument-less `CancelledError`, which is what our own deadline produces.
+
+Going straight to the agent keeps every one of the reasons the shared client
+was chosen - one pool, one set of connections, proxy support, the block list -
+while the request Deferred is a real one with a real canceller, so a deadline
+here aborts the connection instead of merely giving up on it. The cost is
+Synapse's `outgoing_requests_counter`, which this module replaces with its own
+latency histogram and outcome counter.
 """
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from synapse.logging.context import make_deferred_yieldable, run_in_background
+from synapse.logging.context import PreserveLoggingContext, make_deferred_yieldable
 from twisted.internet import defer
 from twisted.internet.protocol import Protocol, connectionDone
 from twisted.python.failure import Failure
@@ -292,7 +299,7 @@ async def moderate_text(
     base_url: str,
     access_token: str,
     *,
-    http_client: Any,
+    agent: Any,
     clock: Any,
     timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
 ) -> Dict[str, Any]:
@@ -301,7 +308,7 @@ async def moderate_text(
     Raises ModerationCheckError on transport/HTTP/decode/shape failure - the
     caller owns the fail-open disposition.
 
-    `http_client` is `ModuleApi.http_client`; `clock` is the homeserver's
+    `agent` is `ModuleApi.http_client.agent`; `clock` is the homeserver's
     `Clock`. Both are passed rather than reached for so a test can drive a
     stalled peer against a clock it controls - with the global reactor the
     stall assertions would be "wait fifteen seconds and hope", and there would
@@ -310,7 +317,7 @@ async def moderate_text(
     """
     try:
         return await _moderate_text(
-            text, base_url, access_token, http_client, clock, timeout_seconds
+            text, base_url, access_token, agent, clock, timeout_seconds
         )
     except ModerationCheckError as error:
         # Severed HERE, one frame out from every raise site, and re-raised
@@ -325,10 +332,14 @@ async def _moderate_text(
     text: str,
     base_url: str,
     access_token: str,
-    http_client: Any,
+    agent: Any,
     clock: Any,
     timeout_seconds: float,
 ) -> Dict[str, Any]:
+    from io import BytesIO
+
+    from twisted.web.client import FileBodyProducer
+
     body = json.dumps({"text": text}).encode("utf-8")
     headers = Headers(
         {
@@ -336,26 +347,25 @@ async def _moderate_text(
             b"Content-Type": [b"application/json"],
         }
     )
-    uri = f"{base_url.rstrip('/')}/choreo/moderate"
+    uri = f"{base_url.rstrip('/')}/choreo/moderate".encode("utf-8")
 
     deadline = clock.time() + timeout_seconds
+    # Set by whichever deadline fires, and read by the classifier below. The
+    # exception twisted delivers for an aborted request says only that the
+    # response never arrived; it cannot say that WE ended it, and a timeout
+    # reported as a transport error is a timeout the breaker's cooldown and
+    # the operator's dashboard both read as the wrong thing.
+    timed_out = [False]
     response: Any = None
     try:
-        # `run_in_background`, never a bare `defer.ensureDeferred`. The
-        # difference is the whole of commit 33f7ead: a bare `ensureDeferred`
-        # leaves this coroutine's logcontext set on the reactor, and since
-        # 1.159 `clock.py` asserts the sentinel context at every timer fire and
-        # permanently kills any Synapse timer that fires inside the leaked
-        # window. A Deferred is needed at all - rather than awaiting the
-        # coroutine directly - because there is nothing to attach a deadline to
-        # otherwise.
-        request = run_in_background(
-            http_client.request, "POST", uri, data=body, headers=headers
-        )
+        request = agent.request(b"POST", uri, headers, FileBodyProducer(BytesIO(body)))
+
+        def _abort_headers() -> None:
+            timed_out[0] = True
+            _from_reactor(request.cancel)
+
         header_timeout = clock.call_later(
-            _SecondsInterval(max(deadline - clock.time(), 0)),
-            _cancel_from_reactor,
-            request,
+            _SecondsInterval(max(deadline - clock.time(), 0)), _abort_headers
         )
         try:
             response = await make_deferred_yieldable(request)
@@ -372,12 +382,16 @@ async def _moderate_text(
         # `post_json_get_json` has exactly this hole and says so in its
         # docstring, which is why it is not used.
         body_deferred, body_protocol = _read_body(response)
+
+        def _abort_body() -> None:
+            timed_out[0] = True
+            _from_reactor(body_protocol.abort)
+
         # `call_later`, not a deferred timeout: ending the wait is not enough,
         # the connection has to be torn down, and cancelling a read only fires
         # the deferred. See `_BoundedBody`.
         timeout = clock.call_later(
-            _SecondsInterval(max(deadline - clock.time(), 0)),
-            body_protocol.abort,
+            _SecondsInterval(max(deadline - clock.time(), 0)), _abort_body
         )
         try:
             raw = await make_deferred_yieldable(body_deferred)
@@ -385,9 +399,10 @@ async def _moderate_text(
             if timeout.active():
                 timeout.cancel()
     except ModerationCheckError:
-        # Already classified at the raise site - the body reader knows whether
-        # it timed out or lost the connection, and re-wrapping here would
-        # flatten that back to `transport`.
+        # Already classified at the raise site, and left alone. The body
+        # reader is the only thing that raises this from inside the block, it
+        # knows whether it timed out or lost the connection, and re-labelling
+        # it here would flatten that back to one kind.
         raise
     except Exception as e:
         # The chain is severed by `ModerationCheckError` itself, not by this
@@ -396,7 +411,7 @@ async def _moderate_text(
         # carries the whole response body on `.doc`.
         raise ModerationCheckError(
             f"moderation request failed: {type(e).__name__}",
-            _transport_kind(e),
+            KIND_TIMEOUT if timed_out[0] else _transport_kind(e),
         ) from None
 
     if response.code >= 400:
@@ -421,30 +436,34 @@ async def _moderate_text(
     return _validated_result(result)
 
 
-def _cancel_from_reactor(deferred: "defer.Deferred[Any]") -> None:
-    """Cancel an in-flight request from a reactor callback.
+def _from_reactor(action: Callable[[], None]) -> None:
+    """Run a deadline's teardown from a reactor callback, safely.
 
-    `PreserveLoggingContext` is not decoration. Cancelling resumes the
-    awaiting coroutine from inside this callback's frame, and that coroutine
-    restores its own logcontext when it does - so without the wrapper the
-    reactor is handed back whatever context the resumed coroutine left set,
-    which is the leak class this module's whole handoff design is written
-    around. Synapse's own `timeout_deferred` wraps its `cancel()` the same
-    way, for the same reason.
+    Two things, and neither is decoration.
 
-    What this cancellation does NOT do is reach the socket.
-    `SimpleHttpClient.request` wraps its request in its own `timeout_deferred`,
-    whose returned Deferred is built with no canceller, so the cancel stops at
-    that wrapper. See this module's docstring: the connection is reclaimed by
-    Synapse's own 60-second request timeout rather than by us, and the wait -
-    which is what a queued moderation job actually occupies - ends here.
+    `PreserveLoggingContext`: cancelling a request, or aborting a body read,
+    fires a Deferred, which resumes the awaiting coroutine from inside THIS
+    frame - and that coroutine restores its own logcontext as it goes. Without
+    the wrapper the reactor is handed back whatever context the resumed
+    coroutine left set, which is the leak class this module's whole handoff
+    design is written around, and which Synapse's 1.159 `clock.py` reports as
+    "Expected logging context call_later was lost". Synapse wraps its own
+    `timeout_deferred` cancellation identically.
+
+    And the `try`: this runs from a `Clock.call_later` callback, where an
+    exception is not caught by the coroutine that scheduled it. A teardown
+    that raised would leave the deadline half-applied and the exception
+    reported by the reactor rather than by us.
     """
-    from synapse.logging.context import PreserveLoggingContext
-
-    if deferred.called:
-        return
-    with PreserveLoggingContext():
-        deferred.cancel()
+    try:
+        with PreserveLoggingContext():
+            action()
+    except Exception:
+        # silent-ok: the deadline has already been recorded by the caller's
+        # `timed_out` flag, and the awaiting coroutine ends either way - by
+        # the teardown that did work, or by the deadline the caller applies.
+        # Logging the exception here would name what was on the wire.
+        logger.warning("tier2 moderation deadline teardown failed")
 
 
 def _transport_kind(error: BaseException) -> str:
@@ -486,14 +505,14 @@ class ChoreoChecker:
     def __init__(
         self,
         *,
-        http_client: Any,
+        agent: Any,
         clock: Any,
         base_url: str,
         access_token: str,
         breaker: Any,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
     ) -> None:
-        self._http_client = http_client
+        self._agent = agent
         self._clock = clock
         self._base_url = base_url
         self._access_token = access_token
@@ -503,7 +522,7 @@ class ChoreoChecker:
     async def check(self, text: str) -> Optional[Dict[str, Any]]:
         from synapse_pangea_chat.moderation import metrics
 
-        refusal = self._breaker.check()
+        refusal, ticket = self._breaker.check()
         if refusal is not None:
             # No HTTP call at all. Counted, because a shed check is a message
             # that went unmoderated and the count is the only thing that says
@@ -511,27 +530,58 @@ class ChoreoChecker:
             metrics.record_drop(refusal)
             return None
 
+        try:
+            return await self._check_admitted(text, ticket)
+        finally:
+            # Wrapping EVERYTHING after admission, reporting included. The
+            # half-open state admits exactly ONE probe and stays half-open
+            # until that probe reports; `release` covers the path where the
+            # caller is cancelled and never reports at all, which would
+            # otherwise hold the latch and refuse every later check as
+            # `breaker_probe_busy` for the life of the process. It is
+            # idempotent and a no-op once an outcome has been recorded - but
+            # a `finally` placed so that it ran BEFORE the outcome was
+            # recorded would reopen the breaker on every successful probe and
+            # make the report itself stale. That is not hypothetical; it is
+            # what the first version of this function did.
+            self._breaker.release(ticket)
+
+    async def _check_admitted(
+        self, text: str, ticket: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        from synapse_pangea_chat.moderation import metrics
+
         started = self._clock.time()
         try:
-            result = await moderate_text(
-                text,
-                base_url=self._base_url,
-                access_token=self._access_token,
-                http_client=self._http_client,
-                clock=self._clock,
-                timeout_seconds=self._timeout_seconds,
-            )
+            try:
+                result = await moderate_text(
+                    text,
+                    base_url=self._base_url,
+                    access_token=self._access_token,
+                    agent=self._agent,
+                    clock=self._clock,
+                    timeout_seconds=self._timeout_seconds,
+                )
+            finally:
+                metrics.TIER2_LATENCY.observe(max(self._clock.time() - started, 0.0))
+        except defer.CancelledError:
+            # NOT caught, and it is the one exception that is not. Everything
+            # else here is a moderation failure to be absorbed; a cancellation
+            # is somebody asking the WORKER running this check to stop, and
+            # swallowing it leaves that worker alive behind a Deferred that
+            # has already fired - which is how a pool of eight quietly becomes
+            # a pool of twelve. The `finally` above still hands the probe
+            # permit back, so the breaker does not wedge either.
+            raise
         except Exception as exc:
             # `Exception`, not `ModerationCheckError`, and the widening is the
             # point: whatever escapes this frame reaches
             # `run_as_background_process`, which calls `logger.exception` on
             # it - so an unmapped exception would be logged in full, with
             # whatever it was carrying, by Synapse rather than by us.
-            self._record_failure(exc)
+            self._record_failure(exc, ticket)
             metrics.record_check("error")
             return None
-        finally:
-            metrics.TIER2_LATENCY.observe(max(self._clock.time() - started, 0.0))
 
         if result.get("evaluated") is False:
             # The documented shape of a provider outage. The choreo handler
@@ -543,7 +593,7 @@ class ChoreoChecker:
             # does not send the key at all is an older endpoint, not a failing
             # one, and inventing failures from a missing field would open the
             # breaker against a service that was working.
-            self._breaker.record_failure()
+            self._breaker.record_failure(ticket)
             metrics.record_check("unevaluated")
             logger.warning(
                 "tier2 moderation endpoint returned no evaluation; "
@@ -551,11 +601,11 @@ class ChoreoChecker:
             )
             return None
 
-        self._breaker.record_success()
+        self._breaker.record_success(ticket)
         metrics.record_check("flagged" if result.get("flagged") else "clean")
         return result
 
-    def _record_failure(self, exc: BaseException) -> None:
+    def _record_failure(self, exc: BaseException, ticket: Optional[int]) -> None:
         kind = failure_kind(exc)
         if kind == KIND_CONFIG_ERROR:
             # Never opens the breaker. A bad or expired service-account token
@@ -563,14 +613,14 @@ class ChoreoChecker:
             # disable moderation until a human noticed, with the breaker's own
             # gauge blaming the provider. Logged at most once per cooldown so
             # the signal is steady rather than one ERROR per message.
-            if self._breaker.record_config_error():
+            if self._breaker.record_config_error(ticket):
                 logger.error(
                     "tier2 moderation is rejected by the endpoint (%s); check "
                     "moderation.choreo_access_token and choreo_base_url",
                     kind,
                 )
             return
-        self._breaker.record_failure()
+        self._breaker.record_failure(ticket)
         logger.warning(
             "tier2 moderation check unavailable (%s/%s)",
             kind or "unmapped",

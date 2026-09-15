@@ -18,6 +18,7 @@ carry that:
 
 import logging
 import unittest
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Tuple
 from unittest.mock import patch
 
@@ -111,7 +112,9 @@ class FakeClock:
 
     def __init__(self) -> None:
         self._now = 1000.0
-        self._pending: List[Tuple[float, int, Callable[..., Any], tuple, dict]] = []
+        self._pending: List[
+            Tuple[float, int, Callable[..., Any], tuple, dict, bool]
+        ] = []
         self._seq = 0
         self.shutdown = False
         self.looping: List[Tuple[Callable[..., Any], float, tuple]] = []
@@ -128,9 +131,21 @@ class FakeClock:
     ) -> _FakeDelayedCall:
         if self.shutdown:
             raise Exception("Cannot start delayed call. Clock has been shutdown")
+        return self._schedule(delay, callback, args, kwargs, wrapped=True)
+
+    def reactor_call_later(
+        self, delay: float, callback: Callable[..., Any], *args: Any
+    ) -> "_FakeDelayedCall":
+        """`reactor.callLater`, which does NOT wrap the callback in a
+        logcontext the way `synapse.util.Clock.call_later` does."""
+        return self._schedule(delay, callback, args, {}, wrapped=False)
+
+    def _schedule(
+        self, delay: Any, callback: Any, args: Any, kwargs: Any, *, wrapped: bool
+    ) -> "_FakeDelayedCall":
         self._seq += 1
         when = self._now + float(delay)
-        self._pending.append((when, self._seq, callback, args, kwargs))
+        self._pending.append((when, self._seq, callback, args, kwargs, wrapped))
         return _FakeDelayedCall(self, when, self._seq)
 
     def looping_call(
@@ -152,8 +167,11 @@ class FakeClock:
             due.sort(key=lambda entry: (entry[0], entry[1]))
             entry = due[0]
             self._pending.remove(entry)
-            _when, _seq, callback, args, kwargs = entry
-            _fire_as_synapse_would(callback, args, kwargs)
+            _when, _seq, callback, args, kwargs, wrapped = entry
+            if wrapped:
+                _fire_as_synapse_would(callback, args, kwargs)
+            else:
+                callback(*args, **kwargs)
             fired += 1
         return fired
 
@@ -245,96 +263,195 @@ class BreakerTestCase(unittest.TestCase):
             max_cooldown_seconds=120.0,
         )
 
+    # Every report has to carry the ticket its admission handed out, so the
+    # helpers below keep the last one. A test that passed the wrong ticket
+    # would exercise the stale-report path by accident and prove nothing about
+    # the state machine.
+    def _admit(self) -> Any:
+        refusal, ticket = self.breaker.check()
+        self._ticket = ticket
+        return refusal
+
+    def _refusal(self) -> Any:
+        refusal, _ticket = self.breaker.check()
+        return refusal
+
+    def _fail(self) -> None:
+        self.breaker.record_failure(self._current_ticket())
+
+    def _succeed(self) -> None:
+        self.breaker.record_success(self._current_ticket())
+
+    def _config_error(self) -> bool:
+        return self.breaker.record_config_error(self._current_ticket())
+
+    def _current_ticket(self) -> Any:
+        # A report always follows its own admission, so the ticket a test
+        # reports with is the breaker's current one unless the test has gone
+        # out of its way to keep an old one.
+        ticket = getattr(self, "_ticket", None)
+        return ticket if ticket is not None else self.breaker._generation
+
     def test_closed_admits_and_stays_closed_under_the_threshold(self) -> None:
-        self.assertIsNone(self.breaker.check())
-        self.breaker.record_failure()
-        self.breaker.record_failure()
+        self.assertIsNone(self._admit())
+        self._fail()
+        self._fail()
         self.assertEqual(self.breaker.state, BREAKER_CLOSED)
-        self.assertIsNone(self.breaker.check())
+        self.assertIsNone(self._admit())
 
     def test_a_success_resets_the_consecutive_count(self) -> None:
-        self.breaker.record_failure()
-        self.breaker.record_failure()
-        self.breaker.record_success()
-        self.breaker.record_failure()
-        self.breaker.record_failure()
+        self._fail()
+        self._fail()
+        self._succeed()
+        self._fail()
+        self._fail()
         self.assertEqual(self.breaker.state, BREAKER_CLOSED)
 
     def test_consecutive_failures_open_it_and_it_then_refuses(self) -> None:
         for _ in range(3):
-            self.breaker.record_failure()
+            self._fail()
         self.assertEqual(self.breaker.state, BREAKER_OPEN)
-        self.assertEqual(self.breaker.check(), "breaker_open")
+        self.assertEqual(self._refusal(), "breaker_open")
 
     def test_cooldown_admits_exactly_one_probe(self) -> None:
         for _ in range(3):
-            self.breaker.record_failure()
+            self._fail()
         self.clock.advance(29.0)
-        self.assertEqual(self.breaker.check(), "breaker_open")
+        self.assertEqual(self._refusal(), "breaker_open")
         self.clock.advance(2.0)
-        self.assertIsNone(self.breaker.check())
+        self.assertIsNone(self._admit())
         self.assertEqual(self.breaker.state, BREAKER_HALF_OPEN)
         # The latch: a second job arriving while the probe is outstanding is
         # refused rather than becoming a second probe.
-        self.assertEqual(self.breaker.check(), "breaker_probe_busy")
+        self.assertEqual(self._refusal(), "breaker_probe_busy")
 
     def test_probe_success_closes_and_resets_the_cooldown(self) -> None:
         for _ in range(3):
-            self.breaker.record_failure()
+            self._fail()
         self.clock.advance(31.0)
-        self.assertIsNone(self.breaker.check())
-        self.breaker.record_success()
+        self.assertIsNone(self._admit())
+        self._succeed()
         self.assertEqual(self.breaker.state, BREAKER_CLOSED)
-        self.assertIsNone(self.breaker.check())
+        self.assertIsNone(self._admit())
         # Cooldown is back to the base value, not the doubled one.
         for _ in range(3):
-            self.breaker.record_failure()
+            self._fail()
         self.clock.advance(31.0)
-        self.assertIsNone(self.breaker.check())
+        self.assertIsNone(self._admit())
 
     def test_probe_failure_reopens_with_a_doubled_cooldown(self) -> None:
         for _ in range(3):
-            self.breaker.record_failure()
+            self._fail()
         self.clock.advance(31.0)
-        self.assertIsNone(self.breaker.check())
-        self.breaker.record_failure()
+        self.assertIsNone(self._admit())
+        self._fail()
         self.assertEqual(self.breaker.state, BREAKER_OPEN)
         # 60s now, not 30s: at 31s past the reopen it is still refusing.
         self.clock.advance(31.0)
-        self.assertEqual(self.breaker.check(), "breaker_open")
+        self.assertEqual(self._refusal(), "breaker_open")
         self.clock.advance(30.0)
-        self.assertIsNone(self.breaker.check())
+        self.assertIsNone(self._admit())
 
     def test_cooldown_is_capped(self) -> None:
         for _ in range(3):
-            self.breaker.record_failure()
+            self._fail()
         for _ in range(8):
             self.clock.advance(1000.0)
-            self.assertIsNone(self.breaker.check())
-            self.breaker.record_failure()
+            self.assertIsNone(self._admit())
+            self._fail()
         self.clock.advance(121.0)
-        self.assertIsNone(self.breaker.check(), "cooldown grew past its cap")
+        self.assertIsNone(self._admit(), "cooldown grew past its cap")
 
     def test_config_error_never_opens_it(self) -> None:
         for _ in range(50):
-            self.breaker.record_config_error()
+            self._config_error()
         self.assertEqual(self.breaker.state, BREAKER_CLOSED)
-        self.assertIsNone(self.breaker.check())
+        self.assertIsNone(self._admit())
 
     def test_config_error_logging_is_rate_limited_to_one_per_cooldown(self) -> None:
-        self.assertTrue(self.breaker.record_config_error())
-        self.assertFalse(self.breaker.record_config_error())
+        self.assertTrue(self._config_error())
+        self.assertFalse(self._config_error())
         self.clock.advance(31.0)
-        self.assertTrue(self.breaker.record_config_error())
+        self.assertTrue(self._config_error())
 
     def test_a_config_error_does_not_reset_a_real_failure_run(self) -> None:
         # A bad token arriving between two genuine outages must neither open
         # the breaker nor paper over the outage by clearing the count.
-        self.breaker.record_failure()
-        self.breaker.record_failure()
-        self.breaker.record_config_error()
-        self.breaker.record_failure()
+        self._fail()
+        self._fail()
+        self._config_error()
+        self._fail()
         self.assertEqual(self.breaker.state, BREAKER_OPEN)
+
+    def test_a_config_error_on_the_probe_does_not_wedge_half_open(self) -> None:
+        # The probe latch is released by whichever outcome the caller reports.
+        # A config error is a third outcome - it says nothing about the
+        # provider, so it must not count as a probe result - and a version
+        # that simply did not touch the latch left the breaker in HALF_OPEN
+        # refusing every later check as `breaker_probe_busy` FOREVER, with
+        # fixing the token no help at all.
+        for _ in range(3):
+            self._fail()
+        self.clock.advance(31.0)
+        self.assertIsNone(self._admit())
+        self.assertEqual(self.breaker.state, BREAKER_HALF_OPEN)
+        self._config_error()
+        self.assertEqual(self.breaker.state, BREAKER_OPEN)
+        # And with the SAME cooldown, not a doubled one: nothing was learned
+        # about the provider, so there is nothing to back off from.
+        self.clock.advance(31.0)
+        self.assertIsNone(self._admit())
+
+    def test_a_released_probe_can_be_retried(self) -> None:
+        # The cancellation path: admitted as the probe, then never reports.
+        for _ in range(3):
+            self._fail()
+        self.clock.advance(31.0)
+        _refusal, ticket = self.breaker.check()
+        self.assertEqual(self.breaker.state, BREAKER_HALF_OPEN)
+        self.breaker.release(ticket)
+        self.assertEqual(self.breaker.state, BREAKER_OPEN)
+        self.clock.advance(31.0)
+        self.assertIsNone(self._admit(), "the probe permit was never given back")
+
+    def test_release_after_an_outcome_changes_nothing(self) -> None:
+        for _ in range(3):
+            self._fail()
+        self.clock.advance(31.0)
+        _refusal, ticket = self.breaker.check()
+        self.breaker.record_success(ticket)
+        self.assertEqual(self.breaker.state, BREAKER_CLOSED)
+        self.breaker.release(ticket)
+        self.assertEqual(
+            self.breaker.state,
+            BREAKER_CLOSED,
+            "release reopened a breaker that had already recovered",
+        )
+
+    def test_a_stale_success_cannot_close_the_breaker(self) -> None:
+        # Several requests are in flight at once while CLOSED. Enough of them
+        # fail to open the breaker; a straggler admitted BEFORE any of that
+        # then comes back successful. Letting it close the breaker skips the
+        # cooldown and the probe entirely, so the breaker flaps instead of
+        # shedding.
+        _refusal, stale = self.breaker.check()
+        for _ in range(3):
+            self._fail()
+        self.assertEqual(self.breaker.state, BREAKER_OPEN)
+        self.breaker.record_success(stale)
+        self.assertEqual(self.breaker.state, BREAKER_OPEN)
+        self.assertEqual(self._refusal(), "breaker_open")
+
+    def test_a_stale_failure_does_not_extend_the_cooldown(self) -> None:
+        # The other half: the failures that opened the breaker are already
+        # counted, and counting a straggler from the same outage again would
+        # double the cooldown for a probe that never ran.
+        _refusal, stale = self.breaker.check()
+        for _ in range(3):
+            self._fail()
+        self.breaker.record_failure(stale)
+        self.clock.advance(31.0)
+        self.assertIsNone(self._admit(), "the cooldown was extended by a straggler")
 
     def test_state_is_published_as_a_gauge(self) -> None:
         reader = MetricReader()
@@ -343,7 +460,7 @@ class BreakerTestCase(unittest.TestCase):
             float(mod_metrics.BREAKER_STATE_VALUES[BREAKER_CLOSED]),
         )
         for _ in range(3):
-            self.breaker.record_failure()
+            self._fail()
         self.assertEqual(
             reader.value("pangea_moderation_tier2_breaker_state"),
             float(mod_metrics.BREAKER_STATE_VALUES[BREAKER_OPEN]),
@@ -433,8 +550,15 @@ class _Hs:
 
     hostname = "example.org"
 
-    def __init__(self) -> None:
+    def __init__(self, clock: "FakeClock" = None) -> None:  # type: ignore[assignment]
         self.shutdown_handlers: List[Any] = []
+        self.clock = clock
+
+    def get_reactor(self) -> Any:
+        from types import SimpleNamespace
+
+        assert self.clock is not None
+        return SimpleNamespace(callLater=self.clock.reactor_call_later)
 
     def register_async_shutdown_handler(
         self, *, phase: str, eventType: str, shutdown_func: Any
@@ -451,6 +575,7 @@ class _Handler:
         self.finished: List[str] = []
         self.gates: Dict[str, "defer.Deferred[None]"] = {}
         self.hold = False
+        self.swallow_cancel = False
         self.raise_for: set = set()
 
     async def __call__(self, job: Any) -> None:
@@ -458,7 +583,17 @@ class _Handler:
         if self.hold:
             gate: "defer.Deferred[None]" = defer.Deferred()
             self.gates[job.event_id] = gate
-            await make_deferred_yieldable(gate)
+            if self.swallow_cancel:
+                # What a handler catching `Exception` does, because twisted's
+                # `CancelledError` IS an `Exception`.
+                try:
+                    await make_deferred_yieldable(gate)
+                except Exception:
+                    gate2: "defer.Deferred[None]" = defer.Deferred()
+                    self.gates[job.event_id] = gate2
+                    await make_deferred_yieldable(gate2)
+            else:
+                await make_deferred_yieldable(gate)
         if job.event_id in self.raise_for:
             self.finished.append(job.event_id)
             raise RuntimeError("handler blew up")
@@ -481,7 +616,7 @@ class DispatcherTestCase(unittest.TestCase):
 
         self.ModerationJob = ModerationJob
         self.clock = FakeClock()
-        self.hs = _Hs()
+        self.hs = _Hs(self.clock)
         self.handler = _Handler()
         self.reader = MetricReader()
         self.watch = _LogcontextWatch()
@@ -778,10 +913,13 @@ class DispatcherTestCase(unittest.TestCase):
             "abandoned work was not counted",
         )
 
-    def test_shutdown_returns_even_with_a_dead_clock(self) -> None:
-        # The drain deadline is itself a `call_later`, and the clock may
-        # already be down by the time a "before shutdown" trigger runs. A
-        # drain that depended on scheduling one more call would hang there.
+    def test_shutdown_survives_the_clock_being_shut_down(self) -> None:
+        # `HomeServer.shutdown()` starts its async shutdown handlers WITHOUT
+        # awaiting them and then calls `Clock.shutdown()`, which cancels every
+        # delayed call the Clock is tracking. A drain deadline taken from the
+        # Clock would be cancelled out from under the drain, leaving it parked
+        # and `_running` populated for the life of the process. The deadline
+        # is taken from the reactor for exactly this reason.
         self.dispatcher.start()
         self.handler.hold = True
         self._drain()
@@ -789,7 +927,135 @@ class DispatcherTestCase(unittest.TestCase):
         self._drain()
         self.clock.shutdown = True
         drained = start_worker(self.dispatcher.shutdown)
-        self.assertTrue(drained.called)
+        self._drain()
+        self.assertFalse(drained.called)
+        self.clock.advance(6.0)
+        self.assertTrue(drained.called, "the drain outlived its own deadline")
+
+    def test_shutdown_returns_when_no_timer_can_be_armed_at_all(self) -> None:
+        self.dispatcher.start()
+        self.handler.hold = True
+        self._drain()
+        self.dispatcher.enqueue(self._job("$stuck"))
+        self._drain()
+
+        def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("reactor is stopping")
+
+        self.hs.get_reactor = lambda: SimpleNamespace(callLater=_refuse)  # type: ignore[method-assign]
+        drained = start_worker(self.dispatcher.shutdown)
+        self.assertTrue(
+            drained.called, "an unbounded wait is worse than an abandoned one"
+        )
+
+    def test_abandoned_work_is_counted_once_and_then_forgotten(self) -> None:
+        # Abandoning has to clear the accounting as well as report it. Leaving
+        # the ids in `_running` makes a second shutdown wait on jobs that have
+        # already been written off, and count them a second time.
+        self.dispatcher.start()
+        self.handler.hold = True
+        self._drain()
+        self.dispatcher.enqueue(self._job("$stuck"))
+        self._drain()
+        self.reader.snapshot(
+            "pangea_moderation_tier2_dropped_total", cause="drain_timeout"
+        )
+        start_worker(self.dispatcher.shutdown)
+        self._drain()
+        self.clock.advance(6.0)
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="drain_timeout"
+            ),
+            1.0,
+        )
+        self.assertEqual(self.dispatcher.inflight, 0)
+        second = start_worker(self.dispatcher.shutdown)
+        self.clock.advance(6.0)
+        self.assertTrue(second.called)
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="drain_timeout"
+            ),
+            1.0,
+            "the same abandoned job was counted twice",
+        )
+
+    def test_a_cancelled_shutdown_does_not_leave_its_waiter_behind(self) -> None:
+        self.dispatcher.start()
+        self.handler.hold = True
+        self._drain()
+        self.dispatcher.enqueue(self._job("$stuck"))
+        self._drain()
+        for _ in range(5):
+            drained = start_worker(self.dispatcher.shutdown)
+            self._drain()
+            self.assertFalse(drained.called)
+            drained.cancel()
+        self.assertEqual(len(self.dispatcher._drain_waiters), 0)
+
+    def test_a_handler_that_swallows_cancellation_does_not_grow_the_pool(
+        self,
+    ) -> None:
+        # The supervisor's liveness signal has to be the worker's own flag and
+        # not its Deferred. A handler that catches `Exception` catches
+        # twisted's `CancelledError` too, so the coroutine can carry on and
+        # park again while its Deferred is already `called` - and a supervisor
+        # reading the Deferred would start a replacement every interval, for
+        # ever, from a pool that is not actually short of anything.
+        self.dispatcher.start()
+        self.handler.hold = True
+        self.handler.swallow_cancel = True
+        self._drain()
+        self.dispatcher.enqueue(self._job("$victim"))
+        self._drain()
+        self.dispatcher._kill_worker_for_test(0)
+        self._drain()
+        self.handler.release_all()
+        self._drain()
+        # Measured through the RESTART COUNTER, not through `live_workers`.
+        # `live_workers` is derived from the same liveness signal the
+        # supervisor uses, so asserting on it would pass whichever signal the
+        # supervisor read - including the wrong one. The counter is
+        # independent: it says how many replacements were actually started.
+        self.reader.snapshot("pangea_moderation_tier2_workers_restarted_total")
+        for _ in range(5):
+            self.clock.fire_looping()
+            self._drain()
+        self.assertEqual(
+            self.reader.delta("pangea_moderation_tier2_workers_restarted_total"),
+            0.0,
+            "the supervisor started replacements for a worker that was still "
+            "running, so the pool grows by one every interval",
+        )
+
+    def test_a_worker_cancelled_mid_job_is_replaced_and_not_duplicated(self) -> None:
+        # `_run` catches `Exception`, and twisted's `CancelledError` IS an
+        # `Exception`. Swallowing it would leave the coroutine running behind
+        # a Deferred that has already fired, so a supervisor reading the
+        # Deferred would start a replacement and the pool would grow by one
+        # every time - six live consumers from a pool of one.
+        self.dispatcher.start()
+        self.handler.hold = True
+        self._drain()
+        self.dispatcher.enqueue(self._job("$victim"))
+        self._drain()
+        self.assertEqual(self.handler.started, ["$victim"])
+        self.assertEqual(self.dispatcher.live_workers, 2)
+        self.dispatcher._kill_worker_for_test(0)
+        self._drain()
+        self.assertEqual(
+            self.dispatcher.live_workers,
+            1,
+            "a cancelled worker carried on, so the supervisor cannot see it",
+        )
+        self.assertEqual(self.dispatcher.inflight, 0, "the cancelled job leaked")
+        for _ in range(4):
+            self.clock.fire_looping()
+            self._drain()
+        self.assertEqual(
+            self.dispatcher.live_workers, 2, "the pool grew or failed to recover"
+        )
 
     def test_shutdown_is_idempotent(self) -> None:
         self.dispatcher.start()
@@ -847,7 +1113,7 @@ class CheckerTestCase(unittest.TestCase):
         )
         self.reader = MetricReader()
         self.checker = ChoreoChecker(
-            http_client=object(),
+            agent=object(),
             clock=self.clock,
             base_url="http://choreo.invalid",
             access_token="syt_x",
@@ -1027,9 +1293,44 @@ class CheckerTestCase(unittest.TestCase):
             RuntimeError("nobody predicted this"),
         ):
             with self.subTest(error=type(error).__name__):
-                self.breaker.record_success()
+                # Reset between subtests through the same door production
+                # uses: admit, then report success on that admission.
+                _refusal, ticket = self.breaker.check()
+                self.breaker.record_success(ticket)
                 self.client.responses = [error]
                 self.assertIsNone(self._check())
+
+    def test_a_cancelled_check_gives_the_probe_permit_back(self) -> None:
+        # The half-open probe is a single permit, and the one path that does
+        # not report an outcome is cancellation. Without the release the
+        # breaker sits in HALF_OPEN refusing every later check as
+        # `breaker_probe_busy` for the life of the process, and fixing
+        # whatever broke does not recover it.
+        self._fail(ModerationCheckError("down", KIND_SERVER_ERROR), 3)
+        for _ in range(3):
+            self._check()
+        self.clock.advance(31.0)
+        held: "defer.Deferred[Any]" = defer.Deferred()
+
+        async def holding(*_args: Any, **_kwargs: Any) -> Any:
+            return await make_deferred_yieldable(held)
+
+        with patch(
+            "synapse_pangea_chat.moderation.choreo_client.moderate_text", holding
+        ):
+            probe = defer.ensureDeferred(self.checker.check("a"))
+            outcome: List[Any] = []
+            probe.addBoth(outcome.append)
+            self.assertEqual(self.breaker.state, BREAKER_HALF_OPEN)
+            probe.cancel()
+            self.assertEqual(len(outcome), 1)
+            # And the cancellation is NOT absorbed: it has to reach the worker
+            # that is being stopped.
+            self.assertIsInstance(outcome[0], Failure)
+            outcome[0].trap(defer.CancelledError)
+        self.assertEqual(self.breaker.state, BREAKER_OPEN)
+        self.clock.advance(31.0)
+        self.assertIsNotNone(self._check(), "the probe permit was never given back")
 
     def test_the_latency_of_every_call_is_observed(self) -> None:
         self.reader.snapshot("pangea_moderation_tier2_latency_seconds_count")

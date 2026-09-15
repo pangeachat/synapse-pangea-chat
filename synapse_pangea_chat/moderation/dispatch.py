@@ -125,12 +125,26 @@ class Tier2Dispatcher:
         self._queue: Deque[ModerationJob] = deque()
         self._waiters: List["defer.Deferred[None]"] = []
         self._workers: List[Optional["defer.Deferred[Any]"]] = [None] * workers
+        # The AUTHORITATIVE liveness signal, set by the worker coroutine
+        # itself and cleared in its own `finally`.
+        #
+        # The obvious signal - "has the worker's background-process Deferred
+        # fired" - is wrong, and wrong in the direction that does damage.
+        # Cancelling that Deferred mid-job raises `CancelledError` inside the
+        # coroutine; anything that catches `Exception` catches it too, so the
+        # coroutine can carry on and park again while its Deferred is already
+        # `called`. A supervisor reading the Deferred then sees a dead worker,
+        # starts a replacement, and the pool grows by one every time it
+        # happens - with `workers=1`, six live consumers.
+        self._worker_alive: List[bool] = [False] * workers
         self._inflight: Set[str] = set()
         self._running: Set[str] = set()
         self._stopping = False
         self._started = False
+        self._drained = False
         self._wakeup_scheduled = False
         self._drain_waiters: List["defer.Deferred[None]"] = []
+        self._drain_deadline: Any = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -160,6 +174,7 @@ class Tier2Dispatcher:
             )
 
     def _start_worker(self, index: int) -> None:
+        self._worker_alive[index] = True
         self._workers[index] = run_as_background_process(
             *background_process_args(
                 self._hs, "pangea_moderation_tier2_worker", self._worker
@@ -280,6 +295,14 @@ class Tier2Dispatcher:
     # ------------------------------------------------------------------
 
     async def _worker(self, index: int) -> None:
+        try:
+            await self._worker_loop(index)
+        finally:
+            # Whatever ends this coroutine - a return, an exception, a
+            # cancellation - the slot is free from here and only from here.
+            self._worker_alive[index] = False
+
+    async def _worker_loop(self, index: int) -> None:
         while not self._stopping:
             job = self._take()
             if job is None:
@@ -314,6 +337,12 @@ class Tier2Dispatcher:
         metrics.TIER2_INFLIGHT.set(len(self._running))
         try:
             await self._handler(job)
+        except defer.CancelledError:
+            # NOT caught. Cancellation means somebody wants this worker to
+            # stop, and swallowing it leaves a consumer running behind a
+            # Deferred that has already fired - which is how the pool grows
+            # without bound. The `finally` below still releases the job.
+            raise
         except Exception as exc:
             # silent-ok: fail-open by contract, and the loop has to survive.
             # A worker that dies leaves the pool one short for the life of
@@ -347,8 +376,8 @@ class Tier2Dispatcher:
         try:
             if self._stopping:
                 return
-            for index, worker in enumerate(self._workers):
-                if worker is not None and not worker.called:
+            for index, alive in enumerate(self._worker_alive):
+                if alive:
                     continue
                 logger.warning("restarting dead tier2 moderation worker %d", index)
                 metrics.TIER2_WORKERS_RESTARTED.inc()
@@ -373,9 +402,7 @@ class Tier2Dispatcher:
 
     @property
     def live_workers(self) -> int:
-        return sum(
-            1 for worker in self._workers if worker is not None and not worker.called
-        )
+        return sum(1 for alive in self._worker_alive if alive)
 
     def _kill_worker_for_test(self, index: int) -> None:
         """Stop one worker the way a crash would: silently.
@@ -397,11 +424,21 @@ class Tier2Dispatcher:
     async def shutdown(self) -> None:
         """Stop accepting, count what is lost, wait briefly for the rest.
 
-        Bounded on every path. The reactor does not reliably wait for this -
-        Synapse 1.159 launches a registered async shutdown handler and
-        discards the Deferred - so a drain that could block would block
-        nothing useful, while a drain that could hang would hang a test
-        harness and, on the fallback registration path, the reactor itself.
+        **Bounded on every path, and the bound does not depend on anything
+        that can be taken away.** The deadline is a timer taken from the
+        REACTOR, not from `synapse.util.Clock`: `HomeServer.shutdown()` starts
+        its async shutdown handlers without awaiting them and then calls
+        `Clock.shutdown()`, which cancels every delayed call the clock is
+        tracking - including, if we used it, the one that would end this wait.
+        A stalled job would then leave this coroutine parked and `_running`
+        populated for the life of the process.
+
+        **The reactor does not reliably wait for this either.** Synapse
+        1.159's `add_system_event_trigger` launches the callback with
+        `run_in_background` and discards the Deferred, so on that path the
+        drain is advisory. Everything that must happen regardless - refusing
+        new work, counting what was queued, waking parked workers - happens
+        synchronously, before the first `await`.
         """
         self._stopping = True
 
@@ -422,25 +459,50 @@ class Tier2Dispatcher:
 
         self._wake_all()
 
-        if not self._running:
+        if self._drained or not self._running:
+            # Nothing to wait for, or a previous drain already accounted for
+            # everything. A second call must not count the same jobs again.
+            self._drained = True
             return
 
         waiter: "defer.Deferred[None]" = defer.Deferred()
         self._drain_waiters.append(waiter)
-        try:
-            timeout: Any = self._clock.call_later(
-                _SecondsInterval(self._drain_timeout), self._abandon_drain
-            )
-        except Exception:
-            # The clock is already down, so there is no way to bound a wait -
-            # and an unbounded one is worse than an abandoned one.
-            self._abandon_drain()
+        self._arm_drain_deadline()
+        if self._drained:
+            # The deadline could not be armed at all, so the drain was
+            # abandoned synchronously and the waiter has already fired.
             return
         try:
             await make_deferred_yieldable(waiter)
         finally:
-            if timeout.active():
-                timeout.cancel()
+            # Removed on EVERY exit, cancellation included. A caller that
+            # cancels its own shutdown would otherwise leave its waiter on the
+            # list for as long as the stalled job lasts, one per attempt.
+            if waiter in self._drain_waiters:
+                self._drain_waiters.remove(waiter)
+
+    def _arm_drain_deadline(self) -> None:
+        if self._drain_deadline is not None:
+            return
+        reactor = getattr(self._hs, "get_reactor", None)
+        if reactor is None:
+            self._abandon_drain()
+            return
+        try:
+            self._drain_deadline = reactor().callLater(
+                self._drain_timeout, self._on_drain_deadline
+            )
+        except Exception:
+            # The reactor is already stopping, so there is no way to bound a
+            # wait - and an unbounded one is worse than an abandoned one.
+            self._abandon_drain()
+
+    def _on_drain_deadline(self) -> None:
+        # Straight from the reactor, so nothing has wrapped this in a
+        # logcontext; `_finish_drain` resumes the waiting coroutine and does
+        # its own wrapping.
+        self._drain_deadline = None
+        self._abandon_drain()
 
     def _notify_drained(self) -> None:
         if not self._drain_waiters or self._running:
@@ -448,18 +510,32 @@ class Tier2Dispatcher:
         self._finish_drain()
 
     def _abandon_drain(self) -> None:
-        abandoned = len(self._running)
+        abandoned = sorted(self._running)
         if abandoned:
-            metrics.record_drop("drain_timeout", abandoned)
+            metrics.record_drop("drain_timeout", len(abandoned))
             logger.warning(
                 "tier2 moderation abandoned %d in-flight checks at the drain "
                 "deadline",
-                abandoned,
+                len(abandoned),
             )
+            # Forgotten as well as counted. The jobs themselves keep running -
+            # nothing here can stop a coroutine mid-`await` - but they have
+            # been accounted for, and leaving their ids in `_running` would
+            # make a second shutdown wait on them again and count them again.
+            for event_id in abandoned:
+                self._running.discard(event_id)
+                self._inflight.discard(event_id)
+            metrics.TIER2_INFLIGHT.set(len(self._running))
         self._finish_drain()
 
     def _finish_drain(self) -> None:
+        self._drained = True
+        if self._drain_deadline is not None and self._drain_deadline.active():
+            self._drain_deadline.cancel()
+        self._drain_deadline = None
         waiters, self._drain_waiters = self._drain_waiters, []
         for waiter in waiters:
+            if waiter.called:
+                continue
             with PreserveLoggingContext():
                 waiter.callback(None)

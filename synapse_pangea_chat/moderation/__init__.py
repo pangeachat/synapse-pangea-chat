@@ -423,7 +423,11 @@ class ChatModeration:
             max_cooldown_seconds=config.moderation_tier2_breaker_max_cooldown_seconds,
         )
         self._checker = ChoreoChecker(
-            http_client=self._api.http_client,
+            # `.agent`, not the client itself - see `choreo_client`'s module
+            # docstring for the three properties of `SimpleHttpClient`'s own
+            # request methods that rule them out. The agent is the shared,
+            # pooled, proxy-aware one either way.
+            agent=self._api.http_client.agent,
             clock=self._clock,
             base_url=config.moderation_choreo_base_url,
             access_token=config.moderation_choreo_access_token,

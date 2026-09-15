@@ -28,14 +28,16 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 from synapse.api.errors import Codes
 from synapse.events import EventBase
-from synapse.http.client import SimpleHttpClient
-from synapse.logging.context import make_deferred_yieldable
+from synapse.logging.context import LoggingContext, PreserveLoggingContext
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import NOT_SPAM, ModuleApi
 from twisted.internet import defer
+from twisted.internet.error import ConnectionAborted
 from twisted.internet.task import Clock
 from twisted.python.failure import Failure
+from twisted.web._newclient import ResponseNeverReceived
 from twisted.web.client import ResponseDone
+from twisted.web.iweb import IBodyProducer
 
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.config import PangeaChatConfig
@@ -1477,6 +1479,12 @@ class _SynapseClock:
     underneath and this is the two-method adapter over it. Nothing is faked
     here that the client relies on; a scheduled call is still a real
     `IDelayedCall` with `active()` and `cancel()`.
+
+    `call_later` fires its callback under a live `LoggingContext`, the way
+    `synapse.util.Clock.call_later` does rather than the way a bare reactor
+    does. That is not cosmetic: a deadline callback that resumes a coroutine
+    without `PreserveLoggingContext` leaks the context, and a fake that fired
+    bare would hide it.
     """
 
     def __init__(self, clock: Clock) -> None:
@@ -1486,87 +1494,160 @@ class _SynapseClock:
         return self.clock.seconds()
 
     def call_later(self, delay: Any, callback: Any, *args: Any, **kwargs: Any) -> Any:
-        return self.clock.callLater(float(delay), callback, *args, **kwargs)
+        def _wrapped(*inner: Any, **inner_kwargs: Any) -> None:
+            with PreserveLoggingContext(
+                LoggingContext(name="call_later", server_name="example.org")
+            ):
+                callback(*inner, **inner_kwargs)
+
+        return self.clock.callLater(float(delay), _wrapped, *args, **kwargs)
 
 
-class _HttpClientDouble:
-    """A `SimpleHttpClient` double bound to the installed signature.
+def _consume(body_producer: Any) -> bytes:
+    """The bytes the agent would put on the wire, and the interface check.
 
-    `inspect.signature(SimpleHttpClient.request).bind` is the point of it. A
-    double that accepts `**kwargs` would take a call with the argument names
-    of the Agent API this client was rewritten away from, and every test would
-    pass against a client that could not issue a single request in
-    production - which is the exact shape of the bug `_BackgroundProcessDouble`
-    was written for one layer up.
+    `IBodyProducer.providedBy` rather than a duck-type test: that is the
+    contract `Agent.request` actually requires, so passing a raw `BytesIO`
+    instead of a `FileBodyProducer` fails here as it would fail there.
+
+    The bytes are read from the producer's file rather than by driving
+    `startProducing`, which cooperates through the global reactor and would
+    leave a pending delayed call behind in a test with no reactor running.
+    """
+    if body_producer is None:
+        raise TypeError("Agent.request was given no body producer")
+    if not IBodyProducer.providedBy(body_producer):
+        raise TypeError(
+            "Agent.request wants an IBodyProducer, got "
+            f"{type(body_producer).__name__}"
+        )
+    source = body_producer._inputFile
+    position = source.tell()
+    try:
+        source.seek(0)
+        return bytes(source.read())
+    finally:
+        source.seek(position)
+
+
+class _LogcontextLeakWatch(logging.Handler):
+    """Collects Synapse's own "you mishandled a logcontext" warnings.
+
+    The deadline paths fire from a reactor callback and resume a coroutine,
+    which is the handoff commit 33f7ead was written about. Asserting only on
+    the BEHAVIOUR of a timeout - that it errbacks, that it tears the
+    connection down - passes just as well while leaking, and the leak is what
+    kills Synapse's timers on 1.159.
     """
 
+    MARKERS = (
+        "Expected logging context",
+        "Background process re-entered without a proc",
+        "Looping call died",
+    )
+
     def __init__(self) -> None:
-        self.signature = inspect.signature(SimpleHttpClient.request)
-        self.requests: List[Dict[str, Any]] = []
-        self.sent_bodies: List[bytes] = []
+        super().__init__(level=logging.WARNING)
+        self.leaks: List[str] = []
+        self._loggers = [
+            logging.getLogger("synapse.logging.context"),
+            logging.getLogger("synapse.metrics.background_process_metrics"),
+        ]
 
-    def _record(self, args: Any, kwargs: Any) -> None:
-        bound = self.signature.bind(self, *args, **kwargs)
-        bound.apply_defaults()
-        arguments = dict(bound.arguments)
-        arguments.pop("self", None)
-        method = arguments["method"]
-        uri = arguments["uri"]
-        data = arguments["data"]
-        if not isinstance(method, str) or not isinstance(uri, str):
-            raise TypeError("SimpleHttpClient.request takes str method and uri")
-        # `request` does `BytesIO(data)`, so anything else is a TypeError
-        # there. Checked here so it is a TypeError here too.
-        if data is not None and not isinstance(data, bytes):
-            raise TypeError(
-                f"SimpleHttpClient.request wants bytes data, got "
-                f"{type(data).__name__}"
-            )
-        self.sent_bodies.append(data if data is not None else b"")
-        self.requests.append(arguments)
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        if any(marker in message for marker in self.MARKERS):
+            self.leaks.append(message)
+
+    def __enter__(self) -> "_LogcontextLeakWatch":
+        for logger in self._loggers:
+            logger.addHandler(self)
+            logger.setLevel(logging.WARNING)
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        for logger in self._loggers:
+            logger.removeHandler(self)
 
 
-class _FakeHttpClient(_HttpClientDouble):
-    """Returns a canned response, optionally after a delay on the clock."""
+class _FakeAgent:
+    """An `IAgent` double that checks the request it was handed.
+
+    An agent that accepts any arguments and returns a canned response tests
+    the response handling and nothing else: the method, the URI and the auth
+    header could all be wrong and every test would pass.
+
+    The Deferred it returns carries a CANCELLER that tears the connection
+    down, which is what twisted's own `Agent` gives and what
+    `SimpleHttpClient.request` does not - a double without one would let the
+    header-deadline test pass against a client that could never abort a
+    stalled connect.
+    """
 
     def __init__(
         self, response: "_FakeResponse", headers_after: Optional[float] = None
     ) -> None:
-        super().__init__()
         self.response = response
         self.headers_after = headers_after
+        self.requests: List[Tuple[bytes, bytes, Any, Any]] = []
+        self.sent_bodies: List[bytes] = []
         self.clock: Optional[Clock] = None
+        self.cancelled = False
 
-    async def request(self, *args: Any, **kwargs: Any) -> Any:
-        self._record(args, kwargs)
+    def request(
+        self, method: bytes, uri: bytes, headers: Any = None, bodyProducer: Any = None
+    ) -> Any:
+        if not isinstance(method, bytes) or not isinstance(uri, bytes):
+            raise TypeError("Agent.request takes bytes for method and uri")
+        # The producer is CONSUMED, the way a real agent consumes it. A double
+        # that only stores it cannot tell a `FileBodyProducer` from the
+        # `BytesIO` somebody passed by mistake, and never sees the payload -
+        # so the request JSON could be renamed and every client test would
+        # still pass.
+        self.sent_bodies.append(_consume(bodyProducer))
+        self.requests.append((method, uri, headers, bodyProducer))
         if self.headers_after is None:
-            return self.response
+            return defer.succeed(self.response)
         assert self.clock is not None
-        deferred: Any = defer.Deferred()
+
+        def _cancel(deferred: Any) -> None:
+            # What twisted's own HTTP client delivers when a request is
+            # aborted before its response: `ResponseNeverReceived`, NOT a bare
+            # `CancelledError`. The difference decides whether the deadline
+            # can be told apart from an ordinary connection failure, so a
+            # double that errbacked `CancelledError` would let a client that
+            # could not tell them apart pass.
+            self.cancelled = True
+            self.response.transport.aborted = True
+            deferred.errback(
+                ResponseNeverReceived([Failure(ConnectionAborted("aborted"))])
+            )
+
+        deferred: Any = defer.Deferred(_cancel)
         self.clock.callLater(self.headers_after, deferred.callback, self.response)
-        return await make_deferred_yieldable(deferred)
+        return deferred
 
 
-class _FailingHttpClient(_HttpClientDouble):
-    """A client whose request fails the way a transport failure does."""
+class _FailingAgent:
+    """An agent whose request fails the way a transport failure does."""
 
     def __init__(self, error: Exception) -> None:
-        super().__init__()
         self.error = error
+        self.requests: List[Any] = []
+        self.sent_bodies: List[bytes] = []
 
-    async def request(self, *args: Any, **kwargs: Any) -> Any:
-        self._record(args, kwargs)
+    def request(
+        self, method: bytes, uri: bytes, headers: Any = None, bodyProducer: Any = None
+    ) -> Any:
         # Raised from inside an ACTIVE `except` block, which is how twisted
         # delivers a transport failure: it resumes the awaiting coroutine from
         # within its own handler, so the original becomes our `__context__`
-        # whatever our own frame does. A failure built outside a handler never
-        # exercises that.
-        deferred: Any = defer.Deferred()
+        # whatever our own frame does. A `defer.fail` built outside a handler
+        # never exercises that.
         try:
             raise self.error
         except Exception:
-            deferred.errback()
-            return await make_deferred_yieldable(deferred)
+            return defer.fail()
 
 
 class _CapturingRecords(logging.Handler):
@@ -1584,26 +1665,6 @@ class _CapturingRecords(logging.Handler):
         self.seen.append(repr(record.args))
 
 
-class _FailingAgent:
-    """An agent whose request fails the way a transport failure does."""
-
-    def __init__(self, error: Exception) -> None:
-        self.error = error
-
-    def request(
-        self, method: bytes, uri: bytes, headers: Any = None, bodyProducer: Any = None
-    ) -> Any:
-        # Raised from inside an ACTIVE `except` block, which is how twisted
-        # delivers a transport failure: it resumes the awaiting coroutine from
-        # within its own handler, so the original becomes our `__context__`
-        # whatever our own frame does. A `defer.fail` built outside a handler
-        # never exercises that.
-        try:
-            raise self.error
-        except Exception:
-            return defer.fail()
-
-
 class TestChoreoClient(unittest.TestCase):
     """The transport, against a clock we control.
 
@@ -1613,19 +1674,85 @@ class TestChoreoClient(unittest.TestCase):
     of a scheduled timeout, which is the actual defect.
     """
 
-    def _call(self, http_client: Any, clock: Clock) -> Tuple[Any, List[Any]]:
+    def _call(self, agent: Any, clock: Clock) -> Tuple[Any, List[Any]]:
         deferred = defer.ensureDeferred(
             moderate_text(
                 "some text",
                 base_url="http://choreo.invalid",
                 access_token="syt_x",
-                http_client=http_client,
+                agent=agent,
                 clock=_SynapseClock(clock),
             )
         )
         results: List[Any] = []
         deferred.addBoth(results.append)
         return deferred, results
+
+    def _call_watched(self, agent: Any, clock: Clock) -> Tuple[Any, List[Any], Any]:
+        """`_call`, with Synapse's logcontext complaints collected."""
+        watch = _LogcontextLeakWatch()
+        with watch:
+            deferred, results = self._call(agent, clock)
+            return deferred, results, watch
+
+    def test_a_body_deadline_does_not_leak_its_reactor_context(self) -> None:
+        """The deadline fires from a `call_later` callback and resumes the
+        coroutine awaiting the body. Without `PreserveLoggingContext` around
+        the teardown the reactor is handed back whatever context the resumed
+        coroutine left set, and 1.159's `clock.py` reports it."""
+        clock = Clock()
+        agent = _FakeAgent(_FakeResponse())
+        watch = _LogcontextLeakWatch()
+        with watch:
+            _deferred, results = self._call(agent, clock)
+            clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        results[0].trap(ModerationCheckError)
+        self.assertEqual(watch.leaks, [], "the body deadline leaked a logcontext")
+
+    def test_a_header_deadline_does_not_leak_its_reactor_context(self) -> None:
+        clock = Clock()
+        agent = _FakeAgent(_FakeResponse(), headers_after=REQUEST_TIMEOUT_SECONDS * 10)
+        agent.clock = clock
+        watch = _LogcontextLeakWatch()
+        with watch:
+            _deferred, results = self._call(agent, clock)
+            clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        results[0].trap(ModerationCheckError)
+        self.assertEqual(watch.leaks, [], "the header deadline leaked a logcontext")
+
+    def test_a_header_deadline_aborts_the_connection(self) -> None:
+        """Headers that never arrive have to end the CONNECTION, not just our
+        wait. `SimpleHttpClient.request` cannot do this - it wraps the request
+        in a `timeout_deferred` whose Deferred has no canceller, so an outside
+        cancel stops at the wrapper and the socket stays up until Synapse's
+        own sixty-second timeout. Going to the agent directly is what buys
+        this, and this is the test that says so."""
+        clock = Clock()
+        agent = _FakeAgent(_FakeResponse(), headers_after=REQUEST_TIMEOUT_SECONDS * 10)
+        agent.clock = clock
+        _deferred, results = self._call(agent, clock)
+        self.assertEqual(results, [])
+        clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        self.assertEqual(len(results), 1)
+        error = results[0].value
+        self.assertIsInstance(error, ModerationCheckError)
+        self.assertTrue(agent.cancelled, "the connect was never cancelled")
+
+    def test_a_deadline_is_reported_as_a_timeout_not_a_transport_error(self) -> None:
+        """The breaker and the dashboards both read `kind`. Twisted's
+        exception for an aborted request says only that the response never
+        arrived; it cannot say that WE ended it, so the deadline records that
+        itself."""
+        for headers_after in (REQUEST_TIMEOUT_SECONDS * 10, None):
+            with self.subTest(stalls="headers" if headers_after else "body"):
+                clock = Clock()
+                agent = _FakeAgent(_FakeResponse(), headers_after=headers_after)
+                agent.clock = clock
+                _deferred, results = self._call(agent, clock)
+                clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+                error = results[0].value
+                self.assertIsInstance(error, ModerationCheckError)
+                self.assertEqual(error.kind, "timeout")
 
     def test_a_stalled_response_body_is_timed_out(self) -> None:
         """`agent.request`'s deferred fires when the RESPONSE HEADERS arrive,
@@ -1634,7 +1761,7 @@ class TestChoreoClient(unittest.TestCase):
         anywhere - the check never completes, never fails, and never logs, and
         they accumulate one per message."""
         clock = Clock()
-        agent = _FakeHttpClient(_FakeResponse())
+        agent = _FakeAgent(_FakeResponse())
         _deferred, results = self._call(agent, clock)
         self.assertEqual(results, [], "the body read should still be pending")
         self.assertTrue(clock.getDelayedCalls(), "no timeout was ever scheduled")
@@ -1652,9 +1779,7 @@ class TestChoreoClient(unittest.TestCase):
         expire at the same instant and the test cannot tell them apart.
         """
         clock = Clock()
-        agent = _FakeHttpClient(
-            _FakeResponse(), headers_after=REQUEST_TIMEOUT_SECONDS - 2
-        )
+        agent = _FakeAgent(_FakeResponse(), headers_after=REQUEST_TIMEOUT_SECONDS - 2)
         agent.clock = clock
         _deferred, results = self._call(agent, clock)
         clock.advance(REQUEST_TIMEOUT_SECONDS - 2)
@@ -1678,7 +1803,7 @@ class TestChoreoClient(unittest.TestCase):
         while the peer keeps sending."""
         clock = Clock()
         response = _FakeResponse()
-        agent = _FakeHttpClient(response)
+        agent = _FakeAgent(response)
         _deferred, results = self._call(agent, clock)
         clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
         results[0].trap(ModerationCheckError)
@@ -1692,7 +1817,7 @@ class TestChoreoClient(unittest.TestCase):
         the per-job deadline both cancel in-flight checks."""
         clock = Clock()
         response = _FakeResponse()
-        agent = _FakeHttpClient(response)
+        agent = _FakeAgent(response)
         deferred, results = self._call(agent, clock)
         self.assertEqual(results, [])
         deferred.cancel()
@@ -1714,7 +1839,7 @@ class TestChoreoClient(unittest.TestCase):
         clock = Clock()
         underlying = _RealTransport()
         response = _FakeResponse(underlying=underlying)
-        agent = _FakeHttpClient(response)
+        agent = _FakeAgent(response)
         _deferred, results = self._call(agent, clock)
         clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
         results[0].trap(ModerationCheckError)
@@ -1733,7 +1858,7 @@ class TestChoreoClient(unittest.TestCase):
         response = _FakeResponse(
             chunks=[chunk] * (MAX_RESPONSE_BYTES // len(chunk) + 2)
         )
-        agent = _FakeHttpClient(response)
+        agent = _FakeAgent(response)
         _deferred, results = self._call(agent, clock)
         self.assertEqual(len(results), 1)
         results[0].trap(ModerationCheckError)
@@ -1748,7 +1873,7 @@ class TestChoreoClient(unittest.TestCase):
         body = prefix + padding + suffix
         self.assertEqual(len(body), MAX_RESPONSE_BYTES)
         clock = Clock()
-        agent = _FakeHttpClient(_FakeResponse(body=body))
+        agent = _FakeAgent(_FakeResponse(body=body))
         _deferred, results = self._call(agent, clock)
         self.assertEqual(results[0]["flagged"], False)
 
@@ -1763,7 +1888,7 @@ class TestChoreoClient(unittest.TestCase):
         self.assertEqual(len(body), MAX_RESPONSE_BYTES + 1)
         clock = Clock()
         response = _FakeResponse(body=body)
-        agent = _FakeHttpClient(response)
+        agent = _FakeAgent(response)
         _deferred, results = self._call(agent, clock)
         self.assertIsInstance(results[0], Failure, results[0])
         results[0].trap(ModerationCheckError)
@@ -1773,21 +1898,21 @@ class TestChoreoClient(unittest.TestCase):
         """The agent double checks what it was handed, so a wrong method, path
         or missing bearer token fails here rather than passing silently."""
         clock = Clock()
-        agent = _FakeHttpClient(_FakeResponse(body=b'{"flagged": false}'))
+        agent = _FakeAgent(_FakeResponse(body=b'{"flagged": false}'))
         _deferred, results = self._call(agent, clock)
         self.assertEqual(len(agent.requests), 1)
-        sent = agent.requests[0]
-        self.assertEqual(sent["method"], "POST")
-        self.assertEqual(sent["uri"], "http://choreo.invalid/choreo/moderate")
-        headers = sent["headers"]
+        method, uri, headers, body_producer = agent.requests[0]
+        self.assertEqual(method, b"POST")
+        self.assertEqual(uri, b"http://choreo.invalid/choreo/moderate")
         self.assertEqual(headers.getRawHeaders(b"Authorization"), [b"Bearer syt_x"])
         self.assertEqual(headers.getRawHeaders(b"Content-Type"), [b"application/json"])
+        self.assertIsNotNone(body_producer)
         self.assertEqual(json.loads(agent.sent_bodies[0]), {"text": "some text"})
 
     def test_a_prompt_response_is_returned(self) -> None:
         """The other direction: the timeout must not break the happy path."""
         clock = Clock()
-        agent = _FakeHttpClient(
+        agent = _FakeAgent(
             _FakeResponse(body=b'{"flagged": true, "categories": ["hate"]}')
         )
         _deferred, results = self._call(agent, clock)
@@ -1803,7 +1928,7 @@ class TestChoreoClient(unittest.TestCase):
         for body in (b"{}", b'{"error": "provider failed"}', b'{"categories": []}'):
             with self.subTest(body=body):
                 clock = Clock()
-                agent = _FakeHttpClient(_FakeResponse(body=body))
+                agent = _FakeAgent(_FakeResponse(body=body))
                 _deferred, results = self._call(agent, clock)
                 self.assertIsInstance(results[0], Failure, results[0])
                 results[0].trap(ModerationCheckError)
@@ -1822,7 +1947,7 @@ class TestChoreoClient(unittest.TestCase):
         ):
             with self.subTest(body=body):
                 clock = Clock()
-                agent = _FakeHttpClient(_FakeResponse(body=body))
+                agent = _FakeAgent(_FakeResponse(body=body))
                 _deferred, results = self._call(agent, clock)
                 self.assertEqual(len(results), 1)
                 self.assertIsInstance(results[0], Failure, results[0])
@@ -1834,7 +1959,7 @@ class TestChoreoClient(unittest.TestCase):
         validation on its own, and the test passed with the status check
         deleted."""
         clock = Clock()
-        agent = _FakeHttpClient(
+        agent = _FakeAgent(
             _FakeResponse(code=502, body=b'{"flagged": false, "categories": []}')
         )
         _deferred, results = self._call(agent, clock)
@@ -1854,7 +1979,7 @@ class TestChoreoClient(unittest.TestCase):
         attached to an error whose own message says only the type.
         """
         clock = Clock()
-        agent = _FakeHttpClient(_FakeResponse(body=self.PAYLOAD.encode()))
+        agent = _FakeAgent(_FakeResponse(body=self.PAYLOAD.encode()))
         _deferred, results = self._call(agent, clock)
         self._assert_chain_severed(error := results[0].value)
         self.assertNotIn(self.PAYLOAD, self._everything_reachable_from(error))
@@ -1865,7 +1990,7 @@ class TestChoreoClient(unittest.TestCase):
         `except` blocks, so a test that only drives one leaves the other free
         to keep the original exception - and its payload - on `__context__`."""
         clock = Clock()
-        agent = _FailingHttpClient(ValueError(self.PAYLOAD))
+        agent = _FailingAgent(ValueError(self.PAYLOAD))
         _deferred, results = self._call(agent, clock)
         error = results[0].value
         self.assertIsInstance(error, ModerationCheckError)
@@ -1897,7 +2022,7 @@ class TestChoreoClient(unittest.TestCase):
         undecodable bytes from its args."""
         clock = Clock()
         body = b'{"flagged":true,"categories":["@alice:example.org"],"n":"\xff"}'
-        agent = _FakeHttpClient(_FakeResponse(body=body))
+        agent = _FakeAgent(_FakeResponse(body=body))
         _deferred, results = self._call(agent, clock)
         self.assertIsInstance(results[0], Failure)
         error = results[0].value

@@ -8,24 +8,36 @@ gate (the mock accepts any non-empty token).
 
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, List, Tuple
 
 FLAG_MARKER = "FLAGME"
 
 
-class _RecordingHTTPServer(HTTPServer):
-    """An `HTTPServer` that owns the list of texts the handler has seen.
+class _RecordingHTTPServer(ThreadingHTTPServer):
+    """An HTTP server that owns the list of texts the handler has seen.
 
     The handler reaches its server through `self.server`, which the stdlib
     types as `socketserver.BaseServer`, so bolting the attribute onto a plain
     `HTTPServer` needed a type suppression at every use. Declaring it on a
     subclass needs none.
+
+    Threading, so `delay_seconds` holds ONE request rather than the whole
+    server: a single-threaded server would serialise the concurrency the
+    worker pool exists to produce, and a test of a queue that cannot be
+    filled tests nothing.
     """
+
+    daemon_threads = True
 
     def __init__(self, address: Tuple[str, int], handler: Any) -> None:
         super().__init__(address, handler)
         self.seen_texts: List[str] = []
+        # Held responses, so a test can have work genuinely in flight when it
+        # stops the homeserver. Without it a drain has nothing to drain and a
+        # test that claims to exercise one proves nothing.
+        self.delay_seconds = 0.0
 
 
 class _MockModerationHandler(BaseHTTPRequestHandler):
@@ -49,6 +61,8 @@ class _MockModerationHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         text = body.get("text", "")
         server.seen_texts.append(text)
+        if server.delay_seconds:
+            time.sleep(server.delay_seconds)
         flagged = FLAG_MARKER in text
         self._send(
             200,
@@ -76,6 +90,11 @@ class MockModerationServer:
     @property
     def seen_texts(self) -> List[str]:
         return self._httpd.seen_texts
+
+    def hold_responses_for(self, seconds: float) -> None:
+        """Make every later response take ``seconds``, so a test can stop the
+        homeserver with checks genuinely in flight."""
+        self._httpd.delay_seconds = seconds
 
     @property
     def base_url(self) -> str:

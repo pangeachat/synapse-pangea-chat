@@ -222,6 +222,7 @@ class TestModerationLogcontext(BaseSynapseE2ETest):
                 mock_moderation.seen_texts,
                 "the moderation endpoint was never called",
             )
+            flagged_count = len(mock_moderation.seen_texts)
 
             await asyncio.sleep(2)
             self.assertEqual(
@@ -230,11 +231,29 @@ class TestModerationLogcontext(BaseSynapseE2ETest):
                 "tier 2 traffic leaked a logcontext:\n" + "\n".join(self._leaks()),
             )
 
-            # And the drain. Shutdown wakes parked workers, fires the drain's
-            # waiter and cancels its deadline, which is three more handoffs -
-            # and this is the window in which the 1.159 clock refuses new
-            # calls, so it is where a supervisor or a drain that scheduled
-            # work unconditionally would produce "Looping call died".
+            # Now put work GENUINELY in flight and stop the server underneath
+            # it. Without this the mock answers instantly, the pool is idle by
+            # the time the server stops, and the drain - the thing this half of
+            # the test claims to cover - never runs at all.
+            mock_moderation.hold_responses_for(20.0)
+            for index in range(20):
+                response = self._send(
+                    room_id, token, f"awful {FLAG_MARKER}", f"txn-drain-{index}"
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+            await asyncio.sleep(1)
+            self.assertGreater(
+                len(mock_moderation.seen_texts),
+                flagged_count,
+                "no check was in flight, so the drain is not being exercised",
+            )
+
+            # Shutdown wakes parked workers, fires the drain's waiter and
+            # cancels its deadline, which is three more handoffs - and this is
+            # the window in which the 1.159 clock refuses new calls and
+            # cancels the ones it is tracking, so it is where a supervisor or
+            # a drain that scheduled work unconditionally would produce
+            # "Looping call died".
             self.stop_synapse(
                 server_process=server_process,
                 stdout_thread=stdout_thread,

@@ -57,7 +57,7 @@ class RecordingClock:
 
     def __init__(self) -> None:
         self.now = 1000.0
-        self.pending: List[Tuple[float, int, Callable[..., Any], tuple]] = []
+        self.pending: List[Tuple[float, int, Callable[..., Any], tuple, bool]] = []
         self.looping: List[Tuple[Callable[..., Any], float]] = []
         self._seq = 0
         self.shutdown = False
@@ -70,8 +70,22 @@ class RecordingClock:
     ) -> RecordingDelayedCall:
         if self.shutdown:
             raise Exception("Cannot start delayed call. Clock has been shutdown")
+        return self._schedule(delay, callback, args, wrapped=True)
+
+    def reactor_call_later(
+        self, delay: float, callback: Callable[..., Any], *args: Any
+    ) -> RecordingDelayedCall:
+        """`reactor.callLater`, which does NOT wrap the callback in a
+        logcontext the way `synapse.util.Clock.call_later` does."""
+        return self._schedule(delay, callback, args, wrapped=False)
+
+    def _schedule(
+        self, delay: Any, callback: Any, args: Any, *, wrapped: bool
+    ) -> RecordingDelayedCall:
         self._seq += 1
-        self.pending.append((self.now + float(delay), self._seq, callback, args))
+        self.pending.append(
+            (self.now + float(delay), self._seq, callback, args, wrapped)
+        )
         return RecordingDelayedCall(self, self._seq)
 
     def looping_call(
@@ -89,7 +103,10 @@ class RecordingClock:
             due.sort(key=lambda entry: (entry[0], entry[1]))
             entry = due[0]
             self.pending.remove(entry)
-            _fire_as_synapse_would(entry[2], entry[3], {})
+            if entry[4]:
+                _fire_as_synapse_would(entry[2], entry[3], {})
+            else:
+                entry[2](*entry[3])
             fired += 1
         return fired
 
@@ -138,6 +155,13 @@ class HomeServerDouble:
 
     def get_clock(self) -> RecordingClock:
         return self.clock
+
+    def get_reactor(self) -> Any:
+        # The drain deadline is taken from the REACTOR, not from the Clock,
+        # because `Clock.shutdown()` cancels everything the Clock tracks. The
+        # double keeps both on one timebase so a test can still step it, while
+        # firing reactor callbacks bare the way the reactor does.
+        return SimpleNamespace(callLater=self.clock.reactor_call_later)
 
     def get_datastores(self) -> Any:
         return SimpleNamespace(main=self.store)
