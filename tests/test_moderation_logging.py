@@ -54,6 +54,7 @@ from synapse.module_api import ModuleApi
 import synapse_pangea_chat.moderation as moderation_package
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.moderation import ChatModeration
+from synapse_pangea_chat.moderation.choreo_client import moderate_text
 from synapse_pangea_chat.moderation.log_safety import _IdentityScrubbingFilter
 
 # Strings that must never survive a moderation code path. Distinctive enough
@@ -85,6 +86,18 @@ def _standard_record_attrs() -> frozenset:
 _STANDARD_RECORD_ATTRS = _standard_record_attrs()
 
 
+def _exception_chain(error: BaseException) -> str:
+    """Everything a structured sink could serialise off an exception."""
+    seen: List[str] = []
+    current: Optional[BaseException] = error
+    while current is not None:
+        seen.append(repr(current.args))
+        seen.append(repr(getattr(current, "__dict__", {})))
+        seen.append(repr(getattr(current, "doc", "")))
+        current = current.__cause__ or current.__context__
+    return "\n".join(seen)
+
+
 class _CapturingHandler(logging.Handler):
     """Records the formatted message, the raw arguments and every extra.
 
@@ -106,6 +119,15 @@ class _CapturingHandler(logging.Handler):
         except Exception:
             self.seen.append(str(record.msg))
         self.seen.append(repr(record.args))
+        # An exception passed as a log ARGUMENT is not covered by `exc_info`,
+        # and it carries a chain: `raise X from None` clears `__cause__` and
+        # stops the traceback being rendered, but leaves `__context__` set, so
+        # a `json.JSONDecodeError` with the whole response body on `.doc` was
+        # reachable from a record whose own message named only a type. A
+        # structured sink walks it; so does this.
+        for argument in record.args or ():
+            if isinstance(argument, BaseException):
+                self.seen.append(_exception_chain(argument))
         if record.exc_info is not None:
             self.seen.append(logging.Formatter().formatException(record.exc_info))
             # The formatted traceback is not the whole exception. A structured
@@ -114,9 +136,7 @@ class _CapturingHandler(logging.Handler):
             # directly rather than only in the rendering.
             exception = record.exc_info[1]
             if exception is not None:
-                self.seen.append(repr(getattr(exception, "args", ())))
-                self.seen.append(repr(exception.__cause__))
-                self.seen.append(repr(exception.__context__))
+                self.seen.append(_exception_chain(exception))
         # Anything attached with `extra=`, and everything Synapse's global
         # log-record factory attaches, lands in the record's __dict__ and never
         # appears in the formatted message - so a leak through that door would
@@ -198,10 +218,16 @@ def _synapse_request_logcontext() -> Iterator[None]:
             requester=CANARY_SENDER,
             authenticated_entity=CANARY_SENDER,
             method="PUT",
-            # A path carrying a Matrix ID, because a moderation record can be
-            # created under any request that persists an event and that set is
-            # not ours to enumerate.
-            url=f"/_matrix/client/v3/user/{CANARY_SENDER}/account_data/x",
+            # A Matrix URL carries client-chosen text in three places at
+            # once: a user id in the path, the same id percent-encoded where
+            # no pattern over the decoded form would find it, and a
+            # transaction id that is whatever the client typed. That is why
+            # the whole value goes rather than a scrubbed version of it.
+            url=(
+                "/_matrix/client/v3/rooms/!room:example.org/send/"
+                f"m.room.message/{CANARY_TEXT}"
+                f"?who=%40{CANARY_LOCALPART}%3Acanary-server.invalid"
+            ),
             protocol="HTTP/1.1",
             user_agent=CANARY_USER_AGENT,
         ),
@@ -211,6 +237,20 @@ def _synapse_request_logcontext() -> Iterator[None]:
             yield
     finally:
         logging.setLogRecordFactory(previous_factory)
+
+
+def _verdict() -> AsyncMock:
+    """A signature-enforcing `moderate_text`. A bare `AsyncMock` accepts
+    `access_t0ken=` as happily as `access_token=`, so a test built on one
+    cannot see the caller getting the keyword wrong - which the real function
+    rejects, inside the fail-open handler, on every message."""
+    mock = create_autospec(moderate_text)
+    mock.return_value = {
+        "flagged": True,
+        "categories": ["harassment"],
+        "evaluated": True,
+    }
+    return cast(AsyncMock, mock)
 
 
 def _config(**overrides: Any) -> PangeaChatConfig:
@@ -328,17 +368,15 @@ class ModerationLoggingTestCase(unittest.IsolatedAsyncioTestCase):
         )
         with patch(
             "synapse_pangea_chat.moderation.moderate_text",
-            new=AsyncMock(
-                return_value={
-                    "flagged": True,
-                    "categories": ["harassment"],
-                    "evaluated": True,
-                }
-            ),
+            new=_verdict(),
         ):
             # No exception may propagate: the caller is a background process
             # whose handler would log it, Matrix ID and all.
             await mod._check_and_redact(_event(CANARY_TEXT), "flagged text")
+        # The redaction must have been ATTEMPTED. Without this the test passes
+        # when the send never happens at all - a different failure, caught by
+        # the same fail-open handler, proving nothing about this one.
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
         self.assertLoggedSomething()
         self.assertNoCanaries()
 
@@ -470,6 +508,7 @@ class ModerationLogContextTestCase(unittest.IsolatedAsyncioTestCase):
                 ),
             ):
                 await mod._check_and_redact(_event(CANARY_TEXT), "flagged text")
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
         self.assertScrubbed()
 
     async def test_the_record_stays_traceable_after_scrubbing(self) -> None:
@@ -484,13 +523,35 @@ class ModerationLogContextTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.request, "PUT-1")
         self.assertEqual(record.server_name, "canary-server.invalid")
         self.assertEqual(record.method, "PUT")
-        # The URL keeps its path - which endpoint produced the record is the
-        # point of keeping it - and loses only the Matrix ID inside it.
-        self.assertIn("/_matrix/client/v3/user/", record.url)
-        self.assertIn("/account_data/x", record.url)
         captured = "\n".join(self.handler.seen)
         self.assertIn("!room:example.org", captured)
         self.assertIn("contact_details", captured)
+
+    async def test_a_handler_filter_cannot_put_the_identity_back(self) -> None:
+        """Synapse still documents attaching `LoggingContextFilter` to a
+        HANDLER, and `Handler.handle` runs its own filters after the logger's -
+        so such a handler re-derives the sender's Matrix ID from the logcontext
+        and puts it back on a record we had already cleaned."""
+        self.handler.addFilter(LoggingContextFilter())
+        with _synapse_request_logcontext():
+            mod = ChatModeration(_module_api(), _config())
+            await mod.check_event_for_spam(_event(CANARY_TEXT))
+        self.assertScrubbed()
+
+    def test_the_handler_scrubber_leaves_other_loggers_alone(self) -> None:
+        """Scoped to this package on purpose: stripping the requester from
+        SYNAPSE's request log is not ours to do, and it is the identity an
+        operator relies on everywhere else."""
+        with _synapse_request_logcontext():
+            ChatModeration(_module_api(), _config())
+            logging.getLogger("synapse.http.server").warning("someone else")
+        other = [
+            record
+            for record in self.handler.records
+            if record.name == "synapse.http.server"
+        ]
+        self.assertEqual(len(other), 1)
+        self.assertEqual(other[0].requester, CANARY_SENDER)
 
     def test_the_scrubber_does_not_delete_the_attributes(self) -> None:
         """A formatter is free to reference `%(requester)s`, and a deployment

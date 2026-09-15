@@ -69,31 +69,29 @@ _MODERATION_CONFIG_KEYS = frozenset(
 _CHOREO_URL_SCHEMES = ("http", "https")
 
 
-def _validate_choreo_base_url(value: str) -> None:
-    """Raise unless `value` is a base URL this module can actually fetch.
+def _validate_choreo_base_url(value: str) -> str:
+    """Return the usable form of `value`, or raise saying why there is none.
 
-    The checks are on the RAW string as well as on the parse, because the
-    parse alone accepts values the request builder then mangles. The endpoint
-    path is appended with `f"{base_url.rstrip('/')}/choreo/moderate"`, so a
-    trailing `?` or `#` - which `urlparse` reports as an empty query and an
-    empty fragment, both falsy - turns the path into `?/choreo/moderate` or
-    swallows it into a fragment, and every request goes to `/`. Whitespace and
+    The checks are on the RAW string as well as on the parse, because the parse
+    alone accepts values the request builder then mangles. The endpoint path is
+    appended with `f"{base_url.rstrip('/')}/choreo/moderate"`, so a trailing `?`
+    or `#` - which `urlparse` reports as an empty query and an empty fragment,
+    both falsy - turns the path into `?/choreo/moderate` or swallows it into a
+    fragment, and every request goes to `/`. Whitespace, control characters and
     non-ASCII fail later still, inside twisted's URI parsing, where the failure
-    is one more swallowed exception per message.
+    is one more swallowed exception per message and no error anybody sees.
+
+    The stripped value is RETURNED rather than validated in place: validating a
+    stripped copy and then storing the original is how `"https://host "` passed
+    a check it did not satisfy.
     """
     raw = value.strip()
-    for character, description in (
-        ("?", "a query string"),
-        ("#", "a fragment"),
-        (" ", "whitespace"),
-        ("\t", "whitespace"),
-        ("\n", "whitespace"),
-    ):
+    for character, description in (("?", "a query string"), ("#", "a fragment")):
         if character in raw:
             raise ValueError(
                 'Config "moderation.choreo_base_url" must not contain '
                 f"{description}; the request path is appended to it, so "
-                f"{character!r} would redirect every moderation check to a "
+                f"{character!r} would send every moderation check to a "
                 "different path than the one configured"
             )
     if not raw.isascii():
@@ -101,6 +99,15 @@ def _validate_choreo_base_url(value: str) -> None:
             'Config "moderation.choreo_base_url" must be ASCII. An '
             "internationalised host has to be given in its punycode form "
             '("xn--..."), because the request URI is built as bytes'
+        )
+    # Every space, tab, carriage return, newline and control character, not a
+    # hand-written list of the ones somebody thought of: `"host\r/a"` was
+    # rejected by twisted and accepted here because `\r` was not on the list.
+    if any(character.isspace() or ord(character) < 0x21 for character in raw):
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must not contain whitespace '
+            "or control characters; twisted refuses to build a request URI "
+            "from one, on every message"
         )
     parsed = urlparse(raw)
     if parsed.scheme not in _CHOREO_URL_SCHEMES:
@@ -111,21 +118,40 @@ def _validate_choreo_base_url(value: str) -> None:
             "fail-open handler, so the effect is unmoderated messages and no "
             "error."
         )
-    if not parsed.netloc:
+    if "@" in parsed.netloc:
+        # Includes the empty-userinfo case `https://@host`, which `username`
+        # and `password` both report as falsy while twisted reads the whole
+        # `@host` as the hostname.
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must not carry credentials or '
+            "an empty userinfo marker; use moderation.choreo_access_token. A "
+            "URL is logged and reported in far more places than a token is."
+        )
+    if not parsed.hostname:
+        # `netloc` is not the test: `"https://:443"` has a non-empty netloc and
+        # no host at all.
         raise ValueError(
             'Config "moderation.choreo_base_url" must include a host, as in '
             '"https://choreo.example.org"'
         )
-    if parsed.username or parsed.password:
+    try:
+        port = parsed.port
+    except ValueError:
+        # `urlparse` raises here for a non-numeric or out-of-range port, and
+        # only when the attribute is read - which nothing did, so
+        # `"https://host:99999"` and `"https://host:bad"` both started cleanly.
         raise ValueError(
-            'Config "moderation.choreo_base_url" must not carry credentials in '
-            "the URL; use moderation.choreo_access_token. A URL is logged and "
-            "reported in far more places than a token is."
+            'Config "moderation.choreo_base_url" has a port that is not a '
+            "number between 1 and 65535"
+        ) from None
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError(
+            'Config "moderation.choreo_base_url" has a port outside 1-65535'
         )
-    if parsed.query or parsed.fragment or parsed.params:
+    if parsed.params:
         raise ValueError(
             'Config "moderation.choreo_base_url" must be a base URL with no '
-            "query string or fragment; the request path is appended to it"
+            "path parameters; the request path is appended to it"
         )
     if parsed.scheme != "https":
         # Not an error: a local stack and the E2E suite legitimately run over
@@ -135,6 +161,7 @@ def _validate_choreo_base_url(value: str) -> None:
             "moderation service account's bearer token and every moderated "
             "message cross the network in the clear"
         )
+    return raw
 
 
 class PangeaChat:
@@ -770,7 +797,9 @@ class PangeaChat:
             # starts cleanly, and then fails on every single message inside the
             # fail-open handler, which is silence. A startup failure names the
             # problem once; the alternative names it never.
-            _validate_choreo_base_url(moderation_choreo_base_url)
+            moderation_choreo_base_url = _validate_choreo_base_url(
+                moderation_choreo_base_url
+            )
             if (
                 not isinstance(moderation_choreo_access_token, str)
                 or not moderation_choreo_access_token.strip()

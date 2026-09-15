@@ -29,14 +29,16 @@ Three channels need closing, and only one of them is a log call we write:
 import hashlib
 import logging
 import os
-import re
 import secrets
-from typing import Tuple
+from typing import Optional, Tuple
 
 # 6 bytes is 12 hex characters: short enough to read in a log line, wide
 # enough that two senders colliding within one process is not a practical
 # concern (2^48 values against, at most, a few million users).
 _DIGEST_BYTES = 6
+
+# Every logger this module writes through sits under this name.
+_PACKAGE_LOGGER = "synapse.modules.synapse_pangea_chat.moderation"
 
 
 def new_digest_key() -> bytes:
@@ -69,24 +71,23 @@ def sender_digest(sender: str, key: bytes) -> str:
 # The rest of what the filter sets - `request`, `server_name`, `site_tag`,
 # `method`, `protocol` - names an endpoint and a request, not a person, and is
 # what makes a record traceable, so it is left alone.
+# `url` joins them, and the first attempt to keep it - scrubbing Matrix-ID
+# shaped substrings out of the path and keeping the rest - was wrong. A Matrix
+# request path carries client-chosen text: the transaction id of a message send
+# is whatever the client put there, `%40alice%3Aexample.org` is a Matrix ID
+# that no pattern over the decoded form will match, and a localpart may contain
+# a `/`. `get_redacted_uri` removes access tokens and client secrets, not
+# arbitrary request data. There is no pattern that separates "the endpoint" from
+# "what the user typed" in a Matrix URL, so the whole value goes; `method` and
+# the request id stay, and Synapse's own request lines carry the URL for an
+# operator who needs it.
 _IDENTITY_RECORD_ATTRS: Tuple[str, ...] = (
     "requester",
     "authenticated_entity",
     "ip_address",
     "user_agent",
+    "url",
 )
-
-# `url` is the awkward one, and it is neither dropped nor kept whole. The path
-# is what tells an operator which endpoint produced a record, and most of them
-# carry a room id rather than a Matrix ID - but a moderation record can be
-# created under any request that persists an event, that set is not ours to
-# enumerate, and some Matrix paths do embed a user id. So the Matrix IDs are
-# taken out of the path and the rest of the path stays. A Matrix ID is
-# `@localpart:server`; the character classes are the ones a Matrix ID and a URL
-# path can actually contain, and the match is deliberately generous on the
-# server part because over-redacting a URL costs nothing.
-_MXID_IN_TEXT = re.compile(r"@[^\s:/?#]+:[^\s/?#]+")
-_URL_RECORD_ATTRS: Tuple[str, ...] = ("url",)
 
 REDACTED = "<redacted:pangea-moderation>"
 
@@ -100,21 +101,54 @@ class _IdentityScrubbingFilter(logging.Filter):
     could reach, including the root handlers a deployment configures and any
     structured sink hanging off them.
 
+    `only_prefix` exists for the second copy. A deployment is still supported
+    in attaching `LoggingContextFilter` to a HANDLER - Synapse documents that
+    configuration and keeps it working - and `Handler.handle` runs its own
+    filters after the logger's, so such a handler re-derives the identity from
+    the logcontext and puts it back on a record we had already cleaned. The
+    answer is a second copy of this filter on those handlers, appended after
+    theirs; the prefix keeps it to our own records, because stripping the
+    requester from SYNAPSE's request log is not ours to do and would take away
+    the identity an operator relies on everywhere else.
+
     It cannot cover records this module did not create - Synapse logging an
     authorisation failure on our behalf is Synapse's record, on Synapse's
-    logger. That is why `_check_and_redact` refuses to let an exception escape
-    at all rather than relying on this.
+    logger. That is why the module refuses to let an exception escape a
+    moderation frame at all rather than relying on this.
     """
 
+    def __init__(self, only_prefix: Optional[str] = None) -> None:
+        super().__init__()
+        self._only_prefix = only_prefix
+
     def filter(self, record: logging.LogRecord) -> bool:
+        if self._only_prefix is not None and not record.name.startswith(
+            self._only_prefix
+        ):
+            return True
         for attr in _IDENTITY_RECORD_ATTRS:
             if getattr(record, attr, None) is not None:
                 setattr(record, attr, REDACTED)
-        for attr in _URL_RECORD_ATTRS:
-            value = getattr(record, attr, None)
-            if isinstance(value, str) and "@" in value:
-                setattr(record, attr, _MXID_IN_TEXT.sub(REDACTED, value))
         return True
+
+
+def scrub_reachable_handlers(logger: logging.Logger) -> None:
+    """Put a second scrubber on every handler `logger`'s records can reach.
+
+    Called once when moderation starts. Handlers attached afterwards - by a
+    logging-configuration reload, say - are not covered, and that residue is
+    recorded in .github/instructions/moderation.instructions.md.
+    """
+    current: Optional[logging.Logger] = logger
+    while current is not None:
+        for handler in current.handlers:
+            if not any(
+                isinstance(f, _IdentityScrubbingFilter) for f in handler.filters
+            ):
+                handler.addFilter(_IdentityScrubbingFilter(only_prefix=_PACKAGE_LOGGER))
+        if not current.propagate:
+            return
+        current = current.parent
 
 
 def scrubbing_logger(name: str) -> logging.Logger:

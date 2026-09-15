@@ -16,8 +16,8 @@ signature and then does what the real runner does with the result, which is the
 only way a test on one pin can be right about both.
 """
 
-import asyncio
 import inspect
+import json
 import traceback
 import unittest
 from types import MappingProxyType, SimpleNamespace
@@ -32,6 +32,7 @@ from twisted.internet import defer
 from twisted.internet.task import Clock
 from twisted.python.failure import Failure
 from twisted.web.client import ResponseDone
+from twisted.web.iweb import IBodyProducer
 
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.config import PangeaChatConfig
@@ -138,12 +139,23 @@ class _BackgroundProcessDouble:
                     "run_as_background_process wants a str server_name, got "
                     f"{type(server_name).__name__}"
                 )
-        if not asyncio.iscoroutinefunction(func):
-            raise TypeError(f"{type(func).__name__} object is not awaitable")
+        if not callable(func):
+            raise TypeError(f"{type(func).__name__} object is not callable")
         # The real runner awaits `func(*args, **kwargs)`, so the double calls
         # it the same way: a caller forwarding a keyword the coroutine does not
-        # take fails here exactly as it fails there.
+        # take fails here exactly as it fails there. What it does NOT do is
+        # demand a coroutine FUNCTION - the runner accepts anything callable
+        # whose result can be awaited, a plain function returning a `Deferred`
+        # included, and a double stricter than the thing it stands for fails
+        # correct code.
         coroutine = func(*extra, **forwarded)
+        if not inspect.isawaitable(coroutine) and not isinstance(
+            coroutine, defer.Deferred
+        ):
+            raise TypeError(
+                f"{type(func).__name__} returned "
+                f"{type(coroutine).__name__}, which cannot be awaited"
+            )
         self.started.append((desc, coroutine))
         return coroutine
 
@@ -642,16 +654,33 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
         """The permissive half of the relation rule, and the reason the rule is
         a rule rather than "always read both". No client renders
         `m.new_content` without `rel_type: m.replace`, so text parked there on
-        a non-edit is text nobody sees, and Tier 1 must not block on it."""
-        mod = _moderation(_config())
-        event = _event(
-            content={
-                "msgtype": "m.text",
-                "body": "an ordinary sentence",
-                "m.new_content": {"msgtype": "m.text", "body": "call 415-555-2671"},
-            }
-        )
-        self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
+        a non-edit is text nobody sees, and Tier 1 must not block on it.
+
+        The outer body is deliberately benign in every case: a fixture whose
+        outer body already trips a rule proves nothing about whether the inner
+        surface was read, because the block arrives either way.
+        """
+        for relates_to in (
+            None,
+            {"rel_type": "m.thread", "event_id": "$other"},
+            {"event_id": "$other"},
+            {"rel_type": "m.annotation", "key": "x"},
+        ):
+            with self.subTest(relates_to=relates_to):
+                content: Dict[str, Any] = {
+                    "msgtype": "m.text",
+                    "body": "an ordinary sentence",
+                    "m.new_content": {
+                        "msgtype": "m.text",
+                        "body": "call 415-555-2671",
+                    },
+                }
+                if relates_to is not None:
+                    content["m.relates_to"] = relates_to
+                mod = _moderation(_config())
+                self.assertEqual(
+                    await mod.check_event_for_spam(_event(content=content)), NOT_SPAM
+                )
 
     async def test_edit_moderates_replacement_text(self) -> None:
         mod = _moderation(_config())
@@ -701,15 +730,33 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
         mappings - and an `isinstance(..., dict)` test on one of those would
         silently stop moderating the replacement text of every edit."""
         mod = _moderation(_config())
+        # BOTH surfaces are non-dict mappings. A fixture whose outer content is
+        # a plain dict leaves the outer `isinstance(..., Mapping)` test
+        # untested, and that is the one a real homeserver exercises on every
+        # event: Synapse hands modules a Rust `JsonObject`, never a dict.
         event = _event(
-            content={
-                "msgtype": "m.text",
-                "body": "* a harmless correction",
-                "m.new_content": MappingProxyType(
-                    {"msgtype": "m.text", "body": "call me: 415-555-2671"}
-                ),
-                "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
-            }
+            content=MappingProxyType(
+                {
+                    "msgtype": "m.text",
+                    "body": "* a harmless correction",
+                    "m.new_content": MappingProxyType(
+                        {"msgtype": "m.text", "body": "call me: 415-555-2671"}
+                    ),
+                    "m.relates_to": MappingProxyType(
+                        {"rel_type": "m.replace", "event_id": "$orig"}
+                    ),
+                }
+            )
+        )
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_a_non_dict_mapping_outer_body_is_moderated(self) -> None:
+        """The plain-message half of the same property."""
+        mod = _moderation(_config())
+        event = _event(
+            content=MappingProxyType(
+                {"msgtype": "m.text", "body": "call me: 415-555-2671"}
+            )
         )
         self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
 
@@ -757,7 +804,13 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
 
-    async def test_an_unterminated_tag_does_not_swallow_the_tail(self) -> None:
+    async def test_an_unterminated_tag_is_not_displayed_and_not_matched(self) -> None:
+        """The permissive direction, corrected. An earlier revision appended
+        the raw tail of an unterminated tag on the theory that over-reading is
+        always the safe error. It is not: HTML5 ends the tokenizer inside the
+        tag state at end-of-input and emits nothing, so every renderer agrees
+        this is invisible - and Tier 1 blocks before persist, so matching it
+        silences a learner over markup nobody can see."""
         mod = _moderation(_config())
         event = _event(
             content={
@@ -767,7 +820,120 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "formatted_body": "see <x call 415-555-2671",
             }
         )
+        self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
+
+    async def test_an_attachment_filename_is_moderated(self) -> None:
+        """`filename` is the attachment's original name and clients show it
+        beside the caption whenever the two differ, so it is displayed text."""
+        mod = _moderation(_config())
+        event = _event(
+            content={
+                "msgtype": "m.file",
+                "body": "notes",
+                "filename": "call 415-555-2671.txt",
+                "url": "mxc://example.org/x",
+            }
+        )
         self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_an_abruptly_closed_comment_does_not_hide_the_message(
+        self,
+    ) -> None:
+        """`<!-->` closes the comment at once under HTML5, so what follows is
+        on screen. Python's parser reads it as an OPEN comment and scans for a
+        later terminator, swallowing everything between."""
+        mod = _moderation(_config())
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "<!-->call 415-555-2671<!-- -->",
+            }
+        )
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_a_cdata_section_does_not_hide_the_message(self) -> None:
+        """HTML5 has no CDATA in an HTML body: `<![CDATA[` starts a bogus
+        comment that ends at the first `>`, so the rest is displayed. Python's
+        parser swallows the whole section."""
+        mod = _moderation(_config())
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "<![CDATA[>call 415-555-2671]]>",
+            }
+        )
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_spoiler_and_maths_attributes_are_moderated(self) -> None:
+        """Element renders the spoiler's reason and the LaTeX source, so both
+        are text a reader receives."""
+        for formatted in (
+            '<span data-mx-spoiler="call 415-555-2671">safe</span>',
+            '<span data-mx-maths="4155552671"></span>',
+        ):
+            with self.subTest(formatted=formatted):
+                mod = _moderation(_config())
+                event = _event(
+                    content={
+                        "msgtype": "m.text",
+                        "body": "",
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": formatted,
+                    }
+                )
+                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_an_attribute_no_renderer_displays_is_not_matched(self) -> None:
+        """`alt` on a `<b>` is shown by nothing. Treating the attribute NAME as
+        displayed text, wherever it appeared, made this message - which reads
+        "hello" - a Tier-1 block."""
+        mod = _moderation(_config())
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "hello",
+                "format": "org.matrix.custom.html",
+                "formatted_body": '<b alt="415-555-2671">hello</b>',
+            }
+        )
+        self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
+
+    async def test_attribute_text_does_not_interrupt_the_visible_text(self) -> None:
+        """Inline elements concatenate, so this reads `415-555-2671`. Splicing
+        the attribute in where the tag stood broke the number in half."""
+        mod = _moderation(_config())
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "",
+                "format": "org.matrix.custom.html",
+                "formatted_body": '41<b title="notes">5</b>-555-2671',
+            }
+        )
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_script_and_style_content_is_not_matched(self) -> None:
+        """Nobody reads a stylesheet, so matching one is a false positive with
+        no upside."""
+        for formatted in (
+            "hello <script>call 415-555-2671</script>",
+            "hello <style>/* call 415-555-2671 */</style>",
+        ):
+            with self.subTest(formatted=formatted):
+                mod = _moderation(_config())
+                event = _event(
+                    content={
+                        "msgtype": "m.text",
+                        "body": "hello",
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": formatted,
+                    }
+                )
+                self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
 
     def test_block_tags_separate_and_inline_tags_do_not(self) -> None:
         """The two halves of "what the reader sees", asserted on the renderer
@@ -868,15 +1034,30 @@ class _FakeTransport:
 
     disconnecting = False
 
-    def __init__(self) -> None:
+    def __init__(self, underlying: Optional[Any] = None) -> None:
         self.stopped = False
         self.lost = False
+        self.aborted = False
+        if underlying is not None:
+            # twisted's proxy keeps the real transport on `_producer`, and the
+            # real transport is where `abortConnection` lives.
+            self._producer = underlying
 
     def stopProducing(self) -> None:
         self.stopped = True
 
     def loseConnection(self) -> None:
         self.lost = True
+
+
+class _RealTransport:
+    """The socket under the proxy: the one with `abortConnection`."""
+
+    def __init__(self) -> None:
+        self.aborted = False
+
+    def abortConnection(self) -> None:
+        self.aborted = True
 
 
 class _FakeResponse:
@@ -890,11 +1071,12 @@ class _FakeResponse:
         code: int = 200,
         body: Optional[bytes] = None,
         chunks: Optional[List[bytes]] = None,
+        underlying: Optional[Any] = None,
     ) -> None:
         self.code = code
         self._chunks = chunks if chunks is not None else ([body] if body else None)
         self.protocol: Any = None
-        self.transport = _FakeTransport()
+        self.transport = _FakeTransport(underlying=underlying)
 
     def deliverBody(self, protocol: Any) -> None:
         self.protocol = protocol
@@ -906,6 +1088,33 @@ class _FakeResponse:
         for chunk in self._chunks:
             protocol.dataReceived(chunk)
         protocol.connectionLost(Failure(ResponseDone()))
+
+
+def _consume(body_producer: Any) -> bytes:
+    """The bytes the agent would put on the wire, and the interface check.
+
+    `IBodyProducer.providedBy` rather than a duck-type test: that is the
+    contract `Agent.request` actually requires, so passing the raw `BytesIO`
+    instead of a `FileBodyProducer` fails here as it would fail there.
+
+    The bytes are read from the producer's file rather than by driving
+    `startProducing`, which cooperates through the global reactor and would
+    leave a pending delayed call behind in a test with no reactor running.
+    """
+    if body_producer is None:
+        raise TypeError("Agent.request was given no body producer")
+    if not IBodyProducer.providedBy(body_producer):
+        raise TypeError(
+            "Agent.request wants an IBodyProducer, got "
+            f"{type(body_producer).__name__}"
+        )
+    source = body_producer._inputFile
+    position = source.tell()
+    try:
+        source.seek(0)
+        return bytes(source.read())
+    finally:
+        source.seek(position)
 
 
 class _FakeAgent:
@@ -922,6 +1131,7 @@ class _FakeAgent:
         self.response = response
         self.headers_after = headers_after
         self.requests: List[Tuple[bytes, bytes, Any, Any]] = []
+        self.sent_bodies: List[bytes] = []
         self.clock: Optional[Clock] = None
 
     def request(
@@ -929,6 +1139,12 @@ class _FakeAgent:
     ) -> Any:
         if not isinstance(method, bytes) or not isinstance(uri, bytes):
             raise TypeError("Agent.request takes bytes for method and uri")
+        # The producer is CONSUMED, the way a real agent consumes it. A double
+        # that only stores it cannot tell a `FileBodyProducer` from the
+        # `BytesIO` somebody passed by mistake, and never sees the payload -
+        # so the request JSON could be renamed and every client test would
+        # still pass.
+        self.sent_bodies.append(_consume(bodyProducer))
         self.requests.append((method, uri, headers, bodyProducer))
         if self.headers_after is None:
             return defer.succeed(self.response)
@@ -936,6 +1152,16 @@ class _FakeAgent:
         deferred: Any = defer.Deferred()
         self.clock.callLater(self.headers_after, deferred.callback, self.response)
         return deferred
+
+
+class _FailingAgent:
+    """An agent whose request fails the way a transport failure does."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:
+        return defer.fail(self.error)
 
 
 class TestChoreoClient(unittest.TestCase):
@@ -947,7 +1173,7 @@ class TestChoreoClient(unittest.TestCase):
     of a scheduled timeout, which is the actual defect.
     """
 
-    def _call(self, agent: _FakeAgent, clock: Clock) -> Tuple[Any, List[Any]]:
+    def _call(self, agent: Any, clock: Clock) -> Tuple[Any, List[Any]]:
         deferred = defer.ensureDeferred(
             moderate_text(
                 "some text",
@@ -1017,6 +1243,45 @@ class TestChoreoClient(unittest.TestCase):
         self.assertTrue(response.transport.stopped, "the peer was not stopped")
         self.assertTrue(response.transport.lost, "the connection was left open")
 
+    def test_a_cancelled_check_tears_the_connection_down(self) -> None:
+        """A Deferred with no canceller fires on cancel and leaves the
+        connection open with the body still arriving - the same defect the
+        timeout exists to fix, reached through a different door. Shutdown and
+        the per-job deadline both cancel in-flight checks."""
+        clock = Clock()
+        response = _FakeResponse()
+        agent = _FakeAgent(response)
+        deferred, results = self._call(agent, clock)
+        self.assertEqual(results, [])
+        deferred.cancel()
+        self.assertEqual(len(results), 1)
+        results[0].trap(ModerationCheckError)
+        self.assertTrue(response.transport.stopped, "the peer was not stopped")
+        self.assertTrue(
+            response.transport.lost or response.transport.aborted,
+            "the connection was left open",
+        )
+
+    def test_a_timeout_aborts_rather_than_closing_gracefully(self) -> None:
+        """`loseConnection` is a GRACEFUL close: it waits for buffered writes
+        and registered producers, so a peer refusing to read leaves the socket
+        open and the check's deadline does not actually end the exchange.
+        `abortConnection` does not wait. The proxy an `Agent` response delivers
+        does not have it and the transport underneath does, so it is reached
+        through when it is there."""
+        clock = Clock()
+        underlying = _RealTransport()
+        response = _FakeResponse(underlying=underlying)
+        agent = _FakeAgent(response)
+        _deferred, results = self._call(agent, clock)
+        clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        results[0].trap(ModerationCheckError)
+        self.assertTrue(underlying.aborted, "the connection was closed gracefully")
+        self.assertFalse(
+            response.transport.lost,
+            "a graceful close was used even though an abort was available",
+        )
+
     def test_an_oversized_body_is_refused_rather_than_buffered(self) -> None:
         """`readBody` has no size limit at all, so a peer that streams forever
         fills the process's memory, and a deadline does not help - it fires the
@@ -1032,14 +1297,25 @@ class TestChoreoClient(unittest.TestCase):
         results[0].trap(ModerationCheckError)
         self.assertTrue(response.transport.lost)
 
-    def test_a_body_at_the_limit_is_still_read(self) -> None:
-        """The cap must not truncate an ordinary verdict."""
+    def test_a_body_exactly_at_the_limit_is_still_read(self) -> None:
+        """At the limit, not near it. A 1 KiB body passes whether the
+        comparison is `>` or `>=`, so it does not test the boundary at all."""
+        prefix = b'{"flagged": false, "categories": [], "note": "'
+        suffix = b'"}'
+        padding = b"y" * (MAX_RESPONSE_BYTES - len(prefix) - len(suffix))
+        body = prefix + padding + suffix
+        self.assertEqual(len(body), MAX_RESPONSE_BYTES)
         clock = Clock()
-        padding = "y" * 1000
-        body = f'{{"flagged": false, "categories": [], "note": "{padding}"}}'
-        agent = _FakeAgent(_FakeResponse(body=body.encode()))
+        agent = _FakeAgent(_FakeResponse(body=body))
         _deferred, results = self._call(agent, clock)
         self.assertEqual(results[0]["flagged"], False)
+
+    def test_a_body_one_byte_over_the_limit_is_refused(self) -> None:
+        clock = Clock()
+        response = _FakeResponse(body=b"x" * (MAX_RESPONSE_BYTES + 1))
+        agent = _FakeAgent(response)
+        _deferred, results = self._call(agent, clock)
+        results[0].trap(ModerationCheckError)
 
     def test_the_request_is_the_one_the_endpoint_expects(self) -> None:
         """The agent double checks what it was handed, so a wrong method, path
@@ -1054,6 +1330,7 @@ class TestChoreoClient(unittest.TestCase):
         self.assertEqual(headers.getRawHeaders(b"Authorization"), [b"Bearer syt_x"])
         self.assertEqual(headers.getRawHeaders(b"Content-Type"), [b"application/json"])
         self.assertIsNotNone(body_producer)
+        self.assertEqual(json.loads(agent.sent_bodies[0]), {"text": "some text"})
 
     def test_a_prompt_response_is_returned(self) -> None:
         """The other direction: the timeout must not break the happy path."""
@@ -1094,24 +1371,110 @@ class TestChoreoClient(unittest.TestCase):
         self.assertIsInstance(results[0], Failure)
         results[0].trap(ModerationCheckError)
 
-    def test_the_failure_carries_no_cause_chain(self) -> None:
-        """ADR-10. `run_as_background_process` calls `logger.exception` on what
-        reaches it, and that prints `__cause__` in full - so a transport error
-        quoting the payload would be logged by a route our format strings never
-        mention. The chain is dropped rather than relabelled."""
+    PAYLOAD = "@alice:example.org a raw copy of the private message body"
+
+    def test_the_failure_carries_no_exception_chain_at_all(self) -> None:
+        """ADR-10, and `from None` is not enough for it.
+
+        `raise X from None` clears `__cause__` and stops the traceback being
+        RENDERED with the original - it leaves `__context__` set, and the
+        original is still hanging off the exception for anything that walks it.
+        A structured log sink walks it, and a `json.JSONDecodeError` carries
+        the whole response body on `.doc`, so the payload left the module
+        attached to an error whose own message says only the type.
+        """
         clock = Clock()
-        agent = _FakeAgent(
-            _FakeResponse(body=b"a raw copy of the private message body")
-        )
+        agent = _FakeAgent(_FakeResponse(body=self.PAYLOAD.encode()))
         _deferred, results = self._call(agent, clock)
         error = results[0].value
         self.assertIsNone(error.__cause__)
-        self.assertTrue(error.__suppress_context__)
-        rendered = "".join(
-            traceback.format_exception(type(error), error, error.__traceback__)
+        self.assertIsNone(error.__context__)
+        self.assertNotIn(self.PAYLOAD, self._everything_reachable_from(error))
+
+    def test_a_transport_failure_carries_no_exception_chain_either(self) -> None:
+        """The other failure site, and it has to be asserted separately: a
+        decode error and a transport error are raised from two different
+        `except` blocks, so a test that only drives one leaves the other free
+        to keep the original exception - and its payload - on `__context__`."""
+        clock = Clock()
+        agent = _FailingAgent(ValueError(self.PAYLOAD))
+        _deferred, results = self._call(agent, clock)
+        error = results[0].value
+        self.assertIsInstance(error, ModerationCheckError)
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+        self.assertNotIn(self.PAYLOAD, self._everything_reachable_from(error))
+
+    def test_an_undecodable_body_does_not_escape_the_module(self) -> None:
+        """`json.loads` raises `UnicodeDecodeError` - not a subclass of
+        `JSONDecodeError` - on a body that is not valid UTF-8. Catching only
+        the latter let it out of the module entirely, into
+        `run_as_background_process`, whose `logger.exception` printed the
+        undecodable bytes from its args."""
+        clock = Clock()
+        body = b'{"flagged":true,"categories":["@alice:example.org"],"n":"\xff"}'
+        agent = _FakeAgent(_FakeResponse(body=body))
+        _deferred, results = self._call(agent, clock)
+        self.assertIsInstance(results[0], Failure)
+        error = results[0].value
+        self.assertIsInstance(error, ModerationCheckError)
+        self.assertNotIn("@alice:example.org", self._everything_reachable_from(error))
+
+    @staticmethod
+    def _everything_reachable_from(error: BaseException) -> str:
+        """Everything a structured log sink could serialise off an exception:
+        the message, the args, the rendered traceback, and every exception
+        hanging off the cause and context chain, with their own attributes."""
+        seen: List[str] = []
+        current: Optional[BaseException] = error
+        while current is not None:
+            seen.append(repr(current.args))
+            seen.append(repr(getattr(current, "__dict__", {})))
+            seen.append(repr(getattr(current, "doc", "")))
+            seen.append(
+                "".join(
+                    traceback.format_exception(
+                        type(current), current, current.__traceback__
+                    )
+                )
+            )
+            current = current.__cause__ or current.__context__
+        return "\n".join(seen)
+
+
+class TestCallbackRegistration(unittest.TestCase):
+    """Which callback goes on which hook, asserted.
+
+    Every other test calls the two methods directly, so swapping them at
+    registration - the post-persist observer wired into the pre-persist
+    blocking hook, or the other way round - changed nothing any of them could
+    see, while in production it would either block on a coroutine that never
+    returns a verdict or never block at all.
+    """
+
+    def test_each_tier_registers_on_its_own_hook(self) -> None:
+        api = _module_api()
+        mod = ChatModeration(
+            api,
+            _config(
+                moderation_tier1_enabled=True,
+                moderation_tier2_enabled=True,
+                moderation_choreo_base_url="http://choreo.invalid",
+                moderation_choreo_access_token="syt_x",
+            ),
         )
-        self.assertNotIn("a raw copy of the private message body", rendered)
-        self.assertNotIn("JSONDecodeError", rendered)
+        api.register_spam_checker_callbacks.assert_called_once_with(
+            check_event_for_spam=mod.check_event_for_spam
+        )
+        api.register_third_party_rules_callbacks.assert_called_once_with(
+            on_new_event=mod.on_new_event
+        )
+
+    def test_a_disabled_tier_registers_nothing(self) -> None:
+        api = _module_api()
+        ChatModeration(api, _config(moderation_tier1_enabled=True))
+        api.register_spam_checker_callbacks.assert_called_once()
+        api.register_third_party_rules_callbacks.assert_not_called()
 
 
 class TestExemptGlobContainer(unittest.TestCase):
@@ -1239,6 +1602,19 @@ class TestParseConfig(unittest.TestCase):
             "https://choreo.inva lid",
             "https://choreo.invalid/a b",
             "https://chöreo.invalid",
+            # `\r` is whitespace a hand-written list of " \t\n" misses, and
+            # twisted refuses to build a URI from it.
+            "https://choreo.invalid\r/a",
+            "https://choreo.invalid/\x00x",
+            # A non-empty authority with no host at all.
+            "https://:443",
+            # Empty userinfo: `username` and `password` are both falsy, and
+            # twisted reads `@choreo.invalid` as the hostname.
+            "https://@choreo.invalid",
+            # `urlparse` raises only when `.port` is READ, which nothing did.
+            "https://choreo.invalid:bad",
+            "https://choreo.invalid:99999",
+            "https://choreo.invalid:0",
         ):
             with self.subTest(url=url):
                 with self.assertRaises(ValueError):
@@ -1253,12 +1629,31 @@ class TestParseConfig(unittest.TestCase):
                         }
                     )
 
+    def test_the_stored_url_is_the_validated_one(self) -> None:
+        """Validating a stripped copy and storing the original is how
+        `"https://host "` passed a check it did not satisfy - and then failed
+        inside twisted's URI parsing on every message."""
+        cfg = PangeaChat.parse_config(
+            {
+                **self.BASE,
+                "moderation": {
+                    "tier2_enabled": True,
+                    "choreo_base_url": "  https://choreo.example.org/api  ",
+                    "choreo_access_token": "syt_x",
+                },
+            }
+        )
+        self.assertEqual(
+            cfg.moderation_choreo_base_url, "https://choreo.example.org/api"
+        )
+
     def test_a_usable_choreo_url_is_accepted(self) -> None:
         for url in (
             "https://choreo.example.org",
             "https://choreo.example.org/",
             "https://choreo.example.org/api",
             "http://127.0.0.1:8080",
+            "https://choreo.example.org:65535",
         ):
             with self.subTest(url=url):
                 cfg = PangeaChat.parse_config(

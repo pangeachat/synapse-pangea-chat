@@ -9,7 +9,7 @@ the module adds no HTTP dependency.
 """
 
 import json
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from twisted.internet import defer
 from twisted.internet.protocol import Protocol, connectionDone
@@ -108,19 +108,48 @@ class _BoundedBody(Protocol):
             return
         self._done = True
         self._chunks = []
-        # Typed `Any` because what arrives here is neither an `ITransport` nor
-        # an `IPushProducer` but twisted's `TransportProxyProducer`, which
-        # implements a hand-picked part of both - `stopProducing` and
-        # `loseConnection`, and no `abortConnection`.
-        transport: Any = self.transport
-        if transport is not None:
-            transport.stopProducing()
-            transport.loseConnection()
+        self._tear_down()
         self._finished.errback(error)
+
+    def _tear_down(self) -> None:
+        """Get the peer to stop sending, as hard as the transport allows.
+
+        Typed `Any` because what arrives here is neither an `ITransport` nor an
+        `IPushProducer` but twisted's `TransportProxyProducer`, which implements
+        a hand-picked part of both. `loseConnection` is a GRACEFUL close: it
+        waits for buffered writes and registered producers, so a peer refusing
+        to read leaves the socket open. `abortConnection` is the one that does
+        not wait, the proxy does not have it, and the real transport underneath
+        does - so it is used when it can be reached, with the graceful pair as
+        the fallback. Reaching through a private attribute is not something to
+        be pleased about; it is here because the alternative is a socket a
+        misbehaving peer can hold open, and this client is replaced wholesale
+        in the chunk that moves to `ModuleApi.http_client`.
+        """
+        transport: Any = self.transport
+        if transport is None:
+            return
+        transport.stopProducing()
+        underlying = getattr(transport, "_producer", None)
+        abort = getattr(transport, "abortConnection", None) or getattr(
+            underlying, "abortConnection", None
+        )
+        if abort is not None:
+            abort()
+            return
+        transport.loseConnection()
 
 
 def _read_body(response: Any) -> Tuple["defer.Deferred[bytes]", _BoundedBody]:
-    finished: "defer.Deferred[bytes]" = defer.Deferred()
+    protocol: _BoundedBody
+
+    def _cancel(_deferred: "defer.Deferred[bytes]") -> None:
+        # Without a canceller a cancelled read fires the deferred and leaves
+        # the connection open with the body still arriving, which is the same
+        # defect the timeout was added to fix, reached by a different door.
+        protocol.abort()
+
+    finished: "defer.Deferred[bytes]" = defer.Deferred(_cancel)
     protocol = _BoundedBody(finished)
     response.deliverBody(protocol)
     return finished, protocol
@@ -182,6 +211,7 @@ async def moderate_text(
     from twisted.web.client import FileBodyProducer
 
     deadline = reactor.seconds() + REQUEST_TIMEOUT_SECONDS
+    failure: Optional[ModerationCheckError] = None
     try:
         d = agent.request(
             b"POST",
@@ -215,19 +245,34 @@ async def moderate_text(
             if timeout.active():
                 timeout.cancel()
     except Exception as e:
-        # `from None`: the caller and `run_as_background_process` both log what
-        # reaches them, and an ordinary `raise X from Y` keeps the original on
-        # `__cause__`, which `logger.exception` prints in full. A transport or
-        # decode error routinely quotes the payload that produced it, so the
-        # chain is dropped rather than relabelled (ADR-10).
-        raise ModerationCheckError(
-            f"moderation request failed: {type(e).__name__}"
-        ) from None
+        # Built here and raised BELOW, outside the `except` block, and that is
+        # not a style choice. `raise X from None` clears `__cause__` and stops
+        # the traceback being RENDERED - it does not clear `__context__`, and
+        # the original is still hanging off the exception for anything that
+        # walks it. A structured log sink does walk it, and a
+        # `json.JSONDecodeError` carries the whole response body on `.doc`, so
+        # the payload travelled out of the module attached to an error whose
+        # own message says only the type. Raising outside the handler leaves
+        # `__context__` empty (ADR-10).
+        failure = ModerationCheckError(f"moderation request failed: {type(e).__name__}")
+    if failure is not None:
+        raise failure
 
     if response.code >= 400:
         raise ModerationCheckError(f"moderation endpoint returned {response.code}")
     try:
         result = json.loads(raw)
-    except json.JSONDecodeError:
-        raise ModerationCheckError("moderation endpoint returned non-JSON") from None
+    except Exception as e:
+        # Not just `JSONDecodeError`: a body that is not valid UTF-8 raises
+        # `UnicodeDecodeError`, which is not a subclass of it. That escaped the
+        # module entirely, reached `run_as_background_process`, and was logged
+        # by `logger.exception` with the undecodable bytes in its args - the
+        # response body, in a plaintext log, by a route no format string of
+        # ours mentions.
+        failure = ModerationCheckError(
+            f"moderation endpoint returned a body we could not read: "
+            f"{type(e).__name__}"
+        )
+    if failure is not None:
+        raise failure
     return _validated_result(result)

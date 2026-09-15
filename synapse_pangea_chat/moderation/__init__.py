@@ -24,6 +24,7 @@ the org trust-and-safety doc it descends from.
 """
 
 import inspect
+import re
 from html.parser import HTMLParser
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -32,10 +33,7 @@ from synapse.events import EventBase
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import NOT_SPAM, ModuleApi
 
-from synapse_pangea_chat.moderation.choreo_client import (
-    ModerationCheckError,
-    moderate_text,
-)
+from synapse_pangea_chat.moderation.choreo_client import moderate_text
 from synapse_pangea_chat.moderation.exempt import (
     CONFIG_KEY,
     ExemptGlobError,
@@ -45,6 +43,7 @@ from synapse_pangea_chat.moderation.exempt import (
 from synapse_pangea_chat.moderation.log_safety import (
     error_site,
     new_digest_key,
+    scrub_reachable_handlers,
     scrubbing_logger,
     sender_digest,
 )
@@ -105,13 +104,43 @@ _BLOCK_LEVEL_TAGS = frozenset(
         "ul",
     }
 )
-# Attribute values a client puts on screen. `alt` is rendered whenever an
-# inline image does not load, and both are read aloud by screen readers, so
-# text parked there is text a reader receives. `href` is deliberately NOT in
-# this set: clients show the link's TEXT, and a URL full of digits is a
-# plausible false positive for the phone rule. Recorded as a limit in
+# Attribute values a client puts on screen, listed as TAG/ATTRIBUTE pairs
+# rather than as bare attribute names. An attribute is displayed only where the
+# renderer displays it: `alt` on an `<img>` is shown whenever the image does not
+# load, and `alt` on a `<b>` is shown by nothing at all, so treating the name
+# alone as displayed text made `<b alt="415-555-2671">hello</b>` a Tier-1 block
+# on a message that reads "hello". Tier 1 blocks before persist, so a false
+# positive silences an innocent learner; the pairs are what the renderers
+# actually implement.
+#
+# `data-mx-spoiler` carries the spoiler's reason and `data-mx-maths` the LaTeX
+# source, both of which Element puts on screen. `href` is deliberately absent:
+# clients show the link's TEXT, and a URL full of digits is a plausible phone
+# false positive. Recorded as a limit in
 # .github/instructions/moderation.instructions.md.
-_DISPLAYED_ATTRIBUTES = frozenset({"alt", "title"})
+_DISPLAYED_ATTRIBUTES = frozenset(
+    {
+        ("img", "alt"),
+        ("img", "title"),
+        ("a", "title"),
+        ("abbr", "title"),
+        ("span", "data-mx-spoiler"),
+        ("span", "data-mx-maths"),
+        ("div", "data-mx-maths"),
+    }
+)
+# Elements whose content is never rendered as text. Including it was a
+# false-positive source with no upside: nobody reads a stylesheet.
+_INVISIBLE_ELEMENTS = frozenset({"script", "style"})
+
+# Python's HTMLParser reads an abruptly-closed comment as an OPEN one and keeps
+# scanning for a later terminator, so everything up to the next `-->` vanishes.
+# HTML5 closes the comment at once and displays what follows
+# (https://html.spec.whatwg.org/multipage/parsing.html#comment-start-state), so
+# `<!-->call 415-555-2671<!-- -->` is a phone number on screen and was nothing
+# at all to the extractor. Rewriting the abrupt form into the well-formed empty
+# comment the spec says it is puts the two back in agreement.
+_ABRUPT_COMMENTS = re.compile(r"<!--?>")
 
 
 class _DisplayedText(HTMLParser):
@@ -125,23 +154,35 @@ class _DisplayedText(HTMLParser):
     both, and fixes them in the order ADR-8a(ii) requires: the tag scanner runs
     over the raw text first, so `&lt;I will kill you&gt;` becomes the visible
     text `<I will kill you>` rather than being decoded into a tag and deleted.
+
+    Attribute text is collected into a SECOND stream and appended afterwards,
+    never spliced in where the tag stood. Inline elements concatenate, so
+    `41<b title="notes">5</b>-555-2671` reads `415-555-2671` on screen;
+    inserting the attribute between the `41` and the `5` broke the number in
+    half and lost the match. Two streams keep the visible text contiguous and
+    still let a rule see what an attribute is hiding.
     """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._parts: List[str] = []
+        self.attribute_text: List[str] = []
+        self._invisible_depth = 0
 
     def handle_data(self, data: str) -> None:
-        self._parts.append(data)
+        if self._invisible_depth == 0:
+            self._parts.append(data)
 
     def _handle_tag(self, tag: str, attrs: Sequence[Tuple[str, Optional[str]]]) -> None:
         if tag in _BLOCK_LEVEL_TAGS:
             self._parts.append("\n")
         for name, value in attrs:
-            if name in _DISPLAYED_ATTRIBUTES and value:
-                self._parts.append(f"\n{value}\n")
+            if value and (tag, name) in _DISPLAYED_ATTRIBUTES:
+                self.attribute_text.append(value)
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag in _INVISIBLE_ELEMENTS:
+            self._invisible_depth += 1
         self._handle_tag(tag, attrs)
 
     def handle_startendtag(
@@ -150,28 +191,35 @@ class _DisplayedText(HTMLParser):
         self._handle_tag(tag, attrs)
 
     def handle_endtag(self, tag: str) -> None:
+        if tag in _INVISIBLE_ELEMENTS and self._invisible_depth > 0:
+            self._invisible_depth -= 1
         if tag in _BLOCK_LEVEL_TAGS:
             self._parts.append("\n")
 
+    def unknown_decl(self, data: str) -> None:
+        """A `<![CDATA[...]]>` section, which is displayed text outside SVG.
+
+        HTML5 has no CDATA in an HTML body: `<!` followed by anything that is
+        not `--` or `DOCTYPE` becomes a bogus comment that ends at the FIRST
+        `>`, so everything after that `>` is on screen. Python's parser instead
+        swallows the whole section up to `]]>`, which made
+        `<![CDATA[>call 415-555-2671]]>` invisible to both tiers and a phone
+        number to every reader.
+        """
+        _, separator, displayed = data.partition(">")
+        if separator and self._invisible_depth == 0:
+            self._parts.append(displayed)
+
     def result(self) -> str:
-        return "".join(self._parts)
+        return "".join(self._parts + ["\n" + a for a in self.attribute_text])
 
 
 def _displayed_text(formatted: str) -> str:
     """The reader-visible text of an HTML body, never less than it displays."""
     parser = _DisplayedText()
-    parser.feed(formatted)
+    parser.feed(_ABRUPT_COMMENTS.sub("<!---->", formatted))
     parser.close()
-    text = parser.result()
-    # An unterminated tag at the end of the string is consumed and discarded by
-    # the parser, as a sanitiser would discard it. Its raw tail is appended all
-    # the same: over-reading text nobody sees can only cost a false positive on
-    # malformed HTML, while under-reading is the bypass this whole function
-    # exists to prevent, and the two are not symmetric.
-    last_open = formatted.rfind("<")
-    if last_open != -1 and ">" not in formatted[last_open:]:
-        text = f"{text}\n{formatted[last_open + 1:]}"
-    return text
+    return parser.result()
 
 
 class ChatModeration:
@@ -201,6 +249,13 @@ class ChatModeration:
         # Keyed per instance so a Matrix ID cannot be recovered from a log
         # line by enumeration; see moderation.log_safety.
         self._log_digest_key = new_digest_key()
+        # A handler may carry its own `LoggingContextFilter` - Synapse still
+        # documents that configuration - and a handler's filters run AFTER the
+        # logger's, so such a handler puts the sender's Matrix ID back on a
+        # record this module had already cleaned. Done here rather than at
+        # import so it runs once moderation is actually enabled, by which time
+        # the deployment's logging config is in place.
+        scrub_reachable_handlers(logger)
 
         if config.moderation_tier1_enabled:
             api.register_spam_checker_callbacks(
@@ -376,12 +431,26 @@ class ChatModeration:
                 base_url=self._config.moderation_choreo_base_url,
                 access_token=self._config.moderation_choreo_access_token,
             )
-        except ModerationCheckError as e:
+        except Exception as exc:
             # silent-ok: fail-open by contract — the choreo handler itself
-            # fails open on provider errors, and a transport failure here
-            # must not crash the background task. Logged with reason type.
+            # fails open on provider errors, and a transport failure here must
+            # not crash the background task.
+            #
+            # `Exception`, not `ModerationCheckError`, and the widening is the
+            # point: this coroutine runs under `run_as_background_process`,
+            # which calls `logger.exception` on anything that reaches it, so
+            # every exception that escapes this frame is a plaintext log record
+            # written by Synapse with whatever the exception was carrying. The
+            # client is meant to raise only `ModerationCheckError`; catching
+            # only that made the rule depend on the client being perfect, and
+            # a `UnicodeDecodeError` out of `json.loads` was the counterexample
+            # - it carried the response body into Synapse's logger. The type
+            # and site are logged; the exception's own message is not.
             logger.warning(
-                "tier2 moderation check unavailable for %s: %s", event.event_id, e
+                "tier2 moderation check unavailable for %s at %s (%s)",
+                event.event_id,
+                error_site(exc),
+                type(exc).__name__,
             )
             return
 
@@ -454,25 +523,41 @@ def _is_replacement(content: Mapping[str, Any]) -> bool:
     )
 
 
+# Fields whose value a client renders as text. `body` is the message or the
+# caption; `filename` is the original name of an attachment, which a client
+# shows beside or instead of the caption whenever the two differ
+# (https://spec.matrix.org/v1.16/client-server-api/#mfile). Reading `body`
+# alone let a sender put anything in `filename` and have it displayed.
+_DISPLAYED_TEXT_FIELDS = ("body", "filename")
+
+
 def _surface_text(surface: Mapping[str, Any]) -> List[str]:
     """Every displayed string carried by one content surface."""
     parts: List[str] = []
-    body = surface.get("body")
-    if isinstance(body, str):
-        if body.strip():
-            parts.append(body)
-    elif body is not None:
-        # A `body` that is not a string is malformed, and malformed is not the
-        # same as absent: `EventValidator` only requires `body` to be present
-        # for the msgtypes it knows, and a client that renders one renders
-        # `str(body)`. Dropping it on a type test is the extraction bypass in
-        # its smallest form, so the value is stringified and matched.
-        parts.append(str(body))
+    for field in _DISPLAYED_TEXT_FIELDS:
+        parts.extend(_field_text(surface.get(field)))
     formatted = surface.get("formatted_body")
     if isinstance(formatted, str) and formatted.strip():
         displayed = _displayed_text(formatted)
         if displayed.strip():
             parts.append(displayed)
+    return parts
+
+
+def _field_text(body: Any) -> List[str]:
+    parts: List[str] = []
+    if isinstance(body, str):
+        if body.strip():
+            parts.append(body)
+    elif body is not None:
+        # A non-string here is malformed, and malformed is not the same as
+        # absent. Synapse's `EventValidator` runs on events this homeserver
+        # CREATES; `on_new_event` also sees events that arrived over
+        # federation, where the sending homeserver decides what passes, and a
+        # client that renders a non-string field renders `str(...)` of it.
+        # Dropping it on a type test is the extraction bypass in its smallest
+        # form, so the value is stringified and matched.
+        parts.append(str(body))
     return parts
 
 
