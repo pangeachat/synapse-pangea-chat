@@ -23,7 +23,7 @@ from synapse_pangea_chat.grant_instructor_analytics_access import (
     GrantInstructorAnalyticsAccess,
 )
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
-from synapse_pangea_chat.moderation import ChatModeration
+from synapse_pangea_chat.moderation import ChatModeration, tier1_prefilter
 from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
@@ -634,27 +634,13 @@ class PangeaChat:
         if not isinstance(moderation_tier1_enabled, bool):
             raise ValueError('Config "moderation.tier1_enabled" must be a boolean')
 
-        moderation_tier1_phone_regions = moderation.get("tier1_phone_regions", ["US"])
-        if not isinstance(moderation_tier1_phone_regions, list) or not all(
-            isinstance(r, str) and r.strip() for r in moderation_tier1_phone_regions
-        ):
-            raise ValueError(
-                'Config "moderation.tier1_phone_regions" must be a list of '
-                "non-empty strings"
-            )
-        if not moderation_tier1_phone_regions:
-            # The matcher iterates the region list, so an empty list runs it
-            # zero times and turns the phone rule off entirely - including for
-            # international +CC numbers, which the docs say match regardless
-            # of region, because libphonenumber still needs a region argument
-            # to be given one. There is no way to express "international only"
-            # here, so an empty list can only be a mistake, and a Tier-1 rule
-            # must not switch itself off quietly.
-            raise ValueError(
-                'Config "moderation.tier1_phone_regions" must name at least '
-                "one region; an empty list disables phone matching entirely, "
-                "including international formats"
-            )
+        # Validated against libphonenumber's own region list, not just for
+        # shape: every wrong value here - an empty list, "us", "US " - is a
+        # string of the right type that the matcher finds no numbers for, so
+        # the phone rule silently does not run. See tier1_prefilter.
+        moderation_tier1_phone_regions = tier1_prefilter.validate_phone_regions(
+            moderation.get("tier1_phone_regions", ["US"])
+        )
 
         moderation_tier2_enabled = moderation.get("tier2_enabled", False)
         if not isinstance(moderation_tier2_enabled, bool):

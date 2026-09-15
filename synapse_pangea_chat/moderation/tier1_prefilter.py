@@ -13,7 +13,7 @@ English-centric, with Tier 2 as its backstop.
 
 import logging
 import re
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional
 
 import phonenumbers
 
@@ -51,6 +51,44 @@ _ADDRESS_RE = re.compile(
     r"\b\d{1,5}\s+(?:[A-Za-z][a-z'.-]*\s+){1,4}(?:" + _STREET_SUFFIXES + r")\.?\b",
     re.IGNORECASE,
 )
+
+
+def validate_phone_regions(regions: object) -> List[str]:
+    """Return the configured regions, or raise `ValueError` describing why not.
+
+    Validated at config-parse time, against libphonenumber's own list, because
+    every way of getting this key wrong fails the same way: the matcher loops
+    over the regions it was given and finds nothing, so the phone rule
+    silently does not run. A shape check alone does not catch it - `[]` runs
+    zero passes, and `"us"` or `"US "` are strings of the right type that
+    libphonenumber does not recognise, so both return no matches for a number
+    the operator believes is blocked. Neither says anything at any log level.
+
+    An empty list is refused rather than read as "international numbers only":
+    libphonenumber still needs a region to match against, so there is no way
+    to express that here, and an empty list can only be a mistake.
+    """
+    if not isinstance(regions, list) or not all(
+        isinstance(region, str) for region in regions
+    ):
+        raise ValueError(
+            'Config "moderation.tier1_phone_regions" must be a list of strings'
+        )
+    if not regions:
+        raise ValueError(
+            'Config "moderation.tier1_phone_regions" must name at least one '
+            "region; an empty list disables phone matching entirely, "
+            "including international formats"
+        )
+    for region in regions:
+        if region not in phonenumbers.SUPPORTED_REGIONS:
+            raise ValueError(
+                f'Config "moderation.tier1_phone_regions" entry {region!r} is '
+                "not a region libphonenumber knows. Use the uppercase ISO "
+                "3166-1 alpha-2 code, with no surrounding whitespace - "
+                '"US", not "us" or "US ".'
+            )
+    return list(regions)
 
 
 def contains_phone_number(text: str, regions: Iterable[str]) -> bool:

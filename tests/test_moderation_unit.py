@@ -443,16 +443,32 @@ class TestParseConfig(unittest.TestCase):
                         }
                     )
 
-    def test_empty_phone_region_list_is_refused(self) -> None:
-        """The matcher iterates the region list, so an empty list silently
-        turns the phone rule off - international numbers included."""
-        with self.assertRaises(ValueError):
-            PangeaChat.parse_config(
-                {
-                    **self.BASE,
-                    "moderation": {"tier1_enabled": True, "tier1_phone_regions": []},
-                }
-            )
+    def test_unusable_phone_regions_are_refused(self) -> None:
+        """Every wrong value here fails the same way and says nothing: the
+        matcher loops over the regions it was given, finds no numbers, and the
+        phone rule silently does not run. A shape check does not catch any of
+        these - they are all lists of strings."""
+        for regions in ([], ["us"], ["US "], ["USA"], ["ZZ"], ["US", "xx"]):
+            with self.subTest(regions=regions):
+                with self.assertRaises(ValueError):
+                    PangeaChat.parse_config(
+                        {
+                            **self.BASE,
+                            "moderation": {
+                                "tier1_enabled": True,
+                                "tier1_phone_regions": regions,
+                            },
+                        }
+                    )
+
+    def test_valid_phone_regions_are_accepted(self) -> None:
+        cfg = PangeaChat.parse_config(
+            {
+                **self.BASE,
+                "moderation": {"tier1_phone_regions": ["US", "FR", "GB"]},
+            }
+        )
+        self.assertEqual(cfg.moderation_tier1_phone_regions, ["US", "FR", "GB"])
 
     def test_match_everything_glob_parses_with_a_warning(self) -> None:
         """EX-5. Exempting everyone is the operator's call to make; the
