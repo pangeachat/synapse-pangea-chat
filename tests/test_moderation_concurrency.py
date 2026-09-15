@@ -179,6 +179,12 @@ class FakeClock:
         self._now += seconds
         self.run_pending()
 
+    def shut_down(self) -> None:
+        """What `synapse.util.Clock.shutdown()` does, which is not just
+        refusing new calls: it CANCELS every delayed call it is tracking."""
+        self.shutdown = True
+        self._pending = []
+
     def fire_looping(self) -> None:
         for f, _interval, args in list(self.looping):
             f(*args)
@@ -550,15 +556,17 @@ class _Hs:
 
     hostname = "example.org"
 
-    def __init__(self, clock: "FakeClock" = None) -> None:  # type: ignore[assignment]
+    def __init__(self, clock: "FakeClock") -> None:
         self.shutdown_handlers: List[Any] = []
         self.clock = clock
+        # Replaced by a test that needs `callLater` to fail. An attribute
+        # rather than an override of the method, so a test can swap it without
+        # assigning over a method - which is both a type error and a less
+        # honest double.
+        self.call_later: Callable[..., Any] = clock.reactor_call_later
 
     def get_reactor(self) -> Any:
-        from types import SimpleNamespace
-
-        assert self.clock is not None
-        return SimpleNamespace(callLater=self.clock.reactor_call_later)
+        return SimpleNamespace(callLater=self.call_later)
 
     def register_async_shutdown_handler(
         self, *, phase: str, eventType: str, shutdown_func: Any
@@ -734,6 +742,64 @@ class DispatcherTestCase(unittest.TestCase):
         self.assertEqual(
             self.reader.delta(
                 "pangea_moderation_tier2_dropped_total", cause="stopping"
+            ),
+            1.0,
+        )
+
+    def test_a_cancelled_wakeup_does_not_look_like_a_pending_one(self) -> None:
+        # `Clock.shutdown()` cancels the delayed calls it is tracking. A
+        # dispatcher that remembered "a wakeup is scheduled" as a BOOLEAN then
+        # coalesced every later enqueue into a wakeup that would never fire:
+        # accepted jobs, every worker parked, nothing pending, nothing
+        # counted. The handle knows; a flag cannot.
+        self.dispatcher.start()
+        self._drain()
+        self.assertTrue(self.dispatcher.enqueue(self._job("$a")))
+        # $a's wakeup is scheduled but has not fired yet.
+        self.clock.shut_down()
+        self.reader.snapshot("pangea_moderation_tier2_dropped_total", cause="no_clock")
+        self.assertFalse(
+            self.dispatcher.enqueue(self._job("$b")),
+            "a job was accepted with no wakeup that will ever fire",
+        )
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="no_clock"
+            ),
+            1.0,
+        )
+
+    def test_a_job_that_fails_in_the_handler_is_counted(self) -> None:
+        # A job that raises before reaching the checker never reaches the
+        # checker's outcome counter either, so without this it vanishes:
+        # accepted, never checked, and absent from every metric.
+        self.dispatcher.start()
+        self._drain()
+        self.handler.raise_for.add("$boom")
+        self.reader.snapshot(
+            "pangea_moderation_tier2_dropped_total", cause="handler_error"
+        )
+        self.dispatcher.enqueue(self._job("$boom"))
+        self._drain()
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="handler_error"
+            ),
+            1.0,
+        )
+
+    def test_a_job_cancelled_under_a_worker_is_counted(self) -> None:
+        self.dispatcher.start()
+        self.handler.hold = True
+        self._drain()
+        self.dispatcher.enqueue(self._job("$victim"))
+        self._drain()
+        self.reader.snapshot("pangea_moderation_tier2_dropped_total", cause="cancelled")
+        self.dispatcher._kill_worker_for_test(0)
+        self._drain()
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="cancelled"
             ),
             1.0,
         )
@@ -942,7 +1008,7 @@ class DispatcherTestCase(unittest.TestCase):
         def _refuse(*_args: Any, **_kwargs: Any) -> Any:
             raise RuntimeError("reactor is stopping")
 
-        self.hs.get_reactor = lambda: SimpleNamespace(callLater=_refuse)  # type: ignore[method-assign]
+        self.hs.call_later = _refuse
         drained = start_worker(self.dispatcher.shutdown)
         self.assertTrue(
             drained.called, "an unbounded wait is worse than an abandoned one"

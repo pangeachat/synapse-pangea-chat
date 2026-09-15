@@ -130,6 +130,14 @@ TIER2_BREAKER_STATE = _get_or_create(
     "Tier 2 choreo circuit breaker: 0 closed, 1 half-open, 2 open.",
 )
 
+TIER2_SHUTDOWN_INFLIGHT = _get_or_create(
+    Gauge,
+    "pangea_moderation_tier2_shutdown_inflight",
+    "Checks that were still running when a shutdown began. Emitted "
+    "synchronously, so it survives a reactor that stops before the drain "
+    "finishes.",
+)
+
 TIER2_ACTIVE = _get_or_create(
     Gauge,
     "pangea_moderation_tier2_active",
@@ -177,6 +185,10 @@ DROP_CAUSES = frozenset(
         "drain_timeout",
         # The queue could not be woken - the reactor clock was already down.
         "no_clock",
+        # The job reached a worker and raised before producing a verdict.
+        "handler_error",
+        # The job was cancelled after a worker picked it up.
+        "cancelled",
     }
 )
 

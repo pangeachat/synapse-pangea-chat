@@ -188,13 +188,44 @@ class _BoundedBody(Protocol):
             ModerationCheckError("moderation response body timed out", KIND_TIMEOUT)
         )
 
+    def tear_down_only(self) -> None:
+        """End the exchange and leave the Deferred to somebody else.
+
+        The cancellation path, and the difference from `abort` is the whole
+        point of it. `abort` errbacks with a timeout of ours, which PRE-EMPTS
+        the `CancelledError` twisted is about to deliver - so a cancelled
+        worker saw a moderation failure, absorbed it, and carried on running
+        behind a Deferred that had already fired. Here the connection is torn
+        down and twisted's own cancellation is left to fire, so the
+        cancellation reaches the coroutine that is being stopped.
+        """
+        if self._done:
+            return
+        self._done = True
+        self._chunks = []
+        self._safe_tear_down()
+
     def _fail(self, error: Exception) -> None:
         if self._done:
             return
         self._done = True
         self._chunks = []
-        self._tear_down()
+        # Teardown first, but never at the cost of the errback. `_done` is
+        # already set, so a teardown that raised used to mean the awaiting
+        # coroutine was never resumed AT ALL - a check that neither completes
+        # nor fails, one per occurrence, with nothing logged because nothing
+        # has failed. Ending the wait is the guarantee; ending the connection
+        # is best-effort on top of it.
+        self._safe_tear_down()
         self._finished.errback(error)
+
+    def _safe_tear_down(self) -> None:
+        try:
+            self._tear_down()
+        except Exception:
+            # silent-ok: a transport failure's own message can quote what was
+            # on the wire, so it is named by type only (ADR-10).
+            logger.warning("tier2 moderation response teardown failed")
 
     def _tear_down(self) -> None:
         """Get the peer to stop sending, as hard as the transport allows.
@@ -231,7 +262,13 @@ def _read_body(response: Any) -> Tuple["defer.Deferred[bytes]", _BoundedBody]:
         # Without a canceller a cancelled read fires the deferred and leaves
         # the connection open with the body still arriving, which is the same
         # defect the timeout was added to fix, reached by a different door.
-        protocol.abort()
+        #
+        # `tear_down_only`, not `abort`: the caller is being CANCELLED, and
+        # errbacking with a timeout of ours here would replace the
+        # `CancelledError` twisted is about to deliver. The cancellation has
+        # to survive the transport, or the worker being stopped absorbs it as
+        # an ordinary moderation failure and carries on.
+        protocol.tear_down_only()
 
     finished: "defer.Deferred[bytes]" = defer.Deferred(_cancel)
     protocol = _BoundedBody(finished)
@@ -363,14 +400,20 @@ async def _moderate_text(
         def _abort_headers() -> None:
             timed_out[0] = True
             _from_reactor(request.cancel)
+            # Whatever the canceller did or failed to do, OUR wait ends here.
+            # A canceller that raises would otherwise leave this coroutine
+            # parked with no timer left to save it - a check that neither
+            # completes nor fails, holding a worker and, when it is the
+            # half-open probe, the breaker's only permit.
+            _end_wait(request, "moderation request timed out")
 
-        header_timeout = clock.call_later(
-            _SecondsInterval(max(deadline - clock.time(), 0)), _abort_headers
+        header_timeout = _arm(
+            clock, deadline, _abort_headers, on_failure=_abort_headers
         )
         try:
             response = await make_deferred_yieldable(request)
         finally:
-            if header_timeout.active():
+            if header_timeout is not None and header_timeout.active():
                 header_timeout.cancel()
         # The body read needs its own deadline, and this is not a
         # belt-and-braces second one. The request deferred fires as soon as the
@@ -386,18 +429,25 @@ async def _moderate_text(
         def _abort_body() -> None:
             timed_out[0] = True
             _from_reactor(body_protocol.abort)
+            _end_wait(body_deferred, "moderation response body timed out")
 
         # `call_later`, not a deferred timeout: ending the wait is not enough,
         # the connection has to be torn down, and cancelling a read only fires
         # the deferred. See `_BoundedBody`.
-        timeout = clock.call_later(
-            _SecondsInterval(max(deadline - clock.time(), 0)), _abort_body
-        )
+        timeout = _arm(clock, deadline, _abort_body, on_failure=_abort_body)
         try:
             raw = await make_deferred_yieldable(body_deferred)
         finally:
-            if timeout.active():
+            if timeout is not None and timeout.active():
                 timeout.cancel()
+    except defer.CancelledError:
+        # NOT converted. The transport is the last place a cancellation can be
+        # turned into an ordinary moderation failure, and turning it into one
+        # is how a cancelled worker absorbs its own stop signal and carries on
+        # running behind a Deferred that has already fired. It travels up
+        # through `ChoreoChecker` and the worker's `_run`, both of which
+        # re-raise it for the same reason.
+        raise
     except ModerationCheckError:
         # Already classified at the raise site, and left alone. The body
         # reader is the only thing that raises this from inside the block, it
@@ -434,6 +484,47 @@ async def _moderate_text(
             KIND_DECODE,
         ) from None
     return _validated_result(result)
+
+
+def _arm(
+    clock: Any,
+    deadline: float,
+    action: Callable[[], None],
+    *,
+    on_failure: Callable[[], None],
+) -> Any:
+    """Schedule ``action`` for ``deadline``, or end the exchange now.
+
+    `Clock.call_later` raises once the clock has been shut down, and the
+    request has already been issued by the time that happens. Returning a
+    failure and walking away would leave the exchange alive with nobody
+    reading it and no timer to end it; so if the deadline cannot be scheduled,
+    it is applied immediately instead.
+    """
+    try:
+        return clock.call_later(
+            _SecondsInterval(max(deadline - clock.time(), 0)), action
+        )
+    except Exception:
+        # silent-ok: the clock is down, which means the process is stopping.
+        # The exchange is ended rather than reported on.
+        on_failure()
+        return None
+
+
+def _end_wait(deferred: "defer.Deferred[Any]", message: str) -> None:
+    """Make sure a deadline ends the WAIT, whatever the teardown managed.
+
+    The teardown is best-effort - a canceller can raise, a transport can
+    already be gone - but the coroutine awaiting this Deferred must be
+    resumed either way. Without this, a teardown that raised produced a check
+    that never completes and never fails: no log, no metric, and a worker held
+    for the life of the process.
+    """
+    if deferred.called:
+        return
+    with PreserveLoggingContext():
+        deferred.errback(ModerationCheckError(message, KIND_TIMEOUT))
 
 
 def _from_reactor(action: Callable[[], None]) -> None:

@@ -553,14 +553,24 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         return cast(AsyncMock, mock)
 
     async def test_activity_room_skipped(self) -> None:
-        mod = _moderation(self._tier2_config())
+        """Asserted on the QUEUE, which is the route production takes.
+
+        It used to be asserted on `run_as_background_process`, which Tier 2
+        no longer dispatches through at all - so replacing the activity-room
+        check with an unconditional `False` left the test green while every
+        activity room was double-moderated.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._tier2_config())
+        assert mod._dispatcher is not None
         state = {(PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE, ""): MagicMock()}
-        background = _BackgroundProcessDouble()
-        with patch(
-            "synapse_pangea_chat.moderation.run_as_background_process", background
-        ):
+        with patch(MODERATE_TEXT, self._verdict()) as moderate:
             await mod.on_new_event(_event("you suck"), state)
-            self.assertEqual(background.calls, [])
+            self.assertEqual(mod._dispatcher.queue_depth, 0)
+            homeserver.clock.drain()
+        moderate.assert_not_awaited()
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
 
     async def test_plain_room_dispatches(self) -> None:
         """Driven all the way through to the redaction, on purpose.
@@ -1418,6 +1428,9 @@ class _FakeTransport:
         self.stopped = False
         self.lost = False
         self.aborted = False
+        # A transport that is already gone raises from `stopProducing`. The
+        # teardown is best-effort; ending the caller's wait is not.
+        self.teardown_raises = False
         if underlying is not None:
             # twisted's proxy keeps the real transport on `_producer`, and the
             # real transport is where `abortConnection` lives.
@@ -1425,6 +1438,8 @@ class _FakeTransport:
 
     def stopProducing(self) -> None:
         self.stopped = True
+        if self.teardown_raises:
+            raise RuntimeError("transport is already gone")
 
     def loseConnection(self) -> None:
         self.lost = True
@@ -1452,11 +1467,13 @@ class _FakeResponse:
         body: Optional[bytes] = None,
         chunks: Optional[List[bytes]] = None,
         underlying: Optional[Any] = None,
+        teardown_raises: bool = False,
     ) -> None:
         self.code = code
         self._chunks = chunks if chunks is not None else ([body] if body else None)
         self.protocol: Any = None
         self.transport = _FakeTransport(underlying=underlying)
+        self.transport.teardown_raises = teardown_raises
 
     def deliverBody(self, protocol: Any) -> None:
         self.protocol = protocol
@@ -1570,6 +1587,13 @@ class _LogcontextLeakWatch(logging.Handler):
             logger.removeHandler(self)
 
 
+class _DeadClock(_SynapseClock):
+    """A clock that refuses to schedule, as Synapse's does after shutdown."""
+
+    def call_later(self, delay: Any, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        raise Exception("Cannot start delayed call. Clock has been shutdown")
+
+
 class _FakeAgent:
     """An `IAgent` double that checks the request it was handed.
 
@@ -1593,6 +1617,7 @@ class _FakeAgent:
         self.sent_bodies: List[bytes] = []
         self.clock: Optional[Clock] = None
         self.cancelled = False
+        self.canceller_raises = False
 
     def request(
         self, method: bytes, uri: bytes, headers: Any = None, bodyProducer: Any = None
@@ -1618,6 +1643,8 @@ class _FakeAgent:
             # double that errbacked `CancelledError` would let a client that
             # could not tell them apart pass.
             self.cancelled = True
+            if self.canceller_raises:
+                raise RuntimeError("canceller blew up")
             self.response.transport.aborted = True
             deferred.errback(
                 ResponseNeverReceived([Failure(ConnectionAborted("aborted"))])
@@ -1813,8 +1840,7 @@ class TestChoreoClient(unittest.TestCase):
     def test_a_cancelled_check_tears_the_connection_down(self) -> None:
         """A Deferred with no canceller fires on cancel and leaves the
         connection open with the body still arriving - the same defect the
-        timeout exists to fix, reached through a different door. Shutdown and
-        the per-job deadline both cancel in-flight checks."""
+        timeout exists to fix, reached through a different door."""
         clock = Clock()
         response = _FakeResponse()
         agent = _FakeAgent(response)
@@ -1822,12 +1848,107 @@ class TestChoreoClient(unittest.TestCase):
         self.assertEqual(results, [])
         deferred.cancel()
         self.assertEqual(len(results), 1)
-        results[0].trap(ModerationCheckError)
         self.assertTrue(response.transport.stopped, "the peer was not stopped")
         self.assertTrue(
             response.transport.lost or response.transport.aborted,
             "the connection was left open",
         )
+
+    def test_a_cancelled_check_stays_cancelled(self) -> None:
+        """The cancellation has to SURVIVE the transport.
+
+        Cancelling a check means stopping the worker running it - a drain, a
+        supervisor. The body reader's canceller used to errback with a timeout
+        of its own, which pre-empted the `CancelledError` twisted was about to
+        deliver: the worker then saw an ordinary moderation failure, absorbed
+        it by contract, and carried on running behind a Deferred that had
+        already fired. The pool grew by one every time.
+        """
+        clock = Clock()
+        response = _FakeResponse()
+        agent = _FakeAgent(response)
+        deferred, results = self._call(agent, clock)
+        deferred.cancel()
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], Failure)
+        results[0].trap(defer.CancelledError)
+
+    def test_a_canceller_that_raises_still_ends_the_wait(self) -> None:
+        """Teardown is best-effort; ending the wait is not.
+
+        A canceller that raises left the coroutine parked with its deadline
+        already spent - a check that neither completes nor fails, holding a
+        worker and, when it is the half-open probe, the breaker's only permit,
+        for the life of the process.
+        """
+        clock = Clock()
+        response = _FakeResponse()
+        agent = _FakeAgent(response, headers_after=REQUEST_TIMEOUT_SECONDS * 10)
+        agent.clock = clock
+        agent.canceller_raises = True
+        _deferred, results = self._call(agent, clock)
+        self.assertEqual(results, [])
+        clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        self.assertEqual(len(results), 1, "the check was never resumed")
+        error = results[0].value
+        self.assertIsInstance(error, ModerationCheckError)
+        self.assertEqual(error.kind, "timeout")
+
+    def test_an_oversized_body_reports_the_cap_even_if_teardown_raises(self) -> None:
+        """The size cap's own errback, isolated from the deadline's.
+
+        `_fail` sets `_done` before tearing down, so a teardown that raised
+        used to skip the errback entirely and let the exception escape through
+        `dataReceived` instead - the check then failed with whatever the
+        transport raised rather than with the reason it was refused, and on
+        the paths where no deadline is left to catch it, not at all.
+        """
+        clock = Clock()
+        chunk = b"x" * 65536
+        response = _FakeResponse(
+            chunks=[chunk] * (MAX_RESPONSE_BYTES // len(chunk) + 2),
+            teardown_raises=True,
+        )
+        agent = _FakeAgent(response)
+        _deferred, results = self._call(agent, clock)
+        self.assertEqual(len(results), 1)
+        error = results[0].value
+        self.assertIsInstance(error, ModerationCheckError)
+        self.assertIn("more than", str(error), str(error))
+
+    def test_a_body_teardown_that_raises_still_ends_the_wait(self) -> None:
+        clock = Clock()
+        response = _FakeResponse(teardown_raises=True)
+        agent = _FakeAgent(response)
+        _deferred, results = self._call(agent, clock)
+        self.assertEqual(results, [])
+        clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        self.assertEqual(len(results), 1, "the body read was never resumed")
+        results[0].trap(ModerationCheckError)
+
+    def test_an_unschedulable_deadline_ends_the_exchange_now(self) -> None:
+        """`Clock.call_later` raises once the clock is shut down, and the
+        request has already gone out by then. Reporting a failure and walking
+        away would leave the exchange alive with nobody reading it and no
+        timer left to end it."""
+        clock = Clock()
+        response = _FakeResponse()
+        agent = _FakeAgent(response, headers_after=REQUEST_TIMEOUT_SECONDS * 10)
+        agent.clock = clock
+        deferred = defer.ensureDeferred(
+            moderate_text(
+                "some text",
+                base_url="http://choreo.invalid",
+                access_token="syt_x",
+                agent=agent,
+                clock=_DeadClock(clock),
+            )
+        )
+        results: List[Any] = []
+        deferred.addBoth(results.append)
+        self.assertEqual(len(results), 1, "the check was left pending")
+        results[0].trap(ModerationCheckError)
+        self.assertTrue(agent.cancelled, "the request was left in flight")
 
     def test_a_timeout_aborts_rather_than_closing_gracefully(self) -> None:
         """`loseConnection` is a GRACEFUL close: it waits for buffered writes

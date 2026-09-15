@@ -265,6 +265,18 @@ class TestModerationLogcontext(BaseSynapseE2ETest):
                 [],
                 "shutdown leaked a logcontext:\n" + "\n".join(self._leaks()),
             )
+            # And the drain RAN. Leak strings are an absence assertion: they
+            # are satisfied just as well by a shutdown handler that was never
+            # registered, or one that returned immediately - in which case
+            # this half of the test proves nothing about the code it names.
+            # The dispatcher says what it did on the way down, so that line is
+            # the evidence.
+            log = "\n".join(self.server_stdout_lines + self.server_stderr_lines)
+            self.assertIn(
+                "tier2 moderation shutting down with",
+                log,
+                "the shutdown handler never ran, so the drain is untested",
+            )
         finally:
             mock_moderation.stop()
             self.stop_synapse(

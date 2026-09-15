@@ -142,7 +142,7 @@ class Tier2Dispatcher:
         self._stopping = False
         self._started = False
         self._drained = False
-        self._wakeup_scheduled = False
+        self._wakeup_call: Any = None
         self._drain_waiters: List["defer.Deferred[None]"] = []
         self._drain_deadline: Any = None
 
@@ -246,21 +246,45 @@ class Tier2Dispatcher:
         return True
 
     def _schedule_wakeup(self) -> bool:
-        if not self._waiters or self._wakeup_scheduled:
-            # No parked worker to wake, or a wakeup already pending. The
-            # pending one wakes as many workers as there is work for, so
-            # coalescing cannot strand a job.
+        if not self._waiters:
+            # No parked worker to wake. Whichever worker is running will take
+            # this job when it comes back for one.
+            return True
+        if self._wakeup_pending():
+            # A wakeup is already scheduled, and it wakes as many workers as
+            # there is work for, so coalescing cannot strand a job.
             return True
         try:
-            self._clock.call_later(_SecondsInterval(0.0), self._wake_available)
+            self._wakeup_call = self._clock.call_later(
+                _SecondsInterval(0.0), self._wake_available
+            )
         except Exception:
             # `Clock.call_later` raises once the clock has been shut down.
+            self._wakeup_call = None
             return False
-        self._wakeup_scheduled = True
         return True
 
+    def _wakeup_pending(self) -> bool:
+        """Is a wakeup actually still going to happen?
+
+        The handle, not a boolean. `Clock.shutdown()` CANCELS every delayed
+        call the clock is tracking, so a flag set when the wakeup was
+        scheduled goes on claiming a wakeup that will never fire - and every
+        later enqueue then coalesces into it and is accepted, leaving jobs on
+        the queue with every worker parked, no wakeup pending, and nothing
+        counted. Asking the handle whether it is still active cannot be wrong
+        in that direction.
+        """
+        call = self._wakeup_call
+        if call is None:
+            return False
+        try:
+            return bool(call.active())
+        except Exception:
+            return False
+
     def _wake_available(self) -> None:
-        self._wakeup_scheduled = False
+        self._wakeup_call = None
         count = min(len(self._waiters), len(self._queue))
         for _ in range(count):
             self._wake_one()
@@ -342,12 +366,24 @@ class Tier2Dispatcher:
             # stop, and swallowing it leaves a consumer running behind a
             # Deferred that has already fired - which is how the pool grows
             # without bound. The `finally` below still releases the job.
+            #
+            # Counted on the way past, because the message was accepted and
+            # will not be checked, and an uncounted one is a silent drop
+            # whichever door it left by.
+            metrics.record_drop("cancelled")
             raise
         except Exception as exc:
             # silent-ok: fail-open by contract, and the loop has to survive.
             # A worker that dies leaves the pool one short for the life of
             # the process, and `run_as_background_process` swallows what
             # reaches it - so an unhandled exception here is invisible.
+            #
+            # Counted for the same reason as the cancellation above: a job
+            # that fails BEFORE the checker runs never reaches the checker's
+            # own outcome counter, so without this it disappears from the
+            # metrics entirely - accepted, never checked, never accounted
+            # for.
+            metrics.record_drop("handler_error")
             logger.warning(
                 "tier2 job failed for %s at %s (%s)",
                 job.event_id,
@@ -458,6 +494,22 @@ class Tier2Dispatcher:
             )
 
         self._wake_all()
+
+        # Recorded SYNCHRONOUSLY, before anything that can be awaited or
+        # cancelled. The drain that follows may never finish: Synapse 1.159
+        # launches a registered shutdown handler and discards its Deferred, so
+        # if the reactor stops first, neither the deadline nor the
+        # abandonment accounting runs at all. This gauge and this log line are
+        # what an operator has in that case - the number of checks that were
+        # in flight when the stop began - and neither of them depends on the
+        # drain reaching its end.
+        still_running = len(self._running)
+        metrics.TIER2_SHUTDOWN_INFLIGHT.set(still_running)
+        if still_running:
+            logger.warning(
+                "tier2 moderation shutting down with %d checks in flight",
+                still_running,
+            )
 
         if self._drained or not self._running:
             # Nothing to wait for, or a previous drain already accounted for
