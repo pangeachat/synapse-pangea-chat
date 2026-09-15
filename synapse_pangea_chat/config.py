@@ -143,3 +143,28 @@ class PangeaChatConfig:
     # this is not a regular expression.
     moderation_exempt_user_id_globs: List[str] = attr.Factory(list)
     moderation_redaction_reason_prefix: str = "Removed by Pangea content moderation"
+    # --- Tier 2 transport and concurrency ---
+    # `on_new_event` is awaited inline by the notifier for every event on the
+    # homeserver, so Tier 2 is a bounded queue drained by a fixed pool rather
+    # than one background process per message. The defaults bound the WAIT: at
+    # eight workers and a fifteen-second per-check budget, a queue of forty is
+    # a worst case of about seventy-five seconds before the oldest accepted
+    # message is picked up. They do not bound throughput - one instance runs
+    # Tier 2, and that is the ceiling.
+    moderation_tier2_workers: int = 8
+    moderation_tier2_queue_size: int = 40
+    # Covers the WHOLE exchange - connect, headers and body. The body half is
+    # the one that had no bound at all.
+    moderation_tier2_request_timeout_seconds: float = 15.0
+    # Consecutive failures that open the circuit breaker, and how long it
+    # stays open before admitting one probe. The cooldown doubles on a failed
+    # probe up to the maximum, so a provider that is down for an hour is
+    # probed a handful of times rather than a hundred.
+    moderation_tier2_breaker_failure_threshold: int = 5
+    moderation_tier2_breaker_cooldown_seconds: float = 30.0
+    moderation_tier2_breaker_max_cooldown_seconds: float = 300.0
+    # How long a clean shutdown waits for checks already in flight before
+    # abandoning and counting them.
+    moderation_tier2_drain_timeout_seconds: float = 10.0
+    # How often the supervisor looks for a worker that died.
+    moderation_tier2_supervisor_interval_seconds: float = 30.0

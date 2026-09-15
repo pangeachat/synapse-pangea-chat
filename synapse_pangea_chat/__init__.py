@@ -62,10 +62,43 @@ _MODERATION_CONFIG_KEYS = frozenset(
         "choreo_base_url",
         "choreo_access_token",
         "redaction_reason_prefix",
+        "tier2_workers",
+        "tier2_queue_size",
+        "tier2_request_timeout_seconds",
+        "tier2_breaker_failure_threshold",
+        "tier2_breaker_cooldown_seconds",
+        "tier2_breaker_max_cooldown_seconds",
+        "tier2_drain_timeout_seconds",
+        "tier2_supervisor_interval_seconds",
         moderation_exempt.CONFIG_KEY,
         moderation_exempt.LEGACY_CONFIG_KEY,
     }
 )
+
+
+def _moderation_int(
+    moderation: Dict[str, Any], key: str, low: int, high: int, default: int
+) -> int:
+    value = moderation.get(key, default)
+    # `bool` before `int`, because `True` IS an `int` in Python and
+    # `tier2_workers: true` would otherwise configure a pool of one.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f'Config "moderation.{key}" must be an integer')
+    if not low <= value <= high:
+        raise ValueError(f'Config "moderation.{key}" must be between {low} and {high}')
+    return value
+
+
+def _moderation_float(
+    moderation: Dict[str, Any], key: str, low: float, high: float, default: float
+) -> float:
+    value = moderation.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f'Config "moderation.{key}" must be a number')
+    if not low <= float(value) <= high:
+        raise ValueError(f'Config "moderation.{key}" must be between {low} and {high}')
+    return float(value)
+
 
 _CHOREO_URL_SCHEMES = ("http", "https")
 # What a DNS label may contain, and how long it may be. Checked because
@@ -914,6 +947,46 @@ class PangeaChat:
                 'Config "moderation.redaction_reason_prefix" must be a non-empty string'
             )
 
+        # Bounds, not just types. Every one of these sizes a buffer, a pool or
+        # a deadline, and a zero or a negative would not fail loudly - it
+        # would produce a queue that accepts nothing, a pool with no workers,
+        # or a deadline that has already expired, all of which look like "Tier
+        # 2 is on and silently checks nothing".
+        moderation_tier2_workers = _moderation_int(
+            moderation, "tier2_workers", 1, 64, 8
+        )
+        moderation_tier2_queue_size = _moderation_int(
+            moderation, "tier2_queue_size", 1, 10_000, 40
+        )
+        moderation_tier2_breaker_failure_threshold = _moderation_int(
+            moderation, "tier2_breaker_failure_threshold", 1, 1_000, 5
+        )
+        moderation_tier2_request_timeout_seconds = _moderation_float(
+            moderation, "tier2_request_timeout_seconds", 0.1, 120.0, 15.0
+        )
+        moderation_tier2_breaker_cooldown_seconds = _moderation_float(
+            moderation, "tier2_breaker_cooldown_seconds", 1.0, 3_600.0, 30.0
+        )
+        moderation_tier2_breaker_max_cooldown_seconds = _moderation_float(
+            moderation, "tier2_breaker_max_cooldown_seconds", 1.0, 86_400.0, 300.0
+        )
+        moderation_tier2_drain_timeout_seconds = _moderation_float(
+            moderation, "tier2_drain_timeout_seconds", 0.0, 300.0, 10.0
+        )
+        moderation_tier2_supervisor_interval_seconds = _moderation_float(
+            moderation, "tier2_supervisor_interval_seconds", 1.0, 3_600.0, 30.0
+        )
+        if (
+            moderation_tier2_breaker_max_cooldown_seconds
+            < moderation_tier2_breaker_cooldown_seconds
+        ):
+            raise ValueError(
+                'Config "moderation.tier2_breaker_max_cooldown_seconds" must '
+                "be at least moderation.tier2_breaker_cooldown_seconds; the "
+                "cooldown doubles up to the maximum, so a maximum below it "
+                "would shorten the first cooldown rather than cap the last"
+            )
+
         return PangeaChatConfig(
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
@@ -973,4 +1046,24 @@ class PangeaChat:
             moderation_choreo_access_token=moderation_choreo_access_token,
             moderation_exempt_user_id_globs=moderation_exempt_user_id_globs,
             moderation_redaction_reason_prefix=moderation_redaction_reason_prefix,
+            moderation_tier2_workers=moderation_tier2_workers,
+            moderation_tier2_queue_size=moderation_tier2_queue_size,
+            moderation_tier2_request_timeout_seconds=(
+                moderation_tier2_request_timeout_seconds
+            ),
+            moderation_tier2_breaker_failure_threshold=(
+                moderation_tier2_breaker_failure_threshold
+            ),
+            moderation_tier2_breaker_cooldown_seconds=(
+                moderation_tier2_breaker_cooldown_seconds
+            ),
+            moderation_tier2_breaker_max_cooldown_seconds=(
+                moderation_tier2_breaker_max_cooldown_seconds
+            ),
+            moderation_tier2_drain_timeout_seconds=(
+                moderation_tier2_drain_timeout_seconds
+            ),
+            moderation_tier2_supervisor_interval_seconds=(
+                moderation_tier2_supervisor_interval_seconds
+            ),
         )

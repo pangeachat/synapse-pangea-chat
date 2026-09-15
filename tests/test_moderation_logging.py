@@ -40,7 +40,6 @@ import logging
 import logging.handlers
 import pkgutil
 import unittest
-from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List, Optional, cast
 from unittest.mock import AsyncMock, create_autospec, patch
 
@@ -57,6 +56,8 @@ from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.moderation import ChatModeration
 from synapse_pangea_chat.moderation.choreo_client import moderate_text
 from synapse_pangea_chat.moderation.log_safety import _IdentityScrubbingFilter
+
+from .moderation_doubles import module_api as module_api_double
 
 # Strings that must never survive a moderation code path. Distinctive enough
 # that a substring search cannot match them by accident.
@@ -189,13 +190,41 @@ def _event(*args: Any, **kwargs: Any) -> EventBase:
     return cast(EventBase, FakeEvent(*args, **kwargs))
 
 
-def _module_api() -> ModuleApi:
+def _module_api(homeserver: Any = None) -> ModuleApi:
     """A signature-enforcing `ModuleApi`, for the reason given in
     tests/test_moderation_unit.py: an unrestricted mock accepts every call, so
     a test built on one cannot fail when the call shape is wrong."""
-    api = create_autospec(ModuleApi, instance=True)
-    api._hs = SimpleNamespace(hostname="example.org")
-    return cast(ModuleApi, api)
+    return module_api_double(homeserver)
+
+
+def _tier2_module(
+    test: unittest.TestCase, api: ModuleApi, config: PangeaChatConfig
+) -> ChatModeration:
+    """Tier 2 running, and stopped when the test ends - see the identical
+    helper in tests/test_moderation_unit.py for why the cleanup matters."""
+    module = ChatModeration(api, config)
+    test.addCleanup(_stop_tier2, module)
+    return module
+
+
+def _stop_tier2(module: ChatModeration) -> None:
+    dispatcher = module._dispatcher
+    if dispatcher is None:
+        return
+    dispatcher._stopping = True
+    dispatcher._wake_all()
+
+
+def _job(text: str = "flagged text", sender: str = CANARY_SENDER) -> Any:
+    from synapse_pangea_chat.moderation.dispatch import ModerationJob
+
+    return ModerationJob(
+        event_id="$evt1",
+        room_id="!room:example.org",
+        sender=sender,
+        text=text,
+        enqueued_at=0.0,
+    )
 
 
 @contextlib.contextmanager
@@ -368,7 +397,8 @@ class ModerationLoggingTestCase(unittest.IsolatedAsyncioTestCase):
         cast(AsyncMock, api.create_and_send_event_into_room).side_effect = RuntimeError(
             f"User {CANARY_SENDER} not in room !room:example.org"
         )
-        mod = ChatModeration(
+        mod = _tier2_module(
+            self,
             api,
             _config(
                 moderation_tier1_enabled=False,
@@ -377,12 +407,12 @@ class ModerationLoggingTestCase(unittest.IsolatedAsyncioTestCase):
             ),
         )
         with patch(
-            "synapse_pangea_chat.moderation.moderate_text",
+            "synapse_pangea_chat.moderation.choreo_client.moderate_text",
             new=_verdict(),
         ):
             # No exception may propagate: the caller is a background process
             # whose handler would log it, Matrix ID and all.
-            await mod._check_and_redact(_event(CANARY_TEXT), "flagged text")
+            await mod._check_and_redact(_job())
         # The redaction must have been ATTEMPTED. Without this the test passes
         # when the send never happens at all - a different failure, caught by
         # the same fail-open handler, proving nothing about this one.
@@ -499,7 +529,8 @@ class ModerationLogContextTestCase(unittest.IsolatedAsyncioTestCase):
             f"User {CANARY_SENDER} not in room !room:example.org"
         )
         with _synapse_request_logcontext():
-            mod = ChatModeration(
+            mod = _tier2_module(
+                self,
                 api,
                 _config(
                     moderation_tier1_enabled=False,
@@ -508,10 +539,10 @@ class ModerationLogContextTestCase(unittest.IsolatedAsyncioTestCase):
                 ),
             )
             with patch(
-                "synapse_pangea_chat.moderation.moderate_text",
+                "synapse_pangea_chat.moderation.choreo_client.moderate_text",
                 new=_verdict(),
             ):
-                await mod._check_and_redact(_event(CANARY_TEXT), "flagged text")
+                await mod._check_and_redact(_job())
         cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
         self.assertScrubbed()
 

@@ -28,13 +28,14 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 from synapse.api.errors import Codes
 from synapse.events import EventBase
+from synapse.http.client import SimpleHttpClient
+from synapse.logging.context import make_deferred_yieldable
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import NOT_SPAM, ModuleApi
 from twisted.internet import defer
 from twisted.internet.task import Clock
 from twisted.python.failure import Failure
 from twisted.web.client import ResponseDone
-from twisted.web.iweb import IBodyProducer
 
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.config import PangeaChatConfig
@@ -53,6 +54,7 @@ from synapse_pangea_chat.moderation.choreo_client import (
     ModerationCheckError,
     moderate_text,
 )
+from synapse_pangea_chat.moderation.dispatch import ModerationJob
 from synapse_pangea_chat.moderation.tier1_prefilter import (
     REASON_CONTACT_DETAILS,
     REASON_PROFANITY,
@@ -60,6 +62,9 @@ from synapse_pangea_chat.moderation.tier1_prefilter import (
     check_text,
 )
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
+
+from .moderation_doubles import EventStoreDouble, HomeServerDouble
+from .moderation_doubles import module_api as module_api_double
 
 
 class FakeEvent:
@@ -70,11 +75,12 @@ class FakeEvent:
         sender: str = "@learner:example.org",
         event_type: str = "m.room.message",
         content: Optional[Dict[str, Any]] = None,
+        event_id: str = "$evt1",
     ):
         self.type = event_type
         self.sender = sender
         self.room_id = "!room:example.org"
-        self.event_id = "$evt1"
+        self.event_id = event_id
         if content is not None:
             self.content = content
         elif body is None:
@@ -93,15 +99,19 @@ def _event(*args: Any, **kwargs: Any) -> EventBase:
     return cast(EventBase, FakeEvent(*args, **kwargs))
 
 
-def _module_api() -> ModuleApi:
+def _module_api(
+    homeserver: Optional[HomeServerDouble] = None,
+    *,
+    run_background_tasks: bool = True,
+) -> ModuleApi:
     """A `ModuleApi` double that checks the signature of every call.
 
-    `_hs` is attached by hand because it is set in `ModuleApi.__init__` rather
-    than declared on the class, so autospec cannot know about it.
+    See `tests/moderation_doubles.py`; the homeserver surface it carries is
+    shared with the other moderation test modules rather than copied, because
+    the part that matters - a clock whose `call_later` does not run inline -
+    is exactly what a second copy would get subtly wrong.
     """
-    api = create_autospec(ModuleApi, instance=True)
-    api._hs = SimpleNamespace(hostname="example.org")
-    return cast(ModuleApi, api)
+    return module_api_double(homeserver, run_background_tasks=run_background_tasks)
 
 
 class _BackgroundProcessDouble:
@@ -188,6 +198,30 @@ def _config(**overrides: Any) -> PangeaChatConfig:
 
 def _moderation(config: PangeaChatConfig) -> ChatModeration:
     return ChatModeration(_module_api(), config)
+
+
+def _tier2_module(
+    test: unittest.TestCase, api: ModuleApi, config: PangeaChatConfig
+) -> ChatModeration:
+    """A `ChatModeration` with Tier 2 running, stopped when the test ends.
+
+    The cleanup is not tidiness. A dispatcher left running holds two worker
+    coroutines parked on Deferreds that nothing will ever fire, and Synapse
+    reports every one of them as "Expected logging context ... was lost" when
+    they are collected - noise that would land in whichever test happened to
+    trigger the collection.
+    """
+    module = ChatModeration(api, config)
+    test.addCleanup(_stop_tier2, module)
+    return module
+
+
+def _stop_tier2(module: ChatModeration) -> None:
+    dispatcher = module._dispatcher
+    if dispatcher is None:
+        return
+    dispatcher._stopping = True
+    dispatcher._wake_all()
 
 
 class TestBackgroundProcessDouble(unittest.IsolatedAsyncioTestCase):
@@ -401,33 +435,29 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
 
     async def test_exempt_sender_skips_tier2_as_well(self) -> None:
         """Both tiers consult the same matcher, so both are asserted."""
-        mod = _moderation(
+        mod = _tier2_module(
+            self,
+            _module_api(),
             _config(
                 moderation_tier1_enabled=False,
                 moderation_tier2_enabled=True,
                 moderation_choreo_base_url="http://choreo.invalid",
                 moderation_choreo_access_token="syt_x",
                 moderation_exempt_user_id_globs=["@bot*:example.org"],
-            )
+            ),
         )
-        background = _BackgroundProcessDouble()
-        with patch(
-            "synapse_pangea_chat.moderation.run_as_background_process", background
-        ):
-            await mod.on_new_event(_event("something", sender="@bot:example.org"), {})
-            self.assertEqual(background.calls, [])
-            await mod.on_new_event(
-                _event("something", sender="@botimposter:example.org.evil.com"),
-                {},
-            )
-            # `calls` as well as `started`: `started` holds only the
-            # dispatches that bound and ran, so asserting on it alone counts a
-            # SECOND, rejected dispatch as no dispatch at all - the production
-            # callback swallows what the double raises. The predecessor
-            # `assert_called_once()` did detect that; this has to too.
-            self.assertEqual(len(background.calls), 1)
-            self.assertEqual(len(background.started), 1)
-            background.discard()
+        assert mod._dispatcher is not None
+        await mod.on_new_event(_event("something", sender="@bot:example.org"), {})
+        self.assertEqual(mod._dispatcher.queue_depth, 0)
+        await mod.on_new_event(
+            _event(
+                "something",
+                sender="@botimposter:example.org.evil.com",
+                event_id="$other",
+            ),
+            {},
+        )
+        self.assertEqual(mod._dispatcher.queue_depth, 1)
 
     async def test_non_message_event_skipped(self) -> None:
         mod = _moderation(_config())
@@ -470,7 +500,24 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
             )
 
 
+# The moderation call now happens inside `ChoreoChecker`, which lives in
+# `choreo_client`, so that is where a test patches it. Patching a name that
+# `moderation/__init__.py` no longer imports would silently patch nothing.
+MODERATE_TEXT = "synapse_pangea_chat.moderation.choreo_client.moderate_text"
+
+
 class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
+    def _job(self, text: str = "x", **overrides: Any) -> ModerationJob:
+        fields: Dict[str, Any] = {
+            "event_id": "$evt1",
+            "room_id": "!room:example.org",
+            "sender": "@learner:example.org",
+            "text": text,
+            "enqueued_at": 0.0,
+        }
+        fields.update(overrides)
+        return ModerationJob(**fields)
+
     def _tier2_config(self, **overrides: Any) -> PangeaChatConfig:
         return _config(
             moderation_tier1_enabled=False,
@@ -516,40 +563,111 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
     async def test_plain_room_dispatches(self) -> None:
         """Driven all the way through to the redaction, on purpose.
 
-        Asserting only that a mock was called is what let the dispatch-shape
-        regression pass. Running the dispatched coroutine is what proves the
-        arguments landed where the runner puts them.
+        Asserting only that something was queued is what let the old
+        dispatch-shape regression pass. Running the queued job - by turning
+        the clock, exactly as the reactor would - is what proves the job made
+        the call and the call reached the redaction.
         """
-        api = _module_api()
-        mod = ChatModeration(api, self._tier2_config())
-        background = _BackgroundProcessDouble()
-        with (
-            patch(
-                "synapse_pangea_chat.moderation.run_as_background_process", background
-            ),
-            patch(
-                "synapse_pangea_chat.moderation.moderate_text", self._verdict()
-            ) as moderate,
-        ):
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._tier2_config())
+        with patch(MODERATE_TEXT, self._verdict()) as moderate:
             await mod.on_new_event(_event("you suck"), {})
-            self.assertEqual(len(background.calls), 1)
-            self.assertEqual(len(background.started), 1)
-            self.assertEqual(background.started[0][0], "pangea_moderation_tier2")
-            await background.drain()
+            # Nothing has run yet: `on_new_event` returns to the notifier
+            # without doing any of the work.
+            moderate.assert_not_awaited()
+            homeserver.clock.drain()
         moderate.assert_awaited_once()
         assert moderate.await_args is not None
         self.assertEqual(moderate.await_args.args[0], "you suck")
         cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
 
+    async def test_a_worker_instance_neither_queues_nor_checks(self) -> None:
+        """`on_new_event` fires on EVERY process subscribed to the events
+        stream, so without the guard an N-worker deployment makes N moderation
+        calls and N redaction attempts for one message."""
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver, run_background_tasks=False)
+        mod = _tier2_module(self, api, self._tier2_config())
+        with patch(MODERATE_TEXT, self._verdict()) as moderate:
+            await mod.on_new_event(_event("you suck"), {})
+            homeserver.clock.drain()
+        moderate.assert_not_awaited()
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        self.assertIsNone(mod._dispatcher)
+
+    async def test_the_same_event_is_only_ever_redacted_once(self) -> None:
+        """The notifier can deliver one event more than once - the local
+        persister and the replication stream both reach it - and a second
+        pass must not produce a second redaction."""
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._tier2_config())
+        event = _event("you suck")
+        with patch(MODERATE_TEXT, self._verdict()) as moderate:
+            await mod.on_new_event(event, {})
+            await mod.on_new_event(event, {})
+            homeserver.clock.drain()
+        moderate.assert_awaited_once()
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
+
+    async def test_an_already_redacted_target_is_not_redacted_again(self) -> None:
+        """The pre-send re-read, which is what makes the send idempotent once
+        the in-flight set has let go of the id."""
+        homeserver = HomeServerDouble(EventStoreDouble(redacted=True))
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._tier2_config())
+        with patch(MODERATE_TEXT, self._verdict()):
+            await mod._check_and_redact(self._job("you suck"))
+        self.assertEqual(homeserver.store.reads, ["$evt1"])
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_a_target_that_has_vanished_is_not_redacted(self) -> None:
+        homeserver = HomeServerDouble(EventStoreDouble(missing=True))
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._tier2_config())
+        with patch(MODERATE_TEXT, self._verdict()):
+            await mod._check_and_redact(self._job("you suck"))
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_a_failed_re_read_leaves_the_message_standing(self) -> None:
+        """Moderation fails open. The precondition for sending a redaction is
+        a read that SAID the event is still there, not the absence of an
+        answer."""
+        store = EventStoreDouble()
+        store.error = RuntimeError("database is unhappy")
+        homeserver = HomeServerDouble(store)
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._tier2_config())
+        with patch(MODERATE_TEXT, self._verdict()):
+            await mod._check_and_redact(self._job("you suck"))
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_a_full_queue_does_not_raise_into_the_notifier(self) -> None:
+        """`on_new_event` is awaited inline by the notifier for every event on
+        the homeserver. Overload has to be a counted refusal, never an
+        exception and never a wait."""
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(
+            self, api, self._tier2_config(moderation_tier2_queue_size=1)
+        )
+        with patch(MODERATE_TEXT, self._verdict()):
+            for index in range(50):
+                await mod.on_new_event(_event("you suck", event_id=f"$e{index}"), {})
+        assert mod._dispatcher is not None
+        self.assertLessEqual(mod._dispatcher.queue_depth, 1)
+
     async def test_flagged_result_redacts_as_sender(self) -> None:
         api = _module_api()
-        mod = ChatModeration(api, self._tier2_config())
-        event = _event("threatening text", sender="@offender:example.org")
+        mod = _tier2_module(self, api, self._tier2_config())
         with patch(
-            "synapse_pangea_chat.moderation.moderate_text",
+            MODERATE_TEXT,
             self._verdict(categories=["harassment/threatening"]),
         ):
-            await mod._check_and_redact(event, "threatening text")
+            await mod._check_and_redact(
+                self._job("threatening text", sender="@offender:example.org")
+            )
         send = cast(AsyncMock, api.create_and_send_event_into_room)
         send.assert_awaited_once()
         await_args = send.await_args
@@ -558,10 +676,11 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["type"], "m.room.redaction")
         # `room_id` is mandatory and autospec checks the METHOD's signature,
         # not the event dictionary's contents, so it has to be asserted here.
-        self.assertEqual(sent["room_id"], event.room_id)
+        job = self._job("threatening text", sender="@offender:example.org")
+        self.assertEqual(sent["room_id"], job.room_id)
         self.assertEqual(sent["sender"], "@offender:example.org")
-        self.assertEqual(sent["redacts"], event.event_id)
-        self.assertEqual(sent["content"]["redacts"], event.event_id)
+        self.assertEqual(sent["redacts"], job.event_id)
+        self.assertEqual(sent["content"]["redacts"], job.event_id)
         self.assertIn("harassment", sent["content"]["reason"])
 
     async def test_self_harm_is_preserved_not_redacted(self) -> None:
@@ -572,13 +691,12 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         the one category whose disposition is not redaction.
         """
         api = _module_api()
-        mod = ChatModeration(api, self._tier2_config())
-        event = _event("i want to hurt myself", sender="@learner:example.org")
+        mod = _tier2_module(self, api, self._tier2_config())
         with patch(
-            "synapse_pangea_chat.moderation.moderate_text",
+            MODERATE_TEXT,
             self._verdict(categories=["self-harm/intent"]),
         ):
-            await mod._check_and_redact(event, "i want to hurt myself")
+            await mod._check_and_redact(self._job("i want to hurt myself"))
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
 
     async def test_self_harm_preserved_even_alongside_a_redactable_category(
@@ -591,23 +709,22 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         label that happens to sort ahead of the disclosure.
         """
         api = _module_api()
-        mod = ChatModeration(api, self._tier2_config())
-        event = _event("mixed", sender="@learner:example.org")
+        mod = _tier2_module(self, api, self._tier2_config())
         with patch(
-            "synapse_pangea_chat.moderation.moderate_text",
+            MODERATE_TEXT,
             self._verdict(categories=["harassment", "self-harm/intent"]),
         ):
-            await mod._check_and_redact(event, "mixed")
+            await mod._check_and_redact(self._job("mixed"))
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
 
     async def test_unflagged_result_does_not_redact(self) -> None:
         api = _module_api()
-        mod = ChatModeration(api, self._tier2_config())
+        mod = _tier2_module(self, api, self._tier2_config())
         with patch(
-            "synapse_pangea_chat.moderation.moderate_text",
+            MODERATE_TEXT,
             self._verdict(flagged=False, categories=[]),
         ) as moderate:
-            await mod._check_and_redact(_event("hi"), "hi")
+            await mod._check_and_redact(self._job("hi"))
         # The check must have RUN. Without this the test passes when the call
         # raised instead - a different failure, caught by the same fail-open
         # handler, that also redacts nothing.
@@ -630,12 +747,12 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(error=type(error).__name__):
                 api = _module_api()
-                mod = ChatModeration(api, self._tier2_config())
+                mod = _tier2_module(self, api, self._tier2_config())
                 with patch(
-                    "synapse_pangea_chat.moderation.moderate_text",
+                    MODERATE_TEXT,
                     self._outage(error),
                 ) as moderate:
-                    await mod._check_and_redact(_event("hi"), "hi")
+                    await mod._check_and_redact(self._job("hi"))
                 moderate.assert_awaited_once()
                 cast(
                     AsyncMock, api.create_and_send_event_into_room
@@ -655,7 +772,7 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(category=category):
                 api = _module_api()
-                mod = ChatModeration(api, self._tier2_config())
+                mod = _tier2_module(self, api, self._tier2_config())
                 captured = _CapturingRecords()
                 root = logging.getLogger()
                 previous_level = root.level
@@ -666,10 +783,10 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
                 root.setLevel(logging.DEBUG)
                 try:
                     with patch(
-                        "synapse_pangea_chat.moderation.moderate_text",
+                        MODERATE_TEXT,
                         self._verdict(categories=[category]),
                     ):
-                        await mod._check_and_redact(_event("x"), "x")
+                        await mod._check_and_redact(self._job("x"))
                 finally:
                     root.removeHandler(captured)
                     root.setLevel(previous_level)
@@ -687,12 +804,12 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_known_category_survives_an_unknown_one_beside_it(self) -> None:
         api = _module_api()
-        mod = ChatModeration(api, self._tier2_config())
+        mod = _tier2_module(self, api, self._tier2_config())
         with patch(
-            "synapse_pangea_chat.moderation.moderate_text",
+            MODERATE_TEXT,
             self._verdict(categories=["@alice:example.org", "sexual/minors"]),
         ):
-            await mod._check_and_redact(_event("x"), "x")
+            await mod._check_and_redact(self._job("x"))
         send = cast(AsyncMock, api.create_and_send_event_into_room)
         assert send.await_args is not None
         self.assertTrue(send.await_args.args[0]["content"]["reason"].endswith("sexual"))
@@ -1351,68 +1468,105 @@ class _FakeResponse:
         protocol.connectionLost(Failure(ResponseDone()))
 
 
-def _consume(body_producer: Any) -> bytes:
-    """The bytes the agent would put on the wire, and the interface check.
+class _SynapseClock:
+    """Synapse's `Clock` surface over a twisted test `Clock`.
 
-    `IBodyProducer.providedBy` rather than a duck-type test: that is the
-    contract `Agent.request` actually requires, so passing the raw `BytesIO`
-    instead of a `FileBodyProducer` fails here as it would fail there.
-
-    The bytes are read from the producer's file rather than by driving
-    `startProducing`, which cooperates through the global reactor and would
-    leave a pending delayed call behind in a test with no reactor running.
+    The client is written against the homeserver's clock - `time()` and
+    `call_later()` - because that is what it gets in production. A test still
+    wants `advance()` and `getDelayedCalls()`, so the twisted clock stays
+    underneath and this is the two-method adapter over it. Nothing is faked
+    here that the client relies on; a scheduled call is still a real
+    `IDelayedCall` with `active()` and `cancel()`.
     """
-    if body_producer is None:
-        raise TypeError("Agent.request was given no body producer")
-    if not IBodyProducer.providedBy(body_producer):
-        raise TypeError(
-            "Agent.request wants an IBodyProducer, got "
-            f"{type(body_producer).__name__}"
-        )
-    source = body_producer._inputFile
-    position = source.tell()
-    try:
-        source.seek(0)
-        return bytes(source.read())
-    finally:
-        source.seek(position)
+
+    def __init__(self, clock: Clock) -> None:
+        self.clock = clock
+
+    def time(self) -> float:
+        return self.clock.seconds()
+
+    def call_later(self, delay: Any, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        return self.clock.callLater(float(delay), callback, *args, **kwargs)
 
 
-class _FakeAgent:
-    """An `Agent` double that checks the request it was handed.
+class _HttpClientDouble:
+    """A `SimpleHttpClient` double bound to the installed signature.
 
-    An agent that accepts any arguments and returns a canned response tests the
-    response handling and nothing else: the method, the URI and the auth header
-    could all be wrong and every test would pass.
+    `inspect.signature(SimpleHttpClient.request).bind` is the point of it. A
+    double that accepts `**kwargs` would take a call with the argument names
+    of the Agent API this client was rewritten away from, and every test would
+    pass against a client that could not issue a single request in
+    production - which is the exact shape of the bug `_BackgroundProcessDouble`
+    was written for one layer up.
     """
+
+    def __init__(self) -> None:
+        self.signature = inspect.signature(SimpleHttpClient.request)
+        self.requests: List[Dict[str, Any]] = []
+        self.sent_bodies: List[bytes] = []
+
+    def _record(self, args: Any, kwargs: Any) -> None:
+        bound = self.signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        arguments = dict(bound.arguments)
+        arguments.pop("self", None)
+        method = arguments["method"]
+        uri = arguments["uri"]
+        data = arguments["data"]
+        if not isinstance(method, str) or not isinstance(uri, str):
+            raise TypeError("SimpleHttpClient.request takes str method and uri")
+        # `request` does `BytesIO(data)`, so anything else is a TypeError
+        # there. Checked here so it is a TypeError here too.
+        if data is not None and not isinstance(data, bytes):
+            raise TypeError(
+                f"SimpleHttpClient.request wants bytes data, got "
+                f"{type(data).__name__}"
+            )
+        self.sent_bodies.append(data if data is not None else b"")
+        self.requests.append(arguments)
+
+
+class _FakeHttpClient(_HttpClientDouble):
+    """Returns a canned response, optionally after a delay on the clock."""
 
     def __init__(
-        self, response: _FakeResponse, headers_after: Optional[float] = None
+        self, response: "_FakeResponse", headers_after: Optional[float] = None
     ) -> None:
+        super().__init__()
         self.response = response
         self.headers_after = headers_after
-        self.requests: List[Tuple[bytes, bytes, Any, Any]] = []
-        self.sent_bodies: List[bytes] = []
         self.clock: Optional[Clock] = None
 
-    def request(
-        self, method: bytes, uri: bytes, headers: Any = None, bodyProducer: Any = None
-    ) -> Any:
-        if not isinstance(method, bytes) or not isinstance(uri, bytes):
-            raise TypeError("Agent.request takes bytes for method and uri")
-        # The producer is CONSUMED, the way a real agent consumes it. A double
-        # that only stores it cannot tell a `FileBodyProducer` from the
-        # `BytesIO` somebody passed by mistake, and never sees the payload -
-        # so the request JSON could be renamed and every client test would
-        # still pass.
-        self.sent_bodies.append(_consume(bodyProducer))
-        self.requests.append((method, uri, headers, bodyProducer))
+    async def request(self, *args: Any, **kwargs: Any) -> Any:
+        self._record(args, kwargs)
         if self.headers_after is None:
-            return defer.succeed(self.response)
+            return self.response
         assert self.clock is not None
         deferred: Any = defer.Deferred()
         self.clock.callLater(self.headers_after, deferred.callback, self.response)
-        return deferred
+        return await make_deferred_yieldable(deferred)
+
+
+class _FailingHttpClient(_HttpClientDouble):
+    """A client whose request fails the way a transport failure does."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    async def request(self, *args: Any, **kwargs: Any) -> Any:
+        self._record(args, kwargs)
+        # Raised from inside an ACTIVE `except` block, which is how twisted
+        # delivers a transport failure: it resumes the awaiting coroutine from
+        # within its own handler, so the original becomes our `__context__`
+        # whatever our own frame does. A failure built outside a handler never
+        # exercises that.
+        deferred: Any = defer.Deferred()
+        try:
+            raise self.error
+        except Exception:
+            deferred.errback()
+            return await make_deferred_yieldable(deferred)
 
 
 class _CapturingRecords(logging.Handler):
@@ -1459,14 +1613,14 @@ class TestChoreoClient(unittest.TestCase):
     of a scheduled timeout, which is the actual defect.
     """
 
-    def _call(self, agent: Any, clock: Clock) -> Tuple[Any, List[Any]]:
+    def _call(self, http_client: Any, clock: Clock) -> Tuple[Any, List[Any]]:
         deferred = defer.ensureDeferred(
             moderate_text(
                 "some text",
                 base_url="http://choreo.invalid",
                 access_token="syt_x",
-                reactor=clock,
-                agent=agent,
+                http_client=http_client,
+                clock=_SynapseClock(clock),
             )
         )
         results: List[Any] = []
@@ -1480,7 +1634,7 @@ class TestChoreoClient(unittest.TestCase):
         anywhere - the check never completes, never fails, and never logs, and
         they accumulate one per message."""
         clock = Clock()
-        agent = _FakeAgent(_FakeResponse())
+        agent = _FakeHttpClient(_FakeResponse())
         _deferred, results = self._call(agent, clock)
         self.assertEqual(results, [], "the body read should still be pending")
         self.assertTrue(clock.getDelayedCalls(), "no timeout was ever scheduled")
@@ -1498,7 +1652,9 @@ class TestChoreoClient(unittest.TestCase):
         expire at the same instant and the test cannot tell them apart.
         """
         clock = Clock()
-        agent = _FakeAgent(_FakeResponse(), headers_after=REQUEST_TIMEOUT_SECONDS - 2)
+        agent = _FakeHttpClient(
+            _FakeResponse(), headers_after=REQUEST_TIMEOUT_SECONDS - 2
+        )
         agent.clock = clock
         _deferred, results = self._call(agent, clock)
         clock.advance(REQUEST_TIMEOUT_SECONDS - 2)
@@ -1522,7 +1678,7 @@ class TestChoreoClient(unittest.TestCase):
         while the peer keeps sending."""
         clock = Clock()
         response = _FakeResponse()
-        agent = _FakeAgent(response)
+        agent = _FakeHttpClient(response)
         _deferred, results = self._call(agent, clock)
         clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
         results[0].trap(ModerationCheckError)
@@ -1536,7 +1692,7 @@ class TestChoreoClient(unittest.TestCase):
         the per-job deadline both cancel in-flight checks."""
         clock = Clock()
         response = _FakeResponse()
-        agent = _FakeAgent(response)
+        agent = _FakeHttpClient(response)
         deferred, results = self._call(agent, clock)
         self.assertEqual(results, [])
         deferred.cancel()
@@ -1558,7 +1714,7 @@ class TestChoreoClient(unittest.TestCase):
         clock = Clock()
         underlying = _RealTransport()
         response = _FakeResponse(underlying=underlying)
-        agent = _FakeAgent(response)
+        agent = _FakeHttpClient(response)
         _deferred, results = self._call(agent, clock)
         clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
         results[0].trap(ModerationCheckError)
@@ -1577,7 +1733,7 @@ class TestChoreoClient(unittest.TestCase):
         response = _FakeResponse(
             chunks=[chunk] * (MAX_RESPONSE_BYTES // len(chunk) + 2)
         )
-        agent = _FakeAgent(response)
+        agent = _FakeHttpClient(response)
         _deferred, results = self._call(agent, clock)
         self.assertEqual(len(results), 1)
         results[0].trap(ModerationCheckError)
@@ -1592,7 +1748,7 @@ class TestChoreoClient(unittest.TestCase):
         body = prefix + padding + suffix
         self.assertEqual(len(body), MAX_RESPONSE_BYTES)
         clock = Clock()
-        agent = _FakeAgent(_FakeResponse(body=body))
+        agent = _FakeHttpClient(_FakeResponse(body=body))
         _deferred, results = self._call(agent, clock)
         self.assertEqual(results[0]["flagged"], False)
 
@@ -1607,7 +1763,7 @@ class TestChoreoClient(unittest.TestCase):
         self.assertEqual(len(body), MAX_RESPONSE_BYTES + 1)
         clock = Clock()
         response = _FakeResponse(body=body)
-        agent = _FakeAgent(response)
+        agent = _FakeHttpClient(response)
         _deferred, results = self._call(agent, clock)
         self.assertIsInstance(results[0], Failure, results[0])
         results[0].trap(ModerationCheckError)
@@ -1617,21 +1773,21 @@ class TestChoreoClient(unittest.TestCase):
         """The agent double checks what it was handed, so a wrong method, path
         or missing bearer token fails here rather than passing silently."""
         clock = Clock()
-        agent = _FakeAgent(_FakeResponse(body=b'{"flagged": false}'))
+        agent = _FakeHttpClient(_FakeResponse(body=b'{"flagged": false}'))
         _deferred, results = self._call(agent, clock)
         self.assertEqual(len(agent.requests), 1)
-        method, uri, headers, body_producer = agent.requests[0]
-        self.assertEqual(method, b"POST")
-        self.assertEqual(uri, b"http://choreo.invalid/choreo/moderate")
+        sent = agent.requests[0]
+        self.assertEqual(sent["method"], "POST")
+        self.assertEqual(sent["uri"], "http://choreo.invalid/choreo/moderate")
+        headers = sent["headers"]
         self.assertEqual(headers.getRawHeaders(b"Authorization"), [b"Bearer syt_x"])
         self.assertEqual(headers.getRawHeaders(b"Content-Type"), [b"application/json"])
-        self.assertIsNotNone(body_producer)
         self.assertEqual(json.loads(agent.sent_bodies[0]), {"text": "some text"})
 
     def test_a_prompt_response_is_returned(self) -> None:
         """The other direction: the timeout must not break the happy path."""
         clock = Clock()
-        agent = _FakeAgent(
+        agent = _FakeHttpClient(
             _FakeResponse(body=b'{"flagged": true, "categories": ["hate"]}')
         )
         _deferred, results = self._call(agent, clock)
@@ -1647,7 +1803,7 @@ class TestChoreoClient(unittest.TestCase):
         for body in (b"{}", b'{"error": "provider failed"}', b'{"categories": []}'):
             with self.subTest(body=body):
                 clock = Clock()
-                agent = _FakeAgent(_FakeResponse(body=body))
+                agent = _FakeHttpClient(_FakeResponse(body=body))
                 _deferred, results = self._call(agent, clock)
                 self.assertIsInstance(results[0], Failure, results[0])
                 results[0].trap(ModerationCheckError)
@@ -1666,7 +1822,7 @@ class TestChoreoClient(unittest.TestCase):
         ):
             with self.subTest(body=body):
                 clock = Clock()
-                agent = _FakeAgent(_FakeResponse(body=body))
+                agent = _FakeHttpClient(_FakeResponse(body=body))
                 _deferred, results = self._call(agent, clock)
                 self.assertEqual(len(results), 1)
                 self.assertIsInstance(results[0], Failure, results[0])
@@ -1678,7 +1834,7 @@ class TestChoreoClient(unittest.TestCase):
         validation on its own, and the test passed with the status check
         deleted."""
         clock = Clock()
-        agent = _FakeAgent(
+        agent = _FakeHttpClient(
             _FakeResponse(code=502, body=b'{"flagged": false, "categories": []}')
         )
         _deferred, results = self._call(agent, clock)
@@ -1698,7 +1854,7 @@ class TestChoreoClient(unittest.TestCase):
         attached to an error whose own message says only the type.
         """
         clock = Clock()
-        agent = _FakeAgent(_FakeResponse(body=self.PAYLOAD.encode()))
+        agent = _FakeHttpClient(_FakeResponse(body=self.PAYLOAD.encode()))
         _deferred, results = self._call(agent, clock)
         self._assert_chain_severed(error := results[0].value)
         self.assertNotIn(self.PAYLOAD, self._everything_reachable_from(error))
@@ -1709,7 +1865,7 @@ class TestChoreoClient(unittest.TestCase):
         `except` blocks, so a test that only drives one leaves the other free
         to keep the original exception - and its payload - on `__context__`."""
         clock = Clock()
-        agent = _FailingAgent(ValueError(self.PAYLOAD))
+        agent = _FailingHttpClient(ValueError(self.PAYLOAD))
         _deferred, results = self._call(agent, clock)
         error = results[0].value
         self.assertIsInstance(error, ModerationCheckError)
@@ -1741,7 +1897,7 @@ class TestChoreoClient(unittest.TestCase):
         undecodable bytes from its args."""
         clock = Clock()
         body = b'{"flagged":true,"categories":["@alice:example.org"],"n":"\xff"}'
-        agent = _FakeAgent(_FakeResponse(body=body))
+        agent = _FakeHttpClient(_FakeResponse(body=body))
         _deferred, results = self._call(agent, clock)
         self.assertIsInstance(results[0], Failure)
         error = results[0].value

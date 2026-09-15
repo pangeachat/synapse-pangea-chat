@@ -38,12 +38,15 @@ from typing import (
     Union,
 )
 
-from synapse.api.errors import Codes
+from synapse.api.errors import AuthError, Codes, SynapseError
 from synapse.events import EventBase
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import NOT_SPAM, ModuleApi
 
-from synapse_pangea_chat.moderation.choreo_client import moderate_text
+from synapse_pangea_chat.moderation import metrics
+from synapse_pangea_chat.moderation.breaker import CircuitBreaker
+from synapse_pangea_chat.moderation.choreo_client import ChoreoChecker
+from synapse_pangea_chat.moderation.dispatch import ModerationJob, Tier2Dispatcher
 from synapse_pangea_chat.moderation.exempt import (
     CONFIG_KEY,
     ExemptGlobError,
@@ -358,14 +361,92 @@ class ChatModeration:
         # the deployment's logging config is in place.
         scrub_reachable_handlers(logger)
 
+        self._tier2_active = False
+        self._dispatcher: Optional[Tier2Dispatcher] = None
+        self._checker: Optional[ChoreoChecker] = None
+        self._clock: Any = None
+
         if config.moderation_tier1_enabled:
             api.register_spam_checker_callbacks(
                 check_event_for_spam=self.check_event_for_spam,
             )
         if config.moderation_tier2_enabled:
+            self._start_tier2()
             api.register_third_party_rules_callbacks(
                 on_new_event=self.on_new_event,
             )
+
+    def _start_tier2(self) -> None:
+        """Build the Tier-2 machinery, on the one instance that should run it.
+
+        **The guard is the whole of the cross-process story, and it is not
+        idempotency.** `on_new_event` is dispatched from
+        `Notifier.notify_new_room_events`, which has three callers: the local
+        persister, the federation path, and `replication/tcp/client.py`'s
+        `EventsStream` branch of `on_rdata` - and that last one runs on every
+        worker subscribed to the events stream. Without a guard, an N-worker
+        deployment makes N moderation calls and N redaction attempts for one
+        message.
+
+        It does not cost coverage. `ReplicationCommandHandler.__init__` builds
+        its stream set from all of `STREAMS_MAP` on every process, so the
+        background-tasks instance receives every event either by persisting it
+        or by replication; in a monolith there is one process and the flag is
+        true there.
+
+        What it does NOT give is idempotency across two instances that both
+        have `run_background_tasks` set. That is a misconfiguration, and it is
+        not detectable from inside either process - two independent processes,
+        two independent in-memory sets, no shared claim and nothing in a
+        redaction's response that says the other one happened. Closing it needs
+        a durable claim table, which is separate work; claiming it is closed
+        here would be false.
+
+        The invariant is made observable rather than asserted: a
+        `pangea_moderation_tier2_active` gauge is 1 here and 0 elsewhere, so
+        `sum(...) == 0` alerts on "Tier 2 is enabled and nothing is running
+        it". A WARNING on every non-background worker would fire in a HEALTHY
+        deployment and train operators to ignore it.
+        """
+        self._tier2_active = bool(self._api.should_run_background_tasks())
+        metrics.TIER2_ACTIVE.set(1 if self._tier2_active else 0)
+        if not self._tier2_active:
+            return
+
+        homeserver = self._api._hs
+        self._clock = homeserver.get_clock()
+        config = self._config
+        breaker = CircuitBreaker(
+            clock=self._clock,
+            failure_threshold=config.moderation_tier2_breaker_failure_threshold,
+            cooldown_seconds=config.moderation_tier2_breaker_cooldown_seconds,
+            max_cooldown_seconds=config.moderation_tier2_breaker_max_cooldown_seconds,
+        )
+        self._checker = ChoreoChecker(
+            http_client=self._api.http_client,
+            clock=self._clock,
+            base_url=config.moderation_choreo_base_url,
+            access_token=config.moderation_choreo_access_token,
+            breaker=breaker,
+            timeout_seconds=config.moderation_tier2_request_timeout_seconds,
+        )
+        self._dispatcher = Tier2Dispatcher(
+            homeserver=homeserver,
+            clock=self._clock,
+            handler=self._check_and_redact,
+            workers=config.moderation_tier2_workers,
+            queue_size=config.moderation_tier2_queue_size,
+            supervisor_interval_seconds=(
+                config.moderation_tier2_supervisor_interval_seconds
+            ),
+            drain_timeout_seconds=config.moderation_tier2_drain_timeout_seconds,
+        )
+        self._dispatcher.start()
+        logger.info(
+            "tier2 moderation is active on this instance: %d workers, queue %d",
+            config.moderation_tier2_workers,
+            config.moderation_tier2_queue_size,
+        )
 
     # ------------------------------------------------------------------
     # Shared filters
@@ -485,9 +566,19 @@ class ChatModeration:
         event: EventBase,
         state_events: Mapping[Tuple[str, str], EventBase],
     ) -> None:
-        """Fire-and-forget the Tier 2 check so event persistence never waits
-        on an HTTP round-trip."""
+        """Hand the Tier 2 check to the worker pool and return.
+
+        This is awaited INLINE by `Notifier.notify_new_room_events`, for every
+        event on the homeserver. So it does no I/O, takes no lock, and never
+        waits: the most it does is a bounded-buffer append and, at most once
+        per reactor turn, schedule a zero-delay wakeup. A full queue is a
+        counted refusal here, never back-pressure on event persistence.
+        """
         try:
+            # First, and before the text is even extracted: on every other
+            # worker this callback's entire cost should be one boolean.
+            if not self._tier2_active or self._dispatcher is None:
+                return
             text = self._extract_text(event)
             if text is None or self._is_exempt_sender(event.sender):
                 return
@@ -495,14 +586,14 @@ class ChatModeration:
                 # The conversation orchestrator owns moderation in activity
                 # rooms; checking here would double-moderate.
                 return
-            run_as_background_process(
-                *_background_process_args(
-                    self._api._hs,
-                    "pangea_moderation_tier2",
-                    self._check_and_redact,
-                ),
-                event,
-                text,
+            self._dispatcher.enqueue(
+                ModerationJob(
+                    event_id=event.event_id,
+                    room_id=event.room_id,
+                    sender=event.sender,
+                    text=text,
+                    enqueued_at=self._clock.time(),
+                )
             )
         except Exception as exc:
             # silent-ok: fail-open by contract; observe-only hook, so the
@@ -525,34 +616,15 @@ class ChatModeration:
             for (ev_type, _state_key) in state_events.keys()
         )
 
-    async def _check_and_redact(self, event: EventBase, text: str) -> None:
-        try:
-            result = await moderate_text(
-                text,
-                base_url=self._config.moderation_choreo_base_url,
-                access_token=self._config.moderation_choreo_access_token,
-            )
-        except Exception as exc:
-            # silent-ok: fail-open by contract — the choreo handler itself
-            # fails open on provider errors, and a transport failure here must
-            # not crash the background task.
-            #
-            # `Exception`, not `ModerationCheckError`, and the widening is the
-            # point: this coroutine runs under `run_as_background_process`,
-            # which calls `logger.exception` on anything that reaches it, so
-            # every exception that escapes this frame is a plaintext log record
-            # written by Synapse with whatever the exception was carrying. The
-            # client is meant to raise only `ModerationCheckError`; catching
-            # only that made the rule depend on the client being perfect, and
-            # a `UnicodeDecodeError` out of `json.loads` was the counterexample
-            # - it carried the response body into Synapse's logger. The type
-            # and site are logged; the exception's own message is not.
-            logger.warning(
-                "tier2 moderation check unavailable for %s at %s (%s)",
-                event.event_id,
-                error_site(exc),
-                type(exc).__name__,
-            )
+    async def _check_and_redact(self, job: ModerationJob) -> None:
+        if self._checker is None:
+            return
+        result = await self._checker.check(job.text)
+        if result is None:
+            # No verdict. Every route to here - transport failure, timeout,
+            # a bad token, an open breaker, `evaluated: false` - is already
+            # counted and logged by the checker, and every one of them means
+            # the same thing: leave the message alone.
             return
 
         if not result.get("flagged"):
@@ -570,17 +642,20 @@ class ChatModeration:
             # contact, so a preserved flag reaches the logs and stops there.
             # That path is pangeachat/admin-dash#105, and it is the reason this
             # branch is a preserve rather than an escalate.
+            metrics.TIER2_SUPPRESSED.labels(category=category).inc()
             logger.info(
                 "tier2 flagged event %s in %s (category=%s); preserved, not redacted",
-                event.event_id,
-                event.room_id,
+                job.event_id,
+                job.room_id,
                 category,
             )
             return
+        if not await self._is_still_redactable(job):
+            return
         logger.info(
             "tier2 flagged event %s in %s (category=%s); redacting",
-            event.event_id,
-            event.room_id,
+            job.event_id,
+            job.room_id,
             category,
         )
         reason = f"{self._config.moderation_redaction_reason_prefix}: {category}"
@@ -593,12 +668,13 @@ class ChatModeration:
             await self._api.create_and_send_event_into_room(
                 {
                     "type": "m.room.redaction",
-                    "room_id": event.room_id,
-                    "sender": event.sender,
-                    "redacts": event.event_id,
-                    "content": {"redacts": event.event_id, "reason": reason},
+                    "room_id": job.room_id,
+                    "sender": job.sender,
+                    "redacts": job.event_id,
+                    "content": {"redacts": job.event_id, "reason": reason},
                 }
             )
+            metrics.TIER2_REDACTIONS.labels(category=category).inc()
         except Exception as exc:
             # A redaction send can fail for reasons that are ordinary rather
             # than exceptional: the sender has left, been kicked or been
@@ -614,16 +690,86 @@ class ChatModeration:
             # into a plaintext log by a route none of this module's own
             # format strings mention.
             #
-            # Counting these failures and escalating the legitimate ones is
-            # separate work; today the message stays up and the failure is
-            # visible, which is what the previous behaviour was missing.
+            # Escalating the legitimate ones is separate work; today the
+            # message stays up and the failure is counted and visible, which
+            # is what the previous behaviour was missing.
+            metrics.record_redaction_failure(_redaction_failure_cause(exc))
             logger.warning(
                 "tier2 redaction failed for %s in %s at %s (%s); message stays",
-                event.event_id,
-                event.room_id,
+                job.event_id,
+                job.room_id,
                 error_site(exc),
                 type(exc).__name__,
             )
+
+    async def _is_still_redactable(self, job: ModerationJob) -> bool:
+        """Re-read the target immediately before sending the redaction.
+
+        This is what makes the redaction idempotent, and the two guarantees
+        are worth separating because only one of them is absolute:
+
+        - **In this process it cannot double-redact.** The dispatcher's
+          in-flight set holds an event id from the moment a job is accepted
+          until it finishes, so there is never more than one job for an event
+          id at a time - and there is no `await` between this read and the
+          send that follows it, on a single-threaded reactor. So the send only
+          ever happens on an event that a fresh read said was not redacted.
+        - **Across processes it is best-effort**, and so is this check. Two
+          instances both configured to run background tasks could both read an
+          unredacted event before either sends. That is a misconfiguration the
+          `should_run_background_tasks` guard exists to prevent and that no
+          in-memory state can detect; see `_start_tier2`.
+
+        A read that fails is a skip, not a redaction. Moderation fails open,
+        and the precondition for sending is a read that SAID the event is
+        still there - not the absence of an answer.
+
+        The cost of a duplicate, for scale: Synapse accepts a second redaction
+        of an already-redacted event and creates a second redaction event. No
+        further content is lost; the damage is noise in the DAG and a second
+        notification. That is why this is a guard rather than a lock.
+        """
+        try:
+            store = self._api._hs.get_datastores().main
+            existing = await store.get_event(job.event_id, allow_none=True)
+        except Exception as exc:
+            # silent-ok: fail-open by contract, and logged by type and site
+            # rather than as a traceback for the reason on the handler below.
+            metrics.TIER2_REDACTION_SKIPPED.labels(cause="lookup_failed").inc()
+            logger.warning(
+                "tier2 could not re-read %s before redacting at %s (%s); "
+                "message stays",
+                job.event_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
+            return False
+        if existing is None:
+            metrics.TIER2_REDACTION_SKIPPED.labels(cause="event_missing").inc()
+            return False
+        if existing.internal_metadata.is_redacted():
+            metrics.TIER2_REDACTION_SKIPPED.labels(cause="already_redacted").inc()
+            return False
+        return True
+
+    async def shutdown(self) -> None:
+        """Drain Tier 2. Registered with the homeserver by the dispatcher;
+        exposed here so a test can drive it without reaching into privates."""
+        if self._dispatcher is not None:
+            await self._dispatcher.shutdown()
+
+
+def _redaction_failure_cause(error: BaseException) -> str:
+    """Which bounded label a failed redaction send goes under.
+
+    Type and status code only. See `metrics.REDACTION_FAILURE_CAUSES` for why
+    the label is not finer-grained than this.
+    """
+    if isinstance(error, (AuthError, SynapseError)) and getattr(
+        error, "code", None
+    ) in (401, 403):
+        return "forbidden"
+    return "other"
 
 
 def _is_replacement(content: Mapping[str, Any]) -> bool:
