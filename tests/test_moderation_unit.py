@@ -300,9 +300,7 @@ class TestTier1Prefilter(unittest.TestCase):
         )
 
     def test_profanity_blocks(self) -> None:
-        self.assertEqual(
-            check_text("you are a fucking idiot", ["US"]), REASON_PROFANITY
-        )
+        self.assertEqual(check_text("you are a motherfucker", ["US"]), REASON_PROFANITY)
 
     def test_clean_multilingual_text_passes(self) -> None:
         self.assertIsNone(check_text("¿Quieres pedir la paella?", ["US"]))
@@ -383,9 +381,7 @@ class TestTier1FailsOpenAsAWhole(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             check_text("call 415-555-2671", ["US"]), REASON_CONTACT_DETAILS
         )
-        self.assertEqual(
-            check_text("you are a fucking idiot", ["US"]), REASON_PROFANITY
-        )
+        self.assertEqual(check_text("you are a motherfucker", ["US"]), REASON_PROFANITY)
 
 
 class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):

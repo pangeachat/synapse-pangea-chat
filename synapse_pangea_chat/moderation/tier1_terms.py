@@ -310,42 +310,78 @@ def _is_letter_of_an_alphabet(char: str) -> bool:
 
 
 def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
-    """One word typed with its letters split apart (`f u c k`, `f*ck`).
+    """One word typed with its letters split apart (`f u c k`, `fu.cking`).
 
     Two rules, because the two kinds of gap mean different things:
 
-    - across PUNCTUATION, fragments of one or two characters rejoin, which is
-      what recovers `f*ck` and `k.u.r.v.a`;
-    - across WHITESPACE ALONE, only single characters of an ALPHABET rejoin. A space
-      is a real word boundary, and in the scripts where one character is a
-      whole syllable it separates ordinary words: `민수 씨 발 아파요?` is
+    - across WHITESPACE ALONE, only single characters of an ALPHABET rejoin. A
+      space is a real word boundary, and in the scripts where one character is
+      a whole syllable it separates ordinary words: `민수 씨 발 아파요?` is
       "Minsu, does your foot hurt?", and rejoining its syllables makes a
       slur. Spaced-out evasions in those scripts are Tier 2's.
+    - across PUNCTUATION, fragments of one or two characters rejoin - but only
+      into a run that is SHAPED LIKE A BROKEN WORD rather than like a list.
+      See `_is_a_split_word`.
 
     The rejoined run must equal a needle outright. Searching the whole
     separatorless message instead is how an ordinary sentence picks up a
     needle it never contained.
     """
-    run: List[str] = []
+    run: List[Span] = []
     for span in spans:
-        if _joinable(span, run):
-            run.append(span.text)
+        if _joinable(span, [piece.text for piece in run]):
+            run.append(span)
             continue
-        if len(run) >= 2 and "".join(run) in needles:
+        if _run_matches(run, needles):
             return True
-        run = [span.text] if len(span.text) <= _FRAGMENT_LEN else []
-    if len(run) >= 2 and "".join(run) in needles:
+        run = [span] if len(span.text) <= _FRAGMENT_LEN else []
+    if _run_matches(run, needles):
         return True
-    # One split point, with a long remainder: `f*cking` -> `f` + `cking`.
-    # Punctuation gaps only, for the same reason as above.
+    # One split point, with a long remainder: `fu.cking` -> `fu` + `cking`.
+    # Punctuation gaps only, and the same word-shape rule: two single letters
+    # either side of a comma are two letters, not a word with a comma in it.
     return any(
         not right.after_space
         and _alphabetic(left.text)
         and _alphabetic(right.text)
         and (len(left.text) <= _FRAGMENT_LEN or len(right.text) <= _FRAGMENT_LEN)
+        and max(len(left.text), len(right.text)) > 1
         and left.text + right.text in needles
         for left, right in zip(spans, spans[1:])
     )
+
+
+def _run_matches(run: Sequence[Span], needles: Set[str]) -> bool:
+    if len(run) < 2 or not _is_a_split_word(run):
+        return False
+    return "".join(span.text for span in run) in needles
+
+
+def _is_a_split_word(run: Sequence[Span]) -> bool:
+    """Is this run one word broken apart, or a list of letters?
+
+    Tier 1 blocks before persist, so it may only act on the one it can tell
+    apart, and this is where the two shapes separate:
+
+    - Every internal gap is WHITESPACE. A space is a word boundary, so a word
+      written with spaces inside it - `f u c k`, `c u n t` - was never a list
+      of separate words, and Tier 1 rejoins it.
+    - A gap contains PUNCTUATION. Then the run is one word only if a piece of
+      it is longer than a single letter: `fu.cking` is `fu` + `cking`, and no
+      lesson spells a word out that way.
+
+    A run of single letters separated by punctuation - `C,U,N,T`, `k.u.r.v.a`,
+    `c.u.n.t` - is structurally identical to a spelling exercise, which is a
+    first-week activity on a language-learning platform. `Press C,U,N,T to
+    continue` was `M_FORBIDDEN` and `Press C, U, N, T to continue` was not,
+    which is the same sentence typed two ways. There is no signal inside the
+    run that separates the evasion from the lesson, so Tier 1 judges neither
+    and Tier 2, which reads the message in context, judges both.
+    """
+    internal_gaps = [span.gap for span in run[1:]]
+    if all(gap and gap.isspace() for gap in internal_gaps):
+        return True
+    return any(len(span.text) > 1 for span in run)
 
 
 def _joinable(span: Span, run: List[str]) -> bool:

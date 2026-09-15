@@ -277,7 +277,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
     block nothing at all."""
 
     MUST_BLOCK = [
-        ("you are a fucking idiot", "en"),
+        ("you are a motherfucker", "en"),
         ("motherfucker", "en"),
         ("what a cunt", "en"),
         ("du 4rschloch", "de"),
@@ -459,6 +459,60 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
             }
         )
         self.assertEqual(carried, _policy()["tier1_languages"])
+
+
+class TestNoAcceptedFalsePositives(unittest.TestCase):
+    """A recorded collision demotes the term. It is never written down and
+    kept.
+
+    `known_residual_false_positives` was an escape hatch: a term could stay in
+    Tier 1 with a benign homograph named on its own record, which is the
+    opposite of the decision rule the same file states. Two entries used it,
+    and both were reproducible pre-send blocks of ordinary sentences. The key
+    is gone and this is what stops it coming back - with the escape hatch
+    available, the next collision is cheaper to record than to act on.
+    """
+
+    def test_no_term_records_an_accepted_false_positive(self) -> None:
+        for entry in universal_terms():
+            with self.subTest(term=entry["term"]):
+                self.assertNotIn(
+                    "known_residual_false_positives",
+                    entry,
+                    "a known benign homograph demotes the term; it is not "
+                    "recorded and kept in the blocking tier",
+                )
+
+    def test_the_policy_does_not_exempt_any_kind_of_collision(self) -> None:
+        """The prose has to agree with the rule. It used to say a proper noun
+        or a case-sensitive technical identifier did not demote a term, which
+        is what licensed the two entries above."""
+        text = str(_policy()["what_demotes_a_term"]).lower()
+        self.assertNotIn("does not", text)
+        self.assertIn("any recorded benign reading", text)
+
+    def test_a_reproduced_benign_collision_is_not_blocked_before_send(self) -> None:
+        """The sentences that reproduced. `fucK` is the case-sensitive gene
+        symbol for L-fuculokinase (NCBI gene 946022) and casefolding merges it
+        with the swear; `Fucking` was an Austrian village until 2021. Both are
+        ordinary sentences in a classroom, and both were `M_FORBIDDEN`."""
+        for text in (
+            "The fucK gene encodes L-fuculokinase.",
+            "The Austrian village of Fucking was renamed Fugging in 2021.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(check_text(text, _PHONE_REGIONS))
+
+    def test_the_demoted_terms_are_still_caught_after_send(self) -> None:
+        """Demotion is a move between tiers, not a hole. Tier 2 reads the
+        message in context, which is the only thing that separates the gene
+        symbol from the swear."""
+        for text in (
+            "Fuck you and leave me alone.",
+            "Lad mig fucking være i fred.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(contains_profanity(text))
 
 
 class TestTheCollisionGate(unittest.TestCase):
@@ -666,9 +720,9 @@ class TestTheMatchingRules(unittest.TestCase):
     its mechanism, so a regression says which rule came back."""
 
     def test_a_needle_does_not_match_a_word_that_starts_with_it(self) -> None:
-        self.assertFalse(matches_tier1("Fuckery is a word in some dictionaries"))
+        self.assertFalse(matches_tier1("Cuntish is a word in some dictionaries"))
         self.assertFalse(matches_tier1("Мы изучаем хуйский язык."))
-        self.assertTrue(matches_tier1("fuck off"))
+        self.assertTrue(matches_tier1("cunt off"))
 
     def test_a_multi_word_term_does_not_match_inside_a_word(self) -> None:
         self.assertFalse(matches_tier1("Pedestrian crossing is ahead"))
@@ -735,22 +789,55 @@ class TestTheMatchingRules(unittest.TestCase):
         for text in ("김 씨 발이 아파요", "민수 씨 발 아파요?", "개 새 끼"):
             with self.subTest(text=text):
                 self.assertFalse(matches_tier1(text))
-        for text in ("f u c k you", "n 1 g g e r", "c.u.n.t"):
+        for text in ("c u n t you", "n 1 g g e r", "cu.nt"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
     def test_a_list_of_letters_is_not_an_evasion(self) -> None:
-        """`Press C, U, N, T to continue` is how a keyboard prompt is
-        written, and `Tôi đang học các chữ cái C, U, N, T` is a learner
-        naming them. A run of single letters rejoins across whitespace and
-        nothing else - a comma is not part of a word."""
+        """`Press C,U,N,T to continue` is how a keyboard prompt is written,
+        and `Tôi đang học các chữ cái C,U,N,T` is a learner naming them.
+
+        Both spellings, spaced and unspaced, because they are the SAME
+        sentence and Tier 1 saw them differently: the control used to test
+        only the spaced form, and the unspaced one - the more natural way to
+        type a list - was blocked pre-send the whole time.
+
+        Spelling a word out letter by letter is a first-week classroom
+        exercise, so this control carries the shapes a lesson actually
+        produces, not only the keyboard prompt.
+        """
         for text in (
             "Press C, U, N, T to continue.",
+            "Press C,U,N,T to continue.",
             "Tôi đang học các chữ cái C, U, N, T.",
+            "Tôi đang học các chữ cái C,U,N,T.",
             "Я запишу буквы х. У. Й.",
+            "Я запишу буквы х.У.Й.",
+            # A spelling lesson, which is the core use case of the product.
+            "How do you spell it? c.u.n.t, with a t at the end.",
+            "Spell it back to me: F,U,C,K.",
         ):
             with self.subTest(text=text):
                 self.assertFalse(matches_tier1(text))
+
+    def test_a_letter_list_is_still_seen_by_tier_2(self) -> None:
+        """The other half of the bargain. Tier 1 cannot tell a spelt-out
+        evasion from a spelt-out lesson, so it judges neither - and the tier
+        that reads the message in context judges both."""
+        for text in ("f.u.c.k", "c.u.n.t", "Spell it back to me: F,U,C,K."):
+            with self.subTest(text=text):
+                self.assertTrue(contains_profanity(text))
+
+    def test_a_broken_word_is_still_an_evasion(self) -> None:
+        """What separates a broken word from a list of letters is that a
+        broken word has a piece longer than one letter in it: `f*ck` is
+        `f` + `ck`, and no lesson spells a word out that way."""
+        for text in ("f*ck", "fu.cking"):
+            with self.subTest(text=text):
+                self.assertTrue(contains_profanity(text))
+        # A piece longer than a letter is what says "one word, broken" rather
+        # than "letters, listed", and Tier 1 still blocks that shape.
+        self.assertTrue(matches_tier1("cu.nt"))
 
     def test_only_letters_of_an_alphabet_are_treated_as_fragments(self) -> None:
         """Asserted on the rule itself, because no term written in one of
@@ -816,7 +903,15 @@ class TestTheMatchingRules(unittest.TestCase):
                 self.assertFalse(matches_tier1(". ".join(words)))
 
     def test_letters_split_apart_are_still_caught(self) -> None:
-        for text in ("f u c k you", "f.u.c.k", "fuuuuck"):
+        """Across WHITESPACE ALONE, a run of single letters is still an
+        evasion Tier 1 blocks: a space is a word boundary, so a word written
+        with spaces inside it was never a list of separate words.
+
+        Across punctuation it is not, and `f.u.c.k` moved to Tier 2 with the
+        spelling lessons it is indistinguishable from - see
+        `test_a_list_of_letters_is_not_an_evasion`.
+        """
+        for text in ("c u n t you", "n 1 g g e r", "cuuuunt"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 

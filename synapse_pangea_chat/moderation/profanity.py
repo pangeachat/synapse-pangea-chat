@@ -304,16 +304,26 @@ def contains_profanity(text: str) -> bool:
 
 
 def _token_matches(token: str, needles: Set[str]) -> bool:
+    """Does this token equal a needle, or a needle plus a short suffix?
+
+    Asked of the TOKEN'S PREFIXES rather than by scanning the needle set, and
+    the difference is a complexity class. The scan was O(tokens x needles) -
+    540 comparisons per token, per message, measured at 1.86 ms on an
+    89-character message and unbounded by input size. An inflection may add at
+    most `_MAX_INFLECTION_SUFFIX` characters, so only four prefixes of the
+    token can possibly be a needle, and each is one set lookup: O(1) per
+    token, independent of how large the wordlist grows.
+    """
     if not token or token in _allowlist():
         return False
     if token in needles:
         return True
-    return any(
-        len(n) >= _min_prefix_len(n)
-        and token.startswith(n)
-        and 0 < len(token) - len(n) <= _MAX_INFLECTION_SUFFIX
-        for n in needles
-    )
+    shortest = max(len(token) - _MAX_INFLECTION_SUFFIX, 1)
+    for length in range(len(token) - 1, shortest - 1, -1):
+        prefix = token[:length]
+        if length >= _min_prefix_len(prefix) and prefix in needles:
+            return True
+    return False
 
 
 def _min_prefix_len(needle: str) -> int:
@@ -341,18 +351,47 @@ def _is_phrase(term: str) -> bool:
 def _short_token_runs(
     tokens: List[str], max_len: int = 2, min_run: int = 2
 ) -> List[str]:
-    """Concatenations of consecutive tokens of at most `max_len` characters —
-    the signature of a word typed with its letters separated (`f u c k`) or
-    broken by punctuation (`f*ck`)."""
+    """Every rejoining of consecutive short tokens — the signature of a word
+    typed with its letters separated (`f u c k`) or broken by punctuation
+    (`c.u.n.t`).
+
+    **Every WINDOW, not only the maximal run**, and that is the difference
+    between catching the evasion and catching it only when it is alone on the
+    line. Taking the maximal run let any ordinary short word beside the
+    evasion destroy the match: `Spell it back to me: F,U,C,K.` rejoined as
+    `tomefuck`, and `How do you spell it? c.u.n.t` as `itcunt`, because `to`,
+    `me` and `it` are short tokens too. The evasion was there in both and this
+    matcher reported neither.
+
+    Bounded by the LONGEST NEEDLE rather than by a window count: a rejoining
+    can only ever match a needle, so extending one past the longest needle in
+    the wordlist cannot produce a match. That makes the scan linear in the
+    message rather than quadratic, which matters because this runs on every
+    Tier-2 message and a 60 KB message of short tokens is a legal one.
+    """
+    limit = _max_needle_length()
     runs: List[str] = []
-    current: List[str] = []
-    for token in tokens:
-        if len(token) <= max_len:
-            current.append(token)
+    count = len(tokens)
+    for start in range(count):
+        if len(tokens[start]) > max_len:
             continue
-        if len(current) >= min_run:
-            runs.append("".join(current))
-        current = []
-    if len(current) >= min_run:
-        runs.append("".join(current))
+        joined = ""
+        for index in range(start, count):
+            token = tokens[index]
+            if len(token) > max_len:
+                break
+            joined += token
+            if len(joined) > limit:
+                break
+            if index - start + 1 >= min_run:
+                runs.append(joined)
     return runs
+
+
+@lru_cache(maxsize=1)
+def _max_needle_length() -> int:
+    """The longest needle any rejoining could equal. Cached with the wordlist,
+    and floored so an empty bucket cannot switch the scan off."""
+    terms = _terms()
+    lengths = [len(needle) for bucket in terms.values() for needle in bucket]
+    return max(lengths, default=_MIN_PREFIX_NEEDLE_LEN)

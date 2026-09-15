@@ -214,7 +214,8 @@
      "term": "fuck",
      "sentence": "Fuck you and leave me alone.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2,
+     "tier_note": "demoted: `fucK` is the gene symbol for L-fuculokinase and Tier 1 casefolds, so the blocking tier cannot separate the two - see tier1_universal.json"
     },
     {
      "term": "cunt",
@@ -1198,7 +1199,8 @@
      "term": "fucking",
      "sentence": "Lad mig fucking være i fred.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2,
+     "tier_note": "demoted: `Fucking` was an Austrian village, and Titlecase is also how the swear opens a sentence - see tier1_universal.json"
     },
     {
      "term": "luder",
