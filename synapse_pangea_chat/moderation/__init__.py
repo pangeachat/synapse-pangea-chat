@@ -557,7 +557,26 @@ class ChatModeration:
 
         if not result.get("flagged"):
             return
-        category = _summarize_categories(result.get("categories") or ())
+        categories = result.get("categories") or ()
+        category = _summarize_categories(categories)
+        if _should_preserve(categories):
+            # Deleting a disclosure of self-harm is itself a harm: the learner
+            # is asking for help, the message is the only record that they did,
+            # and a redaction removes it from the room while telling nobody.
+            # So the verdict is kept and the message is left standing.
+            #
+            # This is the whole of the response today, and it is not enough on
+            # its own: nothing routes the finding to a teacher or safeguarding
+            # contact, so a preserved flag reaches the logs and stops there.
+            # That path is pangeachat/admin-dash#105, and it is the reason this
+            # branch is a preserve rather than an escalate.
+            logger.info(
+                "tier2 flagged event %s in %s (category=%s); preserved, not redacted",
+                event.event_id,
+                event.room_id,
+                category,
+            )
+            return
         logger.info(
             "tier2 flagged event %s in %s (category=%s); redacting",
             event.event_id,
@@ -709,6 +728,12 @@ UNKNOWN_CATEGORY = "other"
 # Used when the service flags a message and names no category at all.
 UNNAMED_CATEGORY = "flagged"
 
+# Categories whose disposition is to LEAVE THE MESSAGE UP. Redaction is the
+# right answer to content that harms the room; it is the wrong answer to a
+# learner disclosing that they intend to harm themselves, where the message is
+# a request for help and deleting it helps nobody.
+PRESERVE_CATEGORIES = frozenset({"self_harm"})
+
 
 def _normalize_category(category: Any) -> str:
     """Map a provider category name onto the orchestrator's flag vocabulary.
@@ -721,6 +746,26 @@ def _normalize_category(category: Any) -> str:
     if not isinstance(category, str) or category not in _PROVIDER_CATEGORIES:
         return UNKNOWN_CATEGORY
     return category.split("/", 1)[0].replace("-", "_")
+
+
+def _should_preserve(categories: Iterable[Any]) -> bool:
+    """True when any recognised category says to leave the message standing.
+
+    Every category is examined, not just the one `_summarize_categories` picks
+    for the log line. That function returns the FIRST recognised category, so a
+    verdict of `["harassment", "self-harm/intent"]` summarises as `harassment`
+    — and deciding on the summary would have redacted a self-harm disclosure
+    because a second label sorted ahead of it.
+
+    Preserving therefore wins over redacting when a verdict carries both. A
+    message that is genuinely both is the hardest case and the reasoning is
+    the same as for the simple one: a learner in crisis who is also being
+    abusive still needs the disclosure to survive, and the abuse is answerable
+    by a human who can see it. The cost is that a redaction the room wanted
+    does not happen, which stays true until somebody is notified — see
+    `_check_and_redact`.
+    """
+    return any(_normalize_category(c) in PRESERVE_CATEGORIES for c in categories)
 
 
 def _summarize_categories(categories: Iterable[Any]) -> str:
