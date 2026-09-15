@@ -264,9 +264,67 @@ class TestTier1Prefilter(unittest.TestCase):
             REASON_CONTACT_DETAILS,
         )
 
-    def test_street_address_blocks(self) -> None:
+    def test_street_address_with_meetup_cue_blocks(self) -> None:
         self.assertEqual(
             check_text("meet me at 42 Maple Street after class", ["US"]),
+            REASON_LOCATION_DETAILS,
+        )
+
+    def test_meetup_cue_is_matched_in_its_other_phrasings(self) -> None:
+        for text in (
+            "come to 42 Maple Street after school",
+            "pick me up at 8 Oak Avenue",
+            "i'll be at 15 Church Road at six",
+            "see you at 15 Church Road",
+            "meet me tomorrow evening at 42 Maple Street",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(check_text(text, ["US"]), REASON_LOCATION_DETAILS)
+
+    def test_landmark_conversation_is_not_blocked(self) -> None:
+        """An address shape with nobody arranging to be met there.
+
+        Tier 1 rejects before the message is sent, so each of these was an
+        innocent learner silenced mid-sentence: discussing a landmark is
+        ordinary conversation in a language-learning room, and naming where
+        you live is an A1 lesson.
+        """
+        for text in (
+            "10 Downing Street is where the Prime Minister lives",
+            "I visited 221 Baker Street in London",
+            "The White House is at 1600 Pennsylvania Avenue",
+            "We read about 4 Privet Drive in Harry Potter",
+            "I live at 42 Maple Street",
+            "My address is 42 Maple Street",
+            "Where do you live? I live at 8 Oak Avenue",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(check_text(text, ["US"]))
+
+    def test_meetup_cue_does_not_reach_across_a_sentence_break(self) -> None:
+        """Proximity is not the same as relation.
+
+        A cue can sit a few characters before an address and have nothing to
+        do with it, so the window stops at the end of the previous sentence.
+        """
+        for text in (
+            "Meet me after class. 10 Downing Street is famous.",
+            "Meet me after class\n10 Downing Street is famous",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(check_text(text, ["US"]))
+
+    def test_a_later_arrangement_still_blocks(self) -> None:
+        """Every address is considered, not only the first.
+
+        The landmark in the first sentence must not shield the arrangement in
+        the second.
+        """
+        self.assertEqual(
+            check_text(
+                "I visited 221 Baker Street. Anyway meet me at 42 Maple Street",
+                ["US"],
+            ),
             REASON_LOCATION_DETAILS,
         )
 
@@ -556,7 +614,7 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         event = _event("threatening text", sender="@offender:example.org")
         with patch(
             "synapse_pangea_chat.moderation.moderate_text",
-            self._verdict(categories=["self-harm/intent"]),
+            self._verdict(categories=["harassment/threatening"]),
         ):
             await mod._check_and_redact(event, "threatening text")
         send = cast(AsyncMock, api.create_and_send_event_into_room)
@@ -571,7 +629,43 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["sender"], "@offender:example.org")
         self.assertEqual(sent["redacts"], event.event_id)
         self.assertEqual(sent["content"]["redacts"], event.event_id)
-        self.assertIn("self_harm", sent["content"]["reason"])
+        self.assertIn("harassment", sent["content"]["reason"])
+
+    async def test_self_harm_is_preserved_not_redacted(self) -> None:
+        """A disclosure of self-harm stays in the room.
+
+        The learner is asking for help and the message is the only record
+        that they did; redacting it removes that and tells nobody. This is
+        the one category whose disposition is not redaction.
+        """
+        api = _module_api()
+        mod = ChatModeration(api, self._tier2_config())
+        event = _event("i want to hurt myself", sender="@learner:example.org")
+        with patch(
+            "synapse_pangea_chat.moderation.moderate_text",
+            self._verdict(categories=["self-harm/intent"]),
+        ):
+            await mod._check_and_redact(event, "i want to hurt myself")
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_self_harm_preserved_even_alongside_a_redactable_category(
+        self,
+    ) -> None:
+        """Preserving wins when a verdict carries both.
+
+        `_summarize_categories` returns the FIRST recognised category, so
+        deciding on the summary would redact this one on the strength of the
+        label that happens to sort ahead of the disclosure.
+        """
+        api = _module_api()
+        mod = ChatModeration(api, self._tier2_config())
+        event = _event("mixed", sender="@learner:example.org")
+        with patch(
+            "synapse_pangea_chat.moderation.moderate_text",
+            self._verdict(categories=["harassment", "self-harm/intent"]),
+        ):
+            await mod._check_and_redact(event, "mixed")
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
 
     async def test_unflagged_result_does_not_redact(self) -> None:
         api = _module_api()

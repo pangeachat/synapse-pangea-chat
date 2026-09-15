@@ -55,6 +55,40 @@ _ADDRESS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The address SHAPE alone is not a reason to block, and in this product it is
+# barely a signal at all: "10 Downing Street is where the Prime Minister lives"
+# is a landmark discussion and "I live at 42 Maple Street" is an A1 lesson,
+# and the shape on its own rejected both before the message was ever sent.
+#
+# What the rule is for is the case the org design names — a minor handing over
+# where to find them — and that case has a second half the lesson does not:
+# somebody arranging to turn up. So the block needs BOTH, and the cue below is
+# the arranging half. It is not a lesson in any curriculum, which is precisely
+# why it discriminates.
+_MEETUP_CUE_RE = re.compile(
+    r"\b(?:"
+    r"meet\s+(?:me|us|you|up)|meeting\s+(?:me|us|you)|"
+    r"come\s+(?:to|over|by|round|around|see\s+me)|"
+    r"pick\s+(?:me|us)\s+up|drop\s+(?:me|us)\s+off|"
+    r"find\s+(?:me|us)\s+at|i'?ll\s+be\s+at|we'?ll\s+be\s+at|"
+    r"see\s+you\s+at|wait\s+for\s+me|bring\s+it\s+to"
+    r")\b",
+    re.IGNORECASE,
+)
+# How far before the address the cue may sit. A cue anywhere in the message
+# would rejoin two unrelated sentences, and the window is what keeps them
+# apart. Wide enough for the ordinary phrasings ("meet me tomorrow evening at
+# 42 Maple Street"), short enough that a separate thought rarely reaches.
+_MEETUP_WINDOW_CHARS = 60
+# The window also stops at a sentence break, because distance alone does not
+# separate two thoughts: "Meet me after class. 10 Downing Street is famous."
+# puts a cue 20 characters before a landmark and means nothing by it. A cue
+# and an address in one sentence is the arrangement; across a full stop it is
+# two remarks. The cost is a miss when a full stop falls between them for an
+# unrelated reason ("Meet me at Dr. Smith's, 42 Maple Street"), which is the
+# direction this tier errs in anyway.
+_SENTENCE_BREAK_RE = re.compile(r"[.!?\n]")
+
 
 def validate_phone_regions(regions: object) -> List[str]:
     """Return the configured regions, or raise `ValueError` describing why not.
@@ -109,7 +143,21 @@ def contains_phone_number(text: str, regions: Iterable[str]) -> bool:
 
 
 def contains_street_address(text: str) -> bool:
-    return _ADDRESS_RE.search(text) is not None
+    """True only for an address that somebody is arranging to be met at.
+
+    The address shape and a meeting cue must BOTH be present, and the cue must
+    sit within `_MEETUP_WINDOW_CHARS` before the address. Every address in the
+    message is considered, because the first one may be the landmark and the
+    second the arrangement.
+    """
+    for match in _ADDRESS_RE.finditer(text):
+        window = text[max(0, match.start() - _MEETUP_WINDOW_CHARS) : match.start()]
+        breaks = list(_SENTENCE_BREAK_RE.finditer(window))
+        if breaks:
+            window = window[breaks[-1].end() :]
+        if _MEETUP_CUE_RE.search(window):
+            return True
+    return False
 
 
 def contains_profanity(text: str) -> bool:
