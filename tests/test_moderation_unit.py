@@ -416,6 +416,12 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
                 _event("something", sender="@botimposter:example.org.evil.com"),
                 {},
             )
+            # `calls` as well as `started`: `started` holds only the
+            # dispatches that bound and ran, so asserting on it alone counts a
+            # SECOND, rejected dispatch as no dispatch at all - the production
+            # callback swallows what the double raises. The predecessor
+            # `assert_called_once()` did detect that; this has to too.
+            self.assertEqual(len(background.calls), 1)
             self.assertEqual(len(background.started), 1)
             background.discard()
 
@@ -522,6 +528,7 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
             ) as moderate,
         ):
             await mod.on_new_event(_event("you suck"), {})
+            self.assertEqual(len(background.calls), 1)
             self.assertEqual(len(background.started), 1)
             self.assertEqual(background.started[0][0], "pangea_moderation_tier2")
             await background.drain()
@@ -545,6 +552,9 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         assert await_args is not None
         sent = await_args.args[0]
         self.assertEqual(sent["type"], "m.room.redaction")
+        # `room_id` is mandatory and autospec checks the METHOD's signature,
+        # not the event dictionary's contents, so it has to be asserted here.
+        self.assertEqual(sent["room_id"], event.room_id)
         self.assertEqual(sent["sender"], "@offender:example.org")
         self.assertEqual(sent["redacts"], event.event_id)
         self.assertEqual(sent["content"]["redacts"], event.event_id)
@@ -556,8 +566,12 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         with patch(
             "synapse_pangea_chat.moderation.moderate_text",
             self._verdict(flagged=False, categories=[]),
-        ):
+        ) as moderate:
             await mod._check_and_redact(_event("hi"), "hi")
+        # The check must have RUN. Without this the test passes when the call
+        # raised instead - a different failure, caught by the same fail-open
+        # handler, that also redacts nothing.
+        moderate.assert_awaited_once()
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
 
     async def test_moderation_outage_fails_open(self) -> None:
@@ -568,8 +582,9 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         with patch(
             "synapse_pangea_chat.moderation.moderate_text",
             self._outage(ModerationCheckError("down")),
-        ):
+        ) as moderate:
             await mod._check_and_redact(_event("hi"), "hi")
+        moderate.assert_awaited_once()
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
 
     async def test_a_service_supplied_category_never_reaches_the_room(self) -> None:
@@ -902,19 +917,25 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
 
-    async def test_attribute_text_does_not_interrupt_the_visible_text(self) -> None:
-        """Inline elements concatenate, so this reads `415-555-2671`. Splicing
-        the attribute in where the tag stood broke the number in half."""
-        mod = _moderation(_config())
-        event = _event(
-            content={
-                "msgtype": "m.text",
-                "body": "",
-                "format": "org.matrix.custom.html",
-                "formatted_body": '41<b title="notes">5</b>-555-2671',
-            }
+    def test_attribute_placement_follows_the_rendering(self) -> None:
+        """Where an attribute's text goes decides whether a number survives,
+        and the two kinds go to different places.
+
+        An image's alternative text stands IN the flow - it replaces the image
+        - so it has to be spliced where the tag was, or `call <img alt="415">`
+        loses the join. A `title` is a tooltip, shown nowhere between the
+        characters either side, so splicing it there splits
+        `41<b title="x">5</b>-555-2671`, which reads as one number, in half.
+        Asserted on the renderer, because an end-to-end fixture passes on
+        either placement as long as SOME rule fires."""
+        self.assertEqual(
+            _displayed_text('call <img src="mxc://x/y" alt="415">-555-2671'),
+            "call 415-555-2671",
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            _displayed_text('41<b title="notes">5</b>-555-2671'), "415-555-2671"
+        )
+        self.assertEqual(_displayed_text('<a title="notes">go</a>'), "go\nnotes")
 
     async def test_script_and_style_content_is_not_matched(self) -> None:
         """Nobody reads a stylesheet, so matching one is a false positive with
@@ -1004,6 +1025,83 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                     }
                 )
                 self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_html_that_a_renderer_normalises_is_still_matched(self) -> None:
+        """Every case here reads as one phone number on screen, and each used
+        to reach the rules as something else: an unparsed CDATA remainder, a
+        table tag with no table around it, a NUL the tokenizer ignores, an
+        `<image>` HTML5 parses as `img`, and alternative text that stands in
+        the flow where the image was."""
+        for formatted in (
+            "<![CDATA[>call &#52;15-555-2671]]>",
+            "<![CDATA[>call 4<b>1</b>5-555-2671]]>",
+            "call 41</td>5-555-2671",
+            "call 41<td>5-555-2671",
+            "call 41\x005-555-2671",
+            '<image src="mxc://x/y" alt="call 415-555-2671">',
+            'call <img src="mxc://x/y" alt="415">-555-2671',
+        ):
+            with self.subTest(formatted=formatted):
+                mod = _moderation(_config())
+                event = _event(
+                    content={
+                        "msgtype": "m.text",
+                        "body": "",
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": formatted,
+                    }
+                )
+                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_markup_a_renderer_hides_is_not_matched(self) -> None:
+        """The permissive direction, and every one of these reads "hello" on
+        screen: a `filename` on a text message is not an attachment name, a
+        `formatted_body` under an unsupported format is ignored by every
+        client, a trailing slash does not make `<script>` void, HTML5 keeps
+        the FIRST of two duplicate attributes, and a doctype's quoted string
+        may contain a `>`."""
+        cases: List[Dict[str, Any]] = [
+            {"msgtype": "m.text", "body": "hello", "filename": "call 415-555-2671"},
+            {
+                "msgtype": "m.text",
+                "body": "hello",
+                "format": "x-not-html",
+                "formatted_body": "call 415-555-2671",
+            },
+            {
+                "msgtype": "m.text",
+                "body": "hello",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "hello<script/>call 415-555-2671</script>",
+            },
+            {
+                "msgtype": "m.text",
+                "body": "hello",
+                "format": "org.matrix.custom.html",
+                "formatted_body": (
+                    'hello <img src="mxc://x/y" alt="notes" alt="call 415-555-2671">'
+                ),
+            },
+            {
+                "msgtype": "m.text",
+                "body": "hello",
+                "format": "org.matrix.custom.html",
+                "formatted_body": '<![CDATA[>hello<b alt="415-555-2671"></b>]]>',
+            },
+            {
+                "msgtype": "m.text",
+                "body": "hello",
+                "format": "org.matrix.custom.html",
+                "formatted_body": ('<!DOCTYPE html PUBLIC "a>call 415-555-2671">hello'),
+            },
+        ]
+        for content in cases:
+            with self.subTest(content=content):
+                mod = _moderation(_config())
+                self.assertEqual(
+                    await mod.check_event_for_spam(_event(content=content)),
+                    NOT_SPAM,
+                )
 
     async def test_ordinary_html_still_passes(self) -> None:
         """The other direction: an extractor that over-reads is a
@@ -1160,8 +1258,18 @@ class _FailingAgent:
     def __init__(self, error: Exception) -> None:
         self.error = error
 
-    def request(self, *args: Any, **kwargs: Any) -> Any:
-        return defer.fail(self.error)
+    def request(
+        self, method: bytes, uri: bytes, headers: Any = None, bodyProducer: Any = None
+    ) -> Any:
+        # Raised from inside an ACTIVE `except` block, which is how twisted
+        # delivers a transport failure: it resumes the awaiting coroutine from
+        # within its own handler, so the original becomes our `__context__`
+        # whatever our own frame does. A `defer.fail` built outside a handler
+        # never exercises that.
+        try:
+            raise self.error
+        except Exception:
+            return defer.fail()
 
 
 class TestChoreoClient(unittest.TestCase):
@@ -1311,11 +1419,21 @@ class TestChoreoClient(unittest.TestCase):
         self.assertEqual(results[0]["flagged"], False)
 
     def test_a_body_one_byte_over_the_limit_is_refused(self) -> None:
+        """Valid JSON, so the only thing that can fail it is the cap. A body of
+        junk bytes fails for a second reason and the test passes even when the
+        cap is raised."""
+        prefix = b'{"flagged": false, "categories": [], "note": "'
+        suffix = b'"}'
+        padding = b"y" * (MAX_RESPONSE_BYTES + 1 - len(prefix) - len(suffix))
+        body = prefix + padding + suffix
+        self.assertEqual(len(body), MAX_RESPONSE_BYTES + 1)
         clock = Clock()
-        response = _FakeResponse(body=b"x" * (MAX_RESPONSE_BYTES + 1))
+        response = _FakeResponse(body=body)
         agent = _FakeAgent(response)
         _deferred, results = self._call(agent, clock)
+        self.assertIsInstance(results[0], Failure, results[0])
         results[0].trap(ModerationCheckError)
+        self.assertTrue(response.transport.lost or response.transport.aborted)
 
     def test_the_request_is_the_one_the_endpoint_expects(self) -> None:
         """The agent double checks what it was handed, so a wrong method, path
@@ -1343,6 +1461,18 @@ class TestChoreoClient(unittest.TestCase):
         self.assertEqual(
             clock.getDelayedCalls(), [], "a completed call left a timer behind"
         )
+
+    def test_a_response_with_no_verdict_is_refused(self) -> None:
+        """Absent is not False. `{}`, or an error object returned with a 200,
+        was read as "this message is fine" - a verdict we were never given,
+        reached by a default."""
+        for body in (b"{}", b'{"error": "provider failed"}', b'{"categories": []}'):
+            with self.subTest(body=body):
+                clock = Clock()
+                agent = _FakeAgent(_FakeResponse(body=body))
+                _deferred, results = self._call(agent, clock)
+                self.assertIsInstance(results[0], Failure, results[0])
+                results[0].trap(ModerationCheckError)
 
     def test_a_malformed_verdict_is_refused_at_the_boundary(self) -> None:
         """Shape is checked where the data enters, not one frame later. The
@@ -1404,6 +1534,24 @@ class TestChoreoClient(unittest.TestCase):
         self.assertIsNone(error.__cause__)
         self.assertIsNone(error.__context__)
         self.assertNotIn(self.PAYLOAD, self._everything_reachable_from(error))
+
+    def test_a_rule_failure_carries_no_chain_either(self) -> None:
+        """`Tier1RuleError` promises "a rule identifier and nothing else", and
+        `raise ... from None` does not deliver it: `__context__` still holds
+        the matcher's own exception, which routinely quotes the message body
+        it failed on."""
+        payload = "@alice:example.org and the message body"
+        with patch.object(
+            tier1_prefilter.phonenumbers,
+            "PhoneNumberMatcher",
+            side_effect=ValueError(payload),
+        ):
+            with self.assertRaises(Tier1RuleError) as caught:
+                check_text("call me", ["US"])
+        error = caught.exception
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+        self.assertNotIn(payload, self._everything_reachable_from(error))
 
     def test_an_undecodable_body_does_not_escape_the_module(self) -> None:
         """`json.loads` raises `UnicodeDecodeError` - not a subclass of
@@ -1471,10 +1619,25 @@ class TestCallbackRegistration(unittest.TestCase):
         )
 
     def test_a_disabled_tier_registers_nothing(self) -> None:
-        api = _module_api()
-        ChatModeration(api, _config(moderation_tier1_enabled=True))
-        api.register_spam_checker_callbacks.assert_called_once()
-        api.register_third_party_rules_callbacks.assert_not_called()
+        """Both directions, because a test that only ever disables Tier 2
+        passes when Tier-1 registration is made unconditional."""
+        tier1_only = _module_api()
+        ChatModeration(tier1_only, _config(moderation_tier1_enabled=True))
+        tier1_only.register_spam_checker_callbacks.assert_called_once()
+        tier1_only.register_third_party_rules_callbacks.assert_not_called()
+
+        tier2_only = _module_api()
+        ChatModeration(
+            tier2_only,
+            _config(
+                moderation_tier1_enabled=False,
+                moderation_tier2_enabled=True,
+                moderation_choreo_base_url="http://choreo.invalid",
+                moderation_choreo_access_token="syt_x",
+            ),
+        )
+        tier2_only.register_spam_checker_callbacks.assert_not_called()
+        tier2_only.register_third_party_rules_callbacks.assert_called_once()
 
 
 class TestExemptGlobContainer(unittest.TestCase):
@@ -1615,6 +1778,13 @@ class TestParseConfig(unittest.TestCase):
             "https://choreo.invalid:bad",
             "https://choreo.invalid:99999",
             "https://choreo.invalid:0",
+            # DEL is a control character above 0x21, which a "< 0x21" test
+            # misses and twisted's `_ensureValidURI` rejects.
+            "https://choreo.invalid/\x7fx",
+            # `urlparse` reports no port for a bare trailing colon, so the
+            # range check never sees it; twisted keeps the colon in the host.
+            "https://choreo.invalid:",
+            "https://[::1]:",
         ):
             with self.subTest(url=url):
                 with self.assertRaises(ValueError):

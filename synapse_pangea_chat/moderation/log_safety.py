@@ -29,8 +29,9 @@ Three channels need closing, and only one of them is a log call we write:
 import hashlib
 import logging
 import os
+import re
 import secrets
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 # 6 bytes is 12 hex characters: short enough to read in a log line, wide
 # enough that two senders colliding within one process is not a practical
@@ -68,9 +69,9 @@ def sender_digest(sender: str, key: bytes) -> str:
 # free to configure a formatter that references `%(requester)s`, and deleting
 # the attribute would turn a privacy fix into a KeyError in the logging system.
 #
-# The rest of what the filter sets - `request`, `server_name`, `site_tag`,
-# `method`, `protocol` - names an endpoint and a request, not a person, and is
-# what makes a record traceable, so it is left alone.
+# The rest of what the filter sets - `server_name`, `site_tag`, `method`,
+# `protocol` - names an endpoint and a request, not a person, and is what makes
+# a record traceable, so it is left alone.
 # `url` joins them, and the first attempt to keep it - scrubbing Matrix-ID
 # shaped substrings out of the path and keeping the rest - was wrong. A Matrix
 # request path carries client-chosen text: the transaction id of a message send
@@ -88,6 +89,16 @@ _IDENTITY_RECORD_ATTRS: Tuple[str, ...] = (
     "user_agent",
     "url",
 )
+
+# `request` is the request id, and it is only safe in the shape Synapse
+# generates: `get_request_id` returns `f"{method}-{sequence}"` UNLESS the
+# deployment sets `request_id_header`, in which case the header's value is
+# used verbatim - so a client that sends `X-Request-ID: @alice:example.org`
+# puts its own Matrix ID on every record of its own request, and the shipped
+# `precise` formatter PRINTS this field. The generated shape is kept, because
+# it is what ties a moderation record to Synapse's own request lines; anything
+# else is client-supplied text and goes.
+_SYNAPSE_REQUEST_ID = re.compile(r"^[A-Z]+-\d+$")
 
 REDACTED = "<redacted:pangea-moderation>"
 
@@ -129,6 +140,12 @@ class _IdentityScrubbingFilter(logging.Filter):
         for attr in _IDENTITY_RECORD_ATTRS:
             if getattr(record, attr, None) is not None:
                 setattr(record, attr, REDACTED)
+        request = getattr(record, "request", None)
+        if request is not None and not _SYNAPSE_REQUEST_ID.match(str(request)):
+            # Written through `__dict__` because that is where a LogRecord
+            # attribute lives; `setattr` with a constant name is the same
+            # thing spelled less plainly.
+            record.__dict__["request"] = REDACTED
         return True
 
 
@@ -139,16 +156,34 @@ def scrub_reachable_handlers(logger: logging.Logger) -> None:
     logging-configuration reload, say - are not covered, and that residue is
     recorded in .github/instructions/moderation.instructions.md.
     """
-    current: Optional[logging.Logger] = logger
-    while current is not None:
-        for handler in current.handlers:
+    for target in _reachable_loggers(logger):
+        for handler in target.handlers:
             if not any(
                 isinstance(f, _IdentityScrubbingFilter) for f in handler.filters
             ):
                 handler.addFilter(_IdentityScrubbingFilter(only_prefix=_PACKAGE_LOGGER))
+
+
+def _reachable_loggers(logger: logging.Logger) -> List[logging.Logger]:
+    """`logger`, its ancestors, and its descendants.
+
+    The descendants are the half an earlier version missed. Walking upwards
+    covers the handlers a record PROPAGATES to; a handler attached directly to
+    `moderation.tier1_prefilter` is not on that path, and a record emitted
+    through that child logger reaches it first of all.
+    """
+    reachable: List[logging.Logger] = []
+    current: Optional[logging.Logger] = logger
+    while current is not None:
+        reachable.append(current)
         if not current.propagate:
-            return
+            break
         current = current.parent
+    prefix = f"{logger.name}."
+    for name, existing in list(logging.Logger.manager.loggerDict.items()):
+        if isinstance(existing, logging.Logger) and name.startswith(prefix):
+            reachable.append(existing)
+    return reachable
 
 
 def scrubbing_logger(name: str) -> logging.Logger:

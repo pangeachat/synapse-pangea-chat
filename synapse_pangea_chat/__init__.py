@@ -103,7 +103,10 @@ def _validate_choreo_base_url(value: str) -> str:
     # Every space, tab, carriage return, newline and control character, not a
     # hand-written list of the ones somebody thought of: `"host\r/a"` was
     # rejected by twisted and accepted here because `\r` was not on the list.
-    if any(character.isspace() or ord(character) < 0x21 for character in raw):
+    if any(
+        character.isspace() or ord(character) < 0x21 or ord(character) == 0x7F
+        for character in raw
+    ):
         raise ValueError(
             'Config "moderation.choreo_base_url" must not contain whitespace '
             "or control characters; twisted refuses to build a request URI "
@@ -147,6 +150,14 @@ def _validate_choreo_base_url(value: str) -> str:
     if port is not None and not 1 <= port <= 65535:
         raise ValueError(
             'Config "moderation.choreo_base_url" has a port outside 1-65535'
+        )
+    if parsed.netloc.endswith(":") or parsed.netloc.rstrip("]").endswith(":"):
+        # `urlparse` reports no port for a bare trailing colon, so the range
+        # check above never sees it - and twisted keeps the colon as part of
+        # the hostname, which then fails to resolve on every request.
+        raise ValueError(
+            'Config "moderation.choreo_base_url" ends its host with a colon '
+            "and no port"
         )
     if parsed.params:
         raise ValueError(

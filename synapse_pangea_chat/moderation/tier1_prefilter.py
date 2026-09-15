@@ -116,8 +116,38 @@ class Tier1RuleError(Exception):
     """A Tier 1 rule could not complete, so the tier has no verdict.
 
     Carries a rule identifier and nothing else: the text that broke the rule is
-    exactly what must not travel with the exception (ADR-10).
+    exactly what must not travel with the exception (ADR-10). The chain is
+    severed on construction rather than by `raise ... from None`, which clears
+    `__cause__` and leaves `__context__` holding the original - and a matcher
+    that failed on a message body routinely quotes that body in its message.
     """
+
+    # `__context__` is shadowed, not merely cleared, and the distinction is
+    # the whole point. The interpreter attaches the active exception at RAISE
+    # time, so clearing it in `__init__` is too early and `raise ... from None`
+    # only sets `__suppress_context__` - the original stays attached and
+    # anything that walks the chain still finds it. Raising outside our own
+    # `except` block fixes our own frames but not the one that matters most:
+    # twisted resumes an awaiting coroutine from inside ITS handler, so a
+    # parse error carrying the raw response line becomes the context however
+    # carefully our code is arranged. A property on the type answers None to
+    # every Python reader of the chain - `traceback`, `logging`, a structured
+    # sink - which is the promise this exception's message makes.
+    @property
+    def __context__(self) -> Optional[BaseException]:
+        return None
+
+    @__context__.setter
+    def __context__(self, value: Optional[BaseException]) -> None:
+        return None
+
+    @property
+    def __cause__(self) -> Optional[BaseException]:
+        return None
+
+    @__cause__.setter
+    def __cause__(self, value: Optional[BaseException]) -> None:
+        return None
 
 
 # The rules, in the order they are asked, each paired with the reason it

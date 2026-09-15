@@ -45,7 +45,43 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 
 
 class ModerationCheckError(Exception):
-    """The moderation service could not produce a verdict."""
+    """The moderation service could not produce a verdict.
+
+    Carries a reason type and nothing else, and severs its own exception chain
+    on construction. Raising outside the local `except` block is not enough:
+    twisted resumes an awaiting coroutine from inside ITS active handler, so a
+    `ParseError` carrying the raw response line becomes our `__context__`
+    however carefully our own frame is arranged. Anything that walks the chain
+    - a structured log sink, `logger.exception` - would then serialise what the
+    service sent, out of an error whose own message names only a type.
+    """
+
+    # `__context__` is shadowed, not merely cleared, and the distinction is
+    # the whole point. The interpreter attaches the active exception at RAISE
+    # time, so clearing it in `__init__` is too early and `raise ... from None`
+    # only sets `__suppress_context__` - the original stays attached and
+    # anything that walks the chain still finds it. Raising outside our own
+    # `except` block fixes our own frames but not the one that matters most:
+    # twisted resumes an awaiting coroutine from inside ITS handler, so a
+    # parse error carrying the raw response line becomes the context however
+    # carefully our code is arranged. A property on the type answers None to
+    # every Python reader of the chain - `traceback`, `logging`, a structured
+    # sink - which is the promise this exception's message makes.
+    @property
+    def __context__(self) -> Optional[BaseException]:
+        return None
+
+    @__context__.setter
+    def __context__(self, value: Optional[BaseException]) -> None:
+        return None
+
+    @property
+    def __cause__(self) -> Optional[BaseException]:
+        return None
+
+    @__cause__.setter
+    def __cause__(self, value: Optional[BaseException]) -> None:
+        return None
 
 
 class _BoundedBody(Protocol):
@@ -168,7 +204,12 @@ def _validated_result(result: Any) -> Dict[str, Any]:
     """
     if not isinstance(result, dict):
         raise ModerationCheckError("moderation endpoint returned a non-object")
-    flagged = result.get("flagged", False)
+    if "flagged" not in result:
+        # Absent is not False. A response of `{}`, or an error object the
+        # endpoint returns with a 200, was read as "this message is fine" -
+        # which is a verdict we were never given, reached by a default.
+        raise ModerationCheckError("moderation endpoint returned no verdict")
+    flagged = result["flagged"]
     if not isinstance(flagged, bool):
         raise ModerationCheckError("moderation endpoint returned a non-boolean flagged")
     categories = result.get("categories")
@@ -211,7 +252,6 @@ async def moderate_text(
     from twisted.web.client import FileBodyProducer
 
     deadline = reactor.seconds() + REQUEST_TIMEOUT_SECONDS
-    failure: Optional[ModerationCheckError] = None
     try:
         d = agent.request(
             b"POST",
@@ -245,18 +285,13 @@ async def moderate_text(
             if timeout.active():
                 timeout.cancel()
     except Exception as e:
-        # Built here and raised BELOW, outside the `except` block, and that is
-        # not a style choice. `raise X from None` clears `__cause__` and stops
-        # the traceback being RENDERED - it does not clear `__context__`, and
-        # the original is still hanging off the exception for anything that
-        # walks it. A structured log sink does walk it, and a
-        # `json.JSONDecodeError` carries the whole response body on `.doc`, so
-        # the payload travelled out of the module attached to an error whose
-        # own message says only the type. Raising outside the handler leaves
-        # `__context__` empty (ADR-10).
-        failure = ModerationCheckError(f"moderation request failed: {type(e).__name__}")
-    if failure is not None:
-        raise failure
+        # The chain is severed by `ModerationCheckError` itself, not by this
+        # `from None` - see the class, and ADR-10. `from None` alone leaves
+        # `__context__` holding the original, and a `json.JSONDecodeError`
+        # carries the whole response body on `.doc`.
+        raise ModerationCheckError(
+            f"moderation request failed: {type(e).__name__}"
+        ) from None
 
     if response.code >= 400:
         raise ModerationCheckError(f"moderation endpoint returned {response.code}")
@@ -269,10 +304,8 @@ async def moderate_text(
         # by `logger.exception` with the undecodable bytes in its args - the
         # response body, in a plaintext log, by a route no format string of
         # ours mentions.
-        failure = ModerationCheckError(
+        raise ModerationCheckError(
             f"moderation endpoint returned a body we could not read: "
             f"{type(e).__name__}"
-        )
-    if failure is not None:
-        raise failure
+        ) from None
     return _validated_result(result)

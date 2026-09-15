@@ -26,7 +26,17 @@ the org trust-and-safety doc it descends from.
 import inspect
 import re
 from html.parser import HTMLParser
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from synapse.api.errors import Codes
 from synapse.events import EventBase
@@ -81,6 +91,13 @@ _REPLACE_REL_TYPE = "m.replace"
 # Tags that produce a visual break when a client renders `formatted_body`.
 # Everything else is inline, and inline elements concatenate with no gap: the
 # displayed text of `4<b>1</b>5` is `415`, so that is the string the rules see.
+# Tags that break the line WHEREVER THEY APPEAR. Table tags are deliberately
+# absent: `<td>` outside a table, and a `</td>` with no open cell, are ignored
+# entirely by an HTML5 parser, so treating them as breaks split
+# `call 41</td>5-555-2671` - one number on screen - into two harmless halves.
+# Everything not listed is inline, and inline elements concatenate with no gap:
+# the displayed text of `4<b>1</b>5` is `415`, so that is the string the rules
+# see.
 _BLOCK_LEVEL_TAGS = frozenset(
     {
         "blockquote",
@@ -97,30 +114,33 @@ _BLOCK_LEVEL_TAGS = frozenset(
         "ol",
         "p",
         "pre",
-        "table",
-        "td",
-        "th",
-        "tr",
         "ul",
     }
 )
 # Attribute values a client puts on screen, listed as TAG/ATTRIBUTE pairs
-# rather than as bare attribute names. An attribute is displayed only where the
-# renderer displays it: `alt` on an `<img>` is shown whenever the image does not
-# load, and `alt` on a `<b>` is shown by nothing at all, so treating the name
-# alone as displayed text made `<b alt="415-555-2671">hello</b>` a Tier-1 block
-# on a message that reads "hello". Tier 1 blocks before persist, so a false
-# positive silences an innocent learner; the pairs are what the renderers
-# actually implement.
+# rather than as bare attribute names, and split by WHERE they appear.
 #
-# `data-mx-spoiler` carries the spoiler's reason and `data-mx-maths` the LaTeX
-# source, both of which Element puts on screen. `href` is deliberately absent:
-# clients show the link's TEXT, and a URL full of digits is a plausible phone
-# false positive. Recorded as a limit in
-# .github/instructions/moderation.instructions.md.
-_DISPLAYED_ATTRIBUTES = frozenset(
+# An attribute is displayed only where the renderer displays it: `alt` on an
+# `<img>` is shown whenever the image does not load, and `alt` on a `<b>` is
+# shown by nothing at all, so treating the name alone as displayed text made
+# `<b alt="415-555-2671">hello</b>` a Tier-1 block on a message that reads
+# "hello". Tier 1 blocks before persist, so a false positive silences an
+# innocent learner.
+#
+# The split matters as much as the list. An image's alternative text stands
+# IN the text flow - it replaces the image, so `call <img alt="415">-555-2671`
+# reads `call 415-555-2671` - while a `title` is a tooltip and a spoiler's
+# reason is revealed separately, neither of them between the characters either
+# side. Putting the first kind in the flow keeps a number whole; keeping the
+# second kind out of it stops `41<b title="notes">5</b>-555-2671`, which also
+# reads as one number, from being split by text nobody sees there.
+#
+# `href` is deliberately absent from both: clients show the link's TEXT, and a
+# URL full of digits is a plausible phone false positive. Recorded as a limit
+# in .github/instructions/moderation.instructions.md.
+_INLINE_ATTRIBUTES = frozenset({("img", "alt")})
+_OUT_OF_FLOW_ATTRIBUTES = frozenset(
     {
-        ("img", "alt"),
         ("img", "title"),
         ("a", "title"),
         ("abbr", "title"),
@@ -132,6 +152,8 @@ _DISPLAYED_ATTRIBUTES = frozenset(
 # Elements whose content is never rendered as text. Including it was a
 # false-positive source with no upside: nobody reads a stylesheet.
 _INVISIBLE_ELEMENTS = frozenset({"script", "style"})
+# HTML5 parses `<image>` as `img`, so its alternative text is displayed.
+_TAG_ALIASES = {"image": "img"}
 
 # Python's HTMLParser reads an abruptly-closed comment as an OPEN one and keeps
 # scanning for a later terminator, so everything up to the next `-->` vanishes.
@@ -141,6 +163,10 @@ _INVISIBLE_ELEMENTS = frozenset({"script", "style"})
 # at all to the extractor. Rewriting the abrupt form into the well-formed empty
 # comment the spec says it is puts the two back in agreement.
 _ABRUPT_COMMENTS = re.compile(r"<!--?>")
+# A doctype's quoted strings may contain `>`, and HTML5 keeps reading to the
+# real end; Python's parser stops at the first `>` and hands the remainder back
+# as text nobody sees. Removed whole, quotes included, before parsing.
+_DOCTYPE = re.compile(r"<!DOCTYPE(?:[^>\"\']|\"[^\"]*\"|\'[^\']*\')*>", re.IGNORECASE)
 
 
 class _DisplayedText(HTMLParser):
@@ -154,13 +180,6 @@ class _DisplayedText(HTMLParser):
     both, and fixes them in the order ADR-8a(ii) requires: the tag scanner runs
     over the raw text first, so `&lt;I will kill you&gt;` becomes the visible
     text `<I will kill you>` rather than being decoded into a tag and deleted.
-
-    Attribute text is collected into a SECOND stream and appended afterwards,
-    never spliced in where the tag stood. Inline elements concatenate, so
-    `41<b title="notes">5</b>-555-2671` reads `415-555-2671` on screen;
-    inserting the attribute between the `41` and the `5` broke the number in
-    half and lost the match. Two streams keep the visible text contiguous and
-    still let a rule see what an attribute is hiding.
     """
 
     def __init__(self) -> None:
@@ -174,10 +193,19 @@ class _DisplayedText(HTMLParser):
             self._parts.append(data)
 
     def _handle_tag(self, tag: str, attrs: Sequence[Tuple[str, Optional[str]]]) -> None:
+        tag = _TAG_ALIASES.get(tag, tag)
         if tag in _BLOCK_LEVEL_TAGS:
             self._parts.append("\n")
+        # First value wins, as HTML5 says: a duplicate attribute is a parse
+        # error and the later one is dropped, so reading both invented text.
+        seen: Dict[str, str] = {}
         for name, value in attrs:
-            if value and (tag, name) in _DISPLAYED_ATTRIBUTES:
+            if value and name not in seen:
+                seen[name] = value
+        for name, value in seen.items():
+            if (tag, name) in _INLINE_ATTRIBUTES:
+                self._parts.append(value)
+            elif (tag, name) in _OUT_OF_FLOW_ATTRIBUTES:
                 self.attribute_text.append(value)
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
@@ -188,12 +216,18 @@ class _DisplayedText(HTMLParser):
     def handle_startendtag(
         self, tag: str, attrs: List[Tuple[str, Optional[str]]]
     ) -> None:
+        # A trailing slash does not make an element void in HTML5: `<script/>`
+        # opens a script element exactly as `<script>` does, and everything
+        # after it is script source until the close tag. Treating it as
+        # self-closing let that source through as displayed text.
+        if tag in _INVISIBLE_ELEMENTS:
+            self._invisible_depth += 1
         self._handle_tag(tag, attrs)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in _INVISIBLE_ELEMENTS and self._invisible_depth > 0:
             self._invisible_depth -= 1
-        if tag in _BLOCK_LEVEL_TAGS:
+        if _TAG_ALIASES.get(tag, tag) in _BLOCK_LEVEL_TAGS:
             self._parts.append("\n")
 
     def unknown_decl(self, data: str) -> None:
@@ -205,10 +239,18 @@ class _DisplayedText(HTMLParser):
         swallows the whole section up to `]]>`, which made
         `<![CDATA[>call 415-555-2671]]>` invisible to both tiers and a phone
         number to every reader.
+
+        The recovered remainder is PARSED, not appended. Appending it raw put
+        `call &#52;15-555-2671` and `call 4<b>1</b>5-555-2671` in front of the
+        rules as literal markup, while a reader saw a phone number in both.
         """
         _, separator, displayed = data.partition(">")
         if separator and self._invisible_depth == 0:
-            self._parts.append(displayed)
+            nested = _DisplayedText()
+            nested.feed(displayed)
+            nested.close()
+            self._parts.append("".join(nested._parts))
+            self.attribute_text.extend(nested.attribute_text)
 
     def result(self) -> str:
         return "".join(self._parts + ["\n" + a for a in self.attribute_text])
@@ -216,8 +258,12 @@ class _DisplayedText(HTMLParser):
 
 def _displayed_text(formatted: str) -> str:
     """The reader-visible text of an HTML body, never less than it displays."""
+    # U+0000 is ignored by an HTML5 tokenizer in text, so `call 41\x005-...`
+    # is one number on screen. Left in, it split the number in two.
+    prepared = formatted.replace("\x00", "")
+    prepared = _DOCTYPE.sub("", prepared)
     parser = _DisplayedText()
-    parser.feed(_ABRUPT_COMMENTS.sub("<!---->", formatted))
+    parser.feed(_ABRUPT_COMMENTS.sub("<!---->", prepared))
     parser.close()
     return parser.result()
 
@@ -523,21 +569,30 @@ def _is_replacement(content: Mapping[str, Any]) -> bool:
     )
 
 
-# Fields whose value a client renders as text. `body` is the message or the
-# caption; `filename` is the original name of an attachment, which a client
-# shows beside or instead of the caption whenever the two differ
-# (https://spec.matrix.org/v1.16/client-server-api/#mfile). Reading `body`
-# alone let a sender put anything in `filename` and have it displayed.
-_DISPLAYED_TEXT_FIELDS = ("body", "filename")
+# `filename` is the original name of an attachment, which a client shows
+# beside or instead of the caption whenever the two differ
+# (https://spec.matrix.org/v1.16/client-server-api/#mfile). It is read only
+# for the msgtypes that HAVE an attachment: on an `m.text` message a
+# `filename` key is not an attachment name, it is a key no client renders, and
+# reading it there made an ordinary text message a Tier-1 block.
+_ATTACHMENT_MSGTYPES = frozenset({"m.file", "m.image", "m.video", "m.audio"})
+# The only `format` for which a client renders `formatted_body`. Without the
+# check, `formatted_body` under an unsupported format - which every client
+# ignores - was matched, which is a false positive on text nobody sees.
+_HTML_FORMAT = "org.matrix.custom.html"
 
 
 def _surface_text(surface: Mapping[str, Any]) -> List[str]:
     """Every displayed string carried by one content surface."""
-    parts: List[str] = []
-    for field in _DISPLAYED_TEXT_FIELDS:
-        parts.extend(_field_text(surface.get(field)))
+    parts: List[str] = list(_field_text(surface.get("body")))
+    if surface.get("msgtype") in _ATTACHMENT_MSGTYPES:
+        parts.extend(_field_text(surface.get("filename")))
     formatted = surface.get("formatted_body")
-    if isinstance(formatted, str) and formatted.strip():
+    if (
+        surface.get("format") == _HTML_FORMAT
+        and isinstance(formatted, str)
+        and formatted.strip()
+    ):
         displayed = _displayed_text(formatted)
         if displayed.strip():
             parts.append(displayed)

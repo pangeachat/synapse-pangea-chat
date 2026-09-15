@@ -189,7 +189,7 @@ def _module_api() -> ModuleApi:
 
 
 @contextlib.contextmanager
-def _synapse_request_logcontext() -> Iterator[None]:
+def _synapse_request_logcontext(request_id: str = "PUT-1") -> Iterator[None]:
     """Synapse's real request logging, installed the way Synapse installs it.
 
     `synapse.config.logger.one_time_logging_setup` does not add
@@ -209,10 +209,10 @@ def _synapse_request_logcontext() -> Iterator[None]:
 
     logging.setLogRecordFactory(factory)
     context = LoggingContext(
-        name="PUT-1",
+        name=request_id,
         server_name="canary-server.invalid",
         request=ContextRequest(
-            request_id="PUT-1",
+            request_id=request_id,
             ip_address=CANARY_IP,
             site_tag="synapse",
             requester=CANARY_SENDER,
@@ -499,17 +499,47 @@ class ModerationLogContextTestCase(unittest.IsolatedAsyncioTestCase):
             )
             with patch(
                 "synapse_pangea_chat.moderation.moderate_text",
-                new=AsyncMock(
-                    return_value={
-                        "flagged": True,
-                        "categories": ["harassment"],
-                        "evaluated": True,
-                    }
-                ),
+                new=_verdict(),
             ):
                 await mod._check_and_redact(_event(CANARY_TEXT), "flagged text")
         cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
         self.assertScrubbed()
+
+    async def test_a_client_supplied_request_id_is_not_kept(self) -> None:
+        """`get_request_id` returns `f"{method}-{sequence}"` unless the
+        deployment sets `request_id_header`, in which case the HEADER's value
+        is used verbatim - so a client can put its own Matrix ID on every
+        record of its own request. The shipped `precise` formatter prints this
+        field, so it leaks with no structured logging at all."""
+        with _synapse_request_logcontext(request_id=f"PUT-{CANARY_SENDER}"):
+            mod = ChatModeration(_module_api(), _config())
+            await mod.check_event_for_spam(_event(CANARY_TEXT))
+        self.assertScrubbed()
+
+    async def test_a_handler_on_a_child_logger_is_scrubbed_too(self) -> None:
+        """Walking upwards covers the handlers a record PROPAGATES to. A
+        handler attached directly to `moderation.tier1_prefilter` is not on
+        that path, and a record emitted through that child logger reaches it
+        first of all."""
+        child = logging.getLogger(
+            "synapse.modules.synapse_pangea_chat.moderation.tier1_prefilter"
+        )
+        child_handler = _CapturingHandler()
+        child_handler.addFilter(LoggingContextFilter())
+        child.addHandler(child_handler)
+        self.addCleanup(child.removeHandler, child_handler)
+        with _synapse_request_logcontext():
+            mod = ChatModeration(_module_api(), _config())
+            with patch(
+                "synapse_pangea_chat.moderation.tier1_prefilter.phonenumbers"
+                ".PhoneNumberMatcher",
+                side_effect=ValueError(f"cannot parse {CANARY_TEXT!r}"),
+            ):
+                await mod.check_event_for_spam(_event(CANARY_TEXT))
+        captured = "\n".join(child_handler.seen)
+        self.assertTrue(child_handler.records, "the child logger never emitted")
+        for canary in (CANARY_SENDER, CANARY_LOCALPART, CANARY_TEXT):
+            self.assertNotIn(canary, captured)
 
     async def test_the_record_stays_traceable_after_scrubbing(self) -> None:
         """The other half of the rule. Stripping the whole record would also
