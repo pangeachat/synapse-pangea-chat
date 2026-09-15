@@ -35,6 +35,28 @@ def _corpus() -> Dict[str, Any]:
     return json.loads(_CORPUS_PATH.read_text(encoding="utf-8"))
 
 
+class TestCorpusIsNotEmpty(unittest.TestCase):
+    """Every per-language loop below iterates a list from the corpus, so an
+    empty list makes its assertions pass without running any of them. Emptying
+    one language's cases is the shape a softening takes here - the suite stays
+    green and the coverage is gone - so the lists are required to be
+    non-empty before anything iterates them."""
+
+    REQUIRED_CASES = ("profanities", "evasions", "negative_controls")
+
+    def test_every_language_carries_cases_of_every_kind(self) -> None:
+        languages = _corpus()["languages"]
+        self.assertTrue(languages, "the corpus lists no languages at all")
+        for lang in languages:
+            for kind in self.REQUIRED_CASES:
+                with self.subTest(lang=lang["lang_code"], kind=kind):
+                    self.assertTrue(
+                        lang.get(kind),
+                        f"{lang['lang_name']} has no {kind}, so every "
+                        f"assertion over them passes without running",
+                    )
+
+
 class TestMultilingualProfanity(unittest.TestCase):
     """Every language's real curse words are caught in a natural sentence."""
 

@@ -31,7 +31,9 @@ import logging
 import os
 import re
 import secrets
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TypeVar
+
+_E = TypeVar("_E", bound=BaseException)
 
 # 6 bytes is 12 hex characters: short enough to read in a log line, wide
 # enough that two senders colliding within one process is not a practical
@@ -133,9 +135,13 @@ class _IdentityScrubbingFilter(logging.Filter):
         self._only_prefix = only_prefix
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if self._only_prefix is not None and not record.name.startswith(
-            self._only_prefix
+        if self._only_prefix is not None and not (
+            record.name == self._only_prefix
+            or record.name.startswith(f"{self._only_prefix}.")
         ):
+            # `startswith` on the bare prefix also matches a sibling logger
+            # named `...moderation_something`, whose records are not ours to
+            # touch. The dot is what makes it a namespace test.
             return True
         for attr in _IDENTITY_RECORD_ATTRS:
             if getattr(record, attr, None) is not None:
@@ -200,6 +206,26 @@ def scrubbing_logger(name: str) -> logging.Logger:
     if not any(isinstance(f, _IdentityScrubbingFilter) for f in logger.filters):
         logger.addFilter(_IdentityScrubbingFilter())
     return logger
+
+
+def _severed(error: _E) -> _E:
+    """Detach an exception from whatever was being handled when it was raised.
+
+    The interpreter attaches the active exception at RAISE time, so this cannot
+    be done in `__init__` (too early) and `raise ... from None` does not do it
+    (it only suppresses the RENDERING, leaving `__context__` set). Shadowing
+    the attribute with a property was worse: it conceals the chain from an
+    ordinary read while `BaseException.__context__.__get__` still returns the
+    original - a mask, not a fix, and a privacy claim that is not true.
+
+    So the exception is caught one frame out, the real slots are cleared, and
+    it is re-raised bare - which does not re-attach, because the exception is
+    already the one being handled. Used at the module's own boundaries.
+    """
+    error.__cause__ = None
+    error.__context__ = None
+    error.__suppress_context__ = True
+    return error
 
 
 def error_site(exc: BaseException) -> str:

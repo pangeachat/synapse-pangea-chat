@@ -9,14 +9,14 @@ the module adds no HTTP dependency.
 """
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from twisted.internet import defer
 from twisted.internet.protocol import Protocol, connectionDone
 from twisted.python.failure import Failure
 from twisted.web.client import PotentialDataLoss, ResponseDone
 
-from synapse_pangea_chat.moderation.log_safety import scrubbing_logger
+from synapse_pangea_chat.moderation.log_safety import _severed, scrubbing_logger
 
 logger = scrubbing_logger(
     "synapse.modules.synapse_pangea_chat.moderation.choreo_client"
@@ -47,41 +47,15 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 class ModerationCheckError(Exception):
     """The moderation service could not produce a verdict.
 
-    Carries a reason type and nothing else, and severs its own exception chain
-    on construction. Raising outside the local `except` block is not enough:
-    twisted resumes an awaiting coroutine from inside ITS active handler, so a
-    `ParseError` carrying the raw response line becomes our `__context__`
-    however carefully our own frame is arranged. Anything that walks the chain
-    - a structured log sink, `logger.exception` - would then serialise what the
-    service sent, out of an error whose own message names only a type.
+    Carries a reason type and nothing else, and leaves this module with no
+    exception chain: `moderate_text` severs it at the boundary. Raising outside
+    the local `except` block is not enough on its own - twisted resumes an
+    awaiting coroutine from inside ITS active handler, so a parse error
+    carrying the raw response line becomes our `__context__` however carefully
+    our own frame is arranged - and anything that walks the chain would then
+    serialise what the service sent, out of an error whose own message names
+    only a type.
     """
-
-    # `__context__` is shadowed, not merely cleared, and the distinction is
-    # the whole point. The interpreter attaches the active exception at RAISE
-    # time, so clearing it in `__init__` is too early and `raise ... from None`
-    # only sets `__suppress_context__` - the original stays attached and
-    # anything that walks the chain still finds it. Raising outside our own
-    # `except` block fixes our own frames but not the one that matters most:
-    # twisted resumes an awaiting coroutine from inside ITS handler, so a
-    # parse error carrying the raw response line becomes the context however
-    # carefully our code is arranged. A property on the type answers None to
-    # every Python reader of the chain - `traceback`, `logging`, a structured
-    # sink - which is the promise this exception's message makes.
-    @property
-    def __context__(self) -> Optional[BaseException]:
-        return None
-
-    @__context__.setter
-    def __context__(self, value: Optional[BaseException]) -> None:
-        return None
-
-    @property
-    def __cause__(self) -> Optional[BaseException]:
-        return None
-
-    @__cause__.setter
-    def __cause__(self, value: Optional[BaseException]) -> None:
-        return None
 
 
 class _BoundedBody(Protocol):
@@ -236,6 +210,24 @@ async def moderate_text(
     caller owns the fail-open disposition. `reactor` and `agent` exist so a
     test can drive the clock and a stalled peer; production passes neither.
     """
+    try:
+        return await _moderate_text(text, base_url, access_token, reactor, agent)
+    except ModerationCheckError as error:
+        # Severed HERE, one frame out from every raise site, and re-raised
+        # bare: the interpreter attaches the active exception at raise time, so
+        # this is the only place it can be removed for certain. See
+        # `log_safety._severed`.
+        _severed(error)
+        raise
+
+
+async def _moderate_text(
+    text: str,
+    base_url: str,
+    access_token: str,
+    reactor: Any,
+    agent: Any,
+) -> Dict[str, Any]:
     from twisted.web.client import Agent
     from twisted.web.http_headers import Headers
 

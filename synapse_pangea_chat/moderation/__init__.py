@@ -147,11 +147,17 @@ _OUT_OF_FLOW_ATTRIBUTES = frozenset(
         ("span", "data-mx-spoiler"),
         ("span", "data-mx-maths"),
         ("div", "data-mx-maths"),
+        # An ordered list's `start` is displayed as its first item's marker,
+        # and the Matrix spec permits the attribute explicitly.
+        ("ol", "start"),
     }
 )
 # Elements whose content is never rendered as text. Including it was a
 # false-positive source with no upside: nobody reads a stylesheet.
 _INVISIBLE_ELEMENTS = frozenset({"script", "style"})
+# Cells break the line, but only inside a table: outside one HTML5 ignores them
+# entirely, and a newline there split a displayed number in half.
+_TABLE_CELL_TAGS = frozenset({"caption", "td", "th", "tr"})
 # HTML5 parses `<image>` as `img`, so its alternative text is displayed.
 _TAG_ALIASES = {"image": "img"}
 
@@ -163,10 +169,7 @@ _TAG_ALIASES = {"image": "img"}
 # at all to the extractor. Rewriting the abrupt form into the well-formed empty
 # comment the spec says it is puts the two back in agreement.
 _ABRUPT_COMMENTS = re.compile(r"<!--?>")
-# A doctype's quoted strings may contain `>`, and HTML5 keeps reading to the
-# real end; Python's parser stops at the first `>` and hands the remainder back
-# as text nobody sees. Removed whole, quotes included, before parsing.
-_DOCTYPE = re.compile(r"<!DOCTYPE(?:[^>\"\']|\"[^\"]*\"|\'[^\']*\')*>", re.IGNORECASE)
+_DOCTYPE_OPENER = "<!doctype"
 
 
 class _DisplayedText(HTMLParser):
@@ -186,48 +189,83 @@ class _DisplayedText(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._parts: List[str] = []
         self.attribute_text: List[str] = []
-        self._invisible_depth = 0
+        # A boolean, not a counter: `script` and `style` put the tokenizer into
+        # CDATA mode, so they cannot nest - anything that looks like a nested
+        # opener inside one is source text. A counter could be incremented
+        # twice and then never fall back to zero, which hid every visible
+        # character after the real closing tag.
+        self._invisible = False
+        # Block tags only break the line where a tree builder would put them.
+        # `</div>` with no open `div` is ignored by HTML5, and a newline there
+        # split a displayed number in half; a `<td>` outside a table is ignored
+        # too, while inside one it separates cells that render apart. Tracking
+        # the open blocks and whether we are in a table is the smallest amount
+        # of tree context that gets both right.
+        self._open_blocks: List[str] = []
+        self._table_depth = 0
 
     def handle_data(self, data: str) -> None:
-        if self._invisible_depth == 0:
+        if not self._invisible:
             self._parts.append(data)
+
+    def _breaks_line(self, tag: str) -> bool:
+        if tag in _BLOCK_LEVEL_TAGS:
+            return True
+        return self._table_depth > 0 and tag in _TABLE_CELL_TAGS
 
     def _handle_tag(self, tag: str, attrs: Sequence[Tuple[str, Optional[str]]]) -> None:
         tag = _TAG_ALIASES.get(tag, tag)
-        if tag in _BLOCK_LEVEL_TAGS:
+        if tag == "table":
+            self._table_depth += 1
+        if self._breaks_line(tag):
+            self._open_blocks.append(tag)
             self._parts.append("\n")
-        # First value wins, as HTML5 says: a duplicate attribute is a parse
-        # error and the later one is dropped, so reading both invented text.
+        if self._invisible:
+            # Attributes inside script or style source are not markup and are
+            # displayed by nothing.
+            return
+        # First occurrence wins, as HTML5 says: a duplicate attribute is a
+        # parse error and the LATER one is dropped. Emptiness is judged after
+        # that choice, not before it - skipping an empty first value and
+        # reading the non-empty duplicate invents text the renderer discarded.
         seen: Dict[str, str] = {}
         for name, value in attrs:
-            if value and name not in seen:
-                seen[name] = value
+            if name not in seen:
+                seen[name] = value or ""
         for name, value in seen.items():
+            if not value:
+                continue
             if (tag, name) in _INLINE_ATTRIBUTES:
                 self._parts.append(value)
             elif (tag, name) in _OUT_OF_FLOW_ATTRIBUTES:
                 self.attribute_text.append(value)
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
-        if tag in _INVISIBLE_ELEMENTS:
-            self._invisible_depth += 1
         self._handle_tag(tag, attrs)
+        if tag in _INVISIBLE_ELEMENTS:
+            self._invisible = True
 
     def handle_startendtag(
         self, tag: str, attrs: List[Tuple[str, Optional[str]]]
     ) -> None:
         # A trailing slash does not make an element void in HTML5: `<script/>`
         # opens a script element exactly as `<script>` does, and everything
-        # after it is script source until the close tag. Treating it as
-        # self-closing let that source through as displayed text.
-        if tag in _INVISIBLE_ELEMENTS:
-            self._invisible_depth += 1
-        self._handle_tag(tag, attrs)
+        # after it is source until the close tag.
+        self.handle_starttag(tag, attrs)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in _INVISIBLE_ELEMENTS and self._invisible_depth > 0:
-            self._invisible_depth -= 1
-        if _TAG_ALIASES.get(tag, tag) in _BLOCK_LEVEL_TAGS:
+        tag = _TAG_ALIASES.get(tag, tag)
+        if tag in _INVISIBLE_ELEMENTS:
+            self._invisible = False
+        if tag == "table" and self._table_depth > 0:
+            self._table_depth -= 1
+        # Only a tag that actually opened a block closes one. An unmatched
+        # `</div>` is ignored by HTML5, and a newline there split a displayed
+        # number in two.
+        if tag in self._open_blocks:
+            while self._open_blocks:
+                if self._open_blocks.pop() == tag:
+                    break
             self._parts.append("\n")
 
     def unknown_decl(self, data: str) -> None:
@@ -245,23 +283,57 @@ class _DisplayedText(HTMLParser):
         rules as literal markup, while a reader saw a phone number in both.
         """
         _, separator, displayed = data.partition(">")
-        if separator and self._invisible_depth == 0:
-            nested = _DisplayedText()
-            nested.feed(displayed)
-            nested.close()
-            self._parts.append("".join(nested._parts))
-            self.attribute_text.extend(nested.attribute_text)
+        if not separator or self._invisible:
+            return
+        # Parsed, not appended raw, and with the terminator HTML5 also shows.
+        # Python's parser consumed the section up to `]]>`; a renderer ended
+        # the bogus comment at the first `>` and displayed everything after it,
+        # the `]]>` included.
+        nested = _DisplayedText()
+        nested.feed(f"{displayed}]]>")
+        nested.close()
+        self._parts.append("".join(nested._parts))
+        self.attribute_text.extend(nested.attribute_text)
 
     def result(self) -> str:
         return "".join(self._parts + ["\n" + a for a in self.attribute_text])
+
+
+def _without_doctype(formatted: str) -> str:
+    """Drop a doctype, whose quoted strings may contain `>`.
+
+    HTML5 keeps reading a doctype to its real end; Python's parser stops at the
+    first `>` and hands the remainder back as text nobody sees. A regex with
+    alternation over quoted runs expresses that and backtracks quadratically on
+    a long run of unterminated openers - measured at over a second on a 40 KB
+    body, in the pre-persist send path, which is a worse problem than the false
+    positive it was fixing. This is a single left-to-right scan instead.
+    """
+    lowered = formatted.lower()
+    start = lowered.find(_DOCTYPE_OPENER)
+    if start == -1:
+        return formatted
+    index = start + len(_DOCTYPE_OPENER)
+    quote = ""
+    while index < len(formatted):
+        character = formatted[index]
+        if quote:
+            if character == quote:
+                quote = ""
+        elif character in "\"'":
+            quote = character
+        elif character == ">":
+            return formatted[:start] + _without_doctype(formatted[index + 1 :])
+        index += 1
+    # An unterminated doctype runs to the end of the input, and so does HTML5's.
+    return formatted[:start]
 
 
 def _displayed_text(formatted: str) -> str:
     """The reader-visible text of an HTML body, never less than it displays."""
     # U+0000 is ignored by an HTML5 tokenizer in text, so `call 41\x005-...`
     # is one number on screen. Left in, it split the number in two.
-    prepared = formatted.replace("\x00", "")
-    prepared = _DOCTYPE.sub("", prepared)
+    prepared = _without_doctype(formatted.replace("\x00", ""))
     parser = _DisplayedText()
     parser.feed(_ABRUPT_COMMENTS.sub("<!---->", prepared))
     parser.close()
@@ -585,7 +657,12 @@ _HTML_FORMAT = "org.matrix.custom.html"
 def _surface_text(surface: Mapping[str, Any]) -> List[str]:
     """Every displayed string carried by one content surface."""
     parts: List[str] = list(_field_text(surface.get("body")))
-    if surface.get("msgtype") in _ATTACHMENT_MSGTYPES:
+    # `isinstance` first: a `msgtype` that is a list or an object is unhashable,
+    # and the set-membership test then raises `TypeError` out of extraction -
+    # which the fail-open handler catches, discarding the outer body that had
+    # already been read. A malformed field must not cost the message its check.
+    msgtype = surface.get("msgtype")
+    if isinstance(msgtype, str) and msgtype in _ATTACHMENT_MSGTYPES:
         parts.extend(_field_text(surface.get("filename")))
     formatted = surface.get("formatted_body")
     if (

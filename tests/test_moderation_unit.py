@@ -18,6 +18,8 @@ only way a test on one pin can be right about both.
 
 import inspect
 import json
+import logging
+import time
 import traceback
 import unittest
 from types import MappingProxyType, SimpleNamespace
@@ -166,8 +168,11 @@ class _BackgroundProcessDouble:
             await coroutine
 
     def discard(self) -> None:
-        for _desc, coroutine in self.started:
-            coroutine.close()
+        for _desc, started in self.started:
+            # A `Deferred` is an accepted return, and it has no `close`.
+            close = getattr(started, "close", None)
+            if close is not None:
+                close()
         self.started = []
 
 
@@ -222,12 +227,20 @@ class TestBackgroundProcessDouble(unittest.IsolatedAsyncioTestCase):
             double(*args, 1, unsupported=True)
 
     def test_it_rejects_the_wrong_call_shape(self) -> None:
+        """Asserted on whichever Synapse is installed, never skipped.
+
+        On 1.159 the 1.124 shape puts the event where the callable belongs -
+        the production bug this chunk fixes. On 1.124 the 1.159 shape does the
+        same thing in the other direction. A test that asserts only under one
+        `if` proves nothing on the other pin.
+        """
         double = _BackgroundProcessDouble()
         if "server_name" in double.signature.parameters:
-            with self.assertRaises(TypeError):
-                # The 1.124 shape on 1.159: the event lands where the callable
-                # belongs, which is the production bug this chunk fixes.
-                double("desc", _event("hi"), "text")
+            wrong_shape: Tuple[Any, ...] = ("desc", _event("hi"), "text")
+        else:
+            wrong_shape = ("desc", "example.org", _event("hi"), "text")
+        with self.assertRaises(TypeError):
+            double(*wrong_shape)
 
     def test_it_records_a_call_it_then_rejects(self) -> None:
         """`started` holds only the calls that ran, so a skip assertion written
@@ -575,17 +588,31 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
 
     async def test_moderation_outage_fails_open(self) -> None:
-        from synapse_pangea_chat.moderation.choreo_client import ModerationCheckError
+        """Both the expected failure and an unexpected one.
 
-        api = _module_api()
-        mod = ChatModeration(api, self._tier2_config())
-        with patch(
-            "synapse_pangea_chat.moderation.moderate_text",
-            self._outage(ModerationCheckError("down")),
-        ) as moderate:
-            await mod._check_and_redact(_event("hi"), "hi")
-        moderate.assert_awaited_once()
-        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        Injecting only `ModerationCheckError` leaves the widened catch
+        untested, and the whole point of widening it was that an exception the
+        client was not supposed to raise - a `UnicodeDecodeError` out of
+        `json.loads` was the real one - must not escape into
+        `run_as_background_process`, which logs whatever reaches it.
+        """
+        for error in (
+            ModerationCheckError("down"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+            RuntimeError("something nobody predicted"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                api = _module_api()
+                mod = ChatModeration(api, self._tier2_config())
+                with patch(
+                    "synapse_pangea_chat.moderation.moderate_text",
+                    self._outage(error),
+                ) as moderate:
+                    await mod._check_and_redact(_event("hi"), "hi")
+                moderate.assert_awaited_once()
+                cast(
+                    AsyncMock, api.create_and_send_event_into_room
+                ).assert_not_awaited()
 
     async def test_a_service_supplied_category_never_reaches_the_room(self) -> None:
         """The category is a free-form string chosen by a service we do not
@@ -602,17 +629,27 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
             with self.subTest(category=category):
                 api = _module_api()
                 mod = ChatModeration(api, self._tier2_config())
-                with patch(
-                    "synapse_pangea_chat.moderation.moderate_text",
-                    self._verdict(categories=[category]),
-                ):
-                    await mod._check_and_redact(_event("x"), "x")
+                captured = _CapturingRecords()
+                root = logging.getLogger()
+                root.addHandler(captured)
+                try:
+                    with patch(
+                        "synapse_pangea_chat.moderation.moderate_text",
+                        self._verdict(categories=[category]),
+                    ):
+                        await mod._check_and_redact(_event("x"), "x")
+                finally:
+                    root.removeHandler(captured)
                 send = cast(AsyncMock, api.create_and_send_event_into_room)
                 assert send.await_args is not None
                 reason = send.await_args.args[0]["content"]["reason"]
                 self.assertTrue(reason.endswith(f": {UNKNOWN_CATEGORY}"), reason)
                 if category:
                     self.assertNotIn(category, reason)
+                    # The log line is the other half of the same rule, and a
+                    # test that checks only the room misses a module that logs
+                    # the raw value beside the safe one.
+                    self.assertNotIn(category, "\n".join(captured.seen))
 
     async def test_a_known_category_survives_an_unknown_one_beside_it(self) -> None:
         api = _module_api()
@@ -725,19 +762,32 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
 
-    async def test_a_missing_msgtype_on_one_surface_skips_nothing(self) -> None:
-        """The msgtype gate is the same bypass in miniature if it is read off
-        one surface only."""
+    async def test_a_surface_without_a_msgtype_is_still_read(self) -> None:
+        """The outer body is benign here on purpose: with a blocking outer
+        body the test passes whether or not the inner surface was read at
+        all."""
         mod = _moderation(_config())
         event = _event(
             content={
                 "msgtype": "m.text",
-                "body": "* call 415-555-2671",
-                "m.new_content": {"body": "harmless now"},
+                "body": "* an ordinary correction",
+                "m.new_content": {"body": "call 415-555-2671"},
                 "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
             }
         )
         self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_a_malformed_msgtype_does_not_cost_the_check(self) -> None:
+        """A `msgtype` that is a list or an object is unhashable, and a set
+        membership test on it raised out of extraction - which the fail-open
+        handler caught, discarding the outer body it had already read."""
+        for msgtype in ([1, 2], {"a": 1}, 3):
+            with self.subTest(msgtype=msgtype):
+                mod = _moderation(_config())
+                event = _event(
+                    content={"msgtype": msgtype, "body": "call 415-555-2671"}
+                )
+                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
 
     async def test_replacement_text_is_read_from_any_mapping(self) -> None:
         """Event content is not guaranteed to be a plain dict - Synapse's Rust
@@ -955,6 +1005,58 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                     }
                 )
                 self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
+
+    def test_block_breaks_follow_the_tree_a_renderer_builds(self) -> None:
+        """Where a line break goes needs a little tree context, and both
+        directions cost a real result. An unmatched `</div>` is ignored by
+        HTML5, and breaking there split a displayed number in half; a `<td>`
+        outside a table is ignored too, while inside one it separates cells
+        that render apart, and running them together invented a number that is
+        on screen as two."""
+        self.assertEqual(
+            _displayed_text("call 41</div>5-555-2671"), "call 415-555-2671"
+        )
+        self.assertEqual(_displayed_text("call 41<td>5-555-2671"), "call 415-555-2671")
+        cells = _displayed_text("<table><tr><td>415</td><td>5552671</td></tr></table>")
+        self.assertEqual(cells.split(), ["415", "5552671"])
+        self.assertEqual(
+            _displayed_text("<div>a</div><div>b</div>").split(), ["a", "b"]
+        )
+
+    def test_an_empty_first_duplicate_attribute_wins(self) -> None:
+        """HTML5 keeps the FIRST of two duplicate attributes, empty or not.
+        Skipping the empty one and reading its non-empty twin invented text
+        the renderer had discarded."""
+        self.assertEqual(
+            _displayed_text('hello <img src="x" alt="" alt="415-555-2671">'),
+            "hello ",
+        )
+
+    def test_a_list_start_marker_is_displayed_text(self) -> None:
+        """An ordered list's `start` is rendered as its first item's marker,
+        and the Matrix spec permits the attribute."""
+        self.assertIn(
+            "4155552671",
+            _displayed_text('<ol start="4155552671"><li>x</li></ol>'),
+        )
+
+    def test_a_self_closing_script_does_not_hide_the_rest(self) -> None:
+        """A trailing slash does not make `<script>` void, but suppression has
+        to end at the real close tag: a counter that could be incremented twice
+        never fell back to zero, and every visible character after the close
+        tag disappeared."""
+        self.assertEqual(
+            _displayed_text("hello<script/>x<script>y</script>visible"),
+            "hellovisible",
+        )
+
+    def test_the_doctype_scan_is_linear(self) -> None:
+        """The predecessor was a regex with alternation over quoted runs, and
+        it backtracked quadratically: over a second on a 40 KB body of
+        unterminated openers, synchronously, in the pre-persist send path."""
+        start = time.monotonic()
+        _displayed_text("<!DOCTYPE " * 4000)
+        self.assertLess(time.monotonic() - start, 0.5)
 
     def test_block_tags_separate_and_inline_tags_do_not(self) -> None:
         """The two halves of "what the reader sees", asserted on the renderer
@@ -1252,6 +1354,21 @@ class _FakeAgent:
         return deferred
 
 
+class _CapturingRecords(logging.Handler):
+    """Every record, formatted and raw, for the assertions that need both."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.seen: List[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.seen.append(record.getMessage())
+        except Exception:
+            self.seen.append(str(record.msg))
+        self.seen.append(repr(record.args))
+
+
 class _FailingAgent:
     """An agent whose request fails the way a transport failure does."""
 
@@ -1495,8 +1612,14 @@ class TestChoreoClient(unittest.TestCase):
                 results[0].trap(ModerationCheckError)
 
     def test_an_error_status_is_refused(self) -> None:
+        """A body that is otherwise a perfectly good verdict, so the status is
+        the only thing left that can fail it. `{}` fails missing-verdict
+        validation on its own, and the test passed with the status check
+        deleted."""
         clock = Clock()
-        agent = _FakeAgent(_FakeResponse(code=502, body=b"{}"))
+        agent = _FakeAgent(
+            _FakeResponse(code=502, body=b'{"flagged": false, "categories": []}')
+        )
         _deferred, results = self._call(agent, clock)
         self.assertIsInstance(results[0], Failure)
         results[0].trap(ModerationCheckError)
@@ -1765,6 +1888,9 @@ class TestParseConfig(unittest.TestCase):
             "https://choreo.inva lid",
             "https://choreo.invalid/a b",
             "https://chöreo.invalid",
+            # Non-ASCII in the PATH, which the host check does not see: the
+            # request URI is built as bytes, so twisted refuses it.
+            "https://choreo.invalid/ü",
             # `\r` is whitespace a hand-written list of " \t\n" misses, and
             # twisted refuses to build a URI from it.
             "https://choreo.invalid\r/a",
@@ -1785,6 +1911,12 @@ class TestParseConfig(unittest.TestCase):
             # range check never sees it; twisted keeps the colon in the host.
             "https://choreo.invalid:",
             "https://[::1]:",
+            # Structurally invalid hostnames: twisted marks these bad and
+            # fails the connection before it ever resolves.
+            "https://a..b.invalid",
+            "https://a;b.invalid",
+            "https://" + "x" * 64 + ".invalid",
+            "https://[not-an-address]",
         ):
             with self.subTest(url=url):
                 with self.assertRaises(ValueError):
@@ -1824,6 +1956,11 @@ class TestParseConfig(unittest.TestCase):
             "https://choreo.example.org/api",
             "http://127.0.0.1:8080",
             "https://choreo.example.org:65535",
+            # A bracketed IPv6 address ending in compressed zero groups is a
+            # host, not a dangling port separator.
+            "https://[::1]",
+            "https://[2001:db8::]",
+            "https://[::1]:8443",
         ):
             with self.subTest(url=url):
                 cfg = PangeaChat.parse_config(

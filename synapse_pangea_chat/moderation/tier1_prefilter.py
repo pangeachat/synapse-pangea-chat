@@ -16,7 +16,11 @@ from typing import Callable, Iterable, List, Optional, Tuple
 
 import phonenumbers
 
-from synapse_pangea_chat.moderation.log_safety import error_site, scrubbing_logger
+from synapse_pangea_chat.moderation.log_safety import (
+    _severed,
+    error_site,
+    scrubbing_logger,
+)
 from synapse_pangea_chat.moderation.profanity import (
     contains_profanity as _contains_profanity_multilingual,
 )
@@ -116,38 +120,11 @@ class Tier1RuleError(Exception):
     """A Tier 1 rule could not complete, so the tier has no verdict.
 
     Carries a rule identifier and nothing else: the text that broke the rule is
-    exactly what must not travel with the exception (ADR-10). The chain is
-    severed on construction rather than by `raise ... from None`, which clears
-    `__cause__` and leaves `__context__` holding the original - and a matcher
-    that failed on a message body routinely quotes that body in its message.
+    exactly what must not travel with the exception (ADR-10). `check_text`
+    severs the chain at its boundary, because `raise ... from None` only
+    suppresses the rendering and leaves `__context__` holding the original -
+    and a matcher that failed on a message body routinely quotes that body.
     """
-
-    # `__context__` is shadowed, not merely cleared, and the distinction is
-    # the whole point. The interpreter attaches the active exception at RAISE
-    # time, so clearing it in `__init__` is too early and `raise ... from None`
-    # only sets `__suppress_context__` - the original stays attached and
-    # anything that walks the chain still finds it. Raising outside our own
-    # `except` block fixes our own frames but not the one that matters most:
-    # twisted resumes an awaiting coroutine from inside ITS handler, so a
-    # parse error carrying the raw response line becomes the context however
-    # carefully our code is arranged. A property on the type answers None to
-    # every Python reader of the chain - `traceback`, `logging`, a structured
-    # sink - which is the promise this exception's message makes.
-    @property
-    def __context__(self) -> Optional[BaseException]:
-        return None
-
-    @__context__.setter
-    def __context__(self, value: Optional[BaseException]) -> None:
-        return None
-
-    @property
-    def __cause__(self) -> Optional[BaseException]:
-        return None
-
-    @__cause__.setter
-    def __cause__(self, value: Optional[BaseException]) -> None:
-        return None
 
 
 # The rules, in the order they are asked, each paired with the reason it
@@ -184,7 +161,14 @@ def check_text(text: str, phone_regions: Iterable[str]) -> Optional[str]:
     The caller's handler logs the failure and returns NOT_SPAM, and Tier 2
     still sees the message.
     """
-    regions = list(phone_regions)
+    try:
+        return _check_rules(text, list(phone_regions))
+    except Tier1RuleError as error:
+        _severed(error)
+        raise
+
+
+def _check_rules(text: str, regions: List[str]) -> Optional[str]:
     for reason, rule in _RULES:
         try:
             hit = rule(text, regions)

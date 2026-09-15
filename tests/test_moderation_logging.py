@@ -571,17 +571,24 @@ class ModerationLogContextTestCase(unittest.IsolatedAsyncioTestCase):
     def test_the_handler_scrubber_leaves_other_loggers_alone(self) -> None:
         """Scoped to this package on purpose: stripping the requester from
         SYNAPSE's request log is not ours to do, and it is the identity an
-        operator relies on everywhere else."""
+        operator relies on everywhere else.
+
+        The second name is the boundary case: `startswith` on the bare package
+        prefix also matches a sibling called `...moderation_metrics`, whose
+        records are outside the namespace and not ours to rewrite."""
+        others = (
+            "synapse.http.server",
+            "synapse.modules.synapse_pangea_chat.moderation_metrics",
+        )
         with _synapse_request_logcontext():
             ChatModeration(_module_api(), _config())
-            logging.getLogger("synapse.http.server").warning("someone else")
-        other = [
-            record
-            for record in self.handler.records
-            if record.name == "synapse.http.server"
-        ]
-        self.assertEqual(len(other), 1)
-        self.assertEqual(other[0].requester, CANARY_SENDER)
+            for name in others:
+                logging.getLogger(name).warning("someone else")
+        for name in others:
+            with self.subTest(logger=name):
+                seen = [r for r in self.handler.records if r.name == name]
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(seen[0].requester, CANARY_SENDER)
 
     def test_the_scrubber_does_not_delete_the_attributes(self) -> None:
         """A formatter is free to reference `%(requester)s`, and a deployment
@@ -615,24 +622,43 @@ class ModerationLoggerCoverageTestCase(unittest.TestCase):
     today. A new module with a bare `logging.getLogger` fails here.
     """
 
+    PACKAGE_LOGGER = "synapse.modules.synapse_pangea_chat.moderation"
+
     def test_every_module_logger_is_scrubbed(self) -> None:
-        checked = []
-        modules = [moderation_package]
+        """Walked from the LOGGING MANAGER, not from module attributes.
+
+        A logger bound to a module-level name is the easy case. One created
+        inside a function, or wrapped in a `LoggerAdapter`, is not a module
+        attribute at all, and a test that only reads `vars(module)` cannot see
+        it - so the registry that actually decides where records go is what
+        gets walked. Importing every submodule first is what puts them in it.
+        """
         for info in pkgutil.iter_modules(moderation_package.__path__):
-            modules.append(
-                importlib.import_module(f"{moderation_package.__name__}.{info.name}")
+            importlib.import_module(f"{moderation_package.__name__}.{info.name}")
+        checked = []
+        for name, logger in list(logging.Logger.manager.loggerDict.items()):
+            if not isinstance(logger, logging.Logger):
+                continue
+            if name != self.PACKAGE_LOGGER and not name.startswith(
+                f"{self.PACKAGE_LOGGER}."
+            ):
+                continue
+            checked.append(name)
+            self.assertTrue(
+                any(isinstance(f, _IdentityScrubbingFilter) for f in logger.filters),
+                f"{name} has no identity scrubber; use " "log_safety.scrubbing_logger",
             )
-        for module in modules:
-            for name, value in vars(module).items():
-                if not isinstance(value, logging.Logger):
-                    continue
-                checked.append(f"{module.__name__}.{name}")
-                self.assertTrue(
-                    any(isinstance(f, _IdentityScrubbingFilter) for f in value.filters),
-                    f"{module.__name__}.{name} ({value.name}) has no identity "
-                    "scrubber; use log_safety.scrubbing_logger",
-                )
         self.assertTrue(checked, "no loggers were found, so nothing was checked")
+
+    def test_an_adapter_over_an_unscrubbed_logger_is_caught(self) -> None:
+        """The check has to be able to fail on the shape it exists for."""
+        unscrubbed = logging.getLogger(f"{self.PACKAGE_LOGGER}.unscrubbed_probe")
+        unscrubbed.filters = []
+        adapter = logging.LoggerAdapter(unscrubbed, {})
+        self.addCleanup(logging.Logger.manager.loggerDict.pop, unscrubbed.name, None)
+        self.assertIs(adapter.logger, unscrubbed)
+        with self.assertRaises(AssertionError):
+            self.test_every_module_logger_is_scrubbed()
 
 
 if __name__ == "__main__":

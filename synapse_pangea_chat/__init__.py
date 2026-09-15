@@ -1,3 +1,4 @@
+import ipaddress
 import logging
 import re
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -67,6 +68,38 @@ _MODERATION_CONFIG_KEYS = frozenset(
 )
 
 _CHOREO_URL_SCHEMES = ("http", "https")
+# What a DNS label may contain, and how long it may be. Checked because
+# twisted marks a structurally invalid hostname bad and fails the connection
+# before it ever resolves - so an empty interior label, a semicolon, or an
+# over-long label is another value that starts cleanly and moderates nothing.
+_DNS_LABEL = re.compile(r"^[A-Za-z0-9_-]{1,63}$")
+
+
+def _validate_choreo_host(hostname: Optional[str], netloc: str) -> None:
+    if hostname is None:
+        return
+    if netloc.startswith("[") or ":" in hostname:
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            raise ValueError(
+                'Config "moderation.choreo_base_url" has brackets around '
+                "something that is not an IP address"
+            ) from None
+        return
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        return
+    for label in hostname.rstrip(".").split("."):
+        if not _DNS_LABEL.match(label):
+            raise ValueError(
+                'Config "moderation.choreo_base_url" host is not a usable '
+                f"name: the label {label!r} is empty, too long, or contains a "
+                "character a hostname cannot contain"
+            )
 
 
 def _validate_choreo_base_url(value: str) -> str:
@@ -151,14 +184,18 @@ def _validate_choreo_base_url(value: str) -> str:
         raise ValueError(
             'Config "moderation.choreo_base_url" has a port outside 1-65535'
         )
-    if parsed.netloc.endswith(":") or parsed.netloc.rstrip("]").endswith(":"):
+    if parsed.netloc.endswith(":"):
         # `urlparse` reports no port for a bare trailing colon, so the range
         # check above never sees it - and twisted keeps the colon as part of
-        # the hostname, which then fails to resolve on every request.
+        # the hostname, which then fails to resolve on every request. Tested on
+        # `netloc`, not on a bracket-stripped copy: `https://[::1]` legitimately
+        # ends in a colon inside the brackets, and stripping them made a valid
+        # IPv6 base URL look like a dangling port separator.
         raise ValueError(
             'Config "moderation.choreo_base_url" ends its host with a colon '
             "and no port"
         )
+    _validate_choreo_host(parsed.hostname, parsed.netloc)
     if parsed.params:
         raise ValueError(
             'Config "moderation.choreo_base_url" must be a base URL with no '
