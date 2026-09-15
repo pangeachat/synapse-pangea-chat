@@ -9,7 +9,12 @@ the module adds no HTTP dependency.
 """
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
+
+from twisted.internet import defer
+from twisted.internet.protocol import Protocol, connectionDone
+from twisted.python.failure import Failure
+from twisted.web.client import PotentialDataLoss, ResponseDone
 
 from synapse_pangea_chat.moderation.log_safety import scrubbing_logger
 
@@ -31,8 +36,94 @@ REQUEST_TIMEOUT_SECONDS = 15
 # shipped as far as it has got.
 
 
+# A verdict is a small JSON object. The cap is three orders of magnitude above
+# anything the endpoint can legitimately return, and it exists because
+# `twisted.web.client.readBody` has no cap at all: a peer that streams forever
+# fills the process's memory, and a deadline alone does not stop it - it fires
+# the deferred and leaves the body arriving.
+MAX_RESPONSE_BYTES = 1024 * 1024
+
+
 class ModerationCheckError(Exception):
     """The moderation service could not produce a verdict."""
+
+
+class _BoundedBody(Protocol):
+    """Reads a response body under a size cap, and can be torn down.
+
+    `readBody` is not used, for two reasons that are the same reason. Its
+    cancellation path calls `transport.abortConnection()` only `if` the
+    transport has one - and the transport an `Agent` response delivers is a
+    `TransportProxyProducer`, which has `stopProducing` and `loseConnection`
+    and no `abortConnection` at all. So cancelling a `readBody` on a real
+    response fires the deferred and leaves the socket open with the body still
+    arriving: the check "times out" and the peer keeps sending. And it has no
+    size limit, so the same peer can stream until the process dies.
+
+    This reads into a bounded buffer and tears the connection down through the
+    methods the proxy actually has.
+    """
+
+    def __init__(self, finished: "defer.Deferred[bytes]") -> None:
+        self._finished = finished
+        self._chunks: List[bytes] = []
+        self._length = 0
+        self._done = False
+
+    def dataReceived(self, data: bytes) -> None:
+        if self._done:
+            return
+        self._length += len(data)
+        if self._length > MAX_RESPONSE_BYTES:
+            self._fail(
+                ModerationCheckError(
+                    f"moderation endpoint returned more than "
+                    f"{MAX_RESPONSE_BYTES} bytes"
+                )
+            )
+            return
+        self._chunks.append(data)
+
+    def connectionLost(self, reason: Failure = connectionDone) -> None:
+        if self._done:
+            return
+        self._done = True
+        if reason.check(ResponseDone, PotentialDataLoss):
+            self._finished.callback(b"".join(self._chunks))
+        else:
+            # The reason is dropped rather than wrapped: a transport failure's
+            # own message can quote what was on the wire (ADR-10).
+            self._finished.errback(
+                ModerationCheckError(
+                    f"moderation response body failed: {reason.type.__name__}"
+                )
+            )
+
+    def abort(self) -> None:
+        """Stop the peer sending, which cancelling `readBody` does not do."""
+        self._fail(ModerationCheckError("moderation response body timed out"))
+
+    def _fail(self, error: Exception) -> None:
+        if self._done:
+            return
+        self._done = True
+        self._chunks = []
+        # Typed `Any` because what arrives here is neither an `ITransport` nor
+        # an `IPushProducer` but twisted's `TransportProxyProducer`, which
+        # implements a hand-picked part of both - `stopProducing` and
+        # `loseConnection`, and no `abortConnection`.
+        transport: Any = self.transport
+        if transport is not None:
+            transport.stopProducing()
+            transport.loseConnection()
+        self._finished.errback(error)
+
+
+def _read_body(response: Any) -> Tuple["defer.Deferred[bytes]", _BoundedBody]:
+    finished: "defer.Deferred[bytes]" = defer.Deferred()
+    protocol = _BoundedBody(finished)
+    response.deliverBody(protocol)
+    return finished, protocol
 
 
 def _validated_result(result: Any) -> Dict[str, Any]:
@@ -75,7 +166,7 @@ async def moderate_text(
     caller owns the fail-open disposition. `reactor` and `agent` exist so a
     test can drive the clock and a stalled peer; production passes neither.
     """
-    from twisted.web.client import Agent, readBody
+    from twisted.web.client import Agent
     from twisted.web.http_headers import Headers
 
     if reactor is None:
@@ -112,9 +203,17 @@ async def moderate_text(
         # no timeout scheduled anywhere and no way back. Those checks
         # accumulate, one per message, and nothing is logged, because nothing
         # has failed - the coroutine is simply never resumed.
-        body_deferred = readBody(response)
-        body_deferred.addTimeout(max(deadline - reactor.seconds(), 0), reactor)
-        raw = await body_deferred
+        body_deferred, body_protocol = _read_body(response)
+        # `callLater`, not `addTimeout`: a timeout has to tear the connection
+        # down, and `addTimeout` only cancels the deferred. See `_BoundedBody`.
+        timeout = reactor.callLater(
+            max(deadline - reactor.seconds(), 0), body_protocol.abort
+        )
+        try:
+            raw = await body_deferred
+        finally:
+            if timeout.active():
+                timeout.cancel()
     except Exception as e:
         # `from None`: the caller and `run_as_background_process` both log what
         # reaches them, and an ordinary `raise X from Y` keeps the original on

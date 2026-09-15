@@ -29,6 +29,7 @@ Three channels need closing, and only one of them is a log call we write:
 import hashlib
 import logging
 import os
+import re
 import secrets
 from typing import Tuple
 
@@ -66,17 +67,26 @@ def sender_digest(sender: str, key: bytes) -> str:
 # the attribute would turn a privacy fix into a KeyError in the logging system.
 #
 # The rest of what the filter sets - `request`, `server_name`, `site_tag`,
-# `method`, `url`, `protocol` - names an endpoint and a request, not a person,
-# and is what makes a record traceable, so it is left alone. `url` is the one
-# judgement call in that list: Synapse has already redacted credentials out of
-# it, and the paths a moderation record is created under
-# (`/rooms/{roomId}/send/...`) carry a room id rather than a Matrix ID.
+# `method`, `protocol` - names an endpoint and a request, not a person, and is
+# what makes a record traceable, so it is left alone.
 _IDENTITY_RECORD_ATTRS: Tuple[str, ...] = (
     "requester",
     "authenticated_entity",
     "ip_address",
     "user_agent",
 )
+
+# `url` is the awkward one, and it is neither dropped nor kept whole. The path
+# is what tells an operator which endpoint produced a record, and most of them
+# carry a room id rather than a Matrix ID - but a moderation record can be
+# created under any request that persists an event, that set is not ours to
+# enumerate, and some Matrix paths do embed a user id. So the Matrix IDs are
+# taken out of the path and the rest of the path stays. A Matrix ID is
+# `@localpart:server`; the character classes are the ones a Matrix ID and a URL
+# path can actually contain, and the match is deliberately generous on the
+# server part because over-redacting a URL costs nothing.
+_MXID_IN_TEXT = re.compile(r"@[^\s:/?#]+:[^\s/?#]+")
+_URL_RECORD_ATTRS: Tuple[str, ...] = ("url",)
 
 REDACTED = "<redacted:pangea-moderation>"
 
@@ -100,6 +110,10 @@ class _IdentityScrubbingFilter(logging.Filter):
         for attr in _IDENTITY_RECORD_ATTRS:
             if getattr(record, attr, None) is not None:
                 setattr(record, attr, REDACTED)
+        for attr in _URL_RECORD_ATTRS:
+            value = getattr(record, attr, None)
+            if isinstance(value, str) and "@" in value:
+                setattr(record, attr, _MXID_IN_TEXT.sub(REDACTED, value))
         return True
 
 

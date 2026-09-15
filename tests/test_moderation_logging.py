@@ -14,11 +14,12 @@ on our behalf, is the same leak, and a module-scoped capture cannot see it.
 
 **They also install Synapse's real request-logging machinery.** An earlier
 revision of this file listed `LoggingContextFilter` as a channel "no module can
-close" and then wrote the assertions so they could not see it - the record's
-extra attributes were compared against a baseline record built through the same
-patched factory, which subtracted the leak from the evidence. That is a gate
-softened around a real finding, which is the one thing these tests exist to
-prevent. The channel IS closeable from inside a module, it is closed
+close", recorded it as a documented limit, and then scoped every test so the
+channel was never exercised: no test installed a logcontext, so the attribute
+carrying the Matrix ID was never set, and the canary assertions passed over a
+leak that was real in production. That is a gate softened around a real
+finding, which is the one thing these tests exist to prevent. The channel IS
+closeable from inside a module, it is closed
 (`log_safety.scrubbing_logger`), and `ModerationLogContextTestCase` drives the
 real `LoggingContextFilter` through the real log-record factory to prove it.
 
@@ -65,38 +66,23 @@ CANARY_IP = "canary-ip-203-0-113-4"
 CANARY_USER_AGENT = "canary-agent-mtrz"
 
 
-# The attribute names `logging.LogRecord.__init__` sets, written out rather
-# than derived by constructing a record. Deriving them was the softening: the
-# baseline record went through the same patched factory as the record under
-# test, so `LoggingContextFilter` decorated BOTH, and subtracting one from the
-# other deleted exactly the attributes carrying the Matrix ID.
-_STANDARD_RECORD_ATTRS = frozenset(
-    {
-        "args",
-        "asctime",
-        "created",
-        "exc_info",
-        "exc_text",
-        "filename",
-        "funcName",
-        "levelname",
-        "levelno",
-        "lineno",
-        "message",
-        "module",
-        "msecs",
-        "msg",
-        "name",
-        "pathname",
-        "process",
-        "processName",
-        "relativeCreated",
-        "stack_info",
-        "taskName",
-        "thread",
-        "threadName",
-    }
-)
+def _standard_record_attrs() -> frozenset:
+    """The attributes a bare `LogRecord` has, so everything else is an extra.
+
+    Built by instantiating `logging.LogRecord` DIRECTLY, which is deliberate
+    and is not the softening the module docstring describes: a direct
+    instantiation does not go through `logging.getLogRecordFactory()`, so this
+    baseline never carries the request attributes the factory adds - deriving
+    it is therefore both safe and self-maintaining across Python versions,
+    where a hardcoded list drifts. A hardcoded list that names an attribute the
+    record does NOT have (`message` and `asctime`, which `Formatter.format`
+    adds later) silently excludes that attribute from the search, which is a
+    place to hide a leak.
+    """
+    return frozenset(logging.LogRecord("", 0, "", 0, "", None, None).__dict__)
+
+
+_STANDARD_RECORD_ATTRS = _standard_record_attrs()
 
 
 class _CapturingHandler(logging.Handler):
@@ -122,6 +108,15 @@ class _CapturingHandler(logging.Handler):
         self.seen.append(repr(record.args))
         if record.exc_info is not None:
             self.seen.append(logging.Formatter().formatException(record.exc_info))
+            # The formatted traceback is not the whole exception. A structured
+            # sink serialises `record.exc_info` itself, so the exception's own
+            # args - where a library puts the text it failed on - are searched
+            # directly rather than only in the rendering.
+            exception = record.exc_info[1]
+            if exception is not None:
+                self.seen.append(repr(getattr(exception, "args", ())))
+                self.seen.append(repr(exception.__cause__))
+                self.seen.append(repr(exception.__context__))
         # Anything attached with `extra=`, and everything Synapse's global
         # log-record factory attaches, lands in the record's __dict__ and never
         # appears in the formatted message - so a leak through that door would
@@ -203,7 +198,10 @@ def _synapse_request_logcontext() -> Iterator[None]:
             requester=CANARY_SENDER,
             authenticated_entity=CANARY_SENDER,
             method="PUT",
-            url="/_matrix/client/v3/rooms/!room:example.org/send/m.room.message/1",
+            # A path carrying a Matrix ID, because a moderation record can be
+            # created under any request that persists an event and that set is
+            # not ours to enumerate.
+            url=f"/_matrix/client/v3/user/{CANARY_SENDER}/account_data/x",
             protocol="HTTP/1.1",
             user_agent=CANARY_USER_AGENT,
         ),
@@ -486,6 +484,10 @@ class ModerationLogContextTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.request, "PUT-1")
         self.assertEqual(record.server_name, "canary-server.invalid")
         self.assertEqual(record.method, "PUT")
+        # The URL keeps its path - which endpoint produced the record is the
+        # point of keeping it - and loses only the Matrix ID inside it.
+        self.assertIn("/_matrix/client/v3/user/", record.url)
+        self.assertIn("/account_data/x", record.url)
         captured = "\n".join(self.handler.seen)
         self.assertIn("!room:example.org", captured)
         self.assertIn("contact_details", captured)

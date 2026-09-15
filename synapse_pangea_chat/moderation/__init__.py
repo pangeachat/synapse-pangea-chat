@@ -73,13 +73,6 @@ def _background_process_args(homeserver: Any, desc: str, func: Any) -> Tuple[Any
     return (desc, func)
 
 
-_TEXTUAL_MSGTYPES = ("m.text", "m.emote", "m.notice")
-# Media messages carry a caption (or filename) in `body`, which readers see
-# exactly like message text — so it is moderated too. Without this, any
-# abusive text sent as an image caption bypassed both tiers entirely.
-_CAPTION_MSGTYPES = ("m.image", "m.video", "m.file", "m.audio")
-_MODERATED_MSGTYPES = frozenset(_TEXTUAL_MSGTYPES + _CAPTION_MSGTYPES)
-
 # The relation type that makes an event a replacement. Per the Matrix spec a
 # replacement is `m.relates_to.rel_type == "m.replace"` and nothing else; the
 # mere presence of an `m.new_content` key means nothing, and no client renders
@@ -232,6 +225,17 @@ class ChatModeration:
         the candidate surfaces is moderated. Over-reading costs a false
         positive on one message; under-reading costs the tier.
 
+        There is no msgtype allowlist, and that is the same rule again rather
+        than an omission. `body` is, by definition in the Matrix spec, "a
+        textual representation of the message", and clients render it for every
+        msgtype - as the caption of an image, as the description of a location,
+        and as the whole message for a msgtype they do not recognise. An
+        allowlist of `m.text`/`m.image`/... therefore handed any sender a
+        one-field bypass of both tiers: `{"msgtype": "m.not-a-real-type",
+        "body": "<payload>"}` is displayed as the payload and matched an
+        allowlist of nothing. The event TYPE is the gate; within
+        `m.room.message`, every displayed string is read.
+
         An edit therefore ADDS a surface rather than replacing one (ADR-8a(0)).
         Both are displayed: modern clients render `m.new_content`, older ones
         render the outer `body` fallback (conventionally `* <new text>`), so
@@ -260,15 +264,6 @@ class ChatModeration:
         new_content = content.get("m.new_content")
         if _is_replacement(content) and isinstance(new_content, Mapping):
             surfaces.append(new_content)
-
-        # The msgtype gate is satisfied by ANY displayed surface. Reading it
-        # from one surface only is the same bypass in miniature: an edit whose
-        # `m.new_content` omits `msgtype` would have skipped the whole event,
-        # outer fallback body included.
-        if not any(
-            surface.get("msgtype") in _MODERATED_MSGTYPES for surface in surfaces
-        ):
-            return None
 
         parts: List[str] = []
         for surface in surfaces:
@@ -463,8 +458,16 @@ def _surface_text(surface: Mapping[str, Any]) -> List[str]:
     """Every displayed string carried by one content surface."""
     parts: List[str] = []
     body = surface.get("body")
-    if isinstance(body, str) and body.strip():
-        parts.append(body)
+    if isinstance(body, str):
+        if body.strip():
+            parts.append(body)
+    elif body is not None:
+        # A `body` that is not a string is malformed, and malformed is not the
+        # same as absent: `EventValidator` only requires `body` to be present
+        # for the msgtypes it knows, and a client that renders one renders
+        # `str(body)`. Dropping it on a type test is the extraction bypass in
+        # its smallest form, so the value is stringified and matched.
+        parts.append(str(body))
     formatted = surface.get("formatted_body")
     if isinstance(formatted, str) and formatted.strip():
         displayed = _displayed_text(formatted)

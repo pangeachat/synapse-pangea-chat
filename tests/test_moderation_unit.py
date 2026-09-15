@@ -38,11 +38,14 @@ from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.moderation import (
     UNKNOWN_CATEGORY,
     ChatModeration,
+    _background_process_args,
     _displayed_text,
     _normalize_category,
     _summarize_categories,
+    tier1_prefilter,
 )
 from synapse_pangea_chat.moderation.choreo_client import (
+    MAX_RESPONSE_BYTES,
     REQUEST_TIMEOUT_SECONDS,
     ModerationCheckError,
     moderate_text,
@@ -113,13 +116,21 @@ class _BackgroundProcessDouble:
 
     def __init__(self) -> None:
         self.signature = inspect.signature(run_as_background_process)
+        self.calls: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
         self.started: List[Tuple[str, Any]] = []
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # Recorded BEFORE anything can reject it. `started` only holds the
+        # calls that bound and ran, so asserting on `started` alone would read
+        # a rejected call as no call at all - and the production callbacks
+        # swallow what this raises, which would turn "we dispatched something
+        # broken" into a passing skip assertion.
+        self.calls.append((args, kwargs))
         bound = self.signature.bind(*args, **kwargs)
         desc = bound.arguments["desc"]
         func = bound.arguments["func"]
         extra = bound.arguments.get("args", ())
+        forwarded = bound.arguments.get("kwargs", {})
         if "server_name" in self.signature.parameters:
             server_name = bound.arguments["server_name"]
             if not isinstance(server_name, str):
@@ -129,7 +140,10 @@ class _BackgroundProcessDouble:
                 )
         if not asyncio.iscoroutinefunction(func):
             raise TypeError(f"{type(func).__name__} object is not awaitable")
-        coroutine = func(*extra)
+        # The real runner awaits `func(*args, **kwargs)`, so the double calls
+        # it the same way: a caller forwarding a keyword the coroutine does not
+        # take fails here exactly as it fails there.
+        coroutine = func(*extra, **forwarded)
         self.started.append((desc, coroutine))
         return coroutine
 
@@ -158,6 +172,59 @@ def _config(**overrides: Any) -> PangeaChatConfig:
 
 def _moderation(config: PangeaChatConfig) -> ChatModeration:
     return ChatModeration(_module_api(), config)
+
+
+class TestBackgroundProcessDouble(unittest.IsolatedAsyncioTestCase):
+    """The double is test infrastructure, so it gets tested too.
+
+    F8 was a double permissive enough that the production bug passed through
+    it. A replacement double that is never itself exercised is the same defect
+    one level up: nothing would notice if it stopped enforcing the contract it
+    exists to enforce.
+    """
+
+    async def test_it_forwards_keyword_arguments_like_the_real_runner(self) -> None:
+        seen: Dict[str, Any] = {}
+
+        async def job(value: int, *, flag: bool = False) -> None:
+            seen["value"] = value
+            seen["flag"] = flag
+
+        double = _BackgroundProcessDouble()
+        args = _background_process_args(
+            SimpleNamespace(hostname="example.org"), "desc", job
+        )
+        double(*args, 1, flag=True)
+        await double.drain()
+        self.assertEqual(seen, {"value": 1, "flag": True})
+
+    async def test_it_rejects_a_keyword_the_coroutine_does_not_take(self) -> None:
+        async def job(value: int) -> None:
+            return None
+
+        double = _BackgroundProcessDouble()
+        args = _background_process_args(
+            SimpleNamespace(hostname="example.org"), "desc", job
+        )
+        with self.assertRaises(TypeError):
+            double(*args, 1, unsupported=True)
+
+    def test_it_rejects_the_wrong_call_shape(self) -> None:
+        double = _BackgroundProcessDouble()
+        if "server_name" in double.signature.parameters:
+            with self.assertRaises(TypeError):
+                # The 1.124 shape on 1.159: the event lands where the callable
+                # belongs, which is the production bug this chunk fixes.
+                double("desc", _event("hi"), "text")
+
+    def test_it_records_a_call_it_then_rejects(self) -> None:
+        """`started` holds only the calls that ran, so a skip assertion written
+        against it reads a rejected call as no call at all."""
+        double = _BackgroundProcessDouble()
+        with self.assertRaises(TypeError):
+            double("desc", _event("hi"), "text")
+        self.assertEqual(len(double.calls), 1)
+        self.assertEqual(double.started, [])
 
 
 class TestTier1Prefilter(unittest.TestCase):
@@ -193,6 +260,13 @@ class TestTier1Prefilter(unittest.TestCase):
         self.assertIsNone(check_text("I have 3 dogs and 2 cats at home", ["US"]))
 
 
+class _ExplodingPattern:
+    """A compiled-pattern stand-in that fails the way a real one can."""
+
+    def search(self, text: str) -> Any:
+        raise RuntimeError("library quirk")
+
+
 class TestTier1FailsOpenAsAWhole(unittest.IsolatedAsyncioTestCase):
     """A rule that cannot answer must not be read as a rule that answered no.
 
@@ -203,31 +277,48 @@ class TestTier1FailsOpenAsAWhole(unittest.IsolatedAsyncioTestCase):
     whose whole contract is that a failure lets the message through.
     """
 
+    # The failure is injected at the LIBRARY boundary each rule sits on, not at
+    # the rule function. Patching `contains_phone_number` itself replaces the
+    # very code that used to swallow the exception, so restoring that swallow
+    # would leave every one of these tests green - the defect would be back and
+    # invisible. `PhoneNumberMatcher`, `_ADDRESS_RE` and the multilingual
+    # matcher are where a real library quirk actually raises.
     RULE_PATCHES = (
-        ("contains_phone_number", "meet me at 42 Maple Street"),
-        ("contains_street_address", "you are a fucking idiot"),
-        ("contains_profanity", "an ordinary sentence"),
+        ("phonenumbers", "meet me at 42 Maple Street"),
+        ("_ADDRESS_RE", "you are a fucking idiot"),
+        ("_contains_profanity_multilingual", "an ordinary sentence"),
     )
 
+    @staticmethod
+    def _broken(target: str) -> Any:
+        if target == "phonenumbers":
+            return patch.object(
+                tier1_prefilter.phonenumbers,
+                "PhoneNumberMatcher",
+                side_effect=RuntimeError("library quirk"),
+            )
+        if target == "_ADDRESS_RE":
+            # `re.Pattern.search` is read-only, so the pattern OBJECT is
+            # replaced. Still the boundary the rule sits on, and still outside
+            # `contains_street_address`, which is the point.
+            return patch.object(tier1_prefilter, "_ADDRESS_RE", _ExplodingPattern())
+        return patch.object(
+            tier1_prefilter, target, side_effect=RuntimeError("library quirk")
+        )
+
     def test_any_failing_rule_aborts_the_whole_tier(self) -> None:
-        for rule, text in self.RULE_PATCHES:
-            with self.subTest(rule=rule):
-                with patch(
-                    f"synapse_pangea_chat.moderation.tier1_prefilter.{rule}",
-                    side_effect=RuntimeError("library quirk"),
-                ):
+        for target, text in self.RULE_PATCHES:
+            with self.subTest(rule=target):
+                with self._broken(target):
                     with self.assertRaises(Tier1RuleError):
                         check_text(text, ["US"])
 
     async def test_a_failed_rule_never_produces_a_block(self) -> None:
         """The end-to-end shape of the same defect: the callback must allow."""
-        for rule, text in self.RULE_PATCHES:
-            with self.subTest(rule=rule):
+        for target, text in self.RULE_PATCHES:
+            with self.subTest(rule=target):
                 mod = _moderation(_config())
-                with patch(
-                    f"synapse_pangea_chat.moderation.tier1_prefilter.{rule}",
-                    side_effect=RuntimeError("library quirk"),
-                ):
+                with self._broken(target):
                     self.assertEqual(
                         await mod.check_event_for_spam(_event(text)), NOT_SPAM
                     )
@@ -308,7 +399,7 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
             "synapse_pangea_chat.moderation.run_as_background_process", background
         ):
             await mod.on_new_event(_event("something", sender="@bot:example.org"), {})
-            self.assertEqual(background.started, [])
+            self.assertEqual(background.calls, [])
             await mod.on_new_event(
                 _event("something", sender="@botimposter:example.org.evil.com"),
                 {},
@@ -368,13 +459,27 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         )
 
     def _verdict(self, **overrides: Any) -> AsyncMock:
+        """An autospec of the real `moderate_text`, not a bare `AsyncMock`.
+
+        A bare mock accepts `access_t0ken=` as happily as `access_token=`, so
+        the tests that use it cannot see a caller passing the wrong keyword -
+        which the real function rejects, inside the fail-open handler, on every
+        message.
+        """
         result: Dict[str, Any] = {
             "flagged": True,
             "categories": ["harassment"],
             "evaluated": True,
         }
         result.update(overrides)
-        return AsyncMock(return_value=result)
+        mock = create_autospec(moderate_text)
+        mock.return_value = result
+        return cast(AsyncMock, mock)
+
+    def _outage(self, error: Exception) -> AsyncMock:
+        mock = create_autospec(moderate_text)
+        mock.side_effect = error
+        return cast(AsyncMock, mock)
 
     async def test_activity_room_skipped(self) -> None:
         mod = _moderation(self._tier2_config())
@@ -384,7 +489,7 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
             "synapse_pangea_chat.moderation.run_as_background_process", background
         ):
             await mod.on_new_event(_event("you suck"), state)
-            self.assertEqual(background.started, [])
+            self.assertEqual(background.calls, [])
 
     async def test_plain_room_dispatches(self) -> None:
         """Driven all the way through to the redaction, on purpose.
@@ -438,7 +543,7 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         mod = ChatModeration(api, self._tier2_config())
         with patch(
             "synapse_pangea_chat.moderation.moderate_text",
-            AsyncMock(return_value={"flagged": False, "evaluated": True}),
+            self._verdict(flagged=False, categories=[]),
         ):
             await mod._check_and_redact(_event("hi"), "hi")
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
@@ -450,7 +555,7 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         mod = ChatModeration(api, self._tier2_config())
         with patch(
             "synapse_pangea_chat.moderation.moderate_text",
-            AsyncMock(side_effect=ModerationCheckError("down")),
+            self._outage(ModerationCheckError("down")),
         ):
             await mod._check_and_redact(_event("hi"), "hi")
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
@@ -676,6 +781,64 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
         self.assertIn("\n", _displayed_text("<p>one</p><p>two</p>"))
         self.assertEqual(_displayed_text("a<br>b").split(), ["a", "b"])
 
+    async def test_an_unknown_msgtype_is_still_moderated(self) -> None:
+        """The msgtype allowlist was the same bypass in a third shape. `body`
+        is "a textual representation of the message" by definition, and a
+        client renders it for a msgtype it does not recognise - so an allowlist
+        of `m.text`/`m.image`/... handed every sender a one-field skip of both
+        tiers."""
+        for msgtype in ("m.not-a-real-type", "com.example.custom", "m.location"):
+            with self.subTest(msgtype=msgtype):
+                mod = _moderation(_config())
+                event = _event(
+                    content={"msgtype": msgtype, "body": "call 415-555-2671"}
+                )
+                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_a_missing_msgtype_is_still_moderated(self) -> None:
+        mod = _moderation(_config())
+        event = _event(content={"body": "call 415-555-2671"})
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_a_non_string_body_is_still_moderated(self) -> None:
+        """Malformed is not absent. `EventValidator` requires `body` to be a
+        string only for the msgtypes it knows about, and a client that renders
+        a non-string body renders `str(body)`."""
+        for body in (4155552671, ["call 415-555-2671"], {"x": "415-555-2671"}):
+            with self.subTest(body=body):
+                mod = _moderation(_config())
+                event = _event(content={"msgtype": "m.text", "body": body})
+                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_a_non_mapping_new_content_is_ignored_not_fatal(self) -> None:
+        """The outer body must still be moderated whatever shape the junk
+        takes, and nothing may raise out of extraction."""
+        for junk in ("a string", ["a", "list"], 42, None):
+            with self.subTest(junk=junk):
+                mod = _moderation(_config())
+                event = _event(
+                    content={
+                        "msgtype": "m.text",
+                        "body": "call 415-555-2671",
+                        "m.new_content": junk,
+                        "m.relates_to": {"rel_type": "m.replace"},
+                    }
+                )
+                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_a_non_mapping_relates_to_is_ignored_not_fatal(self) -> None:
+        for junk in ("m.replace", ["m.replace"], 0):
+            with self.subTest(junk=junk):
+                mod = _moderation(_config())
+                event = _event(
+                    content={
+                        "msgtype": "m.text",
+                        "body": "call 415-555-2671",
+                        "m.relates_to": junk,
+                    }
+                )
+                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
     async def test_ordinary_html_still_passes(self) -> None:
         """The other direction: an extractor that over-reads is a
         false-positive engine, and Tier 1 must stay the permissive tier."""
@@ -694,35 +857,85 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
 
 
+class _FakeTransport:
+    """The transport an `Agent` response actually delivers.
+
+    Deliberately shaped like twisted's `TransportProxyProducer`: `loseConnection`
+    and `stopProducing`, and **no `abortConnection`**. That absence is the point
+    - `readBody`'s canceller aborts only `if` the transport has one, so a double
+    that grows an `abortConnection` would hide the leak the real one has.
+    """
+
+    disconnecting = False
+
+    def __init__(self) -> None:
+        self.stopped = False
+        self.lost = False
+
+    def stopProducing(self) -> None:
+        self.stopped = True
+
+    def loseConnection(self) -> None:
+        self.lost = True
+
+
 class _FakeResponse:
-    """Just enough of `IResponse` for `readBody`, and no more."""
+    """Just enough of `IResponse` for a body read, and no more."""
 
     version = (b"HTTP", 1, 1)
     phrase = b"OK"
 
-    def __init__(self, code: int = 200, body: Optional[bytes] = None) -> None:
+    def __init__(
+        self,
+        code: int = 200,
+        body: Optional[bytes] = None,
+        chunks: Optional[List[bytes]] = None,
+    ) -> None:
         self.code = code
-        self._body = body
+        self._chunks = chunks if chunks is not None else ([body] if body else None)
         self.protocol: Any = None
+        self.transport = _FakeTransport()
 
     def deliverBody(self, protocol: Any) -> None:
         self.protocol = protocol
-        if self._body is None:
+        protocol.makeConnection(self.transport)
+        if self._chunks is None:
             # The stall: headers arrived, the body never does and the
             # connection is never closed.
             return
-        protocol.dataReceived(self._body)
+        for chunk in self._chunks:
+            protocol.dataReceived(chunk)
         protocol.connectionLost(Failure(ResponseDone()))
 
 
 class _FakeAgent:
-    def __init__(self, response: _FakeResponse) -> None:
-        self.response = response
-        self.requests: List[Any] = []
+    """An `Agent` double that checks the request it was handed.
 
-    def request(self, *args: Any, **kwargs: Any) -> Any:
-        self.requests.append(args)
-        return defer.succeed(self.response)
+    An agent that accepts any arguments and returns a canned response tests the
+    response handling and nothing else: the method, the URI and the auth header
+    could all be wrong and every test would pass.
+    """
+
+    def __init__(
+        self, response: _FakeResponse, headers_after: Optional[float] = None
+    ) -> None:
+        self.response = response
+        self.headers_after = headers_after
+        self.requests: List[Tuple[bytes, bytes, Any, Any]] = []
+        self.clock: Optional[Clock] = None
+
+    def request(
+        self, method: bytes, uri: bytes, headers: Any = None, bodyProducer: Any = None
+    ) -> Any:
+        if not isinstance(method, bytes) or not isinstance(uri, bytes):
+            raise TypeError("Agent.request takes bytes for method and uri")
+        self.requests.append((method, uri, headers, bodyProducer))
+        if self.headers_after is None:
+            return defer.succeed(self.response)
+        assert self.clock is not None
+        deferred: Any = defer.Deferred()
+        self.clock.callLater(self.headers_after, deferred.callback, self.response)
+        return deferred
 
 
 class TestChoreoClient(unittest.TestCase):
@@ -766,16 +979,81 @@ class TestChoreoClient(unittest.TestCase):
         results[0].trap(ModerationCheckError)
 
     def test_the_whole_exchange_shares_one_budget(self) -> None:
-        """The body's timeout is what remains of the request's, not a fresh
-        one: two full-length timeouts in series would double the worst case."""
+        """The body's timeout is what REMAINS of the request's, not a fresh one.
+
+        The headers have to arrive late for this to mean anything: if they
+        arrive at clock zero, a shared deadline and a fresh full-length timeout
+        expire at the same instant and the test cannot tell them apart.
+        """
         clock = Clock()
-        agent = _FakeAgent(_FakeResponse())
+        agent = _FakeAgent(_FakeResponse(), headers_after=REQUEST_TIMEOUT_SECONDS - 2)
+        agent.clock = clock
         _deferred, results = self._call(agent, clock)
-        clock.advance(REQUEST_TIMEOUT_SECONDS - 1)
-        self.assertEqual(results, [])
-        clock.advance(2)
+        clock.advance(REQUEST_TIMEOUT_SECONDS - 2)
+        self.assertEqual(results, [], "the body read should have started")
+        clock.advance(1.9)
+        self.assertEqual(results, [], "the shared deadline has not expired yet")
+        clock.advance(0.2)
+        self.assertEqual(
+            len(results),
+            1,
+            "the body read outlived the request's deadline, so the budget was "
+            "restarted rather than shared",
+        )
+        results[0].trap(ModerationCheckError)
+
+    def test_a_timeout_tears_the_connection_down(self) -> None:
+        """Cancelling a `readBody` fires the deferred and leaves the socket
+        open: its canceller aborts only `if` the transport has an
+        `abortConnection`, and the transport an `Agent` response delivers
+        (`TransportProxyProducer`) does not have one. So the check "times out"
+        while the peer keeps sending."""
+        clock = Clock()
+        response = _FakeResponse()
+        agent = _FakeAgent(response)
+        _deferred, results = self._call(agent, clock)
+        clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        results[0].trap(ModerationCheckError)
+        self.assertTrue(response.transport.stopped, "the peer was not stopped")
+        self.assertTrue(response.transport.lost, "the connection was left open")
+
+    def test_an_oversized_body_is_refused_rather_than_buffered(self) -> None:
+        """`readBody` has no size limit at all, so a peer that streams forever
+        fills the process's memory, and a deadline does not help - it fires the
+        deferred and leaves the body arriving."""
+        clock = Clock()
+        chunk = b"x" * 65536
+        response = _FakeResponse(
+            chunks=[chunk] * (MAX_RESPONSE_BYTES // len(chunk) + 2)
+        )
+        agent = _FakeAgent(response)
+        _deferred, results = self._call(agent, clock)
         self.assertEqual(len(results), 1)
         results[0].trap(ModerationCheckError)
+        self.assertTrue(response.transport.lost)
+
+    def test_a_body_at_the_limit_is_still_read(self) -> None:
+        """The cap must not truncate an ordinary verdict."""
+        clock = Clock()
+        padding = "y" * 1000
+        body = f'{{"flagged": false, "categories": [], "note": "{padding}"}}'
+        agent = _FakeAgent(_FakeResponse(body=body.encode()))
+        _deferred, results = self._call(agent, clock)
+        self.assertEqual(results[0]["flagged"], False)
+
+    def test_the_request_is_the_one_the_endpoint_expects(self) -> None:
+        """The agent double checks what it was handed, so a wrong method, path
+        or missing bearer token fails here rather than passing silently."""
+        clock = Clock()
+        agent = _FakeAgent(_FakeResponse(body=b'{"flagged": false}'))
+        _deferred, results = self._call(agent, clock)
+        self.assertEqual(len(agent.requests), 1)
+        method, uri, headers, body_producer = agent.requests[0]
+        self.assertEqual(method, b"POST")
+        self.assertEqual(uri, b"http://choreo.invalid/choreo/moderate")
+        self.assertEqual(headers.getRawHeaders(b"Authorization"), [b"Bearer syt_x"])
+        self.assertEqual(headers.getRawHeaders(b"Content-Type"), [b"application/json"])
+        self.assertIsNotNone(body_producer)
 
     def test_a_prompt_response_is_returned(self) -> None:
         """The other direction: the timeout must not break the happy path."""
@@ -952,6 +1230,15 @@ class TestParseConfig(unittest.TestCase):
             "https://choreo.invalid/#frag",
             "https://user:pw@choreo.invalid",
             "gopher://choreo.invalid",
+            # `urlparse` reports an empty query and an empty fragment for
+            # these, both falsy, so a component check alone lets them through -
+            # and the appended path then becomes `?/choreo/moderate`, or is
+            # swallowed into a fragment, and every request goes to `/`.
+            "https://choreo.invalid?",
+            "https://choreo.invalid#",
+            "https://choreo.inva lid",
+            "https://choreo.invalid/a b",
+            "https://chöreo.invalid",
         ):
             with self.subTest(url=url):
                 with self.assertRaises(ValueError):

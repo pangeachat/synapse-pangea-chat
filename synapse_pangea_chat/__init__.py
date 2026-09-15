@@ -70,8 +70,39 @@ _CHOREO_URL_SCHEMES = ("http", "https")
 
 
 def _validate_choreo_base_url(value: str) -> None:
-    """Raise unless `value` is a base URL this module can actually fetch."""
-    parsed = urlparse(value.strip())
+    """Raise unless `value` is a base URL this module can actually fetch.
+
+    The checks are on the RAW string as well as on the parse, because the
+    parse alone accepts values the request builder then mangles. The endpoint
+    path is appended with `f"{base_url.rstrip('/')}/choreo/moderate"`, so a
+    trailing `?` or `#` - which `urlparse` reports as an empty query and an
+    empty fragment, both falsy - turns the path into `?/choreo/moderate` or
+    swallows it into a fragment, and every request goes to `/`. Whitespace and
+    non-ASCII fail later still, inside twisted's URI parsing, where the failure
+    is one more swallowed exception per message.
+    """
+    raw = value.strip()
+    for character, description in (
+        ("?", "a query string"),
+        ("#", "a fragment"),
+        (" ", "whitespace"),
+        ("\t", "whitespace"),
+        ("\n", "whitespace"),
+    ):
+        if character in raw:
+            raise ValueError(
+                'Config "moderation.choreo_base_url" must not contain '
+                f"{description}; the request path is appended to it, so "
+                f"{character!r} would redirect every moderation check to a "
+                "different path than the one configured"
+            )
+    if not raw.isascii():
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must be ASCII. An '
+            "internationalised host has to be given in its punycode form "
+            '("xn--..."), because the request URI is built as bytes'
+        )
+    parsed = urlparse(raw)
     if parsed.scheme not in _CHOREO_URL_SCHEMES:
         raise ValueError(
             'Config "moderation.choreo_base_url" must be an http or https URL; '
