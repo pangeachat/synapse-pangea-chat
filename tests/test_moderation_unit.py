@@ -2,7 +2,7 @@
 filtering logic). No Synapse process — ModuleApi is mocked."""
 
 import unittest
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, List, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse.api.errors import Codes
@@ -130,10 +130,15 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
         mod = _moderation(
             _config(moderation_exempt_user_id_globs=["@bot*:example.org"])
         )
-        event = _event(
-            "call me: 415-555-2671", sender="@botimposter:example.org.evil.com"
-        )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        for impostor in (
+            "@botimposter:example.org.evil.com",
+            # The star-free half of the same hole: under `re.match` an exact
+            # pattern still behaved as a prefix.
+            "@bot:example.org.evil.com",
+        ):
+            with self.subTest(sender=impostor):
+                event = _event("call me: 415-555-2671", sender=impostor)
+                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
 
     async def test_exempt_glob_does_not_exempt_a_longer_localpart(self) -> None:
         """The same hole without the suffix: an exact glob must not act as a
@@ -291,6 +296,20 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         api.create_and_send_event_into_room.assert_not_awaited()
 
 
+class TestExemptGlobContainer(unittest.TestCase):
+    def test_a_bare_string_is_refused_rather_than_iterated(self) -> None:
+        """A string is iterable. `"@bot:*"` iterated character by character
+        yields a standalone `"*"` glob, which exempts every sender on every
+        homeserver - so the container's type is checked before its items."""
+        with self.assertRaises(ValueError):
+            _moderation(_config(moderation_exempt_user_id_globs="@bot:*"))
+
+    def test_a_list_of_globs_is_accepted(self) -> None:
+        mod = _moderation(_config(moderation_exempt_user_id_globs=["@bot:*"]))
+        self.assertTrue(mod._is_exempt_sender("@bot:example.org"))
+        self.assertFalse(mod._is_exempt_sender("@bots:example.org"))
+
+
 class TestNormalizeCategory(unittest.TestCase):
     def test_openai_names_map_to_orchestrator_vocabulary(self) -> None:
         self.assertEqual(_normalize_category("self-harm/intent"), "self_harm")
@@ -383,6 +402,21 @@ class TestParseConfig(unittest.TestCase):
                         {
                             **self.BASE,
                             "moderation": {"exempt_user_id_globs": [value]},
+                        }
+                    )
+
+    def test_retired_regex_key_is_refused_even_when_null(self) -> None:
+        """An operator who wrote the key with no value still believes an
+        exemption policy is configured; accepting it silently would leave
+        them believing it."""
+        empty: List[str] = []
+        for value in (None, empty):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    PangeaChat.parse_config(
+                        {
+                            **self.BASE,
+                            "moderation": {"exempt_user_id_patterns": value},
                         }
                     )
 

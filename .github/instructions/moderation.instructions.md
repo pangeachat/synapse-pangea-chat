@@ -21,7 +21,7 @@ A glob of only `*` characters exempts every sender on every homeserver. It parse
 
 ### Migrating from `exempt_user_id_patterns`
 
-The former key took regular expressions applied with `re.match`, which anchored only the start: `@bot.*:example\.org` exempted `@botimposter:example.org.evil.com` from both tiers. Startup now **refuses** the old key outright and names each configured value with a suggested glob. Nothing is translated automatically, because the two grammars overlap and disagree — `@bot?:example.org` is valid in both, and means `@bot:example.org` as a regex and `@bota:example.org` as a glob — so an automatic conversion could silently widen an exemption. Restate each value and check it says what you meant.
+The former key took regular expressions applied with `re.match`, which anchored only the start: `@bot.*:example\.org` exempted `@botimposter:example.org.evil.com` from both tiers. Startup now **refuses** the old key outright — its presence is what is refused, so an empty list or a bare `exempt_user_id_patterns:` is refused too — and names each configured value with a suggested glob. Nothing is translated automatically, because the two grammars overlap and disagree — `@bot?:example.org` is valid in both, and means `@bot:example.org` as a regex and `@bota:example.org` as a glob — so an automatic conversion could silently widen an exemption. Restate each value and check it says what you meant.
 
 ## Tier 1 — deterministic pre-filter (blocks on send)
 
@@ -61,6 +61,8 @@ Tier 2 skips rooms carrying an activity-plan state event: the conversation orche
 A moderation log record is not an ordinary diagnostic: it states that a particular person tripped a content filter, and it says something about what they wrote. Application logs are not an access-controlled store, they are shipped to aggregators, and they outlive the decision by months. So the module holds to one rule: **no Matrix ID and no message text ever reaches a log handler.**
 
 What a line does carry is a room id, an event id where one exists, the rule identifier from the table above, and a `sender_digest`. The digest is a keyed hash of the Matrix ID with a key generated once per process: an operator chasing a false positive can see that the same sender tripped a rule repeatedly, and the value cannot be turned back into a Matrix ID — not even by enumerating the homeserver's users, which a plain hash would allow. Correlation stops at the process boundary on purpose; anything longer-lived is a behavioural record of a named person and belongs in the database, behind authorisation. An event id resolves to its sender the same way.
+
+A redaction that cannot be sent is caught inside `_check_and_redact` rather than allowed to propagate. It runs under `run_as_background_process`, which logs whatever reaches it — and Synapse's own "User &lt;mxid&gt; not in room &lt;room&gt;" carries the Matrix ID, which is the ordinary case in a DM the offender leaves. Counting those failures and escalating the legitimate ones is separate work; today the message stays up and the failure is visible.
 
 Exceptions are the channel that is easy to miss. `logger.exception` prints the exception's own message, and a library that fails on a message body routinely quotes that body back, so no moderation handler logs a traceback. Each logs the exception's type and the `file:line` that raised it, which is what identifies a bug, and nothing that came from the message.
 

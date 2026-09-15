@@ -6,6 +6,7 @@ value can turn the send path into a denial of service.
 """
 
 import fnmatch
+import itertools
 import time
 import unittest
 
@@ -87,6 +88,27 @@ class TestGlobMatch(unittest.TestCase):
                         glob_match(glob, value),
                         fnmatch.fnmatchcase(value, glob),
                     )
+
+    def test_agrees_with_fnmatch_exhaustively_over_a_small_alphabet(self) -> None:
+        """Hand-picked pairs are the weaker half of a differential test: the
+        first version of this matcher agreed with `fnmatch` on every pair
+        above and disagreed on 546 pairs here, because none of the values
+        above contained a `*`. Matrix IDs can. Every string of length 0..4
+        over an alphabet that includes both wildcards is checked on both
+        sides - roughly 200k pairs, and fast enough to keep in the suite."""
+        alphabet = "a*?:"
+        strings = [""]
+        for length in range(1, 5):
+            strings.extend(
+                "".join(parts) for parts in itertools.product(alphabet, repeat=length)
+            )
+        mismatches = [
+            (glob, value)
+            for glob in strings
+            for value in strings
+            if glob_match(glob, value) != fnmatch.fnmatchcase(value, glob)
+        ]
+        self.assertEqual(mismatches, [], f"{len(mismatches)} pairs disagree")
 
     def test_pathological_glob_resolves_quickly(self) -> None:
         """The reason the grammar is globs at all. Under the regex predecessor

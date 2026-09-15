@@ -37,7 +37,12 @@ from synapse_pangea_chat.moderation.choreo_client import (
     ModerationCheckError,
     moderate_text,
 )
-from synapse_pangea_chat.moderation.exempt import glob_match, validate_glob
+from synapse_pangea_chat.moderation.exempt import (
+    CONFIG_KEY,
+    ExemptGlobError,
+    glob_match,
+    validate_glob,
+)
 from synapse_pangea_chat.moderation.log_safety import (
     error_site,
     new_digest_key,
@@ -89,10 +94,19 @@ class ChatModeration:
         # Validated again here, not only at config-parse time: this is the
         # single place the values are turned into matching behaviour, so a
         # value that reached it unvalidated must fail startup rather than
-        # quietly exempt the wrong senders.
-        for exempt_glob in config.moderation_exempt_user_id_globs:
+        # quietly exempt the wrong senders. The container's type is checked
+        # first because a bare string is iterable: `"@bot:*"` would become
+        # six single-character globs, one of which is `*`, and `*` exempts
+        # every sender on every homeserver.
+        exempt_globs = config.moderation_exempt_user_id_globs
+        if isinstance(exempt_globs, str) or not isinstance(exempt_globs, (list, tuple)):
+            raise ExemptGlobError(
+                f'Config "moderation.{CONFIG_KEY}" must be a list of strings, '
+                f"got {type(exempt_globs).__name__}"
+            )
+        for exempt_glob in exempt_globs:
             validate_glob(exempt_glob)
-        self._exempt_globs = list(config.moderation_exempt_user_id_globs)
+        self._exempt_globs = list(exempt_globs)
         # Keyed per instance so a Matrix ID cannot be recovered from a log
         # line by enumeration; see moderation.log_safety.
         self._log_digest_key = new_digest_key()
@@ -263,15 +277,41 @@ class ChatModeration:
         # default event-send level). `redacts` is provided both top-level
         # (room versions < 11) and in content (v11+); Synapse's event
         # creation code copies to the right place for the room version.
-        await self._api.create_and_send_event_into_room(
-            {
-                "type": "m.room.redaction",
-                "room_id": event.room_id,
-                "sender": event.sender,
-                "redacts": event.event_id,
-                "content": {"redacts": event.event_id, "reason": reason},
-            }
-        )
+        try:
+            await self._api.create_and_send_event_into_room(
+                {
+                    "type": "m.room.redaction",
+                    "room_id": event.room_id,
+                    "sender": event.sender,
+                    "redacts": event.event_id,
+                    "content": {"redacts": event.event_id, "reason": reason},
+                }
+            )
+        except Exception as exc:
+            # A redaction send can fail for reasons that are ordinary rather
+            # than exceptional: the sender has left, been kicked or been
+            # banned (room auth checks membership before it checks redaction
+            # rights), the room raises the send level for redactions, or the
+            # sender is remote and the module cannot author an event as them.
+            #
+            # It is caught HERE, and not allowed to escape, because this
+            # coroutine runs under `run_as_background_process`, which calls
+            # `logger.exception` on whatever reaches it. Synapse's own
+            # "User <mxid> not in room <room>" carries the Matrix ID, so
+            # letting the exception through would put an identified sender
+            # into a plaintext log by a route none of this module's own
+            # format strings mention.
+            #
+            # Counting these failures and escalating the legitimate ones is
+            # separate work; today the message stays up and the failure is
+            # visible, which is what the previous behaviour was missing.
+            logger.warning(
+                "tier2 redaction failed for %s in %s at %s (%s); message stays",
+                event.event_id,
+                event.room_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
 
 
 def _normalize_category(category: str) -> str:

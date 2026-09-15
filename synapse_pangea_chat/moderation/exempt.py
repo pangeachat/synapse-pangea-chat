@@ -116,15 +116,20 @@ def glob_match(glob: str, value: str) -> bool:
     value_length = len(value)
 
     while value_index < value_length:
-        if glob_index < glob_length and (
+        # `*` is tested BEFORE the literal comparison. The other order looks
+        # equivalent and is not: a Matrix ID may itself contain `*`, and a
+        # literal-first test would match the pattern's `*` against the
+        # value's `*` one-for-one, never recording the wildcard - so
+        # `@bot*:example.org` stopped matching `@bot*x:example.org`.
+        if glob_index < glob_length and glob[glob_index] == "*":
+            star_index = glob_index
+            glob_index += 1
+            resume_index = value_index
+        elif glob_index < glob_length and (
             glob[glob_index] == "?" or glob[glob_index] == value[value_index]
         ):
             glob_index += 1
             value_index += 1
-        elif glob_index < glob_length and glob[glob_index] == "*":
-            star_index = glob_index
-            glob_index += 1
-            resume_index = value_index
         elif star_index >= 0:
             glob_index = star_index + 1
             resume_index += 1

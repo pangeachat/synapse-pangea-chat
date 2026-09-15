@@ -673,12 +673,19 @@ class PangeaChat:
         # grammars overlap with different meanings, so any automatic
         # conversion could silently widen an exemption - and an exempt sender
         # skips both tiers. See moderation/exempt.py.
-        legacy_exempt = moderation.get(moderation_exempt.LEGACY_CONFIG_KEY, None)
-        if legacy_exempt is not None:
+        # Presence of the key is what is refused, not its value: an operator
+        # who wrote `exempt_user_id_patterns:` with nothing after it still
+        # believes an exemption policy is configured, and silently accepting
+        # it would leave them believing it after an upgrade changed the key.
+        _ABSENT = object()
+        legacy_exempt = moderation.get(moderation_exempt.LEGACY_CONFIG_KEY, _ABSENT)
+        if legacy_exempt is not _ABSENT:
             raise ValueError(
                 moderation_exempt.legacy_key_error(
                     [str(value) for value in legacy_exempt]
-                    if isinstance(legacy_exempt, list)
+                    if isinstance(legacy_exempt, (list, tuple))
+                    else []
+                    if legacy_exempt is None
                     else [str(legacy_exempt)]
                 )
             )

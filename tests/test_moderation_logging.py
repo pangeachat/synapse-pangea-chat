@@ -16,7 +16,7 @@ on our behalf, is the same leak, and a module-scoped capture cannot see it.
 import logging
 import unittest
 from typing import Any, Dict, List, Optional, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse.events import EventBase
 
@@ -148,14 +148,8 @@ class ModerationLoggingTestCase(unittest.IsolatedAsyncioTestCase):
         def _boom(text: str, regions: Any) -> None:
             raise ValueError(f"cannot parse {text!r}")
 
-        import synapse_pangea_chat.moderation as moderation_module
-
-        original = moderation_module.check_text
-        moderation_module.check_text = _boom  # type: ignore[assignment]
-        try:
+        with patch("synapse_pangea_chat.moderation.check_text", side_effect=_boom):
             await mod.check_event_for_spam(event)
-        finally:
-            moderation_module.check_text = original  # type: ignore[assignment]
 
         self.assertLoggedSomething()
         self.assertNoCanaries()
@@ -171,11 +165,49 @@ class ModerationLoggingTestCase(unittest.IsolatedAsyncioTestCase):
         )
         event = _event(CANARY_TEXT)
 
-        def _boom(*args: Any, **kwargs: Any) -> None:
-            raise ValueError(f"cannot dispatch {CANARY_SENDER!r}")
+        with patch.object(
+            ChatModeration,
+            "_room_has_activity_plan",
+            side_effect=ValueError(f"cannot dispatch {CANARY_SENDER!r}"),
+        ):
+            await mod.on_new_event(event, {})
+        self.assertLoggedSomething()
+        self.assertNoCanaries()
 
-        mod._room_has_activity_plan = _boom  # type: ignore[assignment]
-        await mod.on_new_event(event, {})
+    async def test_redaction_failure_logs_no_matrix_id(self) -> None:
+        """The channel that is not one of our own log calls. `_check_and_redact`
+        runs under `run_as_background_process`, which calls `logger.exception`
+        on anything that reaches it, and Synapse raises "User <mxid> not in
+        room <room>" when a sender who has left tries to redact - which is the
+        ordinary case in a DM the offender leaves. The exception must not
+        escape this module."""
+        api = MagicMock()
+        api.create_and_send_event_into_room = AsyncMock(
+            side_effect=RuntimeError(
+                f"User {CANARY_SENDER} not in room !room:example.org"
+            )
+        )
+        mod = ChatModeration(
+            api,
+            _config(
+                moderation_tier1_enabled=False,
+                moderation_tier2_enabled=True,
+                moderation_choreo_base_url="http://choreo.invalid",
+            ),
+        )
+        with patch(
+            "synapse_pangea_chat.moderation.moderate_text",
+            new=AsyncMock(
+                return_value={
+                    "flagged": True,
+                    "categories": ["harassment"],
+                    "evaluated": True,
+                }
+            ),
+        ):
+            # No exception may propagate: the caller is a background process
+            # whose handler would log it, Matrix ID and all.
+            await mod._check_and_redact(_event(CANARY_TEXT), "flagged text")
         self.assertLoggedSomething()
         self.assertNoCanaries()
 
