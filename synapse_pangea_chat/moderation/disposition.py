@@ -21,6 +21,24 @@ same reason, and two instances never had it: two processes, two memories, no
 shared claim. An earlier revision proposed an LRU of remembered verdicts,
 which fails on eviction as well.
 
+**The limit, stated exactly, because it is the one the table cannot close.**
+A redaction is an irreversible action taken in another system, and no table
+can recall one that is already in flight. So the guarantee is about the
+ORDER OF DECISIONS: once an event is recorded preserved, no later decision
+may redact it. A preserve that arrives AFTER the redaction decision was
+taken - in the window between the claim committing and the send landing -
+cannot undo it.
+
+Within one instance that window is unreachable: the dispatcher holds an
+in-flight claim per event id, so there is never a second verdict for the same
+event at the same time. It is reachable only when two instances both run
+background tasks, which is the misconfiguration `should_run_background_tasks`
+exists to prevent and which `pangea_moderation_tier2_active` makes visible -
+`sum(...) > 1` is the alert. When it does happen the redaction is counted
+under `pangea_moderation_tier2_redacted_after_preserve_total` and logged at
+ERROR with the room and event, because a disclosure was removed and the only
+remaining remedy is a human who knows.
+
 **It does not fail open, and that is deliberate.** Everywhere else in this
 module an unknown means "leave the message alone and carry on"; here, an
 unknown means "do not redact". A message left standing can still be redacted
@@ -360,6 +378,44 @@ class DispositionStore:
         # claim that wrote it. A random id and nothing derived from the room,
         # the sender or the text.
         return (GRANTED, claim_id) if row[1] == claim_id else (REDACTED, "")
+
+    async def is_preserved(self, event_id: str) -> Optional[bool]:
+        """Read the row and say nothing else. True, False, or None for "we
+        could not find out".
+
+        A plain read, with no claim: this is what a caller asks AFTER an
+        action, to find out whether a decision landed while it was busy. It
+        must not take a row of its own, or asking the question would change
+        the answer.
+        """
+        if event_id in self._remembered:
+            return True
+        try:
+            await self._ensure_table()
+
+            def _select(txn: Any) -> Any:
+                txn.execute(_SELECT_SQL, (event_id,))
+                return txn.fetchone()
+
+            row = await self._pool().runInteraction(
+                "pangea_moderation_read_disposition", _select
+            )
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok: the caller uses this to REPORT, not to decide.
+            logger.warning(
+                "tier2 could not read the disposition of %s at %s (%s)",
+                event_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
+            return None
+        if row is None:
+            return False
+        if row[0] == PRESERVED:
+            self._remember(event_id)
+            return True
+        return False
 
     async def release_redaction_claim(self, event_id: str, claim_id: str) -> None:
         """Give OUR claim back when the redaction did not happen.

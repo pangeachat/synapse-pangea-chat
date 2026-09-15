@@ -221,11 +221,21 @@ _ABRUPT_COMMENTS = re.compile(r"<!--?>")
 # The inserted character is invisible either way - a bogus comment is not
 # displayed - and it cannot create `<!--` or `<!doctype`.
 #
-# Three characters in and three out, so nothing downstream shifts: the
-# rewrite is visible only inside an ATTRIBUTE value, which is displayed text,
-# and a substitution there changes one character rather than adding one.
+# Three characters in and three out, and the substitute is NOT a word
+# character. Both halves matter, and the second one is a correctness rule
+# rather than tidiness. The rewrite runs over the raw string before parsing,
+# so it also lands inside ATTRIBUTE values, where `<![` is literal displayed
+# text rather than markup - and a word character there MERGES WITH THE TOKEN
+# THAT FOLLOWS: `alt="<![415-555-2671"` became `<!x415-555-2671`, one token,
+# and the phone number a reader sees stopped matching. Under-reading is the
+# expensive direction, so the substitute is punctuation, which separates
+# tokens exactly as `[` did.
+#
+# `(` specifically: it cannot combine with what follows into `<!--` (the
+# parser compares four characters from the `<`, and the third is fixed here),
+# so it cannot turn a bogus comment into a real one.
 _MARKED_SECTIONS = re.compile(r"<!\[")
-_BOGUS_COMMENT_OPEN = "<!x"
+_BOGUS_COMMENT_OPEN = "<!("
 
 
 class _DisplayedText(HTMLParser):
@@ -906,6 +916,7 @@ class ChatModeration:
                 }
             )
             metrics.TIER2_REDACTIONS.labels(category=category).inc()
+            await self._warn_if_preserved_meanwhile(job)
         except Exception as exc:
             reraise_if_cancelled(exc)
             # A redaction send can fail for reasons that are ordinary rather
@@ -1050,6 +1061,32 @@ class ChatModeration:
             return None
         metrics.record_redaction_skip("already_redacted")
         return None
+
+    async def _warn_if_preserved_meanwhile(self, job: ModerationJob) -> None:
+        """Did a preserve land while this redaction was in flight?
+
+        The one thing a table cannot do is recall an action already taken in
+        another system, so this does not prevent the harm - it makes it
+        visible. The window is between the claim committing and the send
+        landing, it is unreachable inside one instance (the dispatcher holds
+        one in-flight claim per event id), and it is reachable only when two
+        instances both run background tasks, which is a misconfiguration.
+        When it happens a disclosure has been removed from a room and the only
+        remaining remedy is a human who knows that it was.
+        """
+        if self._disposition is None:
+            return
+        if not await self._disposition.is_preserved(job.event_id):
+            return
+        metrics.TIER2_REDACTED_AFTER_PRESERVE.inc()
+        logger.error(
+            "tier2 redacted %s in %s and the event was preserved while the "
+            "send was in flight: a disclosure has been removed and cannot be "
+            "restored by this module. Check that only one instance has "
+            "run_background_tasks set (pangea_moderation_tier2_active)",
+            job.event_id,
+            job.room_id,
+        )
 
     def _release_claim(self, job: ModerationJob, claim_id: str) -> None:
         """Hand the claim back when no redaction was sent.

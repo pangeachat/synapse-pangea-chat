@@ -159,6 +159,14 @@ TIER2_DISPOSITION_WRITE_FAILED = _get_or_create(
     "binds a restart and a second instance.",
 )
 
+TIER2_REDACTED_AFTER_PRESERVE = _get_or_create(
+    Counter,
+    "pangea_moderation_tier2_redacted_after_preserve_total",
+    "Redactions that landed on an event another instance preserved while the "
+    "send was in flight. A disclosure was removed and a human has to know; "
+    "this is nonzero only when two instances both run background tasks.",
+)
+
 TIER2_WORKERS_RESTARTED = _get_or_create(
     Counter,
     "pangea_moderation_tier2_workers_restarted_total",

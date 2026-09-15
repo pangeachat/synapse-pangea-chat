@@ -1531,6 +1531,65 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
             await b._check_and_redact(self._job())
         cast(AsyncMock, api_b.create_and_send_event_into_room).assert_not_awaited()
 
+    async def test_a_preserve_that_lands_during_the_send_is_reported(
+        self,
+    ) -> None:
+        """The one thing the table cannot do is recall an action already taken
+        in another system.
+
+        A claim commits, the send goes in flight, and a second instance
+        preserves the event before the send lands. The redaction happens - no
+        table can stop it by then - so what must not happen is that it happens
+        SILENTLY: a disclosure has been removed from a room and the only
+        remaining remedy is a human who knows that it was.
+
+        Unreachable inside one instance, because the dispatcher holds one
+        in-flight claim per event id; reachable only when two instances both
+        run background tasks, which is a misconfiguration.
+        """
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier2_redacted_after_preserve_total")
+        db_pool = DbPoolDouble()
+        api_a, hs_a = self._pair(db_pool)
+        api_b, hs_b = self._pair(db_pool)
+        a, b = self._module(api_a, hs_a), self._module(api_b, hs_b)
+        claimed = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _held_send(*_args: Any, **_kwargs: Any) -> Any:
+            claimed.set()
+            await release.wait()
+
+        cast(AsyncMock, api_a.create_and_send_event_into_room).side_effect = _held_send
+        with patch(self.MODERATE, self._verdict("harassment")):
+            redacting = asyncio.ensure_future(a._check_and_redact(self._job()))
+            await claimed.wait()
+            with patch(self.MODERATE, self._verdict("self-harm/intent")):
+                await b._check_and_redact(self._job())
+            release.set()
+            await redacting
+        cast(AsyncMock, api_a.create_and_send_event_into_room).assert_awaited_once()
+        self.assertEqual(
+            reader.delta("pangea_moderation_tier2_redacted_after_preserve_total"),
+            1.0,
+            "a disclosure was removed and nothing said so",
+        )
+
+    async def test_an_ordinary_redaction_is_not_reported_as_one(self) -> None:
+        """The other half: the report has to mean something, so an ordinary
+        redaction must not raise it."""
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier2_redacted_after_preserve_total")
+        api, homeserver = self._pair()
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
+        self.assertEqual(
+            reader.delta("pangea_moderation_tier2_redacted_after_preserve_total"),
+            0.0,
+        )
+
     async def test_a_backlog_does_not_hammer_a_database_that_is_down(
         self,
     ) -> None:
@@ -1686,6 +1745,21 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
             }
         )
         self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    def test_the_rewrite_does_not_merge_a_token_in_an_attribute(self) -> None:
+        """The rewrite runs over the raw string before parsing, so it lands
+        inside attribute values too - where `<![` is literal displayed text
+        rather than markup. A WORD character there merges with the token that
+        follows: `<![415-555-2671` became one token `x415-555-2671` and the
+        phone number a reader sees stopped matching, which is the expensive
+        direction. The substitute is punctuation, so it separates tokens
+        exactly as `[` did."""
+        displayed = _displayed_text('<img alt="<![415-555-2671" src="x">')
+        self.assertIsNotNone(check_text(displayed, ["US"]))
+        # And it cannot turn a bogus comment into a real one.
+        self.assertIn(
+            "415-555-2671", _displayed_text('<img alt="<![-- 415-555-2671" src="x">')
+        )
 
     def test_the_renderer_no_longer_recurses_per_section(self) -> None:
         """Fixed at the mechanism, not by catching the error: HTML5 has no
