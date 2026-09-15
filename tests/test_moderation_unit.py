@@ -306,11 +306,11 @@ class TestTier1FailsOpenAsAWhole(unittest.IsolatedAsyncioTestCase):
     # the rule function. Patching `contains_phone_number` itself replaces the
     # very code that used to swallow the exception, so restoring that swallow
     # would leave every one of these tests green - the defect would be back and
-    # invisible. `PhoneNumberMatcher` and the multilingual matcher are where a
-    # real library quirk actually raises.
+    # invisible. `PhoneNumberMatcher` and the universal-term matcher are
+    # where a real library quirk actually raises.
     RULE_PATCHES = (
         ("phonenumbers", "call 415-555-2671"),
-        ("_contains_profanity_multilingual", "an ordinary sentence"),
+        ("_matches_universal_term", "an ordinary sentence"),
     )
 
     @staticmethod

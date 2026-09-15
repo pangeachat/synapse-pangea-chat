@@ -30,6 +30,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Set
 
+# The lossless primitives live with the Tier 1 core, and both tiers use the
+# same ones: two definitions of "where does a word end" is how the tiers drift
+# apart and how a fix to one silently misses the other.
+from synapse_pangea_chat.moderation.tier1_terms import matches_phrase, split_tokens
+
 _WORDLIST_PATH = Path(__file__).with_name("profanity_wordlists.json")
 
 # Leetspeak / homoglyph folding, applied after diacritic stripping. Small and
@@ -66,11 +71,6 @@ _SUBSTITUTIONS = {
 # Invisible characters carry no meaning and are removed outright (not treated
 # as separators), so `f<zero-width-space>uck` is one token again.
 _INVISIBLE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
-
-# Anything that is not a letter or digit separates tokens. Unicode-aware, so
-# Spanish "¡Joder" and CJK punctuation tokenize correctly — a hand-listed
-# punctuation set silently missed those.
-_SEPARATORS = re.compile(r"[^\w]+", re.UNICODE)
 
 # A needle also matches a token that merely STARTS with it, so inflections and
 # compounds are caught ("fuck" -> "fucking", "puta" -> "putas", "merda" ->
@@ -146,19 +146,34 @@ _CJK_LANGS = {"zh", "ja", "yue"}
 
 
 def _strip_diacritics(text: str) -> str:
-    """Drop combining marks, then RECOMPOSE. Without the recompose step NFKD
-    leaves Hangul as individual jamo, which inflates every Korean token's
-    length and breaks the inflection-suffix bound."""
+    """Drop combining marks from LATIN, GREEK and CYRILLIC bases only, then
+    recompose.
+
+    Stripping every mark in every script is lossy in the scripts where marks
+    are not decoration. Devanagari vowel signs are letters: dropping them
+    turned Hindi `रोड` (road) into `रड`, which is also what `रंडी` (a slur)
+    became, so an ordinary sentence about traffic matched. The same applies to
+    Bengali, Arabic and Hangul. Where a mark IS decoration - Czech `č`,
+    Spanish `ó`, French `è` - stripping it is what defeats the
+    diacritic-stripping evasion, so that much is kept.
+    """
     decomposed = unicodedata.normalize("NFKD", text)
-    # Drop every mark category, not just non-spacing ones. Indic SPACING
-    # vowel signs (category Mc) are marks that `unicodedata.combining()`
-    # reports as 0 and that `\w` does not match, so leaving them in made them
-    # act as separators and shredded Bengali and Devanagari words into single
-    # consonants.
-    stripped = "".join(
-        c for c in decomposed if not unicodedata.category(c).startswith("M")
-    )
-    return unicodedata.normalize("NFC", stripped)
+    kept: List[str] = []
+    base_takes_marks = False
+    for char in decomposed:
+        if unicodedata.category(char).startswith("M"):
+            if base_takes_marks:
+                kept.append(char)
+            continue
+        base_takes_marks = not _decorated_script(char)
+        kept.append(char)
+    return unicodedata.normalize("NFC", "".join(kept))
+
+
+def _decorated_script(char: str) -> bool:
+    """True for the scripts where a combining mark is an accent on a letter
+    rather than a letter in its own right."""
+    return ord(char) < 0x0590 or 0x1E00 <= ord(char) < 0x2000
 
 
 def _fold(text: str) -> str:
@@ -174,74 +189,87 @@ def _collapse_repeats(text: str) -> str:
     return re.sub(r"(.)\1{2,}", r"\1", text)
 
 
-def _normalize_token(token: str) -> str:
-    """Fold a single separatorless token and collapse long repeats."""
-    return _collapse_repeats(_fold(token))
+def _needle(term: str) -> str:
+    """The stored form of a term: folded, with its separators removed, so
+    `f.u.c.k` and `fuck` reduce to the same needle.
 
-
-def _normalize_joined(text: str) -> str:
-    """Fold the whole message and remove separators, so split needles rejoin."""
-    return _collapse_repeats(_SEPARATORS.sub("", _fold(text)))
+    Separators are removed by tokenizing, not by a `\\w`-based substitution:
+    `\\w` does not match Indic vowel signs, so the substitution deleted the
+    marks that tell `रोड` and `रंडी` apart and left every Devanagari and
+    Bengali needle truncated to its bare consonants."""
+    return _collapse_repeats("".join(split_tokens(_fold(term))))
 
 
 @lru_cache(maxsize=1)
 def _allowlist() -> Set[str]:
     """The allowlist normalized the same way tokens are, so entries can be
     written in their natural spelling."""
-    return {_normalize_token(_SEPARATORS.sub("", w)) for w in _ALLOWLIST}
+    return {_needle(w) for w in _ALLOWLIST}
 
 
 @lru_cache(maxsize=1)
 def _terms() -> Dict[str, Set[str]]:
     """Normalized needles unioned across languages (a message's language is
-    unknown at Tier 1). `boundary` = space-delimited scripts, `substring` =
-    CJK. Cached: the file is read once per process."""
+    unknown here too). `boundary` = one word in a space-delimited script,
+    `phrase` = a run of consecutive words, `substring` = a script with no word
+    spacing. Cached: the file is read once per process."""
     raw = json.loads(_WORDLIST_PATH.read_text(encoding="utf-8"))
     boundary: Set[str] = set()
     substring: Set[str] = set()
+    phrase: Set[str] = set()
     for lang, words in raw.items():
         for w in words:
             if not w or not w.strip():
                 continue
-            needle = _normalize_token(_SEPARATORS.sub("", w))
-            # A multi-word term ("đụ má") can never match a single token, and
-            # is specific enough that a substring test is safe. CJK terms are
-            # substring-matched for the same reason (no word spacing).
+            needle = _needle(w)
             # Substring matching is only safe for needles that cannot occur
-            # inside an unrelated word: CJK terms written in their own script,
-            # and multi-word phrases. A Latin-script term listed under a CJK
-            # language (a romanization) must still be boundary-matched, or it
-            # fires inside any word that contains it.
-            if (lang in _CJK_LANGS and _has_non_latin(w)) or _is_phrase(w):
+            # inside an unrelated word, and that is CJK terms written in their
+            # own script and nothing else. A multi-word term is matched across
+            # whole tokens instead: substring-matching it is what let the
+            # Vietnamese term "pe de" fire inside "Pedestrian".
+            if lang in _CJK_LANGS and _has_non_latin(w):
                 substring.add(needle)
+            elif _is_phrase(w):
+                phrase.add(needle)
             else:
                 boundary.add(needle)
-    boundary.discard("")
-    substring.discard("")
-    return {"boundary": boundary, "substring": substring}
+    for bucket in (boundary, substring, phrase):
+        bucket.discard("")
+    return {"boundary": boundary, "substring": substring, "phrase": phrase}
 
 
 def contains_profanity(text: str) -> bool:
-    """True when the normalized message contains a wordlist term — as a whole
-    token (space-delimited scripts) or a substring (CJK, plus spaced-out
-    evasions of longer terms)."""
+    """Tier 2's matcher: true when the normalized message contains a wordlist
+    term, by whole token, by a run of whole tokens, or - for scripts with no
+    word spacing - anywhere inside a token.
+
+    This is the RECALL-oriented tier. It folds diacritics and homoglyphs and
+    matches inflections by prefix, and it is deliberately not what blocks a
+    message: a false positive here costs an LLM call, while a false positive
+    in Tier 1 costs a learner their sentence. Tier 1's core is
+    `tier1_terms.matches_tier1`.
+    """
     if not text:
         return False
     terms = _terms()
-    joined = _normalize_joined(text)
-    if not joined:
+    folded = _fold(text)
+    tokens = [_collapse_repeats(t) for t in split_tokens(folded)]
+    if not tokens:
         return False
 
-    # CJK: direct substring test on the separatorless message.
+    # Scripts without word spacing: direct substring test.
+    joined = "".join(tokens)
     for term in terms["substring"]:
         if term in joined:
             return True
 
     # Boundary: a token matches when it equals a needle, or starts with one
     # plus a short suffix (inflection/compound). Allowlisted tokens never match.
-    folded = _fold(text)
-    tokens = [_collapse_repeats(t) for t in _SEPARATORS.split(folded) if t]
     if any(_token_matches(tok, terms["boundary"]) for tok in tokens):
+        return True
+
+    # A multi-word term, across consecutive whole tokens.
+    if matches_phrase(tokens, terms["phrase"]):
         return True
 
     # Letters spaced apart (`f u c k`, `s.h.i.t`) leave a run of very short

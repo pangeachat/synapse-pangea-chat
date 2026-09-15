@@ -2,7 +2,13 @@
 
 Pure, model-free checks fast enough to run inline in the send path via
 `check_event_for_spam` (pre-persist, can reject): phone numbers a minor might
-share, and wordlist profanity.
+share, and profanity from the universal core of the wordlist.
+
+The tier takes no language and identifies none. Its inputs are the text and
+the configured phone regions, and that is the whole of it: there is no
+language parameter for a caller to select on, which is what makes "LID can
+only ever make Tier 1 more permissive" true by construction rather than by
+policy.
 
 Street addresses were a third rule and are deliberately not here. A pattern
 cannot tell a shared address from a discussed one, and in a language-learning
@@ -25,8 +31,8 @@ from synapse_pangea_chat.moderation.log_safety import (
     error_site,
     scrubbing_logger,
 )
-from synapse_pangea_chat.moderation.profanity import (
-    contains_profanity as _contains_profanity_multilingual,
+from synapse_pangea_chat.moderation.tier1_terms import (
+    matches_tier1 as _matches_universal_term,
 )
 
 logger = scrubbing_logger(
@@ -99,7 +105,15 @@ def contains_phone_number(text: str, regions: Iterable[str]) -> bool:
 
 
 def contains_profanity(text: str) -> bool:
-    return _contains_profanity_multilingual(text)
+    """Tier 1's profanity rule: the universal core, and nothing else.
+
+    Not the full wordlist. Tier 1 rejects before persist, so it carries only
+    terms with no benign homograph in any supported language; everything
+    ambiguous is left to Tier 2, which reads the message in context. Which
+    terms those are, and the measured evidence for each, is in
+    `tier1_universal.json`.
+    """
+    return _matches_universal_term(text)
 
 
 class Tier1RuleError(Exception):

@@ -20,11 +20,9 @@ import unittest
 from pathlib import Path
 from typing import Any, Dict
 
-from synapse_pangea_chat.moderation.tier1_prefilter import (
-    REASON_PROFANITY,
-    check_text,
-    contains_profanity,
-)
+from synapse_pangea_chat.moderation.profanity import contains_profanity
+from synapse_pangea_chat.moderation.tier1_prefilter import REASON_PROFANITY, check_text
+from synapse_pangea_chat.moderation.tier1_terms import matches_tier1
 
 _CORPUS_PATH = Path(__file__).with_name("moderation_corpus.json")
 # Regions only affect phone matching; profanity cases are region-independent.
@@ -72,16 +70,37 @@ class TestMultilingualProfanity(unittest.TestCase):
                         f"{lang['lang_name']}: {case['sentence']!r}",
                     )
 
-    def test_profanity_reports_the_profanity_reason(self) -> None:
-        """A caught message must be attributed to the profanity rule, not to
-        an unrelated one (a phone or address match would misreport why)."""
+    def test_each_case_is_handled_by_the_tier_the_corpus_records(self) -> None:
+        """Every case names the tier that handles it, and both halves are
+        asserted.
+
+        `tier: 1` must be rejected before send AND attributed to the profanity
+        rule, not to an unrelated one (a phone match would misreport why).
+        `tier: 2` must NOT be rejected before send - that is the whole point of
+        demoting it - and must still be seen by the Tier 2 matcher. Written
+        this way, moving a term between tiers cannot be done quietly: the
+        recorded tier and the code have to agree, in both directions.
+        """
         for lang in _corpus()["languages"]:
-            for case in lang["profanities"][:2]:
-                with self.subTest(lang=lang["lang_code"], term=case["term"]):
-                    self.assertEqual(
-                        check_text(case["sentence"], _PHONE_REGIONS),
-                        REASON_PROFANITY,
-                    )
+            for case in lang["profanities"]:
+                with self.subTest(
+                    lang=lang["lang_code"], term=case["term"], tier=case["tier"]
+                ):
+                    verdict = check_text(case["sentence"], _PHONE_REGIONS)
+                    if case["tier"] == 1:
+                        self.assertEqual(verdict, REASON_PROFANITY)
+                    else:
+                        self.assertNotEqual(
+                            verdict,
+                            REASON_PROFANITY,
+                            f"{case['term']!r} is recorded as Tier 2 but Tier 1 "
+                            f"blocked it; see tier1_universal.json",
+                        )
+                        self.assertTrue(
+                            contains_profanity(case["sentence"]),
+                            f"{case['term']!r} left Tier 1 and Tier 2 does not "
+                            f"catch it either, so nothing catches it",
+                        )
 
 
 class TestEvasions(unittest.TestCase):
@@ -104,15 +123,47 @@ class TestEvasions(unittest.TestCase):
 
 
 class TestNegativeControls(unittest.TestCase):
-    """Benign learner messages are never blocked. Equal weight to the above."""
+    """Benign learner messages are never blocked. Equal weight to the above.
 
-    def test_benign_sentences_are_not_blocked(self) -> None:
+    Blocking is Tier 1's, and `test_moderation_tier1_terms.py` asserts every
+    control against it. What is asserted here is the Tier 2 matcher, which
+    does not block but does decide what the LLM is asked about. A control the
+    recall-oriented matcher still flags has to say so in the corpus and say
+    why, and the assertion runs in both directions - an unmarked control must
+    pass it, and a marked one must really fail it - so the marker cannot be
+    sprinkled over a regression.
+    """
+
+    def test_benign_sentences_are_not_flagged_by_the_tier2_matcher(self) -> None:
+        for lang in _corpus()["languages"]:
+            for case in lang["negative_controls"]:
+                marked = case.get("tier2_matcher") == "flags"
+                with self.subTest(lang=lang["lang_code"], sentence=case["sentence"]):
+                    if marked:
+                        self.assertTrue(
+                            case.get("tier2_note", "").strip(),
+                            "a control excused from this assertion must say why",
+                        )
+                        self.assertTrue(
+                            contains_profanity(case["sentence"]),
+                            f"{case['sentence']!r} is recorded as flagged by the "
+                            f"Tier 2 matcher but is not; drop the marker",
+                        )
+                        continue
+                    self.assertFalse(
+                        contains_profanity(case["sentence"]),
+                        f"false positive in {lang['lang_name']}: "
+                        f"{case['sentence']!r} — {case['why_benign']}",
+                    )
+
+    def test_no_benign_sentence_is_blocked_before_send(self) -> None:
+        """The one that actually matters: Tier 1 rejects pre-persist."""
         for lang in _corpus()["languages"]:
             for case in lang["negative_controls"]:
                 with self.subTest(lang=lang["lang_code"], sentence=case["sentence"]):
                     self.assertFalse(
-                        contains_profanity(case["sentence"]),
-                        f"false positive in {lang['lang_name']}: "
+                        matches_tier1(case["sentence"]),
+                        f"Tier 1 blocked a benign {lang['lang_name']} sentence: "
                         f"{case['sentence']!r} — {case['why_benign']}",
                     )
 
@@ -173,7 +224,7 @@ class TestCorpusIntegrity(unittest.TestCase):
 
     def test_every_curation_decision_states_a_reason(self) -> None:
         decisions = _corpus()["curation_decisions"]
-        for bucket in ("drop_term", "allowlist", "drop_control"):
+        for bucket in ("drop_term", "allowlist", "restored_controls"):
             for key, reason in decisions[bucket].items():
                 with self.subTest(bucket=bucket, key=key):
                     self.assertTrue(reason.strip())
