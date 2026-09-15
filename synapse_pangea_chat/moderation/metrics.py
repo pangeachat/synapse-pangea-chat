@@ -116,6 +116,14 @@ TIER2_REDACTION_SKIPPED = _get_or_create(
     ["cause"],
 )
 
+TIER2_DISPOSITION_WRITE_FAILED = _get_or_create(
+    Counter,
+    "pangea_moderation_tier2_disposition_write_failed_total",
+    "Preserved dispositions that could not be written to the durable table. "
+    "The message was still preserved; what is missing is the record that "
+    "binds a restart and a second instance.",
+)
+
 TIER2_WORKERS_RESTARTED = _get_or_create(
     Counter,
     "pangea_moderation_tier2_workers_restarted_total",
@@ -224,7 +232,20 @@ CHECK_OUTCOMES = frozenset({"flagged", "clean", "unevaluated", "error"})
 REDACTION_FAILURE_CAUSES = frozenset({"forbidden", "other"})
 
 REDACTION_SKIP_CAUSES = frozenset(
-    {"already_redacted", "event_missing", "lookup_failed"}
+    {
+        "already_redacted",
+        "event_missing",
+        "lookup_failed",
+        # The event carries a durable PRESERVED disposition. A self-harm
+        # disclosure, protected by an earlier verdict, that a later one wanted
+        # to take down.
+        "preserved",
+        # The disposition table could not be read, so we cannot establish that
+        # this event was NOT preserved. The one place this module refuses to
+        # act on an unknown rather than carrying on - see
+        # `moderation.disposition`.
+        "disposition_unknown",
+    }
 )
 
 
@@ -262,6 +283,19 @@ def record_redaction_failure(cause: str) -> None:
     if cause not in REDACTION_FAILURE_CAUSES:
         raise ValueError(f"unknown moderation redaction failure cause {cause!r}")
     TIER2_REDACTION_FAILED.labels(cause=cause).inc()
+
+
+def record_redaction_skip(cause: str) -> None:
+    """Count a redaction that was not attempted, and say why.
+
+    Validated like every other closed label set. The collector used to be
+    incremented through `.labels(...)` at the call sites, which is the one
+    shape that can invent a series: `REDACTION_SKIP_CAUSES` existed and
+    nothing consulted it.
+    """
+    if cause not in REDACTION_SKIP_CAUSES:
+        raise ValueError(f"unknown moderation redaction skip cause {cause!r}")
+    TIER2_REDACTION_SKIPPED.labels(cause=cause).inc()
 
 
 def set_breaker_state(state: str) -> None:

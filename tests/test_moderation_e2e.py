@@ -11,10 +11,16 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
+import psycopg2
 import requests
+from psycopg2.extensions import parse_dsn
 
 from .base_e2e import BaseSynapseE2ETest
-from .mock_moderation_server import FLAG_MARKER, MockModerationServer
+from .mock_moderation_server import (
+    FLAG_MARKER,
+    PRESERVE_MARKER,
+    MockModerationServer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +49,47 @@ class TestModerationE2E(BaseSynapseE2ETest):
         if resp.status_code != 200:
             return None
         return resp.json()
+
+    def _query_disposition(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """Read the module's own disposition row straight out of Postgres.
+
+        Through the database and not through an API, because what this asserts
+        is that the table the guarantee rests on was created and written on a
+        real Postgres - the SQL, the conflict clause and all.
+        """
+        with psycopg2.connect(**parse_dsn(self.database_url)) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT to_regclass('public.pangea_moderation_disposition')"
+                )
+                fetched = cursor.fetchone()
+                if fetched is None or fetched[0] is None:
+                    return None
+                cursor.execute(
+                    "SELECT room_id, disposition, category, decided_at_ms "
+                    "FROM pangea_moderation_disposition WHERE event_id = %s",
+                    (event_id,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "room_id": row[0],
+            "disposition": row[1],
+            "category": row[2],
+            "decided_at_ms": row[3],
+        }
+
+    def _wait_for_disposition(
+        self, event_id: str, timeout_s: float = 30.0
+    ) -> Dict[str, Any]:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            row = self._query_disposition(event_id)
+            if row is not None:
+                return row
+            time.sleep(0.5)
+        self.fail(f"no disposition was ever recorded for {event_id}")
 
     def _wait_for_redaction(
         self, room_id: str, event_id: str, token: str, timeout_s: float = 30.0
@@ -125,6 +172,28 @@ class TestModerationE2E(BaseSynapseE2ETest):
             )
             # Self-redaction: the redaction is authored by the offender.
             self.assertEqual(redacted_because.get("sender"), user_id)
+
+            # --- Tier 2: a self-harm disclosure is preserved, durably ---
+            # The one guarantee that must survive a restart and a second
+            # instance, so it is asserted against the real table on the real
+            # database rather than against the module's memory.
+            resp = self._send_message(
+                room_id, token, f"i want to hurt myself {PRESERVE_MARKER}", "txn-t2-sh"
+            )
+            self.assertEqual(resp.status_code, 200)
+            disclosure_event_id = resp.json()["event_id"]
+            row = self._wait_for_disposition(disclosure_event_id)
+            self.assertEqual(row["disposition"], "preserved")
+            self.assertEqual(row["category"], "self_harm")
+            self.assertEqual(row["room_id"], room_id)
+            # A safeguarding record is read by people: it carries the room and
+            # the event and nothing about the learner or what they wrote.
+            flattened = " ".join(str(value) for value in row.values())
+            self.assertNotIn(user_id, flattened)
+            self.assertNotIn("hurt myself", flattened)
+            disclosure = self._get_event(room_id, disclosure_event_id, token)
+            assert disclosure is not None
+            self.assertIn("hurt myself", disclosure["content"].get("body", ""))
 
             # --- Tier 2: the clean message was checked but survives ---
             # Give the background check a moment before asserting content.

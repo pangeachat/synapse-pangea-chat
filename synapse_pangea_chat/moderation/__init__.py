@@ -52,6 +52,11 @@ from synapse_pangea_chat.moderation.choreo_client import (
 )
 from synapse_pangea_chat.moderation.compat import reraise_if_cancelled
 from synapse_pangea_chat.moderation.dispatch import ModerationJob, Tier2Dispatcher
+from synapse_pangea_chat.moderation.disposition import (
+    GRANTED,
+    PRESERVED,
+    DispositionStore,
+)
 from synapse_pangea_chat.moderation.exempt import (
     CONFIG_KEY,
     ExemptGlobError,
@@ -429,6 +434,7 @@ class ChatModeration:
         self._tier2_active = False
         self._dispatcher: Optional[Tier2Dispatcher] = None
         self._checker: Optional[ChoreoChecker] = None
+        self._disposition: Optional[DispositionStore] = None
         self._clock: Any = None
 
         if config.moderation_tier1_enabled:
@@ -484,6 +490,7 @@ class ChatModeration:
 
         homeserver = self._api._hs
         self._clock = homeserver.get_clock()
+        self._disposition = DispositionStore(homeserver)
         config = self._config
         breaker = CircuitBreaker(
             clock=self._clock,
@@ -769,11 +776,17 @@ class ChatModeration:
             # and a redaction removes it from the room while telling nobody.
             # So the verdict is kept and the message is left standing.
             #
+            # RECORDED, and recorded before anything else: the decision has to
+            # outlive this job, this process and this instance, because a
+            # second verdict on the same event used to redact what the first
+            # one had protected. See `moderation.disposition`.
+            #
             # This is the whole of the response today, and it is not enough on
             # its own: nothing routes the finding to a teacher or safeguarding
             # contact, so a preserved flag reaches the logs and stops there.
             # That path is pangeachat/admin-dash#105, and it is the reason this
             # branch is a preserve rather than an escalate.
+            await self._record_preserved(job, category)
             metrics.TIER2_SUPPRESSED.labels(category=category).inc()
             logger.info(
                 "tier2 flagged event %s in %s (category=%s); preserved, not redacted",
@@ -782,7 +795,10 @@ class ChatModeration:
                 category,
             )
             return
+        if not await self._may_redact(job, category):
+            return
         if not await self._is_still_redactable(job):
+            await self._release_claim(job)
             return
         logger.info(
             "tier2 flagged event %s in %s (category=%s); redacting",
@@ -826,6 +842,7 @@ class ChatModeration:
             # Escalating the legitimate ones is separate work; today the
             # message stays up and the failure is counted and visible, which
             # is what the previous behaviour was missing.
+            await self._release_claim(job)
             metrics.record_redaction_failure(_redaction_failure_cause(exc))
             logger.warning(
                 "tier2 redaction failed for %s in %s at %s (%s); message stays",
@@ -834,6 +851,64 @@ class ChatModeration:
                 error_site(exc),
                 type(exc).__name__,
             )
+
+    async def _record_preserved(self, job: ModerationJob, category: str) -> None:
+        if self._disposition is None:
+            return
+        await self._disposition.record_preserved(
+            event_id=job.event_id, room_id=job.room_id, category=category
+        )
+
+    async def _may_redact(self, job: ModerationJob, category: str) -> bool:
+        """Claim the right to redact this event, or decline.
+
+        Asked before every redaction, and not only when this verdict happens
+        to be a self-harm one: the verdict that arrives second is by
+        definition a different one, and `self-harm/intent` then `harassment`
+        on the same event is exactly the sequence that used to delete a
+        disclosure.
+
+        An unknown answer is a NO. This is the one decision in the module that
+        does not fail towards carrying on, for the reason in
+        `moderation.disposition`.
+        """
+        if self._disposition is None:
+            return True
+        claim = await self._disposition.claim_redaction(
+            event_id=job.event_id, room_id=job.room_id, category=category
+        )
+        if claim == GRANTED:
+            return True
+        if claim is None:
+            metrics.record_redaction_skip("disposition_unknown")
+            logger.warning(
+                "tier2 will not redact %s in %s: its disposition could not be "
+                "established, and an unknown disposition is never a redaction",
+                job.event_id,
+                job.room_id,
+            )
+            return False
+        if claim == PRESERVED:
+            metrics.record_redaction_skip("preserved")
+            logger.info(
+                "tier2 will not redact %s in %s: it carries a preserved "
+                "disposition from an earlier verdict",
+                job.event_id,
+                job.room_id,
+            )
+            return False
+        metrics.record_redaction_skip("already_redacted")
+        return False
+
+    async def _release_claim(self, job: ModerationJob) -> None:
+        """Hand the claim back when no redaction was sent.
+
+        Without this a send that failed for an ordinary reason - the sender
+        left the room, the room raised its redaction level - would leave the
+        event claimed forever, so nothing could ever take it down.
+        """
+        if self._disposition is not None:
+            await self._disposition.release_redaction_claim(job.event_id)
 
     async def _is_still_redactable(self, job: ModerationJob) -> bool:
         """Re-read the target immediately before sending the redaction.
@@ -869,7 +944,7 @@ class ChatModeration:
             reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract, and logged by type and site
             # rather than as a traceback for the reason on the handler below.
-            metrics.TIER2_REDACTION_SKIPPED.labels(cause="lookup_failed").inc()
+            metrics.record_redaction_skip("lookup_failed")
             logger.warning(
                 "tier2 could not re-read %s before redacting at %s (%s); "
                 "message stays",
@@ -879,10 +954,10 @@ class ChatModeration:
             )
             return False
         if existing is None:
-            metrics.TIER2_REDACTION_SKIPPED.labels(cause="event_missing").inc()
+            metrics.record_redaction_skip("event_missing")
             return False
         if existing.internal_metadata.is_redacted():
-            metrics.TIER2_REDACTION_SKIPPED.labels(cause="already_redacted").inc()
+            metrics.record_redaction_skip("already_redacted")
             return False
         return True
 

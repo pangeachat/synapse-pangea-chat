@@ -16,6 +16,7 @@ signature and then does what the real runner does with the result, which is the
 only way a test on one pin can be right about both.
 """
 
+import asyncio
 import inspect
 import json
 import logging
@@ -57,6 +58,7 @@ from synapse_pangea_chat.moderation.choreo_client import (
     moderate_text,
 )
 from synapse_pangea_chat.moderation.dispatch import ModerationJob
+from synapse_pangea_chat.moderation.disposition import DISPOSITION_TABLE, STATEMENTS
 from synapse_pangea_chat.moderation.tier1_prefilter import (
     REASON_CONTACT_DETAILS,
     REASON_PROFANITY,
@@ -65,7 +67,12 @@ from synapse_pangea_chat.moderation.tier1_prefilter import (
 )
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
 
-from .moderation_doubles import EventStoreDouble, HomeServerDouble, MetricReader
+from .moderation_doubles import (
+    DbPoolDouble,
+    EventStoreDouble,
+    HomeServerDouble,
+    MetricReader,
+)
 from .moderation_doubles import module_api as module_api_double
 
 
@@ -511,7 +518,6 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
 # The moderation call now happens inside `ChoreoChecker`, which lives in
 # `choreo_client`, so that is where a test patches it. Patching a name that
 # `moderation/__init__.py` no longer imports would silently patch nothing.
-MODERATE_TEXT = "synapse_pangea_chat.moderation.choreo_client.moderate_text"
 
 
 class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
@@ -825,6 +831,255 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         send = cast(AsyncMock, api.create_and_send_event_into_room)
         assert send.await_args is not None
         self.assertTrue(send.await_args.args[0]["content"]["reason"].endswith("sexual"))
+
+
+MODERATE_TEXT = "synapse_pangea_chat.moderation.choreo_client.moderate_text"
+
+
+class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
+    """The one guarantee in this feature that is absolute.
+
+    Deleting a disclosure of self-harm is itself a harm: the learner is asking
+    for help, the message is the only record that they did, and a redaction
+    removes it from the room while telling nobody. "Never" therefore cannot
+    rest on anything a process can lose - and it did. Preserving a message
+    recorded no decision anywhere; the only thing standing between the
+    disclosure and a redaction was the dispatcher's in-flight claim, which is
+    released the moment the job finishes. A second verdict on the same event,
+    a restart, or a second instance redacted it.
+
+    Every test here drives the real handler against a shared, durable table.
+    """
+
+    MODERATE = MODERATE_TEXT
+
+    def _module(self, api: ModuleApi, homeserver: HomeServerDouble) -> ChatModeration:
+        return _tier2_module(self, api, _tier2_config())
+
+    def _pair(
+        self, db_pool: Optional[DbPoolDouble] = None
+    ) -> Tuple[ModuleApi, HomeServerDouble]:
+        """A module api and homeserver sharing one database.
+
+        Passing the SAME `db_pool` to a second pair is how a restart and a
+        second instance are expressed: new process, new memory, same table.
+        """
+        store = EventStoreDouble()
+        if db_pool is not None:
+            store.db_pool = db_pool
+        homeserver = HomeServerDouble(store)
+        return _module_api(homeserver), homeserver
+
+    def _verdict(self, *categories: str) -> AsyncMock:
+        mock = create_autospec(moderate_text)
+        mock.return_value = {"flagged": True, "categories": list(categories)}
+        return cast(AsyncMock, mock)
+
+    def _job(self, event_id: str = "$disclosure", text: str = "x") -> ModerationJob:
+        return ModerationJob(
+            event_id=event_id,
+            room_id="!room:example.org",
+            sender="@learner:example.org",
+            text=text,
+            enqueued_at=0.0,
+        )
+
+    async def test_a_later_differing_verdict_does_not_redact(self) -> None:
+        """The reproduction. Deliver the event, get `self-harm/intent`, let
+        the job finish; deliver it again and get `harassment`. The second
+        verdict redacted the disclosure the first one had protected."""
+        api, homeserver = self._pair()
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job())
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_the_protection_survives_a_restart(self) -> None:
+        """In-memory state is lost on a restart, and a guarantee that is lost
+        on a restart is not one. The table is the guarantee."""
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job())
+
+        # A second process: nothing in common but the database.
+        restarted_api, restarted_hs = self._pair(db_pool)
+        restarted = self._module(restarted_api, restarted_hs)
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await restarted._check_and_redact(self._job())
+        cast(
+            AsyncMock, restarted_api.create_and_send_event_into_room
+        ).assert_not_awaited()
+
+    async def test_a_second_worker_cannot_redact_what_another_preserved(
+        self,
+    ) -> None:
+        """Two instances both running background tasks is a misconfiguration
+        the in-memory guard cannot detect - and it is exactly the case where
+        one instance's protection has to bind the other."""
+        db_pool = DbPoolDouble()
+        first_api, first_hs = self._pair(db_pool)
+        second_api, second_hs = self._pair(db_pool)
+        first = self._module(first_api, first_hs)
+        second = self._module(second_api, second_hs)
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await first._check_and_redact(self._job())
+        with patch(self.MODERATE, self._verdict("sexual/minors")):
+            await second._check_and_redact(self._job())
+        cast(AsyncMock, second_api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_two_workers_racing_on_one_event_redact_nothing(self) -> None:
+        """Both verdicts genuinely in flight at once, in two instances.
+
+        The two coroutines are interleaved at the service call, so neither has
+        finished when the other starts - which is the shape a read-then-redact
+        cannot survive: both read a table that says nothing, one writes
+        `preserved` and the other sends the redaction. The claim is one atomic
+        insert, so exactly one decision lands and the loser is told which.
+        """
+        db_pool = DbPoolDouble()
+        first_api, first_hs = self._pair(db_pool)
+        second_api, second_hs = self._pair(db_pool)
+        first = self._module(first_api, first_hs)
+        second = self._module(second_api, second_hs)
+
+        async def _verdict_for(text: str, *args: Any, **kwargs: Any) -> Any:
+            # A real suspension, so the two jobs are interleaved rather than
+            # run one after the other.
+            await asyncio.sleep(0)
+            category = "self-harm/intent" if text == "disclosure" else "harassment"
+            return {"flagged": True, "categories": [category]}
+
+        moderate = create_autospec(moderate_text, side_effect=_verdict_for)
+        with patch(self.MODERATE, moderate):
+            await asyncio.gather(
+                first._check_and_redact(self._job(text="disclosure")),
+                second._check_and_redact(self._job(text="abuse")),
+            )
+        self.assertEqual(moderate.await_count, 2, "the two jobs did not both run")
+        cast(AsyncMock, second_api.create_and_send_event_into_room).assert_not_awaited()
+        cast(AsyncMock, first_api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_two_instances_do_not_both_redact_one_message(self) -> None:
+        """The claim is what the in-flight set could never be: shared. Two
+        instances both configured to run background tasks used to send two
+        redactions for one message, each blind to the other."""
+        db_pool = DbPoolDouble()
+        first_api, first_hs = self._pair(db_pool)
+        second_api, second_hs = self._pair(db_pool)
+        first = self._module(first_api, first_hs)
+        second = self._module(second_api, second_hs)
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await first._check_and_redact(self._job())
+            await second._check_and_redact(self._job())
+        cast(AsyncMock, first_api.create_and_send_event_into_room).assert_awaited_once()
+        cast(AsyncMock, second_api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_a_failed_send_gives_the_claim_back(self) -> None:
+        """A claim that outlived a failed send would turn a transient failure
+        - the sender is briefly unable to send - into a permanent one: the
+        message could never be taken down by anybody, ever again."""
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        send = cast(AsyncMock, api.create_and_send_event_into_room)
+        send.side_effect = RuntimeError("the sender has left the room")
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job())
+
+        retry_api, retry_hs = self._pair(db_pool)
+        retry = self._module(retry_api, retry_hs)
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await retry._check_and_redact(self._job())
+        cast(AsyncMock, retry_api.create_and_send_event_into_room).assert_awaited_once()
+
+    async def test_an_edit_arriving_later_does_not_take_the_original(
+        self,
+    ) -> None:
+        """A disclosure sitting under a later harmful edit. The edit is its
+        own event and may be redacted on its own merits; the original, which
+        carries the disclosure, may not be - by any path."""
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job("$original"))
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job("$edit"))
+        send = cast(AsyncMock, api.create_and_send_event_into_room)
+        redacted = [call.args[0]["redacts"] for call in send.await_args_list]
+        self.assertEqual(redacted, ["$edit"])
+
+    async def test_an_unreadable_disposition_never_redacts(self) -> None:
+        """The one place this module does NOT fail towards action. If we
+        cannot establish that an event was not preserved, we do not redact it:
+        a message left standing is recoverable and a deleted disclosure is
+        not."""
+        reader = MetricReader()
+        reader.snapshot(
+            "pangea_moderation_tier2_redaction_skipped_total",
+            cause="disposition_unknown",
+        )
+        api, homeserver = self._pair()
+        mod = self._module(api, homeserver)
+        homeserver.store.db_pool.error = RuntimeError("database is unhappy")
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_redaction_skipped_total",
+                cause="disposition_unknown",
+            ),
+            1.0,
+        )
+
+    async def test_a_preserve_that_cannot_be_recorded_is_counted(self) -> None:
+        """A write that failed is a guarantee that is not durable, and the
+        operator has to be able to see it. The message is still preserved, and
+        this process still holds the line in memory - but the record that
+        would bind a restart is missing and says so."""
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier2_disposition_write_failed_total")
+        api, homeserver = self._pair()
+        mod = self._module(api, homeserver)
+        homeserver.store.db_pool.error = RuntimeError("database is unhappy")
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        self.assertEqual(
+            reader.delta("pangea_moderation_tier2_disposition_write_failed_total"),
+            1.0,
+        )
+
+    def test_every_statement_names_the_table(self) -> None:
+        """The statements carry the table name as a literal, so that nothing
+        in this module formats a query. This is what stops the constant and
+        the SQL drifting into two different table names."""
+        for statement in STATEMENTS:
+            with self.subTest(statement=statement.split()[0]):
+                self.assertIn(DISPOSITION_TABLE, statement)
+                self.assertNotIn("{", statement)
+
+    async def test_the_record_carries_no_sender_and_no_message(self) -> None:
+        """The table is a safeguarding record and it is read by people. It
+        holds the room, the event and the category - never the learner's
+        Matrix ID and never a word of what they wrote."""
+        api, homeserver = self._pair()
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job(text="i want to hurt myself"))
+        rows = homeserver.store.db_pool.connection.execute(
+            f"SELECT * FROM {DISPOSITION_TABLE}"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        flattened = " ".join(str(value) for value in rows[0])
+        self.assertNotIn("@learner", flattened)
+        self.assertNotIn("hurt myself", flattened)
+        self.assertIn("self_harm", flattened)
 
 
 class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase):

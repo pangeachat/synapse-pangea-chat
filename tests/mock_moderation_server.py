@@ -1,7 +1,9 @@
 """Mock choreo moderation server for E2E tests.
 
 Implements POST /choreo/moderate with the ModerationResult shape. Flags any
-text containing the marker string "FLAGME"; everything else is clean. A bare
+text containing the marker string "FLAGME" as harassment and any text
+containing "PRESERVEME" as a self-harm disclosure - the one verdict that must
+never be redacted; everything else is clean. A bare
 Bearer token is required, mirroring the real endpoint's has_matrix_account
 gate (the mock accepts any non-empty token).
 """
@@ -13,6 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, List, Tuple
 
 FLAG_MARKER = "FLAGME"
+#: Flagged as a self-harm disclosure, which is the one verdict whose
+#: disposition is to LEAVE THE MESSAGE STANDING.
+PRESERVE_MARKER = "PRESERVEME"
 
 
 class _RecordingHTTPServer(ThreadingHTTPServer):
@@ -63,12 +68,19 @@ class _MockModerationHandler(BaseHTTPRequestHandler):
         server.seen_texts.append(text)
         if server.delay_seconds:
             time.sleep(server.delay_seconds)
-        flagged = FLAG_MARKER in text
+        preserve = PRESERVE_MARKER in text
+        flagged = preserve or FLAG_MARKER in text
+        if preserve:
+            categories = ["self-harm/intent"]
+        elif flagged:
+            categories = ["harassment"]
+        else:
+            categories = []
         self._send(
             200,
             {
                 "flagged": flagged,
-                "categories": ["harassment"] if flagged else [],
+                "categories": categories,
                 "evaluated": True,
             },
         )

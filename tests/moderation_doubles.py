@@ -7,6 +7,7 @@ second, slightly different copy would get wrong. `tests/base_e2e.py` is the
 same idea one level up.
 """
 
+import sqlite3
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 from unittest.mock import create_autospec
@@ -64,6 +65,9 @@ class RecordingClock:
 
     def time(self) -> float:
         return self.now
+
+    def time_msec(self) -> int:
+        return int(self.now * 1000)
 
     def call_later(
         self, delay: Any, callback: Callable[..., Any], *args: Any, **kwargs: Any
@@ -127,12 +131,68 @@ class StoredEvent:
         self.internal_metadata = SimpleNamespace(is_redacted=lambda: redacted)
 
 
+class _TransactionDouble:
+    """`LoggingTransaction`, reduced to what a module's SQL actually uses.
+
+    SQLite rather than a dictionary, on purpose. A dictionary double proves
+    that the store was called; it proves nothing about the statement, so a
+    typo, a missing column or a conflict clause Postgres rejects would pass
+    every test and fail on the first real message. Synapse's own transaction
+    rewrites `%s` into `?` for SQLite (`Sqlite3Engine.convert_param_style`),
+    so the double does the same and the module writes one dialect.
+    """
+
+    def __init__(self, connection: "sqlite3.Connection") -> None:
+        self._cursor = connection.cursor()
+
+    def execute(self, sql: str, args: Any = ()) -> None:
+        self._cursor.execute(sql.replace("%s", "?"), tuple(args))
+
+    def fetchone(self) -> Any:
+        return self._cursor.fetchone()
+
+    def fetchall(self) -> Any:
+        return self._cursor.fetchall()
+
+    @property
+    def rowcount(self) -> int:
+        return self._cursor.rowcount
+
+
+class DbPoolDouble:
+    """`db_pool`, reduced to `runInteraction` over one in-memory database.
+
+    Shared between two `ChatModeration` instances by a test that needs a
+    restart or a second process: that is the whole point of a durable table,
+    so a double that cannot be shared cannot test it.
+    """
+
+    def __init__(self) -> None:
+        self.connection = sqlite3.connect(":memory:")
+        #: Set by a test to make the next interaction fail, the way a database
+        #: that is down or a table that could not be created would.
+        self.error: Optional[Exception] = None
+        self.interactions: List[str] = []
+
+    async def runInteraction(
+        self, desc: str, func: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        self.interactions.append(desc)
+        if self.error is not None:
+            raise self.error
+        txn = _TransactionDouble(self.connection)
+        result = func(txn, *args, **kwargs)
+        self.connection.commit()
+        return result
+
+
 class EventStoreDouble:
     def __init__(self, redacted: bool = False, missing: bool = False) -> None:
         self.redacted = redacted
         self.missing = missing
         self.error: Optional[Exception] = None
         self.reads: List[str] = []
+        self.db_pool = DbPoolDouble()
 
     async def get_event(self, event_id: str, allow_none: bool = False) -> Any:
         self.reads.append(event_id)
