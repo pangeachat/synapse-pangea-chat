@@ -33,7 +33,7 @@ from typing import Dict, List, Set
 # The lossless primitives live with the Tier 1 core, and both tiers use the
 # same ones: two definitions of "where does a word end" is how the tiers drift
 # apart and how a fix to one silently misses the other.
-from synapse_pangea_chat.moderation.tier1_terms import matches_phrase, split_tokens
+from synapse_pangea_chat.moderation.tier1_terms import matches_phrase, split_spans
 
 _WORDLIST_PATH = Path(__file__).with_name("profanity_wordlists.json")
 
@@ -197,7 +197,7 @@ def _needle(term: str) -> str:
     `\\w` does not match Indic vowel signs, so the substitution deleted the
     marks that tell `रोड` and `रंडी` apart and left every Devanagari and
     Bengali needle truncated to its bare consonants."""
-    return _collapse_repeats("".join(split_tokens(_fold(term))))
+    return _collapse_repeats("".join(span.text for span in split_spans(_fold(term))))
 
 
 @lru_cache(maxsize=1)
@@ -253,7 +253,8 @@ def contains_profanity(text: str) -> bool:
         return False
     terms = _terms()
     folded = _fold(text)
-    tokens = [_collapse_repeats(t) for t in split_tokens(folded)]
+    spans = split_spans(folded)
+    tokens = [span.text for span in spans]
     if not tokens:
         return False
 
@@ -269,7 +270,9 @@ def contains_profanity(text: str) -> bool:
         return True
 
     # A multi-word term, across consecutive whole tokens.
-    if matches_phrase(tokens, terms["phrase"]):
+    # `within_sentence=False`: this tier is recall-oriented, and an evasion
+    # written `đ.ị.t mẹ` is one term with punctuation inside it.
+    if matches_phrase(spans, terms["phrase"], within_sentence=False):
         return True
 
     # Letters spaced apart (`f u c k`, `s.h.i.t`) leave a run of very short

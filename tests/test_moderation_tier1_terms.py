@@ -22,7 +22,7 @@ from synapse_pangea_chat.moderation.tier1_terms import (
     matches_tier1,
     needle,
     needle_floor,
-    split_tokens,
+    split_spans,
     universal_terms,
 )
 
@@ -103,6 +103,7 @@ _REASONS_FOR_TIER2 = {
     "mention_not_use",
     "register",
     "romanization",
+    "no_word_boundary",
     "too_short",
     "unadjudicated",
 }
@@ -197,8 +198,23 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         ("kurwa, co za dzień", "pl"),
         ("иди на хуй", "ru"),
         ("씨발 진짜", "ko"),
-        ("你是傻逼", "zh"),
+        ("Ets un fill de puta.", "ca"),
     ]
+
+    def test_chinese_and_japanese_have_no_tier1_coverage(self) -> None:
+        """Stated as a test because it is a product fact, not an oversight.
+
+        Both scripts write without word spacing, so a Tier 1 needle has no
+        boundary to respect and fires inside ordinary sentences. Every term
+        of theirs is Tier 2's, and Tier 2 still catches them.
+        """
+        for lang in _corpus()["languages"]:
+            if lang["lang_code"] not in ("ja", "zh"):
+                continue
+            for case in lang["profanities"]:
+                with self.subTest(lang=lang["lang_code"], term=case["term"]):
+                    self.assertEqual(case["tier"], 2)
+                    self.assertTrue(contains_profanity(case["sentence"]))
 
     def test_tier1_still_covers_most_of_the_corpus(self) -> None:
         """The sentinels above are eight sentences; this is the whole corpus.
@@ -214,9 +230,22 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         blocked = [case for case in cases if case["tier"] == 1]
         self.assertGreaterEqual(
             len(blocked),
-            100,
+            90,
             f"Tier 1 now blocks only {len(blocked)} of {len(cases)} corpus "
             f"profanity sentences",
+        )
+        covered = {
+            lang["lang_code"]
+            for lang in _corpus()["languages"]
+            for case in lang["profanities"]
+            if case["tier"] == 1
+        }
+        self.assertGreaterEqual(
+            len(covered),
+            28,
+            "every language except the two written without word spacing keeps "
+            f"some Tier 1 coverage; these do not: "
+            f"{sorted({lang['lang_code'] for lang in _corpus()['languages']} - covered)}",
         )
 
     def test_real_profanity_is_still_rejected_before_send(self) -> None:
@@ -352,20 +381,18 @@ class TestTheCollisionGate(unittest.TestCase):
         corpus, not only against a frequency list. Naming the term as well as
         the sentence is the point - it says which row of the table to fix."""
         controls = [
-            (case["sentence"], split_tokens(case["sentence"].casefold()))
+            (case["sentence"], split_spans(case["sentence"].casefold()))
             for case in _controls()
         ]
         for entry in universal_terms():
             if not entry["tier1"]:
                 continue
             term_needle = needle(entry["term"])
-            for sentence, tokens in controls:
-                if entry["match"] == "substring":
-                    hit = any(term_needle in token for token in tokens)
-                elif entry["match"] == "phrase":
-                    hit = matches_phrase(tokens, {term_needle})
+            for sentence, spans in controls:
+                if entry["match"] == "phrase":
+                    hit = matches_phrase(spans, {term_needle})
                 else:
-                    hit = term_needle in tokens
+                    hit = term_needle in [span.text for span in spans]
                 with self.subTest(term=entry["term"], sentence=sentence):
                     self.assertFalse(
                         hit,
@@ -490,15 +517,17 @@ class TestTheMatchingRules(unittest.TestCase):
         self.assertTrue(phrases, "no phrase term left to exercise the rule")
         for entry in phrases:
             stored = needle(entry["term"])
+            words = entry["term"].split()
             with self.subTest(term=entry["term"]):
                 self.assertFalse(
                     matches_tier1(f"za{stored}za"),
                     "a phrase matched inside a single word",
                 )
-                self.assertTrue(
-                    matches_tier1(entry["term"]),
-                    "and it still matches when it is written as its own words",
-                )
+                if all(word.isalpha() for word in words):
+                    self.assertTrue(
+                        matches_tier1(entry["term"]),
+                        "and it still matches when it is written as its own words",
+                    )
 
     def test_indic_vowel_signs_are_letters_not_diacritics(self) -> None:
         """`रोड` (road) and `रंडी` (a slur) differ only in their marks, so
@@ -522,24 +551,55 @@ class TestTheMatchingRules(unittest.TestCase):
         self.assertFalse(matches_tier1("Merg cu tine"))
 
     def test_fragments_are_not_rejoined_across_a_space(self) -> None:
-        """A space is a real word boundary. In Korean and Vietnamese the words
-        on either side of one are routinely a syllable long, so rejoining two
-        of them makes slurs out of ordinary sentences - `김 씨 발이 아파요` is
-        "Mr Kim's foot hurts"."""
-        self.assertFalse(matches_tier1("김 씨 발이 아파요"))
-        self.assertFalse(matches_tier1("Anh ấy đi bộ đi học mỗi ngày"))
-        # Still caught: one character per letter is the unmistakable signature
-        # of a spaced-out evasion, and punctuation is never a word boundary.
-        self.assertTrue(matches_tier1("개 새 끼"))
-        self.assertTrue(matches_tier1("f*cking hell"))
+        """A space is a real word boundary, and in the scripts where one
+        character is a whole syllable it separates ordinary words.
 
-    def test_a_cjk_term_does_not_match_across_a_clause_boundary(self) -> None:
-        """Chinese is substring-matched because it has no word spacing, but
-        the substring has to live inside ONE token: joining the whole message
-        made `做完体操，你妈妈来接你` ("after gymnastics your mother picks you
-        up") contain `操你妈`."""
-        self.assertFalse(matches_tier1("做完体操，你妈妈来接你。"))
-        self.assertTrue(matches_tier1("操你妈"))
+        `김 씨 발이 아파요` is "Mr Kim's foot hurts" and `민수 씨 발 아파요?`
+        is "Minsu, does your foot hurt?" - 씨 is an honorific and 발 a foot.
+        Rejoining across a space is therefore restricted to single characters
+        of an alphabet, where one character really is one letter. Spaced-out
+        evasions in Hangul, kana and the abugidas are Tier 2's.
+        """
+        for text in ("김 씨 발이 아파요", "민수 씨 발 아파요?", "개 새 끼"):
+            with self.subTest(text=text):
+                self.assertFalse(matches_tier1(text))
+        for text in ("f u c k you", "п и ч к а", "f*cking hell"):
+            with self.subTest(text=text):
+                self.assertTrue(matches_tier1(text))
+
+    def test_tier1_never_matches_inside_a_word(self) -> None:
+        """Tier 1 does not substring-match at all, which is why Chinese and
+        Japanese terms are Tier 2's.
+
+        A script with no word spacing offers no boundary to respect, so a
+        needle fires inside ordinary text however the message is split:
+        `操你妈` is spread across 体操 / 你 / 妈妈 in "can your mother do this
+        gymnastics routine", with no punctuation anywhere near it. Deciding
+        where a Chinese word ends needs segmentation, which is Tier 2's to do.
+        """
+        for text in ("这套体操你妈妈会做吗？", "做完体操，你妈妈来接你。", "操你妈"):
+            with self.subTest(text=text):
+                self.assertFalse(matches_tier1(text))
+        self.assertTrue(
+            contains_profanity("操你妈"), "and Tier 2 still catches the term itself"
+        )
+        self.assertEqual(
+            [
+                entry["term"]
+                for entry in universal_terms()
+                if entry["tier1"] and entry["match"] == "substring"
+            ],
+            [],
+            "no term may be promoted into Tier 1 as a substring needle",
+        )
+
+    def test_a_phrase_does_not_form_across_a_sentence_boundary(self) -> None:
+        """`Tôi đang tập viết chữ pê. Đê là chữ tiếp theo` is "I am
+        practising the letter P. Đ is the next one". A run of words is a
+        phrase only within one sentence."""
+        self.assertFalse(
+            matches_tier1("Tôi đang tập viết chữ pê. Đê là chữ tiếp theo.")
+        )
 
     def test_letters_split_apart_are_still_caught(self) -> None:
         for text in ("f u c k you", "f.u.c.k", "fuuuuck"):

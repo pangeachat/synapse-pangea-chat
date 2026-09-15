@@ -49,10 +49,21 @@ _UNIVERSAL_PATH = Path(__file__).with_name("tier1_universal.json")
 
 
 class Span(NamedTuple):
-    """A token, and whether whitespace stood between it and the previous one."""
+    """A token, and the separator that stood between it and the one before."""
 
     text: str
-    after_space: bool
+    gap: str
+
+    @property
+    def after_space(self) -> bool:
+        """A space is a real word boundary; punctuation inside a word is not."""
+        return any(char.isspace() for char in self.gap)
+
+    @property
+    def after_space_only(self) -> bool:
+        """Nothing but whitespace, so the two tokens are consecutive words of
+        one sentence - not two words either side of a full stop."""
+        return self.gap != "" and self.gap.isspace()
 
 
 class TermRecord(TypedDict, total=False):
@@ -134,17 +145,13 @@ def split_spans(text: str) -> List["Span"]:
             current.append(char)
             continue
         if current:
-            spans.append(Span(_collapse_repeats("".join(current)), _spaced(gap)))
+            spans.append(Span(_collapse_repeats("".join(current)), "".join(gap)))
             current = []
             gap = []
         gap.append(char)
     if current:
-        spans.append(Span(_collapse_repeats("".join(current)), _spaced(gap)))
+        spans.append(Span(_collapse_repeats("".join(current)), "".join(gap)))
     return spans
-
-
-def _spaced(gap: List[str]) -> bool:
-    return any(char.isspace() for char in gap)
 
 
 def split_tokens(text: str) -> List[str]:
@@ -184,14 +191,22 @@ def needle_floor(needle_text: str) -> int:
 def _universal() -> Dict[str, Set[str]]:
     """The universal set, split by how each needle may be matched.
 
-    `token` needles match a whole token; `substring` needles come from
-    scripts without word spacing and match anywhere; `phrase` needles match a
-    run of consecutive whole tokens.
+    `token` needles match a whole token and `phrase` needles a run of
+    consecutive whole words. There is no substring bucket: see below.
     """
     data = json.loads(_UNIVERSAL_PATH.read_text(encoding="utf-8"))
-    buckets: Dict[str, Set[str]] = {"token": set(), "substring": set(), "phrase": set()}
+    buckets: Dict[str, Set[str]] = {"token": set(), "phrase": set()}
     for entry in data["terms"]:
         if not entry.get("tier1"):
+            continue
+        if entry["match"] == "substring":
+            # Tier 1 does not substring-match. In a script with no word
+            # spacing there is no boundary to respect, so a needle fires
+            # inside ordinary text: 操你妈 is spread across 体操 / 你 / 妈妈
+            # in "can your mother do this gymnastics routine". Establishing
+            # the boundary needs segmentation Tier 1 cannot afford, so
+            # Chinese and Japanese terms are Tier 2's. The classification
+            # records that decision per term; this is the backstop.
             continue
         stored = needle(entry["term"])
         # Belt and braces: the floor is a property of the matcher, so it is
@@ -224,35 +239,45 @@ def matches_tier1(text: str) -> bool:
     spans = split_spans(_fold(text))
     if not spans:
         return False
-    tokens = [span.text for span in spans]
 
-    if any(token in terms["token"] for token in tokens):
+    if any(span.text in terms["token"] for span in spans):
         return True
-    if matches_phrase(tokens, terms["phrase"]):
-        return True
-    if _matches_substring(tokens, terms["substring"]):
+    if matches_phrase(spans, terms["phrase"]):
         return True
     return _matches_split_word(spans, terms["token"])
 
 
-def matches_phrase(tokens: Sequence[str], phrases: Set[str]) -> bool:
-    """A multi-word term matches a run of consecutive WHOLE tokens.
+def matches_phrase(
+    spans: Sequence[Span], phrases: Set[str], within_sentence: bool = True
+) -> bool:
+    """A multi-word term matches a run of consecutive WHOLE words of ONE
+    sentence.
 
     Substring-matching a phrase against the message with its spaces removed
-    is what let the Vietnamese term `pe de` fire inside `Pedestrian`.
+    is what let the Vietnamese term `pe de` fire inside `Pedestrian`. Letting
+    a run cross any separator is what let `Tôi đang tập viết chữ pê. Đê là
+    chữ tiếp theo` ("I am practising the letter P. Đ is the next one") form
+    one, across the full stop. So a run continues only over whitespace.
 
-    Indexed rather than sliced: `tokens[start:]` copies the rest of the
-    message on every iteration, which made this quadratic in message length -
-    412 ms on a 60 KB message, inline in the send path.
+    `within_sentence` is what Tier 1 needs and Tier 2 does not: Tier 2 is the
+    recall-oriented matcher, where a false positive costs an LLM call rather
+    than a learner's sentence, and it has to keep catching evasions written
+    with punctuation inside them (`đ.ị.t mẹ`).
+
+    Indexed rather than sliced, and abandoned as soon as it cannot become a
+    phrase: `tokens[start:]` copied the rest of the message on every
+    iteration, which cost 412 ms on a 60 KB message, inline in the send path.
     """
     if not phrases:
         return False
     prefixes = _prefixes(frozenset(phrases))
-    count = len(tokens)
+    count = len(spans)
     for start in range(count):
         joined = ""
         for index in range(start, count):
-            joined += tokens[index]
+            if index > start and within_sentence and not spans[index].after_space_only:
+                break
+            joined += spans[index].text
             if joined not in prefixes:
                 break
             if joined in phrases:
@@ -270,25 +295,14 @@ def _prefixes(phrases: FrozenSet[str]) -> Set[str]:
     }
 
 
-def _matches_substring(tokens: Sequence[str], substrings: Set[str]) -> bool:
-    """Chinese and Japanese have no word spacing, so their terms can only be
-    matched inside a token.
+def _is_letter_of_an_alphabet(char: str) -> bool:
+    """True for Latin, Greek and Cyrillic, where one character is one letter.
 
-    Inside ONE token, not inside the whole message with its punctuation
-    removed: joining everything spanned clause boundaries, so
-    `做完体操，你妈妈来接你` ("after gymnastics your mother picks you up")
-    yielded `操你妈`. The cost is that an evader who puts punctuation inside a
-    CJK term escapes Tier 1; that is the permissive direction, and Tier 2
-    still reads the message.
+    False for Hangul, kana, ideographs and the Indic abugidas, where one
+    character is a syllable or a whole morpheme - and therefore an ordinary
+    word, not the fragment of one.
     """
-    if not substrings:
-        return False
-    # Every substring needle is CJK, so an all-ASCII token cannot contain one.
-    # Without the guard this is one pass over the needles per token, which is
-    # most of the cost of checking an ordinary Latin-script message.
-    return any(
-        term in token for token in tokens if not token.isascii() for term in substrings
-    )
+    return ord(char) < 0x0590
 
 
 def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
@@ -298,11 +312,11 @@ def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
 
     - across PUNCTUATION, fragments of one or two characters rejoin, which is
       what recovers `f*ck` and `k.u.r.v.a`;
-    - across a SPACE, only single characters rejoin, because a space is a real
-      word boundary and an ordinary Korean or Vietnamese sentence is full of
-      one and two character words. `김 씨 발이 아파요` is "Mr Kim's foot
-      hurts", and rejoining two-character fragments across its spaces made it
-      a slur.
+    - across a SPACE, only single characters of an ALPHABET rejoin. A space
+      is a real word boundary, and in the scripts where one character is a
+      whole syllable it separates ordinary words: `민수 씨 발 아파요?` is
+      "Minsu, does your foot hurt?", and rejoining its syllables makes a
+      slur. Spaced-out evasions in those scripts are Tier 2's.
 
     The rejoined run must equal a needle outright. Searching the whole
     separatorless message instead is how an ordinary sentence picks up a
@@ -310,8 +324,7 @@ def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
     """
     run: List[str] = []
     for span in spans:
-        joinable = len(span.text) <= (1 if span.after_space else _FRAGMENT_LEN)
-        if joinable and (not span.after_space or not run or len(run[-1]) == 1):
+        if _joinable(span, run):
             run.append(span.text)
             continue
         if len(run) >= 2 and "".join(run) in needles:
@@ -326,4 +339,14 @@ def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
         and (len(left.text) <= _FRAGMENT_LEN or len(right.text) <= _FRAGMENT_LEN)
         and left.text + right.text in needles
         for left, right in zip(spans, spans[1:])
+    )
+
+
+def _joinable(span: Span, run: List[str]) -> bool:
+    if not span.after_space:
+        return len(span.text) <= _FRAGMENT_LEN
+    return (
+        len(span.text) == 1
+        and _is_letter_of_an_alphabet(span.text)
+        and (not run or (len(run[-1]) == 1 and _is_letter_of_an_alphabet(run[-1])))
     )

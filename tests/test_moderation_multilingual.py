@@ -121,6 +121,26 @@ class TestEvasions(unittest.TestCase):
                         f"(base {case['base_term']!r})",
                     )
 
+    def test_each_evasion_is_handled_by_the_tier_the_corpus_records(self) -> None:
+        """Asserting the evasions against Tier 2 alone would have let every
+        leetspeak spelling drop out of Tier 1 unnoticed - `n1gger`,
+        `4rschloch`, `v1ttu` are all still classified as universal terms, and
+        removing them from the blocking core kept a Tier-2-only assertion
+        green. Same two-sided rule as the profanity cases."""
+        for lang in _corpus()["languages"]:
+            for case in lang["evasions"]:
+                with self.subTest(
+                    lang=lang["lang_code"], term=case["term"], tier=case["tier"]
+                ):
+                    if case["tier"] == 1:
+                        self.assertTrue(
+                            matches_tier1(case["term"]),
+                            f"{case['term']!r} is recorded as caught before send "
+                            f"and no longer is",
+                        )
+                    else:
+                        self.assertFalse(matches_tier1(case["term"]))
+
 
 class TestNegativeControls(unittest.TestCase):
     """Benign learner messages are never blocked. Equal weight to the above.

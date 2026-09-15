@@ -46,11 +46,18 @@
   },
   "tier2_known_flags": [
    "La puta de sol és molt forta avui.",
+   "We bought a faggot for dinner.",
+   "The hoer removed the weeds.",
    "くその木を観察しました。",
    "김 씨 발이 아파요.",
+   "2016년은 병신(丙申)년입니다.",
+   "민수 씨 발 아파요?",
+   "Tôi đang tập viết chữ pê. Đê là chữ tiếp theo.",
    "做完体操，你妈妈来接你。",
+   "这套体操你妈妈会做吗？",
    "रंडी नामक एक पुराना स्थान संदर्भ में आया।",
    "Kurva nevű településről olvastunk egy régi térképen.",
+   "Saya membeli tepung Pondan untuk membuat kue.",
    "Cipka to zdrobnienie spotykane w słownikach anatomii.",
    "Merg cu tine",
    "Pica je jednotka používaná v typografii.",
@@ -92,12 +99,14 @@
     {
      "term": "f1ll de puta",
      "base_term": "fill de puta",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "marico",
      "base_term": "maricó",
-     "technique": "diacritic stripping"
+     "technique": "diacritic stripping",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -160,17 +169,20 @@
     {
      "term": "4rschloch",
      "base_term": "Arschloch",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "H u r e n s o h n",
      "base_term": "Hurensohn",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "Scheisse",
      "base_term": "Scheiße",
-     "technique": "character substitution"
+     "technique": "character substitution",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -218,7 +230,7 @@
      "term": "faggot",
      "sentence": "They harassed him by calling him a faggot.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "nigger",
@@ -231,17 +243,20 @@
     {
      "term": "f*ck",
      "base_term": "fuck",
-     "technique": "character replacement"
+     "technique": "character replacement",
+     "tier": 2
     },
     {
      "term": "c u n t",
      "base_term": "cunt",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "n1gger",
      "base_term": "nigger",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -264,6 +279,18 @@
     {
      "sentence": "Pedestrian crossing is ahead",
      "why_benign": "Plain English. The Vietnamese two-word term 'pe de' was substring-matched, so it fired inside 'pedestrian'."
+    },
+    {
+     "sentence": "We bought a faggot for dinner.",
+     "why_benign": "A faggot is a British dish of seasoned offal meatballs (Oxford Learner's Dictionary). The slur and the food are the same word, and only context separates them.",
+     "tier2_matcher": "flags",
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the slur and the food are the same word, and Tier 2 carries the full wordlist."
+    },
+    {
+     "sentence": "The hoer removed the weeds.",
+     "why_benign": "'Hoer' - one who hoes - is in Merriam-Webster, and the frequency lists score it 0.0. A term can collide with ordinary vocabulary and leave no trace in the data the gate measures.",
+     "tier2_matcher": "flags",
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Dutch 'hoer' is on the Tier 2 list and the English word is spelled the same."
     }
    ]
   },
@@ -306,17 +333,20 @@
     {
      "term": "h1jo de puta",
      "base_term": "hijo de puta",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "m a r i c ó n",
      "base_term": "maricón",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "maricon",
      "base_term": "maricón",
-     "technique": "diacritic stripping"
+     "technique": "diacritic stripping",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -377,17 +407,20 @@
     {
      "term": "f1ls de pute",
      "base_term": "fils de pute",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "e n c u l é",
      "base_term": "enculé",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "pede",
      "base_term": "pédé",
-     "technique": "diacritic stripping"
+     "technique": "diacritic stripping",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -442,17 +475,20 @@
     {
      "term": "c4zzo",
      "base_term": "cazzo",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "s t r o n z o",
      "base_term": "stronzo",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "froccio",
      "base_term": "frocio",
-     "technique": "doubled consonant"
+     "technique": "doubled consonant",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -482,7 +518,7 @@
      "term": "死ね",
      "sentence": "お前なんか死ね。",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "くそ",
@@ -500,19 +536,21 @@
      "term": "まんこ",
      "sentence": "彼女に「まんこ」と言って嫌がらせした。",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
     {
      "term": "し ね",
      "base_term": "死ね",
-     "technique": "script conversion and inserted space"
+     "technique": "script conversion and inserted space",
+     "tier": 2
     },
     {
      "term": "kuso",
      "base_term": "くそ",
-     "technique": "Latin-script transliteration"
+     "technique": "Latin-script transliteration",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -569,17 +607,20 @@
     {
      "term": "ㅆㅂ",
      "base_term": "씨발",
-     "technique": "initial-consonant abbreviation"
+     "technique": "initial-consonant abbreviation",
+     "tier": 1
     },
     {
      "term": "개 새 끼",
      "base_term": "개새끼",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 2
     },
     {
      "term": "byungshin",
      "base_term": "병신",
-     "technique": "Latin-script transliteration"
+     "technique": "Latin-script transliteration",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -604,6 +645,18 @@
      "why_benign": "Korean for 'Mr Kim's foot hurts'. Rejoining fragments across spaces turned the ordinary words 씨 and 발이 into a slur; a space is a real word boundary, and Korean words either side of one are routinely one syllable long.",
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher rejoins short fragments without asking what separated them."
+    },
+    {
+     "sentence": "2016년은 병신(丙申)년입니다.",
+     "why_benign": "병신 is also 丙申, a year of the sexagenary cycle, written in ordinary Korean dates.",
+     "tier2_matcher": "flags",
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 병신 is on the Tier 2 list; the calendar sense is the collision."
+    },
+    {
+     "sentence": "민수 씨 발 아파요?",
+     "why_benign": "Korean for 'Minsu, does your foot hurt?'. 씨 is an honorific and 발 is a foot; both are whole words, and one Hangul syllable is never the fragment of a letter-by-letter evasion.",
+     "tier2_matcher": "flags",
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher rejoins short fragments without asking what separated them, which in Korean is most sentences."
     }
    ]
   },
@@ -646,17 +699,20 @@
     {
      "term": "f1lho da puta",
      "base_term": "filho da puta",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "c a r a l h o",
      "base_term": "caralho",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "v1ado",
      "base_term": "viado",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -711,12 +767,14 @@
     {
      "term": "бл9дь",
      "base_term": "блядь",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "pidor",
      "base_term": "пидор",
-     "technique": "Latin-script transliteration"
+     "technique": "Latin-script transliteration",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -777,17 +835,20 @@
     {
      "term": "du ma",
      "base_term": "đụ má",
-     "technique": "diacritic stripping"
+     "technique": "diacritic stripping",
+     "tier": 2
     },
     {
      "term": "đ.ị.t mẹ",
      "base_term": "địt mẹ",
-     "technique": "inserted punctuation"
+     "technique": "inserted punctuation",
+     "tier": 2
     },
     {
      "term": "pe de",
      "base_term": "pê đê",
-     "technique": "diacritic stripping"
+     "technique": "diacritic stripping",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -806,6 +867,12 @@
     {
      "sentence": "Cô ấy đĩa thức ăn lên bàn.",
      "why_benign": "“đĩa” means plate and must not match “đĩ.”"
+    },
+    {
+     "sentence": "Tôi đang tập viết chữ pê. Đê là chữ tiếp theo.",
+     "why_benign": "Vietnamese for 'I am practising the letter P. Đ is the next one'. A phrase term must not form across a full stop.",
+     "tier2_matcher": "flags",
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher joins a phrase across any separator, because it also has to catch an evasion written with punctuation inside it."
     }
    ]
   },
@@ -817,13 +884,13 @@
      "term": "操你妈",
      "sentence": "你给我滚，操你妈。",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "傻逼",
      "sentence": "别像个傻逼一样说话。",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "他妈的",
@@ -835,30 +902,33 @@
      "term": "婊子",
      "sentence": "她被人辱骂为婊子。",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "死基佬",
      "sentence": "有人用死基佬侮辱他。",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
     {
      "term": "艹你妈",
      "base_term": "操你妈",
-     "technique": "character substitution"
+     "technique": "character substitution",
+     "tier": 2
     },
     {
      "term": "傻 B",
      "base_term": "傻逼",
-     "technique": "Latin-letter substitution and spacing"
+     "technique": "Latin-letter substitution and spacing",
+     "tier": 2
     },
     {
      "term": "cao ni ma",
      "base_term": "操你妈",
-     "technique": "Latin-script transliteration"
+     "technique": "Latin-script transliteration",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -883,6 +953,12 @@
      "why_benign": "Chinese for 'after gymnastics your mother comes to pick you up'. Substring-matching the whole message with its punctuation removed spanned the clause boundary and produced 操你妈.",
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher substring-matches over the whole message with its punctuation removed."
+    },
+    {
+     "sentence": "这套体操你妈妈会做吗？",
+     "why_benign": "Chinese for 'can your mother do this gymnastics routine?'. 操你妈 is spread across 体操 / 你 / 妈妈 - Chinese has no word spacing, so a substring needle has no boundary to respect.",
+     "tier2_matcher": "flags",
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher substring-matches Chinese without word boundaries."
     }
    ]
   },
@@ -925,17 +1001,20 @@
     {
      "term": "koss omak",
      "base_term": "كس أمك",
-     "technique": "Latin-script transliteration"
+     "technique": "Latin-script transliteration",
+     "tier": 1
     },
     {
      "term": "ش ر م و ط ة",
      "base_term": "شرموطة",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 2
     },
     {
      "term": "5ول",
      "base_term": "خول",
-     "technique": "Arabizi numeral substitution"
+     "technique": "Arabizi numeral substitution",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -990,12 +1069,14 @@
     {
      "term": "madarchod",
      "base_term": "মাদারচোদ",
-     "technique": "Latin-script transliteration"
+     "technique": "Latin-script transliteration",
+     "tier": 2
     },
     {
      "term": "মা দা র চো দ",
      "base_term": "মাদারচোদ",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1056,17 +1137,20 @@
     {
      "term": "curak",
      "base_term": "čurák",
-     "technique": "diacritic stripping"
+     "technique": "diacritic stripping",
+     "tier": 1
     },
     {
      "term": "p 1 c a",
      "base_term": "píča",
-     "technique": "spacing, leetspeak, and diacritic stripping"
+     "technique": "spacing, leetspeak, and diacritic stripping",
+     "tier": 2
     },
     {
      "term": "k.u.r.v.a",
      "base_term": "kurva",
-     "technique": "inserted punctuation"
+     "technique": "inserted punctuation",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1115,12 +1199,14 @@
     {
      "term": "f*cking",
      "base_term": "fucking",
-     "technique": "character replacement"
+     "technique": "character replacement",
+     "tier": 1
     },
     {
      "term": "r o v h u l",
      "base_term": "røvhul",
-     "technique": "spacing and diacritic stripping"
+     "technique": "spacing and diacritic stripping",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1175,12 +1261,14 @@
     {
      "term": "π ο υ τ ά ν α",
      "base_term": "πουτάνα",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "πουστης",
      "base_term": "πούστης",
-     "technique": "diacritic stripping"
+     "technique": "diacritic stripping",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1235,17 +1323,20 @@
     {
      "term": "v1ttu",
      "base_term": "vittu",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "p e r k e l e",
      "base_term": "perkele",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "hu0ra",
      "base_term": "huora",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1300,17 +1391,20 @@
     {
      "term": "madarchod",
      "base_term": "मादरचोद",
-     "technique": "Latin-script transliteration"
+     "technique": "Latin-script transliteration",
+     "tier": 2
     },
     {
      "term": "b3henchod",
      "base_term": "बहनचोद",
-     "technique": "Latin transliteration and leetspeak"
+     "technique": "Latin transliteration and leetspeak",
+     "tier": 2
     },
     {
      "term": "चू ति या",
      "base_term": "चूतिया",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1377,17 +1471,20 @@
     {
      "term": "g3ci",
      "base_term": "geci",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 2
     },
     {
      "term": "k.u.r.v.a",
      "base_term": "kurva",
-     "technique": "inserted punctuation"
+     "technique": "inserted punctuation",
+     "tier": 2
     },
     {
      "term": "b u z i",
      "base_term": "buzi",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1450,17 +1547,20 @@
     {
      "term": "b4ngsat",
      "base_term": "bangsat",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 2
     },
     {
      "term": "k o n t o l",
      "base_term": "kontol",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "l0nte",
      "base_term": "lonte",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1479,6 +1579,12 @@
     {
      "sentence": "Saya belajar bahasa Indonesia.",
      "why_benign": "Ordinary learner sentence."
+    },
+    {
+     "sentence": "Saya membeli tepung Pondan untuk membuat kue.",
+     "why_benign": "Pondan is a national baking-mix brand, so the word appears in ordinary shopping and cooking talk.",
+     "tier2_matcher": "flags",
+     "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'pondan' is on the Tier 2 list and the brand name is spelled the same."
     }
    ]
   },
@@ -1508,19 +1614,21 @@
      "term": "pondan",
      "sentence": "Mereka mengejeknya dengan kata pondan.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
     {
      "term": "puk1mak",
      "base_term": "pukimak",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "p0ndan",
      "base_term": "pondan",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1556,7 +1664,7 @@
      "term": "hoer",
      "sentence": "Ze werd lastiggevallen en hoer genoemd.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "tering",
@@ -1569,7 +1677,8 @@
     {
      "term": "k l o o t z a k",
      "base_term": "klootzak",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1624,12 +1733,14 @@
     {
      "term": "k u r w a",
      "base_term": "kurwa",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "chvj",
      "base_term": "chuj",
-     "technique": "character substitution"
+     "technique": "character substitution",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1686,17 +1797,20 @@
     {
      "term": "m u i e",
      "base_term": "muie",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "pizda",
      "base_term": "pizdă",
-     "technique": "diacritic stripping"
+     "technique": "diacritic stripping",
+     "tier": 1
     },
     {
      "term": "p0ponar",
      "base_term": "poponar",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1763,17 +1877,20 @@
     {
      "term": "k0kot",
      "base_term": "kokot",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "pica",
      "base_term": "piča",
-     "technique": "diacritic stripping"
+     "technique": "diacritic stripping",
+     "tier": 2
     },
     {
      "term": "b u z e r a n t",
      "base_term": "buzerant",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1842,17 +1959,20 @@
     {
      "term": "jebem ti mater",
      "base_term": "јебем ти матер",
-     "technique": "Latin-script transliteration"
+     "technique": "Latin-script transliteration",
+     "tier": 1
     },
     {
      "term": "п и ч к а",
      "base_term": "пичка",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "p3der",
      "base_term": "педер",
-     "technique": "Latin transliteration and leetspeak"
+     "technique": "Latin transliteration and leetspeak",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1915,17 +2035,20 @@
     {
      "term": "0rospu cocugu",
      "base_term": "orospu çocuğu",
-     "technique": "leetspeak and diacritic stripping"
+     "technique": "leetspeak and diacritic stripping",
+     "tier": 1
     },
     {
      "term": "s i k t i r",
      "base_term": "siktir",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 1
     },
     {
      "term": "amina koyayim",
      "base_term": "amına koyayım",
-     "technique": "diacritic stripping"
+     "technique": "diacritic stripping",
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1980,12 +2103,14 @@
     {
      "term": "бл9дь",
      "base_term": "блядь",
-     "technique": "leetspeak"
+     "technique": "leetspeak",
+     "tier": 1
     },
     {
      "term": "pidor",
      "base_term": "підор",
-     "technique": "Latin-script transliteration"
+     "technique": "Latin-script transliteration",
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -2046,17 +2171,20 @@
     {
      "term": "madarchod",
      "base_term": "ماں چود",
-     "technique": "Latin-script transliteration"
+     "technique": "Latin-script transliteration",
+     "tier": 2
     },
     {
      "term": "bhen ch0d",
      "base_term": "بہن چود",
-     "technique": "Latin transliteration and leetspeak"
+     "technique": "Latin transliteration and leetspeak",
+     "tier": 2
     },
     {
      "term": "چ و ت ی ا",
      "base_term": "چوتیا",
-     "technique": "inserted spaces"
+     "technique": "inserted spaces",
+     "tier": 2
     }
    ],
    "negative_controls": [
