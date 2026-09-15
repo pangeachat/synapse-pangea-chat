@@ -349,6 +349,47 @@ class TestParseConfig(unittest.TestCase):
         self.assertFalse(cfg.moderation_tier1_enabled)
         self.assertFalse(cfg.moderation_tier2_enabled)
 
+    def test_a_misspelled_key_is_refused_rather_than_ignored(self) -> None:
+        """Every key in this block turns moderation ON. A typo that parses
+        cleanly leaves both tiers dark, registers no callback and logs nothing
+        at any level, so the operator's next signal is an incident."""
+        for typo in (
+            {"tier1_enable": True},
+            {"tier_1_enabled": True},
+            {"tier2_enabled": True, "choreo_url": "https://c.invalid"},
+            {"exempt_user_id_glob": ["@bot:*"]},
+        ):
+            with self.subTest(typo=typo):
+                with self.assertRaises(ValueError) as caught:
+                    PangeaChat.parse_config({**self.BASE, "moderation": typo})
+                self.assertIn("unknown keys", str(caught.exception))
+
+    def test_the_unknown_key_error_names_the_key_and_the_alternatives(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            PangeaChat.parse_config({**self.BASE, "moderation": {"tier1_enable": True}})
+        message = str(caught.exception)
+        self.assertIn("tier1_enable", message)
+        self.assertIn("tier1_enabled", message)
+
+    def test_every_documented_key_is_accepted(self) -> None:
+        """The other half of the unknown-key gate: an accepted-key list that
+        has drifted away from the parser rejects valid configuration."""
+        cfg = PangeaChat.parse_config(
+            {
+                **self.BASE,
+                "moderation": {
+                    "tier1_enabled": True,
+                    "tier1_phone_regions": ["US"],
+                    "tier2_enabled": True,
+                    "choreo_base_url": "https://choreo.invalid",
+                    "choreo_access_token": "syt_x",
+                    "exempt_user_id_globs": ["@bot:*"],
+                    "redaction_reason_prefix": "Removed",
+                },
+            }
+        )
+        self.assertTrue(cfg.moderation_tier2_enabled)
+
     def test_tier2_requires_url_and_token(self) -> None:
         with self.assertRaises(ValueError):
             PangeaChat.parse_config(
@@ -364,6 +405,69 @@ class TestParseConfig(unittest.TestCase):
                     },
                 }
             )
+
+    def test_an_unusable_choreo_url_is_refused_at_startup(self) -> None:
+        """A non-empty string is not a URL. Each of these starts cleanly and
+        then fails on every message inside the fail-open handler, which is
+        indistinguishable from moderation being switched off."""
+        for url in (
+            "ftp://choreo.invalid",
+            "choreo.invalid",
+            "/choreo",
+            "https://",
+            "https://choreo.invalid/?token=x",
+            "https://choreo.invalid/#frag",
+            "https://user:pw@choreo.invalid",
+            "gopher://choreo.invalid",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    PangeaChat.parse_config(
+                        {
+                            **self.BASE,
+                            "moderation": {
+                                "tier2_enabled": True,
+                                "choreo_base_url": url,
+                                "choreo_access_token": "syt_x",
+                            },
+                        }
+                    )
+
+    def test_a_usable_choreo_url_is_accepted(self) -> None:
+        for url in (
+            "https://choreo.example.org",
+            "https://choreo.example.org/",
+            "https://choreo.example.org/api",
+            "http://127.0.0.1:8080",
+        ):
+            with self.subTest(url=url):
+                cfg = PangeaChat.parse_config(
+                    {
+                        **self.BASE,
+                        "moderation": {
+                            "tier2_enabled": True,
+                            "choreo_base_url": url,
+                            "choreo_access_token": "syt_x",
+                        },
+                    }
+                )
+                self.assertEqual(cfg.moderation_choreo_base_url, url)
+
+    def test_plaintext_choreo_url_parses_with_a_warning(self) -> None:
+        """A local stack legitimately runs over http; the token crossing the
+        network in the clear is still worth saying out loud."""
+        with self.assertLogs("synapse.modules.synapse_pangea_chat", "WARNING") as logs:
+            PangeaChat.parse_config(
+                {
+                    **self.BASE,
+                    "moderation": {
+                        "tier2_enabled": True,
+                        "choreo_base_url": "http://127.0.0.1:8080",
+                        "choreo_access_token": "syt_x",
+                    },
+                }
+            )
+        self.assertIn("not https", "\n".join(logs.output))
 
     def test_retired_regex_key_is_refused_with_a_migration_message(self) -> None:
         """EX-3/EX-6. The old key is never reinterpreted: a value valid under

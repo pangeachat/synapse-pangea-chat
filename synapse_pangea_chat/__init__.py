@@ -1,6 +1,7 @@
 import logging
 import re
 from typing import Any, Dict, Mapping, Optional, Tuple
+from urllib.parse import urlparse
 
 from synapse.events import EventBase
 from synapse.module_api import ModuleApi
@@ -48,6 +49,61 @@ from synapse_pangea_chat.user_activity import (
 from synapse_pangea_chat.user_directory_search import UserDirectorySearch
 
 logger = logging.getLogger("synapse.modules.synapse_pangea_chat")
+
+# Every key the `moderation` config block accepts. The retired regex key is in
+# the set on purpose: it has its own migration error, which says what to write
+# instead, and that is a better answer than "unknown key".
+_MODERATION_CONFIG_KEYS = frozenset(
+    {
+        "tier1_enabled",
+        "tier1_phone_regions",
+        "tier2_enabled",
+        "choreo_base_url",
+        "choreo_access_token",
+        "redaction_reason_prefix",
+        moderation_exempt.CONFIG_KEY,
+        moderation_exempt.LEGACY_CONFIG_KEY,
+    }
+)
+
+_CHOREO_URL_SCHEMES = ("http", "https")
+
+
+def _validate_choreo_base_url(value: str) -> None:
+    """Raise unless `value` is a base URL this module can actually fetch."""
+    parsed = urlparse(value.strip())
+    if parsed.scheme not in _CHOREO_URL_SCHEMES:
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must be an http or https URL; '
+            f"got scheme {parsed.scheme!r}. Every moderation check would fail "
+            "against any other scheme, and each failure is swallowed by the "
+            "fail-open handler, so the effect is unmoderated messages and no "
+            "error."
+        )
+    if not parsed.netloc:
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must include a host, as in '
+            '"https://choreo.example.org"'
+        )
+    if parsed.username or parsed.password:
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must not carry credentials in '
+            "the URL; use moderation.choreo_access_token. A URL is logged and "
+            "reported in far more places than a token is."
+        )
+    if parsed.query or parsed.fragment or parsed.params:
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must be a base URL with no '
+            "query string or fragment; the request path is appended to it"
+        )
+    if parsed.scheme != "https":
+        # Not an error: a local stack and the E2E suite legitimately run over
+        # plaintext. Naming it is what keeps it a deliberate choice.
+        logger.warning(
+            'Config "moderation.choreo_base_url" is not https, so the '
+            "moderation service account's bearer token and every moderated "
+            "message cross the network in the clear"
+        )
 
 
 class PangeaChat:
@@ -630,6 +686,23 @@ class PangeaChat:
         if not isinstance(moderation, dict):
             raise ValueError('Config "moderation" must be an object')
 
+        # Unknown keys are refused, and this is a security check rather than
+        # tidiness. Every key in this block is a switch that turns moderation
+        # ON; ignoring one an operator misspelled means `tier1_enable: true`
+        # parses cleanly, both tiers stay dark, no callback is registered and
+        # nothing is logged at any level. The operator's next signal is a
+        # moderation incident. `get` with a default cannot detect that - only
+        # comparing the keys present against the keys that exist can.
+        unknown_moderation_keys = sorted(
+            str(key) for key in moderation if key not in _MODERATION_CONFIG_KEYS
+        )
+        if unknown_moderation_keys:
+            raise ValueError(
+                'Config "moderation" has unknown keys '
+                f"{unknown_moderation_keys}; known keys are "
+                f"{sorted(_MODERATION_CONFIG_KEYS)}"
+            )
+
         moderation_tier1_enabled = moderation.get("tier1_enabled", False)
         if not isinstance(moderation_tier1_enabled, bool):
             raise ValueError('Config "moderation.tier1_enabled" must be a boolean')
@@ -659,6 +732,14 @@ class PangeaChat:
                     'Config "moderation.choreo_base_url" is required when '
                     "moderation.tier2_enabled is true"
                 )
+            # Present is not the same as usable, and the difference is the whole
+            # point of refusing a half-configured Tier 2: a non-empty string
+            # that is not a URL we can fetch - "ftp://choreo.invalid",
+            # "choreo.invalid" with no scheme - passes a presence check,
+            # starts cleanly, and then fails on every single message inside the
+            # fail-open handler, which is silence. A startup failure names the
+            # problem once; the alternative names it never.
+            _validate_choreo_base_url(moderation_choreo_base_url)
             if (
                 not isinstance(moderation_choreo_access_token, str)
                 or not moderation_choreo_access_token.strip()
