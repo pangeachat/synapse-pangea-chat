@@ -1039,7 +1039,20 @@ class ChatModeration:
             )
             return None
         if self._disposition is None:
-            return ""
+            # No store means no disposition can be established, and an
+            # unknown disposition is never a redaction - the same rule as a
+            # read that fails. An empty claim id was returned here, which is
+            # falsy but not None, so the caller's `is None` test let it
+            # through and the whole guarantee reverted to what it replaced.
+            # Unreachable today (`_start_tier2` sets the store before the
+            # checker and nothing clears it) and written to be right anyway.
+            metrics.record_redaction_skip("disposition_unknown")
+            logger.warning(
+                "tier2 will not redact %s in %s: no disposition store",
+                job.event_id,
+                job.room_id,
+            )
+            return None
         claimed = await self._disposition.claim_redaction(
             event_id=job.event_id, room_id=job.room_id, category=category
         )

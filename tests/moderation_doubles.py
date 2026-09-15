@@ -198,6 +198,11 @@ class DbPoolDouble:
         #: that is down or a table that could not be created would.
         self.error: Optional[Exception] = None
         self.interactions: List[str] = []
+        #: Called with each interaction's description as it starts. A hook
+        #: rather than a test monkey-patching `runInteraction`: assigning over
+        #: a method is a type error, and silencing it would be a suppression
+        #: in a file whose whole job is to not need one.
+        self.on_interaction: Optional[Callable[[str], None]] = None
 
     def __del__(self) -> None:
         # An in-memory database left to the collector raises a ResourceWarning
@@ -212,6 +217,8 @@ class DbPoolDouble:
         self, desc: str, func: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Any:
         self.interactions.append(desc)
+        if self.on_interaction is not None:
+            self.on_interaction(desc)
         if self.error is not None:
             raise self.error
         txn = _TransactionDouble(self.connection)

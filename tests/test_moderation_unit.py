@@ -1663,17 +1663,29 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
         mod = self._module(api, homeserver)
         order: List[str] = []
         homeserver.store.on_read = lambda: order.append("re-read")
-        original = db_pool.runInteraction
 
-        async def _record(desc: str, *args: Any, **kwargs: Any) -> Any:
+        def _note(desc: str) -> None:
             if "claim" in desc:
                 order.append("claim")
-            return await original(desc, *args, **kwargs)
 
-        db_pool.runInteraction = _record  # type: ignore[method-assign]
+        db_pool.on_interaction = _note
         with patch(self.MODERATE, self._verdict("harassment")):
             await mod._check_and_redact(self._job())
         self.assertEqual(order, ["re-read", "claim"])
+
+    async def test_no_disposition_store_means_no_redaction(self) -> None:
+        """The branch that reverted the whole guarantee. It returned an empty
+        claim id, which is falsy but not None, so the caller's `is None` test
+        let it through and the redaction went out with no disposition tracking
+        at all. Unreachable through the real construction path, and the
+        contract has to hold anyway - this is the invariant the file exists
+        for, not a convenience."""
+        api, homeserver = self._pair()
+        mod = self._module(api, homeserver)
+        mod._disposition = None
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
 
     async def test_an_unreadable_disposition_never_redacts(self) -> None:
         """The one place this module does NOT fail towards action. If we
