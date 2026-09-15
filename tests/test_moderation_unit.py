@@ -43,6 +43,7 @@ from twisted.web.iweb import IBodyProducer
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.moderation import (
+    MATCHER_MAX_CHARS,
     UNKNOWN_CATEGORY,
     ChatModeration,
     _background_process_args,
@@ -910,6 +911,116 @@ class TestTier2RefusesToRunThroughAProxy(unittest.TestCase):
         api = self._api_with_proxy(https_proxy="http://proxy.invalid:8080")
         module = ChatModeration(api, _config(moderation_tier1_enabled=True))
         self.assertIsNone(module._dispatcher)
+
+
+class TestTheDeterministicMatcherIsAMeasuredSignal(unittest.IsolatedAsyncioTestCase):
+    """The 470-term wordlist runs on every Tier-2 message, and only counts.
+
+    It had no production caller at all, which made Tier 2 LLM-only and left
+    the directive that the post-send check be MORE COMPLETE unmet. Wiring it
+    as a redaction trigger unmeasured would delete innocent learners'
+    messages - the list is noisy, notably in Korean - so it publishes an
+    agreement matrix instead, and promoting it becomes a decision somebody
+    takes on staging evidence.
+    """
+
+    METRIC = "pangea_moderation_tier2_matcher_agreement_total"
+
+    def _module(self) -> Tuple[ModuleApi, ChatModeration]:
+        api = _module_api(HomeServerDouble())
+        return api, _tier2_module(self, api, _tier2_config())
+
+    def _job(self, text: str) -> ModerationJob:
+        return ModerationJob(
+            event_id="$evt1",
+            room_id="!room:example.org",
+            sender="@learner:example.org",
+            text=text,
+            enqueued_at=0.0,
+        )
+
+    async def _run(self, verdict: Any, text: str) -> None:
+        _api, mod = self._module()
+        with patch(MODERATE_TEXT, verdict):
+            await mod._check_and_redact(self._job(text))
+
+    def _clean(self) -> AsyncMock:
+        mock = create_autospec(moderate_text)
+        mock.return_value = {"flagged": False, "categories": [], "evaluated": True}
+        return cast(AsyncMock, mock)
+
+    def _flagged(self) -> AsyncMock:
+        mock = create_autospec(moderate_text)
+        mock.return_value = {"flagged": True, "categories": ["harassment"]}
+        return cast(AsyncMock, mock)
+
+    def _outage(self) -> AsyncMock:
+        mock = create_autospec(moderate_text)
+        mock.side_effect = ModerationCheckError("down")
+        return cast(AsyncMock, mock)
+
+    async def test_every_cell_of_the_agreement_matrix_is_reachable(self) -> None:
+        """All four combinations plus the no-verdict row, because a matrix
+        with a cell nothing can reach tells an operator nothing about that
+        case - and the interesting cell is `clean`/`hit`: the model said
+        nothing and our wordlist did."""
+        cases = [
+            ("clean", "hit", self._clean(), "you are a fuck"),
+            ("clean", "miss", self._clean(), "hola, como estas"),
+            ("flagged", "hit", self._flagged(), "you are a fuck"),
+            ("flagged", "miss", self._flagged(), "i know where you live"),
+            ("no_verdict", "hit", self._outage(), "you are a fuck"),
+            ("no_verdict", "miss", self._outage(), "hola, como estas"),
+        ]
+        for service, matcher, verdict, text in cases:
+            with self.subTest(service=service, matcher=matcher):
+                reader = MetricReader()
+                reader.snapshot(self.METRIC, service=service, matcher=matcher)
+                await self._run(verdict, text)
+                self.assertEqual(
+                    reader.delta(self.METRIC, service=service, matcher=matcher),
+                    1.0,
+                )
+
+    async def test_a_matcher_hit_on_its_own_never_redacts(self) -> None:
+        """The whole of the decision. The matcher is noisy in languages nobody
+        on this change can read, so until the matrix says otherwise it is an
+        observation and not a verdict."""
+        api, mod = self._module()
+        with patch(MODERATE_TEXT, self._clean()):
+            await mod._check_and_redact(self._job("you are a fuck"))
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_a_matcher_failure_is_counted_rather_than_read_as_clean(
+        self,
+    ) -> None:
+        """A matcher that broke did not find the message clean. Folding the
+        failure into `miss` is the fail-silent shape this module counts
+        everywhere else."""
+        reader = MetricReader()
+        reader.snapshot(self.METRIC, service="clean", matcher="error")
+        with patch(
+            "synapse_pangea_chat.moderation.contains_profanity",
+            side_effect=RuntimeError("wordlist is unreadable"),
+        ):
+            await self._run(self._clean(), "anything")
+        self.assertEqual(
+            reader.delta(self.METRIC, service="clean", matcher="error"), 1.0
+        )
+
+    async def test_the_matcher_reads_exactly_what_the_endpoint_reads(self) -> None:
+        """`/choreo/moderate` truncates its input, so a matcher reading past
+        the cut would report a disagreement that is an artifact of the cut.
+        The matrix only means something if both sides saw the same text."""
+        reader = MetricReader()
+        reader.snapshot(self.METRIC, service="clean", matcher="hit")
+        beyond = ("a" * MATCHER_MAX_CHARS) + " you are a fuck"
+        await self._run(self._clean(), beyond)
+        self.assertEqual(
+            reader.delta(self.METRIC, service="clean", matcher="hit"),
+            0.0,
+            "the matcher read past what the endpoint was given",
+        )
 
 
 class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):

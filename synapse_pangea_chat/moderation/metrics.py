@@ -116,6 +116,27 @@ TIER2_REDACTION_SKIPPED = _get_or_create(
     ["cause"],
 )
 
+MATCHER_AGREEMENT = _get_or_create(
+    Counter,
+    "pangea_moderation_tier2_matcher_agreement_total",
+    "Tier 2 messages by what the moderation service said and what the "
+    "deterministic wordlist matcher said, so the two can be compared. The "
+    "matcher does not redact; this is what would justify letting it.",
+    ["service", "matcher"],
+)
+
+# What the service said about the message. `no_verdict` is not an outcome the
+# service produced - it is every route by which we have no opinion from it at
+# all (transport failure, timeout, open breaker, `evaluated: false`), and it
+# is kept separate because a matcher hit on a message the service never judged
+# is a coverage gap of a completely different kind from one it judged clean.
+MATCHER_SERVICE_STATES = frozenset({"flagged", "clean", "no_verdict"})
+
+# What the wordlist matcher said. `error` rather than folding a failure into
+# `miss`: a matcher that broke did not find the message clean, and reading it
+# as clean is the fail-silent shape this module counts everywhere else.
+MATCHER_STATES = frozenset({"hit", "miss", "error"})
+
 TIER2_DISPOSITION_WRITE_FAILED = _get_or_create(
     Counter,
     "pangea_moderation_tier2_disposition_write_failed_total",
@@ -286,6 +307,15 @@ def record_redaction_failure(cause: str) -> None:
     if cause not in REDACTION_FAILURE_CAUSES:
         raise ValueError(f"unknown moderation redaction failure cause {cause!r}")
     TIER2_REDACTION_FAILED.labels(cause=cause).inc()
+
+
+def record_matcher_agreement(service: str, matcher: str) -> None:
+    """Count one cell of the service/matcher agreement matrix."""
+    if service not in MATCHER_SERVICE_STATES:
+        raise ValueError(f"unknown moderation matcher service state {service!r}")
+    if matcher not in MATCHER_STATES:
+        raise ValueError(f"unknown moderation matcher state {matcher!r}")
+    MATCHER_AGREEMENT.labels(service=service, matcher=matcher).inc()
 
 
 def record_redaction_skip(cause: str) -> None:

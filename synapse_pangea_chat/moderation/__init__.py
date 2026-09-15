@@ -71,6 +71,7 @@ from synapse_pangea_chat.moderation.log_safety import (
     scrubbing_logger,
     sender_digest,
 )
+from synapse_pangea_chat.moderation.profanity import contains_profanity
 from synapse_pangea_chat.moderation.tier1_prefilter import check_text
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
 
@@ -767,6 +768,7 @@ class ChatModeration:
         if self._checker is None:
             return
         result = await self._checker.check(job.text)
+        self._record_matcher_agreement(job, result)
         if result is None:
             # No verdict. Every route to here - transport failure, timeout,
             # a bad token, an open breaker, `evaluated: false` - is already
@@ -863,6 +865,51 @@ class ChatModeration:
                 error_site(exc),
                 type(exc).__name__,
             )
+
+    def _record_matcher_agreement(
+        self, job: ModerationJob, result: Optional[Mapping[str, Any]]
+    ) -> None:
+        """Run the deterministic wordlist matcher beside the service verdict,
+        and record only what the two of them said.
+
+        **It does not redact, and that is the decision rather than an
+        omission.** The 470-term multilingual matcher had no production caller
+        at all, which made Tier 2 LLM-only and left the directive that the
+        post-send check be MORE COMPLETE unmet. But the matcher is known to be
+        noisy - notably in Korean, where `년` is an ordinary bound noun
+        meaning "year" and is on the list as a slur - so making it a second
+        redaction trigger unmeasured would delete innocent learners' messages
+        in exactly the languages nobody on this change can read.
+
+        So it runs, and the agreement matrix is published: service flagged /
+        matcher hit / both / neither. That makes the service's real miss rate
+        measurable in staging on real traffic, and promoting the matcher to a
+        redaction trigger becomes a decision somebody takes on evidence.
+
+        **Both sides see the same text**, which is what makes the matrix mean
+        anything: the endpoint truncates its input, so a matcher reading past
+        that point would report disagreements that are an artifact of the
+        cut rather than of the model.
+        """
+        if result is None:
+            service = "no_verdict"
+        else:
+            service = "flagged" if result.get("flagged") else "clean"
+        try:
+            text = job.text[:MATCHER_MAX_CHARS]
+            matcher = "hit" if contains_profanity(text) else "miss"
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok: an observability signal must never cost a check. A
+            # failure is still COUNTED - a matcher that broke did not find the
+            # message clean.
+            matcher = "error"
+            logger.warning(
+                "tier2 wordlist matcher failed at %s (%s)",
+                error_site(exc),
+                type(exc).__name__,
+            )
+        metrics.record_matcher_agreement(service, matcher)
 
     async def _record_preserved(self, job: ModerationJob, category: str) -> None:
         if self._disposition is None:
@@ -1147,6 +1194,14 @@ UNNAMED_CATEGORY = "flagged"
 # learner disclosing that they intend to harm themselves, where the message is
 # a request for help and deleting it helps nobody.
 PRESERVE_CATEGORIES = frozenset({"self_harm"})
+
+# How much of a message the deterministic matcher reads, matching what the
+# endpoint reads. `/choreo/moderate` truncates its input at 10,000 characters
+# (`input=text[:_MAX_TEXT_LEN]`), so a matcher that read further would report
+# disagreements that are an artifact of the cut rather than of the model - and
+# the agreement matrix only means something if both sides saw the same text.
+# It also bounds the scan, which runs on the reactor thread inside the worker.
+MATCHER_MAX_CHARS = 10_000
 
 
 def _normalize_category(category: Any) -> str:

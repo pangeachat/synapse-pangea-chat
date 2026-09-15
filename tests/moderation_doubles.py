@@ -321,3 +321,84 @@ class MetricReader:
 
     def value(self, name: str, **labels: str) -> float:
         return self._read(name, **labels)
+
+
+class Tier2MatcherProbe:
+    """Runs text through the PRODUCTION Tier-2 handler and reports what the
+    deterministic wordlist matcher recorded.
+
+    The coverage claim - "everything Tier 1 stopped blocking is caught by
+    Tier 2" - used to be asserted by calling `profanity.contains_profanity`
+    from the test. Nothing in production called that function, so the claim
+    was about a helper rather than about the system: stubbing the real
+    `ChoreoChecker.check` to return None left the test green while Tier 2 was
+    LLM-only. The matcher is wired now, and this probe is what makes the test
+    exercise the wiring: delete the call site and every assertion made through
+    here fails.
+
+    The service is stubbed CLEAN on purpose. That is the case the agreement
+    matrix exists to measure - the model said nothing and our wordlist did -
+    and it is the one that would be invisible if the test asked the matcher
+    directly.
+    """
+
+    _METRIC = "pangea_moderation_tier2_matcher_agreement_total"
+
+    def __init__(self, test: Any) -> None:
+        import asyncio
+        from unittest.mock import create_autospec, patch
+
+        from synapse_pangea_chat.config import PangeaChatConfig
+        from synapse_pangea_chat.moderation import ChatModeration
+        from synapse_pangea_chat.moderation.choreo_client import moderate_text
+        from synapse_pangea_chat.moderation.dispatch import ModerationJob
+
+        self._asyncio = asyncio
+        self._ModerationJob = ModerationJob
+        self._homeserver = HomeServerDouble()
+        module = ChatModeration(
+            module_api(self._homeserver),
+            PangeaChatConfig(
+                cms_base_url="http://cms.invalid",
+                cms_service_api_key="k",
+                moderation_tier1_enabled=False,
+                moderation_tier2_enabled=True,
+                moderation_choreo_base_url="http://choreo.invalid",
+                moderation_choreo_access_token="syt_test",
+            ),
+        )
+        self._module = module
+        test.addCleanup(self._stop)
+
+        async def _clean(*_args: Any, **_kwargs: Any) -> Any:
+            return {"flagged": False, "categories": [], "evaluated": True}
+
+        patcher = patch(
+            "synapse_pangea_chat.moderation.choreo_client.moderate_text",
+            create_autospec(moderate_text, side_effect=_clean),
+        )
+        patcher.start()
+        test.addCleanup(patcher.stop)
+        self._reader = MetricReader()
+        self._sequence = 0
+
+    def _stop(self) -> None:
+        dispatcher = self._module._dispatcher
+        if dispatcher is None:
+            return
+        dispatcher._stopping = True
+        dispatcher._wake_all()
+
+    def matcher_hit(self, text: str) -> bool:
+        """True when the production Tier-2 path recorded a matcher hit."""
+        self._sequence += 1
+        job = self._ModerationJob(
+            event_id=f"$probe{self._sequence}",
+            room_id="!room:example.org",
+            sender="@learner:example.org",
+            text=text,
+            enqueued_at=0.0,
+        )
+        self._reader.snapshot(self._METRIC, service="clean", matcher="hit")
+        self._asyncio.run(self._module._check_and_redact(job))
+        return self._reader.delta(self._METRIC, service="clean", matcher="hit") > 0

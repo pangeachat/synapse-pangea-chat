@@ -27,6 +27,8 @@ from synapse_pangea_chat.moderation.tier1_terms import (
     universal_terms,
 )
 
+from .moderation_doubles import Tier2MatcherProbe
+
 _CORPUS_PATH = Path(__file__).with_name("moderation_corpus.json")
 _WORDLIST_PATH = (
     Path(__file__).parents[1]
@@ -276,6 +278,13 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
     universal set were emptied, every test above would pass and Tier 1 would
     block nothing at all."""
 
+    def setUp(self) -> None:
+        # Through the production Tier-2 handler, not through the matcher
+        # function. The claim being asserted is about the SYSTEM - what Tier 2
+        # does with a message Tier 1 let past - and asking the matcher
+        # directly asserted it about a helper that production did not call.
+        self.tier2 = Tier2MatcherProbe(self)
+
     MUST_BLOCK = [
         ("you are a motherfucker", "en"),
         ("motherfucker", "en"),
@@ -309,7 +318,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
             with self.subTest(term=case["term"]):
                 self.assertFalse(matches_tier1(text))
                 self.assertTrue(
-                    contains_profanity(text),
+                    self.tier2.matcher_hit(text),
                     f"{case['term']!r} left Tier 1 and Tier 2 does not catch it",
                 )
 

@@ -24,6 +24,8 @@ from synapse_pangea_chat.moderation.profanity import contains_profanity
 from synapse_pangea_chat.moderation.tier1_prefilter import REASON_PROFANITY, check_text
 from synapse_pangea_chat.moderation.tier1_terms import matches_tier1
 
+from .moderation_doubles import Tier2MatcherProbe
+
 _CORPUS_PATH = Path(__file__).with_name("moderation_corpus.json")
 # Regions only affect phone matching; profanity cases are region-independent.
 _PHONE_REGIONS = ["US"]
@@ -81,6 +83,7 @@ class TestMultilingualProfanity(unittest.TestCase):
         this way, moving a term between tiers cannot be done quietly: the
         recorded tier and the code have to agree, in both directions.
         """
+        tier2 = Tier2MatcherProbe(self)
         for lang in _corpus()["languages"]:
             for case in lang["profanities"]:
                 with self.subTest(
@@ -96,8 +99,11 @@ class TestMultilingualProfanity(unittest.TestCase):
                             f"{case['term']!r} is recorded as Tier 2 but Tier 1 "
                             f"blocked it; see tier1_universal.json",
                         )
+                        # Through the production Tier-2 handler: the claim is
+                        # about what the system does with the message, not
+                        # about what a helper returns.
                         self.assertTrue(
-                            contains_profanity(case["sentence"]),
+                            tier2.matcher_hit(case["sentence"]),
                             f"{case['term']!r} left Tier 1 and Tier 2 does not "
                             f"catch it either, so nothing catches it",
                         )
