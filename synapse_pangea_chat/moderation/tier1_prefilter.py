@@ -1,17 +1,21 @@
 """Tier 1 deterministic pre-filter (trust-and-safety: server-side moderation).
 
 Pure, model-free checks fast enough to run inline in the send path via
-`check_event_for_spam` (pre-persist, can reject). Covers content where the
-right outcome is to never let it appear, even briefly: contact details a
-minor might share (phone numbers, street addresses) and wordlist profanity.
+`check_event_for_spam` (pre-persist, can reject): phone numbers a minor might
+share, and wordlist profanity.
+
+Street addresses were a third rule and are deliberately not here. A pattern
+cannot tell a shared address from a discussed one, and in a language-learning
+room the innocent readings dominate: landmarks are a stock topic and naming
+where you live is an A1 lesson. Tier 1 rejects before persist, so each of
+those was a learner silenced mid-sentence. Judging an address needs the
+context only Tier 2 has.
 
 Package choices and their limits are recorded in
 .github/instructions/moderation.instructions.md. Profanity is matched across
-all our learner languages (see `profanity.py`); the address pattern remains
-English-centric, with Tier 2 as its backstop.
+all our learner languages (see `profanity.py`).
 """
 
-import re
 from typing import Callable, Iterable, List, Optional, Tuple
 
 import phonenumbers
@@ -39,55 +43,7 @@ logger = scrubbing_logger(
 # there is one rule per family, so nothing is lost - the mapping from
 # identifier to check is in moderation.instructions.md.
 REASON_CONTACT_DETAILS = "contact_details"
-REASON_LOCATION_DETAILS = "location_details"
 REASON_PROFANITY = "profanity"
-
-# Conservative street-address shape: a 1-5 digit house number, one to four
-# capitalized-or-plain name words, then a street-suffix word. Deliberately
-# narrow — a false block on ordinary chat is worse than a miss (Tier 2 and
-# human reporting back this up), so no city/zip-only or bare-suffix matching.
-_STREET_SUFFIXES = (
-    "street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|court|ct|"
-    "place|pl|terrace|ter|way|square|sq|highway|hwy|parkway|pkwy|circle|cir"
-)
-_ADDRESS_RE = re.compile(
-    r"\b\d{1,5}\s+(?:[A-Za-z][a-z'.-]*\s+){1,4}(?:" + _STREET_SUFFIXES + r")\.?\b",
-    re.IGNORECASE,
-)
-
-# The address SHAPE alone is not a reason to block, and in this product it is
-# barely a signal at all: "10 Downing Street is where the Prime Minister lives"
-# is a landmark discussion and "I live at 42 Maple Street" is an A1 lesson,
-# and the shape on its own rejected both before the message was ever sent.
-#
-# What the rule is for is the case the org design names — a minor handing over
-# where to find them — and that case has a second half the lesson does not:
-# somebody arranging to turn up. So the block needs BOTH, and the cue below is
-# the arranging half. It is not a lesson in any curriculum, which is precisely
-# why it discriminates.
-_MEETUP_CUE_RE = re.compile(
-    r"\b(?:"
-    r"meet\s+(?:me|us|you|up)|meeting\s+(?:me|us|you)|"
-    r"come\s+(?:to|over|by|round|around|see\s+me)|"
-    r"pick\s+(?:me|us)\s+up|drop\s+(?:me|us)\s+off|"
-    r"find\s+(?:me|us)\s+at|i'?ll\s+be\s+at|we'?ll\s+be\s+at|"
-    r"see\s+you\s+at|wait\s+for\s+me|bring\s+it\s+to"
-    r")\b",
-    re.IGNORECASE,
-)
-# How far before the address the cue may sit. A cue anywhere in the message
-# would rejoin two unrelated sentences, and the window is what keeps them
-# apart. Wide enough for the ordinary phrasings ("meet me tomorrow evening at
-# 42 Maple Street"), short enough that a separate thought rarely reaches.
-_MEETUP_WINDOW_CHARS = 60
-# The window also stops at a sentence break, because distance alone does not
-# separate two thoughts: "Meet me after class. 10 Downing Street is famous."
-# puts a cue 20 characters before a landmark and means nothing by it. A cue
-# and an address in one sentence is the arrangement; across a full stop it is
-# two remarks. The cost is a miss when a full stop falls between them for an
-# unrelated reason ("Meet me at Dr. Smith's, 42 Maple Street"), which is the
-# direction this tier errs in anyway.
-_SENTENCE_BREAK_RE = re.compile(r"[.!?\n]")
 
 
 def validate_phone_regions(regions: object) -> List[str]:
@@ -142,24 +98,6 @@ def contains_phone_number(text: str, regions: Iterable[str]) -> bool:
     return any(any(phonenumbers.PhoneNumberMatcher(text, region)) for region in regions)
 
 
-def contains_street_address(text: str) -> bool:
-    """True only for an address that somebody is arranging to be met at.
-
-    The address shape and a meeting cue must BOTH be present, and the cue must
-    sit within `_MEETUP_WINDOW_CHARS` before the address. Every address in the
-    message is considered, because the first one may be the landmark and the
-    second the arrangement.
-    """
-    for match in _ADDRESS_RE.finditer(text):
-        window = text[max(0, match.start() - _MEETUP_WINDOW_CHARS) : match.start()]
-        breaks = list(_SENTENCE_BREAK_RE.finditer(window))
-        if breaks:
-            window = window[breaks[-1].end() :]
-        if _MEETUP_CUE_RE.search(window):
-            return True
-    return False
-
-
 def contains_profanity(text: str) -> bool:
     return _contains_profanity_multilingual(text)
 
@@ -184,7 +122,6 @@ _RULES: Tuple[Tuple[str, Callable[[str, Iterable[str]], bool]], ...] = (
         REASON_CONTACT_DETAILS,
         lambda text, regions: contains_phone_number(text, regions),
     ),
-    (REASON_LOCATION_DETAILS, lambda text, _regions: contains_street_address(text)),
     (REASON_PROFANITY, lambda text, _regions: contains_profanity(text)),
 )
 
@@ -199,12 +136,12 @@ def check_text(text: str, phone_regions: Iterable[str]) -> Optional[str]:
     The predecessor caught the phone matcher's exception inside
     `contains_phone_number` and returned `False`, which is not the same thing
     as "no phone number here" - it is "we do not know" wearing the answer's
-    clothes. `check_text` then went on to the address rule and returned
-    `Codes.FORBIDDEN`, so a message was REJECTED on the strength of a Tier 1
-    run that had already failed, in a tier whose entire contract is that a
-    failure lets the message through. Converting a partial failure into a clean
-    negative is the class; the table above and this raise are the fix for all
-    of it rather than for the phone rule alone.
+    clothes. `check_text` then went on to the next rule and returned
+    `Codes.FORBIDDEN` on its verdict, so a message was REJECTED on the strength
+    of a Tier 1 run that had already failed, in a tier whose entire contract is
+    that a failure lets the message through. Converting a partial failure into
+    a clean negative is the class; the table above and this raise are the fix
+    for all of it rather than for the rule that happened to expose it.
 
     The caller's handler logs the failure and returns NOT_SPAM, and Tier 2
     still sees the message.

@@ -55,7 +55,6 @@ from synapse_pangea_chat.moderation.choreo_client import (
 )
 from synapse_pangea_chat.moderation.tier1_prefilter import (
     REASON_CONTACT_DETAILS,
-    REASON_LOCATION_DETAILS,
     REASON_PROFANITY,
     Tier1RuleError,
     check_text,
@@ -264,70 +263,6 @@ class TestTier1Prefilter(unittest.TestCase):
             REASON_CONTACT_DETAILS,
         )
 
-    def test_street_address_with_meetup_cue_blocks(self) -> None:
-        self.assertEqual(
-            check_text("meet me at 42 Maple Street after class", ["US"]),
-            REASON_LOCATION_DETAILS,
-        )
-
-    def test_meetup_cue_is_matched_in_its_other_phrasings(self) -> None:
-        for text in (
-            "come to 42 Maple Street after school",
-            "pick me up at 8 Oak Avenue",
-            "i'll be at 15 Church Road at six",
-            "see you at 15 Church Road",
-            "meet me tomorrow evening at 42 Maple Street",
-        ):
-            with self.subTest(text=text):
-                self.assertEqual(check_text(text, ["US"]), REASON_LOCATION_DETAILS)
-
-    def test_landmark_conversation_is_not_blocked(self) -> None:
-        """An address shape with nobody arranging to be met there.
-
-        Tier 1 rejects before the message is sent, so each of these was an
-        innocent learner silenced mid-sentence: discussing a landmark is
-        ordinary conversation in a language-learning room, and naming where
-        you live is an A1 lesson.
-        """
-        for text in (
-            "10 Downing Street is where the Prime Minister lives",
-            "I visited 221 Baker Street in London",
-            "The White House is at 1600 Pennsylvania Avenue",
-            "We read about 4 Privet Drive in Harry Potter",
-            "I live at 42 Maple Street",
-            "My address is 42 Maple Street",
-            "Where do you live? I live at 8 Oak Avenue",
-        ):
-            with self.subTest(text=text):
-                self.assertIsNone(check_text(text, ["US"]))
-
-    def test_meetup_cue_does_not_reach_across_a_sentence_break(self) -> None:
-        """Proximity is not the same as relation.
-
-        A cue can sit a few characters before an address and have nothing to
-        do with it, so the window stops at the end of the previous sentence.
-        """
-        for text in (
-            "Meet me after class. 10 Downing Street is famous.",
-            "Meet me after class\n10 Downing Street is famous",
-        ):
-            with self.subTest(text=text):
-                self.assertIsNone(check_text(text, ["US"]))
-
-    def test_a_later_arrangement_still_blocks(self) -> None:
-        """Every address is considered, not only the first.
-
-        The landmark in the first sentence must not shield the arrangement in
-        the second.
-        """
-        self.assertEqual(
-            check_text(
-                "I visited 221 Baker Street. Anyway meet me at 42 Maple Street",
-                ["US"],
-            ),
-            REASON_LOCATION_DETAILS,
-        )
-
     def test_profanity_blocks(self) -> None:
         self.assertEqual(
             check_text("you are a fucking idiot", ["US"]), REASON_PROFANITY
@@ -339,15 +274,22 @@ class TestTier1Prefilter(unittest.TestCase):
     def test_bare_year_is_not_a_phone_number(self) -> None:
         self.assertIsNone(check_text("I was born in 2008 and I like soccer", ["US"]))
 
-    def test_ordinary_number_plus_noun_is_not_an_address(self) -> None:
-        self.assertIsNone(check_text("I have 3 dogs and 2 cats at home", ["US"]))
+    def test_an_address_is_not_a_tier1_block(self) -> None:
+        """Addresses are Tier 2's to judge.
 
-
-class _ExplodingPattern:
-    """A compiled-pattern stand-in that fails the way a real one can."""
-
-    def search(self, text: str) -> Any:
-        raise RuntimeError("library quirk")
+        A pattern cannot tell a shared address from a discussed one, and Tier 1
+        rejects before persist, so each of these was an innocent learner
+        silenced: landmarks are a stock topic in a language-learning room and
+        naming where you live is an A1 lesson.
+        """
+        for text in (
+            "10 Downing Street is where the Prime Minister lives",
+            "The White House is at 1600 Pennsylvania Avenue",
+            "I live at 42 Maple Street",
+            "meet me at 42 Maple Street after class",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(check_text(text, ["US"]))
 
 
 class TestTier1FailsOpenAsAWhole(unittest.IsolatedAsyncioTestCase):
@@ -364,11 +306,10 @@ class TestTier1FailsOpenAsAWhole(unittest.IsolatedAsyncioTestCase):
     # the rule function. Patching `contains_phone_number` itself replaces the
     # very code that used to swallow the exception, so restoring that swallow
     # would leave every one of these tests green - the defect would be back and
-    # invisible. `PhoneNumberMatcher`, `_ADDRESS_RE` and the multilingual
-    # matcher are where a real library quirk actually raises.
+    # invisible. `PhoneNumberMatcher` and the multilingual matcher are where a
+    # real library quirk actually raises.
     RULE_PATCHES = (
-        ("phonenumbers", "meet me at 42 Maple Street"),
-        ("_ADDRESS_RE", "you are a fucking idiot"),
+        ("phonenumbers", "call 415-555-2671"),
         ("_contains_profanity_multilingual", "an ordinary sentence"),
     )
 
@@ -380,11 +321,6 @@ class TestTier1FailsOpenAsAWhole(unittest.IsolatedAsyncioTestCase):
                 "PhoneNumberMatcher",
                 side_effect=RuntimeError("library quirk"),
             )
-        if target == "_ADDRESS_RE":
-            # `re.Pattern.search` is read-only, so the pattern OBJECT is
-            # replaced. Still the boundary the rule sits on, and still outside
-            # `contains_street_address`, which is the point.
-            return patch.object(tier1_prefilter, "_ADDRESS_RE", _ExplodingPattern())
         return patch.object(
             tier1_prefilter, target, side_effect=RuntimeError("library quirk")
         )
@@ -410,9 +346,6 @@ class TestTier1FailsOpenAsAWhole(unittest.IsolatedAsyncioTestCase):
         """The other half: failing open must not become failing always."""
         self.assertEqual(
             check_text("call 415-555-2671", ["US"]), REASON_CONTACT_DETAILS
-        )
-        self.assertEqual(
-            check_text("meet me at 42 Maple Street", ["US"]), REASON_LOCATION_DETAILS
         )
         self.assertEqual(
             check_text("you are a fucking idiot", ["US"]), REASON_PROFANITY
