@@ -219,13 +219,20 @@ class DispositionStore:
         """
         if not self._pending:
             return True
-        ok = True
         for pending_id, (room_id, category) in list(self._pending.items()):
-            if await self._write_preserve(pending_id, room_id, category):
-                self._pending.pop(pending_id, None)
-            elif event_id is None or pending_id == event_id:
-                ok = False
-        return ok
+            if not await self._write_preserve(pending_id, room_id, category):
+                # Stop on the first failure rather than retrying the whole
+                # backlog against a database that has just refused one: the
+                # rest are retried on the next operation, and hammering a
+                # database that is down is how a moderation problem becomes a
+                # homeserver problem.
+                break
+            self._pending.pop(pending_id, None)
+        if event_id is not None:
+            # The caller asked about one decision: it landed if it is no
+            # longer waiting, whatever happened to the rest of the backlog.
+            return event_id not in self._pending
+        return not self._pending
 
     async def _write_preserve(self, event_id: str, room_id: str, category: str) -> bool:
         try:

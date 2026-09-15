@@ -1531,6 +1531,39 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
             await b._check_and_redact(self._job())
         cast(AsyncMock, api_b.create_and_send_event_into_room).assert_not_awaited()
 
+    async def test_a_backlog_does_not_hammer_a_database_that_is_down(
+        self,
+    ) -> None:
+        """The retry is bounded to one attempt per operation while the
+        database is refusing, and the whole backlog lands before the first
+        claim is granted once it comes back. Retrying every pending decision
+        against a database that has just refused one is how a moderation
+        problem becomes a homeserver problem."""
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        db_pool.error = RuntimeError("database is unhappy")
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            for index in range(20):
+                await mod._check_and_redact(self._job(f"$e{index}"))
+        before = len(db_pool.interactions)
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job("$other"))
+        self.assertEqual(
+            len(db_pool.interactions) - before,
+            1,
+            "one refused write became a burst against a dead database",
+        )
+
+        db_pool.error = None
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job("$other"))
+        preserved = db_pool.connection.execute(
+            f"SELECT count(*) FROM {DISPOSITION_TABLE} "
+            f"WHERE disposition = 'preserved'"
+        ).fetchone()
+        self.assertEqual(preserved[0], 20, "the backlog did not land")
+
     async def test_a_claim_is_taken_with_no_await_before_the_send(self) -> None:
         """A claim taken and then abandoned at an `await` is a row saying
         `redacted` on a message that is still standing, which nothing would
