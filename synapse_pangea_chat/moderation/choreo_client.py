@@ -55,24 +55,32 @@ rather than left to be rediscovered:
 - During proxy CONNECT the agent waits on `HTTPProxiedClientFactory.on_connection`,
   a Deferred with **no canceller**. Our deadline therefore ends the wait
   without closing the proxy socket, so a proxy that accepts connections and
-  stalls the CONNECT leaks one socket per check. The deadline still bounds the
-  check, the breaker still opens on the resulting timeouts, and the drop is
-  counted - what is not bounded is the socket.
+  stalls the CONNECT leaks one socket per check, without bound: the breaker's
+  half-open probe opens another every cooldown, for as long as the process
+  runs. The deadline bounds the check and the drop is counted; what is not
+  bounded is the file descriptor, and running out of those takes the
+  homeserver down rather than merely moderation.
+
+  **So Tier 2 refuses to run through a proxy at all** - see
+  `assert_no_proxy_in_front_of`. Closing it inside the transport means
+  supplying this module's own CONNECT endpoint and factory, carrying
+  Synapse's TLS verification and IP policy with it, which is a
+  re-implementation of Synapse's proxy client. Bounding it instead - a cap on
+  outstanding connection attempts - bounds the descriptors and leaves Tier 2
+  permanently wedged once the cap fills, which is the same outage arrived at
+  slowly. Refusing costs a proxied deployment either a `no_proxy` entry for
+  the moderation host or Tier 2, and it says so at startup rather than
+  running out of sockets in a week.
 - `HTTPConnectSetupClient.handleStatus` logs the CONNECT **reason phrase
   verbatim** at DEBUG on `synapse.http.connectproxyclient`, which is outside
   this module's logger namespace and so outside its scrubbing. A hostile or
   compromised HTTPS proxy replying `HTTP/1.1 200 @alice:example.org` gets that
   string into the log of a deployment running that logger at DEBUG.
 
-Neither is reachable without an HTTPS proxy configured for outbound requests.
-The second is closed here, in `install_proxy_log_guard`, by filtering that one
-record out before any handler sees it - a logging filter needs no change to
-Synapse. The first is not: closing it means supplying this module's own CONNECT
-endpoint and factory so the handshake Deferred has a canceller, which is a
-re-implementation of Synapse's proxy client carrying its TLS verification and
-IP policy with it. That is a real fix and it is available; it is out of
-proportion to a transport change, and it is recorded here as a deliberate
-scope decision rather than as an impossibility.
+Neither is reachable without a proxy configured for outbound requests. The
+second is closed in `install_proxy_log_guard`, which drops the whole status
+line before any handler sees it - a logging filter needs no change to Synapse.
+The first is closed by not running there at all.
 """
 
 import json
@@ -110,10 +118,97 @@ REQUEST_TIMEOUT_SECONDS = 15
 # the deferred and leaves the body arriving.
 MAX_RESPONSE_BYTES = 1024 * 1024
 
+
 # What went wrong, as a closed vocabulary. The circuit breaker treats these
 # differently and must not guess: a 401 that opened the breaker would disable
 # moderation until somebody noticed, while a 503 that did not would hammer a
 # dead provider once per message.
+class ModerationProxyUnsupportedError(Exception):
+    """Tier 2 would reach the moderation endpoint through an HTTP proxy.
+
+    A startup failure rather than a runtime degradation, because what it
+    prevents is silent and cumulative: see the two proxy limits in the module
+    docstring. An operator fixes it by exempting the moderation host from the
+    proxy (`no_proxy`) or by turning Tier 2 off; either way they find out now.
+    """
+
+
+def assert_no_proxy_in_front_of(agent: Any, base_url: str) -> None:
+    """Raise unless `base_url` is reached without a proxy.
+
+    Asked of the AGENT, so it reflects the configuration the requests will
+    actually use rather than a second reading of the environment. The
+    uncertain case raises: if the agent does not present a proxy
+    configuration we recognise, we cannot establish that nothing is in the
+    way, and the failure this guards against does not announce itself.
+    """
+    from urllib.parse import urlsplit
+
+    proxied = _proxy_agent(agent)
+    if proxied is None:
+        raise ModerationProxyUnsupportedError(
+            "tier 2 moderation cannot establish whether its HTTP agent uses a "
+            "proxy, and a proxied CONNECT leaks a socket per check; refusing "
+            "to start. Set moderation.tier2_enabled to false, or report the "
+            f"agent type {type(agent).__name__}"
+        )
+    split = urlsplit(base_url)
+    host = split.hostname or ""
+    endpoint = (
+        proxied.https_proxy_endpoint
+        if split.scheme == "https"
+        else proxied.http_proxy_endpoint
+    )
+    if endpoint is None:
+        return
+    if _bypasses_proxy(proxied, host):
+        return
+    raise ModerationProxyUnsupportedError(
+        f'Config "moderation.choreo_base_url" ({base_url}) would be reached '
+        "through an HTTP proxy, and Synapse's proxy CONNECT leaks one socket "
+        "per stalled handshake with no way for this module to close it. Add "
+        "the moderation host to no_proxy, or set "
+        "moderation.tier2_enabled to false"
+    )
+
+
+def _proxy_agent(agent: Any) -> Any:
+    """The `ProxyAgent` behind whatever wrappers the client put in front.
+
+    `SimpleHttpClient` wraps its agent in `BlocklistingAgentWrapper` when an
+    IP blocklist is configured, and a deployment may wrap it further. Bounded
+    so a cyclic or self-referential wrapper cannot spin.
+    """
+    for _ in range(8):
+        if agent is None:
+            return None
+        if hasattr(agent, "http_proxy_endpoint") and hasattr(
+            agent, "https_proxy_endpoint"
+        ):
+            return agent
+        agent = getattr(agent, "_agent", None)
+    return None
+
+
+def _bypasses_proxy(proxied: Any, host: str) -> bool:
+    """Does the agent's own `no_proxy` exempt this host?
+
+    Through Synapse's own helper, so `no_proxy` means here exactly what it
+    means to the request that follows. An error deciding it is not a bypass:
+    the safe answer to "we could not tell" is the one that refuses.
+    """
+    if not host:
+        return False
+    try:
+        from synapse.http.proxyagent import proxy_bypass_environment
+
+        config = getattr(proxied, "proxy_config", None)
+        proxies = config.get_proxies_dictionary() if config is not None else None
+        return bool(proxy_bypass_environment(host, proxies=proxies))
+    except Exception:
+        return False
+
+
 KIND_TRANSPORT = "transport"
 KIND_TIMEOUT = "timeout"
 KIND_SERVER_ERROR = "server_error"
@@ -840,32 +935,43 @@ _PROXY_STATUS_LOG_FORMAT = "Got Status: %s %s %s"
 _PROXY_LOGGER_NAME = "synapse.http.connectproxyclient"
 
 
+# What the record says instead. A fixed string with no arguments at all: the
+# operator still learns that a CONNECT status came back, and learns nothing a
+# proxy wrote.
+_PROXY_STATUS_WITHHELD = "Got Status: <withheld, see moderation.choreo_client>"
+
+
 class _ProxyStatusFilter(logging.Filter):
-    """Keeps a proxy's own CONNECT reason phrase out of the log.
+    """Keeps a proxy's CONNECT status line out of the log. All of it.
 
     `HTTPConnectSetupClient.handleStatus` logs the status line **verbatim** at
-    DEBUG, and the reason phrase is a string the proxy chooses: an HTTPS proxy
-    replying `HTTP/1.1 200 @alice:example.org` puts that Matrix ID into the log
-    of any deployment running this logger at DEBUG. It is reached identically
-    through every Synapse HTTP client, so the transport choice does not avoid
-    it - but a logging filter is ours to install and needs no change to
-    Synapse.
+    DEBUG, so an HTTPS proxy replying `HTTP/1.1 200 @alice:example.org` puts
+    that Matrix ID into the log of any deployment running this logger at
+    DEBUG. It is reached identically through every Synapse HTTP client, so the
+    transport choice does not avoid it - but a logging filter is ours to
+    install and needs no change to Synapse.
 
-    The record is redacted rather than dropped, so an operator debugging a
-    proxy still sees that a status arrived and what its code was. Only the
-    phrase the proxy wrote is removed.
+    **The whole line, not one field of it.** An earlier version scrubbed the
+    reason phrase and passed the status and the version through, on the
+    reading that an operator debugging a proxy wants to see the code. But
+    `HTTPClient.lineReceived` simply splits the line into three on spaces and
+    validates none of them, so all three fields are strings the proxy chose:
+    feeding that parser `@alice:example.org 200 OK` put a Matrix ID in the
+    VERSION field, straight past a guard that was installed and working.
+
+    Cleaning one field of an attacker-influenced line is not cleaning the
+    line, and there is no field of it we can establish is ours. So the record
+    keeps its level, its logger and its timestamp - an operator still sees
+    that a CONNECT status arrived and when - and carries no bytes off the
+    wire at all. The diagnostic that is lost is the status code, which is not
+    worth a route into a plaintext log for anything a proxy cares to write.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.msg != _PROXY_STATUS_LOG_FORMAT:
             return True
-        args = record.args
-        if isinstance(args, tuple) and len(args) == 3:
-            status, _message, version = args
-            record.args = (status, b"<redacted>", version)
-        else:
-            record.args = ()
-            record.msg = "Got Status: <redacted>"
+        record.args = ()
+        record.msg = _PROXY_STATUS_WITHHELD
         return True
 
 

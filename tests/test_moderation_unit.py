@@ -55,6 +55,7 @@ from synapse_pangea_chat.moderation.choreo_client import (
     MAX_RESPONSE_BYTES,
     REQUEST_TIMEOUT_SECONDS,
     ModerationCheckError,
+    ModerationProxyUnsupportedError,
     moderate_text,
 )
 from synapse_pangea_chat.moderation.dispatch import ModerationJob
@@ -72,6 +73,7 @@ from .moderation_doubles import (
     EventStoreDouble,
     HomeServerDouble,
     MetricReader,
+    http_client_double,
 )
 from .moderation_doubles import module_api as module_api_double
 
@@ -210,13 +212,14 @@ def _moderation(config: PangeaChatConfig) -> ChatModeration:
 
 
 def _tier2_config(**overrides: Any) -> PangeaChatConfig:
-    return _config(
-        moderation_tier1_enabled=False,
-        moderation_tier2_enabled=True,
-        moderation_choreo_base_url="http://choreo.invalid",
-        moderation_choreo_access_token="syt_test",
-        **overrides,
-    )
+    defaults: Dict[str, Any] = {
+        "moderation_tier1_enabled": False,
+        "moderation_tier2_enabled": True,
+        "moderation_choreo_base_url": "http://choreo.invalid",
+        "moderation_choreo_access_token": "syt_test",
+    }
+    defaults.update(overrides)
+    return _config(**defaults)
 
 
 def _tier2_module(
@@ -834,6 +837,79 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
 
 
 MODERATE_TEXT = "synapse_pangea_chat.moderation.choreo_client.moderate_text"
+
+
+class TestTier2RefusesToRunThroughAProxy(unittest.TestCase):
+    """A stalled HTTPS proxy leaks one socket per check, without bound.
+
+    Synapse's proxy CONNECT waits on `HTTPProxiedClientFactory.on_connection`,
+    a Deferred with no canceller and no transport behind it. A proxy that
+    accepts TCP and never answers CONNECT therefore survives every deadline
+    this module has: `request.cancel()` ends OUR wait and closes nothing.
+    Three cancelled handshakes, zero closed transports. The breaker's
+    half-open probe keeps opening more, one per cooldown, for as long as the
+    process runs - so the bounded queue, the worker pool and the deadlines do
+    not prevent file-descriptor exhaustion, which takes the homeserver down
+    and not merely moderation.
+
+    Closing it inside the transport means supplying this module's own CONNECT
+    endpoint and factory, carrying Synapse's TLS verification and IP policy
+    with it. What it costs to REFUSE is a deployment that must either exempt
+    the moderation host from its proxy or run without Tier 2 - and it finds
+    that out at startup, loudly, instead of running out of sockets in a week.
+    """
+
+    def _api_with_proxy(self, **proxies: Optional[str]) -> ModuleApi:
+        return module_api_double(http_client=http_client_double(**proxies))
+
+    def test_a_proxied_https_endpoint_refuses_to_start(self) -> None:
+        api = self._api_with_proxy(https_proxy="http://proxy.invalid:8080")
+        config = _tier2_config(moderation_choreo_base_url="https://choreo.example.org")
+        with self.assertRaises(ModerationProxyUnsupportedError) as raised:
+            ChatModeration(api, config)
+        self.assertIn("choreo_base_url", str(raised.exception))
+
+    def test_a_proxied_http_endpoint_refuses_to_start(self) -> None:
+        api = self._api_with_proxy(http_proxy="http://proxy.invalid:8080")
+        config = _tier2_config(moderation_choreo_base_url="http://choreo.example.org")
+        with self.assertRaises(ModerationProxyUnsupportedError):
+            ChatModeration(api, config)
+
+    def test_a_bypassed_host_is_not_proxied_and_starts(self) -> None:
+        """`no_proxy` is the operator's own answer to this, so it has to be
+        honoured: exempting the moderation host is the fix the startup error
+        points at, and it would be no fix if we refused anyway."""
+        api = self._api_with_proxy(
+            https_proxy="http://proxy.invalid:8080", no_proxy="choreo.example.org"
+        )
+        config = _tier2_config(moderation_choreo_base_url="https://choreo.example.org")
+        module = ChatModeration(api, config)
+        self.addCleanup(_stop_tier2, module)
+        self.assertIsNotNone(module._dispatcher)
+
+    def test_the_other_scheme_s_proxy_does_not_block_it(self) -> None:
+        """An `http_proxy` says nothing about an https request: the CONNECT
+        path is only reached for the scheme its own proxy is set for."""
+        api = self._api_with_proxy(http_proxy="http://proxy.invalid:8080")
+        config = _tier2_config(moderation_choreo_base_url="https://choreo.example.org")
+        module = ChatModeration(api, config)
+        self.addCleanup(_stop_tier2, module)
+        self.assertIsNotNone(module._dispatcher)
+
+    def test_an_unreadable_proxy_configuration_refuses(self) -> None:
+        """If we cannot establish that no proxy is in the way, we do not run.
+        The failure this guards against is silent and cumulative, so the
+        uncertain case goes the safe way."""
+        api = module_api_double(http_client=SimpleNamespace(agent=object()))
+        with self.assertRaises(ModerationProxyUnsupportedError):
+            ChatModeration(api, _tier2_config())
+
+    def test_tier_1_only_deployments_are_unaffected(self) -> None:
+        """The leak is Tier 2's transport. A homeserver running the pre-filter
+        alone has no outbound call to proxy."""
+        api = self._api_with_proxy(https_proxy="http://proxy.invalid:8080")
+        module = ChatModeration(api, _config(moderation_tier1_enabled=True))
+        self.assertIsNone(module._dispatcher)
 
 
 class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):

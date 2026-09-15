@@ -1673,16 +1673,50 @@ class ProxyLogGuardTestCase(unittest.TestCase):
         self.addCleanup(self.logger.setLevel, self._previous)
         self.addCleanup(self.logger.removeHandler, self.handler)
 
-    def test_a_hostile_reason_phrase_does_not_reach_a_handler(self) -> None:
+    def test_no_field_of_the_status_line_reaches_a_handler(self) -> None:
+        """All three fields, because all three come off the wire.
+
+        The guard used to scrub the reason phrase alone. Twisted splits the
+        status line on spaces and validates nothing, so the VERSION and the
+        STATUS are strings the proxy chose too - and a guard that cleans one
+        field of an attacker-influenced line has not cleaned the line.
+        """
         self.logger.debug(
-            "Got Status: %s %s %s", b"200", b"@alice:example.org", b"HTTP/1.1"
+            "Got Status: %s %s %s",
+            b"@alice:example.org",
+            b"@bob:example.org",
+            b"@carol:example.org",
         )
         self.assertTrue(self.records, "the record never reached the handler")
         joined = "\n".join(self.records)
-        self.assertNotIn("@alice:example.org", joined)
-        # The status itself survives: an operator debugging a proxy still
-        # needs to see that a status arrived, and which one.
-        self.assertIn("200", joined)
+        for identifier in ("@alice", "@bob", "@carol"):
+            with self.subTest(identifier=identifier):
+                self.assertNotIn(identifier, joined)
+
+    def test_the_real_parser_cannot_put_a_matrix_id_in_the_log(self) -> None:
+        """Driven through Synapse's own status-line parser rather than by
+        calling `logger.debug` with the arguments we expect.
+
+        `HTTPClient.lineReceived` splits the line into three on spaces and
+        hands them straight to `handleStatus`, so a proxy replying
+        `@alice:example.org 200 OK` puts a Matrix ID in the VERSION field -
+        which is exactly the field the previous guard passed through. Asserted
+        against the parser so the test cannot agree with the guard about a
+        field order that the wire does not respect.
+        """
+        from synapse.http.connectproxyclient import HTTPConnectSetupClient
+
+        client = HTTPConnectSetupClient(b"choreo.example.org", 443, None)
+        client.lineReceived(b"@alice:example.org 200 OK")
+        self.assertTrue(self.records, "the record never reached the handler")
+        self.assertNotIn("@alice:example.org", "\n".join(self.records))
+
+    def test_the_operator_still_sees_that_a_status_arrived(self) -> None:
+        """Withheld, not silent. A deployment debugging a proxy still needs to
+        know a CONNECT status came back; what it does not need is any of the
+        bytes the proxy chose."""
+        self.logger.debug("Got Status: %s %s %s", b"200", b"OK", b"HTTP/1.1")
+        self.assertTrue(any("Got Status" in record for record in self.records))
 
     def test_other_records_from_that_logger_are_untouched(self) -> None:
         self.logger.debug("Connecting to %s:%d", "proxy.example.org", 8080)

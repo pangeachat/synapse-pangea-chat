@@ -233,10 +233,49 @@ class HomeServerDouble:
         self.shutdown_handlers.append(shutdown_func)
 
 
+def http_client_double(
+    *,
+    http_proxy: Optional[str] = None,
+    https_proxy: Optional[str] = None,
+    no_proxy: Optional[str] = None,
+) -> Any:
+    """`ModuleApi.http_client`, with the proxy surface Tier 2 inspects.
+
+    A real object rather than whatever `create_autospec` invents, because the
+    thing under test is a NEGATIVE: Tier 2 refuses to start when a proxy sits
+    in front of the moderation endpoint. An autospec mock answers every
+    attribute with another mock, so `https_proxy_endpoint` is truthy on a
+    double that was meant to represent a homeserver with no proxy at all - the
+    check would refuse in every test and the tests would have to be written
+    around it rather than against it.
+    """
+    return SimpleNamespace(
+        agent=SimpleNamespace(
+            http_proxy_endpoint=object() if http_proxy else None,
+            https_proxy_endpoint=object() if https_proxy else None,
+            proxy_config=SimpleNamespace(
+                http_proxy=http_proxy,
+                https_proxy=https_proxy,
+                no_proxy_hosts=[] if no_proxy is None else no_proxy.split(","),
+                get_proxies_dictionary=lambda: {
+                    key: value
+                    for key, value in (
+                        ("http", http_proxy),
+                        ("https", https_proxy),
+                        ("no", no_proxy),
+                    )
+                    if value
+                },
+            ),
+        )
+    )
+
+
 def module_api(
     homeserver: Optional[HomeServerDouble] = None,
     *,
     run_background_tasks: bool = True,
+    http_client: Optional[Any] = None,
 ) -> ModuleApi:
     """A `ModuleApi` double that checks the signature of every call.
 
@@ -250,6 +289,7 @@ def module_api(
     api = create_autospec(ModuleApi, instance=True)
     api._hs = homeserver if homeserver is not None else HomeServerDouble()
     api.should_run_background_tasks.return_value = run_background_tasks
+    api.http_client = http_client_double() if http_client is None else http_client
     return cast(ModuleApi, api)
 
 

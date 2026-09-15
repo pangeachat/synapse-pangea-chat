@@ -48,6 +48,7 @@ from synapse_pangea_chat.moderation import metrics
 from synapse_pangea_chat.moderation.breaker import CircuitBreaker
 from synapse_pangea_chat.moderation.choreo_client import (
     ChoreoChecker,
+    assert_no_proxy_in_front_of,
     install_proxy_log_guard,
 )
 from synapse_pangea_chat.moderation.compat import reraise_if_cancelled
@@ -498,12 +499,19 @@ class ChatModeration:
             cooldown_seconds=config.moderation_tier2_breaker_cooldown_seconds,
             max_cooldown_seconds=config.moderation_tier2_breaker_max_cooldown_seconds,
         )
+        agent = self._api.http_client.agent
+        # Before anything is built, and it RAISES: a proxied CONNECT leaks a
+        # socket per stalled handshake that no deadline of ours can close, and
+        # the breaker's probe keeps opening more. See `choreo_client`'s module
+        # docstring. Moderation off and loud is a state an operator can see
+        # and fix; a homeserver quietly running out of file descriptors is not.
+        assert_no_proxy_in_front_of(agent, config.moderation_choreo_base_url)
         self._checker = ChoreoChecker(
             # `.agent`, not the client itself - see `choreo_client`'s module
             # docstring for the three properties of `SimpleHttpClient`'s own
             # request methods that rule them out. The agent is the shared,
-            # pooled, proxy-aware one either way.
-            agent=self._api.http_client.agent,
+            # pooled one either way.
+            agent=agent,
             clock=self._clock,
             base_url=config.moderation_choreo_base_url,
             access_token=config.moderation_choreo_access_token,
