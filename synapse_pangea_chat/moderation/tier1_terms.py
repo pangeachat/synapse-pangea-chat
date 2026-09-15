@@ -43,9 +43,16 @@ import re
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Sequence, Set, TypedDict
+from typing import Dict, FrozenSet, List, NamedTuple, Sequence, Set, TypedDict
 
 _UNIVERSAL_PATH = Path(__file__).with_name("tier1_universal.json")
+
+
+class Span(NamedTuple):
+    """A token, and whether whitespace stood between it and the previous one."""
+
+    text: str
+    after_space: bool
 
 
 class TermRecord(TypedDict, total=False):
@@ -66,22 +73,26 @@ class TermRecord(TypedDict, total=False):
 # Invisible characters carry no meaning; an evader puts them inside a word.
 _INVISIBLE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
 
-# Shortest needle Tier 1 will carry in a space-delimited script. A two or
-# three letter word is an ordinary word somewhere among thirty languages -
-# Romanian `cu`, Malay `cip` - and exact matching does not save it.
-MIN_TOKEN_NEEDLE_LEN = 4
-
-# Scripts without word spacing cannot be tokenized, so their needles are
-# substring-matched and the length floor is what keeps that safe.
-MIN_SUBSTRING_NEEDLE_LEN = 2
+# Shortest needle Tier 1 will carry, by script. A short needle is an ordinary
+# word somewhere among thirty languages - Romanian `cu`, Malay `cip` - and
+# whole-token matching does not save it, because those are whole tokens too.
+# The floor is script-relative because the information per character is: one
+# Hangul syllable or one ideograph is a morpheme, four Latin letters are not.
+MIN_LATIN_NEEDLE_LEN = 4
+MIN_ALPHABET_NEEDLE_LEN = 3
+MIN_IDEOGRAPH_NEEDLE_LEN = 2
 
 # A run of tokens this short is what a word typed with its letters split
 # apart leaves behind (`f u c k`, `f*ck`).
 _FRAGMENT_LEN = 2
 
 
+@lru_cache(maxsize=4096)
 def _is_word_char(char: str) -> bool:
     """Marks count as word characters, unlike `\\w`.
+
+    Cached per character: this runs once per character of every message, and
+    `unicodedata.category` is not free.
 
     Indic vowel signs are category Mc/Mn but they are letters in every sense
     that matters here. `\\w` does not match them, so a separator-based split
@@ -104,22 +115,43 @@ def _collapse_repeats(text: str) -> str:
     return re.sub(r"(.)\1{2,}", r"\1", text)
 
 
-def split_tokens(text: str) -> List[str]:
-    """The words of a message, with marks kept. Shared with `profanity.py`
-    so the two tiers cannot drift into two different ideas of where a word
-    ends."""
-    tokens: List[str] = []
+def split_spans(text: str) -> List["Span"]:
+    """Tokenize, keeping what SEPARATED each token from the one before it.
+
+    The distinction is load-bearing. A word split by punctuation - `f*ck`,
+    `k.u.r.v.a` - was never two words, so rejoining it recovers the original.
+    A space is a real word boundary in every language that has them, and in
+    Korean or Vietnamese the words on either side of one are routinely a
+    syllable long: rejoining across a space turned `김 씨 발이 아파요` ("Mr
+    Kim's foot hurts") into a slur. So the two gaps are treated differently
+    in `_matches_split_word`, and that needs to be recorded here.
+    """
+    spans: List[Span] = []
     current: List[str] = []
+    gap: List[str] = []
     for char in text:
         if _is_word_char(char):
             current.append(char)
             continue
         if current:
-            tokens.append("".join(current))
+            spans.append(Span(_collapse_repeats("".join(current)), _spaced(gap)))
             current = []
+            gap = []
+        gap.append(char)
     if current:
-        tokens.append("".join(current))
-    return [_collapse_repeats(token) for token in tokens]
+        spans.append(Span(_collapse_repeats("".join(current)), _spaced(gap)))
+    return spans
+
+
+def _spaced(gap: List[str]) -> bool:
+    return any(char.isspace() for char in gap)
+
+
+def split_tokens(text: str) -> List[str]:
+    """The words of a message, with marks kept. Shared with `profanity.py`
+    so the two tiers cannot drift into two different ideas of where a word
+    ends."""
+    return [span.text for span in split_spans(text)]
 
 
 def needle(term: str) -> str:
@@ -127,6 +159,25 @@ def needle(term: str) -> str:
     written `k.u.r.v.a` or `f*ck` is one word with its letters split, so the
     separators are not part of it."""
     return _collapse_repeats("".join(split_tokens(_fold(term))))
+
+
+def needle_floor(needle_text: str) -> int:
+    """The shortest this needle is allowed to be, given the script it is
+    written in."""
+    codes = [ord(char) for char in needle_text if char.isalnum()]
+    if not codes:
+        return MIN_LATIN_NEEDLE_LEN
+    if all(code < 0x250 for code in codes):
+        return MIN_LATIN_NEEDLE_LEN
+    if any(
+        0x1100 <= code <= 0x11FF
+        or 0x3040 <= code <= 0x9FFF
+        or 0xAC00 <= code <= 0xD7AF
+        or 0x3130 <= code <= 0x318F
+        for code in codes
+    ):
+        return MIN_IDEOGRAPH_NEEDLE_LEN
+    return MIN_ALPHABET_NEEDLE_LEN
 
 
 @lru_cache(maxsize=1)
@@ -142,7 +193,14 @@ def _universal() -> Dict[str, Set[str]]:
     for entry in data["terms"]:
         if not entry.get("tier1"):
             continue
-        buckets[entry["match"]].add(needle(entry["term"]))
+        stored = needle(entry["term"])
+        # Belt and braces: the floor is a property of the matcher, so it is
+        # applied here as well as asserted over the data. A needle that slips
+        # below it is not loaded, rather than quietly blocking a whole class
+        # of ordinary short words until someone runs the tests.
+        if len(stored) < needle_floor(stored):
+            continue
+        buckets[entry["match"]].add(stored)
     for bucket in buckets.values():
         bucket.discard("")
     return buckets
@@ -163,9 +221,10 @@ def matches_tier1(text: str) -> bool:
     if not text:
         return False
     terms = _universal()
-    tokens = split_tokens(_fold(text))
-    if not tokens:
+    spans = split_spans(_fold(text))
+    if not spans:
         return False
+    tokens = [span.text for span in spans]
 
     if any(token in terms["token"] for token in tokens):
         return True
@@ -173,7 +232,7 @@ def matches_tier1(text: str) -> bool:
         return True
     if _matches_substring(tokens, terms["substring"]):
         return True
-    return _matches_split_word(tokens, terms["token"])
+    return _matches_split_word(spans, terms["token"])
 
 
 def matches_phrase(tokens: Sequence[str], phrases: Set[str]) -> bool:
@@ -181,50 +240,90 @@ def matches_phrase(tokens: Sequence[str], phrases: Set[str]) -> bool:
 
     Substring-matching a phrase against the message with its spaces removed
     is what let the Vietnamese term `pe de` fire inside `Pedestrian`.
+
+    Indexed rather than sliced: `tokens[start:]` copies the rest of the
+    message on every iteration, which made this quadratic in message length -
+    412 ms on a 60 KB message, inline in the send path.
     """
     if not phrases:
         return False
-    longest = max(len(phrase) for phrase in phrases)
-    for start in range(len(tokens)):
+    prefixes = _prefixes(frozenset(phrases))
+    count = len(tokens)
+    for start in range(count):
         joined = ""
-        for token in tokens[start:]:
-            joined += token
-            if len(joined) > longest:
+        for index in range(start, count):
+            joined += tokens[index]
+            if joined not in prefixes:
                 break
             if joined in phrases:
                 return True
     return False
 
 
+@lru_cache(maxsize=4)
+def _prefixes(phrases: FrozenSet[str]) -> Set[str]:
+    """Every prefix of every phrase, so a scan abandons a run as soon as it
+    cannot become one. Without it, each token started a scan that ran to the
+    longest phrase's length - milliseconds per message, in the send path."""
+    return {
+        phrase[:length] for phrase in phrases for length in range(1, len(phrase) + 1)
+    }
+
+
 def _matches_substring(tokens: Sequence[str], substrings: Set[str]) -> bool:
     """Chinese and Japanese have no word spacing, so their terms can only be
-    matched inside a token. The length floor and the per-term collision gate
-    are what keep that from firing on ordinary compounds."""
+    matched inside a token.
+
+    Inside ONE token, not inside the whole message with its punctuation
+    removed: joining everything spanned clause boundaries, so
+    `做完体操，你妈妈来接你` ("after gymnastics your mother picks you up")
+    yielded `操你妈`. The cost is that an evader who puts punctuation inside a
+    CJK term escapes Tier 1; that is the permissive direction, and Tier 2
+    still reads the message.
+    """
     if not substrings:
         return False
-    joined = "".join(tokens)
-    return any(term in joined for term in substrings)
+    # Every substring needle is CJK, so an all-ASCII token cannot contain one.
+    # Without the guard this is one pass over the needles per token, which is
+    # most of the cost of checking an ordinary Latin-script message.
+    return any(
+        term in token for token in tokens if not token.isascii() for term in substrings
+    )
 
 
-def _matches_split_word(tokens: Sequence[str], needles: Set[str]) -> bool:
+def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
     """One word typed with its letters split apart (`f u c k`, `f*ck`).
 
-    Only runs of very short fragments are rejoined, and the rejoined run must
-    equal a needle outright - searching the whole separatorless message
-    instead is how an ordinary sentence picks up a needle it never contained.
+    Two rules, because the two kinds of gap mean different things:
+
+    - across PUNCTUATION, fragments of one or two characters rejoin, which is
+      what recovers `f*ck` and `k.u.r.v.a`;
+    - across a SPACE, only single characters rejoin, because a space is a real
+      word boundary and an ordinary Korean or Vietnamese sentence is full of
+      one and two character words. `김 씨 발이 아파요` is "Mr Kim's foot
+      hurts", and rejoining two-character fragments across its spaces made it
+      a slur.
+
+    The rejoined run must equal a needle outright. Searching the whole
+    separatorless message instead is how an ordinary sentence picks up a
+    needle it never contained.
     """
     run: List[str] = []
-    for token in tokens:
-        if len(token) <= _FRAGMENT_LEN:
-            run.append(token)
+    for span in spans:
+        joinable = len(span.text) <= (1 if span.after_space else _FRAGMENT_LEN)
+        if joinable and (not span.after_space or not run or len(run[-1]) == 1):
+            run.append(span.text)
             continue
         if len(run) >= 2 and "".join(run) in needles:
             return True
-        run = []
+        run = [span.text] if len(span.text) <= _FRAGMENT_LEN else []
     if len(run) >= 2 and "".join(run) in needles:
         return True
+    # One split point, with a long remainder: `f*cking` -> `f` + `cking`.
+    # Punctuation gaps only, for the same reason as above.
     return any(
-        (len(left) <= _FRAGMENT_LEN or len(right) <= _FRAGMENT_LEN)
-        and left + right in needles
-        for left, right in zip(tokens, tokens[1:])
+        not right.after_space
+        and (len(left.text) <= _FRAGMENT_LEN or len(right.text) <= _FRAGMENT_LEN)
+        and left.text + right.text in needles
+        for left, right in zip(spans, spans[1:])
     )

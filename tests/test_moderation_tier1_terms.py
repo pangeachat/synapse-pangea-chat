@@ -17,11 +17,11 @@ from typing import Any, Dict, List
 from synapse_pangea_chat.moderation.profanity import contains_profanity
 from synapse_pangea_chat.moderation.tier1_prefilter import REASON_PROFANITY, check_text
 from synapse_pangea_chat.moderation.tier1_terms import (
-    MIN_SUBSTRING_NEEDLE_LEN,
     TermRecord,
     matches_phrase,
     matches_tier1,
     needle,
+    needle_floor,
     split_tokens,
     universal_terms,
 )
@@ -162,6 +162,28 @@ class TestRestoredControlsCannotBeRetiredAgain(unittest.TestCase):
                 )
 
 
+class TestTheTier2FlagMarkerIsARecordedList(unittest.TestCase):
+    """A negative control may say "Tier 2 still flags this" - Tier 2 does not
+    block, so that is a note, not an excuse. But the set of controls allowed
+    to say it is recorded in `curation_decisions`, so adding one is an edit to
+    the decisions record rather than a field quietly dropped onto a case."""
+
+    def test_only_the_recorded_sentences_carry_the_marker(self) -> None:
+        corpus = _corpus()
+        allowed = set(corpus["curation_decisions"]["tier2_known_flags"])
+        marked = {
+            case["sentence"]
+            for case in _controls()
+            if case.get("tier2_matcher") == "flags"
+        }
+        self.assertEqual(
+            marked,
+            allowed,
+            "a control was excused from the Tier 2 assertion without being "
+            "recorded in curation_decisions.tier2_known_flags",
+        )
+
+
 class TestTier1StillBlocksProfanity(unittest.TestCase):
     """The other half of the bargain. Permissive must not mean inert: if the
     universal set were emptied, every test above would pass and Tier 1 would
@@ -175,8 +197,27 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         ("kurwa, co za dzień", "pl"),
         ("иди на хуй", "ru"),
         ("씨발 진짜", "ko"),
-        ("你他妈的", "zh"),
+        ("你是傻逼", "zh"),
     ]
+
+    def test_tier1_still_covers_most_of_the_corpus(self) -> None:
+        """The sentinels above are eight sentences; this is the whole corpus.
+
+        Demoting terms one at a time until Tier 1 is empty would keep every
+        false-positive test green, and each step would look reasonable. The
+        floor makes the aggregate visible: dropping below it is a deliberate
+        edit to this number, in a diff a reviewer reads.
+        """
+        cases = [
+            case for lang in _corpus()["languages"] for case in lang["profanities"]
+        ]
+        blocked = [case for case in cases if case["tier"] == 1]
+        self.assertGreaterEqual(
+            len(blocked),
+            100,
+            f"Tier 1 now blocks only {len(blocked)} of {len(cases)} corpus "
+            f"profanity sentences",
+        )
 
     def test_real_profanity_is_still_rejected_before_send(self) -> None:
         for text, lang in self.MUST_BLOCK:
@@ -186,10 +227,6 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
                     REASON_PROFANITY,
                     f"Tier 1 no longer catches {text!r}",
                 )
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestEveryTermIsClassified(unittest.TestCase):
@@ -277,17 +314,33 @@ class TestTheCollisionGate(unittest.TestCase):
                     "half-finished promotion",
                 )
 
-    def test_universal_needles_clear_the_length_floor(self) -> None:
+    def test_universal_needles_clear_the_length_floor_for_their_script(
+        self,
+    ) -> None:
         """A short needle is an ordinary word somewhere among thirty
         languages, and whole-token matching does not save it: Romanian `cu` is
-        a whole token too."""
+        a whole token too.
+
+        Per SCRIPT. Applying the two-character ideograph floor to everything
+        would let a Latin `cu` through the guard that exists for it.
+        """
+        floors = {4: [], 3: [], 2: []}  # type: Dict[int, List[str]]
         for entry in universal_terms():
             if not entry["tier1"]:
                 continue
+            stored = needle(entry["term"])
             with self.subTest(term=entry["term"]):
-                self.assertGreaterEqual(
-                    len(needle(entry["term"])), MIN_SUBSTRING_NEEDLE_LEN
-                )
+                self.assertGreaterEqual(len(stored), needle_floor(stored))
+            floors[needle_floor(stored)].append(stored)
+        self.assertEqual(
+            needle_floor("cu"), 4, "Latin needles are held to four characters"
+        )
+        self.assertEqual(needle_floor("хуй"), 3)
+        self.assertEqual(needle_floor("씨발"), 2)
+        self.assertTrue(
+            floors[4] and floors[3] and floors[2],
+            "every floor is exercised by real terms, so none of them is dead",
+        )
 
     def test_recorded_needles_match_what_the_matcher_computes(self) -> None:
         for entry in universal_terms():
@@ -308,7 +361,7 @@ class TestTheCollisionGate(unittest.TestCase):
             term_needle = needle(entry["term"])
             for sentence, tokens in controls:
                 if entry["match"] == "substring":
-                    hit = term_needle in "".join(tokens)
+                    hit = any(term_needle in token for token in tokens)
                 elif entry["match"] == "phrase":
                     hit = matches_phrase(tokens, {term_needle})
                 else:
@@ -425,11 +478,41 @@ class TestTheMatchingRules(unittest.TestCase):
         self.assertFalse(matches_tier1("Pedestrian crossing is ahead"))
         self.assertFalse(contains_profanity("Pedestrian crossing is ahead"))
 
+    def test_a_live_phrase_term_does_not_match_inside_a_word(self) -> None:
+        """The sentence above stopped exercising Tier 1's phrase rule the
+        moment `pe de` was demoted out of Tier 1, so the rule is also tested
+        against a phrase that is actually in the universal set today."""
+        phrases = [
+            entry
+            for entry in universal_terms()
+            if entry["tier1"] and entry["match"] == "phrase"
+        ]
+        self.assertTrue(phrases, "no phrase term left to exercise the rule")
+        for entry in phrases:
+            stored = needle(entry["term"])
+            with self.subTest(term=entry["term"]):
+                self.assertFalse(
+                    matches_tier1(f"za{stored}za"),
+                    "a phrase matched inside a single word",
+                )
+                self.assertTrue(
+                    matches_tier1(entry["term"]),
+                    "and it still matches when it is written as its own words",
+                )
+
     def test_indic_vowel_signs_are_letters_not_diacritics(self) -> None:
         """`रोड` (road) and `रंडी` (a slur) differ only in their marks, so
-        stripping the marks made an ordinary sentence about traffic match."""
+        stripping the marks made an ordinary sentence about traffic match.
+
+        Asserted on the normalizer as well as on the sentence: `रंडी` is Tier
+        2's now, so the sentence alone would stay green even if Tier 1 went
+        back to discarding every mark.
+        """
         self.assertFalse(matches_tier1("रोड पर ट्रैफिक है"))
         self.assertFalse(contains_profanity("रोड पर ट्रैफिक है"))
+        self.assertNotEqual(needle("रोड"), needle("रंडी"))
+        self.assertEqual(needle("मादरचोद"), "मादरचोद")
+        self.assertEqual(needle("খানকির"), "খানকির")
 
     def test_diacritics_do_not_merge_two_different_words(self) -> None:
         self.assertFalse(matches_tier1("Pica je jednotka v typografii"))
@@ -438,7 +521,31 @@ class TestTheMatchingRules(unittest.TestCase):
     def test_a_short_needle_does_not_match_an_ordinary_word(self) -> None:
         self.assertFalse(matches_tier1("Merg cu tine"))
 
+    def test_fragments_are_not_rejoined_across_a_space(self) -> None:
+        """A space is a real word boundary. In Korean and Vietnamese the words
+        on either side of one are routinely a syllable long, so rejoining two
+        of them makes slurs out of ordinary sentences - `김 씨 발이 아파요` is
+        "Mr Kim's foot hurts"."""
+        self.assertFalse(matches_tier1("김 씨 발이 아파요"))
+        self.assertFalse(matches_tier1("Anh ấy đi bộ đi học mỗi ngày"))
+        # Still caught: one character per letter is the unmistakable signature
+        # of a spaced-out evasion, and punctuation is never a word boundary.
+        self.assertTrue(matches_tier1("개 새 끼"))
+        self.assertTrue(matches_tier1("f*cking hell"))
+
+    def test_a_cjk_term_does_not_match_across_a_clause_boundary(self) -> None:
+        """Chinese is substring-matched because it has no word spacing, but
+        the substring has to live inside ONE token: joining the whole message
+        made `做完体操，你妈妈来接你` ("after gymnastics your mother picks you
+        up") contain `操你妈`."""
+        self.assertFalse(matches_tier1("做完体操，你妈妈来接你。"))
+        self.assertTrue(matches_tier1("操你妈"))
+
     def test_letters_split_apart_are_still_caught(self) -> None:
         for text in ("f u c k you", "f.u.c.k", "fuuuuck"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
+
+
+if __name__ == "__main__":
+    unittest.main()
