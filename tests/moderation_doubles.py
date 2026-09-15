@@ -199,6 +199,15 @@ class DbPoolDouble:
         self.error: Optional[Exception] = None
         self.interactions: List[str] = []
 
+    def __del__(self) -> None:
+        # An in-memory database left to the collector raises a ResourceWarning
+        # into whichever test happened to trigger the collection, which is
+        # noise the next reader has to rule out.
+        try:
+            self.connection.close()
+        except Exception:
+            pass
+
     async def runInteraction(
         self, desc: str, func: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Any:

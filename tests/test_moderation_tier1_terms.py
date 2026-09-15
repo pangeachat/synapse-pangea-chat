@@ -584,13 +584,19 @@ class TestNoAcceptedFalsePositives(unittest.TestCase):
     def test_the_demoted_terms_are_still_caught_after_send(self) -> None:
         """Demotion is a move between tiers, not a hole. Tier 2 reads the
         message in context, which is the only thing that separates the gene
-        symbol from the swear."""
+        symbol from the swear.
+
+        Through the production handler, because this is the evidence the
+        demotion rests on: asked of the matcher directly it would survive the
+        matcher being unwired from Tier 2 entirely.
+        """
+        tier2 = Tier2MatcherProbe(self)
         for text in (
             "Fuck you and leave me alone.",
             "Lad mig fucking være i fred.",
         ):
             with self.subTest(text=text):
-                self.assertTrue(contains_profanity(text))
+                self.assertTrue(tier2.matcher_hit(text))
 
 
 class TestTheCollisionGate(unittest.TestCase):
@@ -902,7 +908,12 @@ class TestTheMatchingRules(unittest.TestCase):
     def test_a_letter_list_is_still_seen_by_tier_2(self) -> None:
         """The other half of the bargain. Tier 1 cannot tell a spelt-out
         evasion from a spelt-out lesson, so it judges neither - and the tier
-        that reads the message in context judges both."""
+        that reads the message in context judges both.
+
+        Through the production handler, for the same reason as the demoted
+        terms above: this is what the tier move rests on.
+        """
+        tier2 = Tier2MatcherProbe(self)
         for text in (
             "f.u.c.k",
             "c.u.n.t",
@@ -911,7 +922,7 @@ class TestTheMatchingRules(unittest.TestCase):
             "Spell it back to me: F,U,C,K.",
         ):
             with self.subTest(text=text):
-                self.assertTrue(contains_profanity(text))
+                self.assertTrue(tier2.matcher_hit(text))
 
     def test_the_rejoin_scan_stays_linear_in_the_message(self) -> None:
         """Tier 1 runs INLINE IN THE SEND PATH on a single-threaded reactor,
