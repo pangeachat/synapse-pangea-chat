@@ -12,7 +12,7 @@ import importlib.util
 import json
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from synapse_pangea_chat.moderation.profanity import contains_profanity
 from synapse_pangea_chat.moderation.tier1_prefilter import REASON_PROFANITY, check_text
@@ -122,6 +122,25 @@ def _corpus() -> Dict[str, Any]:
     return json.loads(_CORPUS_PATH.read_text(encoding="utf-8"))
 
 
+def _native_review_problem(review: Dict[str, Any]) -> Optional[str]:
+    """Why this `native_review` record is not acceptable, or None.
+
+    A function rather than a run of assertions inside a loop, so the rule can
+    be exercised on records whether or not the data happens to contain any -
+    see `test_the_native_review_rule_rejects_what_it_is_for`.
+    """
+    reviewer = str(review.get("by", "")).strip()
+    if not reviewer:
+        return "reviewer"
+    if "curator" in reviewer:
+        # The curator is a native speaker of English and of nothing else on
+        # the list; a native review signed by them is not one.
+        return "curator"
+    if not str(review.get("date", "")).strip():
+        return "date"
+    return None
+
+
 def _policy() -> Dict[str, Any]:
     return json.loads(
         (
@@ -131,6 +150,27 @@ def _policy() -> Dict[str, Any]:
             / "tier1_universal.json"
         ).read_text(encoding="utf-8")
     )["_policy"]
+
+
+def _promoted() -> List[TermRecord]:
+    """Every term Tier 1 may block on, with the core asserted non-empty.
+
+    The filter `if not entry["tier1"]: continue` appears in most of the gate's
+    loops, and every one of them passes vacuously on an empty core - which is
+    the state ADR-2c forbids and the one an accident would reach. One helper,
+    one assertion, and no loop in this file can be emptied without a failure.
+    """
+    promoted = [entry for entry in universal_terms() if entry["tier1"]]
+    if not promoted:
+        # Raised rather than asserted: `assert` disappears under `python -O`,
+        # and a gate that can be switched off by an interpreter flag is not
+        # one.
+        raise AssertionError(
+            "no term is promoted into Tier 1, so every gate over the promoted "
+            "set passes without asserting anything; D1 requires a non-empty "
+            "reviewed core"
+        )
+    return promoted
 
 
 def _controls() -> List[Dict[str, str]]:
@@ -401,9 +441,8 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
     """
 
     def test_every_promoted_term_records_its_evidence(self) -> None:
-        for entry in universal_terms():
-            if not entry["tier1"]:
-                continue
+        promoted = _promoted()
+        for entry in promoted:
             with self.subTest(term=entry["term"]):
                 review = entry.get("review")
                 self.assertIsNotNone(review, "promoted with no review record")
@@ -418,9 +457,7 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
         and that is checked in both directions: the basis cannot be claimed
         for an ordinary word, and an ordinary word cannot be promoted by
         claiming it."""
-        for entry in universal_terms():
-            if not entry["tier1"]:
-                continue
+        for entry in _promoted():
             has_digit = any(char.isdigit() for char in needle(entry["term"]))
             claims = entry["review"]["basis"] == "not_a_word_in_any_orthography"
             with self.subTest(term=entry["term"]):
@@ -442,19 +479,50 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
             with self.subTest(word=word):
                 self.assertTrue(word.isascii() and word.isalpha())
 
-    def test_a_native_review_names_a_reviewer(self) -> None:
-        for entry in universal_terms():
-            if not entry["tier1"] or entry["review"]["basis"] != "native_review":
-                continue
-            reviewer = str(entry["review"].get("by", "")).strip()
+    def test_the_native_review_rule_rejects_what_it_is_for(self) -> None:
+        """Asserted against the RULE, because the data has no native reviews.
+
+        There are none yet - that is the point of the promotion policy, and it
+        is why 29 languages carry no plain-word terms in Tier 1. So the
+        previous version of this test iterated an empty set: every subTest was
+        skipped, nothing was asserted, and the day somebody adds a native
+        review with no reviewer named it would have passed. The rule is
+        exercised on records instead, which is what the data will be checked
+        against when it finally has one.
+        """
+        cases = [
+            (
+                {"basis": "native_review", "by": "A. Reviewer", "date": "2026-01-02"},
+                None,
+            ),
+            ({"basis": "native_review", "by": "", "date": "2026-01-02"}, "reviewer"),
+            ({"basis": "native_review", "date": "2026-01-02"}, "reviewer"),
+            (
+                {
+                    "basis": "native_review",
+                    "by": "single non-native curator",
+                    "date": "2026-01-02",
+                },
+                "curator",
+            ),
+            ({"basis": "native_review", "by": "A. Reviewer", "date": "  "}, "date"),
+            ({"basis": "native_review", "by": "A. Reviewer"}, "date"),
+        ]
+        for review, expected in cases:
+            with self.subTest(review=review):
+                self.assertEqual(_native_review_problem(review), expected)
+
+    def test_every_native_review_in_the_data_passes_the_rule(self) -> None:
+        """And the data goes through the same rule. Empty today; the test
+        above is what keeps the rule honest while it is."""
+        reviewed = [
+            entry
+            for entry in universal_terms()
+            if entry["tier1"] and entry["review"]["basis"] == "native_review"
+        ]
+        for entry in reviewed:
             with self.subTest(term=entry["term"]):
-                self.assertTrue(reviewer, "a native review has to name its reviewer")
-                self.assertNotIn(
-                    "curator",
-                    reviewer,
-                    "the curator is not a native reviewer of anything but English",
-                )
-                self.assertTrue(str(entry["review"].get("date", "")).strip())
+                self.assertIsNone(_native_review_problem(entry["review"]))
 
     def test_the_languages_tier1_carries_terms_for_are_recorded(self) -> None:
         """Adding a language to Tier 1 is a review task. Recording the list
@@ -530,9 +598,13 @@ class TestTheCollisionGate(unittest.TestCase):
     term that collides with ordinary vocabulary in another language."""
 
     def test_every_collision_on_a_universal_term_is_adjudicated(self) -> None:
-        for entry in universal_terms():
-            if not entry["tier1"] or not entry["collisions"]:
-                continue
+        with_collisions = [entry for entry in _promoted() if entry["collisions"]]
+        self.assertTrue(
+            with_collisions,
+            "no promoted term carries a measured collision, so this gate ran "
+            "over nothing - the sweep or the classification has gone empty",
+        )
+        for entry in with_collisions:
             with self.subTest(term=entry["term"]):
                 adjudication = entry.get("adjudication")
                 self.assertIsNotNone(
@@ -558,9 +630,9 @@ class TestTheCollisionGate(unittest.TestCase):
                 self.assertTrue(note.strip())
 
     def test_a_demoted_term_carries_no_adjudication_to_wave_it_through(self) -> None:
-        for entry in universal_terms():
-            if entry["tier1"]:
-                continue
+        demoted = [entry for entry in universal_terms() if not entry["tier1"]]
+        self.assertGreater(len(demoted), 100, "the classification has gone empty")
+        for entry in demoted:
             with self.subTest(term=entry["term"]):
                 self.assertNotIn(
                     "adjudication",
@@ -580,9 +652,7 @@ class TestTheCollisionGate(unittest.TestCase):
         would let a Latin `cu` through the guard that exists for it.
         """
         floors = {4: [], 3: [], 2: []}  # type: Dict[int, List[str]]
-        for entry in universal_terms():
-            if not entry["tier1"]:
-                continue
+        for entry in _promoted():
             stored = needle(entry["term"])
             with self.subTest(term=entry["term"]):
                 self.assertGreaterEqual(len(stored), needle_floor(stored))
@@ -615,9 +685,8 @@ class TestTheCollisionGate(unittest.TestCase):
             (case["sentence"], split_spans(case["sentence"].casefold()))
             for case in _controls()
         ]
-        for entry in universal_terms():
-            if not entry["tier1"]:
-                continue
+        self.assertTrue(controls, "the corpus carries no negative controls")
+        for entry in _promoted():
             term_needle = needle(entry["term"])
             for sentence, spans in controls:
                 if entry["match"] == "phrase":

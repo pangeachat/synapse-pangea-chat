@@ -879,16 +879,49 @@ class DispatcherTestCase(unittest.TestCase):
         self._drain()
         self.assertIn("$after_restart", self.handler.finished)
 
-    def test_the_supervisor_never_raises_during_shutdown(self) -> None:
-        # A looping call whose function raises is logged "Looping call died"
-        # and STOPS FOREVER. During shutdown the clock refuses new calls, so
-        # a supervisor that scheduled work unconditionally would do exactly
-        # that on the way down.
+    def test_the_supervisor_does_not_restart_a_worker_during_shutdown(self) -> None:
+        """The guard's actual effect, with a DEAD worker for it to decline.
+
+        The previous version left both workers healthy, so the supervisor's
+        loop body never ran and the `_stopping` guard was never reached:
+        deleting the guard left the test green. A worker restarted on the way
+        down is a consumer started after the drain has counted what it was
+        going to count.
+        """
         self.dispatcher.start()
         self._drain()
+        self.dispatcher._kill_worker_for_test(0)
+        self._drain()
+        self.assertEqual(self.dispatcher.live_workers, 1)
+        self.reader.snapshot("pangea_moderation_tier2_workers_restarted_total")
         self.dispatcher._stopping = True
         self.clock.shutdown = True
         self.clock.fire_looping()
+        self._drain()
+        self.assertEqual(
+            self.reader.delta("pangea_moderation_tier2_workers_restarted_total"),
+            0.0,
+            "the supervisor restarted a worker after shutdown began",
+        )
+
+    def test_the_supervisor_survives_a_restart_that_raises(self) -> None:
+        """A looping call whose function raises is logged "Looping call died"
+        and STOPS FOREVER, so the one thing standing between a dead worker and
+        a pool that never recovers would be gone. Asserted by making the
+        restart itself fail, which is what `_supervise` actually does."""
+        self.dispatcher.start()
+        self._drain()
+        self.dispatcher._kill_worker_for_test(0)
+        self._drain()
+        with patch.object(
+            self.dispatcher, "_start_worker", side_effect=RuntimeError("no")
+        ):
+            self.clock.fire_looping()
+        # And the pool still recovers afterwards: the supervisor was not the
+        # thing that died.
+        self.clock.fire_looping()
+        self._drain()
+        self.assertEqual(self.dispatcher.live_workers, 2)
 
     # --- shutdown ---------------------------------------------------
 
@@ -1495,6 +1528,7 @@ class CancellationRuleTestCase(unittest.TestCase):
 
         root = pathlib.Path(__file__).resolve().parent.parent
         unguarded: List[str] = []
+        examined: Dict[str, int] = {m: 0 for m in self.GUARDED_MODULES}
         for relative in self.GUARDED_MODULES:
             path = root / relative
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -1506,6 +1540,7 @@ class CancellationRuleTestCase(unittest.TestCase):
                 for handler in node.handlers:
                     if not _catches_broadly(handler):
                         continue
+                    examined[relative] += 1
                     if not _calls_the_rule_first(handler):
                         unguarded.append(f"{relative}:{handler.lineno}")
         self.assertEqual(
@@ -1514,6 +1549,18 @@ class CancellationRuleTestCase(unittest.TestCase):
             "a fail-open handler around an `await` does not call "
             "`reraise_if_cancelled` as its first statement, so it absorbs the "
             "cancellation of the coroutine it is running in:\n" + "\n".join(unguarded),
+        )
+        # And the walk found handlers to check. An empty result reads exactly
+        # like a clean one, so a helper that stopped matching - a new AST node
+        # shape, a module renamed out of the list - would report perfect
+        # compliance with nothing examined.
+        self.assertEqual(
+            [module for module, count in examined.items() if count == 0],
+            [],
+            "the AST walk found no broadly-catching handler around an `await` "
+            "in these modules, so the empty result above says nothing about "
+            "them: every module on the dispatch path has at least one, and a "
+            "walk that finds none has stopped matching rather than passed",
         )
 
     def test_the_rule_lets_only_cancellation_past(self) -> None:
