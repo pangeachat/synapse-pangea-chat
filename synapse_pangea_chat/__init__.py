@@ -1,3 +1,4 @@
+import logging
 import re
 from typing import Any, Dict, Mapping, Optional, Tuple
 
@@ -23,6 +24,7 @@ from synapse_pangea_chat.grant_instructor_analytics_access import (
 )
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.moderation import ChatModeration
+from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
     PreviewWithCode,
@@ -44,6 +46,8 @@ from synapse_pangea_chat.user_activity import (
     UserCourses,
 )
 from synapse_pangea_chat.user_directory_search import UserDirectorySearch
+
+logger = logging.getLogger("synapse.modules.synapse_pangea_chat")
 
 
 class PangeaChat:
@@ -665,22 +669,43 @@ class PangeaChat:
                     "moderation.tier2_enabled is true"
                 )
 
-        moderation_exempt_user_id_patterns = moderation.get(
-            "exempt_user_id_patterns", []
+        # The retired regex key is refused rather than translated. The two
+        # grammars overlap with different meanings, so any automatic
+        # conversion could silently widen an exemption - and an exempt sender
+        # skips both tiers. See moderation/exempt.py.
+        legacy_exempt = moderation.get(moderation_exempt.LEGACY_CONFIG_KEY, None)
+        if legacy_exempt is not None:
+            raise ValueError(
+                moderation_exempt.legacy_key_error(
+                    [str(value) for value in legacy_exempt]
+                    if isinstance(legacy_exempt, list)
+                    else [str(legacy_exempt)]
+                )
+            )
+
+        moderation_exempt_user_id_globs = moderation.get(
+            moderation_exempt.CONFIG_KEY, []
         )
-        if not isinstance(moderation_exempt_user_id_patterns, list) or not all(
-            isinstance(pat, str) for pat in moderation_exempt_user_id_patterns
+        if not isinstance(moderation_exempt_user_id_globs, list) or not all(
+            isinstance(pat, str) for pat in moderation_exempt_user_id_globs
         ):
             raise ValueError(
-                'Config "moderation.exempt_user_id_patterns" must be a list of strings'
+                f'Config "moderation.{moderation_exempt.CONFIG_KEY}" must be a '
+                "list of strings"
             )
-        for pat in moderation_exempt_user_id_patterns:
-            try:
-                re.compile(pat)
-            except re.error as e:
-                raise ValueError(
-                    f'Config "moderation.exempt_user_id_patterns" entry {pat!r} '
-                    f"is not a valid regex: {e}"
+        for pat in moderation_exempt_user_id_globs:
+            # Validated here so a bad value fails startup once instead of
+            # being re-discovered on every message in the send path.
+            moderation_exempt.validate_glob(pat)
+            if moderation_exempt.matches_every_sender(pat):
+                # Not an error: exempting everyone is a decision an operator
+                # is allowed to make. Naming it is what makes it a deliberate
+                # one rather than a typo nobody notices.
+                logger.warning(
+                    'Config "moderation.%s" entry %r exempts every sender on '
+                    "every homeserver, disabling moderation for all of them",
+                    moderation_exempt.CONFIG_KEY,
+                    pat,
                 )
 
         moderation_redaction_reason_prefix = moderation.get(
@@ -751,6 +776,6 @@ class PangeaChat:
             moderation_tier2_enabled=moderation_tier2_enabled,
             moderation_choreo_base_url=moderation_choreo_base_url,
             moderation_choreo_access_token=moderation_choreo_access_token,
-            moderation_exempt_user_id_patterns=moderation_exempt_user_id_patterns,
+            moderation_exempt_user_id_globs=moderation_exempt_user_id_globs,
             moderation_redaction_reason_prefix=moderation_redaction_reason_prefix,
         )

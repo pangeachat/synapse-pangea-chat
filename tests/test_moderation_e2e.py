@@ -83,7 +83,7 @@ class TestModerationE2E(BaseSynapseE2ETest):
                         "tier2_enabled": True,
                         "choreo_base_url": mock_moderation.base_url,
                         "choreo_access_token": "syt_mock_service_token",
-                        "exempt_user_id_patterns": [r"@exemptbot:.*"],
+                        "exempt_user_id_globs": ["@exemptbot:*"],
                     },
                 }
             )

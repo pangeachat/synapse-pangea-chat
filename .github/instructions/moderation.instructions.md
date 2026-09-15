@@ -9,6 +9,20 @@ The design — why moderation lives at the homeserver, the two-tier split, and t
 
 Both tiers ship dark: nothing runs until an operator enables a tier in the module's `moderation` config, and Tier 2 refuses to start half-configured (base URL and service token are required at parse time). Configured bot accounts are exempt from both tiers — bot content is governed upstream, and redacting the bot's replies would fight the orchestrator.
 
+## Exempt senders
+
+`moderation.exempt_user_id_globs` lists the senders neither tier ever sees. An exemption is a security boundary, not a convenience filter, so two rules hold.
+
+**Glob syntax, not regular expressions.** `*` matches any run of characters, `?` matches exactly one, and every other character is a literal drawn from the set a Matrix ID is built from (`a-z A-Z 0-9 . _ = / + - @ :`). Anything else — a backslash, a character class, an alternation, an anchor — is refused at parse time. The values only ever describe Matrix IDs, so a regular expression buys nothing, and it is evaluated in the pre-persist send path on every message: a configured pattern such as `@(a+)+:example.org` backtracks catastrophically against a long non-matching Matrix ID and stalls the reactor, where the module's fail-open handling cannot reach it. A consequence worth knowing: a server name written as an IPv6 literal cannot be matched, because `[` and `]` are outside the grammar. Use `*` for the server part.
+
+**The match is whole-string.** `@bot*:example.org` exempts `@bot:example.org` and `@bot-staging:example.org`, and does not exempt `@botimposter:example.org.evil.com`.
+
+A glob of only `*` characters exempts every sender on every homeserver. It parses — that is an operator's call to make — and logs a WARNING naming it.
+
+### Migrating from `exempt_user_id_patterns`
+
+The former key took regular expressions applied with `re.match`, which anchored only the start: `@bot.*:example\.org` exempted `@botimposter:example.org.evil.com` from both tiers. Startup now **refuses** the old key outright and names each configured value with a suggested glob. Nothing is translated automatically, because the two grammars overlap and disagree — `@bot?:example.org` is valid in both, and means `@bot:example.org` as a regex and `@bota:example.org` as a glob — so an automatic conversion could silently widen an exemption. Restate each value and check it says what you meant.
+
 ## Tier 1 — deterministic pre-filter (blocks on send)
 
 Runs in the send path and can reject a message before it appears, so everything here must stay model-free and sub-millisecond. A wrongly blocked ordinary message is worse than a miss (Tier 2 and human reporting back this up), so every pattern leans conservative:

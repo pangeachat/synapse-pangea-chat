@@ -117,10 +117,52 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
 
     async def test_exempt_sender_skipped(self) -> None:
         mod = _moderation(
-            _config(moderation_exempt_user_id_patterns=[r"@bot.*:example\.org"])
+            _config(moderation_exempt_user_id_globs=["@bot*:example.org"])
         )
         event = _event("call me: 415-555-2671", sender="@bot:example.org")
         self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
+
+    async def test_exempt_glob_does_not_exempt_a_longer_impostor(self) -> None:
+        """EX-1. An exempt sender skips BOTH tiers, so a pattern that matches
+        more than it names is a bypass, not a cosmetic bug. The regex
+        predecessor of this glob was applied with `re.match`, which anchors
+        only the start, and exempted this sender."""
+        mod = _moderation(
+            _config(moderation_exempt_user_id_globs=["@bot*:example.org"])
+        )
+        event = _event(
+            "call me: 415-555-2671", sender="@botimposter:example.org.evil.com"
+        )
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_exempt_glob_does_not_exempt_a_longer_localpart(self) -> None:
+        """The same hole without the suffix: an exact glob must not act as a
+        prefix. `@bot:example.org` is not `@bot2:example.org`."""
+        mod = _moderation(_config(moderation_exempt_user_id_globs=["@bot:example.org"]))
+        event = _event("call me: 415-555-2671", sender="@bot2:example.org")
+        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+
+    async def test_exempt_sender_skips_tier2_as_well(self) -> None:
+        """Both tiers consult the same matcher, so both are asserted."""
+        mod = _moderation(
+            _config(
+                moderation_tier1_enabled=False,
+                moderation_tier2_enabled=True,
+                moderation_choreo_base_url="http://choreo.invalid",
+                moderation_choreo_access_token="syt_x",
+                moderation_exempt_user_id_globs=["@bot*:example.org"],
+            )
+        )
+        with patch(
+            "synapse_pangea_chat.moderation.run_as_background_process"
+        ) as run_bg:
+            await mod.on_new_event(_event("something", sender="@bot:example.org"), {})
+            run_bg.assert_not_called()
+            await mod.on_new_event(
+                _event("something", sender="@botimposter:example.org.evil.com"),
+                {},
+            )
+            run_bg.assert_called_once()
 
     async def test_non_message_event_skipped(self) -> None:
         mod = _moderation(_config())
@@ -281,11 +323,78 @@ class TestParseConfig(unittest.TestCase):
                 }
             )
 
-    def test_invalid_exempt_regex_rejected(self) -> None:
+    def test_retired_regex_key_is_refused_with_a_migration_message(self) -> None:
+        """EX-3/EX-6. The old key is never reinterpreted: a value valid under
+        both grammars would mean different things, so the operator restates
+        it. The error names the value and suggests a glob."""
+        with self.assertRaises(ValueError) as caught:
+            PangeaChat.parse_config(
+                {
+                    **self.BASE,
+                    "moderation": {"exempt_user_id_patterns": [r"@bot.*:example\.org"]},
+                }
+            )
+        message = str(caught.exception)
+        self.assertIn("exempt_user_id_globs", message)
+        self.assertIn(repr(r"@bot.*:example\.org"), message)
+        self.assertIn("@bot*:example.org", message)
+
+    def test_both_grammars_value_under_the_old_key_is_still_refused(self) -> None:
+        """EX-6. `@bot?:example.org` parses under both grammars and means
+        different things in each; nothing inspects it, the key refuses it."""
         with self.assertRaises(ValueError):
             PangeaChat.parse_config(
-                {**self.BASE, "moderation": {"exempt_user_id_patterns": ["["]}}
+                {
+                    **self.BASE,
+                    "moderation": {"exempt_user_id_patterns": ["@bot?:example.org"]},
+                }
             )
+
+    def test_regex_shaped_glob_is_rejected(self) -> None:
+        """EX-4. A value written for the old grammar, pasted under the new
+        key, is refused rather than matched as a glob."""
+        with self.assertRaises(ValueError) as caught:
+            PangeaChat.parse_config(
+                {
+                    **self.BASE,
+                    "moderation": {"exempt_user_id_globs": [r"@bot.*:example\.org"]},
+                }
+            )
+        self.assertIn("glob grammar", str(caught.exception))
+
+    def test_character_class_glob_is_rejected(self) -> None:
+        """EX-4. `[` and `]` are outside the documented grammar, so they are
+        refused rather than silently read as a character class."""
+        for value in ("@bot[0-9]:example.org", "@bot:example.org|evil.com"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    PangeaChat.parse_config(
+                        {
+                            **self.BASE,
+                            "moderation": {"exempt_user_id_globs": [value]},
+                        }
+                    )
+
+    def test_empty_glob_is_rejected(self) -> None:
+        for value in ("", "   "):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    PangeaChat.parse_config(
+                        {
+                            **self.BASE,
+                            "moderation": {"exempt_user_id_globs": [value]},
+                        }
+                    )
+
+    def test_match_everything_glob_parses_with_a_warning(self) -> None:
+        """EX-5. Exempting everyone is the operator's call to make; the
+        warning is what makes it a deliberate one."""
+        with self.assertLogs("synapse.modules.synapse_pangea_chat", "WARNING") as logs:
+            cfg = PangeaChat.parse_config(
+                {**self.BASE, "moderation": {"exempt_user_id_globs": ["*"]}}
+            )
+        self.assertEqual(cfg.moderation_exempt_user_id_globs, ["*"])
+        self.assertIn("every sender", "\n".join(logs.output))
 
     def test_full_config_parses(self) -> None:
         cfg = PangeaChat.parse_config(
@@ -297,7 +406,7 @@ class TestParseConfig(unittest.TestCase):
                     "tier2_enabled": True,
                     "choreo_base_url": "http://choreo.invalid",
                     "choreo_access_token": "syt_x",
-                    "exempt_user_id_patterns": [r"@bot:.*"],
+                    "exempt_user_id_globs": ["@bot:*"],
                 },
             }
         )

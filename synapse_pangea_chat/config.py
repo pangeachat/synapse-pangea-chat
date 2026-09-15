@@ -136,8 +136,10 @@ class PangeaChatConfig:
     # accepts any valid token on this homeserver.
     moderation_choreo_base_url: Optional[str] = None
     moderation_choreo_access_token: Optional[str] = None
-    # Senders never moderated (regex, full user id) — set the bot users here:
-    # bot content is already governed upstream, and Tier 2 redacting the
-    # bot's own replies would fight the orchestrator.
-    moderation_exempt_user_id_patterns: List[str] = attr.Factory(list)
+    # Senders never moderated — set the bot users here: bot content is
+    # already governed upstream, and Tier 2 redacting the bot's own replies
+    # would fight the orchestrator. Glob patterns over the full Matrix ID
+    # ('*' and '?'), matched whole-string; see moderation/exempt.py for why
+    # this is not a regular expression.
+    moderation_exempt_user_id_globs: List[str] = attr.Factory(list)
     moderation_redaction_reason_prefix: str = "Removed by Pangea content moderation"

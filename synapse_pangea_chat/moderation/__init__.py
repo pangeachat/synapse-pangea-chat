@@ -37,6 +37,7 @@ from synapse_pangea_chat.moderation.choreo_client import (
     ModerationCheckError,
     moderate_text,
 )
+from synapse_pangea_chat.moderation.exempt import glob_match, validate_glob
 from synapse_pangea_chat.moderation.log_safety import (
     error_site,
     new_digest_key,
@@ -85,9 +86,13 @@ class ChatModeration:
     def __init__(self, api: ModuleApi, config: Any):
         self._api = api
         self._config = config
-        self._exempt_patterns = [
-            re.compile(p) for p in config.moderation_exempt_user_id_patterns
-        ]
+        # Validated again here, not only at config-parse time: this is the
+        # single place the values are turned into matching behaviour, so a
+        # value that reached it unvalidated must fail startup rather than
+        # quietly exempt the wrong senders.
+        for exempt_glob in config.moderation_exempt_user_id_globs:
+            validate_glob(exempt_glob)
+        self._exempt_globs = list(config.moderation_exempt_user_id_globs)
         # Keyed per instance so a Matrix ID cannot be recovered from a log
         # line by enumeration; see moderation.log_safety.
         self._log_digest_key = new_digest_key()
@@ -129,7 +134,10 @@ class ChatModeration:
         return text or None
 
     def _is_exempt_sender(self, sender: str) -> bool:
-        return any(p.match(sender) for p in self._exempt_patterns)
+        # Whole-string, both ends. A prefix match here exempted any sender
+        # whose Matrix ID merely started the same way, which skipped both
+        # tiers - see moderation.exempt.
+        return any(glob_match(g, sender) for g in self._exempt_globs)
 
     def _sender_digest(self, sender: str) -> str:
         """A log-safe stand-in for a sender's Matrix ID."""
