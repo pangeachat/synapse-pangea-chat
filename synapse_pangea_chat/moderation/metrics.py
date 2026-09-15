@@ -47,14 +47,10 @@ def _get_or_create(
     return collector_class(name, documentation, list(labelnames), **kwargs)
 
 
-# --- Tier 1 ---------------------------------------------------------------
-
-TIER1_BLOCKS = _get_or_create(
-    Counter,
-    "pangea_moderation_tier1_blocks_total",
-    "Events rejected pre-persist by the Tier 1 pre-filter.",
-    ["reason"],
-)
+# Tier 1's own counters are deliberately absent. Declaring a metric nothing
+# increments publishes a series that reads as a steady zero - which an
+# operator cannot tell from "the thing never happens", and which is worse than
+# no series at all. They belong to the change that instruments the pre-filter.
 
 # --- Tier 2 queue and dispatch -------------------------------------------
 

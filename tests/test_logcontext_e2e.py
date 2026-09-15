@@ -277,6 +277,15 @@ class TestModerationLogcontext(BaseSynapseE2ETest):
                 log,
                 "the shutdown handler never ran, so the drain is untested",
             )
+            # And it RAN TO THE END. The line above proves only that the
+            # handler was entered; a `shutdown` that returned immediately -
+            # registering no waiter, arming no deadline, abandoning nothing -
+            # would satisfy it while removing everything the drain does.
+            self.assertIn(
+                "tier2 moderation drain finished",
+                log,
+                "the drain was entered but never completed",
+            )
         finally:
             mock_moderation.stop()
             self.stop_synapse(

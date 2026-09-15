@@ -1408,3 +1408,200 @@ class CheckerTestCase(unittest.TestCase):
             2.0,
             "a failed call has a latency too, and hiding it hides the slow path",
         )
+
+
+class CancellationRuleTestCase(unittest.TestCase):
+    """Every fail-open handler in the Tier-2 path must let a cancellation past.
+
+    Two review rounds found handlers that swallowed `CancelledError` one site
+    at a time - the transport, the checker, the worker, the pre-send re-read,
+    the redaction send. They are all the same defect, because they are all the
+    same idiom: `except Exception` is what fail-open requires, and twisted's
+    `CancelledError` is an `Exception`.
+
+    So the rule lives in `compat.reraise_if_cancelled`, and this test is what
+    keeps it applied. The structural half reads the source and fails on a
+    fail-open handler that does not call it; the behavioural half drives a
+    cancellation through the real call path and asserts it comes out the other
+    end. Neither alone is enough - the first cannot tell whether the call
+    actually does anything, and the second cannot see a site nobody wrote a
+    case for.
+    """
+
+    # Every module on the Tier-2 dispatch path. Tier 1's own modules are not
+    # here: nothing on that path awaits, so nothing on it can be cancelled.
+    GUARDED_MODULES = (
+        "synapse_pangea_chat/moderation/__init__.py",
+        "synapse_pangea_chat/moderation/choreo_client.py",
+        "synapse_pangea_chat/moderation/dispatch.py",
+    )
+
+    def test_every_handler_around_an_await_applies_the_rule(self) -> None:
+        """Read from the AST, and scoped to handlers that can actually see one.
+
+        A cancellation is delivered at an `await`, so the rule applies to a
+        broad handler whose `try` body contains one. A narrow synchronous
+        guard - `Clock.call_later` refusing, `json.loads` failing, a transport
+        teardown - cannot receive a cancellation at all, and demanding the
+        call there would be noise that teaches people to ignore the rule.
+        """
+        import ast
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        unguarded: List[str] = []
+        for relative in self.GUARDED_MODULES:
+            path = root / relative
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Try):
+                    continue
+                if not _contains_await(node.body):
+                    continue
+                for handler in node.handlers:
+                    if not _catches_broadly(handler):
+                        continue
+                    if not _calls_the_rule_first(handler):
+                        unguarded.append(f"{relative}:{handler.lineno}")
+        self.assertEqual(
+            unguarded,
+            [],
+            "a fail-open handler around an `await` does not call "
+            "`reraise_if_cancelled` as its first statement, so it absorbs the "
+            "cancellation of the coroutine it is running in:\n" + "\n".join(unguarded),
+        )
+
+    def test_the_rule_lets_only_cancellation_past(self) -> None:
+        from synapse_pangea_chat.moderation.compat import reraise_if_cancelled
+
+        with self.assertRaises(defer.CancelledError):
+            reraise_if_cancelled(defer.CancelledError())
+        # Everything else is absorbed by the handler that called it.
+        reraise_if_cancelled(RuntimeError("an ordinary failure"))
+        reraise_if_cancelled(ModerationCheckError("down", KIND_SERVER_ERROR))
+
+    def test_a_cancellation_travels_the_whole_dispatch_path(self) -> None:
+        """End to end, through the real call chain rather than per-frame.
+
+        A worker holding a job is cancelled. The cancellation has to survive
+        the transport, the checker and the worker's own handler, and the
+        worker has to end - which is what the supervisor then sees.
+        """
+        from synapse_pangea_chat.moderation.choreo_client import ChoreoChecker
+        from synapse_pangea_chat.moderation.dispatch import (
+            ModerationJob,
+            Tier2Dispatcher,
+        )
+
+        clock = FakeClock()
+        hs = _Hs(clock)
+        breaker = CircuitBreaker(
+            clock=clock,
+            failure_threshold=3,
+            cooldown_seconds=30.0,
+            max_cooldown_seconds=120.0,
+        )
+        held: "defer.Deferred[Any]" = defer.Deferred()
+
+        async def holding(*_args: Any, **_kwargs: Any) -> Any:
+            return await make_deferred_yieldable(held)
+
+        checker = ChoreoChecker(
+            agent=object(),
+            clock=clock,
+            base_url="http://choreo.invalid",
+            access_token="syt_x",
+            breaker=breaker,
+            timeout_seconds=15.0,
+        )
+
+        async def handler(job: Any) -> None:
+            await checker.check(job.text)
+
+        dispatcher = Tier2Dispatcher(
+            homeserver=hs,
+            clock=clock,
+            handler=handler,
+            workers=1,
+            queue_size=4,
+            supervisor_interval_seconds=30.0,
+            drain_timeout_seconds=5.0,
+        )
+        with patch(
+            "synapse_pangea_chat.moderation.choreo_client.moderate_text", holding
+        ):
+            dispatcher.start()
+            clock.run_pending()
+            dispatcher.enqueue(
+                ModerationJob(
+                    event_id="$victim",
+                    room_id="!room:example.org",
+                    sender="@learner:example.org",
+                    text="x",
+                    enqueued_at=clock.time(),
+                )
+            )
+            for _ in range(10):
+                if not clock.run_pending():
+                    break
+            self.assertEqual(dispatcher.live_workers, 1)
+            dispatcher._kill_worker_for_test(0)
+            for _ in range(10):
+                if not clock.run_pending():
+                    break
+        self.assertEqual(
+            dispatcher.live_workers,
+            0,
+            "the cancellation was absorbed somewhere on the path and the "
+            "worker carried on",
+        )
+        self.assertEqual(dispatcher.inflight, 0, "the cancelled job leaked")
+
+
+def _contains_await(body: List[Any]) -> bool:
+    """Is there an `await` in this block, not counting nested functions?
+
+    A nested `async def` has its own frame and its own handlers; an `await`
+    inside one says nothing about whether the enclosing `try` can see a
+    cancellation.
+    """
+    import ast
+
+    for statement in body:
+        for node in ast.walk(statement):
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            if isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
+                return True
+    return False
+
+
+def _catches_broadly(handler: Any) -> bool:
+    import ast
+
+    if handler.type is None:
+        return True
+    return isinstance(handler.type, ast.Name) and handler.type.id in (
+        "Exception",
+        "BaseException",
+    )
+
+
+def _calls_the_rule_first(handler: Any) -> bool:
+    import ast
+
+    for statement in handler.body:
+        # Skip a docstring, which is the only statement allowed before the
+        # rule. `ast.Str` is gone in 3.12+; a docstring is a `Constant` holding
+        # a string.
+        if isinstance(statement, ast.Expr) and isinstance(
+            statement.value, ast.Constant
+        ):
+            continue
+        return (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id == "reraise_if_cancelled"
+        )
+    return False

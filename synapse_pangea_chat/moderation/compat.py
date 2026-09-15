@@ -16,9 +16,10 @@ inside it is how a transport change becomes unreviewable.
 """
 
 import inspect
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from synapse.metrics.background_process_metrics import run_as_background_process
+from twisted.internet import defer
 
 _RUN_AS_BG_SUPPORTS_SERVER_NAME = (
     "server_name" in inspect.signature(run_as_background_process).parameters
@@ -105,3 +106,39 @@ def register_shutdown_handler(
         return False
     reactor().addSystemEventTrigger("before", "shutdown", shutdown_func)
     return True
+
+
+def reraise_if_cancelled(
+    error: BaseException, on_cancel: Optional[Callable[[], None]] = None
+) -> None:
+    """The one rule every fail-open handler in this module obeys.
+
+    Tier 1 and Tier 2 both fail open by contract: a moderation failure must
+    never block a send or kill a background process, so the handlers catch
+    `Exception` rather than a list of expected types - an unmapped exception
+    escaping into `run_as_background_process` is logged by Synapse in full,
+    with whatever it was carrying.
+
+    **But twisted's `CancelledError` is an `Exception`.** So every one of those
+    handlers absorbs it by default, and a cancellation means the opposite of a
+    moderation failure: somebody is stopping the coroutine, and the coroutine
+    carrying on regardless is how a worker ends up running behind a Deferred
+    that has already fired, with the pool growing by one every time the
+    supervisor notices.
+
+    Two review rounds found those handlers one site at a time. This is the rule
+    in one place, named, so the next `except Exception` in this module is
+    written with it - and `tests/test_moderation_concurrency.py` enumerates the
+    sites and fails when one is added without it.
+
+    Call it as the FIRST statement of every fail-open `except Exception`.
+    """
+    if not isinstance(error, defer.CancelledError):
+        return
+    if on_cancel is not None:
+        # For the caller that still has something to record about the
+        # cancellation on its way past - a drop counter, say. It runs here
+        # rather than before the call so that this stays the FIRST statement
+        # of every handler, which is what makes the rule checkable.
+        on_cancel()
+    raise error

@@ -73,6 +73,7 @@ from synapse_pangea_chat.moderation.compat import (
     background_process_args,
     looping_call_interval,
     register_shutdown_handler,
+    reraise_if_cancelled,
 )
 from synapse_pangea_chat.moderation.log_safety import error_site, scrubbing_logger
 
@@ -205,6 +206,7 @@ class Tier2Dispatcher:
         try:
             return self._enqueue(job)
         except Exception as exc:
+            reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract. A moderation queue that could
             # raise into the notifier would make a moderation bug an outage.
             logger.warning(
@@ -361,18 +363,11 @@ class Tier2Dispatcher:
         metrics.TIER2_INFLIGHT.set(len(self._running))
         try:
             await self._handler(job)
-        except defer.CancelledError:
-            # NOT caught. Cancellation means somebody wants this worker to
-            # stop, and swallowing it leaves a consumer running behind a
-            # Deferred that has already fired - which is how the pool grows
-            # without bound. The `finally` below still releases the job.
-            #
-            # Counted on the way past, because the message was accepted and
-            # will not be checked, and an uncounted one is a silent drop
-            # whichever door it left by.
-            metrics.record_drop("cancelled")
-            raise
         except Exception as exc:
+            # Counted on the way past - the message was accepted and will not
+            # be checked, and an uncounted one is a silent drop whichever door
+            # it left by - and then re-raised rather than absorbed.
+            reraise_if_cancelled(exc, lambda: metrics.record_drop("cancelled"))
             # silent-ok: fail-open by contract, and the loop has to survive.
             # A worker that dies leaves the pool one short for the life of
             # the process, and `run_as_background_process` swallows what
@@ -394,6 +389,18 @@ class Tier2Dispatcher:
             # In a `finally` on every path - completion, failure,
             # cancellation. An id left behind does not just leak: it
             # permanently blocks that event from ever being moderated again.
+            #
+            # The limit, stated rather than discovered: on the cancellation
+            # path the claim is released while a redaction this job had
+            # already submitted may still be committing, so a redelivery of
+            # the same event could be admitted, re-read a target that is not
+            # yet redacted, and send a second redaction. Nothing in production
+            # cancels a worker - the drain abandons rather than cancels, the
+            # supervisor restarts rather than cancels, and the client's
+            # deadlines cancel the HTTP request and not the worker - so the
+            # window is not reachable today. Closing it for good needs a
+            # durable claim that outlives the process, which is the same thing
+            # cross-instance idempotency needs and is tracked with it.
             self._running.discard(job.event_id)
             self._inflight.discard(job.event_id)
             metrics.TIER2_INFLIGHT.set(len(self._running))
@@ -419,6 +426,7 @@ class Tier2Dispatcher:
                 metrics.TIER2_WORKERS_RESTARTED.inc()
                 self._start_worker(index)
         except Exception as exc:
+            reraise_if_cancelled(exc)
             # silent-ok: raising here would kill the supervisor itself, which
             # is the one thing standing between a dead worker and a pool that
             # never recovers.
@@ -444,9 +452,9 @@ class Tier2Dispatcher:
         """Stop one worker the way a crash would: silently.
 
         Test-only, and it lives here rather than in the test so it kills a
-        worker through the same door a real failure uses - the coroutine
-        ends and its Deferred fires - instead of reaching into private state
-        from outside and proving something else.
+        worker through the same door a real failure uses - the coroutine ends
+        and its Deferred fires - instead of reaching into private state from
+        outside and proving something else.
         """
         worker = self._workers[index]
         if worker is None or worker.called:
@@ -581,6 +589,16 @@ class Tier2Dispatcher:
         self._finish_drain()
 
     def _finish_drain(self) -> None:
+        if not self._drained:
+            # The END of the drain, and it is logged separately from the start
+            # on purpose: "shutting down with N in flight" proves only that
+            # the handler was entered, and an end-to-end test asserting on it
+            # passes just as well against a `shutdown` that returns
+            # immediately, registering no waiter and running no deadline.
+            logger.info(
+                "tier2 moderation drain finished with %d checks unaccounted for",
+                len(self._running),
+            )
         self._drained = True
         if self._drain_deadline is not None and self._drain_deadline.active():
             self._drain_deadline.cancel()

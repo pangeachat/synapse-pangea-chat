@@ -46,6 +46,7 @@ from synapse.module_api import NOT_SPAM, ModuleApi
 from synapse_pangea_chat.moderation import metrics
 from synapse_pangea_chat.moderation.breaker import CircuitBreaker
 from synapse_pangea_chat.moderation.choreo_client import ChoreoChecker
+from synapse_pangea_chat.moderation.compat import reraise_if_cancelled
 from synapse_pangea_chat.moderation.dispatch import ModerationJob, Tier2Dispatcher
 from synapse_pangea_chat.moderation.exempt import (
     CONFIG_KEY,
@@ -600,6 +601,7 @@ class ChatModeration:
                 )
             )
         except Exception as exc:
+            reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract; observe-only hook, so the
             # only cost of a failure here is a missed check — logged by type
             # and site rather than as a traceback, for the reason given on
@@ -680,6 +682,7 @@ class ChatModeration:
             )
             metrics.TIER2_REDACTIONS.labels(category=category).inc()
         except Exception as exc:
+            reraise_if_cancelled(exc)
             # A redaction send can fail for reasons that are ordinary rather
             # than exceptional: the sender has left, been kicked or been
             # banned (room auth checks membership before it checks redaction
@@ -737,6 +740,7 @@ class ChatModeration:
             store = self._api._hs.get_datastores().main
             existing = await store.get_event(job.event_id, allow_none=True)
         except Exception as exc:
+            reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract, and logged by type and site
             # rather than as a traceback for the reason on the handler below.
             metrics.TIER2_REDACTION_SKIPPED.labels(cause="lookup_failed").inc()

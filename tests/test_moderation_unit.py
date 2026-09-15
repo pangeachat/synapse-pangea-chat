@@ -1618,6 +1618,9 @@ class _FakeAgent:
         self.clock: Optional[Clock] = None
         self.cancelled = False
         self.canceller_raises = False
+        # Whatever the request Deferred was fired with, recorded before the
+        # client's own callbacks consume it.
+        self.source_results: List[Any] = []
 
     def request(
         self, method: bytes, uri: bytes, headers: Any = None, bodyProducer: Any = None
@@ -1651,7 +1654,22 @@ class _FakeAgent:
             )
 
         deferred: Any = defer.Deferred(_cancel)
-        self.clock.callLater(self.headers_after, deferred.callback, self.response)
+
+        def _record(result: Any) -> Any:
+            self.source_results.append(result)
+            return result
+
+        deferred.addBoth(_record)
+
+        def _deliver() -> None:
+            # A real client does not deliver a response on a connection it has
+            # already aborted. An unguarded `callback` here would raise
+            # `AlreadyCalledError` for reasons that are the double's, not the
+            # client's.
+            if not deferred.called:
+                deferred.callback(self.response)
+
+        self.clock.callLater(self.headers_after, _deliver)
         return deferred
 
 
@@ -1872,6 +1890,78 @@ class TestChoreoClient(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertIsInstance(results[0], Failure)
         results[0].trap(defer.CancelledError)
+
+    def test_a_cancel_while_awaiting_headers_stays_cancelled(self) -> None:
+        """The header phase, asserted separately from the body phase.
+
+        Cancelling a real request awaiting headers errbacks with
+        `ResponseNeverReceived`, which is an ordinary transport failure - so
+        the conversion that has to be prevented happens on a different route
+        here than it does mid-body, and a test that covered only one of them
+        left the other free to swallow a worker's stop signal.
+        """
+        clock = Clock()
+        response = _FakeResponse()
+        agent = _FakeAgent(response, headers_after=REQUEST_TIMEOUT_SECONDS * 10)
+        agent.clock = clock
+        deferred, results = self._call(agent, clock)
+        self.assertEqual(results, [])
+        deferred.cancel()
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], Failure)
+        results[0].trap(defer.CancelledError)
+        self.assertTrue(agent.cancelled, "the request was left in flight")
+
+    def test_a_deadline_never_fires_the_agents_own_deferred(self) -> None:
+        """The wait ends on a Deferred WE own; the agent's is only cancelled.
+
+        Forcing an errback onto the agent's Deferred would mean its producer
+        can fire an already-called Deferred later - an `AlreadyCalledError` out
+        of the reactor, on the commonest timeout path there is. A response
+        arriving after the deadline is the case the deadline exists for, so
+        that is not a rare corner.
+        """
+        clock = Clock()
+        response = _FakeResponse()
+        agent = _FakeAgent(response, headers_after=REQUEST_TIMEOUT_SECONDS * 4)
+        agent.clock = clock
+        _deferred, results = self._call(agent, clock)
+        clock.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        self.assertEqual(len(results), 1)
+        results[0].trap(ModerationCheckError)
+        # The agent's own Deferred was ended by its CANCELLER, not handed our
+        # error. `ResponseNeverReceived` is what its canceller delivers.
+        self.assertEqual(len(agent.source_results), 1)
+        source = agent.source_results[0]
+        self.assertIsInstance(source, Failure)
+        self.assertNotIsInstance(source.value, ModerationCheckError)
+        # And the late arrival changes nothing.
+        clock.advance(REQUEST_TIMEOUT_SECONDS * 4)
+        self.assertEqual(len(results), 1)
+
+    def test_a_config_error_status_is_not_relabelled_by_a_stalled_body(
+        self,
+    ) -> None:
+        """Status before body, because the two answer different questions.
+
+        A 401 whose body then stalls was reported as a timeout - and a timeout
+        opens the breaker, while a bad service-account token must never open
+        it: the token repeats forever, so opening would disable moderation
+        until a human noticed, with the breaker's gauge blaming the provider.
+        """
+        clock = Clock()
+        response = _FakeResponse(code=401)
+        agent = _FakeAgent(response)
+        _deferred, results = self._call(agent, clock)
+        self.assertEqual(len(results), 1, "the status check waited for the body")
+        error = results[0].value
+        self.assertIsInstance(error, ModerationCheckError)
+        self.assertEqual(error.kind, "config_error")
+        self.assertTrue(
+            response.transport.lost or response.transport.aborted,
+            "the refused response's connection was left open, so it never "
+            "returns to the pool",
+        )
 
     def test_a_canceller_that_raises_still_ends_the_wait(self) -> None:
         """Teardown is best-effort; ending the wait is not.
