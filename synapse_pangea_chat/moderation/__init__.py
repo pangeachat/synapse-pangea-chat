@@ -274,18 +274,24 @@ class _DisplayedText(HTMLParser):
         # outside a cell is moved OUT by an HTML5 tree builder and displayed
         # immediately BEFORE the table, in order - so
         # `<table>41<tr><td>notes</td></tr>5-555-2671</table>` reads as
-        # `415-555-2671` followed by a one-cell table. Read in source order,
-        # with the cell breaks between them, it was `41 notes 5-555-2671` and
-        # the number a reader sees was shown to neither tier.
+        # `415-555-2671` followed by a one-cell table, while this extractor
+        # reads it in source order with the cell breaks between.
         #
-        # Collected per table and added as an EXTRA surface rather than
-        # replacing the in-place reading: that is this module's standing rule
-        # for an ambiguous rendering, and it means the repair can only ever
-        # add text, never remove some. It is not a tree builder - it is the
-        # one rule that moves displayed characters somewhere else.
+        # **We do not reconstruct that reading. We report that we cannot.**
+        # Three attempts to synthesise the fostered run produced, in turn: a
+        # missed number when a row held the text, a missed number when one
+        # `<div>` sat inside a cell, and an INVENTED number across a nested
+        # table - a pre-send block on text no reader sees, which is the
+        # expensive direction. Getting it right needs the insertion modes and
+        # the element stack of a real tree builder; that is out of scope here,
+        # and each partial model of it was wrong in a new place.
+        #
+        # So the case is made SAFE rather than silently wrong: the extraction
+        # is marked incomplete, which counts it and hands it to Tier 2, and
+        # the text is left in source order for whatever the rules can make of
+        # it. Tier 1 does not act on a reading we know is not the reader's.
         self._in_a_cell = False
-        self._fostered: List[str] = []
-        self._fostered_runs: List[str] = []
+        self._fostered_text = False
 
     def handle_data(self, data: str) -> None:
         if self._invisible:
@@ -293,19 +299,14 @@ class _DisplayedText(HTMLParser):
         self._emit(data)
 
     def _emit(self, text: str) -> None:
-        """Displayed text, into the in-place reading and into the fostered
-        run when one is open. One place, so the two cannot drift: a character
-        that is in the flow is in the flow wherever the flow ends up."""
+        """Displayed text, in source order - and a note when the reader will
+        not see it in that order."""
         self._parts.append(text)
-        if self._table_depth > 0 and not self._in_a_cell:
-            self._fostered.append(text)
+        if self._table_depth > 0 and not self._in_a_cell and text.strip():
+            self._fostered_text = True
 
     def _end_table(self) -> None:
         self._in_a_cell = False
-        fostered, self._fostered = self._fostered, []
-        for run in "".join(fostered).split("\n"):
-            if run.strip():
-                self._fostered_runs.append(run.strip())
 
     def _breaks_line(self, tag: str) -> bool:
         if tag in _BLOCK_LEVEL_TAGS:
@@ -332,19 +333,7 @@ class _DisplayedText(HTMLParser):
         if self._breaks_line(tag):
             self._open_blocks.append(tag)
             self._parts.append("\n")
-            if tag in _BLOCK_LEVEL_TAGS:
-                # A real block boundary breaks the FOSTERED run too. Foster
-                # parenting moves the characters out of the table; it does
-                # not merge two block boxes into one line, so
-                # `<table><div>415</div><div>5552671</div></table>` is two
-                # blocks before the table and not the phone number
-                # `4155552671` - which Tier 1 blocked, on a message where no
-                # reader sees it.
-                #
-                # A row or cell tag is NOT such a boundary: those elements
-                # move into the table, and the characters foster-parented
-                # past them are contiguous on screen.
-                self._fostered.append("\n")
+
         if self._invisible:
             # Attributes inside script or style source are not markup and are
             # displayed by nothing.
@@ -365,14 +354,6 @@ class _DisplayedText(HTMLParser):
                 # its ordinary markers, so the value is on screen nowhere.
                 continue
             if (tag, name) in _INLINE_ATTRIBUTES:
-                # In the flow, so it is foster-parented with the flow. An
-                # image's alternative text REPLACES the image between the
-                # characters either side, and leaving it out of the fostered
-                # run joined the text on both sides of it:
-                # `<table>41<img alt="999">5-555-2671</table>` reads as
-                # `41 999 5-555-2671` and produced the phone number
-                # `415-555-2671`, which is a pre-send block on a number no
-                # reader sees.
                 self._emit(value)
             elif (tag, name) in _OUT_OF_FLOW_ATTRIBUTES:
                 self.attribute_text.append(value)
@@ -410,12 +391,16 @@ class _DisplayedText(HTMLParser):
 
     def close(self) -> None:
         super().close()
-        # An unclosed `<table>` still displays its fostered text.
         self._end_table()
 
+    @property
+    def rearranged(self) -> bool:
+        """True when the reader sees this text in an order we did not read it
+        in, so the caller can count the message and hand it to Tier 2."""
+        return self._fostered_text
+
     def result(self) -> str:
-        extra = self._fostered_runs + self.attribute_text
-        return "".join(self._parts + ["\n" + text for text in extra])
+        return "".join(self._parts + ["\n" + a for a in self.attribute_text])
 
 
 def _displayed_text(formatted: str) -> str:
@@ -439,6 +424,22 @@ def _displayed_text(formatted: str) -> str:
     parser.feed(prepared)
     parser.close()
     return parser.result()
+
+
+def _displayed_reading(formatted: str) -> Tuple[str, bool]:
+    """The displayed text, and whether the reader sees it in this ORDER.
+
+    Two values because they are two facts: the characters, and whether the
+    arrangement we read them in is the arrangement on screen. See
+    `_DisplayedText` for why the second one is reported rather than repaired.
+    """
+    prepared = formatted.replace("\x00", "\ufffd")
+    prepared = _ABRUPT_COMMENTS.sub("<!---->", prepared)
+    prepared = _MARKED_SECTIONS.sub(_BOGUS_COMMENT_OPEN, prepared)
+    parser = _DisplayedText()
+    parser.feed(prepared)
+    parser.close()
+    return parser.result(), parser.rearranged
 
 
 class _Extracted(NamedTuple):
@@ -941,7 +942,6 @@ class ChatModeration:
                     "content": {"redacts": job.event_id, "reason": reason},
                 }
             )
-            metrics.TIER2_REDACTIONS.labels(category=category).inc()
         except Exception as exc:
             # The claim goes back on the CANCELLATION path as well, which is
             # what the callback is for: `reraise_if_cancelled` re-raises
@@ -988,7 +988,9 @@ class ChatModeration:
         # OUTSIDE the try, and deliberately: anything that raised in here
         # while inside it would be read as a failed send, and the module would
         # release a claim and count a failure on a redaction that had already
-        # landed.
+        # landed. The success metric is out here for the same reason - the
+        # `try` holds the send and nothing else.
+        metrics.TIER2_REDACTIONS.labels(category=category).inc()
         await self._warn_if_preserved_meanwhile(job)
 
     def _record_matcher_agreement(
@@ -1274,7 +1276,13 @@ def _surface_text(surface: Mapping[str, Any]) -> Tuple[List[str], bool]:
     incomplete = False
     for name, reader in _SURFACE_READERS:
         try:
-            parts.extend(reader(surface))
+            read, rearranged = reader(surface)
+            parts.extend(read)
+            # "Read in an order the reader does not see" counts the same as
+            # "could not read": in both cases what the rules were given is not
+            # what is on screen, so the message is counted and handed to Tier
+            # 2 rather than judged on it.
+            incomplete = incomplete or rearranged
         except Exception as exc:
             reraise_if_cancelled(exc)
             incomplete = True
@@ -1293,36 +1301,38 @@ def _surface_text(surface: Mapping[str, Any]) -> Tuple[List[str], bool]:
     return parts, incomplete
 
 
-def _body_field(surface: Mapping[str, Any]) -> List[str]:
-    return _field_text(surface.get("body"))
+def _body_field(surface: Mapping[str, Any]) -> Tuple[List[str], bool]:
+    return _field_text(surface.get("body")), False
 
 
-def _filename_field(surface: Mapping[str, Any]) -> List[str]:
+def _filename_field(surface: Mapping[str, Any]) -> Tuple[List[str], bool]:
     # `isinstance` first: a `msgtype` that is a list or an object is unhashable,
     # and the set-membership test then raises `TypeError` out of extraction -
     # which the fail-open handler catches, discarding the outer body that had
     # already been read. A malformed field must not cost the message its check.
     msgtype = surface.get("msgtype")
     if isinstance(msgtype, str) and msgtype in _ATTACHMENT_MSGTYPES:
-        return _field_text(surface.get("filename"))
-    return []
+        return _field_text(surface.get("filename")), False
+    return [], False
 
 
-def _formatted_field(surface: Mapping[str, Any]) -> List[str]:
+def _formatted_field(surface: Mapping[str, Any]) -> Tuple[List[str], bool]:
     formatted = surface.get("formatted_body")
     if (
         surface.get("format") != _HTML_FORMAT
         or not isinstance(formatted, str)
         or not formatted.strip()
     ):
-        return []
-    displayed = _displayed_text(formatted)
-    return [displayed] if displayed.strip() else []
+        return [], False
+    displayed, rearranged = _displayed_reading(formatted)
+    return ([displayed] if displayed.strip() else []), rearranged
 
 
 #: The three independent readings of one content surface, each named for the
 #: log line so that nothing inside the per-field guard can raise.
-_SURFACE_READERS: Tuple[Tuple[str, Callable[[Mapping[str, Any]], List[str]]], ...]
+_SURFACE_READERS: Tuple[
+    Tuple[str, Callable[[Mapping[str, Any]], Tuple[List[str], bool]]], ...
+]
 
 
 def _field_text(body: Any) -> List[str]:
@@ -1387,6 +1397,10 @@ UNNAMED_CATEGORY = "flagged"
 # learner disclosing that they intend to harm themselves, where the message is
 # a request for help and deleting it helps nobody.
 PRESERVE_CATEGORIES = frozenset({"self_harm"})
+# The same names written without a separator at all. A provider that sends
+# `selfharm` has said the one thing that must never be redacted, and losing a
+# disclosure to a missing hyphen is not a trade this feature makes.
+_PRESERVE_RUN_ON = frozenset({"selfharm"})
 
 # How much of a message the deterministic matcher reads, matching what the
 # endpoint reads. `/choreo/moderate` truncates its input at 10,000 characters
@@ -1462,8 +1476,14 @@ def _preserves(category: Any) -> bool:
         return True
     if not isinstance(category, str):
         return False
-    head = category.casefold().split("/", 1)[0].replace("-", "_")
-    return head in PRESERVE_CATEGORIES
+    # Stripped, and every separator folded, because the point of this branch
+    # is to recognise a name we do NOT have in our vocabulary - so it cannot
+    # depend on the service spelling it the way we would. A leading space
+    # defeated it: `" self-harm/intent"` normalised to `" self_harm"`, fell
+    # through to `other`, and `other` redacts.
+    head = category.strip().casefold().split("/", 1)[0]
+    head = head.replace("-", "_").replace(" ", "_")
+    return head in PRESERVE_CATEGORIES or head.replace("_", "") in _PRESERVE_RUN_ON
 
 
 def _summarize_categories(categories: Iterable[Any]) -> str:

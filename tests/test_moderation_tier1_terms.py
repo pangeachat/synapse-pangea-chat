@@ -939,6 +939,38 @@ class TestTheMatchingRules(unittest.TestCase):
         self.assertFalse(matches_tier1(message))
         self.assertLess(time.perf_counter() - started, 1.0)
 
+    def test_a_run_is_matched_by_its_suffixes(self) -> None:
+        """The run grows from wherever the last unjoinable token was, so a
+        whole-run test let one short word in front defeat it: `p 1 c a`
+        blocked and `Say a p 1 c a now` did not."""
+        for text in (
+            "p 1 c a",
+            "Say a p 1 c a now",
+            "x n 1 g g e r",
+            "a b p 1 c a",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(check_text(text, _PHONE_REGIONS), REASON_PROFANITY)
+
+    def test_a_line_break_is_not_a_word_space(self) -> None:
+        """A newline is a stronger boundary than a space, and the rendered
+        text of a table row, a list or a `<br>` is full of them. A learner's
+        numbered list rejoined down the column and returned `M_FORBIDDEN`."""
+        from synapse_pangea_chat.moderation import _displayed_text
+
+        for formatted in (
+            "<table><tr><td>p</td><td>1</td><td>c</td><td>a</td></tr></table>",
+            "<p>p</p><p>1</p><p>c</p><p>a</p>",
+            "<ol><li>v</li><li>1</li><li>t</li><li>t</li><li>u</li></ol>",
+            "b<br>4<br>n<br>g<br>s<br>a<br>t",
+        ):
+            with self.subTest(formatted=formatted):
+                self.assertIsNone(
+                    check_text(_displayed_text(formatted), _PHONE_REGIONS)
+                )
+        # And a word written with spaces inside it stays on one line.
+        self.assertEqual(check_text("p 1 c a", _PHONE_REGIONS), REASON_PROFANITY)
+
     def test_a_rejoining_needs_whitespace_and_a_digit(self) -> None:
         """Both conditions, because each on its own blocks ordinary text.
 

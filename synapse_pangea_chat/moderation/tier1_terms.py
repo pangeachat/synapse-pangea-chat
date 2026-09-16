@@ -71,9 +71,21 @@ class Span(NamedTuple):
 
     @property
     def after_space_only(self) -> bool:
-        """Nothing but whitespace, so the two tokens are consecutive words of
-        one sentence - not two words either side of a full stop."""
-        return self.gap != "" and self.gap.isspace()
+        """Nothing but whitespace, and no LINE BREAK, so the two tokens are
+        consecutive words of one line.
+
+        A newline is a stronger boundary than a space, not a weaker one, and
+        the rendered text of a table row, a list or a `<br>` is full of them:
+        `<ol><li>v</li><li>1</li><li>t</li><li>t</li><li>u</li></ol>` is a
+        numbered list a learner can write, and rejoining down it produced
+        `M_FORBIDDEN`. A word written with spaces inside it stays on one line.
+        """
+        return (
+            self.gap != ""
+            and self.gap.isspace()
+            and "\n" not in self.gap
+            and "\r" not in self.gap
+        )
 
 
 class TermRecord(TypedDict, total=False):
@@ -375,9 +387,25 @@ def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
             dropped = run.popleft()
             run_length -= len(dropped.text)
             run_digits -= _digit_count(dropped.text)
-        if run_digits and len(run) >= 2:
-            if "".join(piece.text for piece in run) in needles:
-                return True
+        if run_digits and len(run) >= 2 and _run_hits(run, needles):
+            return True
+    return False
+
+
+def _run_hits(run: Sequence[Span], needles: Set[str]) -> bool:
+    """Does any SUFFIX of this run equal a needle?
+
+    Every suffix, not only the whole run: the run grows from wherever the last
+    unjoinable token was, so one short word in front of the evasion defeated a
+    whole-run test - `p 1 c a` blocked and `Say a p 1 c a now` did not. The run
+    is capped at the longest needle, so this is a bounded number of joins per
+    token and the scan stays linear in the message.
+    """
+    joined = ""
+    for span in reversed(run):
+        joined = span.text + joined
+        if len(joined) >= 2 and joined in needles:
+            return True
     return False
 
 

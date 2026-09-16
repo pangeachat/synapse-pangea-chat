@@ -48,6 +48,7 @@ from synapse_pangea_chat.moderation import (
     UNKNOWN_CATEGORY,
     ChatModeration,
     _background_process_args,
+    _displayed_reading,
     _displayed_text,
     _normalize_category,
     _summarize_categories,
@@ -1225,6 +1226,27 @@ class TestAnUnusableVerdictIsNoVerdict(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
+    def test_every_clause_of_the_usable_check_is_load_bearing(self) -> None:
+        """Each clause on its own, because deleting either the non-empty test
+        or the all-strings test left every other test in the suite green - and
+        an empty list summarises to `flagged`, which redacts."""
+        from synapse_pangea_chat.moderation import _usable_categories
+
+        self.assertTrue(_usable_categories(["harassment"]))
+        unusable_cases: List[Any] = [[], None, "harassment", ["harassment", 7], [None]]
+        for unusable in unusable_cases:
+            with self.subTest(categories=unusable):
+                self.assertFalse(_usable_categories(unusable))
+
+    def test_a_redaction_skip_cause_is_validated(self) -> None:
+        """The closed label set is enforced, like every other one in this
+        module: a cause nobody declared is a skip filed where nobody alerts."""
+        from synapse_pangea_chat.moderation import metrics as mod_metrics
+
+        with self.assertRaises(ValueError):
+            mod_metrics.record_redaction_skip("not-a-declared-cause")
+        mod_metrics.record_redaction_skip("preserved")
+
     async def test_an_unusable_verdict_takes_no_decision_at_all(self) -> None:
         """Not a redaction, and not a preserve either: saying preserve would
         be the same overclaim in the other direction, since nothing durable is
@@ -1248,6 +1270,39 @@ class TestAnUnusableVerdictIsNoVerdict(unittest.IsolatedAsyncioTestCase):
             ),
             1.0,
         )
+
+    async def test_a_self_harm_name_we_do_not_know_still_preserves(self) -> None:
+        """The prefix rule exists to catch a name we do NOT have in our
+        vocabulary, so it cannot depend on the service spelling it the way we
+        would. A leading space defeated it: `" self-harm/intent"` normalised
+        to `" self_harm"`, fell through to `other`, and `other` redacts."""
+        for category in (
+            " self-harm/intent",
+            "self-harm/intent ",
+            "SELF-HARM/INTENT",
+            "self harm",
+            "selfharm",
+            "self_harm/brand-new",
+        ):
+            with self.subTest(category=category):
+                api, mod = self._module()
+                verdict = create_autospec(moderate_text)
+                verdict.return_value = {"flagged": True, "categories": [category]}
+                with patch(MODERATE_TEXT, verdict):
+                    await mod._check_and_redact(self._job())
+                cast(
+                    AsyncMock, api.create_and_send_event_into_room
+                ).assert_not_awaited()
+
+    async def test_an_ordinary_category_is_still_redacted(self) -> None:
+        """The rule has to stay narrow: a name that merely looks unfamiliar is
+        not a disclosure."""
+        api, mod = self._module()
+        verdict = create_autospec(moderate_text)
+        verdict.return_value = {"flagged": True, "categories": [" harassment "]}
+        with patch(MODERATE_TEXT, verdict):
+            await mod._check_and_redact(self._job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
 
     async def test_an_unrecognised_self_harm_category_still_preserves(self) -> None:
         """A sub-category the provider adds after our fixture was pinned
@@ -1481,6 +1536,30 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
             f"SELECT disposition FROM {DISPOSITION_TABLE}"
         ).fetchall()
         self.assertEqual(rows, [("preserved",)])
+
+    async def test_a_claim_that_cannot_be_given_back_is_counted(self) -> None:
+        """A release that fails leaves a durable row saying the event was
+        redacted when it was not, so no verdict on any instance will ever take
+        that message down. That is worse than the behaviour before the table
+        existed, and clearing the row is a human's job - they have to know."""
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier2_claim_stranded_total")
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        sends = cast(AsyncMock, api.create_and_send_event_into_room)
+        sends.side_effect = RuntimeError("the sender has left the room")
+
+        def _fail_the_release(desc: str) -> None:
+            if "release" in desc:
+                raise RuntimeError("database is unhappy")
+
+        db_pool.on_interaction = _fail_the_release
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job())
+        self.assertEqual(
+            reader.delta("pangea_moderation_tier2_claim_stranded_total"), 1.0
+        )
 
     async def test_a_cancelled_send_gives_the_claim_back(self) -> None:
         """The drain cancels an abandoned worker, and it can be parked on this
@@ -1914,7 +1993,7 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
             }
         )
         with patch(
-            "synapse_pangea_chat.moderation._displayed_text",
+            "synapse_pangea_chat.moderation._displayed_reading",
             side_effect=RecursionError("boom"),
         ):
             self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
@@ -1927,7 +2006,7 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
         every other test in this suite green."""
         from synapse_pangea_chat.moderation import _SURFACE_READERS
 
-        def _broken(_surface: Any) -> List[str]:
+        def _broken(_surface: Any) -> Tuple[List[str], bool]:
             raise RuntimeError("boom")
 
         self.assertEqual(len(_SURFACE_READERS), 3)
@@ -1974,7 +2053,7 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
             }
         )
         with patch(
-            "synapse_pangea_chat.moderation._displayed_text",
+            "synapse_pangea_chat.moderation._displayed_reading",
             side_effect=RecursionError("boom"),
         ):
             self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
@@ -2013,7 +2092,7 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
             }
         )
         with patch(
-            "synapse_pangea_chat.moderation._displayed_text",
+            "synapse_pangea_chat.moderation._displayed_reading",
             side_effect=RecursionError("boom"),
         ):
             await mod.on_new_event(event, {})
@@ -2062,108 +2141,103 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
         )
 
 
-class TestTableRepair(unittest.IsolatedAsyncioTestCase):
+class TestFosterParentedText(unittest.IsolatedAsyncioTestCase):
     """Text inside a table but outside a cell is DISPLAYED BEFORE THE TABLE.
 
-    HTML5 calls it foster parenting, and it is not an obscure corner: it is
-    what every browser does with `<table>41<tr><td>notes</td></tr>5-555-2671`,
-    which reads as `415-555-2671` followed by a one-cell table. The extractor
-    returned `41\n\nnotes\n\n5-555-2671` - source order, with the cell
-    breaks between - so the number a reader sees was never shown to either
-    tier. Same rule as every other case in this file: what the rules see is
-    never less than what a reader sees.
+    HTML5 calls it foster parenting, and it is what every browser does with
+    `<table>41<tr><td>notes</td></tr>5-555-2671</table>`: `415-555-2671`
+    followed by a one-cell table. This extractor reads source order, so it
+    reads something the reader does not see.
+
+    **It reports that rather than repairing it**, and that is the decision.
+    Three attempts to synthesise the reader's order were each wrong in a new
+    place - a missed number when a row held the text, a missed number when one
+    `<div>` sat inside a cell, and an INVENTED number across a nested table,
+    which is a pre-send block on text nobody sees. Getting it right needs the
+    insertion modes and the element stack of a real tree builder. So the case
+    is made SAFE instead: counted, handed to Tier 2, and never acted on by the
+    tier that blocks.
     """
 
-    FOSTERED = "<table>41<tr><td>notes</td></tr>5-555-2671</table>"
+    FOSTERED = (
+        "<table>41<tr><td>notes</td></tr>5-555-2671</table>",
+        "<table>41<tr><td><div>x</div></td></tr>5-555-2671</table>",
+        "<table>41<td>notes<td>x</tr>5-555-2671</table>",
+        "<table><tr>415-555-2671<td>a</td></tr></table>",
+        "<table><tbody>415-555-2671<tr><td>a</td></tr></tbody></table>",
+        "<table><tr><td>a<table><tr><td>b</td></tr></table>41</td></tr>"
+        "5-555-2671</table>",
+    )
 
-    def test_the_fostered_run_is_moderated_as_one_string(self) -> None:
-        self.assertIn("415-555-2671", _displayed_text(self.FOSTERED))
+    def test_a_rearranged_reading_is_reported(self) -> None:
+        for formatted in self.FOSTERED:
+            with self.subTest(formatted=formatted):
+                _text, rearranged = _displayed_reading(formatted)
+                self.assertTrue(rearranged)
 
-    def test_cell_text_is_still_separated(self) -> None:
-        """The repair adds a surface; it does not join cells that render
-        apart, which would invent a number out of two columns."""
-        cells = _displayed_text("<table><tr><td>415</td><td>5552671</td></tr></table>")
-        self.assertNotIn("4155552671", cells)
-
-    def test_a_cell_left_open_still_closes(self) -> None:
-        """HTML5 inserts the end tag for you: a second `<td>` closes the
-        first, and a row boundary closes whatever cell is open. Counting
-        cells instead of tracking one meant a table with implied end tags
-        never came back out of a cell, and the number before it was collected
-        by nothing."""
+    def test_an_ordinary_table_is_not_reported(self) -> None:
+        """The report has to mean something, so a table whose text is all
+        inside its cells must not raise it - nor must ordinary markup."""
         for formatted in (
-            "<table>41<td>notes<td>x</tr>5-555-2671</table>",
-            "<table><tbody><tr><td>a</td></tr></tbody>41<tr><td>b</td></tr>"
+            "<table><tr><td>415</td><td>5552671</td></tr></table>",
+            "<table><caption>notes</caption><tr><td>a</td></tr></table>",
+            "call 41<td>5-555-2671",
+            "<p>one</p><p>two</p>",
+        ):
+            with self.subTest(formatted=formatted):
+                _text, rearranged = _displayed_reading(formatted)
+                self.assertFalse(rearranged)
+
+    def test_nothing_is_invented(self) -> None:
+        """The expensive direction. A number assembled out of text a reader
+        sees in a different order, or in different blocks, is a pre-send block
+        on a message nobody can read that way."""
+        for formatted in (
+            "<table><tr><td>a<table><tr><td>b</td></tr></table>41</td></tr>"
             "5-555-2671</table>",
+            "<table><div>415</div><div>5552671</div></table>",
+            "<table>41</table><table>5-555-2671</table>",
+            '<table>41<img alt="999" src="x">5-555-2671</table>',
         ):
             with self.subTest(formatted=formatted):
-                self.assertIn("415-555-2671", _displayed_text(formatted))
+                text, _rearranged = _displayed_reading(formatted)
+                self.assertIsNone(check_text(text, ["US"]))
 
-    def test_a_row_start_is_not_a_cell_start(self) -> None:
-        """Text directly inside a row or a table section is inside no cell at
-        all, and HTML5 foster-parents it like any other.
-
-        Asserted by COUNTING, because the in-place reading already contains
-        this number: a run that is contiguous in the source is contiguous
-        there whether or not it was collected, so `assertIn` passes on a
-        collector that never ran. The fostered surface adds the second copy.
-        """
-        for formatted in (
-            "<table><tr>415-555-2671<td>a</td></tr></table>",
-            "<table><tbody>415-555-2671<tr><td>a</td></tr></tbody></table>",
-        ):
-            with self.subTest(formatted=formatted):
-                self.assertEqual(
-                    _displayed_text(formatted).count("415-555-2671"),
-                    2,
-                    "the row's own text was not foster-parented",
-                )
-
-    def test_the_repair_keeps_the_text_that_stands_in_the_flow(self) -> None:
-        """An image's alternative text REPLACES the image between the
-        characters either side, so it is in the flow and is foster-parented
-        with the flow. Left out, the text on both sides of it joined:
-        `<table>41<img alt="999">5-555-2671</table>` reads as
-        `41 999 5-555-2671` and produced `415-555-2671`, a pre-send block on a
-        number no reader sees."""
-        displayed = _displayed_text(
-            '<table>41<img alt="999" src="x">5-555-2671</table>'
+    async def test_it_is_counted_and_reaches_tier_2(self) -> None:
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_extraction_incomplete_total", tier="tier2")
+        homeserver = HomeServerDouble()
+        mod = _tier2_module(self, _module_api(homeserver), _tier2_config())
+        dispatcher = mod._dispatcher
+        assert dispatcher is not None
+        event = _event(
+            content={
+                "msgtype": "m.text",
+                "body": "look",
+                "format": "org.matrix.custom.html",
+                "formatted_body": self.FOSTERED[0],
+            }
         )
-        self.assertNotIn("415-555-2671", displayed)
-        self.assertIn("419995-555-2671", displayed)
-
-    def test_a_row_is_not_a_cell(self) -> None:
-        """Text between a `</td>` and its `</tr>` is outside every cell, and
-        HTML5 foster-parents it exactly like text before the first row."""
-        self.assertIn(
-            "415-555-2671",
-            _displayed_text("<table>41<tr><td>notes</td>5-555-2671</tr></table>"),
+        await mod.on_new_event(event, {})
+        self.assertEqual(dispatcher.queue_depth, 1)
+        self.assertEqual(
+            reader.delta("pangea_moderation_extraction_incomplete_total", tier="tier2"),
+            1.0,
         )
 
-    def test_the_repair_does_not_invent_a_number_across_blocks(self) -> None:
-        """The expensive direction. Foster parenting moves the characters out
-        of the table; it does not merge two block boxes into one line, and a
-        number invented out of two blocks is a Tier-1 block on a message
-        nobody can read that way."""
-        displayed = _displayed_text("<table><div>415</div><div>5552671</div></table>")
-        self.assertNotIn("4155552671", displayed)
-
-    def test_two_tables_do_not_run_together(self) -> None:
-        first = "<table>41</table>"
-        second = "<table>5-555-2671</table>"
-        self.assertNotIn("415-555-2671", _displayed_text(first + second))
-
-    async def test_the_displayed_number_blocks_before_send(self) -> None:
+    async def test_tier_1_does_not_block_on_a_reading_it_cannot_trust(
+        self,
+    ) -> None:
         mod = _moderation(_config())
         event = _event(
             content={
                 "msgtype": "m.text",
                 "body": "look",
                 "format": "org.matrix.custom.html",
-                "formatted_body": self.FOSTERED,
+                "formatted_body": self.FOSTERED[0],
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(await mod.check_event_for_spam(event), NOT_SPAM)
 
 
 class TestExtraction(unittest.IsolatedAsyncioTestCase):

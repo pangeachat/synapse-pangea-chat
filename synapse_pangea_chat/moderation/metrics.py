@@ -167,6 +167,14 @@ TIER2_REDACTED_AFTER_PRESERVE = _get_or_create(
     "this is nonzero only when two instances both run background tasks.",
 )
 
+TIER2_CLAIM_STRANDED = _get_or_create(
+    Counter,
+    "pangea_moderation_tier2_claim_stranded_total",
+    "Redaction claims that could not be given back after no redaction was "
+    "sent. The row says the event was redacted and it was not, so nothing "
+    "will ever take that message down; a human has to clear the row.",
+)
+
 TIER2_WORKERS_RESTARTED = _get_or_create(
     Counter,
     "pangea_moderation_tier2_workers_restarted_total",

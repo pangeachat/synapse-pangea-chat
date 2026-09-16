@@ -21,6 +21,15 @@ same reason, and two instances never had it: two processes, two memories, no
 shared claim. An earlier revision proposed an LRU of remembered verdicts,
 which fails on eviction as well.
 
+**A claim that cannot be given back is a message that can never be taken
+down.** The release is scoped and retried by nothing, so a release that fails
+- or a process killed between the claim committing and the send - leaves a
+durable `redacted` row on a message nobody redacted. There is no expiry and
+no reconciliation here: a claim with a time limit is a second way to
+double-redact, and choosing between those needs evidence this change does not
+have. It is counted (`pangea_moderation_tier2_claim_stranded_total`) and
+logged at ERROR so the row can be cleared by hand.
+
 **The limit, stated exactly, because it is the one the table cannot close.**
 A redaction is an irreversible action taken in another system, and no table
 can recall one that is already in flight. So the guarantee is about the
@@ -323,10 +332,20 @@ class DispositionStore:
         read a table that says nothing, and then one writes `preserved` while
         the other sends the redaction. `INSERT ... ON CONFLICT DO NOTHING`
         followed by a read of the row IN THE SAME TRANSACTION closes it -
-        exactly one of the two decisions lands, and the loser is told which
-        one won. Preserving wins whenever it got there first, which is the
+        exactly one of the two decisions lands, and the loser learns that it
+        lost. Preserving wins whenever it got there first, which is the
         guarantee; the reverse order is the limit ADR-7/OD-14 already records,
         that a first evaluation can simply miss a disclosure.
+
+        **What the loser is told depends on the isolation level, and the safe
+        answer does not.** Synapse sets REPEATABLE READ on its Postgres
+        connections, so the loser's `SELECT` reads the snapshot its
+        transaction opened with and may not see the row the winner has just
+        committed. It then reads `row is None` and reports an unknown
+        disposition rather than naming the winner. Both outcomes refuse to
+        redact - which is the guarantee - and the difference is which metric
+        an operator sees, so it is written down here rather than left to be
+        inferred from a docstring that assumed READ COMMITTED.
 
         It also makes a redaction idempotent ACROSS processes, which nothing
         in memory could: the in-flight set the dispatcher keeps is per-process,
@@ -458,10 +477,18 @@ class DispositionStore:
             )
         except Exception as exc:
             reraise_if_cancelled(exc)
-            # silent-ok: the cost is one message that will not be re-tried,
-            # which is the behaviour before this table existed.
-            logger.warning(
-                "tier2 could not release the redaction claim on %s at %s (%s)",
+            # silent-ok in the sense that nothing is blocked, and NOT in the
+            # sense that nothing is lost: the row still says this event was
+            # redacted and it was not, so no verdict on any instance will
+            # ever take that message down again. That is worse than the
+            # behaviour before this table existed, where a later verdict
+            # could still act, so it is counted rather than logged alone -
+            # clearing the row is a human's job and they have to know.
+            metrics.TIER2_CLAIM_STRANDED.inc()
+            logger.error(
+                "tier2 could not release the redaction claim on %s at %s "
+                "(%s); the row says it was redacted and it was not, so "
+                "nothing will take that message down until the row is cleared",
                 event_id,
                 error_site(exc),
                 type(exc).__name__,
