@@ -1182,9 +1182,16 @@ class ChoreoChecker:
         except Exception as exc:
             reraise_if_cancelled(exc)
             if failure_kind(exc) == KIND_BATCH_UNSUPPORTED:
-                # Not a failure of the provider: nothing is reported to the
-                # breaker and nothing is counted as an error, because the
-                # messages are about to be checked properly one at a time.
+                # silent-ok: not a failure of the provider, and deliberately
+                # not reported as one. The endpoint refused the SHAPE of the
+                # request, the messages are about to be checked properly one
+                # at a time, and nothing has gone unmoderated - so nothing is
+                # told to the breaker and nothing is counted as an error. It
+                # is not unobservable either: `_demote_batching` logs the
+                # demotion once and raises the
+                # `tier2_batch_unsupported` gauge, which is the signal an
+                # operator actually wants - a per-batch line would say the
+                # same thing on every batch for the life of the process.
                 return _BATCH_UNSUPPORTED
             # `Exception` rather than `ModerationCheckError`, for the reason
             # given on `_check_admitted`: whatever escapes this frame reaches

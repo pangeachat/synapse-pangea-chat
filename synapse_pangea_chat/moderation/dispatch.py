@@ -506,7 +506,12 @@ class Tier2Dispatcher:
                 waiter,
             )
         except Exception:
-            # `Clock.call_later` raises once the clock has been shut down.
+            # silent-ok: not a failure to report — the clock has been shut
+            # down, which happens on every ordinary stop, and the caller's
+            # answer to `False` is simply to dispatch the batch it already
+            # holds. `Clock.call_later` raises once shut down; logging it
+            # would put a line on every worker on the way down, saying only
+            # that the process is stopping.
             return False
         self._waiters.append(waiter)
         try:
@@ -520,8 +525,13 @@ class Tier2Dispatcher:
                 if timer.active():
                     timer.cancel()
             except Exception:
-                # The clock is going away; there is nothing useful to do and
-                # the wait has already ended.
+                # silent-ok: best-effort cleanup of a timer that has already
+                # done its job or is about to be discarded with the clock.
+                # The guarantee this `finally` exists for - ending the wait
+                # and taking the waiter out of the list - is already met
+                # above, and a failure to cancel a timer cannot cost a
+                # message: `_expire_linger` is a no-op on a Deferred that has
+                # already been called.
                 pass
         return True
 
