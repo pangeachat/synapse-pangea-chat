@@ -346,7 +346,7 @@ class DeleteUser(Resource):
                 INSERT INTO {SCHEDULE_TABLE}
                     (user_id, execute_at_ms, requested_at_ms, requested_by,
                      requested_by_admin, attempts)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT (user_id)
                 DO UPDATE SET
                     execute_at_ms = EXCLUDED.execute_at_ms,
@@ -373,7 +373,7 @@ class DeleteUser(Resource):
     async def _delete_schedule(self, user_id: str) -> bool:
         def _delete(txn: Any) -> bool:
             txn.execute(
-                f"DELETE FROM {SCHEDULE_TABLE} WHERE user_id = %s",
+                f"DELETE FROM {SCHEDULE_TABLE} WHERE user_id = ?",
                 (user_id,),
             )
             return bool(txn.rowcount)
@@ -389,7 +389,7 @@ class DeleteUser(Resource):
                 f"""
                 SELECT user_id, execute_at_ms, requested_at_ms, requested_by, requested_by_admin
                 FROM {SCHEDULE_TABLE}
-                WHERE user_id = %s
+                WHERE user_id = ?
                 """,
                 (user_id,),
             )
@@ -414,7 +414,7 @@ class DeleteUser(Resource):
             txn.execute(
                 f"""
                 DELETE FROM {SCHEDULE_TABLE}
-                WHERE execute_at_ms <= %s
+                WHERE execute_at_ms <= ?
                 RETURNING user_id, requested_by, requested_by_admin, attempts
                 """,
                 (now_ms,),

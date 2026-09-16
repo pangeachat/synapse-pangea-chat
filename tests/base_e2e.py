@@ -137,6 +137,12 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         self.server_stderr_lines = stderr_lines
         try:
             postgres, db_url = await self._start_postgres()
+            # Exposed so a test can read the module's own tables back out of
+            # the database Synapse is actually using. `postgres.url()` points
+            # at the default database, not the one created for this run, so a
+            # test that reaches for it queries an empty schema and reports a
+            # missing row as a missing feature.
+            self.database_url = db_url
 
             synapse_dir = tempfile.mkdtemp()
             config_path = os.path.join(synapse_dir, "homeserver.yaml")
