@@ -56,7 +56,7 @@ silent drop is not acceptable at any capacity.
 """
 
 from collections import deque
-from typing import Any, Callable, Deque, List, Optional, Set
+from typing import Any, Callable, Deque, List, Optional, Set, Tuple
 
 import attr
 from synapse.logging.context import (
@@ -98,23 +98,52 @@ class ModerationJob:
 
 
 class Tier2Dispatcher:
-    """A bounded queue drained by a fixed pool of long-lived workers."""
+    """A bounded queue drained by a fixed pool of long-lived workers.
+
+    **Work is taken in batches, and the batch is the unit of the provider
+    call.** A moderation call costs about two seconds whether it carries one
+    message or thirty-two, so a pool that takes one job at a time has a
+    throughput of `workers / 2` per second and nothing but more workers moves
+    it. At `max_batch` 32 the same pool clears 32 messages per call.
+
+    Every counter here stays per JOB, because every one of them answers a
+    question about one message: the queue depth, the in-flight set, the
+    duplicate guard and each drop cause. A batch that fails is N messages that
+    will not be checked, and counting it once would understate the gap by the
+    whole batch size.
+
+    **Batching is opportunistic, and a lone message is never delayed.** A
+    worker takes whatever is already queued, up to `max_batch`, with no wait
+    at all - so under load, where the queue has depth, batches form for free,
+    and in an idle system they are size one. `batch_max_wait_seconds` is a
+    bounded linger on top of that, and `_collect` states the two conditions it
+    needs: a partly-filled batch, and no parked peer. Neither holds for one
+    message arriving into an idle pool, so that message waits for nothing.
+    `max_batch=1` with no linger is the pre-batching dispatcher exactly, which
+    is what keeps the rest of this suite pointed at this code path.
+    """
 
     def __init__(
         self,
         *,
         homeserver: Any,
         clock: Any,
-        handler: Callable[[ModerationJob], Any],
+        handler: Callable[[Tuple[ModerationJob, ...]], Any],
         workers: int,
         queue_size: int,
         supervisor_interval_seconds: float,
         drain_timeout_seconds: float,
+        max_batch: int = 1,
+        batch_max_wait_seconds: float = 0.0,
     ) -> None:
         if workers < 1:
             raise ValueError("workers must be at least 1")
         if queue_size < 1:
             raise ValueError("queue_size must be at least 1")
+        if max_batch < 1:
+            raise ValueError("max_batch must be at least 1")
+        if batch_max_wait_seconds < 0:
+            raise ValueError("batch_max_wait_seconds must not be negative")
         self._hs = homeserver
         self._clock = clock
         self._handler = handler
@@ -122,6 +151,8 @@ class Tier2Dispatcher:
         self._queue_size = queue_size
         self._supervisor_interval = supervisor_interval_seconds
         self._drain_timeout = drain_timeout_seconds
+        self._max_batch = max_batch
+        self._batch_max_wait = batch_max_wait_seconds
 
         self._queue: Deque[ModerationJob] = deque()
         self._waiters: List["defer.Deferred[None]"] = []
@@ -355,7 +386,12 @@ class Tier2Dispatcher:
                     # fill and start dropping while nothing was running.
                     self._discard_waiter(waiter)
                 continue
-            await self._run(job)
+            batch = await self._collect(job)
+            # No suspension point between `_collect` returning and `_run`
+            # entering its own `try`, so a cancellation cannot land on a batch
+            # that no `finally` owns. `_collect` releases its own jobs if it
+            # is the thing that raises.
+            await self._run(batch)
 
     def _take(self) -> Optional[ModerationJob]:
         if not self._queue:
@@ -363,13 +399,160 @@ class Tier2Dispatcher:
         job = self._queue.popleft()
         metrics.TIER2_QUEUE_DEPTH.set(len(self._queue))
         metrics.TIER2_QUEUE_WAIT.observe(max(self._clock.time() - job.enqueued_at, 0.0))
-        return job
-
-    async def _run(self, job: ModerationJob) -> None:
+        # Claimed the moment it leaves the queue, and not when the handler
+        # starts. With a linger there is now an `await` between those two
+        # points, and a job sitting in a worker's local batch is in neither
+        # the queue nor `_running` - so `shutdown`, which counts the queue,
+        # and the drain deadline, which counts `_running`, would BOTH miss it
+        # and the message would be lost without being counted. That is the
+        # silent drop this whole file exists to prevent.
         self._running.add(job.event_id)
         metrics.TIER2_INFLIGHT.set(len(self._running))
+        return job
+
+    async def _collect(self, first: ModerationJob) -> Tuple[ModerationJob, ...]:
+        """Take up to `max_batch` jobs, in queue order, starting with `first`.
+
+        Two phases, and the split is what keeps an idle system fast. First
+        whatever is ALREADY queued is taken, with no wait at all: under load
+        that is the whole batch and it costs nothing. Only then does the
+        worker consider lingering for more.
+
+        **A batch of one never lingers**, and that is what guarantees an
+        unloaded system is not made slower. A worker that took one job and
+        found the queue empty has no evidence that anything else is coming, so
+        waiting could only add latency to a message with nothing to wait for.
+        It holds at every pool size, including `workers=1` - which a
+        "linger unless a peer is idle" rule got wrong, because with one worker
+        there is never an idle peer and so every single message paid the full
+        window.
+
+        Lingering therefore needs BOTH conditions: a partly-filled batch,
+        which is evidence that messages are arriving faster than this pool is
+        clearing them, and no parked peer. A parked peer is woken by the next
+        arrival immediately, so waiting for that arrival ourselves would gain
+        nothing; this worker is not in `_waiters` - it has just taken a job -
+        so an empty list means every other worker is busy.
+        """
+        batch: List[ModerationJob] = [first]
+        # A `finally` with a completion flag rather than `except Exception:
+        # release; raise`. Two reasons, and the second is the important one:
+        # this frame absorbs nothing, so the `reraise_if_cancelled` rule has
+        # nothing to apply to - and a `finally` also covers a `BaseException`,
+        # which an `except Exception` is specifically supposed to let past.
+        # A batch lost to a `KeyboardInterrupt` is as unmoderated as one lost
+        # to a cancellation.
+        collected = False
         try:
-            await self._handler(job)
+            while len(batch) < self._max_batch:
+                nxt = self._take()
+                if nxt is None:
+                    break
+                batch.append(nxt)
+            # A DEADLINE, and not a window per round. Each linger ends as soon
+            # as anything arrives, so a loop that re-armed the full wait each
+            # time would wait `max_wait` again after every arrival - which is
+            # not a bounded wait at all, it is one that a steady trickle of
+            # traffic extends forever, and the batch it is holding is never
+            # moderated. `max_wait` bounds the TOTAL.
+            deadline = self._clock.time() + self._batch_max_wait
+            while (
+                self._batch_max_wait > 0
+                and len(batch) > 1
+                and len(batch) < self._max_batch
+                and not self._queue
+                and not self._waiters
+                and not self._stopping
+            ):
+                remaining = deadline - self._clock.time()
+                if remaining <= 0:
+                    break
+                if not await self._linger(remaining):
+                    break
+                while len(batch) < self._max_batch:
+                    nxt = self._take()
+                    if nxt is None:
+                        break
+                    batch.append(nxt)
+            collected = True
+        finally:
+            if not collected:
+                # These jobs are out of the queue and into `_running`, and
+                # nothing else will ever account for them: releasing them here
+                # is what keeps an interrupted collect from losing a batch
+                # silently.
+                self._release_unrun(batch)
+        return tuple(batch)
+
+    async def _linger(self, seconds: float) -> bool:
+        """Wait up to `seconds` for the batch to grow. True unless unschedulable.
+
+        Implemented as an ordinary park on `_waiters` with a timer beside it,
+        so an arrival ends the wait EARLY through the machinery that already
+        exists - `enqueue` schedules a wakeup and `_wake_one` fires it - and
+        the full wait is paid only when nothing arrives. A plain sleep would
+        make every lingering worker pay the whole window even when the batch
+        filled in the first millisecond.
+
+        Returns False when no timer could be scheduled, which is a clock that
+        has been shut down: waiting then would be unbounded, and an unbounded
+        wait here holds a batch of accepted messages forever.
+        """
+        waiter: "defer.Deferred[None]" = defer.Deferred()
+        try:
+            timer = self._clock.call_later(
+                _SecondsInterval(seconds),
+                self._expire_linger,
+                waiter,
+            )
+        except Exception:
+            # `Clock.call_later` raises once the clock has been shut down.
+            return False
+        self._waiters.append(waiter)
+        try:
+            await make_deferred_yieldable(waiter)
+        finally:
+            # Both, on every exit including a cancellation. A waiter left in
+            # the list absorbs a wakeup meant for a live worker; a timer left
+            # armed fires on a Deferred that has already been called.
+            self._discard_waiter(waiter)
+            try:
+                if timer.active():
+                    timer.cancel()
+            except Exception:
+                # The clock is going away; there is nothing useful to do and
+                # the wait has already ended.
+                pass
+        return True
+
+    def _expire_linger(self, waiter: "defer.Deferred[None]") -> None:
+        """End one linger from the timer.
+
+        Under `PreserveLoggingContext` for the same reason `_wake_one` is:
+        firing a Deferred resumes the coroutine awaiting it right here, and
+        that coroutine restores its own context as it goes.
+        """
+        self._discard_waiter(waiter)
+        if waiter.called:
+            return
+        with PreserveLoggingContext():
+            waiter.callback(None)
+
+    def _release_unrun(self, jobs: List[ModerationJob]) -> None:
+        for job in jobs:
+            # Guarded on `_running`, because the drain may already have
+            # written this job off and counted it - counting it twice made
+            # one lost message two on the dashboard.
+            if job.event_id in self._running:
+                metrics.record_drop("cancelled")
+                self._running.discard(job.event_id)
+            self._inflight.discard(job.event_id)
+        metrics.TIER2_INFLIGHT.set(len(self._running))
+        self._notify_drained()
+
+    async def _run(self, jobs: Tuple[ModerationJob, ...]) -> None:
+        try:
+            await self._handler(jobs)
         except Exception as exc:
             # Counted on the way past - the message was accepted and will not
             # be checked, and an uncounted one is a silent drop whichever door
@@ -380,7 +563,7 @@ class Tier2Dispatcher:
             # `drain_timeout` and removes it from `_running`, so counting it
             # again here as `cancelled` made one lost message two on the
             # dashboard.
-            reraise_if_cancelled(exc, lambda: self._count_cancelled(job))
+            reraise_if_cancelled(exc, lambda: self._count_cancelled(jobs))
             # silent-ok: fail-open by contract, and the loop has to survive.
             # A worker that dies leaves the pool one short for the life of
             # the process, and `run_as_background_process` swallows what
@@ -391,10 +574,15 @@ class Tier2Dispatcher:
             # own outcome counter, so without this it disappears from the
             # metrics entirely - accepted, never checked, never accounted
             # for.
-            metrics.record_drop("handler_error")
+            # Once PER JOB. A batch that failed is every one of its messages
+            # unchecked, and counting the batch as one drop understates the
+            # gap by the batch size - which is the invisibility this counter
+            # exists to end.
+            metrics.record_drop("handler_error", len(jobs))
             logger.warning(
-                "tier2 job failed for %s at %s (%s)",
-                job.event_id,
+                "tier2 batch of %d failed (first %s) at %s (%s)",
+                len(jobs),
+                jobs[0].event_id,
                 error_site(exc),
                 type(exc).__name__,
             )
@@ -412,14 +600,16 @@ class Tier2Dispatcher:
             # keeps two jobs for one event off the queue at once; it is no
             # longer the only thing standing between one message and two
             # redactions.
-            self._running.discard(job.event_id)
-            self._inflight.discard(job.event_id)
+            for job in jobs:
+                self._running.discard(job.event_id)
+                self._inflight.discard(job.event_id)
             metrics.TIER2_INFLIGHT.set(len(self._running))
             self._notify_drained()
 
-    def _count_cancelled(self, job: ModerationJob) -> None:
-        if job.event_id in self._running:
-            metrics.record_drop("cancelled")
+    def _count_cancelled(self, jobs: Tuple[ModerationJob, ...]) -> None:
+        for job in jobs:
+            if job.event_id in self._running:
+                metrics.record_drop("cancelled")
 
     def _supervise(self) -> None:
         """Restart any worker that is no longer running.

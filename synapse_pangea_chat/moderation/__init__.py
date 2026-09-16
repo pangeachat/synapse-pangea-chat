@@ -661,19 +661,23 @@ class ChatModeration:
         self._dispatcher = Tier2Dispatcher(
             homeserver=homeserver,
             clock=self._clock,
-            handler=self._check_and_redact,
+            handler=self._screen_batch,
             workers=config.moderation_tier2_workers,
             queue_size=config.moderation_tier2_queue_size,
             supervisor_interval_seconds=(
                 config.moderation_tier2_supervisor_interval_seconds
             ),
             drain_timeout_seconds=config.moderation_tier2_drain_timeout_seconds,
+            max_batch=config.moderation_tier2_max_batch,
+            batch_max_wait_seconds=config.moderation_tier2_batch_max_wait_seconds,
         )
         self._dispatcher.start()
         logger.info(
-            "tier2 moderation is active on this instance: %d workers, queue %d",
+            "tier2 moderation is active on this instance: %d workers, queue "
+            "%d, batches of up to %d",
             config.moderation_tier2_workers,
             config.moderation_tier2_queue_size,
+            config.moderation_tier2_max_batch,
         )
 
     # ------------------------------------------------------------------
@@ -952,9 +956,71 @@ class ChatModeration:
             for (ev_type, _state_key) in state_events.keys()
         )
 
-    async def _check_and_redact(self, job: ModerationJob) -> None:
+    async def _screen_batch(self, jobs: Tuple[ModerationJob, ...]) -> None:
+        """Screen a batch with one call, then confirm anything it flagged.
+
+        **No redaction is ever taken on a batched verdict.** The wire contract
+        is positional, so a result attributed to the wrong message would
+        redact an innocent learner and leave a harmful one standing - and a
+        redaction is irreversible. So the batch is only ever a SCREEN: a
+        flagged entry sends that ONE message back through the ordinary
+        single-text path, and it is that call's verdict which drives severity,
+        the preserve branch, the durable claim and the send.
+
+        That makes misattribution structurally impossible rather than merely
+        unlikely, because a response to a request carrying exactly one text
+        has no index to get wrong. Every guarantee in `_check_and_redact` is
+        preserved by construction, since that function is unchanged and is
+        still the only thing that redacts.
+
+        The cost is one extra call per FLAGGED message, which is the term in
+        the capacity arithmetic that is an estimate rather than a measurement;
+        `pangea_moderation_tier2_screen_total{verdict="flagged"}` is what makes
+        it a measurement on real traffic.
+
+        The screen's own mapping is closed at both ends. The texts are derived
+        from `jobs` in the same expression that pairs the results back to it,
+        `jobs` is an immutable tuple, so there is no second ordering for the
+        two to disagree about; `check_batch` refuses any response whose length
+        differs from the request's; and `zip(..., strict=True)` raises rather
+        than truncating if either of those were ever wrong.
+        """
         if self._checker is None:
             return
+        if len(jobs) == 1:
+            # One message needs no screen, and a batch of one against an
+            # un-upgraded endpoint would cost a refused round trip before the
+            # single call it was always going to make.
+            await self._check_and_redact(jobs[0])
+            return
+        for job in jobs:
+            self._count_truncation(job)
+        verdicts = await self._checker.check_batch([job.text for job in jobs])
+        # `strict=True` is the last line of defence and it is deliberately a
+        # RAISE rather than a shorter loop: a silent truncation here pairs
+        # every verdict after the shortfall with the wrong message. The raise
+        # reaches the dispatcher, which counts every job in the batch as
+        # unchecked - the fail-open direction.
+        for job, result in zip(jobs, verdicts.results, strict=True):
+            if verdicts.confirmed:
+                # Each answer came back from a request carrying only its own
+                # text, so it is already the verdict a confirmation would
+                # fetch. This is the single-text fallback against an
+                # un-upgraded endpoint; asking again would double every
+                # flagged message's provider calls against the very
+                # deployment with the least capacity to spare.
+                await self._decide(job, result)
+                continue
+            if result is not None and result.get("flagged"):
+                # A screen result, not a decision. Ask again about this one
+                # message alone; `_check_and_redact` records its own matcher
+                # agreement and its own check outcome from that answer.
+                await self._check_and_redact(job, count_truncation=False)
+                continue
+            self._record_matcher_agreement(job, result)
+
+    @staticmethod
+    def _count_truncation(job: ModerationJob) -> None:
         if len(job.text) > MATCHER_MAX_CHARS:
             # `/choreo/moderate` truncates its input, so a longer message gets
             # a verdict about its PREFIX and the remainder is judged by
@@ -963,7 +1029,40 @@ class ChatModeration:
             # message. Chunking past the truncation is ADR-8b and is not this
             # change; making the gap visible is.
             metrics.TIER2_TRUNCATED.inc()
+
+    async def _check_and_redact(
+        self, job: ModerationJob, *, count_truncation: bool = True
+    ) -> None:
+        """Ask about one message, then act on the answer.
+
+        Split from `_decide` so the batched path can reach the decision with a
+        verdict it already has. The split is a seam and not a behaviour
+        change: this is still the only route to a redaction, and every
+        guarantee - the preserve branch, the thresholds, the durable claim,
+        the drain check - lives below it in `_decide`, untouched.
+        """
+        if self._checker is None:
+            return
+        if count_truncation:
+            # False when a batched screen has already counted this message.
+            # The counter is one per MESSAGE Tier 2 read only part of, and a
+            # confirmation is a second look at a message already counted - so
+            # counting it again would report every long flagged message twice.
+            self._count_truncation(job)
         result = await self._checker.check(job.text)
+        await self._decide(job, result)
+
+    async def _decide(
+        self, job: ModerationJob, result: Optional[Dict[str, Any]]
+    ) -> None:
+        """Everything that follows from one message's own verdict.
+
+        `result` must be a verdict about THIS message and nothing else - the
+        answer to a request that carried only `job.text`. A positionally
+        mapped batch entry is not that, which is why `_screen_batch` sends a
+        flagged screen result back through `_check_and_redact` instead of
+        arriving here with it.
+        """
         self._record_matcher_agreement(job, result)
         if result is None:
             # No verdict. Every route to here - transport failure, timeout,

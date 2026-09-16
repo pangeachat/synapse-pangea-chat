@@ -263,6 +263,44 @@ TIER2_BREAKER_STATE = _get_or_create(
     "Tier 2 choreo circuit breaker: 0 closed, 1 half-open, 2 open.",
 )
 
+TIER2_BATCH_SIZE = _get_or_create(
+    Histogram,
+    "pangea_moderation_tier2_batch_size",
+    "Messages carried by one batched Tier 2 provider call. `_count` is the "
+    "number of batch calls and `_sum` the messages they carried, so the ratio "
+    "is the amortisation batching is actually achieving - which is the number "
+    "the capacity arithmetic assumes and the one that collapses first when "
+    "the queue is empty.",
+    buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256, float("inf")),
+)
+
+# A GAUGE and not a counter, because it is a state rather than an event: the
+# question an operator has is "is this deployment batching at all", and on a
+# staging homeserver running an un-upgraded choreo the answer is no for the
+# life of the process. Pinned at 0 on an upgraded deployment; 1 is a
+# deployment whose Tier 2 capacity is back to one message per provider call.
+TIER2_BATCH_UNSUPPORTED = _get_or_create(
+    Gauge,
+    "pangea_moderation_tier2_batch_unsupported",
+    "1 when the moderation endpoint has refused a batched request and Tier 2 "
+    "has fallen back to single-text calls for the life of this process.",
+)
+
+# The SCREEN's own per-item verdict, which is not the same thing as a check:
+# a screen result that says `flagged` decides nothing, because the message is
+# then re-asked one text at a time and that answer is what redacts. This is
+# what makes the confirmation traffic visible - `flagged` here is one extra
+# provider call each, and it is the term in the capacity arithmetic that is a
+# guess rather than a measurement.
+SCREEN_VERDICTS = frozenset({"clean", "flagged", "no_verdict"})
+
+TIER2_SCREEN = _get_or_create(
+    Counter,
+    "pangea_moderation_tier2_screen_total",
+    "Per-message outcome of the batched Tier 2 screen, before confirmation.",
+    ["verdict"],
+)
+
 TIER2_SHUTDOWN_INFLIGHT = _get_or_create(
     Gauge,
     "pangea_moderation_tier2_shutdown_inflight",
@@ -509,10 +547,32 @@ def record_extraction_incomplete(tier: str) -> None:
     EXTRACTION_INCOMPLETE.labels(tier=tier).inc()
 
 
-def record_check(outcome: str) -> None:
+def record_check(outcome: str, count: int = 1) -> None:
+    """Count the verdict that DECIDED one message's disposition.
+
+    Exactly one increment per message that reached a check, which is the
+    invariant batching had to preserve: a batched screen records `clean` for
+    the items it clears and records NOTHING for the ones it flags, because a
+    flagged item is re-asked one text at a time and it is that answer which
+    decides. Counting both would report two checks for one message and halve
+    every rate derived from this series.
+    """
     if outcome not in CHECK_OUTCOMES:
         raise ValueError(f"unknown moderation check outcome {outcome!r}")
-    TIER2_CHECKS.labels(outcome=outcome).inc()
+    TIER2_CHECKS.labels(outcome=outcome).inc(count)
+
+
+def record_screen(verdict: str, count: int = 1) -> None:
+    """Count one message the batched screen looked at.
+
+    Validated against a closed set like every other label here: the screen is
+    what stands between a message and a confirmation call, and a verdict filed
+    under a label nobody knows about is a message whose fate is unaccounted
+    for.
+    """
+    if verdict not in SCREEN_VERDICTS:
+        raise ValueError(f"unknown moderation screen verdict {verdict!r}")
+    TIER2_SCREEN.labels(verdict=verdict).inc(count)
 
 
 def record_redaction_failure(cause: str) -> None:

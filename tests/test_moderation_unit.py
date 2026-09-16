@@ -55,11 +55,14 @@ from synapse_pangea_chat.moderation import (
     tier1_prefilter,
 )
 from synapse_pangea_chat.moderation.choreo_client import (
+    KIND_BATCH_UNSUPPORTED,
+    KIND_SHAPE,
     MAX_RESPONSE_BYTES,
     REQUEST_TIMEOUT_SECONDS,
     ModerationCheckError,
     ModerationProxyUnsupportedError,
     moderate_text,
+    moderate_texts,
 )
 from synapse_pangea_chat.moderation.dispatch import ModerationJob
 from synapse_pangea_chat.moderation.disposition import (
@@ -695,6 +698,175 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(moderate.await_args.args[0], "you suck")
         cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
 
+    def _batched_config(self, **overrides: Any) -> PangeaChatConfig:
+        return self._tier2_config(
+            moderation_tier2_workers=1,
+            moderation_tier2_max_batch=4,
+            moderation_tier2_batch_max_wait_seconds=0.0,
+            **overrides,
+        )
+
+    async def _enqueue_all(self, mod: ChatModeration, bodies: List[str]) -> None:
+        for index, body in enumerate(bodies):
+            await mod.on_new_event(_event(body, event_id=f"$batch{index}"), {})
+
+    async def test_a_batched_flag_is_confirmed_alone_before_any_redaction(
+        self,
+    ) -> None:
+        """The safety property this whole design exists for.
+
+        The batch wire contract is POSITIONAL. If a verdict were applied to
+        the wrong message the module would redact an innocent learner and
+        leave a harmful message standing, and a redaction cannot be taken
+        back. So a batched `flagged` never redacts anything: the message goes
+        back out on its own, and the answer to a request carrying exactly one
+        text has no index to get wrong.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._batched_config())
+        batch = create_autospec(moderate_texts)
+        batch.return_value = [
+            {"flagged": False, "categories": [], "evaluated": True},
+            {"flagged": True, "categories": ["harassment"], "evaluated": True},
+        ]
+        single = self._verdict()
+        with patch(MODERATE_TEXTS, batch), patch(MODERATE_TEXT, single):
+            await self._enqueue_all(mod, ["fine", "you suck"])
+            homeserver.clock.drain()
+        batch.assert_awaited_once()
+        # The confirmation went out on its own, carrying only the message the
+        # screen flagged.
+        single.assert_awaited_once()
+        assert single.await_args is not None
+        self.assertEqual(single.await_args.args[0], "you suck")
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
+
+    async def test_a_batched_flag_the_confirmation_clears_is_not_redacted(
+        self,
+    ) -> None:
+        """The screen does not get a vote.
+
+        This is what a misattributed batch verdict looks like from inside the
+        module, and it is also what a genuinely borderline message looks like:
+        either way the single-text answer is the one that counts, and it says
+        this message stands.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._batched_config())
+        batch = create_autospec(moderate_texts)
+        batch.return_value = [
+            {"flagged": True, "categories": ["harassment"], "evaluated": True},
+            {"flagged": True, "categories": ["harassment"], "evaluated": True},
+        ]
+        single = self._verdict(flagged=False, categories=[])
+        with patch(MODERATE_TEXTS, batch), patch(MODERATE_TEXT, single):
+            await self._enqueue_all(mod, ["hello", "good morning"])
+            homeserver.clock.drain()
+        self.assertEqual(single.await_count, 2)
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_self_harm_is_still_preserved_through_the_batch_path(
+        self,
+    ) -> None:
+        """Every guarantee survives batching because none of them moved.
+
+        The preserve branch, the severity thresholds, the durable claim and
+        the send all live in `_check_and_redact`, and the confirmation is an
+        ordinary call into it. Asserted rather than argued, because "the code
+        is the same" is exactly the claim a refactor breaks.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._batched_config())
+        batch = create_autospec(moderate_texts)
+        batch.return_value = [
+            {"flagged": False, "categories": [], "evaluated": True},
+            {"flagged": True, "categories": ["self-harm/intent"], "evaluated": True},
+        ]
+        single = self._verdict(categories=["self-harm/intent"])
+        with patch(MODERATE_TEXTS, batch), patch(MODERATE_TEXT, single):
+            await self._enqueue_all(mod, ["fine", "a disclosure"])
+            homeserver.clock.drain()
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_a_clean_batch_costs_exactly_one_provider_call(self) -> None:
+        """The point of the exercise.
+
+        Four messages, no flags, one call. A pool that took them one at a
+        time would make four, and at ~2 s each that is the ~4 msg/s ceiling
+        the queue used to fill against.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._batched_config())
+        batch = create_autospec(moderate_texts)
+        batch.return_value = [
+            {"flagged": False, "categories": [], "evaluated": True}
+        ] * 4
+        single = self._verdict()
+        with patch(MODERATE_TEXTS, batch), patch(MODERATE_TEXT, single):
+            await self._enqueue_all(mod, ["a", "b", "c", "d"])
+            homeserver.clock.drain()
+        batch.assert_awaited_once()
+        single.assert_not_awaited()
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_a_short_batch_result_redacts_nothing_and_is_counted(
+        self,
+    ) -> None:
+        """Four texts, three results.
+
+        `check_batch` refuses the pairing, so the module sees four `None`
+        verdicts and leaves every message alone - the fail-open direction.
+        What must NOT happen is three of the four being judged by the next
+        message's answer.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._batched_config())
+        batch = create_autospec(moderate_texts)
+        batch.side_effect = ModerationCheckError(
+            "moderation endpoint returned 3 results for 4 texts", KIND_SHAPE
+        )
+        single = self._verdict()
+        with patch(MODERATE_TEXTS, batch), patch(MODERATE_TEXT, single):
+            await self._enqueue_all(mod, ["a", "b", "c", "d"])
+            homeserver.clock.drain()
+        single.assert_not_awaited()
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_an_un_upgraded_endpoint_still_redacts_every_message(
+        self,
+    ) -> None:
+        """Staging today. Batching must degrade, never stop.
+
+        The batch is refused with the 422 an endpoint whose `text` field is
+        required answers, and all four messages are then checked one at a
+        time - including the one that has to be redacted.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._batched_config())
+        batch = create_autospec(moderate_texts)
+        batch.side_effect = ModerationCheckError(
+            "moderation endpoint returned 422", KIND_BATCH_UNSUPPORTED
+        )
+        single = self._verdict()
+        with patch(MODERATE_TEXTS, batch), patch(MODERATE_TEXT, single):
+            await self._enqueue_all(mod, ["a", "b", "c", "d"])
+            homeserver.clock.drain()
+        self.assertEqual(
+            single.await_count,
+            4,
+            "an endpoint that cannot batch stopped moderating instead of "
+            "falling back",
+        )
+        self.assertEqual(
+            cast(AsyncMock, api.create_and_send_event_into_room).await_count, 4
+        )
+
     async def test_a_worker_instance_neither_queues_nor_checks(self) -> None:
         """`on_new_event` fires on EVERY process subscribed to the events
         stream, so without the guard an N-worker deployment makes N moderation
@@ -929,6 +1101,7 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
 
 
 MODERATE_TEXT = "synapse_pangea_chat.moderation.choreo_client.moderate_text"
+MODERATE_TEXTS = "synapse_pangea_chat.moderation.choreo_client.moderate_texts"
 
 
 class TestTier2RefusesToRunThroughAProxy(unittest.TestCase):

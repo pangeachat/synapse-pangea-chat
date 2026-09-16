@@ -85,8 +85,9 @@ The first is closed by not running there at all.
 
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 
+import attr
 from synapse.logging.context import PreserveLoggingContext, make_deferred_yieldable
 from twisted.internet import defer
 from twisted.internet.protocol import Protocol, connectionDone
@@ -241,6 +242,16 @@ KIND_RATE_LIMITED = "rate_limited"
 KIND_CONFIG_ERROR = "config_error"
 KIND_DECODE = "decode"
 KIND_SHAPE = "shape"
+# The endpoint does not understand a batched request. Deliberately NOT a kind
+# of `config_error`, even though the status that carries it is a 4xx: the two
+# want opposite responses. A config error means stop asking and tell an
+# operator; this one means ask again, one text at a time, right now - and
+# never asking again is moderation silently switching itself off.
+#
+# It is also not a `shape` failure, which means the provider is misbehaving
+# and the messages are left alone. This one is the ordinary state of an
+# un-upgraded deployment and costs nothing but a round trip.
+KIND_BATCH_UNSUPPORTED = "batch_unsupported"
 
 FAILURE_KINDS = frozenset(
     {
@@ -251,8 +262,43 @@ FAILURE_KINDS = frozenset(
         KIND_CONFIG_ERROR,
         KIND_DECODE,
         KIND_SHAPE,
+        KIND_BATCH_UNSUPPORTED,
     }
 )
+
+# The statuses that mean "this request's SHAPE was refused", which is what an
+# endpoint with a required `text` field answers to a body carrying `texts`.
+# FastAPI validates the Pydantic model before the handler runs and returns 422;
+# 400 is here for a gateway that rewrites it.
+#
+# Narrow on purpose. A 401 is an expired service-account token, a 404 is a
+# misconfigured path, a 429 is rate limiting and a 5xx is the provider - none
+# of them says anything about batching, and reading one as "batching is
+# unsupported" would demote a healthy deployment to single-text calls for the
+# life of the process on one transient error.
+_BATCH_REFUSED_STATUSES = frozenset({400, 422})
+
+
+# The "this endpoint does not do batches" signal, as a value rather than an
+# exception. See `ChoreoChecker._batch_admitted` for why it is not a raise.
+_BATCH_UNSUPPORTED = object()
+
+
+@attr.s(auto_attribs=True, frozen=True, slots=True)
+class BatchVerdicts:
+    """What `ChoreoChecker.check_batch` answers, and whether it may be acted on.
+
+    Two fields because they are two different facts, and collapsing them is
+    the mistake this type exists to prevent. `results` is one entry per
+    requested text, in request order, `None` where there is no verdict.
+    `confirmed` says whether each entry came back from a request carrying
+    exactly its own text - so a caller may act on it directly - or was mapped
+    by position out of one batched response, in which case it is a screen and
+    anything it flags has to be asked again on its own.
+    """
+
+    results: List[Optional[Dict[str, Any]]]
+    confirmed: bool
 
 
 class ModerationCheckError(Exception):
@@ -478,7 +524,7 @@ def _validated_result(result: Any) -> Dict[str, Any]:
     return result
 
 
-def _status_kind(code: int) -> str:
+def _status_kind(code: int, *, batched: bool = False) -> str:
     """Which failure a non-2xx status is, for the breaker.
 
     The distinction is load-bearing, not tidiness. A 401 from an expired
@@ -486,12 +532,59 @@ def _status_kind(code: int) -> str:
     breaker on it would disable moderation indefinitely while the state gauge
     blamed the provider. A 5xx or a 429 is the provider, and is exactly what
     the breaker exists to stop hammering.
+
+    `batched` splits one more case off the 4xx band. An endpoint whose
+    `ModerationRequest.text` is a required field answers 422 to a body
+    carrying `texts`, and that is not a configuration error - it is the
+    ordinary state of a deployment that has not been upgraded yet, and the
+    answer to it is to ask again one text at a time rather than to tell an
+    operator to check their token.
     """
+    if batched and code in _BATCH_REFUSED_STATUSES:
+        return KIND_BATCH_UNSUPPORTED
     if code == 429:
         return KIND_RATE_LIMITED
     if 400 <= code < 500:
         return KIND_CONFIG_ERROR
     return KIND_SERVER_ERROR
+
+
+def _validated_batch(result: Any, expected: int) -> List[Dict[str, Any]]:
+    """The batch response, refused unless it can be mapped with certainty.
+
+    The wire contract is POSITIONAL - one result per input, in input order -
+    so the length is not a detail, it is the whole of the evidence that a
+    result belongs to the message it will be applied to. A list one short
+    does not mean "one message went unchecked": paired naively it shifts every
+    verdict from the point of the omission onwards onto the wrong learner's
+    message, redacting one who wrote nothing wrong and leaving the harmful one
+    standing. So a length that does not match the request produces NO verdicts
+    at all, and the caller's fail-open path leaves every message in the batch
+    alone.
+
+    A response that is not a `{"results": [...]}` object at all is read as an
+    endpoint that did not understand `texts`, not as a misbehaving one - that
+    is what an un-upgraded choreo looks like if it ever answers 200, and the
+    caller's answer to it is to re-ask one text at a time.
+    """
+    if not isinstance(result, dict) or not isinstance(result.get("results"), list):
+        raise ModerationCheckError(
+            "moderation endpoint returned no batch results",
+            KIND_BATCH_UNSUPPORTED,
+        )
+    results = result["results"]
+    if len(results) != expected:
+        raise ModerationCheckError(
+            f"moderation endpoint returned {len(results)} results for "
+            f"{expected} texts",
+            KIND_SHAPE,
+        )
+    # Every element, before any of them is used. One element we cannot read
+    # means the endpoint is not doing what the contract says, and the element
+    # we cannot read may be exactly the one whose position is wrong - so
+    # reading the others positionally is the move that misattributes a
+    # verdict. A batch is one answer to one question.
+    return [_validated_result(item) for item in results]
 
 
 async def moderate_text(
@@ -536,6 +629,51 @@ async def moderate_text(
         raise
 
 
+async def moderate_texts(
+    texts: Sequence[str],
+    base_url: str,
+    access_token: str,
+    *,
+    agent: Any,
+    clock: Any,
+    timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+) -> List[Dict[str, Any]]:
+    """Return one choreo ModerationResult per entry of ``texts``, in order.
+
+    The batched half of the same endpoint: `{"texts": [...]}` answers
+    `{"results": [...]}`, one result per input. One provider call therefore
+    carries many messages, which is what turns a ~2-second provider latency
+    into throughput instead of a queue that fills and drops.
+
+    **The returned list is always exactly as long as ``texts``, or there is no
+    list.** A caller pairs the two positionally, so a short or long answer is
+    not a partial result to salvage - it is a pairing in which verdicts belong
+    to the wrong messages. `_validated_batch` refuses it outright and this
+    raises, which is the caller's fail-open path.
+
+    Raises `ModerationCheckError` with kind `batch_unsupported` when the
+    endpoint does not understand a batched request, which is what an
+    un-upgraded choreo answers. That is a signal to ask again one text at a
+    time, never a reason to stop moderating.
+    """
+    try:
+        result = await _exchange(
+            {"texts": list(texts), "mock": False},
+            base_url,
+            access_token,
+            agent,
+            clock,
+            timeout_seconds,
+            batched=True,
+        )
+        return _validated_batch(result, len(texts))
+    except ModerationCheckError as error:
+        # Severed one frame out from every raise site, for the reason given on
+        # `moderate_text`.
+        _severed(error)
+        raise
+
+
 async def _moderate_text(
     text: str,
     base_url: str,
@@ -544,11 +682,47 @@ async def _moderate_text(
     clock: Any,
     timeout_seconds: float,
 ) -> Dict[str, Any]:
+    # `{"text": ...}` alone, deliberately: `mock` defaults to false on the
+    # endpoint's own request model, and this is the shape that is already in
+    # production. The batched call sends `mock` explicitly because that is the
+    # contract the batched handler is being written to; there is no reason to
+    # move a working request to match it.
+    result = await _exchange(
+        {"text": text},
+        base_url,
+        access_token,
+        agent,
+        clock,
+        timeout_seconds,
+        batched=False,
+    )
+    return _validated_result(result)
+
+
+async def _exchange(
+    payload: Dict[str, Any],
+    base_url: str,
+    access_token: str,
+    agent: Any,
+    clock: Any,
+    timeout_seconds: float,
+    *,
+    batched: bool,
+) -> Any:
+    """One POST to `/choreo/moderate`, decoded but not yet interpreted.
+
+    Shared by the single and batched callers so that the two deadlines, the
+    bounded body read, the status-before-body ordering and the chain severing
+    are written once. The only thing `batched` changes is how a 4xx status is
+    classified - see `_status_kind`; everything else about the exchange is
+    identical, and a second copy of it is how one of the two halves quietly
+    loses its body deadline.
+    """
     from io import BytesIO
 
     from twisted.web.client import FileBodyProducer
 
-    body = json.dumps({"text": text}).encode("utf-8")
+    body = json.dumps(payload).encode("utf-8")
     headers = Headers(
         {
             b"Authorization": [f"Bearer {access_token}".encode("utf-8")],
@@ -585,7 +759,7 @@ async def _moderate_text(
             _drain_unwanted_body(response)
             raise ModerationCheckError(
                 f"moderation endpoint returned {response.code}",
-                _status_kind(response.code),
+                _status_kind(response.code, batched=batched),
             )
         # The body read needs its own deadline, and this is not a
         # belt-and-braces second one. The request deferred fires as soon as the
@@ -625,7 +799,7 @@ async def _moderate_text(
     if response.code >= 400:
         raise ModerationCheckError(
             f"moderation endpoint returned {response.code}",
-            _status_kind(response.code),
+            _status_kind(response.code, batched=batched),
         )
     try:
         result = json.loads(raw)
@@ -641,7 +815,7 @@ async def _moderate_text(
             f"{type(e).__name__}",
             KIND_DECODE,
         ) from None
-    return _validated_result(result)
+    return result
 
 
 async def _with_deadline(
@@ -860,6 +1034,175 @@ class ChoreoChecker:
         self._access_token = access_token
         self._breaker = breaker
         self._timeout_seconds = timeout_seconds
+        # The batch contract, negotiated once and then remembered. Starts
+        # optimistic: an upgraded endpoint is the intended state, and the cost
+        # of being wrong is one refused request per process.
+        self._batch_supported = True
+
+    async def check_batch(self, texts: Sequence[str]) -> "BatchVerdicts":
+        """Screen many messages with one provider call, in order.
+
+        **`results` is always exactly as long as ``texts``, on every path** -
+        a clean batch, a refused one, an open breaker, a fallback to
+        single-text calls. The caller pairs the two positionally, so a short
+        return is the one failure that could silently shift every verdict onto
+        the next message; there is no route out of this function that produces
+        one.
+
+        An entry is `None` when that message got no verdict, which always
+        means the same thing it means everywhere else here: leave the message
+        alone.
+
+        **`confirmed` is what says whether a verdict may be acted on.** It is
+        true when each verdict came back from a request carrying exactly its
+        own text - a batch of one, or the single-text fallback - and false
+        when they were mapped by position out of one batched response. A
+        positional verdict is a screen: the caller re-asks that one message
+        before taking any irreversible action.
+
+        It is returned rather than left for the caller to infer, because the
+        two paths look identical from outside and getting it wrong is silent
+        in both directions: treating a screen as confirmed redacts on a
+        positional mapping, and treating a confirmed verdict as a screen
+        asks the provider a second time for every flagged message.
+
+        A flagged SCREEN entry is deliberately not counted by `record_check`
+        here - the confirmation counts it, and counting both would report two
+        checks for one message.
+        """
+        from synapse_pangea_chat.moderation import metrics
+
+        if not texts:
+            return BatchVerdicts([], confirmed=True)
+        if len(texts) == 1 or not self._batch_supported:
+            # A batch of one buys nothing and, against an un-upgraded
+            # endpoint, costs a refused round trip before the single call it
+            # was always going to make. `check` also already carries the
+            # breaker, the latency observation and the per-message counter,
+            # so the fallback is the ordinary path rather than a second
+            # implementation of it - and each of its answers is confirmed by
+            # construction, because each request carried one text.
+            return BatchVerdicts(
+                [await self.check(text) for text in texts], confirmed=True
+            )
+
+        refusal, ticket = self._breaker.check()
+        if refusal is not None:
+            # Counted once PER MESSAGE, not once per batch: each of them went
+            # unmoderated, and a shed batch reported as one drop understates
+            # the gap by the size of the batch.
+            metrics.record_drop(refusal, len(texts))
+            return BatchVerdicts([None] * len(texts), confirmed=False)
+
+        try:
+            results = await self._batch_admitted(texts, ticket)
+        finally:
+            # Same placement and the same reason as in `check`: after the
+            # outcome has been reported, never before it.
+            self._breaker.release(ticket)
+
+        if results is None:
+            return BatchVerdicts([None] * len(texts), confirmed=False)
+        if results is _BATCH_UNSUPPORTED:
+            self._demote_batching()
+            # Re-asked immediately and one at a time. Never wedge and never
+            # fail closed: an endpoint that does not understand `texts` is the
+            # ordinary state of a deployment that has not been upgraded, and
+            # the messages in this batch still have to be moderated.
+            return BatchVerdicts(
+                [await self.check(text) for text in texts], confirmed=True
+            )
+
+        verdicts = cast(List[Dict[str, Any]], results)
+        clean = sum(1 for verdict in verdicts if not verdict.get("flagged"))
+        flagged = len(verdicts) - clean
+        if clean:
+            metrics.record_screen("clean", clean)
+            metrics.record_check("clean", clean)
+        if flagged:
+            metrics.record_screen("flagged", flagged)
+        return BatchVerdicts(list(verdicts), confirmed=False)
+
+    def _demote_batching(self) -> None:
+        from synapse_pangea_chat.moderation import metrics
+
+        if not self._batch_supported:
+            return
+        self._batch_supported = False
+        metrics.TIER2_BATCH_UNSUPPORTED.set(1)
+        # Once per process, at INFO rather than WARNING: this is the expected
+        # state of a deployment whose choreo predates the batched handler, not
+        # a fault. What it costs is throughput, and the gauge above is what an
+        # operator alerts on.
+        logger.info(
+            "tier2 moderation endpoint does not accept batched requests; "
+            "falling back to one call per message for the life of this "
+            "process"
+        )
+
+    async def _batch_admitted(self, texts: Sequence[str], ticket: Optional[int]) -> Any:
+        """The batch's verdicts, `None` for no verdict, or the demote sentinel.
+
+        A SENTINEL and not an exception for the unsupported case, deliberately.
+        Raising a new exception from inside an `except` re-attaches the
+        original on `__context__`, and the original here is a
+        `ModerationCheckError` whose chain this module goes to some length to
+        sever. A return value carries the same information and carries nothing
+        else.
+        """
+        from synapse_pangea_chat.moderation import metrics
+
+        started = self._clock.time()
+        try:
+            try:
+                results = await moderate_texts(
+                    texts,
+                    base_url=self._base_url,
+                    access_token=self._access_token,
+                    agent=self._agent,
+                    clock=self._clock,
+                    timeout_seconds=self._timeout_seconds,
+                )
+            finally:
+                # Per CALL, which is what this histogram has always measured.
+                # The per-message figure is this divided by the batch size,
+                # and `TIER2_BATCH_SIZE` is the other half of that division.
+                metrics.TIER2_LATENCY.observe(max(self._clock.time() - started, 0.0))
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            if failure_kind(exc) == KIND_BATCH_UNSUPPORTED:
+                # Not a failure of the provider: nothing is reported to the
+                # breaker and nothing is counted as an error, because the
+                # messages are about to be checked properly one at a time.
+                return _BATCH_UNSUPPORTED
+            # `Exception` rather than `ModerationCheckError`, for the reason
+            # given on `_check_admitted`: whatever escapes this frame reaches
+            # `run_as_background_process`, which logs it in full.
+            self._record_failure(exc, ticket)
+            metrics.record_check("error", len(texts))
+            metrics.record_screen("no_verdict", len(texts))
+            return None
+
+        metrics.TIER2_BATCH_SIZE.observe(len(texts))
+        if any(result.get("evaluated") is False for result in results):
+            # The documented shape of a provider outage, and it is read across
+            # the WHOLE batch rather than per item. The choreo handler answers
+            # `evaluated: false` when its own provider call failed, and a
+            # provider that failed for one text in a single request failed for
+            # all of them - treating the rest as evaluated would report a
+            # verdict nobody produced.
+            self._breaker.record_failure(ticket)
+            metrics.record_check("unevaluated", len(texts))
+            metrics.record_screen("no_verdict", len(texts))
+            logger.warning(
+                "tier2 moderation endpoint returned no evaluation for a batch "
+                "of %d; those messages were left unchecked",
+                len(texts),
+            )
+            return None
+
+        self._breaker.record_success(ticket)
+        return results
 
     async def check(self, text: str) -> Optional[Dict[str, Any]]:
         from synapse_pangea_chat.moderation import metrics

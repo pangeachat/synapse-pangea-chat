@@ -557,8 +557,23 @@ class _Handler:
         self.hold = False
         self.swallow_cancel = False
         self.raise_for: set = set()
+        # One entry per handler call, holding that call's event ids in order.
+        self.batches: List[List[str]] = []
 
-    async def __call__(self, job: Any) -> None:
+    async def __call__(self, jobs: Any) -> None:
+        """Takes the BATCH the dispatcher hands it, one job at a time inside.
+
+        The per-job body is unchanged, so every assertion the suite already
+        makes about `started`, `finished`, the gates and the raise still means
+        what it meant. `batches` is the new surface, and it is what the
+        batching tests read: it records the grouping, which is the only thing
+        the per-job lists cannot show.
+        """
+        self.batches.append([job.event_id for job in jobs])
+        for job in jobs:
+            await self._one(job)
+
+    async def _one(self, job: Any) -> None:
         self.started.append(job.event_id)
         if self.hold:
             gate: "defer.Deferred[None]" = defer.Deferred()
@@ -1748,6 +1763,315 @@ def _calls_the_rule_first(handler: Any) -> bool:
             and statement.value.func.id == "reraise_if_cancelled"
         )
     return False
+
+
+class BatchingDispatcherTestCase(unittest.TestCase):
+    """Coalescing queued jobs into one handler call.
+
+    The dispatcher is where batching has to happen, because the dispatcher is
+    where the queue is. Everything below holds the per-JOB accounting - the
+    queue depth, the in-flight set, the drop causes, the duplicate guard -
+    constant while the unit of WORK becomes a group, because every one of
+    those counters answers a question about one message.
+    """
+
+    def setUp(self) -> None:
+        from synapse_pangea_chat.moderation.dispatch import (
+            ModerationJob,
+            Tier2Dispatcher,
+        )
+
+        self.ModerationJob = ModerationJob
+        self.Tier2Dispatcher = Tier2Dispatcher
+        self.clock = FakeClock()
+        self.hs = _Hs(self.clock)
+        self.handler = _Handler()
+        self.reader = MetricReader()
+        self.watch = _LogcontextWatch()
+        self.watch.__enter__()
+        self.addCleanup(self.watch.__exit__, None, None, None)
+        self.dispatcher: Any = None
+
+    def _build(
+        self,
+        *,
+        workers: int = 1,
+        queue_size: int = 64,
+        max_batch: int = 4,
+        batch_max_wait_seconds: float = 0.0,
+    ) -> Any:
+        self.dispatcher = self.Tier2Dispatcher(
+            homeserver=self.hs,
+            clock=self.clock,
+            handler=self.handler,
+            workers=workers,
+            queue_size=queue_size,
+            supervisor_interval_seconds=30.0,
+            drain_timeout_seconds=5.0,
+            max_batch=max_batch,
+            batch_max_wait_seconds=batch_max_wait_seconds,
+        )
+        self.addCleanup(self._stop)
+        return self.dispatcher
+
+    def _stop(self) -> None:
+        self.handler.release_all()
+        self.clock.run_pending()
+        self.dispatcher._stopping = True
+        self.dispatcher._wake_all()
+        self.clock.run_pending()
+        self.assertEqual(self.watch.leaks, [], "logcontext leaked")
+
+    def _job(self, event_id: str) -> Any:
+        return self.ModerationJob(
+            event_id=event_id,
+            room_id="!room:example.org",
+            sender="@learner:example.org",
+            text=f"text for {event_id}",
+            enqueued_at=self.clock.time(),
+        )
+
+    def _drain(self) -> None:
+        for _ in range(20):
+            if not self.clock.run_pending():
+                break
+
+    def test_queued_jobs_are_coalesced_into_one_call(self) -> None:
+        """The whole point. Four queued messages, one provider call.
+
+        A worker blocks ~2 s on the provider whether the call carries one
+        message or thirty-two, so a pool that takes them one at a time has a
+        throughput of workers/2 per second and nothing else changes it.
+        """
+        dispatcher = self._build(max_batch=4)
+        for index in range(4):
+            self.assertTrue(dispatcher.enqueue(self._job(f"$e{index}")))
+        dispatcher.start()
+        self._drain()
+        self.assertEqual(
+            self.handler.batches,
+            [["$e0", "$e1", "$e2", "$e3"]],
+            "the queue was drained one message per call",
+        )
+
+    def test_a_batch_never_exceeds_its_maximum(self) -> None:
+        """One call carries every text in the batch and the endpoint reads
+        10,000 characters of each, so an unbounded batch trades the drop this
+        exists to prevent for a request body nothing will answer."""
+        dispatcher = self._build(max_batch=3)
+        for index in range(10):
+            dispatcher.enqueue(self._job(f"$e{index}"))
+        dispatcher.start()
+        self._drain()
+        self.assertTrue(self.handler.batches, "nothing ran")
+        self.assertTrue(
+            all(len(batch) <= 3 for batch in self.handler.batches),
+            f"a batch ran over its maximum: {self.handler.batches}",
+        )
+        self.assertEqual(
+            [event_id for batch in self.handler.batches for event_id in batch],
+            [f"$e{index}" for index in range(10)],
+            "batching reordered the queue",
+        )
+
+    def test_a_lone_message_in_an_idle_pool_is_not_delayed(self) -> None:
+        """Batching must not make an unloaded system slower.
+
+        With a worker parked and idle, an arrival is picked up immediately -
+        so lingering for more could only ever ADD latency to a message that
+        had nothing to wait for. The condition is asserted the only way that
+        means anything: no timer is scheduled at all.
+        """
+        dispatcher = self._build(workers=2, max_batch=8, batch_max_wait_seconds=0.02)
+        dispatcher.start()
+        self._drain()
+        pending_before = set(self.clock.pending_ids)
+        self.handler.hold = True
+        dispatcher.enqueue(self._job("$only"))
+        self._drain()
+        self.assertEqual(
+            self.handler.batches,
+            [["$only"]],
+            "a lone message did not go out immediately",
+        )
+        self.assertEqual(
+            set(self.clock.pending_ids) - pending_before,
+            set(),
+            "a linger timer was scheduled for a message with nothing to wait " "for",
+        )
+
+    def test_a_lone_message_never_lingers_even_with_one_worker(self) -> None:
+        """The pool size must not decide whether a message is delayed.
+
+        A `workers=1` pool never has an idle peer, so a rule that lingered
+        whenever no peer was parked made EVERY single message pay the full
+        window. Requiring a partly-filled batch is what closes that: one job
+        and an empty queue is no evidence that anything else is coming.
+        """
+        dispatcher = self._build(workers=1, max_batch=8, batch_max_wait_seconds=0.02)
+        self.handler.hold = True
+        dispatcher.enqueue(self._job("$only"))
+        dispatcher.start()
+        self._drain()
+        self.assertEqual(
+            self.handler.batches,
+            [["$only"]],
+            "a lone message waited for a batch that had no reason to arrive",
+        )
+
+    def test_a_partly_filled_batch_lingers_for_more(self) -> None:
+        """The case where waiting is nearly free.
+
+        Two messages were already queued, so the pool is not keeping up and
+        the next arrival waits a full provider call whatever we do. Lingering
+        20 ms to carry it in this call costs 20 ms against the measured ~45 ms
+        local path and saves it those two seconds.
+        """
+        dispatcher = self._build(workers=1, max_batch=8, batch_max_wait_seconds=0.02)
+        self.handler.hold = True
+        dispatcher.enqueue(self._job("$hold"))
+        dispatcher.start()
+        self._drain()
+        # The worker is inside the handler. Queue two, so that when it comes
+        # back it collects a partly-filled batch and has grounds to linger.
+        dispatcher.enqueue(self._job("$a"))
+        dispatcher.enqueue(self._job("$b"))
+        self.handler.hold = False
+        self.handler.release_all()
+        self._drain()
+        self.assertNotIn(
+            ["$a", "$b"],
+            self.handler.batches,
+            "a partly-filled batch went out without lingering",
+        )
+        dispatcher.enqueue(self._job("$c"))
+        self.clock.advance(0.02)
+        self._drain()
+        self.assertIn(
+            ["$a", "$b", "$c"],
+            self.handler.batches,
+            "the linger did not collect the message that arrived during it",
+        )
+
+    def test_the_linger_is_bounded(self) -> None:
+        """A max-wait with no maximum is a message that is never moderated."""
+        dispatcher = self._build(workers=1, max_batch=8, batch_max_wait_seconds=0.02)
+        self.handler.hold = True
+        dispatcher.enqueue(self._job("$hold"))
+        dispatcher.start()
+        self._drain()
+        dispatcher.enqueue(self._job("$a"))
+        dispatcher.enqueue(self._job("$b"))
+        self.handler.hold = False
+        self.handler.release_all()
+        self._drain()
+        self.assertNotIn(["$a", "$b"], self.handler.batches)
+        self.clock.advance(0.02)
+        self._drain()
+        self.assertIn(
+            ["$a", "$b"],
+            self.handler.batches,
+            "a batch sat in a worker past the max-wait, so the wait has no "
+            "bound and those messages are never moderated",
+        )
+
+    def test_every_job_in_a_batch_is_released_from_the_inflight_set(
+        self,
+    ) -> None:
+        """An id left behind does not leak, it permanently blocks that event
+        from ever being moderated again."""
+        dispatcher = self._build(max_batch=4)
+        for index in range(4):
+            dispatcher.enqueue(self._job(f"$e{index}"))
+        dispatcher.start()
+        self._drain()
+        self.assertEqual(dispatcher.inflight, 0)
+        self.assertEqual(dispatcher.queue_depth, 0)
+
+    def test_a_duplicate_is_still_refused_while_its_batch_runs(self) -> None:
+        """The same event reaches the notifier from the local persister AND
+        from the replication stream. Batching must not open a window where
+        both are accepted."""
+        dispatcher = self._build(max_batch=4)
+        self.handler.hold = True
+        dispatcher.enqueue(self._job("$e0"))
+        dispatcher.start()
+        self._drain()
+        self.reader.snapshot("pangea_moderation_tier2_dropped_total", cause="duplicate")
+        self.assertFalse(dispatcher.enqueue(self._job("$e0")))
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="duplicate"
+            ),
+            1.0,
+        )
+
+    def test_a_handler_failure_counts_every_job_in_the_batch(self) -> None:
+        """A batch that fails is N messages that will not be checked, not one.
+
+        Counting it once was the shape of the original per-job handler and
+        would understate the gap by the whole batch size - which is exactly
+        the invisibility the drop counter exists to end.
+        """
+        dispatcher = self._build(max_batch=4)
+        self.handler.raise_for = {"$e0"}
+        for index in range(4):
+            dispatcher.enqueue(self._job(f"$e{index}"))
+        self.reader.snapshot(
+            "pangea_moderation_tier2_dropped_total", cause="handler_error"
+        )
+        dispatcher.start()
+        self._drain()
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="handler_error"
+            ),
+            4.0,
+            "a failed batch counted as one unmoderated message rather than " "four",
+        )
+
+    def test_jobs_held_in_a_batch_are_counted_when_the_drain_gives_up(
+        self,
+    ) -> None:
+        """Taken out of the queue is not the same as safe.
+
+        A batch a worker is holding is off the queue, so `shutdown`'s count of
+        the queue cannot see it. It has to be in the in-flight accounting the
+        drain deadline reports, or those messages are lost silently.
+        """
+        dispatcher = self._build(max_batch=4)
+        self.handler.hold = True
+        for index in range(4):
+            dispatcher.enqueue(self._job(f"$e{index}"))
+        dispatcher.start()
+        self._drain()
+        self.reader.snapshot(
+            "pangea_moderation_tier2_dropped_total", cause="drain_timeout"
+        )
+        start_worker(dispatcher.shutdown)
+        self.clock.advance(5.0)
+        self._drain()
+        self.assertEqual(
+            self.reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="drain_timeout"
+            ),
+            4.0,
+            "the drain wrote off a batch as one message",
+        )
+
+    def test_a_batch_of_one_behaves_exactly_as_before(self) -> None:
+        """`max_batch=1` is the pre-batching dispatcher, byte for byte.
+
+        Worth pinning: it is the configuration the whole existing concurrency
+        suite runs under, so it is what keeps that suite's coverage pointed at
+        this code path rather than at a code path nobody uses.
+        """
+        dispatcher = self._build(max_batch=1)
+        for index in range(3):
+            dispatcher.enqueue(self._job(f"$e{index}"))
+        dispatcher.start()
+        self._drain()
+        self.assertEqual(self.handler.batches, [["$e0"], ["$e1"], ["$e2"]])
 
 
 class ProxyLogGuardTestCase(unittest.TestCase):
