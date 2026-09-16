@@ -867,6 +867,125 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
             cast(AsyncMock, api.create_and_send_event_into_room).await_count, 4
         )
 
+    async def test_one_job_failing_does_not_cost_the_rest_of_its_batch(
+        self,
+    ) -> None:
+        """A batch is a transport decision, not a blast radius.
+
+        Before batching every job was its own handler call, so one job's
+        failure reached the dispatcher and cost exactly that message. Sharing
+        a call must not quietly widen that: an exception decided on job two
+        would abandon jobs three and four, which were already checked and had
+        verdicts waiting to be applied.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._batched_config())
+        batch = create_autospec(moderate_texts)
+        batch.return_value = [
+            {"flagged": True, "categories": ["harassment"], "evaluated": True}
+        ] * 3
+        single = self._verdict()
+        calls: List[str] = []
+
+        original = mod._check_and_redact
+
+        async def _explode_on_the_second(job: Any, **kwargs: Any) -> None:
+            calls.append(job.event_id)
+            if job.event_id == "$batch1":
+                raise RuntimeError("decision blew up")
+            await original(job, **kwargs)
+
+        with (
+            patch(MODERATE_TEXTS, batch),
+            patch(MODERATE_TEXT, single),
+            patch.object(mod, "_check_and_redact", _explode_on_the_second),
+        ):
+            await self._enqueue_all(mod, ["a", "b", "c"])
+            homeserver.clock.drain()
+        self.assertEqual(
+            calls,
+            ["$batch0", "$batch1", "$batch2"],
+            "a failure on one message stopped the rest of its batch being "
+            "decided, so messages with verdicts in hand went unmoderated",
+        )
+        self.assertEqual(
+            cast(AsyncMock, api.create_and_send_event_into_room).await_count,
+            2,
+            "the two messages either side of the failure were not redacted",
+        )
+
+    async def test_a_failed_job_in_a_batch_is_counted_once(self) -> None:
+        """Counted, because an uncounted one reads exactly like a clean
+        message on every dashboard an operator has - and counted ONCE, not
+        once per message in the batch that carried it."""
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier2_dropped_total", cause="handler_error")
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._batched_config())
+        batch = create_autospec(moderate_texts)
+        batch.return_value = [
+            {"flagged": True, "categories": ["harassment"], "evaluated": True}
+        ] * 3
+        single = self._verdict()
+
+        original = mod._check_and_redact
+
+        async def _explode_on_the_second(job: Any, **kwargs: Any) -> None:
+            if job.event_id == "$batch1":
+                raise RuntimeError("decision blew up")
+            await original(job, **kwargs)
+
+        with (
+            patch(MODERATE_TEXTS, batch),
+            patch(MODERATE_TEXT, single),
+            patch.object(mod, "_check_and_redact", _explode_on_the_second),
+        ):
+            await self._enqueue_all(mod, ["a", "b", "c"])
+            homeserver.clock.drain()
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_dropped_total", cause="handler_error"
+            ),
+            1.0,
+        )
+
+    async def test_a_demoted_endpoint_stops_the_dispatcher_batching(
+        self,
+    ) -> None:
+        """The fallback must not turn one batch into a serial queue.
+
+        `check_batch`'s fallback asks one text at a time inside the worker
+        that holds the batch, so a batch of 32 against an un-upgraded endpoint
+        is 32 sequential ~2 s calls - 64 seconds during which the last message
+        is unmoderated and the drain deadline will abandon the lot. Throughput
+        is unchanged (every worker is equally busy either way); the damage is
+        entirely to latency, and it is reachable during a rolling choreo
+        upgrade, where production load meets an endpoint that answers 422.
+
+        So the demotion has to reach the DISPATCHER, not just the checker.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._batched_config())
+        assert mod._dispatcher is not None
+        self.assertEqual(mod._dispatcher.max_batch, 4)
+        batch = create_autospec(moderate_texts)
+        batch.side_effect = ModerationCheckError(
+            "moderation endpoint returned 422", KIND_BATCH_UNSUPPORTED
+        )
+        single = self._verdict(flagged=False, categories=[])
+        with patch(MODERATE_TEXTS, batch), patch(MODERATE_TEXT, single):
+            await self._enqueue_all(mod, ["a", "b"])
+            homeserver.clock.drain()
+        self.assertEqual(
+            mod._dispatcher.max_batch,
+            1,
+            "the dispatcher kept forming batches for an endpoint that cannot "
+            "take one, so every batch pays its whole fallback serially",
+        )
+
     async def test_a_worker_instance_neither_queues_nor_checks(self) -> None:
         """`on_new_event` fires on EVERY process subscribed to the events
         stream, so without the guard an N-worker deployment makes N moderation

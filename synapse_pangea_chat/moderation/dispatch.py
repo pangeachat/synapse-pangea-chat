@@ -657,6 +657,25 @@ class Tier2Dispatcher:
         return not self._drained
 
     @property
+    def max_batch(self) -> int:
+        return self._max_batch
+
+    @max_batch.setter
+    def max_batch(self, value: int) -> None:
+        """Re-size the batch while running.
+
+        Settable because the endpoint decides it, not the operator: when a
+        choreo that cannot take a batched request is discovered at runtime,
+        `check_batch` falls back to asking one text at a time INSIDE the
+        worker holding the batch - so continuing to form batches of 32 would
+        turn one call into 32 sequential ones. Dropping to 1 puts that work
+        back across the pool.
+        """
+        if value < 1:
+            raise ValueError("max_batch must be at least 1")
+        self._max_batch = value
+
+    @property
     def queue_depth(self) -> int:
         return len(self._queue)
 

@@ -1001,23 +1001,74 @@ class ChatModeration:
         # every verdict after the shortfall with the wrong message. The raise
         # reaches the dispatcher, which counts every job in the batch as
         # unchecked - the fail-open direction.
+        if not self._checker.batch_supported:
+            # The demotion has to reach the DISPATCHER and not just the
+            # checker. `check_batch`'s fallback asks one text at a time inside
+            # the worker holding the batch, so a batch of 32 against an
+            # un-upgraded endpoint is 32 sequential ~2 s calls - a minute
+            # during which the last message is unmoderated, and long enough
+            # that the drain deadline abandons the lot. Throughput is
+            # unaffected (every worker is equally busy either way); the damage
+            # is entirely latency, and it is reachable during a rolling choreo
+            # upgrade where production load meets an endpoint answering 422.
+            self._stop_batching()
         for job, result in zip(jobs, verdicts.results, strict=True):
-            if verdicts.confirmed:
-                # Each answer came back from a request carrying only its own
-                # text, so it is already the verdict a confirmation would
-                # fetch. This is the single-text fallback against an
-                # un-upgraded endpoint; asking again would double every
-                # flagged message's provider calls against the very
-                # deployment with the least capacity to spare.
-                await self._decide(job, result)
-                continue
-            if result is not None and result.get("flagged"):
-                # A screen result, not a decision. Ask again about this one
-                # message alone; `_check_and_redact` records its own matcher
-                # agreement and its own check outcome from that answer.
-                await self._check_and_redact(job, count_truncation=False)
-                continue
-            self._record_matcher_agreement(job, result)
+            # Each job inside its own guard. Sharing one provider call is a
+            # transport decision and must not widen a blast radius: before
+            # batching every job was its own handler call, so a failure cost
+            # exactly that message, and an exception raised deciding job two
+            # would otherwise abandon jobs three and four - which have
+            # verdicts in hand and nothing wrong with them. Same rule the
+            # extraction applies per surface and the disposition applies per
+            # row.
+            try:
+                await self._decide_screened(job, result, verdicts.confirmed)
+            except Exception as exc:
+                reraise_if_cancelled(exc)
+                # silent-ok: fail-open by contract, and the loop has to
+                # survive for the jobs behind this one. Counted for this
+                # message alone - the dispatcher's own counter would count the
+                # whole batch, which overstates the gap by everything that
+                # actually succeeded.
+                metrics.record_drop("handler_error")
+                logger.warning(
+                    "tier2 decision failed for %s in %s at %s (%s)",
+                    job.event_id,
+                    job.room_id,
+                    error_site(exc),
+                    type(exc).__name__,
+                )
+
+    async def _decide_screened(
+        self,
+        job: ModerationJob,
+        result: Optional[Dict[str, Any]],
+        confirmed: bool,
+    ) -> None:
+        if confirmed:
+            # This answer came back from a request carrying only its own text,
+            # so it is already the verdict a confirmation would fetch. This is
+            # the single-text fallback against an un-upgraded endpoint; asking
+            # again would double every flagged message's provider calls
+            # against the deployment with the least capacity to spare.
+            await self._decide(job, result)
+            return
+        if result is not None and result.get("flagged"):
+            # A screen result, not a decision. Ask again about this one
+            # message alone; `_check_and_redact` records its own matcher
+            # agreement and its own check outcome from that answer.
+            await self._check_and_redact(job, count_truncation=False)
+            return
+        self._record_matcher_agreement(job, result)
+
+    def _stop_batching(self) -> None:
+        if self._dispatcher is None or self._dispatcher.max_batch == 1:
+            return
+        self._dispatcher.max_batch = 1
+        logger.info(
+            "tier2 moderation is no longer batching: the endpoint refused a "
+            "batched request, so work is taken one message at a time"
+        )
 
     @staticmethod
     def _count_truncation(job: ModerationJob) -> None:

@@ -1039,6 +1039,17 @@ class ChoreoChecker:
         # of being wrong is one refused request per process.
         self._batch_supported = True
 
+    @property
+    def batch_supported(self) -> bool:
+        """Whether the endpoint has been seen to refuse a batched request.
+
+        Read by the caller after a batch so the DISPATCHER can stop forming
+        batches this endpoint cannot take - the fallback is serial inside one
+        worker, so a batch it cannot use is latency with nothing to show for
+        it.
+        """
+        return self._batch_supported
+
     async def check_batch(self, texts: Sequence[str]) -> "BatchVerdicts":
         """Screen many messages with one provider call, in order.
 

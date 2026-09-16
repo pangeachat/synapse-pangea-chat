@@ -3,9 +3,17 @@
 Tier 1: a message containing a phone number is rejected at send time
 (M_FORBIDDEN); a clean message lands. Tier 2: a message the (mocked) choreo
 moderation endpoint flags is redacted after the fact, sent as the offender.
-Activity rooms are moderated too - the orchestrator stopped producing a
-moderation flag in the reset, so leaving them to it left them checked by
-nothing; `moderation.tier2_moderate_activity_rooms` restores the skip.
+
+Scope note, so this docstring does not outlive what the test does - which is
+the defect that left activity rooms unmoderated in the first place. Activity
+rooms ARE now moderated (the orchestrator stopped producing a moderation flag
+in the reset, so leaving them to it left them checked by nothing), and
+`moderation.tier2_moderate_activity_rooms` restores the old skip. Neither is
+covered HERE: both are driven through the real dispatcher in
+`tests/test_moderation_unit.py::TestTier2Dispatch`. The default path does not
+consult the room's state at all, so what is untested end-to-end is only
+whether Synapse hands `on_new_event` the activity-plan state event that the
+non-default restore path reads.
 """
 
 import asyncio

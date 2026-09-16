@@ -186,9 +186,11 @@ class PangeaChatConfig:
     # items cost one extra single-text confirmation each (see
     # `moderation.dispatch`). With a 5% flag rate one worker clears
     # 32/(2*(1+32*0.05)) = 6.2 messages/second, so sixteen workers clear about
-    # 98/second - roughly 3x the target. It degrades above that: at a 20% flag
-    # rate the same pool clears about 35/second, which is the target with
-    # almost no margin.
+    # 98/second by that arithmetic and 94/second when actually driven
+    # (`tests/test_moderation_load.py`) - roughly 3x the target. It degrades
+    # on the FLAG rate rather than the message rate: at a 20% flag rate the
+    # same pool clears about 35/second, which is the target with almost no
+    # margin.
     #
     # The queue is one message from every modelled student: a classroom
     # burst - a teacher saying "everyone answer now" - is the realistic worst
