@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 
 classifiers = ["License :: OSI Approved :: Apache Software License"]
 
-dependencies = ["attrs"]
+dependencies = ["attrs", "phonenumbers"]
 
 [project.optional-dependencies]
 dev = [
@@ -24,6 +24,12 @@ dev = [
   "psycopg2",
   "requests",
   "testing.postgresql",
+  # For the Tier 1 collision gate (tests/test_moderation_tier1_terms.py) only.
+  # NEVER a runtime dependency: it carries ~324 MB of frequency data with the
+  # [cjk] extra, which is what supplies the Japanese, Korean and Chinese
+  # tokenizers. Without that extra those three languages raise
+  # ModuleNotFoundError and drop out of the gate's coverage silently.
+  "wordfreq[cjk] == 3.1.1",
   # for type checking
   "mypy == 1.6.1",
   # for linting
@@ -37,6 +43,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["synapse_pangea_chat*"]
+
+# The moderation wordlist and the Tier 1 classification are data the module
+# reads at runtime. Without this they are left out of the wheel, so an
+# installed build raises FileNotFoundError inside the Tier 1 profanity rule -
+# and because that tier fails open, the only symptom is a warning per message
+# and a moderation tier that is quietly not running.
+[tool.setuptools.package-data]
+synapse_pangea_chat = ["moderation/*.json"]
 
 [tool.setuptools_scm]
 

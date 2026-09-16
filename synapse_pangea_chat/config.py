@@ -123,3 +123,48 @@ class PangeaChatConfig:
     # Refuse knocks/joins from users every room admin has blocked. Off switch
     # only; the rule itself is fixed by design.
     blocked_join_gate_enabled: bool = True
+
+    # --- moderation config (server-side, trust-and-safety) ---
+    # Both tiers ship dark: nothing runs until an operator enables a tier.
+    moderation_tier1_enabled: bool = False
+    # Regions whose NATIONAL phone formats are matched bare (international
+    # +CC formats match regardless).
+    moderation_tier1_phone_regions: List[str] = attr.Factory(lambda: ["US"])
+    moderation_tier2_enabled: bool = False
+    # Choreographer base URL (e.g. https://api.staging.pangea.chat) and the
+    # Matrix access token of the moderation service account — /choreo/moderate
+    # accepts any valid token on this homeserver.
+    moderation_choreo_base_url: Optional[str] = None
+    moderation_choreo_access_token: Optional[str] = None
+    # Senders never moderated — set the bot users here: bot content is
+    # already governed upstream, and Tier 2 redacting the bot's own replies
+    # would fight the orchestrator. Glob patterns over the full Matrix ID
+    # ('*' and '?'), matched whole-string; see moderation/exempt.py for why
+    # this is not a regular expression.
+    moderation_exempt_user_id_globs: List[str] = attr.Factory(list)
+    moderation_redaction_reason_prefix: str = "Removed by Pangea content moderation"
+    # --- Tier 2 transport and concurrency ---
+    # `on_new_event` is awaited inline by the notifier for every event on the
+    # homeserver, so Tier 2 is a bounded queue drained by a fixed pool rather
+    # than one background process per message. The defaults bound the WAIT: at
+    # eight workers and a fifteen-second per-check budget, a queue of forty is
+    # a worst case of about seventy-five seconds before the oldest accepted
+    # message is picked up. They do not bound throughput - one instance runs
+    # Tier 2, and that is the ceiling.
+    moderation_tier2_workers: int = 8
+    moderation_tier2_queue_size: int = 40
+    # Covers the WHOLE exchange - connect, headers and body. The body half is
+    # the one that had no bound at all.
+    moderation_tier2_request_timeout_seconds: float = 15.0
+    # Consecutive failures that open the circuit breaker, and how long it
+    # stays open before admitting one probe. The cooldown doubles on a failed
+    # probe up to the maximum, so a provider that is down for an hour is
+    # probed a handful of times rather than a hundred.
+    moderation_tier2_breaker_failure_threshold: int = 5
+    moderation_tier2_breaker_cooldown_seconds: float = 30.0
+    moderation_tier2_breaker_max_cooldown_seconds: float = 300.0
+    # How long a clean shutdown waits for checks already in flight before
+    # abandoning and counting them.
+    moderation_tier2_drain_timeout_seconds: float = 10.0
+    # How often the supervisor looks for a worker that died.
+    moderation_tier2_supervisor_interval_seconds: float = 30.0

@@ -1,5 +1,8 @@
+import ipaddress
+import logging
 import re
 from typing import Any, Dict, Mapping, Optional, Tuple
+from urllib.parse import urlparse
 
 from synapse.events import EventBase
 from synapse.module_api import ModuleApi
@@ -22,6 +25,8 @@ from synapse_pangea_chat.grant_instructor_analytics_access import (
     GrantInstructorAnalyticsAccess,
 )
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
+from synapse_pangea_chat.moderation import ChatModeration, tier1_prefilter
+from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
     PreviewWithCode,
@@ -43,6 +48,201 @@ from synapse_pangea_chat.user_activity import (
     UserCourses,
 )
 from synapse_pangea_chat.user_directory_search import UserDirectorySearch
+
+logger = logging.getLogger("synapse.modules.synapse_pangea_chat")
+
+# Every key the `moderation` config block accepts. The retired regex key is in
+# the set on purpose: it has its own migration error, which says what to write
+# instead, and that is a better answer than "unknown key".
+_MODERATION_CONFIG_KEYS = frozenset(
+    {
+        "tier1_enabled",
+        "tier1_phone_regions",
+        "tier2_enabled",
+        "choreo_base_url",
+        "choreo_access_token",
+        "redaction_reason_prefix",
+        "tier2_workers",
+        "tier2_queue_size",
+        "tier2_request_timeout_seconds",
+        "tier2_breaker_failure_threshold",
+        "tier2_breaker_cooldown_seconds",
+        "tier2_breaker_max_cooldown_seconds",
+        "tier2_drain_timeout_seconds",
+        "tier2_supervisor_interval_seconds",
+        moderation_exempt.CONFIG_KEY,
+        moderation_exempt.LEGACY_CONFIG_KEY,
+    }
+)
+
+
+def _moderation_int(
+    moderation: Dict[str, Any], key: str, low: int, high: int, default: int
+) -> int:
+    value = moderation.get(key, default)
+    # `bool` before `int`, because `True` IS an `int` in Python and
+    # `tier2_workers: true` would otherwise configure a pool of one.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f'Config "moderation.{key}" must be an integer')
+    if not low <= value <= high:
+        raise ValueError(f'Config "moderation.{key}" must be between {low} and {high}')
+    return value
+
+
+def _moderation_float(
+    moderation: Dict[str, Any], key: str, low: float, high: float, default: float
+) -> float:
+    value = moderation.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f'Config "moderation.{key}" must be a number')
+    if not low <= float(value) <= high:
+        raise ValueError(f'Config "moderation.{key}" must be between {low} and {high}')
+    return float(value)
+
+
+_CHOREO_URL_SCHEMES = ("http", "https")
+# What a DNS label may contain, and how long it may be. Checked because
+# twisted marks a structurally invalid hostname bad and fails the connection
+# before it ever resolves - so an empty interior label, a semicolon, or an
+# over-long label is another value that starts cleanly and moderates nothing.
+_DNS_LABEL = re.compile(r"^[A-Za-z0-9_-]{1,63}$")
+
+
+def _validate_choreo_host(hostname: Optional[str], netloc: str) -> None:
+    if hostname is None:
+        return
+    if netloc.startswith("[") or ":" in hostname:
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            raise ValueError(
+                'Config "moderation.choreo_base_url" has brackets around '
+                "something that is not an IP address"
+            ) from None
+        return
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        return
+    for label in hostname.rstrip(".").split("."):
+        if not _DNS_LABEL.match(label):
+            raise ValueError(
+                'Config "moderation.choreo_base_url" host is not a usable '
+                f"name: the label {label!r} is empty, too long, or contains a "
+                "character a hostname cannot contain"
+            )
+
+
+def _validate_choreo_base_url(value: str) -> str:
+    """Return the usable form of `value`, or raise saying why there is none.
+
+    The checks are on the RAW string as well as on the parse, because the parse
+    alone accepts values the request builder then mangles. The endpoint path is
+    appended with `f"{base_url.rstrip('/')}/choreo/moderate"`, so a trailing `?`
+    or `#` - which `urlparse` reports as an empty query and an empty fragment,
+    both falsy - turns the path into `?/choreo/moderate` or swallows it into a
+    fragment, and every request goes to `/`. Whitespace, control characters and
+    non-ASCII fail later still, inside twisted's URI parsing, where the failure
+    is one more swallowed exception per message and no error anybody sees.
+
+    The stripped value is RETURNED rather than validated in place: validating a
+    stripped copy and then storing the original is how `"https://host "` passed
+    a check it did not satisfy.
+    """
+    raw = value.strip()
+    for character, description in (("?", "a query string"), ("#", "a fragment")):
+        if character in raw:
+            raise ValueError(
+                'Config "moderation.choreo_base_url" must not contain '
+                f"{description}; the request path is appended to it, so "
+                f"{character!r} would send every moderation check to a "
+                "different path than the one configured"
+            )
+    if not raw.isascii():
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must be ASCII. An '
+            "internationalised host has to be given in its punycode form "
+            '("xn--..."), because the request URI is built as bytes'
+        )
+    # Every space, tab, carriage return, newline and control character, not a
+    # hand-written list of the ones somebody thought of: `"host\r/a"` was
+    # rejected by twisted and accepted here because `\r` was not on the list.
+    if any(
+        character.isspace() or ord(character) < 0x21 or ord(character) == 0x7F
+        for character in raw
+    ):
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must not contain whitespace '
+            "or control characters; twisted refuses to build a request URI "
+            "from one, on every message"
+        )
+    parsed = urlparse(raw)
+    if parsed.scheme not in _CHOREO_URL_SCHEMES:
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must be an http or https URL; '
+            f"got scheme {parsed.scheme!r}. Every moderation check would fail "
+            "against any other scheme, and each failure is swallowed by the "
+            "fail-open handler, so the effect is unmoderated messages and no "
+            "error."
+        )
+    if "@" in parsed.netloc:
+        # Includes the empty-userinfo case `https://@host`, which `username`
+        # and `password` both report as falsy while twisted reads the whole
+        # `@host` as the hostname.
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must not carry credentials or '
+            "an empty userinfo marker; use moderation.choreo_access_token. A "
+            "URL is logged and reported in far more places than a token is."
+        )
+    if not parsed.hostname:
+        # `netloc` is not the test: `"https://:443"` has a non-empty netloc and
+        # no host at all.
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must include a host, as in '
+            '"https://choreo.example.org"'
+        )
+    try:
+        port = parsed.port
+    except ValueError:
+        # `urlparse` raises here for a non-numeric or out-of-range port, and
+        # only when the attribute is read - which nothing did, so
+        # `"https://host:99999"` and `"https://host:bad"` both started cleanly.
+        raise ValueError(
+            'Config "moderation.choreo_base_url" has a port that is not a '
+            "number between 1 and 65535"
+        ) from None
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError(
+            'Config "moderation.choreo_base_url" has a port outside 1-65535'
+        )
+    if parsed.netloc.endswith(":"):
+        # `urlparse` reports no port for a bare trailing colon, so the range
+        # check above never sees it - and twisted keeps the colon as part of
+        # the hostname, which then fails to resolve on every request. Tested on
+        # `netloc`, not on a bracket-stripped copy: `https://[::1]` legitimately
+        # ends in a colon inside the brackets, and stripping them made a valid
+        # IPv6 base URL look like a dangling port separator.
+        raise ValueError(
+            'Config "moderation.choreo_base_url" ends its host with a colon '
+            "and no port"
+        )
+    _validate_choreo_host(parsed.hostname, parsed.netloc)
+    if parsed.params:
+        raise ValueError(
+            'Config "moderation.choreo_base_url" must be a base URL with no '
+            "path parameters; the request path is appended to it"
+        )
+    if parsed.scheme != "https":
+        # Not an error: a local stack and the E2E suite legitimately run over
+        # plaintext. Naming it is what keeps it a deliberate choice.
+        logger.warning(
+            'Config "moderation.choreo_base_url" is not https, so the '
+            "moderation service account's bearer token and every moderated "
+            "message cross the network in the clear"
+        )
+    return raw
 
 
 class PangeaChat:
@@ -233,6 +433,13 @@ class PangeaChat:
             path="/_synapse/client/pangea/v1/send_push",
             resource=self.direct_push_resource,
         )
+
+        # --- Server-side chat moderation ---
+        # Constructed only when a tier is enabled: construction is what
+        # registers the callbacks, so dark config stays truly dark.
+        self.chat_moderation: Optional[ChatModeration] = None
+        if config.moderation_tier1_enabled or config.moderation_tier2_enabled:
+            self.chat_moderation = ChatModeration(api, config)
 
         # --- Limit User Directory ---
         if config.limit_user_directory_public_attribute_search_path is not None:
@@ -611,6 +818,175 @@ class PangeaChat:
                 'Config "delayed_push.require_synapse_version" must not be empty'
             )
 
+        # --- moderation config ---
+        moderation = config.get("moderation", {})
+        if moderation is None:
+            moderation = {}
+        if not isinstance(moderation, dict):
+            raise ValueError('Config "moderation" must be an object')
+
+        # Unknown keys are refused, and this is a security check rather than
+        # tidiness. Every key in this block is a switch that turns moderation
+        # ON; ignoring one an operator misspelled means `tier1_enable: true`
+        # parses cleanly, both tiers stay dark, no callback is registered and
+        # nothing is logged at any level. The operator's next signal is a
+        # moderation incident. `get` with a default cannot detect that - only
+        # comparing the keys present against the keys that exist can.
+        unknown_moderation_keys = sorted(
+            str(key) for key in moderation if key not in _MODERATION_CONFIG_KEYS
+        )
+        if unknown_moderation_keys:
+            raise ValueError(
+                'Config "moderation" has unknown keys '
+                f"{unknown_moderation_keys}; known keys are "
+                f"{sorted(_MODERATION_CONFIG_KEYS)}"
+            )
+
+        moderation_tier1_enabled = moderation.get("tier1_enabled", False)
+        if not isinstance(moderation_tier1_enabled, bool):
+            raise ValueError('Config "moderation.tier1_enabled" must be a boolean')
+
+        # Validated against libphonenumber's own region list, not just for
+        # shape: every wrong value here - an empty list, "us", "US " - is a
+        # string of the right type that the matcher finds no numbers for, so
+        # the phone rule silently does not run. See tier1_prefilter.
+        moderation_tier1_phone_regions = tier1_prefilter.validate_phone_regions(
+            moderation.get("tier1_phone_regions", ["US"])
+        )
+
+        moderation_tier2_enabled = moderation.get("tier2_enabled", False)
+        if not isinstance(moderation_tier2_enabled, bool):
+            raise ValueError('Config "moderation.tier2_enabled" must be a boolean')
+
+        moderation_choreo_base_url = moderation.get("choreo_base_url", None)
+        moderation_choreo_access_token = moderation.get("choreo_access_token", None)
+        if moderation_tier2_enabled:
+            # Refuse a half-configured Tier 2 at startup rather than failing
+            # (open, hence silently) on every message later.
+            if (
+                not isinstance(moderation_choreo_base_url, str)
+                or not moderation_choreo_base_url.strip()
+            ):
+                raise ValueError(
+                    'Config "moderation.choreo_base_url" is required when '
+                    "moderation.tier2_enabled is true"
+                )
+            # Present is not the same as usable, and the difference is the whole
+            # point of refusing a half-configured Tier 2: a non-empty string
+            # that is not a URL we can fetch - "ftp://choreo.invalid",
+            # "choreo.invalid" with no scheme - passes a presence check,
+            # starts cleanly, and then fails on every single message inside the
+            # fail-open handler, which is silence. A startup failure names the
+            # problem once; the alternative names it never.
+            moderation_choreo_base_url = _validate_choreo_base_url(
+                moderation_choreo_base_url
+            )
+            if (
+                not isinstance(moderation_choreo_access_token, str)
+                or not moderation_choreo_access_token.strip()
+            ):
+                raise ValueError(
+                    'Config "moderation.choreo_access_token" is required when '
+                    "moderation.tier2_enabled is true"
+                )
+
+        # The retired regex key is refused rather than translated. The two
+        # grammars overlap with different meanings, so any automatic
+        # conversion could silently widen an exemption - and an exempt sender
+        # skips both tiers. See moderation/exempt.py.
+        # Presence of the key is what is refused, not its value: an operator
+        # who wrote `exempt_user_id_patterns:` with nothing after it still
+        # believes an exemption policy is configured, and silently accepting
+        # it would leave them believing it after an upgrade changed the key.
+        _ABSENT = object()
+        legacy_exempt = moderation.get(moderation_exempt.LEGACY_CONFIG_KEY, _ABSENT)
+        if legacy_exempt is not _ABSENT:
+            raise ValueError(
+                moderation_exempt.legacy_key_error(
+                    [str(value) for value in legacy_exempt]
+                    if isinstance(legacy_exempt, (list, tuple))
+                    else []
+                    if legacy_exempt is None
+                    else [str(legacy_exempt)]
+                )
+            )
+
+        moderation_exempt_user_id_globs = moderation.get(
+            moderation_exempt.CONFIG_KEY, []
+        )
+        if not isinstance(moderation_exempt_user_id_globs, list) or not all(
+            isinstance(pat, str) for pat in moderation_exempt_user_id_globs
+        ):
+            raise ValueError(
+                f'Config "moderation.{moderation_exempt.CONFIG_KEY}" must be a '
+                "list of strings"
+            )
+        for pat in moderation_exempt_user_id_globs:
+            # Validated here so a bad value fails startup once instead of
+            # being re-discovered on every message in the send path.
+            moderation_exempt.validate_glob(pat)
+            if moderation_exempt.matches_every_sender(pat):
+                # Not an error: exempting everyone is a decision an operator
+                # is allowed to make. Naming it is what makes it a deliberate
+                # one rather than a typo nobody notices.
+                logger.warning(
+                    'Config "moderation.%s" entry %r exempts every sender on '
+                    "every homeserver, disabling moderation for all of them",
+                    moderation_exempt.CONFIG_KEY,
+                    pat,
+                )
+
+        moderation_redaction_reason_prefix = moderation.get(
+            "redaction_reason_prefix", "Removed by Pangea content moderation"
+        )
+        if (
+            not isinstance(moderation_redaction_reason_prefix, str)
+            or not moderation_redaction_reason_prefix.strip()
+        ):
+            raise ValueError(
+                'Config "moderation.redaction_reason_prefix" must be a non-empty string'
+            )
+
+        # Bounds, not just types. Every one of these sizes a buffer, a pool or
+        # a deadline, and a zero or a negative would not fail loudly - it
+        # would produce a queue that accepts nothing, a pool with no workers,
+        # or a deadline that has already expired, all of which look like "Tier
+        # 2 is on and silently checks nothing".
+        moderation_tier2_workers = _moderation_int(
+            moderation, "tier2_workers", 1, 64, 8
+        )
+        moderation_tier2_queue_size = _moderation_int(
+            moderation, "tier2_queue_size", 1, 10_000, 40
+        )
+        moderation_tier2_breaker_failure_threshold = _moderation_int(
+            moderation, "tier2_breaker_failure_threshold", 1, 1_000, 5
+        )
+        moderation_tier2_request_timeout_seconds = _moderation_float(
+            moderation, "tier2_request_timeout_seconds", 0.1, 120.0, 15.0
+        )
+        moderation_tier2_breaker_cooldown_seconds = _moderation_float(
+            moderation, "tier2_breaker_cooldown_seconds", 1.0, 3_600.0, 30.0
+        )
+        moderation_tier2_breaker_max_cooldown_seconds = _moderation_float(
+            moderation, "tier2_breaker_max_cooldown_seconds", 1.0, 86_400.0, 300.0
+        )
+        moderation_tier2_drain_timeout_seconds = _moderation_float(
+            moderation, "tier2_drain_timeout_seconds", 0.0, 300.0, 10.0
+        )
+        moderation_tier2_supervisor_interval_seconds = _moderation_float(
+            moderation, "tier2_supervisor_interval_seconds", 1.0, 3_600.0, 30.0
+        )
+        if (
+            moderation_tier2_breaker_max_cooldown_seconds
+            < moderation_tier2_breaker_cooldown_seconds
+        ):
+            raise ValueError(
+                'Config "moderation.tier2_breaker_max_cooldown_seconds" must '
+                "be at least moderation.tier2_breaker_cooldown_seconds; the "
+                "cooldown doubles up to the maximum, so a maximum below it "
+                "would shorten the first cooldown rather than cap the last"
+            )
+
         return PangeaChatConfig(
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
@@ -663,4 +1039,31 @@ class PangeaChat:
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,
             delayed_push_require_synapse_version=delayed_push_require_synapse_version,
             blocked_join_gate_enabled=blocked_join_gate_enabled,
+            moderation_tier1_enabled=moderation_tier1_enabled,
+            moderation_tier1_phone_regions=moderation_tier1_phone_regions,
+            moderation_tier2_enabled=moderation_tier2_enabled,
+            moderation_choreo_base_url=moderation_choreo_base_url,
+            moderation_choreo_access_token=moderation_choreo_access_token,
+            moderation_exempt_user_id_globs=moderation_exempt_user_id_globs,
+            moderation_redaction_reason_prefix=moderation_redaction_reason_prefix,
+            moderation_tier2_workers=moderation_tier2_workers,
+            moderation_tier2_queue_size=moderation_tier2_queue_size,
+            moderation_tier2_request_timeout_seconds=(
+                moderation_tier2_request_timeout_seconds
+            ),
+            moderation_tier2_breaker_failure_threshold=(
+                moderation_tier2_breaker_failure_threshold
+            ),
+            moderation_tier2_breaker_cooldown_seconds=(
+                moderation_tier2_breaker_cooldown_seconds
+            ),
+            moderation_tier2_breaker_max_cooldown_seconds=(
+                moderation_tier2_breaker_max_cooldown_seconds
+            ),
+            moderation_tier2_drain_timeout_seconds=(
+                moderation_tier2_drain_timeout_seconds
+            ),
+            moderation_tier2_supervisor_interval_seconds=(
+                moderation_tier2_supervisor_interval_seconds
+            ),
         )
