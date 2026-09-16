@@ -50,6 +50,7 @@ from typing import (
     FrozenSet,
     List,
     NamedTuple,
+    Optional,
     Sequence,
     Set,
     TypedDict,
@@ -100,7 +101,7 @@ class TermRecord(TypedDict, total=False):
     reason: str
     note: str
     #: Present only on a promoted term: the positive evidence for promoting
-    #: it. `basis` is one of `not_a_word_in_any_orthography`,
+    #: it. `basis` is one of `not_a_word_or_an_identifier`,
     #: `curator_attested` or `native_review`.
     review: Dict[str, str]
     collisions: Dict[str, float]
@@ -213,26 +214,71 @@ def needle_floor(needle_text: str) -> int:
     return MIN_ALPHABET_NEEDLE_LEN
 
 
+#: A compact whole token: `n1gger` matches the token `n1gger`.
+BUCKET_TOKEN = "token"
+#: A run of consecutive whole words of one sentence: `bhen ch0d`.
+BUCKET_PHRASE = "phrase"
+#: A word typed with its letters spaced apart and NOTHING else: `p 1 c a`
+#: matches `p 1 c a` and never the token `p1ca`.
+BUCKET_SPLIT = "split"
+#: Every needle a spelled-out run may equal - the union of the two above.
+#: Precomputed, because the rejoining scan caches its longest needle on the
+#: set it is given and building that union per message would defeat it.
+BUCKET_REJOIN = "rejoin"
+
+
+def match_bucket(entry: TermRecord) -> Optional[str]:
+    """Which bucket this term's needle belongs in, or None for a term Tier 1
+    does not carry at all.
+
+    **A term written with its letters separated is a SPELLED-OUT evasion, and
+    may only ever match a spelled-out run.** `needle()` strips every
+    separator - it has to, because `f*ck` and `k.u.r.v.a` are one word with
+    its letters split - and that is exactly what defeated the intent of a
+    term authored as `p 1 c a`. Stored as `p1ca` in the compact bucket, a
+    needle written to catch a run of spaced letters became a blocklist entry
+    for any whole token, and `Room P1CA is down the hall`, `Model P1CA-200
+    ships Friday` and a gamertag were all rejected before persist.
+
+    The irony is worth recording so it is not repeated: `pica` was demoted
+    for ambiguity - a typographic unit in Slovak, an ordinary word in
+    Catalan, Portuguese and Spanish - and its leetspeak form carried the
+    identical collision straight back in.
+
+    `substring` is None rather than a bucket: in a script with no word
+    spacing there is no boundary to respect, so a needle fires inside
+    ordinary text - 操你妈 is spread across 体操 / 你 / 妈妈 in "can your
+    mother do this gymnastics routine". Establishing the boundary needs
+    segmentation Tier 1 cannot afford, so Chinese and Japanese terms are
+    Tier 2's. The classification records that per term; this is the backstop.
+    """
+    if entry["match"] == "substring":
+        return None
+    if entry["match"] == "phrase":
+        return BUCKET_PHRASE
+    if any(char.isspace() for char in entry["term"]):
+        return BUCKET_SPLIT
+    return BUCKET_TOKEN
+
+
 @lru_cache(maxsize=1)
 def _universal() -> Dict[str, Set[str]]:
     """The universal set, split by how each needle may be matched.
 
-    `token` needles match a whole token and `phrase` needles a run of
-    consecutive whole words. There is no substring bucket: see below.
+    See `match_bucket` for what separates the three, and why a needle in
+    `split` must never reach `token`.
     """
     data = json.loads(_UNIVERSAL_PATH.read_text(encoding="utf-8"))
-    buckets: Dict[str, Set[str]] = {"token": set(), "phrase": set()}
+    buckets: Dict[str, Set[str]] = {
+        BUCKET_TOKEN: set(),
+        BUCKET_PHRASE: set(),
+        BUCKET_SPLIT: set(),
+    }
     for entry in data["terms"]:
         if not entry.get("tier1"):
             continue
-        if entry["match"] == "substring":
-            # Tier 1 does not substring-match. In a script with no word
-            # spacing there is no boundary to respect, so a needle fires
-            # inside ordinary text: 操你妈 is spread across 体操 / 你 / 妈妈
-            # in "can your mother do this gymnastics routine". Establishing
-            # the boundary needs segmentation Tier 1 cannot afford, so
-            # Chinese and Japanese terms are Tier 2's. The classification
-            # records that decision per term; this is the backstop.
+        bucket = match_bucket(entry)
+        if bucket is None:
             continue
         stored = needle(entry["term"])
         # Belt and braces: the floor is a property of the matcher, so it is
@@ -241,9 +287,10 @@ def _universal() -> Dict[str, Set[str]]:
         # of ordinary short words until someone runs the tests.
         if len(stored) < needle_floor(stored):
             continue
-        buckets[entry["match"]].add(stored)
-    for bucket in buckets.values():
-        bucket.discard("")
+        buckets[bucket].add(stored)
+    for bucket_terms in buckets.values():
+        bucket_terms.discard("")
+    buckets[BUCKET_REJOIN] = buckets[BUCKET_TOKEN] | buckets[BUCKET_SPLIT]
     return buckets
 
 
@@ -266,11 +313,14 @@ def matches_tier1(text: str) -> bool:
     if not spans:
         return False
 
-    if any(span.text in terms["token"] for span in spans):
+    # Only the compact bucket may match a whole token. A needle authored as a
+    # spaced spelling is in `split`, and is reachable only through the
+    # rejoining scan below.
+    if any(span.text in terms[BUCKET_TOKEN] for span in spans):
         return True
-    if matches_phrase(spans, terms["phrase"]):
+    if matches_phrase(spans, terms[BUCKET_PHRASE]):
         return True
-    return _matches_split_word(spans, terms["token"])
+    return _matches_split_word(spans, terms[BUCKET_REJOIN])
 
 
 def matches_phrase(
@@ -346,13 +396,18 @@ def _matches_split_word(spans: Sequence[Span], needles: Set[str]) -> bool:
     persist, so each of those is a learner silenced mid-sentence.
 
     **And the run must carry a DIGIT.** It is the evidence standard the
-    promotion policy already applies to a term
-    (`not_a_word_in_any_orthography`), applied to the rejoining: no orthography
-    of the thirty supported languages puts a digit inside a word, so a
-    SPACED-OUT run carrying one can only be a deliberately obfuscated
-    spelling. Without it, `The letters are C U N T.` is a spelling lesson -
-    a first-week classroom exercise here - and Tier 1 cannot tell it from the
-    evasion it is structurally identical to.
+    promotion policy applies to a term (`not_a_word_or_an_identifier`),
+    applied to the rejoining: no orthography of the thirty supported languages
+    puts a digit inside a word, and no identifier is written as spaced single
+    letters either, so a SPACED-OUT run carrying one can only be a
+    deliberately obfuscated spelling. Without it, `The letters are C U N T.`
+    is a spelling lesson - a first-week classroom exercise here - and Tier 1
+    cannot tell it from the evasion it is structurally identical to.
+
+    Both halves of that are load-bearing, and only the RUN has both. A
+    COMPACT token carrying a digit is exactly the shape of an identifier -
+    `P1CA`, `P3DER` - which is why the digit alone never licensed a compact
+    needle and why five terms left Tier 1 when it was checked.
 
     Everything the two conditions exclude is Tier 2's, which reads the message
     in context: `c u n t`, `f.u.c.k`, `cu.nt`, `Press C,U,N,T to continue.`

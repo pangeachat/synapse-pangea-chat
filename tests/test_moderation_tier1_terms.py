@@ -18,8 +18,14 @@ from typing import Any, Dict, List, Optional
 from synapse_pangea_chat.moderation.profanity import contains_profanity
 from synapse_pangea_chat.moderation.tier1_prefilter import REASON_PROFANITY, check_text
 from synapse_pangea_chat.moderation.tier1_terms import (
+    BUCKET_PHRASE,
+    BUCKET_REJOIN,
+    BUCKET_SPLIT,
+    BUCKET_TOKEN,
     TermRecord,
     _is_letter_of_an_alphabet,
+    _universal,
+    match_bucket,
     matches_phrase,
     matches_tier1,
     needle,
@@ -101,8 +107,14 @@ _LARGE_LIST_THRESHOLD = 3.0
 _SMALL_LIST_THRESHOLD = 0.01
 
 _REASONS_FOR_TIER1 = {"reviewed", "collision_adjudicated"}
+# `not_a_word_in_any_orthography` is deliberately NOT here. It was the old
+# name of the digit basis, and the claim it made - a needle with a digit "can
+# only match a deliberately obfuscated spelling" - is false: alphanumeric
+# identifiers substitute a digit for a letter as a matter of course. The
+# replacement carries the second half of the question in its name, so a term
+# cannot be re-promoted on the old reasoning by writing the old word.
 _REVIEW_BASES = {
-    "not_a_word_in_any_orthography",
+    "not_a_word_or_an_identifier",
     "curator_attested",
     "native_review",
 }
@@ -116,6 +128,9 @@ _REASONS_FOR_TIER2 = {
     "no_word_boundary",
     "too_short",
     "unadjudicated",
+    # The needle carries a digit, and the word it spells has an ordinary
+    # reading - so an identifier spelled the same way is ordinary content.
+    "identifier_reading",
 }
 
 
@@ -454,13 +469,18 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
                 self.assertTrue(note.strip())
 
     def test_the_obfuscation_basis_is_verified_not_asserted(self) -> None:
-        """`not_a_word_in_any_orthography` means the needle carries a digit,
-        and that is checked in both directions: the basis cannot be claimed
-        for an ordinary word, and an ordinary word cannot be promoted by
-        claiming it."""
+        """`not_a_word_or_an_identifier` means the needle carries a digit, and
+        that is checked in both directions: the basis cannot be claimed for an
+        ordinary word, and an ordinary word cannot be promoted by claiming it.
+
+        It is the FIRST half of the basis only. The digit says the needle is
+        not orthographic; it does not say the needle is not an identifier, and
+        `TestALeetFormCarriesNoEvidenceOfItsOwn` is the test for the half this
+        one cannot see - which is precisely how `p1ca` got in.
+        """
         for entry in _promoted():
             has_digit = any(char.isdigit() for char in needle(entry["term"]))
-            claims = entry["review"]["basis"] == "not_a_word_in_any_orthography"
+            claims = entry["review"]["basis"] == "not_a_word_or_an_identifier"
             with self.subTest(term=entry["term"]):
                 self.assertEqual(claims, has_digit)
 
@@ -874,7 +894,7 @@ class TestTheMatchingRules(unittest.TestCase):
         for text in ("김 씨 발이 아파요", "민수 씨 발 아파요?", "개 새 끼"):
             with self.subTest(text=text):
                 self.assertFalse(matches_tier1(text))
-        for text in ("n 1 g g e r", "p 1 c a", "4 r s c h l o c h"):
+        for text in ("n 1 g g e r", "v 1 t t u", "4 r s c h l o c h"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -942,12 +962,17 @@ class TestTheMatchingRules(unittest.TestCase):
     def test_a_run_is_matched_by_its_suffixes(self) -> None:
         """The run grows from wherever the last unjoinable token was, so a
         whole-run test let one short word in front defeat it: `p 1 c a`
-        blocked and `Say a p 1 c a now` did not."""
+        blocked and `Say a p 1 c a now` did not.
+
+        Driven on `v 1 t t u` because `p 1 c a` - the spelling the bug was
+        found on - is no longer in Tier 1: the rule is about runs, and a rule
+        exercised on a term nobody matches is not exercised at all.
+        """
         for text in (
-            "p 1 c a",
-            "Say a p 1 c a now",
+            "v 1 t t u",
+            "Say a v 1 t t u now",
             "x n 1 g g e r",
-            "a b p 1 c a",
+            "a b v 1 t t u",
         ):
             with self.subTest(text=text):
                 self.assertEqual(check_text(text, _PHONE_REGIONS), REASON_PROFANITY)
@@ -959,8 +984,8 @@ class TestTheMatchingRules(unittest.TestCase):
         from synapse_pangea_chat.moderation import _displayed_text
 
         for formatted in (
-            "<table><tr><td>p</td><td>1</td><td>c</td><td>a</td></tr></table>",
-            "<p>p</p><p>1</p><p>c</p><p>a</p>",
+            "<table><tr><td>n</td><td>1</td><td>g</td><td>g</td></tr></table>",
+            "<p>v</p><p>1</p><p>t</p><p>t</p><p>u</p>",
             "<ol><li>v</li><li>1</li><li>t</li><li>t</li><li>u</li></ol>",
             "b<br>4<br>n<br>g<br>s<br>a<br>t",
         ):
@@ -969,7 +994,7 @@ class TestTheMatchingRules(unittest.TestCase):
                     check_text(_displayed_text(formatted), _PHONE_REGIONS)
                 )
         # And a word written with spaces inside it stays on one line.
-        self.assertEqual(check_text("p 1 c a", _PHONE_REGIONS), REASON_PROFANITY)
+        self.assertEqual(check_text("v 1 t t u", _PHONE_REGIONS), REASON_PROFANITY)
 
     def test_a_rejoining_needs_whitespace_and_a_digit(self) -> None:
         """Both conditions, because each on its own blocks ordinary text.
@@ -994,7 +1019,7 @@ class TestTheMatchingRules(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(check_text(text, _PHONE_REGIONS))
-        for text in ("p 1 c a", "n 1 g g e r", "4 r s c h l o c h"):
+        for text in ("v 1 t t u", "n 1 g g e r", "4 r s c h l o c h"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -1069,9 +1094,241 @@ class TestTheMatchingRules(unittest.TestCase):
         `test_a_list_of_letters_is_not_an_evasion` and
         `test_a_rejoining_needs_whitespace_and_a_digit`.
         """
-        for text in ("n 1 g g e r", "p 1 c a", "cuuuunt"):
+        for text in ("n 1 g g e r", "v 1 t t u", "cuuuunt"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
+
+
+class TestALeetFormCarriesNoEvidenceOfItsOwn(unittest.TestCase):
+    """A digit inside a needle is not evidence that the string can only be an
+    evasion.
+
+    The promotion basis claimed it was: "the needle contains a digit, which no
+    orthography of the thirty supported languages puts inside a word, so it
+    can only match a deliberately obfuscated spelling." The first half is
+    true and the second does not follow. ALPHANUMERIC IDENTIFIERS - gamertags,
+    room and apartment codes, SKUs, model numbers, usernames - substitute a
+    digit for a letter as a matter of course, and they are ordinary chat
+    content. `check_text("Room P1CA is down the hall")` was `M_FORBIDDEN`.
+
+    The matcher's own docstring already knew: rejoining across punctuation was
+    removed because `p3.der` (a DER certificate), `/api/v1/ado` and `p1.ca`
+    blocked - 198 forms. That fixed the REJOINING path and left the compact
+    one, where the same strings without the dot still blocked.
+
+    And `pica` had been demoted for exactly this class of ambiguity - a
+    typographic unit in Slovak, an ordinary word in Catalan, Portuguese and
+    Spanish - while its leetspeak form carried the identical collision back in
+    through a basis that was never checked against it.
+    """
+
+    @staticmethod
+    def _leet_needles(promoted: bool) -> List[str]:
+        return [
+            needle(entry["term"])
+            for entry in universal_terms()
+            if bool(entry["tier1"]) is promoted
+            and any(char.isdigit() for char in needle(entry["term"]))
+        ]
+
+    def test_the_reproduced_identifier_collisions_are_not_blocked(self) -> None:
+        """The four cases from the review, verbatim. The control passes today
+        and is here so a matcher that stopped matching anything at all cannot
+        make the other three green."""
+        for text in (
+            "p1ca",
+            "Room P1CA is down the hall",
+            "Model P1CA-200 ships Friday",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    check_text(text, _PHONE_REGIONS),
+                    "an ordinary alphanumeric identifier was rejected "
+                    "before persist",
+                )
+        self.assertIsNone(check_text("Pica is a typography unit", _PHONE_REGIONS))
+
+    def test_no_demoted_leet_needle_blocks_an_identifier(self) -> None:
+        """Driven off the data, so the class cannot be closed for `p1ca` and
+        left open for the fourteen terms beside it.
+
+        Three shapes, because an identifier turns up in all of them: bare, as
+        a room or apartment code, and as a model number with a suffix.
+        """
+        demoted = self._leet_needles(promoted=False)
+        self.assertTrue(demoted, "no demoted leet needle left to exercise this")
+        for stored in demoted:
+            if not stored.isascii():
+                continue
+            for text in (
+                stored,
+                f"Room {stored.upper()} is down the hall",
+                f"Model {stored.upper()}-200 ships Friday",
+                f"my gamertag is {stored}",
+            ):
+                with self.subTest(text=text):
+                    self.assertIsNone(check_text(text, _PHONE_REGIONS))
+
+    def test_no_promoted_leet_needle_spells_a_word_that_has_a_reading(
+        self,
+    ) -> None:
+        """The narrowed basis, RE-DERIVED here rather than read off the term.
+
+        A leet form inherits the readings of the word it spells. `P1CA` reads
+        as a stylized `Pica` - a typographic unit, and an ordinary word in
+        Catalan, Portuguese and Spanish - so `Room P1CA` is a room code;
+        `4RSCHLOCH` spells nothing but the slur, so a string written that way
+        is the slur however it is punctuated. That is what makes the digit
+        narrow the question from "is this a word in one of thirty languages?"
+        - which nobody here can answer - to "does an ordinary identifier get
+        spelled this way?", which the recorded readings can.
+
+        Two sources, both machine-read, because one of them can be forgotten:
+        the policy's own list of skeletons with a reading, AND every term the
+        wordlist itself demotes for a recorded benign reading. `pica`, `geci`
+        and `pondan` are demoted in the wordlist and would fail this test on
+        that alone.
+        """
+        readings = set(_policy()["skeletons_with_a_benign_reading"])
+        self.assertTrue(readings, "the recorded readings list is empty")
+        demoted_for_a_reading = {
+            entry["needle"]
+            for entry in universal_terms()
+            if not entry["tier1"]
+            and entry["reason"]
+            in {"benign_homograph", "benign_sense_in_own_language", "register"}
+        }
+        checked = 0
+        for entry in _promoted():
+            if entry["review"]["basis"] != "not_a_word_or_an_identifier":
+                continue
+            checked += 1
+            spellings = _deleet(needle(entry["term"]))
+            with self.subTest(term=entry["term"]):
+                self.assertEqual(
+                    sorted(spellings & (readings | demoted_for_a_reading)),
+                    [],
+                    "this needle spells a word that has an ordinary reading, "
+                    "so an identifier spelled the same way is ordinary "
+                    "content and Tier 1 must not reject it before persist",
+                )
+        self.assertTrue(checked, "no promoted term claims the narrowed basis")
+
+    def test_the_readings_that_demoted_a_term_are_each_recorded(self) -> None:
+        """And the list is not a place to quietly drop an entry.
+
+        Every skeleton recorded here carries the reading that makes it one, so
+        removing an entry to re-promote a term is an edit a reviewer sees next
+        to the sentence explaining what it would let through.
+        """
+        readings = _policy()["skeletons_with_a_benign_reading"]
+        self.assertIsInstance(readings, dict)
+        for skeleton, reading in readings.items():
+            with self.subTest(skeleton=skeleton):
+                self.assertTrue(str(reading).strip(), "a reading states itself")
+                self.assertTrue(skeleton.isalpha(), "a skeleton carries no digit")
+
+    def test_the_demoted_leet_terms_are_still_caught_after_send(self) -> None:
+        """Demoting is moving a term to Tier 2, not dropping it. D1 is that
+        everything ambiguous is judged with the message in front of it."""
+        for stored in self._leet_needles(promoted=False):
+            with self.subTest(needle=stored):
+                self.assertTrue(contains_profanity(stored))
+
+    def test_a_spelled_out_term_never_matches_a_compact_token(self) -> None:
+        """The normalization half, asserted on the classifier.
+
+        `needle()` strips every separator, so a term AUTHORED as a spaced
+        spelling - `p 1 c a` - produced the compact needle `p1ca` and went
+        into the bucket that matches any whole token. The term's own intent
+        was a run of spaced letters; the stored form silently became a
+        blocklist entry for an identifier.
+
+        Exercised on records rather than on the live data, because no term in
+        Tier 1 is written that way today and an assertion over an empty set
+        protects nothing - which is exactly how this survived.
+        """
+        spaced: TermRecord = {
+            "term": "p 1 c a",
+            "match": "token",
+            "needle": "p1ca",
+            "langs": ["cs"],
+            "tier1": True,
+            "reason": "reviewed",
+        }
+        compact: TermRecord = {
+            "term": "n1gger",
+            "match": "token",
+            "needle": "n1gger",
+            "langs": ["en"],
+            "tier1": True,
+            "reason": "reviewed",
+        }
+        phrase: TermRecord = {
+            "term": "bhen ch0d",
+            "match": "phrase",
+            "needle": "bhench0d",
+            "langs": ["ur"],
+            "tier1": True,
+            "reason": "reviewed",
+        }
+        self.assertEqual(match_bucket(spaced), BUCKET_SPLIT)
+        self.assertEqual(match_bucket(compact), BUCKET_TOKEN)
+        self.assertEqual(match_bucket(phrase), BUCKET_PHRASE)
+
+    def test_no_letter_spaced_term_reaches_the_compact_bucket(self) -> None:
+        """And the live data goes through the same rule."""
+        for entry in _promoted():
+            if entry["match"] != "token":
+                continue
+            with self.subTest(term=entry["term"]):
+                if any(char.isspace() for char in entry["term"]):
+                    self.assertEqual(match_bucket(entry), BUCKET_SPLIT)
+                else:
+                    self.assertEqual(match_bucket(entry), BUCKET_TOKEN)
+
+    def test_a_spelled_out_needle_still_catches_the_spelled_out_run(
+        self,
+    ) -> None:
+        """The other half of the same rule: moving the needle out of the
+        compact bucket must not stop it matching what it was written for."""
+        buckets = _universal()
+        self.assertEqual(
+            buckets[BUCKET_TOKEN] & buckets[BUCKET_SPLIT],
+            set(),
+            "a needle in both buckets makes the split bucket meaningless",
+        )
+        self.assertTrue(
+            buckets[BUCKET_TOKEN] | buckets[BUCKET_SPLIT] <= buckets[BUCKET_REJOIN],
+            "a spelled-out run is matched against every needle either bucket "
+            "holds, or a term moved out of `token` stops being caught at all",
+        )
+        # Driven end to end on a term that IS promoted, so this cannot pass on
+        # an empty bucket.
+        self.assertTrue(matches_tier1("n 1 g g e r"))
+
+
+def _deleet(text: str) -> set:
+    """Every plain spelling a leet needle could be written from.
+
+    The substitutions are the ones the wordlist actually uses, and both
+    readings of `1` are tried: `v1ado` is `viado` and also `vlado`, a Slavic
+    given name, which is the second reason that term has no business blocking
+    a message before it is sent.
+    """
+    readings = {
+        "0": ["o"],
+        "1": ["i", "l"],
+        "3": ["e"],
+        "4": ["a"],
+        "5": ["s"],
+        "9": ["я"],
+    }
+    out = {""}
+    for char in text:
+        choices = readings.get(char, [char])
+        out = {prefix + choice for prefix in out for choice in choices}
+    return out
 
 
 if __name__ == "__main__":
