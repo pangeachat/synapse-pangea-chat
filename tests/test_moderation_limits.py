@@ -970,3 +970,81 @@ class TestSeverityGatesTheRedaction(unittest.IsolatedAsyncioTestCase):
             if name == UNKNOWN_CATEGORY:
                 continue
             self.assertLessEqual(minors, threshold, name)
+
+
+class TestTheVisibleWindowIsMeasured(unittest.IsolatedAsyncioTestCase):
+    """L4. Tier 2 redacts after persist, so between a flagged message
+    appearing and its redaction there is a window in which every member of the
+    room can read it.
+
+    That window is inherent to the design - closing it means blocking in the
+    send path, which is the thing the queue and the worker pool exist to avoid
+    - so it is not being eliminated. What was wrong is that its size was an
+    anecdote: "about two seconds", measured once, on one machine, against a
+    warm provider. It is now a histogram an operator can read a distribution
+    off.
+    """
+
+    def setUp(self) -> None:
+        self.reader = MetricReader()
+        self.homeserver = HomeServerDouble()
+        self.api = module_api_double(self.homeserver)
+
+    async def test_the_window_is_measured_from_persist_to_redaction_sent(
+        self,
+    ) -> None:
+        """End to end, not the provider call alone: the clock advances during
+        the queue wait AND during the check, and the observation covers both
+        plus the send."""
+        clock = self.homeserver.clock
+        module = _tier2_module(self, _tier2_config(), api=self.api)
+        enqueued_at = clock.time()
+
+        async def slow_check(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+            clock.now += 1.75
+            return {"flagged": True, "categories": ["harassment"], "evaluated": True}
+
+        before = self.reader.value(
+            "pangea_moderation_tier2_redaction_window_seconds_sum"
+        )
+        count_before = self.reader.value(
+            "pangea_moderation_tier2_redaction_window_seconds_count"
+        )
+        with patch(MODERATE_TEXT, side_effect=slow_check):
+            # 0.5s of queue wait before a worker even picks it up.
+            clock.now += 0.5
+            await module._check_and_redact(_job("you suck", enqueued_at=enqueued_at))
+        after = self.reader.value(
+            "pangea_moderation_tier2_redaction_window_seconds_sum"
+        )
+        count_after = self.reader.value(
+            "pangea_moderation_tier2_redaction_window_seconds_count"
+        )
+        self.assertEqual(count_after - count_before, 1.0)
+        self.assertAlmostEqual(after - before, 2.25, places=6)
+
+    async def test_a_message_that_is_not_redacted_is_not_in_the_window(
+        self,
+    ) -> None:
+        """The series measures the visible window of a message that WAS taken
+        down. Folding in the ones that were left standing - a clean verdict, a
+        preserve, a score below threshold - would make the distribution
+        describe something nobody is asking about."""
+        count_before = self.reader.value(
+            "pangea_moderation_tier2_redaction_window_seconds_count"
+        )
+        module = _tier2_module(self, _tier2_config(), api=self.api)
+        with patch(
+            MODERATE_TEXT,
+            _verdict(
+                categories=["self-harm/intent"],
+                category_scores={"self-harm/intent": 0.9},
+            ),
+        ):
+            await module._check_and_redact(_job("i want to hurt myself"))
+        with patch(MODERATE_TEXT, _verdict(flagged=False, categories=[])):
+            await module._check_and_redact(_job("hola", event_id="$evt2"))
+        self.assertEqual(
+            self.reader.value("pangea_moderation_tier2_redaction_window_seconds_count"),
+            count_before,
+        )

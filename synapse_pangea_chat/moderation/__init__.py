@@ -1138,6 +1138,23 @@ class ChatModeration:
         # landed. The success metric is out here for the same reason - the
         # `try` holds the send and nothing else.
         metrics.TIER2_REDACTIONS.labels(category=category).inc()
+        # The VISIBLE WINDOW, observed here and nowhere else: the send has
+        # returned, so this is the first moment the message is provably no
+        # longer readable, and `enqueued_at` was taken in `on_new_event`,
+        # which the notifier awaits once the event has persisted and is
+        # visible. Everything in between - the queue wait, the provider call,
+        # the disposition reads, the send - is inside the number.
+        #
+        # Only on the redaction path. A message left standing has no window,
+        # and folding a preserve or a below-threshold verdict into this series
+        # would make the distribution describe something nobody is asking
+        # about.
+        #
+        # Outside the `try` for the same reason the counter above is: the
+        # `try` holds the send and nothing else.
+        metrics.TIER2_REDACTION_WINDOW.observe(
+            max(self._clock.time() - job.enqueued_at, 0.0)
+        )
         await self._warn_if_preserved_meanwhile(job)
 
     def _record_matcher_agreement(

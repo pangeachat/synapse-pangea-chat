@@ -291,6 +291,38 @@ TIER2_QUEUE_WAIT = _get_or_create(
     buckets=(0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, float("inf")),
 )
 
+TIER2_REDACTION_WINDOW = _get_or_create(
+    Histogram,
+    "pangea_moderation_tier2_redaction_window_seconds",
+    "The VISIBLE WINDOW: wall time from a flagged message reaching "
+    "`on_new_event` - by which point it has persisted and every member of the "
+    "room can read it - to its redaction being sent. Tier 2 moderates after "
+    "persist by design, so this gap is inherent and is not being closed; what "
+    "was missing is that nobody could say how long it is. It is a LOWER BOUND "
+    "on what a reader experiences: it starts at the notifier rather than at "
+    "the sender's keystroke, so the client's round trip and the persist "
+    "itself are outside it, as is the time a client takes to apply the "
+    "redaction it receives. Distinct from `tier2_latency_seconds`, which "
+    "times the provider call alone, and from `tier2_queue_wait_seconds`, "
+    "which times the wait before it: this is the whole path end to end, "
+    "including both of those and the redaction send.",
+    buckets=(
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        3.0,
+        5.0,
+        8.0,
+        13.0,
+        21.0,
+        34.0,
+        60.0,
+        120.0,
+        float("inf"),
+    ),
+)
+
 # --- Severity ------------------------------------------------------------
 
 TIER2_CATEGORY_SCORE = _get_or_create(

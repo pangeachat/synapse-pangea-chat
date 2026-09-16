@@ -253,6 +253,34 @@ The rule governs records this module creates. One channel sits outside it, and i
 - **Synapse's own records, on Synapse's own loggers.** `handle_new_client_event` logs "Denying new event … User &lt;mxid&gt; not in room …" before raising, and `run_as_background_process` calls `logger.exception` on whatever a background task lets escape. A filter on our loggers cannot touch either. The module's answer to the second is to let **no** exception escape a moderation frame — `_check_and_redact` catches `Exception`, not just `ModerationCheckError`, because the narrower catch made the rule depend on the HTTP client being perfect and a `UnicodeDecodeError` out of `json.loads` was the counterexample: it carried the response body into Synapse's logger. The first is written entirely outside our call stack and cannot be closed from here.
 - **An exception's `__context__` is a channel too, and `raise … from None` does not close it.** It clears `__cause__` and stops the traceback being *rendered* with the original; the original stays attached, and a `json.JSONDecodeError` carries the whole response body on `.doc`. And it cannot be fixed by arranging our own frames: the interpreter attaches the active exception at *raise* time, so clearing it in `__init__` is too early, and raising outside our own handler does not help when twisted resumes an awaiting coroutine from inside *its* handler. Shadowing the attribute with a property was worse — it conceals the chain from an ordinary read while `BaseException.__context__.__get__` still returns the original, which is a mask rather than a fix. Each module exception is therefore caught one frame out at the module's boundary, its real slots cleared, and re-raised bare, which does not re-attach.
 
+## The visible window
+
+Tier 2 fires after the event persists, so between a flagged message appearing
+in the room and its redaction arriving there is a window in which every member
+can read it. **That window is inherent and is not being closed**: eliminating
+it means blocking in the send path, which is the thing the bounded queue and
+the fixed worker pool exist to avoid, and which Tier 1 — the tier that *can*
+block — is deliberately kept model-free and sub-millisecond for.
+
+What was wrong is that its size was an anecdote. "About two seconds" was one
+measurement, on one machine, against a warm provider, and nobody could say
+what the distribution looked like under load, during a provider slowdown, or
+with a queue that had backed up.
+`pangea_moderation_tier2_redaction_window_seconds` is that distribution:
+observed once per redaction that actually landed, from `enqueued_at` — taken
+in `on_new_event`, which the notifier awaits once the event is persisted and
+visible — to the moment the redaction send returns. It spans the queue wait,
+the provider call, the disposition reads and the send, so it is the whole path
+rather than any one leg of it; `tier2_latency_seconds` and
+`tier2_queue_wait_seconds` remain the two legs, and are inside it.
+
+Two honesty notes on the number. It is a **lower bound** on what a reader
+experiences: it starts at the notifier, so the client's round trip and the
+persist are outside it, as is the time a client takes to apply the redaction
+it receives. And it is observed only on the redaction path — a message left
+standing has no window, and folding a preserve or a below-threshold verdict
+into the series would make it describe something nobody is asking about.
+
 ## Encrypted rooms: what neither tier can do, and how you can see it
 
 In an end-to-end encrypted room the homeserver receives an `m.room.encrypted`
