@@ -157,16 +157,59 @@ class PangeaChatConfig:
     # A self-harm category cannot be given one: that disposition is preserve
     # at any score, and the key is refused rather than accepted and inert.
     moderation_tier2_category_thresholds: Optional[Mapping[str, float]] = None
+    # Whether Tier 2 checks rooms carrying an activity-plan state event.
+    #
+    # Default TRUE, and the default is the whole point of the setting. Tier 2
+    # used to return early on those rooms because the conversation
+    # orchestrator was understood to moderate activity sessions itself. It
+    # does not: on `2-step-choreographer@origin/main` the orchestrator's
+    # `flag` field is documented "always null: moderation left the LLM layer
+    # in the reset", `ModerationFlag` is defined and never constructed
+    # anywhere in that repository, and the only route to `/choreo/moderate`
+    # is the standalone moderator router this module calls. Activity sessions
+    # - the core product surface - were therefore moderated by nothing.
+    #
+    # It is a setting rather than a deletion so that an operator can restore
+    # the skip in minutes if the orchestrator's moderation ever comes back,
+    # without a release: running both would double-redact and double-spend.
+    moderation_tier2_moderate_activity_rooms: bool = True
     # --- Tier 2 transport and concurrency ---
     # `on_new_event` is awaited inline by the notifier for every event on the
     # homeserver, so Tier 2 is a bounded queue drained by a fixed pool rather
-    # than one background process per message. The defaults bound the WAIT: at
-    # eight workers and a fifteen-second per-check budget, a queue of forty is
-    # a worst case of about seventy-five seconds before the oldest accepted
-    # message is picked up. They do not bound throughput - one instance runs
-    # Tier 2, and that is the ceiling.
-    moderation_tier2_workers: int = 8
-    moderation_tier2_queue_size: int = 40
+    # than one background process per message.
+    #
+    # The numbers are derived, not chosen. Target load is 1,000 concurrent
+    # students at one message per 30 seconds - about 33 messages/second. A
+    # provider call costs about 2 seconds whether it carries one text or
+    # thirty-two, so batching is what turns latency into throughput: at
+    # `tier2_max_batch` 32 a worker clears 32 messages per call, and flagged
+    # items cost one extra single-text confirmation each (see
+    # `moderation.dispatch`). With a 5% flag rate one worker clears
+    # 32/(2*(1+32*0.05)) = 6.2 messages/second, so sixteen workers clear about
+    # 98/second - roughly 3x the target. It degrades above that: at a 20% flag
+    # rate the same pool clears about 35/second, which is the target with
+    # almost no margin.
+    #
+    # The queue is one message from every modelled student: a classroom
+    # burst - a teacher saying "everyone answer now" - is the realistic worst
+    # case, and 1,024 absorbs it in full instead of dropping most of it. It is
+    # also about 31 seconds of buffer at the sustained target rate, against
+    # the 1.2 seconds the previous 40 gave. Memory is bounded by the Matrix
+    # 64 KB event cap: 1,024 queued jobs are at most ~64 MB of held text.
+    moderation_tier2_workers: int = 16
+    moderation_tier2_queue_size: int = 1024
+    # How many queued messages one provider call may carry, and how long a
+    # worker may linger to fill a batch.
+    #
+    # The linger is 20 ms against a measured ~45 ms local (non-provider) path,
+    # so a batched message can never wait longer than about half the work it
+    # was already going to do, and it is 1% of the ~2 s provider call. It is
+    # also skipped outright whenever any other worker is parked and idle -
+    # then an arrival is picked up immediately and waiting could only add
+    # latency - so a lone message in an unloaded system is never delayed at
+    # all. See `Tier2Dispatcher._collect`.
+    moderation_tier2_max_batch: int = 32
+    moderation_tier2_batch_max_wait_seconds: float = 0.02
     # Covers the WHOLE exchange - connect, headers and body. The body half is
     # the one that had no bound at all.
     moderation_tier2_request_timeout_seconds: float = 15.0

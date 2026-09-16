@@ -2,8 +2,10 @@
 
 Tier 1: a message containing a phone number is rejected at send time
 (M_FORBIDDEN); a clean message lands. Tier 2: a message the (mocked) choreo
-moderation endpoint flags is redacted after the fact, sent as the offender;
-activity rooms are left to the orchestrator.
+moderation endpoint flags is redacted after the fact, sent as the offender.
+Activity rooms are moderated too - the orchestrator stopped producing a
+moderation flag in the reset, so leaving them to it left them checked by
+nothing; `moderation.tier2_moderate_activity_rooms` restores the skip.
 """
 
 import asyncio

@@ -41,7 +41,7 @@ from twisted.web._newclient import ResponseNeverReceived
 from twisted.web.client import ResponseDone
 from twisted.web.iweb import IBodyProducer
 
-from synapse_pangea_chat import PangeaChat
+from synapse_pangea_chat import _MODERATION_CONFIG_KEYS, PangeaChat
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.moderation import (
     MATCHER_MAX_CHARS,
@@ -66,6 +66,9 @@ from synapse_pangea_chat.moderation.disposition import (
     DISPOSITION_TABLE,
     STATEMENTS,
     DispositionStore,
+)
+from synapse_pangea_chat.moderation.exempt import (
+    LEGACY_CONFIG_KEY as LEGACY_EXEMPT_CONFIG_KEY,
 )
 from synapse_pangea_chat.moderation.tier1_prefilter import (
     REASON_CONTACT_DETAILS,
@@ -581,13 +584,23 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         mock.side_effect = error
         return cast(AsyncMock, mock)
 
-    async def test_activity_room_skipped(self) -> None:
-        """Asserted on the QUEUE, which is the route production takes.
+    async def test_activity_room_is_moderated_by_default(self) -> None:
+        """The skip is gone, and the default is to moderate.
 
-        It used to be asserted on `run_as_background_process`, which Tier 2
-        no longer dispatches through at all - so replacing the activity-room
-        check with an unconditional `False` left the test green while every
-        activity room was double-moderated.
+        Tier 2 used to return early on any room carrying an activity-plan
+        state event, on the premise that the conversation orchestrator
+        moderated activity sessions itself. That premise is false: on
+        `2-step-choreographer@origin/main` the orchestrator's `flag` field is
+        documented "always null: moderation left the LLM layer in the reset",
+        `ModerationFlag` has no construction site anywhere in that repo, and
+        the only route to `/choreo/moderate` is the standalone moderator
+        router this module calls. Activity rooms were therefore moderated by
+        nothing at all, and they are the core product surface.
+
+        Asserted on the QUEUE, which is the route production takes. It used to
+        be asserted on `run_as_background_process`, which Tier 2 no longer
+        dispatches through at all - so replacing the activity-room check with
+        a constant left the test green while the behaviour inverted.
         """
         homeserver = HomeServerDouble()
         api = _module_api(homeserver)
@@ -596,7 +609,66 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         state = {(PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE, ""): MagicMock()}
         with patch(MODERATE_TEXT, self._verdict()) as moderate:
             await mod.on_new_event(_event("you suck"), state)
+            self.assertEqual(
+                mod._dispatcher.queue_depth,
+                1,
+                "an activity-room message was not enqueued, so the room is "
+                "moderated by nobody",
+            )
+            homeserver.clock.drain()
+        moderate.assert_awaited()
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited()
+
+    async def test_activity_room_skip_is_restorable_by_config(self) -> None:
+        """An operator can put the skip back without a code change.
+
+        If the orchestrator's moderation ever returns, running both would
+        double-redact and double-spend. `tier2_moderate_activity_rooms: false`
+        is that switch, and it restores exactly the old behaviour.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(
+            self,
+            api,
+            self._tier2_config(moderation_tier2_moderate_activity_rooms=False),
+        )
+        assert mod._dispatcher is not None
+        state = {(PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE, ""): MagicMock()}
+        with patch(MODERATE_TEXT, self._verdict()) as moderate:
+            await mod.on_new_event(_event("you suck"), state)
             self.assertEqual(mod._dispatcher.queue_depth, 0)
+            homeserver.clock.drain()
+        moderate.assert_not_awaited()
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_an_exempt_sender_is_still_exempt_in_an_activity_room(
+        self,
+    ) -> None:
+        """The bot is a PARTICIPANT in an activity room, not a bystander.
+
+        Moderating activity rooms means Tier 2 now sees the bot's own replies
+        for the first time, and redacting those would be a visible product
+        regression. The exempt filter has to win over the room's new
+        inclusion, so it is asserted here and not inferred from the order two
+        `if`s happen to sit in today.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(
+            self,
+            api,
+            self._tier2_config(moderation_exempt_user_id_globs=["@bot*:example.org"]),
+        )
+        assert mod._dispatcher is not None
+        state = {(PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE, ""): MagicMock()}
+        with patch(MODERATE_TEXT, self._verdict()) as moderate:
+            await mod.on_new_event(_event("you suck", sender="@bot:example.org"), state)
+            self.assertEqual(
+                mod._dispatcher.queue_depth,
+                0,
+                "the bot's own reply was enqueued in an activity room",
+            )
             homeserver.clock.drain()
         moderate.assert_not_awaited()
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
@@ -2551,7 +2623,17 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
         reader = MetricReader()
         reader.snapshot("pangea_moderation_tier2_dropped_total", cause="dispatch_error")
         homeserver = HomeServerDouble()
-        mod = _tier2_module(self, _module_api(homeserver), _tier2_config())
+        # The activity-room check is only CONSULTED when an operator has
+        # switched activity-room moderation off, so that is the configuration
+        # this drives. The point of the test is the counter at `on_new_event`'s
+        # fail-open boundary, not which call happens to raise; keeping the
+        # same raising call rather than picking a new one keeps it honest
+        # about the boundary it is testing.
+        mod = _tier2_module(
+            self,
+            _module_api(homeserver),
+            _tier2_config(moderation_tier2_moderate_activity_rooms=False),
+        )
         with patch.object(
             mod, "_room_has_activity_plan", side_effect=RuntimeError("boom")
         ):
@@ -4358,24 +4440,148 @@ class TestParseConfig(unittest.TestCase):
         self.assertIn("tier1_enable", message)
         self.assertIn("tier1_enabled", message)
 
+    # One usable value per accepted key. Kept beside the test that consumes it
+    # so adding a key without a value fails loudly here rather than leaving the
+    # key untested.
+    ACCEPTED_KEY_VALUES: Dict[str, Any] = {
+        "tier1_enabled": True,
+        "tier1_phone_regions": ["US"],
+        "tier2_enabled": True,
+        "choreo_base_url": "https://choreo.invalid",
+        "choreo_access_token": "syt_x",
+        "exempt_user_id_globs": ["@bot:*"],
+        "redaction_reason_prefix": "Removed",
+        "tier1_refusal_messages": {"profanity": "No."},
+        "tier2_category_thresholds": {"harassment": 0.8},
+        "tier2_moderate_activity_rooms": False,
+        "tier2_workers": 4,
+        "tier2_queue_size": 64,
+        "tier2_max_batch": 8,
+        "tier2_batch_max_wait_seconds": 0.05,
+        "tier2_request_timeout_seconds": 5.0,
+        "tier2_breaker_failure_threshold": 3,
+        "tier2_breaker_cooldown_seconds": 10.0,
+        "tier2_breaker_max_cooldown_seconds": 60.0,
+        "tier2_drain_timeout_seconds": 2.0,
+        "tier2_supervisor_interval_seconds": 15.0,
+    }
+
     def test_every_documented_key_is_accepted(self) -> None:
         """The other half of the unknown-key gate: an accepted-key list that
-        has drifted away from the parser rejects valid configuration."""
+        has drifted away from the parser rejects valid configuration.
+
+        Derived from `_MODERATION_CONFIG_KEYS` rather than from a hand-written
+        block. The hand-written version listed seven of the eighteen keys the
+        parser accepted, so eleven of them - every sizing and breaker knob -
+        were covered by nothing, and a key could be added to the accepted set
+        with no parser behind it and nothing would say so.
+        """
+        accepted = set(_MODERATION_CONFIG_KEYS) - {
+            # Refused on purpose, with its own migration error.
+            LEGACY_EXEMPT_CONFIG_KEY
+        }
+        self.assertEqual(
+            accepted - set(self.ACCEPTED_KEY_VALUES),
+            set(),
+            "an accepted moderation config key has no value in this test, so "
+            "nothing checks that the parser understands it",
+        )
+        self.assertEqual(
+            set(self.ACCEPTED_KEY_VALUES) - accepted,
+            set(),
+            "this test offers a key the parser does not accept",
+        )
+        # Together, then one at a time: a key can be accepted in company and
+        # rejected on its own (a cross-key validation), and the whole-block
+        # form would not see it.
         cfg = PangeaChat.parse_config(
-            {
-                **self.BASE,
-                "moderation": {
-                    "tier1_enabled": True,
-                    "tier1_phone_regions": ["US"],
+            {**self.BASE, "moderation": dict(self.ACCEPTED_KEY_VALUES)}
+        )
+        self.assertTrue(cfg.moderation_tier2_enabled)
+        for key, value in self.ACCEPTED_KEY_VALUES.items():
+            with self.subTest(key=key):
+                block: Dict[str, Any] = {
+                    # Tier 2 refuses to start half-configured, so the two
+                    # required values ride along with every single-key case.
                     "tier2_enabled": True,
                     "choreo_base_url": "https://choreo.invalid",
                     "choreo_access_token": "syt_x",
-                    "exempt_user_id_globs": ["@bot:*"],
-                    "redaction_reason_prefix": "Removed",
-                },
-            }
+                    key: value,
+                }
+                PangeaChat.parse_config({**self.BASE, "moderation": block})
+
+    def test_the_activity_room_switch_is_a_boolean_and_defaults_to_on(self) -> None:
+        """Default ON, because nothing else moderates an activity session.
+
+        A non-bool is refused rather than coerced, for the reason
+        `tier1_enabled` is: `tier2_moderate_activity_rooms: "false"` is truthy
+        in Python, so an operator restoring the skip would silently not
+        restore it and activity rooms would keep being checked.
+        """
+        cfg = PangeaChat.parse_config(dict(self.BASE))
+        self.assertTrue(cfg.moderation_tier2_moderate_activity_rooms)
+        for bad in ("false", 0, 1, [], None):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError) as caught:
+                    PangeaChat.parse_config(
+                        {
+                            **self.BASE,
+                            "moderation": {"tier2_moderate_activity_rooms": bad},
+                        }
+                    )
+                self.assertIn("tier2_moderate_activity_rooms", str(caught.exception))
+
+    def test_the_batching_knobs_are_bounded(self) -> None:
+        """Each of these sizes a buffer or a wait, and each has a value that
+        would not fail loudly: a batch of zero is a call carrying no text, and
+        a wait of an hour is a message nobody moderates today."""
+        for key, bad in (
+            ("tier2_max_batch", 0),
+            ("tier2_max_batch", 257),
+            ("tier2_max_batch", True),
+            ("tier2_batch_max_wait_seconds", -0.001),
+            ("tier2_batch_max_wait_seconds", 5.001),
+            ("tier2_batch_max_wait_seconds", True),
+        ):
+            with self.subTest(key=key, value=bad):
+                with self.assertRaises(ValueError):
+                    PangeaChat.parse_config({**self.BASE, "moderation": {key: bad}})
+
+    def test_the_shipped_defaults_carry_the_documented_capacity(self) -> None:
+        """The sizing is an arithmetic claim, so it is pinned rather than
+        left in a comment.
+
+        Target is 1,000 concurrent students at one message per 30 s (~33.3
+        msg/s). A provider call costs ~2 s regardless of how many texts it
+        carries, so a worker clears `max_batch` messages per call plus one
+        single-text confirmation per flagged item. At a 5% flag rate that is
+        32/(2*(1+32*0.05)) = 6.15 msg/s per worker; sixteen workers clear
+        ~98 msg/s, about 3x target. A comment saying so is not evidence; this
+        is.
+        """
+        cfg = PangeaChat.parse_config(dict(self.BASE))
+        target_rate = 1000 / 30.0
+        provider_seconds = 2.0
+        flag_rate = 0.05
+        per_worker = cfg.moderation_tier2_max_batch / (
+            provider_seconds * (1 + cfg.moderation_tier2_max_batch * flag_rate)
         )
-        self.assertTrue(cfg.moderation_tier2_enabled)
+        capacity = per_worker * cfg.moderation_tier2_workers
+        self.assertGreaterEqual(
+            capacity,
+            2.0 * target_rate,
+            f"the shipped defaults clear {capacity:.1f} msg/s against a "
+            f"{target_rate:.1f} msg/s target, which is under 2x headroom",
+        )
+        self.assertGreaterEqual(
+            cfg.moderation_tier2_queue_size / target_rate,
+            30.0,
+            "the queue holds less than one 30-second student message cycle, "
+            "so a synchronised classroom burst is partly dropped",
+        )
+        # The linger has to stay a minority of the measured ~45 ms local path,
+        # or batching is paying for itself with latency it does not have.
+        self.assertLess(cfg.moderation_tier2_batch_max_wait_seconds, 0.045 / 2)
 
     def test_tier2_requires_url_and_token(self) -> None:
         with self.assertRaises(ValueError):

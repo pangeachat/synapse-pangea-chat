@@ -15,9 +15,16 @@ send path enforces normal room auth, and a user may always redact their own
 message, so this works in every room — DMs included — without requiring a
 privileged member. The moderation reason rides on the redaction event.
 
-Activity rooms (those carrying an activity-plan state event) are skipped by
-Tier 2: the conversation orchestrator already bundles moderation there, and
-double-moderating would double-redact and double-spend.
+Activity rooms (those carrying an activity-plan state event) ARE moderated by
+Tier 2. They used to be skipped, on the premise that the conversation
+orchestrator bundled moderation into its per-turn call — a premise that is no
+longer true, and the stale comment asserting it is what kept the core product
+surface unmoderated. On `2-step-choreographer@origin/main` the orchestrator's
+`flag` is documented "always null: moderation left the LLM layer in the reset",
+`ModerationFlag` is defined and never constructed anywhere in that repository,
+and the only route to `/choreo/moderate` is the standalone moderator router
+this module calls. `moderation.tier2_moderate_activity_rooms` restores the skip
+if that ever changes.
 
 Design doc: .github/instructions/moderation.instructions.md (repo-level) and
 the org trust-and-safety doc it descends from.
@@ -548,6 +555,12 @@ class ChatModeration:
         self._category_thresholds = severity.validate_thresholds(
             config.moderation_tier2_category_thresholds
         )
+        # Read once here rather than off `self._config` at every event: this
+        # is tested on the notifier's inline path, for every event on the
+        # homeserver.
+        self._moderate_activity_rooms = bool(
+            config.moderation_tier2_moderate_activity_rooms
+        )
         # Keyed per instance so a Matrix ID cannot be recovered from a log
         # line by enumeration; see moderation.log_safety.
         self._log_digest_key = new_digest_key()
@@ -888,9 +901,19 @@ class ChatModeration:
                     # counted drop, not a message that passed.
                     metrics.record_drop("extraction_failed")
                 return
-            if self._room_has_activity_plan(state_events):
-                # The conversation orchestrator owns moderation in activity
-                # rooms; checking here would double-moderate.
+            if not self._moderate_activity_rooms and self._room_has_activity_plan(
+                state_events
+            ):
+                # Only when an operator has asked for it. The default is to
+                # moderate: the orchestrator stopped producing a moderation
+                # flag in the reset, so skipping here left activity sessions
+                # checked by nothing at all. See the module docstring.
+                #
+                # Note what is ABOVE this line and stays above it: the exempt
+                # filter. The bot is a participant in an activity room rather
+                # than a bystander, and Tier 2 redacting its replies would be
+                # a visible product regression, so the exemption has to win
+                # over the room's inclusion.
                 return
             self._dispatcher.enqueue(
                 ModerationJob(

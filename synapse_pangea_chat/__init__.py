@@ -64,8 +64,11 @@ _MODERATION_CONFIG_KEYS = frozenset(
         "choreo_base_url",
         "choreo_access_token",
         "redaction_reason_prefix",
+        "tier2_moderate_activity_rooms",
         "tier2_workers",
         "tier2_queue_size",
+        "tier2_max_batch",
+        "tier2_batch_max_wait_seconds",
         "tier2_request_timeout_seconds",
         "tier2_breaker_failure_threshold",
         "tier2_breaker_cooldown_seconds",
@@ -862,6 +865,16 @@ class PangeaChat:
         if not isinstance(moderation_tier2_enabled, bool):
             raise ValueError('Config "moderation.tier2_enabled" must be a boolean')
 
+        # Default true: nothing else moderates an activity session. See the
+        # field on `PangeaChatConfig` for the verification behind that.
+        moderation_tier2_moderate_activity_rooms = moderation.get(
+            "tier2_moderate_activity_rooms", True
+        )
+        if not isinstance(moderation_tier2_moderate_activity_rooms, bool):
+            raise ValueError(
+                'Config "moderation.tier2_moderate_activity_rooms" must be a ' "boolean"
+            )
+
         moderation_choreo_base_url = moderation.get("choreo_base_url", None)
         moderation_choreo_access_token = moderation.get("choreo_access_token", None)
         if moderation_tier2_enabled:
@@ -940,6 +953,27 @@ class PangeaChat:
                     pat,
                 )
 
+        if (
+            moderation_tier2_enabled
+            and moderation_tier2_moderate_activity_rooms
+            and not moderation_exempt_user_id_globs
+        ):
+            # Not an error - an operator may genuinely have no bot - but it is
+            # the one configuration in which this release changes what learners
+            # SEE. Tier 2 now enters activity rooms, where the bot is a
+            # participant rather than a bystander, so with no exemption
+            # configured the bot's own replies are moderated for the first
+            # time and a flagged one would be redacted out of the session.
+            # That is a visible product regression, and an operator who reads
+            # this line before a rollout does not ship it.
+            logger.warning(
+                'Config "moderation.tier2_moderate_activity_rooms" is true '
+                'and "moderation.%s" is empty: Tier 2 now checks activity '
+                "rooms, so the bot's own messages will be moderated and may "
+                "be redacted. List the bot's Matrix ID to exempt it.",
+                moderation_exempt.CONFIG_KEY,
+            )
+
         moderation_redaction_reason_prefix = moderation.get(
             "redaction_reason_prefix", "Removed by Pangea content moderation"
         )
@@ -974,10 +1008,24 @@ class PangeaChat:
         # or a deadline that has already expired, all of which look like "Tier
         # 2 is on and silently checks nothing".
         moderation_tier2_workers = _moderation_int(
-            moderation, "tier2_workers", 1, 64, 8
+            moderation, "tier2_workers", 1, 64, 16
         )
         moderation_tier2_queue_size = _moderation_int(
-            moderation, "tier2_queue_size", 1, 10_000, 40
+            moderation, "tier2_queue_size", 1, 10_000, 1_024
+        )
+        # Upper bound 256 rather than "as many as you like": one call carries
+        # every text in the batch, the endpoint reads 10,000 characters of
+        # each, and a batch large enough to build a multi-megabyte request
+        # body trades the drop this exists to prevent for a timeout. It is
+        # also the blast radius of one lost call.
+        moderation_tier2_max_batch = _moderation_int(
+            moderation, "tier2_max_batch", 1, 256, 32
+        )
+        # Lower bound 0.0, which disables the linger outright: opportunistic
+        # batching over whatever is already queued still works, and an
+        # operator who wants provably zero added latency can ask for it.
+        moderation_tier2_batch_max_wait_seconds = _moderation_float(
+            moderation, "tier2_batch_max_wait_seconds", 0.0, 5.0, 0.02
         )
         moderation_tier2_breaker_failure_threshold = _moderation_int(
             moderation, "tier2_breaker_failure_threshold", 1, 1_000, 5
@@ -1069,8 +1117,15 @@ class PangeaChat:
             moderation_redaction_reason_prefix=moderation_redaction_reason_prefix,
             moderation_tier1_refusal_messages=moderation_tier1_refusal_messages,
             moderation_tier2_category_thresholds=moderation_tier2_category_thresholds,
+            moderation_tier2_moderate_activity_rooms=(
+                moderation_tier2_moderate_activity_rooms
+            ),
             moderation_tier2_workers=moderation_tier2_workers,
             moderation_tier2_queue_size=moderation_tier2_queue_size,
+            moderation_tier2_max_batch=moderation_tier2_max_batch,
+            moderation_tier2_batch_max_wait_seconds=(
+                moderation_tier2_batch_max_wait_seconds
+            ),
             moderation_tier2_request_timeout_seconds=(
                 moderation_tier2_request_timeout_seconds
             ),
