@@ -185,12 +185,26 @@ class PangeaChatConfig:
     # `tier2_max_batch` 32 a worker clears 32 messages per call, and flagged
     # items cost one extra single-text confirmation each (see
     # `moderation.dispatch`). With a 5% flag rate one worker clears
-    # 32/(2*(1+32*0.05)) = 6.2 messages/second, so sixteen workers clear about
-    # 98/second by that arithmetic and 94/second when actually driven
-    # (`tests/test_moderation_load.py`) - roughly 3x the target. It degrades
-    # on the FLAG rate rather than the message rate: at a 20% flag rate the
-    # same pool clears about 35/second, which is the target with almost no
-    # margin.
+    # 32/(2*(1+32*0.05)) = 6.2 messages/second, so EIGHT workers clear about
+    # 49/second by that arithmetic and about 47/second when actually driven
+    # (`tests/test_moderation_load.py`) - roughly 1.4x the target.
+    #
+    # Eight is a deliberate first-rollout choice, not the ceiling. A worker is
+    # a coroutine on the existing reactor, not a process, so the count costs
+    # no infrastructure either way; what it bounds is how many provider calls
+    # are in flight at once. Eight keeps that pressure modest while Tier 2 is
+    # new. Sixteen measures at 94/second - roughly 3x the target - and is the
+    # documented next step.
+    #
+    # RAISE TO SIXTEEN when any of these is observed, because capacity
+    # degrades on the FLAG rate rather than the message rate:
+    #   - `pangea_moderation_tier2_screen_total{verdict="flagged"}` shows a
+    #     flag rate above 5%. At 10% eight workers clear about 30/second,
+    #     which is BELOW the 33/second target; sixteen still clear about 61.
+    #   - any sustained `queue_full` drop, or mean queue depth above 25%.
+    #   - sustained screened rate above 25/second.
+    # The flag rate is currently an ESTIMATE. It has never been measured on
+    # real traffic, and it is the input this sizing is most sensitive to.
     #
     # The queue is one message from every modelled student: a classroom
     # burst - a teacher saying "everyone answer now" - is the realistic worst
@@ -198,7 +212,7 @@ class PangeaChatConfig:
     # also about 31 seconds of buffer at the sustained target rate, against
     # the 1.2 seconds the previous 40 gave. Memory is bounded by the Matrix
     # 64 KB event cap: 1,024 queued jobs are at most ~64 MB of held text.
-    moderation_tier2_workers: int = 16
+    moderation_tier2_workers: int = 8
     moderation_tier2_queue_size: int = 1024
     # How many queued messages one provider call may carry, and how long a
     # worker may linger to fill a batch.
