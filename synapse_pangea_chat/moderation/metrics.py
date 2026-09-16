@@ -175,6 +175,25 @@ TIER2_CLAIM_STRANDED = _get_or_create(
     "will ever take that message down; a human has to clear the row.",
 )
 
+TIER2_CLAIM_RETAINED = _get_or_create(
+    Counter,
+    "pangea_moderation_tier2_claim_retained_total",
+    "Redaction claims deliberately NOT given back after the send raised, by "
+    "what a re-read of the event established. `landed` means the redaction is "
+    "durably in the room and the raise arrived afterwards; `unknown` means the "
+    "re-read could not say. Distinct from `claim_stranded`, which is a release "
+    "that was attempted and failed: this one was never attempted, because "
+    "giving a claim back is only correct when the send provably did not "
+    "happen. Both leave a row a human may have to clear.",
+    ["evidence"],
+)
+
+# What the re-read after a raised send established. Two values, because they
+# are the two ways a release is NOT justified, and an operator reads them
+# differently: `landed` is a message that is gone, `unknown` is a message
+# whose state nobody can establish.
+CLAIM_RETENTION_EVIDENCE = frozenset({"landed", "unknown"})
+
 TIER2_WORKERS_RESTARTED = _get_or_create(
     Counter,
     "pangea_moderation_tier2_workers_restarted_total",
@@ -341,6 +360,18 @@ def record_redaction_failure(cause: str) -> None:
     if cause not in REDACTION_FAILURE_CAUSES:
         raise ValueError(f"unknown moderation redaction failure cause {cause!r}")
     TIER2_REDACTION_FAILED.labels(cause=cause).inc()
+
+
+def record_claim_retained(evidence: str) -> None:
+    """Count a redaction claim kept on purpose, and say on what evidence.
+
+    Validated against a closed set like every other label here: a retained
+    claim is a row somebody may have to clear by hand, and one filed under a
+    label nobody alerts on is a row nobody clears.
+    """
+    if evidence not in CLAIM_RETENTION_EVIDENCE:
+        raise ValueError(f"unknown moderation claim retention evidence {evidence!r}")
+    TIER2_CLAIM_RETAINED.labels(evidence=evidence).inc()
 
 
 def record_matcher_agreement(service: str, matcher: str) -> None:

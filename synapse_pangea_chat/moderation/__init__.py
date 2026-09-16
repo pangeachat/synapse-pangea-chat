@@ -25,6 +25,7 @@ the org trust-and-safety doc it descends from.
 
 import inspect
 import re
+from functools import partial
 from html.parser import HTMLParser
 from typing import (
     Any,
@@ -943,20 +944,20 @@ class ChatModeration:
                 }
             )
         except Exception as exc:
-            # The claim goes back on the CANCELLATION path as well, which is
-            # what the callback is for: `reraise_if_cancelled` re-raises
-            # before anything below it runs, so a release written underneath
-            # is unreachable exactly when it matters most. And cancellation
-            # here is not hypothetical - the drain cancels an abandoned worker
-            # parked on this very send. A claim that outlived it would be a
-            # durable row saying `redacted` on a message nobody redacted, and
-            # no verdict on any instance could ever take that message down.
-            reraise_if_cancelled(exc, lambda: self._release_claim(job, claim_id))
-            # A redaction send can fail for reasons that are ordinary rather
-            # than exceptional: the sender has left, been kicked or been
-            # banned (room auth checks membership before it checks redaction
-            # rights), the room raises the send level for redactions, or the
-            # sender is remote and the module cannot author an event as them.
+            # A raise here is an UNKNOWN, not a failure, and the two are not
+            # interchangeable: the send's durable write happens inside
+            # Synapse's `handle_new_client_event` and the fan-out to pushers,
+            # the notifier and the third-party rules runs after it, so this
+            # handler can be reached with the redaction already in the room.
+            # `_settle_claim` is therefore what decides, on a re-read, whether
+            # the claim goes back and whether this was a failure at all.
+            #
+            # Settled on the CANCELLATION path as well, which is what the
+            # callback is for: `reraise_if_cancelled` re-raises before
+            # anything below it runs, so a settlement written underneath is
+            # unreachable exactly when it matters most. And cancellation here
+            # is not hypothetical - the drain cancels an abandoned worker
+            # parked on this very send.
             #
             # It is caught HERE, and not allowed to escape, because this
             # coroutine runs under `run_as_background_process`, which calls
@@ -966,19 +967,23 @@ class ChatModeration:
             # into a plaintext log by a route none of this module's own
             # format strings mention.
             #
-            # Escalating the legitimate ones is separate work; today the
+            # Escalating the legitimate failures is separate work; today the
             # message stays up and the failure is counted and visible, which
             # is what the previous behaviour was missing.
             #
-            # Released through `run_in_background`, so a CANCELLATION reaches
-            # this line and still gives the claim back: awaiting the release
-            # inside a coroutine that is being cancelled would be cancelled
-            # with it, and the row would say `redacted` forever on a message
-            # nobody had redacted.
-            self._release_claim(job, claim_id)
-            metrics.record_redaction_failure(_redaction_failure_cause(exc))
+            # `partial` rather than a lambda, because it binds the arguments
+            # NOW: `except ... as exc` unbinds `exc` at the end of the block,
+            # so a closure that reads it later reads a name that no longer
+            # exists. It happens to work while the call is synchronous, and
+            # it is the kind of working-by-accident the next edit breaks
+            # silently.
+            reraise_if_cancelled(
+                exc, partial(self._settle_claim, job, claim_id, category, exc)
+            )
+            self._settle_claim(job, claim_id, category, exc)
             logger.warning(
-                "tier2 redaction failed for %s in %s at %s (%s); message stays",
+                "tier2 redaction raised for %s in %s at %s (%s); whether it "
+                "landed is being re-read",
                 job.event_id,
                 job.room_id,
                 error_site(exc),
@@ -1142,23 +1147,128 @@ class ChatModeration:
             job.room_id,
         )
 
-    def _release_claim(self, job: ModerationJob, claim_id: str) -> None:
-        """Hand the claim back when no redaction was sent.
+    def _settle_claim(
+        self, job: ModerationJob, claim_id: str, category: str, error: BaseException
+    ) -> None:
+        """Decide what to do with the claim after the send RAISED.
 
-        Without this a send that failed for an ordinary reason - the sender
-        left the room, the room raised its redaction level - would leave the
-        event claimed forever, so nothing could ever take it down.
+        **A claim may be given back only when the send provably did NOT
+        happen.** Release used to be the default on every exit from the
+        handler, and a default is the wrong shape here, because the two
+        mistakes are not comparable:
+
+        - A claim kept on a message that is still standing blocks later
+          verdicts on that one event. A human can clear the row, and the
+          counters (`claim_retained`, `claim_stranded`) are what tells them to.
+        - A claim given back on a message that is ALREADY GONE erases the only
+          record that a redaction was taken. The disposition table exists so a
+          human can trust what it says about a safeguarding decision, and a
+          table that forgets a redaction is a table that will later report the
+          event as untouched - or as `preserved` - for a message nobody can
+          get back.
+
+        So the unknown goes to the first of those, and the evidence is a
+        re-read. Nothing about this is specific to cancellation: cancellation
+        is merely the reachable case, because `worker.cancel()` at the drain
+        deadline delivers `CancelledError` at whatever `await` the coroutine
+        is parked on and rolls back nothing that already committed.
 
         Detached with `run_in_background` rather than awaited, and that is the
         point: the caller may be being CANCELLED, and awaiting here would be
-        cancelled with it, leaving the row saying `redacted` on a message
-        nobody redacted. A detached call still runs.
+        cancelled with it. A detached call still runs.
+
+        The failure LABEL is derived here and the exception is not carried
+        into the detached half: a label is a bounded string, and holding a
+        live exception across a background task keeps its traceback - and
+        every frame's locals, message text included - alive with it.
         """
         if self._disposition is None or not claim_id:
             return
         run_in_background(
-            self._disposition.release_redaction_claim, job.event_id, claim_id
+            self._settle_claim_now,
+            job,
+            claim_id,
+            category,
+            _redaction_failure_cause(error),
         )
+
+    async def _settle_claim_now(
+        self, job: ModerationJob, claim_id: str, category: str, cause: str
+    ) -> None:
+        """The detached half of `_settle_claim`. Never raises to its caller
+        except on a cancellation of its own, which leaves the claim in place -
+        the safe direction, at the cost of the count."""
+        disposition = self._disposition
+        if disposition is None:
+            return
+        landed = await self._redaction_landed(job)
+        if landed is False:
+            # The only branch with positive evidence: the event is there and
+            # it is not redacted, so the send did not happen and the claim
+            # would otherwise turn a transient failure into a permanent one.
+            metrics.record_redaction_failure(cause)
+            await disposition.release_redaction_claim(job.event_id, claim_id)
+            return
+        if landed is True:
+            # It landed. Counted as a redaction rather than as a failed send,
+            # because it IS one - counting it the other way was the same
+            # inverted assumption in metric form - and reported through the
+            # same path a send that returned normally goes through, so a
+            # preserve that arrived underneath is not silent here either.
+            metrics.TIER2_REDACTIONS.labels(category=category).inc()
+            metrics.record_claim_retained("landed")
+            logger.warning(
+                "tier2 redaction for %s in %s raised after it had already "
+                "landed; the claim is kept, because releasing it would leave "
+                "nothing recording that the message was taken down",
+                job.event_id,
+                job.room_id,
+            )
+            await self._warn_if_preserved_meanwhile(job)
+            return
+        metrics.record_redaction_failure(cause)
+        metrics.record_claim_retained("unknown")
+        logger.error(
+            "tier2 could not establish whether the redaction of %s in %s "
+            "landed, so the claim is kept: the row says redacted and nobody "
+            "can say whether it is, which a human has to resolve",
+            job.event_id,
+            job.room_id,
+        )
+
+    async def _redaction_landed(self, job: ModerationJob) -> Optional[bool]:
+        """Did the redaction reach the room? True, False, or None for "we
+        could not find out".
+
+        A second reader of the same row as `_is_still_redactable`, and
+        deliberately not the same function: the two want OPPOSITE things from
+        an unknown. That one skips a redaction it cannot justify; this one
+        keeps a claim it cannot justify giving back. One `except` cannot serve
+        two contradictory defaults, and folding them together is how a
+        fail-open default reached a decision that must not fail open.
+
+        A missing event is an unknown and not a `False`. It is not evidence
+        the redaction did not land - a redacted event is still readable, so
+        `None` here means something else happened to it - and guessing in the
+        permissive direction is the thing this function exists to stop.
+        """
+        try:
+            store = self._api._hs.get_datastores().main
+            existing = await store.get_event(job.event_id, allow_none=True)
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok: the caller counts and logs the unknown this produces.
+            # Type and site rather than a traceback, as everywhere else here.
+            logger.warning(
+                "tier2 could not re-read %s to settle its claim at %s (%s)",
+                job.event_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
+            return None
+        if existing is None:
+            return None
+        return bool(existing.internal_metadata.is_redacted())
 
     async def _is_still_redactable(self, job: ModerationJob) -> bool:
         """Re-read the target immediately before sending the redaction.

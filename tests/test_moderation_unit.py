@@ -1594,6 +1594,226 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
             await retry._check_and_redact(self._job())
         cast(AsyncMock, retry_api.create_and_send_event_into_room).assert_awaited_once()
 
+    async def test_a_cancellation_after_the_redaction_landed_keeps_the_claim(
+        self,
+    ) -> None:
+        """The rule: a claim is given back only when the send provably did NOT
+        happen.
+
+        Cancellation does not roll back statements that already completed.
+        The durable write is inside Synapse's `handle_new_client_event`, and
+        the fan-out to pushers, the notifier and the third-party rules runs
+        after it - so `worker.cancel()` at the drain deadline can deliver
+        `CancelledError` into a coroutine whose redaction is ALREADY in the
+        room. Releasing the claim then erased the only record that a redaction
+        had been taken, and counted the send as a failure, for a message that
+        is gone.
+        """
+        reader = MetricReader()
+        reader.snapshot(
+            "pangea_moderation_tier2_claim_retained_total", evidence="landed"
+        )
+        reader.snapshot("pangea_moderation_tier2_redaction_failed_total", cause="other")
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+
+        async def _landed_then_cancelled(*_args: Any, **_kwargs: Any) -> Any:
+            # The ORDER is the whole test: the side effect commits, and the
+            # cancellation arrives afterwards. Every existing double holds the
+            # coroutine BEFORE any side effect and then completes atomically,
+            # which is the case that was already safe.
+            homeserver.store.redacted = True
+            raise defer.CancelledError()
+
+        cast(
+            AsyncMock, api.create_and_send_event_into_room
+        ).side_effect = _landed_then_cancelled
+        with patch(self.MODERATE, self._verdict("harassment")):
+            with self.assertRaises(defer.CancelledError):
+                await mod._check_and_redact(self._job())
+        row = db_pool.connection.execute(
+            f"SELECT disposition FROM {DISPOSITION_TABLE} WHERE event_id = ?",
+            (self._job().event_id,),
+        ).fetchone()
+        self.assertEqual(
+            row,
+            ("redacted",),
+            "the claim on a redaction that LANDED was given back, so the "
+            "table no longer records that the message was taken down",
+        )
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_claim_retained_total", evidence="landed"
+            ),
+            1.0,
+            "a claim kept on purpose has to be visible, or it reads as a leak",
+        )
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_redaction_failed_total", cause="other"
+            ),
+            0.0,
+            "a redaction that landed was counted as a send that failed",
+        )
+
+    async def test_an_ordinary_failure_after_the_redaction_landed_keeps_it(
+        self,
+    ) -> None:
+        """The same rule on the other exit path. `CancelledError` is the
+        reachable case, but nothing about the rule is specific to it: any
+        raise from the send is an UNKNOWN unless a re-read says otherwise,
+        and Synapse has post-persist work that can raise too."""
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+
+        async def _landed_then_raised(*_args: Any, **_kwargs: Any) -> Any:
+            homeserver.store.redacted = True
+            raise RuntimeError("the fan-out after the persist blew up")
+
+        cast(
+            AsyncMock, api.create_and_send_event_into_room
+        ).side_effect = _landed_then_raised
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job())
+        row = db_pool.connection.execute(
+            f"SELECT disposition FROM {DISPOSITION_TABLE} WHERE event_id = ?",
+            (self._job().event_id,),
+        ).fetchone()
+        self.assertEqual(row, ("redacted",), "a landed redaction lost its record")
+
+    async def test_a_claim_is_kept_when_the_re_read_cannot_say(self) -> None:
+        """An unknown is not a release.
+
+        The read that would establish whether the redaction landed can itself
+        fail - most likely during exactly the shutdown that caused the
+        cancellation. A stuck claim is recoverable and counted; a released one
+        on a message that is gone is neither.
+        """
+        reader = MetricReader()
+        reader.snapshot(
+            "pangea_moderation_tier2_claim_retained_total", evidence="unknown"
+        )
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        store = homeserver.store
+
+        def _break_after_the_pre_send_read() -> None:
+            # The pre-send re-read has to succeed or no claim is ever taken;
+            # it is the read AFTERWARDS that has to be the one that fails.
+            # The hook runs after the read is recorded, so the second one
+            # sees the error it sets.
+            if len(store.reads) >= 2:
+                store.error = RuntimeError("the datastore is going down")
+
+        store.on_read = _break_after_the_pre_send_read
+        cast(
+            AsyncMock, api.create_and_send_event_into_room
+        ).side_effect = defer.CancelledError()
+        with patch(self.MODERATE, self._verdict("harassment")):
+            with self.assertRaises(defer.CancelledError):
+                await mod._check_and_redact(self._job())
+        row = db_pool.connection.execute(
+            f"SELECT disposition FROM {DISPOSITION_TABLE} WHERE event_id = ?",
+            (self._job().event_id,),
+        ).fetchone()
+        self.assertEqual(
+            row, ("redacted",), "a claim was given back on no evidence at all"
+        )
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_claim_retained_total", evidence="unknown"
+            ),
+            1.0,
+        )
+
+    async def test_an_event_that_is_gone_is_an_unknown_not_a_release(self) -> None:
+        """A read that comes back empty is the third answer, and it is not a
+        `no`.
+
+        A redacted event is still readable, so "not there" is not evidence the
+        redaction did not land - it says something else happened to the event,
+        which is precisely the state nobody should be guessing about. Reading
+        the empty row as "the send did not happen" is the same permissive
+        default in its quietest form.
+        """
+        reader = MetricReader()
+        reader.snapshot(
+            "pangea_moderation_tier2_claim_retained_total", evidence="unknown"
+        )
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        store = homeserver.store
+
+        def _vanish_after_the_pre_send_read() -> None:
+            if len(store.reads) >= 2:
+                store.missing = True
+
+        store.on_read = _vanish_after_the_pre_send_read
+        cast(
+            AsyncMock, api.create_and_send_event_into_room
+        ).side_effect = defer.CancelledError()
+        with patch(self.MODERATE, self._verdict("harassment")):
+            with self.assertRaises(defer.CancelledError):
+                await mod._check_and_redact(self._job())
+        row = db_pool.connection.execute(
+            f"SELECT disposition FROM {DISPOSITION_TABLE} WHERE event_id = ?",
+            (self._job().event_id,),
+        ).fetchone()
+        self.assertEqual(
+            row,
+            ("redacted",),
+            "an event nobody could read was treated as one nobody redacted",
+        )
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_claim_retained_total", evidence="unknown"
+            ),
+            1.0,
+        )
+
+    async def test_a_disclosure_removed_by_a_cancelled_send_is_reported(
+        self,
+    ) -> None:
+        """The cancellation path gets the same report the success path has.
+
+        `_warn_if_preserved_meanwhile` runs after a send that RETURNED, so a
+        send that landed and was then cancelled reached none of it: a
+        disclosure was removed from a room, the claim was handed back, and
+        nothing anywhere said so. This is the same cross-instance window
+        `test_a_preserve_that_lands_during_the_send_is_reported` covers,
+        reached by the other exit.
+        """
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier2_redacted_after_preserve_total")
+        db_pool = DbPoolDouble()
+        api_a, hs_a = self._pair(db_pool)
+        api_b, hs_b = self._pair(db_pool)
+        a, b = self._module(api_a, hs_a), self._module(api_b, hs_b)
+
+        async def _preserved_underneath_then_cancelled(
+            *_args: Any, **_kwargs: Any
+        ) -> Any:
+            hs_a.store.redacted = True
+            with patch(self.MODERATE, self._verdict("self-harm/intent")):
+                await b._check_and_redact(self._job())
+            raise defer.CancelledError()
+
+        cast(
+            AsyncMock, api_a.create_and_send_event_into_room
+        ).side_effect = _preserved_underneath_then_cancelled
+        with patch(self.MODERATE, self._verdict("harassment")):
+            with self.assertRaises(defer.CancelledError):
+                await a._check_and_redact(self._job())
+        self.assertEqual(
+            reader.delta("pangea_moderation_tier2_redacted_after_preserve_total"),
+            1.0,
+            "a disclosure was removed on the cancellation path, silently",
+        )
+
     async def test_a_failed_send_gives_the_claim_back(self) -> None:
         """A claim that outlived a failed send would turn a transient failure
         - the sender is briefly unable to send - into a permanent one: the
