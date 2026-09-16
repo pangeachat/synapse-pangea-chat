@@ -219,6 +219,14 @@ class DispositionStore:
         remembered and RETRIED on the next operation, because the alternative
         is a guarantee that lives only in this process's memory until the row
         happens to be written by somebody.
+
+        **The retry is in memory, so a restart before it lands loses it**, and
+        a later verdict on that event will then redact the disclosure. There
+        is no closing that from here: the only durable place to record "we
+        could not record this" is the store that just refused. It is counted
+        (`pangea_moderation_tier2_disposition_write_failed_total`) and logged
+        at ERROR, and while the store is refusing it is also refusing every
+        claim, so nothing is being redacted in the meantime.
         """
         # Remembered first and unconditionally. If the write below fails this
         # is all that stands between the disclosure and the next verdict in
@@ -232,8 +240,17 @@ class DispositionStore:
 
         Called before every claim as well as on the preserve itself, so a
         database that was briefly unavailable cannot leave a disclosure
-        unprotected once it comes back: the claim that would redact it writes
-        the preserve first and then loses the row to it.
+        unprotected once it comes back - in THIS process: the claim that would
+        redact it writes the preserve first and then loses the row to it. A
+        restart before the retry lands loses the decision; see
+        `record_preserved`.
+
+        **A preserve that can never be written wedges every redaction in this
+        process**, because a claim is refused while anything is pending. That
+        is the safe direction and it is a whole-feature outage from one row,
+        so it is said here rather than discovered: a store that refuses a
+        write but serves reads is exotic, and a store that refuses both
+        already stops every claim at `_ensure_table`.
         """
         if not self._pending:
             return True

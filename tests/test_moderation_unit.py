@@ -946,6 +946,29 @@ class TestTier2RefusesToRunThroughAProxy(unittest.TestCase):
         self.assertTrue(_bypasses_proxy(with_config, "choreo.example.org"))
         self.assertFalse(_bypasses_proxy(with_config, "elsewhere.example.org"))
 
+    def test_the_older_synapse_pin_keeps_its_no_proxy(self) -> None:
+        """Synapse 1.124's agent holds a bare `no_proxy` string and passes
+        `{"no": self.no_proxy}`; 1.159 holds a `proxy_config` object. Reading
+        only the newer shape refused startup on a 1.124 deployment that had
+        done exactly what the error message asks for, and COMPAT.yml declares
+        both pins supported."""
+        from synapse_pangea_chat.moderation.choreo_client import _bypasses_proxy
+
+        legacy = SimpleNamespace(
+            http_proxy_endpoint=None,
+            https_proxy_endpoint=object(),
+            no_proxy="choreo.example.org",
+        )
+        self.assertTrue(_bypasses_proxy(legacy, "choreo.example.org"))
+        self.assertFalse(_bypasses_proxy(legacy, "elsewhere.example.org"))
+        api = module_api_double(http_client=SimpleNamespace(agent=legacy))
+        module = ChatModeration(
+            api,
+            _tier2_config(moderation_choreo_base_url="https://choreo.example.org"),
+        )
+        self.addCleanup(_stop_tier2, module)
+        self.assertIsNotNone(module._dispatcher)
+
     def test_tier_1_only_deployments_are_unaffected(self) -> None:
         """The leak is Tier 2's transport. A homeserver running the pre-filter
         alone has no outbound call to proxy."""
@@ -1202,6 +1225,30 @@ class TestAnUnusableVerdictIsNoVerdict(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
+    async def test_an_unusable_verdict_takes_no_decision_at_all(self) -> None:
+        """Not a redaction, and not a preserve either: saying preserve would
+        be the same overclaim in the other direction, since nothing durable is
+        recorded and a preserve is by definition durable. It is counted, so
+        an endpoint misbehaving is visible."""
+        reader = MetricReader()
+        reader.snapshot(
+            "pangea_moderation_tier2_redaction_skipped_total",
+            cause="unusable_verdict",
+        )
+        api, mod = self._module()
+        verdict = create_autospec(moderate_text)
+        verdict.return_value = {"flagged": True, "categories": None}
+        with patch(MODERATE_TEXT, verdict):
+            await mod._check_and_redact(self._job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        self.assertEqual(
+            reader.delta(
+                "pangea_moderation_tier2_redaction_skipped_total",
+                cause="unusable_verdict",
+            ),
+            1.0,
+        )
+
     async def test_an_unrecognised_self_harm_category_still_preserves(self) -> None:
         """A sub-category the provider adds after our fixture was pinned
         normalises to `other`, and `other` redacts - so the vocabulary check
@@ -1434,6 +1481,39 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
             f"SELECT disposition FROM {DISPOSITION_TABLE}"
         ).fetchall()
         self.assertEqual(rows, [("preserved",)])
+
+    async def test_a_cancelled_send_gives_the_claim_back(self) -> None:
+        """The drain cancels an abandoned worker, and it can be parked on this
+        very send. `reraise_if_cancelled` re-raises before anything below it
+        runs, so a release written underneath is unreachable exactly when it
+        matters - and the claim it strands is DURABLE: the row says `redacted`
+        on a message nobody redacted, and no verdict on any instance could
+        ever take that message down again."""
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        # Twisted's `CancelledError`, which is what a cancelled Deferred
+        # delivers into the coroutine and is an `Exception` - asyncio's is a
+        # `BaseException` that no handler in this module catches, so a test
+        # built on `Task.cancel()` would be testing a different thing.
+        cast(
+            AsyncMock, api.create_and_send_event_into_room
+        ).side_effect = defer.CancelledError()
+        with patch(self.MODERATE, self._verdict("harassment")):
+            with self.assertRaises(defer.CancelledError):
+                await mod._check_and_redact(self._job())
+        row = db_pool.connection.execute(
+            f"SELECT disposition FROM {DISPOSITION_TABLE} WHERE event_id = ?",
+            (self._job().event_id,),
+        ).fetchone()
+        self.assertIsNone(row, "a cancelled send stranded its claim")
+
+        # And a later verdict can still take the message down.
+        retry_api, retry_hs = self._pair(db_pool)
+        retry = self._module(retry_api, retry_hs)
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await retry._check_and_redact(self._job())
+        cast(AsyncMock, retry_api.create_and_send_event_into_room).assert_awaited_once()
 
     async def test_a_failed_send_gives_the_claim_back(self) -> None:
         """A claim that outlived a failed send would turn a transient failure
@@ -1839,6 +1919,45 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
         ):
             self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
 
+    async def test_each_field_of_a_surface_is_read_on_its_own(self) -> None:
+        """The granularity IS the fix. A failure in one field must cost that
+        field's text and nothing else, so the guard is asserted on every
+        reader rather than only on the HTML one - collapsing the three into a
+        single `try`, or breaking out of the loop on the first failure, left
+        every other test in this suite green."""
+        from synapse_pangea_chat.moderation import _SURFACE_READERS
+
+        def _broken(_surface: Any) -> List[str]:
+            raise RuntimeError("boom")
+
+        self.assertEqual(len(_SURFACE_READERS), 3)
+        for index, (name, _reader) in enumerate(_SURFACE_READERS):
+            with self.subTest(broken=name):
+                # The TABLE is substituted, not the module attribute: the
+                # table binds the functions at import, so patching the
+                # attribute leaves the code calling the originals and the
+                # test passes without exercising anything.
+                table = list(_SURFACE_READERS)
+                table[index] = (name, _broken)
+                mod = _moderation(_config())
+                # Every surviving reader carries a rule-tripping value, so
+                # whichever two are still read must block.
+                event = _event(
+                    content={
+                        "msgtype": "m.image",
+                        "body": "call 415-555-2671",
+                        "filename": "call 415-555-2671.png",
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": "call 415-555-2671",
+                    }
+                )
+                with patch(
+                    "synapse_pangea_chat.moderation._SURFACE_READERS", tuple(table)
+                ):
+                    self.assertEqual(
+                        await mod.check_event_for_spam(event), Codes.FORBIDDEN
+                    )
+
     async def test_a_surface_that_cannot_be_read_is_counted(self) -> None:
         """Fail-open must not mean fail-silent. An unreadable surface is an
         unknown, and an uncounted unknown is indistinguishable from a clean
@@ -1999,6 +2118,19 @@ class TestTableRepair(unittest.IsolatedAsyncioTestCase):
                     2,
                     "the row's own text was not foster-parented",
                 )
+
+    def test_the_repair_keeps_the_text_that_stands_in_the_flow(self) -> None:
+        """An image's alternative text REPLACES the image between the
+        characters either side, so it is in the flow and is foster-parented
+        with the flow. Left out, the text on both sides of it joined:
+        `<table>41<img alt="999">5-555-2671</table>` reads as
+        `41 999 5-555-2671` and produced `415-555-2671`, a pre-send block on a
+        number no reader sees."""
+        displayed = _displayed_text(
+            '<table>41<img alt="999" src="x">5-555-2671</table>'
+        )
+        self.assertNotIn("415-555-2671", displayed)
+        self.assertIn("419995-555-2671", displayed)
 
     def test_a_row_is_not_a_cell(self) -> None:
         """Text between a `</td>` and its `</tr>` is outside every cell, and

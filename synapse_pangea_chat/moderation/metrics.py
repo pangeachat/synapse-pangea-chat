@@ -286,6 +286,10 @@ REDACTION_SKIP_CAUSES = frozenset(
         # The drain has ended, so this job was written off before it got
         # here. A shutdown that has returned must not change a room.
         "shutdown",
+        # The service flagged the message and named no category we can read,
+        # so there is no decision to take - not a redaction and not a
+        # preserve.
+        "unusable_verdict",
         # The disposition table could not be read, so we cannot establish that
         # this event was NOT preserved. The one place this module refuses to
         # act on an unknown rather than carrying on - see

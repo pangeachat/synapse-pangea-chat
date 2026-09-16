@@ -874,7 +874,7 @@ class TestTheMatchingRules(unittest.TestCase):
         for text in ("김 씨 발이 아파요", "민수 씨 발 아파요?", "개 새 끼"):
             with self.subTest(text=text):
                 self.assertFalse(matches_tier1(text))
-        for text in ("n 1 g g e r", "n1.gger", "p 1 c a"):
+        for text in ("n 1 g g e r", "p 1 c a", "4 r s c h l o c h"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -939,13 +939,30 @@ class TestTheMatchingRules(unittest.TestCase):
         self.assertFalse(matches_tier1(message))
         self.assertLess(time.perf_counter() - started, 1.0)
 
-    def test_only_a_digit_rejoins_a_run_before_send(self) -> None:
-        """The one thing that separates an evasion from a lesson: no
-        orthography of the thirty supported languages puts a digit inside a
-        word, so a rejoined run carrying one can only be a deliberately
-        obfuscated spelling. It is the same evidence standard the promotion
-        policy already applies to a term."""
-        for text in ("p 1 c a", "n 1 g g e r", "n1.gger", "p.1.c.a"):
+    def test_a_rejoining_needs_whitespace_and_a_digit(self) -> None:
+        """Both conditions, because each on its own blocks ordinary text.
+
+        Without the digit, `The letters are C U N T.` is a spelling lesson.
+        Without the whitespace rule, punctuation between two pieces is how an
+        IDENTIFIER is written, and `p3.der` (a DER certificate),
+        `/api/v1/ado` and `p1.ca` were all `M_FORBIDDEN` - 198 blocking forms
+        across `.`, `-` and `/`.
+        """
+        for text in (
+            "Download the cert from p3.der and install it.",
+            "The API path is /api/v1/ado for now.",
+            "Our domain is p1.ca and it works.",
+            "p1-ca",
+            "P3/DER",
+            "v1.ttu",
+            "n1.gger",
+            "p.1.c.a",
+            "A 1 B 2 C 3",
+            "Room 4 B 2",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(check_text(text, _PHONE_REGIONS))
+        for text in ("p 1 c a", "n 1 g g e r", "4 r s c h l o c h"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -1013,15 +1030,14 @@ class TestTheMatchingRules(unittest.TestCase):
                 self.assertFalse(matches_tier1(". ".join(words)))
 
     def test_letters_split_apart_are_still_caught(self) -> None:
-        """Across WHITESPACE ALONE, a run of single letters is still an
-        evasion Tier 1 blocks: a space is a word boundary, so a word written
-        with spaces inside it was never a list of separate words.
-
-        Across punctuation it is not, and `f.u.c.k` moved to Tier 2 with the
-        spelling lessons it is indistinguishable from - see
-        `test_a_list_of_letters_is_not_an_evasion`.
+        """A rejoining Tier 1 acts on is across WHITESPACE ALONE and carries a
+        DIGIT. A run of letters with no digit, and any run joined across
+        punctuation, moved to Tier 2 with the spelling lessons and the
+        filenames they are indistinguishable from - see
+        `test_a_list_of_letters_is_not_an_evasion` and
+        `test_a_rejoining_needs_whitespace_and_a_digit`.
         """
-        for text in ("n 1 g g e r", "p.1.c.a", "cuuuunt"):
+        for text in ("n 1 g g e r", "p 1 c a", "cuuuunt"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 

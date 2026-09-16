@@ -199,8 +199,8 @@ def _bypasses_proxy(proxied: Any, host: str) -> bool:
     """
     if not host:
         return False
-    config = getattr(proxied, "proxy_config", None)
-    if config is None or not hasattr(config, "get_proxies_dictionary"):
+    proxies = _saved_proxies(proxied)
+    if proxies is None:
         # No configuration we can read means no bypass we can establish, and
         # an unestablished bypass is not one. Falling back to the environment
         # here was reading a DIFFERENT source from the one the request will
@@ -209,11 +209,29 @@ def _bypasses_proxy(proxied: Any, host: str) -> bool:
     try:
         from synapse.http.proxyagent import proxy_bypass_environment
 
-        return bool(
-            proxy_bypass_environment(host, proxies=config.get_proxies_dictionary())
-        )
+        return bool(proxy_bypass_environment(host, proxies=proxies))
     except Exception:
         return False
+
+
+def _saved_proxies(proxied: Any) -> Optional[Dict[str, str]]:
+    """The exclusion list the AGENT is holding, in either supported shape.
+
+    Synapse 1.159 keeps a `proxy_config` object and passes
+    `get_proxies_dictionary()` into `proxy_bypass_environment`; 1.124 keeps a
+    bare `no_proxy` string and passes `{"no": self.no_proxy}`. Reading only
+    the newer shape refused startup on a 1.124 deployment that had done
+    exactly what the error message asks for - exempted the moderation host -
+    and COMPAT.yml declares both pins supported.
+    """
+    config = getattr(proxied, "proxy_config", None)
+    if config is not None and hasattr(config, "get_proxies_dictionary"):
+        proxies = config.get_proxies_dictionary()
+        return dict(proxies) if isinstance(proxies, dict) else None
+    no_proxy = getattr(proxied, "no_proxy", None)
+    if isinstance(no_proxy, str):
+        return {"no": no_proxy}
+    return None
 
 
 KIND_TRANSPORT = "transport"

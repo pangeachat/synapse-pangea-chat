@@ -28,6 +28,7 @@ import re
 from html.parser import HTMLParser
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -289,9 +290,15 @@ class _DisplayedText(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._invisible:
             return
-        self._parts.append(data)
+        self._emit(data)
+
+    def _emit(self, text: str) -> None:
+        """Displayed text, into the in-place reading and into the fostered
+        run when one is open. One place, so the two cannot drift: a character
+        that is in the flow is in the flow wherever the flow ends up."""
+        self._parts.append(text)
         if self._table_depth > 0 and not self._in_a_cell:
-            self._fostered.append(data)
+            self._fostered.append(text)
 
     def _end_table(self) -> None:
         self._in_a_cell = False
@@ -358,7 +365,15 @@ class _DisplayedText(HTMLParser):
                 # its ordinary markers, so the value is on screen nowhere.
                 continue
             if (tag, name) in _INLINE_ATTRIBUTES:
-                self._parts.append(value)
+                # In the flow, so it is foster-parented with the flow. An
+                # image's alternative text REPLACES the image between the
+                # characters either side, and leaving it out of the fostered
+                # run joined the text on both sides of it:
+                # `<table>41<img alt="999">5-555-2671</table>` reads as
+                # `41 999 5-555-2671` and produced the phone number
+                # `415-555-2671`, which is a pre-send block on a number no
+                # reader sees.
+                self._emit(value)
             elif (tag, name) in _OUT_OF_FLOW_ATTRIBUTES:
                 self.attribute_text.append(value)
 
@@ -838,17 +853,24 @@ class ChatModeration:
             return
         categories = result.get("categories")
         if not _usable_categories(categories):
-            # A flagged verdict we cannot read the categories of is a verdict
-            # we cannot act on, and the safe reading of "we do not know what
-            # this is" is the same as the safe reading of self-harm: leave the
-            # message standing. The client validates the response at the
-            # transport boundary as well; this is the check at the point of
-            # DECISION, which is the one that cannot be bypassed by a caller
-            # that got its verdict some other way.
-            metrics.TIER2_SUPPRESSED.labels(category=UNNAMED_CATEGORY).inc()
-            logger.info(
+            # A flagged verdict whose categories we cannot read is NOT a
+            # verdict, and it is not a preserve either - saying so would be
+            # the same overclaim in the other direction. Nothing is recorded
+            # and nothing is redacted: this delivery produced no decision, and
+            # a later well-formed verdict decides on its own merits.
+            #
+            # What it does NOT establish is that the unreadable category was
+            # not self-harm, so a later `harassment` verdict on the same event
+            # can still redact it. Closing that would mean recording a durable
+            # preserve on a verdict we could not read, which protects
+            # harassment forever on one malformed response. The response shape
+            # is validated at the transport boundary too; this is the check at
+            # the point of DECISION, which a caller cannot bypass, and it is
+            # counted so an operator sees the endpoint misbehaving.
+            metrics.record_redaction_skip("unusable_verdict")
+            logger.warning(
                 "tier2 flagged event %s in %s with no usable category; "
-                "preserved, not redacted",
+                "no decision taken",
                 job.event_id,
                 job.room_id,
             )
@@ -893,6 +915,10 @@ class ChatModeration:
         claim = await self._may_redact(job, category)
         if claim is None:
             return
+        # Bound after the narrowing, because the release below runs inside a
+        # closure and a captured Optional does not carry the narrowing with
+        # it.
+        claim_id: str = claim
         logger.info(
             "tier2 flagged event %s in %s (category=%s); redacting",
             job.event_id,
@@ -917,7 +943,15 @@ class ChatModeration:
             )
             metrics.TIER2_REDACTIONS.labels(category=category).inc()
         except Exception as exc:
-            reraise_if_cancelled(exc)
+            # The claim goes back on the CANCELLATION path as well, which is
+            # what the callback is for: `reraise_if_cancelled` re-raises
+            # before anything below it runs, so a release written underneath
+            # is unreachable exactly when it matters most. And cancellation
+            # here is not hypothetical - the drain cancels an abandoned worker
+            # parked on this very send. A claim that outlived it would be a
+            # durable row saying `redacted` on a message nobody redacted, and
+            # no verdict on any instance could ever take that message down.
+            reraise_if_cancelled(exc, lambda: self._release_claim(job, claim_id))
             # A redaction send can fail for reasons that are ordinary rather
             # than exceptional: the sender has left, been kicked or been
             # banned (room auth checks membership before it checks redaction
@@ -941,7 +975,7 @@ class ChatModeration:
             # inside a coroutine that is being cancelled would be cancelled
             # with it, and the row would say `redacted` forever on a message
             # nobody had redacted.
-            self._release_claim(job, claim)
+            self._release_claim(job, claim_id)
             metrics.record_redaction_failure(_redaction_failure_cause(exc))
             logger.warning(
                 "tier2 redaction failed for %s in %s at %s (%s); message stays",
@@ -1238,16 +1272,21 @@ def _surface_text(surface: Mapping[str, Any]) -> Tuple[List[str], bool]:
     """
     parts: List[str] = []
     incomplete = False
-    for reader in (_body_field, _filename_field, _formatted_field):
+    for name, reader in _SURFACE_READERS:
         try:
             parts.extend(reader(surface))
         except Exception as exc:
             reraise_if_cancelled(exc)
             incomplete = True
+            # The name comes from the TABLE, not from the callable. Reading
+            # `reader.__name__` here put an attribute access inside the
+            # handler that isolates the fields, and anything that raises
+            # there costs the whole surface - which is the isolation this
+            # loop exists to provide.
             logger.warning(
                 "moderation could not read the %s of a message surface at "
                 "%s (%s); the other fields are still checked",
-                reader.__name__.removesuffix("_field"),
+                name,
                 error_site(exc),
                 type(exc).__name__,
             )
@@ -1281,6 +1320,11 @@ def _formatted_field(surface: Mapping[str, Any]) -> List[str]:
     return [displayed] if displayed.strip() else []
 
 
+#: The three independent readings of one content surface, each named for the
+#: log line so that nothing inside the per-field guard can raise.
+_SURFACE_READERS: Tuple[Tuple[str, Callable[[Mapping[str, Any]], List[str]]], ...]
+
+
 def _field_text(body: Any) -> List[str]:
     parts: List[str] = []
     if isinstance(body, str):
@@ -1296,6 +1340,13 @@ def _field_text(body: Any) -> List[str]:
         # form, so the value is stringified and matched.
         parts.append(str(body))
     return parts
+
+
+_SURFACE_READERS = (
+    ("body", _body_field),
+    ("filename", _filename_field),
+    ("formatted_body", _formatted_field),
+)
 
 
 # The provider's documented category vocabulary, and the whole of it. A
