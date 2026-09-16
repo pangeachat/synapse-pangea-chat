@@ -19,7 +19,7 @@ carry that:
 import logging
 import unittest
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from unittest.mock import patch
 
 from synapse.logging.context import (
@@ -1798,6 +1798,7 @@ class BatchingDispatcherTestCase(unittest.TestCase):
         workers: int = 1,
         queue_size: int = 64,
         max_batch: int = 4,
+        max_batch_chars: int = 40_000,
         batch_max_wait_seconds: float = 0.0,
     ) -> Any:
         self.dispatcher = self.Tier2Dispatcher(
@@ -1809,6 +1810,7 @@ class BatchingDispatcherTestCase(unittest.TestCase):
             supervisor_interval_seconds=30.0,
             drain_timeout_seconds=5.0,
             max_batch=max_batch,
+            max_batch_chars=max_batch_chars,
             batch_max_wait_seconds=batch_max_wait_seconds,
         )
         self.addCleanup(self._stop)
@@ -1822,12 +1824,12 @@ class BatchingDispatcherTestCase(unittest.TestCase):
         self.clock.run_pending()
         self.assertEqual(self.watch.leaks, [], "logcontext leaked")
 
-    def _job(self, event_id: str) -> Any:
+    def _job(self, event_id: str, text: Optional[str] = None) -> Any:
         return self.ModerationJob(
             event_id=event_id,
             room_id="!room:example.org",
             sender="@learner:example.org",
-            text=f"text for {event_id}",
+            text=f"text for {event_id}" if text is None else text,
             enqueued_at=self.clock.time(),
         )
 
@@ -2072,6 +2074,84 @@ class BatchingDispatcherTestCase(unittest.TestCase):
         dispatcher.start()
         self._drain()
         self.assertEqual(self.handler.batches, [["$e0"], ["$e1"], ["$e2"]])
+
+    # --- the peer's total-character cap -----------------------------
+
+    def test_a_batch_never_exceeds_the_total_character_cap(self) -> None:
+        """The item count is only half the contract the peer publishes.
+
+        `/choreo/moderate` refuses a batch whose texts total more than 40,000
+        characters after its own 10,000-character per-item cap, and it refuses
+        it with the same 422 an un-upgraded deployment answers. So a batch
+        bounded only by its item count is a batch the peer will reject, and
+        five ordinary long messages are enough to build one.
+        """
+        dispatcher = self._build(max_batch=8, max_batch_chars=1_000)
+        for index in range(6):
+            dispatcher.enqueue(self._job(f"$e{index}", text="x" * 400))
+        dispatcher.start()
+        self._drain()
+        self.assertTrue(self.handler.batches, "nothing ran")
+        self.assertTrue(
+            all(len(batch) <= 2 for batch in self.handler.batches),
+            f"a batch carried more than the character cap allows: "
+            f"{self.handler.batches}",
+        )
+        self.assertEqual(
+            [event_id for batch in self.handler.batches for event_id in batch],
+            [f"$e{index}" for index in range(6)],
+            "the character cap reordered or dropped queued messages",
+        )
+
+    def test_one_item_larger_than_the_whole_cap_goes_out_alone(self) -> None:
+        """The boundary, and the one place a cap can wedge a queue.
+
+        An item whose own accounted size is past the total cap can never fit
+        beside anything - including, if the cap were read as a precondition
+        rather than a bound on what JOINS a batch, beside nothing. It goes out
+        on its own, and the messages behind it are not held hostage to it.
+        """
+        dispatcher = self._build(max_batch=8, max_batch_chars=1_000)
+        dispatcher.enqueue(self._job("$huge", text="x" * 5_000))
+        for index in range(2):
+            dispatcher.enqueue(self._job(f"$e{index}", text="x" * 10))
+        dispatcher.start()
+        self._drain()
+        self.assertEqual(
+            self.handler.batches,
+            [["$huge"], ["$e0", "$e1"]],
+            "an over-cap message did not go out alone, or blocked the queue "
+            "behind it",
+        )
+
+    def test_both_caps_bound_a_batch_at_once(self) -> None:
+        """Whichever binds first. Neither cap is allowed to hide the other."""
+        dispatcher = self._build(max_batch=2, max_batch_chars=40_000)
+        for index in range(4):
+            dispatcher.enqueue(self._job(f"$e{index}", text="x" * 10))
+        dispatcher.start()
+        self._drain()
+        self.assertEqual(
+            self.handler.batches,
+            [["$e0", "$e1"], ["$e2", "$e3"]],
+            "the item cap stopped binding once a character cap existed",
+        )
+
+    def test_the_character_cap_counts_what_the_peer_counts(self) -> None:
+        """The peer measures each item stripped and truncated at 10,000, so a
+        50,000-character message contributes 10,000 to its total and not
+        50,000. Counting the queued length instead would split batches the
+        peer would have taken, which is throughput given away for nothing."""
+        dispatcher = self._build(max_batch=4, max_batch_chars=25_000)
+        for index in range(2):
+            dispatcher.enqueue(self._job(f"$e{index}", text="x" * 50_000))
+        dispatcher.start()
+        self._drain()
+        self.assertEqual(
+            self.handler.batches,
+            [["$e0", "$e1"]],
+            "two messages the peer would have taken together were split",
+        )
 
 
 class ProxyLogGuardTestCase(unittest.TestCase):

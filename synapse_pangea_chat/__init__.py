@@ -68,6 +68,7 @@ _MODERATION_CONFIG_KEYS = frozenset(
         "tier2_workers",
         "tier2_queue_size",
         "tier2_max_batch",
+        "tier2_max_batch_chars",
         "tier2_batch_max_wait_seconds",
         "tier2_request_timeout_seconds",
         "tier2_breaker_failure_threshold",
@@ -1021,6 +1022,15 @@ class PangeaChat:
         moderation_tier2_max_batch = _moderation_int(
             moderation, "tier2_max_batch", 1, 256, 32
         )
+        # Bounded below at 1,000 rather than 1: a cap under one message's
+        # worth of characters would make every batch a batch of one, which is
+        # batching switched off by a number nobody would read that way. The
+        # upper bound is an order of magnitude above the peer's own 40,000,
+        # which is room for a peer that raises its cap and a refusal for an
+        # operator who invents one.
+        moderation_tier2_max_batch_chars = _moderation_int(
+            moderation, "tier2_max_batch_chars", 1_000, 400_000, 40_000
+        )
         # Lower bound 0.0, which disables the linger outright: opportunistic
         # batching over whatever is already queued still works, and an
         # operator who wants provably zero added latency can ask for it.
@@ -1123,6 +1133,7 @@ class PangeaChat:
             moderation_tier2_workers=moderation_tier2_workers,
             moderation_tier2_queue_size=moderation_tier2_queue_size,
             moderation_tier2_max_batch=moderation_tier2_max_batch,
+            moderation_tier2_max_batch_chars=moderation_tier2_max_batch_chars,
             moderation_tier2_batch_max_wait_seconds=(
                 moderation_tier2_batch_max_wait_seconds
             ),

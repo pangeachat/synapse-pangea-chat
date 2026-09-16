@@ -68,6 +68,10 @@ from synapse.metrics.background_process_metrics import run_as_background_process
 from twisted.internet import defer
 
 from synapse_pangea_chat.moderation import metrics
+from synapse_pangea_chat.moderation.choreo_client import (
+    DEFAULT_MAX_BATCH_CHARS,
+    batch_chars,
+)
 from synapse_pangea_chat.moderation.compat import (
     _SecondsInterval,
     background_process_args,
@@ -112,6 +116,13 @@ class Tier2Dispatcher:
     will not be checked, and counting it once would understate the gap by the
     whole batch size.
 
+    **A batch is bounded by two caps, not one.** `max_batch` bounds the item
+    count; `max_batch_chars` bounds the total text, because the endpoint
+    refuses a batch past its own total-character cap with the same 422 an
+    un-upgraded deployment answers. Thirty-two ordinary chat messages clear
+    that cap easily, so an item count on its own builds requests the peer will
+    reject. See `choreo_client.batch_chars` for how each item is measured.
+
     **Batching is opportunistic, and a lone message is never delayed.** A
     worker takes whatever is already queued, up to `max_batch`, with no wait
     at all - so under load, where the queue has depth, batches form for free,
@@ -134,6 +145,7 @@ class Tier2Dispatcher:
         supervisor_interval_seconds: float,
         drain_timeout_seconds: float,
         max_batch: int = 1,
+        max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
         batch_max_wait_seconds: float = 0.0,
     ) -> None:
         if workers < 1:
@@ -142,6 +154,8 @@ class Tier2Dispatcher:
             raise ValueError("queue_size must be at least 1")
         if max_batch < 1:
             raise ValueError("max_batch must be at least 1")
+        if max_batch_chars < 1:
+            raise ValueError("max_batch_chars must be at least 1")
         if batch_max_wait_seconds < 0:
             raise ValueError("batch_max_wait_seconds must not be negative")
         self._hs = homeserver
@@ -152,6 +166,7 @@ class Tier2Dispatcher:
         self._supervisor_interval = supervisor_interval_seconds
         self._drain_timeout = drain_timeout_seconds
         self._max_batch = max_batch
+        self._max_batch_chars = max_batch_chars
         self._batch_max_wait = batch_max_wait_seconds
 
         self._queue: Deque[ModerationJob] = deque()
@@ -410,8 +425,36 @@ class Tier2Dispatcher:
         metrics.TIER2_INFLIGHT.set(len(self._running))
         return job
 
+    def _take_if_it_fits(self, chars: int) -> Optional[ModerationJob]:
+        """The next queued job, unless it would put the batch over the cap.
+
+        A PEEK before the take, because `_take` is not reversible: it counts
+        the queue wait, claims the job into `_running` and moves the depth
+        gauge, and putting a job back would make one message two on every one
+        of those.
+
+        Head-of-line, never a skip. A job that does not fit is left at the
+        front of the queue and becomes the first job of the next batch, so the
+        queue keeps its order and nothing can be passed over indefinitely by
+        an unlucky sequence of sizes. It also means a job whose own size is
+        past the whole cap is never stuck behind this test: it is only ever
+        asked to JOIN a batch here, and as the `first` of one it is dispatched
+        alone.
+        """
+        if not self._queue:
+            return None
+        if chars + batch_chars(self._queue[0].text) > self._max_batch_chars:
+            return None
+        return self._take()
+
     async def _collect(self, first: ModerationJob) -> Tuple[ModerationJob, ...]:
-        """Take up to `max_batch` jobs, in queue order, starting with `first`.
+        """Take jobs in queue order from `first`, under BOTH caps.
+
+        `max_batch` bounds the count and `max_batch_chars` bounds the total
+        text - the peer enforces both, and refuses either way with a status
+        this module cannot distinguish from "I do not do batches at all".
+        `first` is always in the batch whatever its size, so a message larger
+        than the whole cap goes out alone rather than wedging the queue.
 
         Two phases, and the split is what keeps an idle system fast. First
         whatever is ALREADY queued is taken, with no wait at all: under load
@@ -435,6 +478,10 @@ class Tier2Dispatcher:
         so an empty list means every other worker is busy.
         """
         batch: List[ModerationJob] = [first]
+        # Measured the way the PEER measures - see `choreo_client.batch_chars`
+        # - because the number that matters is the one the endpoint will check
+        # the request against, not the one the queue happens to hold.
+        chars = batch_chars(first.text)
         # A `finally` with a completion flag rather than `except Exception:
         # release; raise`. Two reasons, and the second is the important one:
         # this frame absorbs nothing, so the `reraise_if_cancelled` rule has
@@ -445,10 +492,11 @@ class Tier2Dispatcher:
         collected = False
         try:
             while len(batch) < self._max_batch:
-                nxt = self._take()
+                nxt = self._take_if_it_fits(chars)
                 if nxt is None:
                     break
                 batch.append(nxt)
+                chars += batch_chars(nxt.text)
             # A DEADLINE, and not a window per round. Each linger ends as soon
             # as anything arrives, so a loop that re-armed the full wait each
             # time would wait `max_wait` again after every arrival - which is
@@ -460,6 +508,10 @@ class Tier2Dispatcher:
                 self._batch_max_wait > 0
                 and len(batch) > 1
                 and len(batch) < self._max_batch
+                # A batch already at the character cap has room for nothing,
+                # so lingering could only add latency to messages that are
+                # going out either way.
+                and chars < self._max_batch_chars
                 and not self._queue
                 and not self._waiters
                 and not self._stopping
@@ -470,10 +522,11 @@ class Tier2Dispatcher:
                 if not await self._linger(remaining):
                     break
                 while len(batch) < self._max_batch:
-                    nxt = self._take()
+                    nxt = self._take_if_it_fits(chars)
                     if nxt is None:
                         break
                     batch.append(nxt)
+                    chars += batch_chars(nxt.text)
             collected = True
         finally:
             if not collected:
@@ -680,6 +733,11 @@ class Tier2Dispatcher:
         worker holding the batch - so continuing to form batches of 32 would
         turn one call into 32 sequential ones. Dropping to 1 puts that work
         back across the pool.
+
+        Only reached on evidence that the endpoint does not understand the
+        batch SHAPE. A batch the endpoint refused on size is split and
+        retried instead, and never comes here: the two arrive as the same
+        status and want opposite answers.
         """
         if value < 1:
             raise ValueError("max_batch must be at least 1")

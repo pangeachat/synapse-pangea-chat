@@ -128,6 +128,7 @@ class _Run:
         workers: int,
         queue_size: int,
         max_batch: int,
+        max_batch_chars: int,
         batch_max_wait: float,
     ) -> None:
         self.clock = HomeServerDouble().clock
@@ -145,6 +146,7 @@ class _Run:
             supervisor_interval_seconds=30.0,
             drain_timeout_seconds=10.0,
             max_batch=max_batch,
+            max_batch_chars=max_batch_chars,
             batch_max_wait_seconds=batch_max_wait,
         )
         self.rate = rate
@@ -298,6 +300,7 @@ class Tier2LoadTestCase(unittest.TestCase):
             workers=_DEFAULTS.moderation_tier2_workers,
             queue_size=_DEFAULTS.moderation_tier2_queue_size,
             max_batch=_DEFAULTS.moderation_tier2_max_batch,
+            max_batch_chars=_DEFAULTS.moderation_tier2_max_batch_chars,
             batch_max_wait=_DEFAULTS.moderation_tier2_batch_max_wait_seconds,
         )
         run.go()
@@ -347,6 +350,7 @@ class Tier2LoadTestCase(unittest.TestCase):
             workers=_DEFAULTS.moderation_tier2_workers,
             queue_size=_DEFAULTS.moderation_tier2_queue_size,
             max_batch=_DEFAULTS.moderation_tier2_max_batch,
+            max_batch_chars=_DEFAULTS.moderation_tier2_max_batch_chars,
             batch_max_wait=_DEFAULTS.moderation_tier2_batch_max_wait_seconds,
         )
         run.go()
@@ -384,6 +388,7 @@ class Tier2LoadTestCase(unittest.TestCase):
             workers=_DEFAULTS.moderation_tier2_workers,
             queue_size=_DEFAULTS.moderation_tier2_queue_size,
             max_batch=1,
+            max_batch_chars=_DEFAULTS.moderation_tier2_max_batch_chars,
             batch_max_wait=0.0,
         )
         run.go()
@@ -416,6 +421,7 @@ class Tier2LoadTestCase(unittest.TestCase):
             workers=_DEFAULTS.moderation_tier2_workers,
             queue_size=_DEFAULTS.moderation_tier2_queue_size,
             max_batch=_DEFAULTS.moderation_tier2_max_batch,
+            max_batch_chars=_DEFAULTS.moderation_tier2_max_batch_chars,
             batch_max_wait=_DEFAULTS.moderation_tier2_batch_max_wait_seconds,
         )
         run.go()
@@ -466,6 +472,7 @@ class LoadReportTestCase(unittest.TestCase):
                 workers=_DEFAULTS.moderation_tier2_workers,
                 queue_size=_DEFAULTS.moderation_tier2_queue_size,
                 max_batch=max_batch,
+                max_batch_chars=_DEFAULTS.moderation_tier2_max_batch_chars,
                 batch_max_wait=(
                     _DEFAULTS.moderation_tier2_batch_max_wait_seconds
                     if max_batch > 1

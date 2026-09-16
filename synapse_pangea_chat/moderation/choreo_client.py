@@ -252,6 +252,18 @@ KIND_SHAPE = "shape"
 # and the messages are left alone. This one is the ordinary state of an
 # un-upgraded deployment and costs nothing but a round trip.
 KIND_BATCH_UNSUPPORTED = "batch_unsupported"
+# The endpoint refused this batched request, and nothing in the answer says
+# why. Split from `batch_unsupported` because a status code is not a
+# diagnosis: "I do not understand this request shape" and "this particular
+# request was too big" are different failures that arrive as the same 422,
+# from the same Pydantic layer, before the same handler runs - and they want
+# opposite answers. The first is permanent and the answer is to stop asking;
+# the second is about THIS request and the answer is to send a smaller one.
+#
+# So this kind claims nothing. The caller splits the batch and retries, which
+# is right for a size refusal and harmless for anything else, and demotion is
+# left to evidence that actually distinguishes the two.
+KIND_BATCH_REFUSED = "batch_refused"
 
 FAILURE_KINDS = frozenset(
     {
@@ -263,6 +275,7 @@ FAILURE_KINDS = frozenset(
         KIND_DECODE,
         KIND_SHAPE,
         KIND_BATCH_UNSUPPORTED,
+        KIND_BATCH_REFUSED,
     }
 )
 
@@ -278,10 +291,61 @@ FAILURE_KINDS = frozenset(
 # life of the process on one transient error.
 _BATCH_REFUSED_STATUSES = frozenset({400, 422})
 
+# The peer's per-item truncation, mirrored here because the peer's own batch
+# accounting uses it: `/choreo/moderate` measures a batch as
+# `sum(min(len(t.strip()), _MAX_TEXT_LEN) for t in texts)` and reads at most
+# that much of each item (`app/handlers/moderator/moderator.py`). Counting the
+# queued length instead would split batches the peer would have taken, and
+# counting the raw length of a 50,000-character message would make one message
+# look like five batches' worth of budget.
+#
+# `MATCHER_MAX_CHARS` in `moderation/__init__.py` is the same 10,000 for the
+# same reason - the wordlist reads exactly what the endpoint reads - and is
+# deliberately not imported here: this module is the one that talks to the
+# peer, and the dispatcher imports the accounting from here rather than from
+# the package root, which would be a cycle.
+PEER_MAX_TEXT_CHARS = 10_000
+
+# The peer's total-character cap for one batch, as a default. The live value
+# is config (`moderation.tier2_max_batch_chars`) so it can track a peer that
+# moves without a release of this module.
+#
+# The arithmetic, from the choreo handler: its `_MAX_BATCH_TOTAL_CHARS` is
+# 40,000, derived there from the 10,000 tokens-per-minute floor published for
+# `omni-moderation-latest` at roughly four characters per token - one minute
+# of the lowest published token budget in a single request. Against this
+# module's 32-item cap that is a 1,250-character average per message, which
+# ordinary chat clears easily: 32 items x 10,000 characters is 320,000, eight
+# times the cap. Exceeding it is an HTTP 422, which is why the item count was
+# never the whole contract.
+DEFAULT_MAX_BATCH_CHARS = 40_000
+
+
+def batch_chars(text: str) -> int:
+    """What ``text`` costs against the peer's total-character cap.
+
+    Deliberately the peer's own expression rather than `len(text)`: the peer
+    strips each item and truncates it at `PEER_MAX_TEXT_CHARS` before both
+    measuring and classifying it, so this is what is actually SENT for the
+    purposes of the cap, not what was queued.
+    """
+    return min(len(text.strip()), PEER_MAX_TEXT_CHARS)
+
 
 # The "this endpoint does not do batches" signal, as a value rather than an
 # exception. See `ChoreoChecker._batch_admitted` for why it is not a raise.
 _BATCH_UNSUPPORTED = object()
+
+# "This request was refused and the answer did not say why." Same reason it is
+# a value and not an exception; a different instruction to the caller - split
+# and retry rather than stop batching.
+_BATCH_REFUSED = object()
+
+# How many refusals of the smallest batch this module sends - two texts,
+# inside the configured character cap - it takes to conclude, with no help
+# from the endpoint's own error, that the endpoint does not understand the
+# batched shape. See `ChoreoChecker._split_refused`.
+_UNEXPLAINED_REFUSALS_BEFORE_DEMOTION = 3
 
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
@@ -533,15 +597,17 @@ def _status_kind(code: int, *, batched: bool = False) -> str:
     blamed the provider. A 5xx or a 429 is the provider, and is exactly what
     the breaker exists to stop hammering.
 
-    `batched` splits one more case off the 4xx band. An endpoint whose
-    `ModerationRequest.text` is a required field answers 422 to a body
-    carrying `texts`, and that is not a configuration error - it is the
-    ordinary state of a deployment that has not been upgraded yet, and the
-    answer to it is to ask again one text at a time rather than to tell an
-    operator to check their token.
+    `batched` splits one more case off the 4xx band, and splits it into a kind
+    that CLAIMS NOTHING. A 400 or 422 on a batched request is a refusal, and a
+    refusal has at least two causes that arrive identically: an endpoint whose
+    `ModerationRequest.text` is a required field rejects a body carrying
+    `texts`, and an upgraded endpoint rejects a batch past its own size caps -
+    both from Pydantic, both before the handler runs, both 422. It is not a
+    configuration error either way, so it is not read as "check your token";
+    which of the two it is, is decided on evidence by `_batch_refusal_kind`.
     """
     if batched and code in _BATCH_REFUSED_STATUSES:
-        return KIND_BATCH_UNSUPPORTED
+        return KIND_BATCH_REFUSED
     if code == 429:
         return KIND_RATE_LIMITED
     if 400 <= code < 500:
@@ -562,15 +628,24 @@ def _validated_batch(result: Any, expected: int) -> List[Dict[str, Any]]:
     at all, and the caller's fail-open path leaves every message in the batch
     alone.
 
-    A response that is not a `{"results": [...]}` object at all is read as an
-    endpoint that did not understand `texts`, not as a misbehaving one - that
-    is what an un-upgraded choreo looks like if it ever answers 200, and the
-    caller's answer to it is to re-ask one text at a time.
+    A 200 that is ITSELF a single-text verdict is read as an endpoint that did
+    not understand `texts` and answered the older contract instead - the one
+    shape that says so positively. Anything else that is not a batch response
+    is a provider misbehaving: `{}`, a null `results` and a bare list are not
+    evidence that this endpoint implements the older contract, and reading
+    them as if they were would let a gateway's error page switch batching off
+    for the life of the process. They are a shape failure, which leaves every
+    message in the batch alone and recovers on its own.
     """
     if not isinstance(result, dict) or not isinstance(result.get("results"), list):
+        if isinstance(result, dict) and isinstance(result.get("flagged"), bool):
+            raise ModerationCheckError(
+                "moderation endpoint answered the single-text contract",
+                KIND_BATCH_UNSUPPORTED,
+            )
         raise ModerationCheckError(
             "moderation endpoint returned no batch results",
-            KIND_BATCH_UNSUPPORTED,
+            KIND_SHAPE,
         )
     results = result["results"]
     if len(results) != expected:
@@ -652,9 +727,15 @@ async def moderate_texts(
     raises, which is the caller's fail-open path.
 
     Raises `ModerationCheckError` with kind `batch_unsupported` when the
-    endpoint does not understand a batched request, which is what an
-    un-upgraded choreo answers. That is a signal to ask again one text at a
-    time, never a reason to stop moderating.
+    endpoint's own answer says it does not understand a batched request, which
+    is what an un-upgraded choreo answers. That is a signal to ask again one
+    text at a time, never a reason to stop moderating.
+
+    Raises kind `batch_refused` when the endpoint refused the request without
+    saying why. **The two are deliberately different kinds**: a refusal is
+    also what an UPGRADED endpoint answers to a batch past its size caps, with
+    the same status, and the answer to that one is a smaller batch rather than
+    no batches ever again.
     """
     try:
         result = await _exchange(
@@ -756,10 +837,18 @@ async def _exchange(
         # because it repeats forever and opening would disable moderation
         # until somebody noticed.
         if response.code >= 400:
-            _drain_unwanted_body(response)
+            kind = _status_kind(response.code, batched=batched)
+            if kind == KIND_BATCH_REFUSED:
+                # The ONE status whose body is worth reading, because it is
+                # the one status that is ambiguous. Everything else is drained
+                # unread: a body we do not need is a body we do not want, and
+                # reading one would be a byte of the service's for no gain.
+                kind = await _batch_refusal_kind(response, clock, deadline, timed_out)
+            else:
+                _drain_unwanted_body(response)
             raise ModerationCheckError(
                 f"moderation endpoint returned {response.code}",
-                _status_kind(response.code, batched=batched),
+                kind,
             )
         # The body read needs its own deadline, and this is not a
         # belt-and-braces second one. The request deferred fires as soon as the
@@ -932,6 +1021,98 @@ async def _with_deadline(
             timer.cancel()
 
 
+async def _batch_refusal_kind(
+    response: Any,
+    clock: Any,
+    deadline: float,
+    timed_out: List[bool],
+) -> str:
+    """Which refusal this is, decided on the endpoint's own error - or neither.
+
+    **A status code is not a diagnosis.** An un-upgraded choreo has
+    `ModerationRequest.text` as a required field and no `texts` field at all,
+    so FastAPI raises `RequestValidationError` before the handler runs and the
+    envelope NAMES the field it wanted::
+
+        {"detail": [{"type": "missing", "loc": ["body", "text"], ...}]}
+
+    An upgraded choreo refuses an over-cap batch through the same layer, with
+    the same status, but as a model validator's error on the body as a whole -
+    `type` `value_error`, `loc` `["body"]`, and never a missing `text`. That
+    naming is the only thing in the answer that separates the two, so it is
+    the only thing read.
+
+    **Nothing else is treated as evidence.** A body that is empty, not JSON,
+    not the validation envelope, or rewritten by a gateway says nothing about
+    which refusal this is, and returns `batch_refused` - the reading that
+    costs a round trip rather than the deployment's throughput. A body that
+    fails or times out reads the same way; the deadline is the caller's, so a
+    peer cannot buy extra time by stalling here.
+
+    **Nothing from the body leaves this function.** FastAPI echoes the
+    rejected request under `input`, which is learners' messages, so the body
+    is inspected structurally and reduced to one of two constants - never
+    logged, never carried on the exception, never kept (ADR-10).
+    """
+    body_deferred, body_protocol = _read_body(response)
+    try:
+        raw = await _with_deadline(
+            clock,
+            deadline,
+            body_deferred,
+            teardown=body_protocol.abort,
+            timed_out=timed_out,
+            message="moderation refusal body timed out",
+        )
+        detail = json.loads(raw)
+    # silent-ok: not a failure to report. The refusal itself is already being
+    # raised by the caller with the kind this returns, and the only thing lost
+    # is the chance to distinguish the two refusals - which is exactly what
+    # `batch_refused` means. Logging it would name the peer's body by type at
+    # best and quote it at worst (ADR-10). A cancellation is re-raised rather
+    # than absorbed: it carries no response for a chain to leak, and it has to
+    # reach the worker being stopped.
+    except Exception as exc:
+        reraise_if_cancelled(exc)
+        return KIND_BATCH_REFUSED
+    return (
+        KIND_BATCH_UNSUPPORTED
+        if _names_a_missing_text_field(detail)
+        else KIND_BATCH_REFUSED
+    )
+
+
+def _names_a_missing_text_field(detail: Any) -> bool:
+    """True when the refusal is FastAPI asking for a `text` field.
+
+    Structural, and nothing is retained. `"missing" in type` rather than an
+    equality test because Pydantic v1 spells the same error
+    `value_error.missing` and v2 spells it `missing`, and an endpoint old
+    enough not to know `texts` may well be old enough to be on either. The
+    `loc` test is the load-bearing half: a cap refusal's `loc` is the body
+    root, never a `text` field, so the two cannot be confused.
+    """
+    if not isinstance(detail, dict):
+        return False
+    errors = detail.get("detail")
+    if not isinstance(errors, list):
+        return False
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        error_type = error.get("type")
+        location = error.get("loc")
+        if (
+            isinstance(error_type, str)
+            and "missing" in error_type
+            and isinstance(location, list)
+            and location
+            and location[-1] == "text"
+        ):
+            return True
+    return False
+
+
 def _drain_unwanted_body(response: Any) -> None:
     """Consume and discard the body of a response we are refusing on status.
 
@@ -1027,6 +1208,7 @@ class ChoreoChecker:
         access_token: str,
         breaker: Any,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+        max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
     ) -> None:
         self._agent = agent
         self._clock = clock
@@ -1034,10 +1216,20 @@ class ChoreoChecker:
         self._access_token = access_token
         self._breaker = breaker
         self._timeout_seconds = timeout_seconds
+        # The same cap the DISPATCHER forms batches under, and it is here for
+        # one job: to say whether a refused batch could possibly have been
+        # refused on size. A two-text batch inside this cap cannot have been,
+        # so its refusal is evidence about the shape.
+        self._max_batch_chars = max_batch_chars
         # The batch contract, negotiated once and then remembered. Starts
         # optimistic: an upgraded endpoint is the intended state, and the cost
         # of being wrong is one refused request per process.
         self._batch_supported = True
+        # Refusals of the SMALLEST batch this module sends that no size could
+        # explain, since the last batch that succeeded. Evidence, accumulated,
+        # for the case where the endpoint's own answer carries none - see
+        # `_split_refused`.
+        self._unexplained_refusals = 0
 
     @property
     def batch_supported(self) -> bool:
@@ -1123,8 +1315,14 @@ class ChoreoChecker:
             return BatchVerdicts(
                 [await self.check(text) for text in texts], confirmed=True
             )
+        if results is _BATCH_REFUSED:
+            return await self._split_refused(texts)
 
         verdicts = cast(List[Dict[str, Any]], results)
+        # A batch the endpoint took is the end of any argument about whether
+        # it takes batches. Whatever refusals came before were about those
+        # requests, not about this contract.
+        self._unexplained_refusals = 0
         clean = sum(1 for verdict in verdicts if not verdict.get("flagged"))
         flagged = len(verdicts) - clean
         if clean:
@@ -1133,6 +1331,73 @@ class ChoreoChecker:
         if flagged:
             metrics.record_screen("flagged", flagged)
         return BatchVerdicts(list(verdicts), confirmed=False)
+
+    async def _split_refused(self, texts: Sequence[str]) -> "BatchVerdicts":
+        """Halve a refused batch and ask again. Never a demotion on its own.
+
+        **The answer to "this request was too big" is a smaller request.** A
+        refusal carries no diagnosis, and the reading that costs least if it is
+        wrong is "too big": splitting an un-upgraded endpoint's batch costs a
+        few refused round trips once, while demoting an upgraded endpoint's
+        costs the deployment its throughput until somebody restarts it - and a
+        queue that fills is a silently unmoderated classroom.
+
+        Halves rather than straight to single-text calls, because a batch of
+        16 that succeeds is 16 messages on one provider call; dropping to
+        singles on the first refusal would hand back the whole point of
+        batching to one long message.
+
+        **Where the evidence comes from when the endpoint sends none.** The
+        recursion bottoms out at two texts. If a two-text batch INSIDE the
+        configured character cap is refused, no size the peer could be
+        enforcing on its total explains it, so that refusal is evidence about
+        the shape - the same conclusion `_batch_refusal_kind` reaches from the
+        endpoint's own error, reached the slow way for a peer whose body a
+        gateway rewrote. `_UNEXPLAINED_REFUSALS_BEFORE_DEMOTION` of them with
+        no successful batch in between demotes.
+
+        Three is not a magic number, it is a floor on how much has to be true
+        at once: one refusal is an event, and a single learner's long message
+        must never be able to switch batching off for the process. The honest
+        residual: a peer whose TOTAL cap is below two truncated items, whose
+        body carries no usable error, and whose traffic is long messages
+        throughout, is demoted when it need not have been. That costs
+        throughput, not moderation, and a restart clears it.
+        """
+        from synapse_pangea_chat.moderation import metrics
+
+        metrics.TIER2_BATCH_REFUSED.inc()
+        if len(texts) == 2 and not self._explained_by_size(texts):
+            self._unexplained_refusals += 1
+            if self._unexplained_refusals >= _UNEXPLAINED_REFUSALS_BEFORE_DEMOTION:
+                self._demote_batching()
+        middle = len(texts) // 2
+        # `check_batch` and not a private half, so each half gets the whole
+        # contract: the breaker, the demotion check at the top, the single
+        # path at length one, and the length guarantee on the way out.
+        first = await self.check_batch(texts[:middle])
+        second = await self.check_batch(texts[middle:])
+        return BatchVerdicts(
+            list(first.results) + list(second.results),
+            # AND, which is the conservative direction: a half answered by a
+            # single-text call is confirmed, a half answered positionally is a
+            # screen, and reporting the pair as a screen costs one extra call
+            # per FLAGGED message. Reporting it as confirmed would redact on a
+            # positional mapping, which is the one thing this type exists to
+            # prevent.
+            confirmed=first.confirmed and second.confirmed,
+        )
+
+    def _explained_by_size(self, texts: Sequence[str]) -> bool:
+        """Could the peer's total-character cap account for refusing these?
+
+        Measured the way the peer measures - stripped, truncated per item -
+        against the cap this module forms batches under. `True` means the
+        batch was over our own cap, so a refusal says nothing about the shape;
+        `False` means it was inside it, and a refusal then needs another
+        explanation.
+        """
+        return sum(batch_chars(text) for text in texts) > self._max_batch_chars
 
     def _demote_batching(self) -> None:
         from synapse_pangea_chat.moderation import metrics
@@ -1181,6 +1446,16 @@ class ChoreoChecker:
                 metrics.TIER2_LATENCY.observe(max(self._clock.time() - started, 0.0))
         except Exception as exc:
             reraise_if_cancelled(exc)
+            if failure_kind(exc) == KIND_BATCH_REFUSED:
+                # silent-ok, for the same reason as the demotion below and
+                # with less claimed: the endpoint refused THIS request, the
+                # messages are about to be asked again in smaller batches, and
+                # nothing has gone unmoderated. The breaker is told nothing
+                # because nothing about the provider has been learned, and
+                # `TIER2_BATCH_REFUSED` in `_split_refused` is the counter an
+                # operator reads - a log line here would repeat on every
+                # refused batch and say the same thing each time.
+                return _BATCH_REFUSED
             if failure_kind(exc) == KIND_BATCH_UNSUPPORTED:
                 # silent-ok: not a failure of the provider, and deliberately
                 # not reported as one. The endpoint refused the SHAPE of the

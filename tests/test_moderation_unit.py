@@ -55,9 +55,12 @@ from synapse_pangea_chat.moderation import (
     tier1_prefilter,
 )
 from synapse_pangea_chat.moderation.choreo_client import (
+    DEFAULT_MAX_BATCH_CHARS,
+    KIND_BATCH_REFUSED,
     KIND_BATCH_UNSUPPORTED,
     KIND_SHAPE,
     MAX_RESPONSE_BYTES,
+    PEER_MAX_TEXT_CHARS,
     REQUEST_TIMEOUT_SECONDS,
     ModerationCheckError,
     ModerationProxyUnsupportedError,
@@ -865,6 +868,41 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             cast(AsyncMock, api.create_and_send_event_into_room).await_count, 4
+        )
+
+    async def test_a_batch_refused_on_size_keeps_batching_and_moderates_all(
+        self,
+    ) -> None:
+        """The defect, from the module's own edge.
+
+        An upgraded endpoint refuses an over-cap batch with the same 422 an
+        un-upgraded one answers. Read as "this endpoint does not do batches"
+        it collapses the deployment to one call per message for the life of
+        the process, the queue fills, and messages are dropped unmoderated in
+        a classroom. Read as what it is, the batch is split, every message is
+        checked, and the next batch is still a batch.
+        """
+        homeserver = HomeServerDouble()
+        api = _module_api(homeserver)
+        mod = _tier2_module(self, api, self._batched_config())
+        assert mod._dispatcher is not None
+        batch = create_autospec(moderate_texts)
+        batch.side_effect = ModerationCheckError(
+            "moderation endpoint returned 422", KIND_BATCH_REFUSED
+        )
+        single = self._verdict()
+        with patch(MODERATE_TEXTS, batch), patch(MODERATE_TEXT, single):
+            await self._enqueue_all(mod, ["a", "b", "c", "d"])
+            homeserver.clock.drain()
+        self.assertEqual(
+            single.await_count,
+            4,
+            "a refused batch left messages unmoderated instead of being split",
+        )
+        self.assertEqual(
+            mod._dispatcher.max_batch,
+            4,
+            "one refused batch switched batching off for the whole process",
         )
 
     async def test_one_job_failing_does_not_cost_the_rest_of_its_batch(
@@ -4749,6 +4787,7 @@ class TestParseConfig(unittest.TestCase):
         "tier2_workers": 4,
         "tier2_queue_size": 64,
         "tier2_max_batch": 8,
+        "tier2_max_batch_chars": 20_000,
         "tier2_batch_max_wait_seconds": 0.05,
         "tier2_request_timeout_seconds": 5.0,
         "tier2_breaker_failure_threshold": 3,
@@ -4831,6 +4870,9 @@ class TestParseConfig(unittest.TestCase):
             ("tier2_max_batch", 0),
             ("tier2_max_batch", 257),
             ("tier2_max_batch", True),
+            ("tier2_max_batch_chars", 999),
+            ("tier2_max_batch_chars", 400_001),
+            ("tier2_max_batch_chars", True),
             ("tier2_batch_max_wait_seconds", -0.001),
             ("tier2_batch_max_wait_seconds", 5.001),
             ("tier2_batch_max_wait_seconds", True),
@@ -4874,6 +4916,59 @@ class TestParseConfig(unittest.TestCase):
         # The linger has to stay a minority of the measured ~45 ms local path,
         # or batching is paying for itself with latency it does not have.
         self.assertLess(cfg.moderation_tier2_batch_max_wait_seconds, 0.045 / 2)
+
+    def test_the_shipped_batch_caps_cannot_build_a_request_the_peer_refuses(
+        self,
+    ) -> None:
+        """The cross-repo half of the contract, pinned on this side of it.
+
+        `/choreo/moderate` publishes two batch bounds
+        (`app/handlers/moderator/moderator.py`): at most 32 items, and at most
+        40,000 characters in total measured `sum(min(len(t.strip()), 10_000))`.
+        Exceeding either is an HTTP 422 - indistinguishable, by status, from
+        the 422 an un-upgraded deployment answers. So a default on this side
+        that is looser than the peer's is not a tuning choice, it is a request
+        the peer will reject, and the rejection is the one this module used to
+        answer by switching batching off for the life of the process.
+
+        The item cap alone never bounded the characters: 32 items at the
+        peer's own 10,000-character per-item cap is 320,000, eight times the
+        total. The cap is a 1,250-character average per message, which
+        ordinary chat clears.
+        """
+        peer_max_items = 32
+        peer_max_total_chars = 40_000
+        peer_max_text_chars = 10_000
+        cfg = PangeaChat.parse_config(dict(self.BASE))
+        self.assertLessEqual(
+            cfg.moderation_tier2_max_batch,
+            peer_max_items,
+            "the shipped item cap is past the peer's, so a full batch is refused",
+        )
+        self.assertLessEqual(
+            cfg.moderation_tier2_max_batch_chars,
+            peer_max_total_chars,
+            "the shipped character cap is past the peer's, so an ordinary "
+            "batch of long messages is refused",
+        )
+        self.assertEqual(
+            PEER_MAX_TEXT_CHARS,
+            peer_max_text_chars,
+            "this module measures a batch item differently from the peer, so "
+            "the two disagree about when a batch is too big",
+        )
+        self.assertEqual(
+            DEFAULT_MAX_BATCH_CHARS,
+            cfg.moderation_tier2_max_batch_chars,
+            "the transport's default cap and the config's have drifted, so "
+            "the two halves of this module form different batches",
+        )
+        self.assertGreater(
+            cfg.moderation_tier2_max_batch * peer_max_text_chars,
+            peer_max_total_chars,
+            "this test would pass with no character cap at all, because the "
+            "item cap alone now bounds the characters",
+        )
 
     def test_tier2_requires_url_and_token(self) -> None:
         with self.assertRaises(ValueError):

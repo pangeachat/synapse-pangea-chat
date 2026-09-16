@@ -657,6 +657,7 @@ class ChatModeration:
             access_token=config.moderation_choreo_access_token,
             breaker=breaker,
             timeout_seconds=config.moderation_tier2_request_timeout_seconds,
+            max_batch_chars=config.moderation_tier2_max_batch_chars,
         )
         self._dispatcher = Tier2Dispatcher(
             homeserver=homeserver,
@@ -669,15 +670,17 @@ class ChatModeration:
             ),
             drain_timeout_seconds=config.moderation_tier2_drain_timeout_seconds,
             max_batch=config.moderation_tier2_max_batch,
+            max_batch_chars=config.moderation_tier2_max_batch_chars,
             batch_max_wait_seconds=config.moderation_tier2_batch_max_wait_seconds,
         )
         self._dispatcher.start()
         logger.info(
             "tier2 moderation is active on this instance: %d workers, queue "
-            "%d, batches of up to %d",
+            "%d, batches of up to %d messages or %d characters",
             config.moderation_tier2_workers,
             config.moderation_tier2_queue_size,
             config.moderation_tier2_max_batch,
+            config.moderation_tier2_max_batch_chars,
         )
 
     # ------------------------------------------------------------------

@@ -211,6 +211,19 @@ class PangeaChatConfig:
     # latency - so a lone message in an unloaded system is never delayed at
     # all. See `Tier2Dispatcher._collect`.
     moderation_tier2_max_batch: int = 32
+    # The other half of the peer's batch contract, and the half that was
+    # missing. `/choreo/moderate` refuses a batch whose texts total more than
+    # 40,000 characters - measured stripped and truncated at its own
+    # 10,000-character per-item cap - with an HTTP 422, the same status an
+    # un-upgraded deployment answers. 32 items at up to 10,000 characters each
+    # is 320,000, eight times the cap, so the item count alone was never the
+    # contract: the cap works out to a 1,250-character average per message,
+    # which ordinary chat clears easily.
+    #
+    # It is a setting rather than a constant so it can track a peer that moves
+    # without a release of this module. Raising it past the peer's own cap
+    # does not buy throughput - it buys refused requests.
+    moderation_tier2_max_batch_chars: int = 40_000
     moderation_tier2_batch_max_wait_seconds: float = 0.02
     # Covers the WHOLE exchange - connect, headers and body. The body half is
     # the one that had no bound at all.

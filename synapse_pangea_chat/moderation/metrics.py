@@ -286,6 +286,20 @@ TIER2_BATCH_UNSUPPORTED = _get_or_create(
     "has fallen back to single-text calls for the life of this process.",
 )
 
+# A COUNTER, and the companion to the gauge above: a refusal is an event, and
+# the two questions an operator has about it are different. The gauge answers
+# "is this deployment batching at all"; this answers "how often is the peer
+# refusing what we send", which on an upgraded deployment means our batch
+# caps have drifted from the peer's and every refusal is a round trip bought
+# for nothing. A steady, non-zero rate here with the gauge at 0 is the signal
+# to look at `moderation.tier2_max_batch_chars` against the peer's own cap.
+TIER2_BATCH_REFUSED = _get_or_create(
+    Counter,
+    "pangea_moderation_tier2_batch_refused_total",
+    "Batched Tier 2 requests the moderation endpoint refused without saying "
+    "why; each one is split in half and retried.",
+)
+
 # The SCREEN's own per-item verdict, which is not the same thing as a check:
 # a screen result that says `flagged` decides nothing, because the message is
 # then re-asked one text at a time and that answer is what redacts. This is

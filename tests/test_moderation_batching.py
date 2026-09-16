@@ -30,6 +30,7 @@ from twisted.web.iweb import IBodyProducer
 
 from synapse_pangea_chat.moderation.breaker import CircuitBreaker
 from synapse_pangea_chat.moderation.choreo_client import (
+    KIND_BATCH_REFUSED,
     KIND_BATCH_UNSUPPORTED,
     KIND_SHAPE,
     ChoreoChecker,
@@ -132,6 +133,39 @@ class _Agent:
         return defer.succeed(outcome)
 
 
+class _ShapeAgent:
+    """Answers by request SHAPE rather than by call order.
+
+    A fixed list of responses cannot express "this endpoint refuses every
+    batch and answers every single-text call", which is the whole of what an
+    un-upgraded deployment is - and it is the only way to drive a split that
+    retries without hand-counting the recursion.
+    """
+
+    def __init__(self, *, batch_response: Any, single_body: bytes) -> None:
+        self._batch_response = batch_response
+        self._single_body = single_body
+        self.bodies: List[Dict[str, Any]] = []
+        self.calls = 0
+
+    @property
+    def batch_calls(self) -> int:
+        return sum(1 for body in self.bodies if "texts" in body)
+
+    def request(
+        self, method: bytes, uri: bytes, headers: Any = None, bodyProducer: Any = None
+    ) -> Any:
+        self.calls += 1
+        body = json.loads(_consume(bodyProducer))
+        self.bodies.append(body)
+        if "texts" in body:
+            response = self._batch_response
+            if callable(response):
+                response = response(body["texts"])
+            return defer.succeed(response)
+        return defer.succeed(_Response(200, self._single_body))
+
+
 def _consume(producer: Any) -> bytes:
     """The bytes the agent would put on the wire, and the interface check.
 
@@ -165,6 +199,56 @@ def _body(results: Sequence[Any]) -> bytes:
     something that is NOT a verdict object in the list, which is precisely the
     shape the validator has to refuse."""
     return json.dumps({"results": list(results)}).encode("utf-8")
+
+
+def _missing_text_body(texts: Sequence[str]) -> bytes:
+    """What an UN-UPGRADED choreo answers to `{"texts": [...]}`.
+
+    `ModerationRequest.text` is a required field on the deployed model and
+    `texts` is not a field at all, so FastAPI's `RequestValidationError` fires
+    before the handler runs and the envelope names the missing field. The
+    `input` key is FastAPI echoing our own request body back - learners'
+    messages - which is exactly why nothing in the transport may log or carry
+    any part of this body.
+    """
+    return json.dumps(
+        {
+            "detail": [
+                {
+                    "type": "missing",
+                    "loc": ["body", "text"],
+                    "msg": "Field required",
+                    "input": {"texts": list(texts), "mock": False},
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+
+def _too_large_body(texts: Sequence[str]) -> bytes:
+    """What an UPGRADED choreo answers to a batch past its total-character cap.
+
+    The same 422, from the same Pydantic layer, before the same handler runs -
+    and the reason the status alone cannot be a diagnosis. What separates it
+    is the error itself: a model validator's `value_error` on the body as a
+    whole, not a missing `text` field.
+    """
+    return json.dumps(
+        {
+            "detail": [
+                {
+                    "type": "value_error",
+                    "loc": ["body"],
+                    "msg": (
+                        "Value error, `texts` totals 41000 characters after "
+                        "the 10000-character per-item cap; the batch total "
+                        "cap is 40000 - split the batch"
+                    ),
+                    "input": {"texts": list(texts), "mock": False},
+                }
+            ]
+        }
+    ).encode("utf-8")
 
 
 def _verdict(flagged: bool = False, categories: Optional[List[str]] = None) -> Dict:
@@ -282,26 +366,72 @@ class BatchTransportTestCase(unittest.TestCase):
         messages are left alone, while this one means "ask again one text at
         a time", and never asking again would stop moderating.
         """
-        for body in (b"{}", b'{"results": null}', b'{"flagged": false}', b"[]"):
+        agent = _Agent([_Response(200, b'{"flagged": false}')])
+        with self.assertRaises(ModerationCheckError) as caught:
+            self._call(["a", "b"], agent)
+        self.assertEqual(caught.exception.kind, KIND_BATCH_UNSUPPORTED)
+
+    def test_a_200_we_cannot_place_is_a_shape_failure_and_not_a_demotion(
+        self,
+    ) -> None:
+        """A body that answers neither contract is a provider misbehaving.
+
+        `{}`, a null `results`, a bare list: none of them is a single-text
+        verdict, so none of them is evidence that this endpoint implements the
+        older contract. Reading them as one would let a gateway's error page
+        switch batching off for the life of the process. They are refused as a
+        shape failure - no verdicts, every message left alone, and the breaker
+        told, which is bounded and recovers on its own.
+        """
+        for body in (b"{}", b'{"results": null}', b"[]", b'{"results": "no"}'):
             with self.subTest(body=body):
                 agent = _Agent([_Response(200, body)])
                 with self.assertRaises(ModerationCheckError) as caught:
                     self._call(["a", "b"], agent)
-                self.assertEqual(caught.exception.kind, KIND_BATCH_UNSUPPORTED)
+                self.assertEqual(caught.exception.kind, KIND_SHAPE)
 
-    def test_a_422_reads_as_batch_unsupported(self) -> None:
-        """What an un-upgraded choreo actually answers.
+    def test_a_missing_text_field_reads_as_batch_unsupported(self) -> None:
+        """What an un-upgraded choreo actually answers, and how it is known.
 
-        `ModerationRequest.text` is a required Pydantic field, so FastAPI
-        rejects a body carrying `texts` and no `text` with 422 before the
-        handler runs. 400 is included for a gateway that rewrites it.
+        `ModerationRequest.text` is a required Pydantic field on the deployed
+        model and `texts` is not a field at all, so FastAPI rejects the body
+        with 422 before the handler runs - and the envelope says which field
+        it wanted. That naming is the evidence; the status is not.
         """
         for code in (400, 422):
             with self.subTest(code=code):
-                agent = _Agent([_Response(code, b'{"detail": "field required"}')])
+                agent = _Agent([_Response(code, _missing_text_body(["a", "b"]))])
                 with self.assertRaises(ModerationCheckError) as caught:
                     self._call(["a", "b"], agent)
                 self.assertEqual(caught.exception.kind, KIND_BATCH_UNSUPPORTED)
+
+    def test_a_size_refusal_is_not_read_as_batch_unsupported(self) -> None:
+        """The defect, at the point it is decided.
+
+        An upgraded choreo refuses a batch past its total-character cap with
+        the SAME 422, from the same Pydantic layer, before the same handler
+        runs. Reading the status as "this endpoint does not do batches" turns
+        a handful of long messages into a process-lifetime collapse of
+        throughput; the two want opposite answers, so they must not share a
+        kind.
+        """
+        for code in (400, 422):
+            with self.subTest(code=code):
+                agent = _Agent([_Response(code, _too_large_body(["a", "b"]))])
+                with self.assertRaises(ModerationCheckError) as caught:
+                    self._call(["a", "b"], agent)
+                self.assertEqual(caught.exception.kind, KIND_BATCH_REFUSED)
+
+    def test_a_refusal_we_cannot_read_claims_nothing(self) -> None:
+        """No evidence is not evidence. A body a gateway rewrote, truncated or
+        never sent says nothing about which of the two refusals this is, and
+        the ambiguous reading must be the one that does no damage."""
+        for body in (b"", b"not json", b"{}", b'{"detail": "field required"}'):
+            with self.subTest(body=body):
+                agent = _Agent([_Response(422, body)])
+                with self.assertRaises(ModerationCheckError) as caught:
+                    self._call(["a", "b"], agent)
+                self.assertEqual(caught.exception.kind, KIND_BATCH_REFUSED)
 
     def test_other_statuses_keep_their_ordinary_meaning(self) -> None:
         """A 401 is a bad token and a 500 is a provider outage. Reading either
@@ -333,7 +463,7 @@ class BatchCheckerTestCase(unittest.TestCase):
         TIER2_BATCH_UNSUPPORTED.set(0)
         self.addCleanup(TIER2_BATCH_UNSUPPORTED.set, 0)
 
-    def _checker(self, agent: _Agent) -> ChoreoChecker:
+    def _checker(self, agent: Any, max_batch_chars: int = 40_000) -> ChoreoChecker:
         return ChoreoChecker(
             agent=agent,
             clock=self.clock,
@@ -341,6 +471,7 @@ class BatchCheckerTestCase(unittest.TestCase):
             access_token="syt_x",
             breaker=self.breaker,
             timeout_seconds=15.0,
+            max_batch_chars=max_batch_chars,
         )
 
     def test_the_returned_list_always_matches_the_request_length(self) -> None:
@@ -355,7 +486,11 @@ class BatchCheckerTestCase(unittest.TestCase):
             ("clean", [_Response(200, _body([_verdict()] * 3))]),
             ("shape", [_Response(200, _body([_verdict()]))]),
             ("server error", [_Response(500, b"{}")]),
-            ("unsupported then singles", [_Response(422, b"{}")]),
+            (
+                "unsupported then singles",
+                [_Response(422, _missing_text_body(["a", "b", "c"]))],
+            ),
+            ("refused then split", [_Response(422, _too_large_body(["a", "b", "c"]))]),
         ]
         for name, responses in cases:
             with self.subTest(case=name):
@@ -374,7 +509,7 @@ class BatchCheckerTestCase(unittest.TestCase):
         """
         agent = _Agent(
             [
-                _Response(422, b'{"detail": "field required"}'),
+                _Response(422, _missing_text_body(["bad", "fine"])),
                 _Response(200, json.dumps(_verdict(True, ["harassment"])).encode()),
                 _Response(200, json.dumps(_verdict(False)).encode()),
             ]
@@ -402,7 +537,8 @@ class BatchCheckerTestCase(unittest.TestCase):
         group of messages for the whole life of a staging deployment.
         """
         agent = _Agent(
-            [_Response(422, b"{}")] + [_Response(200, b'{"flagged": false}')] * 10
+            [_Response(422, _missing_text_body(["a", "b"]))]
+            + [_Response(200, b'{"flagged": false}')] * 10
         )
         checker = self._checker(agent)
         _run(checker.check_batch(["a", "b"]))
@@ -416,7 +552,10 @@ class BatchCheckerTestCase(unittest.TestCase):
         )
 
     def test_the_demotion_is_visible_on_a_gauge(self) -> None:
-        agent = _Agent([_Response(422, b"{}")] + [_Response(200, b"{}")] * 4)
+        agent = _Agent(
+            [_Response(422, _missing_text_body(["a", "b"]))]
+            + [_Response(200, b"{}")] * 4
+        )
         checker = self._checker(agent)
         self.assertEqual(
             self.reader.value("pangea_moderation_tier2_batch_unsupported"), 0.0
@@ -526,6 +665,150 @@ class BatchCheckerTestCase(unittest.TestCase):
         agent = _Agent([])
         self.assertEqual(_run(self._checker(agent).check_batch([])).results, [])
         self.assertEqual(agent.calls, 0)
+
+    # --- a refusal is not a diagnosis --------------------------------
+
+    def test_a_size_refusal_is_split_and_retried_rather_than_demoting(
+        self,
+    ) -> None:
+        """The defect, end to end.
+
+        An upgraded choreo refuses a batch past its total-character cap with
+        422 - the same status an un-upgraded one answers. Demoting on it costs
+        the process its throughput until the next restart, and the queue then
+        fills and drops messages. Splitting costs one extra round trip and
+        every message still gets a verdict.
+        """
+        agent = _Agent(
+            [
+                _Response(422, _too_large_body(["a", "b", "c", "d"])),
+                _Response(200, _body([_verdict(False), _verdict(True, ["hate"])])),
+                _Response(200, _body([_verdict(False), _verdict(False)])),
+            ]
+        )
+        checker = self._checker(agent)
+        verdicts = _run(checker.check_batch(["a", "b", "c", "d"]))
+        self.assertEqual(
+            [r and r["flagged"] for r in verdicts.results],
+            [False, True, False, False],
+            "a refused batch lost verdicts instead of being split",
+        )
+        self.assertTrue(
+            checker.batch_supported,
+            "a batch that was merely too large switched batching off for the "
+            "life of the process",
+        )
+        self.assertEqual(
+            self.reader.value("pangea_moderation_tier2_batch_unsupported"), 0.0
+        )
+        self.assertEqual(
+            [body["texts"] for body in agent.bodies],
+            [["a", "b", "c", "d"], ["a", "b"], ["c", "d"]],
+            "the refused batch was not split in half and retried",
+        )
+
+    def test_one_learner_cannot_switch_batching_off_for_everybody(self) -> None:
+        """A long message is ordinary traffic, not a contract negotiation.
+
+        The batch is refused on size, split, and both halves answer. Repeat it
+        as often as a classroom would and batching is still on - because
+        nothing in a size refusal is evidence about the SHAPE the endpoint
+        understands.
+        """
+        agent = _ShapeAgent(
+            batch_response=lambda texts: (
+                _Response(422, _too_large_body(texts))
+                if len(texts) > 2
+                else _Response(200, _body([_verdict(False)] * len(texts)))
+            ),
+            single_body=json.dumps(_verdict(False)).encode(),
+        )
+        checker = self._checker(agent)
+        for _ in range(5):
+            verdicts = _run(checker.check_batch(["a", "b", "c", "d"]))
+            self.assertEqual(len(verdicts.results), 4)
+        self.assertTrue(
+            checker.batch_supported,
+            "repeated size refusals demoted batching, which is the one-shot "
+            "defect reached by a slower road",
+        )
+        self.assertEqual(
+            self.reader.value("pangea_moderation_tier2_batch_unsupported"), 0.0
+        )
+
+    def test_an_un_upgraded_endpoint_demotes_on_the_evidence_it_sends(
+        self,
+    ) -> None:
+        """Staging runs one, and it must still be recognised at the first ask.
+
+        The evidence is the endpoint's own validation error naming `text` as
+        the field it wanted - which no cap refusal ever says - so the demotion
+        costs exactly one refused request, as it always did.
+        """
+        agent = _Agent(
+            [
+                _Response(422, _missing_text_body(["a", "b"])),
+                _Response(200, json.dumps(_verdict(False)).encode()),
+                _Response(200, json.dumps(_verdict(True, ["harassment"])).encode()),
+            ]
+        )
+        checker = self._checker(agent)
+        verdicts = _run(checker.check_batch(["a", "b"]))
+        self.assertFalse(
+            checker.batch_supported,
+            "an endpoint that named `text` as the field it wanted was still "
+            "treated as one that understands `texts`",
+        )
+        self.assertEqual([r and r["flagged"] for r in verdicts.results], [False, True])
+        self.assertTrue(verdicts.confirmed)
+        self.assertEqual(
+            sum(1 for body in agent.bodies if "texts" in body),
+            1,
+            "recognising an un-upgraded endpoint cost more than one request",
+        )
+
+    def test_an_unreadable_refusal_demotes_only_on_repeated_evidence(
+        self,
+    ) -> None:
+        """An un-upgraded endpoint behind a gateway that rewrote its body.
+
+        There is then no evidence in any one answer, so the evidence has to be
+        built: a batch is refused, split, refused again, and when the SMALLEST
+        batch this module will ever send - two texts, well inside the cap -
+        is refused too, while single-text calls answer normally, size cannot
+        be the explanation. Three of those, and batching is demoted. The cost
+        is bounded, paid once, and never reachable from one refusal.
+        """
+        agent = _ShapeAgent(
+            batch_response=_Response(422, b"{}"),
+            single_body=json.dumps(_verdict(False)).encode(),
+        )
+        checker = self._checker(agent)
+        verdicts = _run(checker.check_batch([f"m{i}" for i in range(8)]))
+        self.assertEqual(len(verdicts.results), 8)
+        self.assertTrue(
+            all(result is not None for result in verdicts.results),
+            "messages went unmoderated while the shape was being established",
+        )
+        self.assertTrue(verdicts.confirmed)
+        self.assertFalse(
+            checker.batch_supported,
+            "an endpoint that refuses even a two-text batch was asked for one "
+            "forever",
+        )
+        first_round = agent.batch_calls
+        self.assertLessEqual(
+            first_round,
+            12,
+            f"establishing the shape cost {first_round} refused requests",
+        )
+        _run(checker.check_batch(["x", "y"]))
+        self.assertEqual(
+            agent.batch_calls,
+            first_round,
+            "a batch was attempted against an endpoint already known not to "
+            "understand one",
+        )
 
     def test_a_single_message_does_not_pay_for_the_batch_contract(self) -> None:
         """One message goes out on the single-text endpoint.
