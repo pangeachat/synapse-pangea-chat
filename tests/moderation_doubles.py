@@ -163,10 +163,22 @@ class _TransactionDouble:
     is not a test.
     """
 
-    def __init__(self, connection: "sqlite3.Connection") -> None:
+    def __init__(
+        self,
+        connection: "sqlite3.Connection",
+        on_statement: Optional[Callable[[str, Any], None]] = None,
+    ) -> None:
         self._cursor = connection.cursor()
+        self._on_statement = on_statement
 
     def execute(self, sql: str, args: Any = ()) -> None:
+        # The hook sees the ARGUMENTS as well as the statement, which is what
+        # lets a test express "the database refuses THIS ROW" rather than
+        # "the database is down". They are different failures - one is
+        # transient and one is not - and the interaction-level hook cannot
+        # tell them apart.
+        if self._on_statement is not None:
+            self._on_statement(sql, tuple(args))
         # Through Synapse's OWN converter, not through a hand-written stand-in
         # for it. That is the coupling the previous double got wrong, and the
         # only way this file can be right about it is to call the same code
@@ -203,6 +215,10 @@ class DbPoolDouble:
         #: a method is a type error, and silencing it would be a suppression
         #: in a file whose whole job is to not need one.
         self.on_interaction: Optional[Callable[[str], None]] = None
+        #: Called with each statement and its arguments. The finer hook, for
+        #: the failure the coarse one cannot express: a database that accepts
+        #: every other row and refuses ONE.
+        self.on_statement: Optional[Callable[[str, Any], None]] = None
 
     def __del__(self) -> None:
         # An in-memory database left to the collector raises a ResourceWarning
@@ -221,7 +237,7 @@ class DbPoolDouble:
             self.on_interaction(desc)
         if self.error is not None:
             raise self.error
-        txn = _TransactionDouble(self.connection)
+        txn = _TransactionDouble(self.connection, self.on_statement)
         result = func(txn, *args, **kwargs)
         self.connection.commit()
         return result

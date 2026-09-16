@@ -159,6 +159,19 @@ TIER2_DISPOSITION_WRITE_FAILED = _get_or_create(
     "binds a restart and a second instance.",
 )
 
+TIER2_DISPOSITION_UNWRITTEN = _get_or_create(
+    Gauge,
+    "pangea_moderation_tier2_disposition_unwritten",
+    "Preserved dispositions still waiting to be written to the durable table. "
+    "A GAUGE and not a counter, because the number that matters is how many "
+    "are outstanding RIGHT NOW: a row the database will never take stands at "
+    "one here forever, which is the only way anybody finds out. The messages "
+    "are still preserved and still protected from a claim in this process; "
+    "what is missing is the record that binds a restart and a second "
+    "instance, and unrelated events are no longer refused a redaction "
+    "while it is.",
+)
+
 TIER2_REDACTED_AFTER_PRESERVE = _get_or_create(
     Counter,
     "pangea_moderation_tier2_redacted_after_preserve_total",

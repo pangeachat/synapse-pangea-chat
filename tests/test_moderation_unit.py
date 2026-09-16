@@ -1729,6 +1729,161 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
             1.0,
         )
 
+    @staticmethod
+    def _refuse_one_row(event_id: str) -> Any:
+        """A database that accepts every row but one.
+
+        Not an outage: an outage stops the claim at `_ensure_table` too, so
+        nothing is redacted anyway and there is nothing to starve. This is
+        the failure the wedge comment understated - something specific to one
+        row's values, which no retry will ever get past.
+        """
+
+        def _hook(sql: str, args: Any) -> None:
+            # The PRESERVE only - `DO UPDATE` is what distinguishes it from
+            # the claim's `DO NOTHING`. A hook that refused both would let
+            # these tests pass for the wrong reason: the claim would fail on
+            # its own and report an unknown, so the protection being asserted
+            # would never be reached.
+            if "DO UPDATE" in sql and event_id in args:
+                raise RuntimeError("this row is not acceptable to the database")
+
+        return _hook
+
+    async def test_one_unwritable_preserve_does_not_wedge_every_redaction(
+        self,
+    ) -> None:
+        """A single row the database will never take used to stop Tier 2
+        redacting ANYTHING, process-wide and permanently.
+
+        `_flush_pending` iterated in insertion order and stopped at the first
+        failure, and `claim_redaction` refused while anything was pending - so
+        the flush hit the stuck row first every time and never reached the
+        rest. The comment called it "this event is stuck"; the behaviour was
+        "Tier 2 stops redacting anything at all until a human clears one row".
+        It fails safe, so this is denial of moderation rather than a safety
+        violation, and the fix is proportionate: rotate the row to the back of
+        the queue, scope the refusal to the event it is actually about, and
+        put the backlog on a gauge.
+        """
+        reader = MetricReader()
+        reader.snapshot("pangea_moderation_tier2_disposition_unwritten")
+        db_pool = DbPoolDouble()
+        db_pool.on_statement = self._refuse_one_row("$poison")
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job("$poison"))
+        sends = cast(AsyncMock, api.create_and_send_event_into_room)
+        with patch(self.MODERATE, self._verdict("harassment")):
+            for index in range(4):
+                await mod._check_and_redact(self._job(f"$unrelated{index}"))
+        self.assertTrue(
+            sends.await_count,
+            "one unwritable row starved every other event's redaction",
+        )
+        self.assertEqual(
+            reader.value("pangea_moderation_tier2_disposition_unwritten"),
+            1.0,
+            "an unwritable row has to be visible, standing at one until a "
+            "human clears it",
+        )
+
+    async def test_an_unwritten_preserve_still_protects_its_own_event(
+        self,
+    ) -> None:
+        """Narrowing the refusal must not unprotect the disclosure.
+
+        The event whose preserve cannot be written is exactly the one a later
+        verdict must not redact, and the in-memory cache that would otherwise
+        cover it is an LRU that evicts. So the claim reads the pending set
+        directly, and that set is not bounded.
+        """
+        db_pool = DbPoolDouble()
+        db_pool.on_statement = self._refuse_one_row("$poison")
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job("$poison"))
+        with patch(self.MODERATE, self._verdict("harassment")):
+            for index in range(4):
+                await mod._check_and_redact(self._job(f"$unrelated{index}"))
+        assert mod._disposition is not None
+        # Evicting the cache is what a busy process does on its own; the
+        # guarantee must not be the thing that was evicted.
+        mod._disposition._remembered.clear()
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job("$poison"))
+        redacted = [
+            call.args[0]["redacts"]
+            for call in cast(
+                AsyncMock, api.create_and_send_event_into_room
+            ).await_args_list
+        ]
+        self.assertNotIn(
+            "$poison", redacted, "the disclosure whose record failed was redacted"
+        )
+
+    async def test_a_stuck_row_does_not_block_the_preserves_behind_it(
+        self,
+    ) -> None:
+        """The other half of the starvation, inside the queue itself.
+
+        The backlog was walked in insertion order and abandoned at the first
+        failure, so a row that always fails from the head of it meant every
+        preserve QUEUED BEHIND it also never landed - each one a disclosure
+        whose durable record a restart would not find. A failed write moves
+        its row to the back, so the queue drains around it.
+        """
+        db_pool = DbPoolDouble()
+        db_pool.on_statement = self._refuse_one_row("$poison")
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job("$poison"))
+            for index in range(3):
+                await mod._check_and_redact(self._job(f"$behind{index}"))
+        # One more operation of any kind is enough for the queue to turn over.
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job("$unrelated"))
+        landed = {
+            row[0]
+            for row in db_pool.connection.execute(
+                f"SELECT event_id FROM {DISPOSITION_TABLE} "
+                f"WHERE disposition = 'preserved'"
+            ).fetchall()
+        }
+        self.assertEqual(
+            landed,
+            {"$behind0", "$behind1", "$behind2"},
+            "the preserves queued behind a permanently failing row never landed",
+        )
+
+    async def test_an_unwritten_preserve_is_still_retried(self) -> None:
+        """Moved to the back of the queue is not dropped. A row refused for a
+        reason that later goes away - a column somebody widens, a constraint
+        somebody drops - is written on the next flush, and the durable
+        guarantee comes back."""
+        db_pool = DbPoolDouble()
+        db_pool.on_statement = self._refuse_one_row("$poison")
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job("$poison"))
+        with patch(self.MODERATE, self._verdict("harassment")):
+            for index in range(4):
+                await mod._check_and_redact(self._job(f"$unrelated{index}"))
+        db_pool.on_statement = None
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job("$later"))
+        row = db_pool.connection.execute(
+            f"SELECT disposition FROM {DISPOSITION_TABLE} WHERE event_id = ?",
+            ("$poison",),
+        ).fetchone()
+        self.assertEqual(
+            row, ("preserved",), "a rotated row stopped being retried at all"
+        )
+
     async def test_an_event_that_is_gone_is_an_unknown_not_a_release(self) -> None:
         """A read that comes back empty is the third answer, and it is not a
         `no`.
@@ -2006,7 +2161,46 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
         database is refusing, and the whole backlog lands before the first
         claim is granted once it comes back. Retrying every pending decision
         against a database that has just refused one is how a moderation
-        problem becomes a homeserver problem."""
+        problem becomes a homeserver problem.
+
+        Asserted as BACKLOG-INDEPENDENCE rather than as a fixed number, which
+        is the stronger statement of the same property: a flush that costs one
+        statement with one row waiting and twenty with twenty is the burst
+        this guards against, and no count of statements can be traded for it.
+        The fixed number it replaces also happened to encode something else -
+        that a failed flush made the claim return without a transaction of its
+        own - and that second behaviour was a whole-feature outage from one
+        unwritable row, which is why it is gone. The cost of the backlog is
+        now stated exactly: one statement, whatever its depth.
+        """
+
+        async def _statements_for_one_check(depth: int) -> int:
+            db_pool = DbPoolDouble()
+            api, homeserver = self._pair(db_pool)
+            mod = self._module(api, homeserver)
+            db_pool.error = RuntimeError("database is unhappy")
+            with patch(self.MODERATE, self._verdict("self-harm/intent")):
+                for index in range(depth):
+                    await mod._check_and_redact(self._job(f"$e{index}"))
+            before = len(db_pool.interactions)
+            with patch(self.MODERATE, self._verdict("harassment")):
+                await mod._check_and_redact(self._job("$other"))
+            return len(db_pool.interactions) - before
+
+        empty = await _statements_for_one_check(0)
+        one = await _statements_for_one_check(1)
+        twenty = await _statements_for_one_check(20)
+        self.assertEqual(
+            one,
+            twenty,
+            "the retry cost grows with the backlog, which is the burst",
+        )
+        self.assertEqual(
+            twenty,
+            empty + 1,
+            "a backlog of any depth costs exactly one retry per operation",
+        )
+
         db_pool = DbPoolDouble()
         api, homeserver = self._pair(db_pool)
         mod = self._module(api, homeserver)
@@ -2014,15 +2208,6 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
         with patch(self.MODERATE, self._verdict("self-harm/intent")):
             for index in range(20):
                 await mod._check_and_redact(self._job(f"$e{index}"))
-        before = len(db_pool.interactions)
-        with patch(self.MODERATE, self._verdict("harassment")):
-            await mod._check_and_redact(self._job("$other"))
-        self.assertEqual(
-            len(db_pool.interactions) - before,
-            1,
-            "one refused write became a burst against a dead database",
-        )
-
         db_pool.error = None
         with patch(self.MODERATE, self._verdict("harassment")):
             await mod._check_and_redact(self._job("$other"))

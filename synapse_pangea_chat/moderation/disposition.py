@@ -71,7 +71,7 @@ SQLite - which an end-to-end test that only ever boots Postgres cannot see.
 
 import uuid
 from collections import OrderedDict
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from synapse_pangea_chat.moderation import metrics
 from synapse_pangea_chat.moderation.compat import reraise_if_cancelled
@@ -180,10 +180,17 @@ class DispositionStore:
         # Preserves whose durable write has not landed. NOT bounded, and
         # deliberately: this holds only the decisions the database refused,
         # every one of them is retried on the next operation, and dropping one
-        # to save memory would drop the guarantee it carries. While the
-        # database is refusing writes it is also refusing the claim reads, so
-        # nothing is being redacted anyway.
-        self._pending: Dict[str, Tuple[str, str]] = {}
+        # to save memory would drop the guarantee it carries.
+        #
+        # It is also where a disclosure whose record cannot be written is
+        # PROTECTED, which `_remembered` cannot be trusted to do: that is an
+        # LRU and it evicts. `claim_redaction` reads this set directly.
+        #
+        # An `OrderedDict` because a failed write moves its row to the BACK.
+        # A row the database refuses for a reason specific to its own values
+        # sat at the head of a queue walked in insertion order, and every
+        # preserve behind it waited on it forever.
+        self._pending: "OrderedDict[str, Tuple[str, str]]" = OrderedDict()
 
     # ------------------------------------------------------------------
     # Schema
@@ -242,6 +249,7 @@ class DispositionStore:
         # this process, and it must not depend on the write succeeding.
         self._remember(event_id)
         self._pending[event_id] = (room_id, category)
+        metrics.TIER2_DISPOSITION_UNWRITTEN.set(len(self._pending))
         return await self._flush_pending(event_id)
 
     async def _flush_pending(self, event_id: Optional[str] = None) -> bool:
@@ -254,24 +262,41 @@ class DispositionStore:
         restart before the retry lands loses the decision; see
         `record_preserved`.
 
-        **A preserve that can never be written wedges every redaction in this
-        process**, because a claim is refused while anything is pending. That
-        is the safe direction and it is a whole-feature outage from one row,
-        so it is said here rather than discovered: a store that refuses a
-        write but serves reads is exotic, and a store that refuses both
-        already stops every claim at `_ensure_table`.
+        **A row the database will never take is isolated to its own event.**
+        It used to stop Tier 2 redacting ANYTHING in this process: the queue
+        was walked in insertion order and abandoned at the first failure, and
+        a claim was refused while anything at all was pending - so a preserve
+        that failed for a reason specific to its own values (not an outage,
+        which stops the claim at `_ensure_table` anyway) sat at the head of
+        the queue and every OTHER event's redaction waited on it until a human
+        cleared the row. The comment here called that "this event is stuck".
+        It was "Tier 2 stops redacting anything at all". Two changes, and
+        neither retries harder against a database that is down:
+
+        - A failed write moves its row to the BACK, so the preserves behind it
+          land on the next flush instead of queueing behind it forever.
+        - `claim_redaction` refuses on THIS event's unlanded preserve rather
+          than on any, which is the only refusal that was ever protecting
+          anything: a disclosure preserved elsewhere is either in the table,
+          where the atomic claim loses to it, or in another process's memory,
+          which our backlog could never have told us about.
+
+        The gauge `pangea_moderation_tier2_disposition_unwritten` is what
+        makes a row that never lands visible rather than discovered - it
+        stands at one for as long as the row is stuck.
         """
         if not self._pending:
             return True
         for pending_id, (room_id, category) in list(self._pending.items()):
             if not await self._write_preserve(pending_id, room_id, category):
-                # Stop on the first failure rather than retrying the whole
-                # backlog against a database that has just refused one: the
-                # rest are retried on the next operation, and hammering a
-                # database that is down is how a moderation problem becomes a
-                # homeserver problem.
+                # To the back, and then stop. Stopping is what keeps a
+                # database that is down from being hammered - the rest are
+                # retried on the next operation - and moving the row is what
+                # stops one permanent failure owning the head of the queue.
+                self._pending.move_to_end(pending_id)
                 break
             self._pending.pop(pending_id, None)
+        metrics.TIER2_DISPOSITION_UNWRITTEN.set(len(self._pending))
         if event_id is not None:
             # The caller asked about one decision: it landed if it is no
             # longer waiting, whatever happened to the rest of the backlog.
@@ -357,11 +382,23 @@ class DispositionStore:
         # Preserves the database refused earlier are written FIRST, so a
         # database that was briefly unavailable cannot leave a disclosure
         # unprotected once it comes back: the row exists before this claim
-        # asks for it, and the claim then loses to it. A flush that fails
-        # means we still cannot establish the dispositions we hold, which is
-        # an unknown, which is never a redaction.
-        if not await self._flush_pending():
-            return None
+        # asks for it, and the claim then loses to it.
+        await self._flush_pending()
+        # **Scoped to THIS event, and not to the backlog.** A preserve of this
+        # event that has not landed is still a preserve, and this is where it
+        # is protected - `_remembered` is an LRU and evicts, this does not.
+        #
+        # Refusing on ANY pending row is what this replaced, and it was a
+        # whole-feature outage from one unwritable row: a preserve the
+        # database will never take stopped every OTHER event being redacted,
+        # for good. It protected nothing that is not already protected here. A
+        # disclosure preserved by another process is either in the table,
+        # where this claim's atomic insert loses to it, or in that process's
+        # memory, which our backlog could never have told us about; and a
+        # store refusing writes refuses this claim's insert too, so it returns
+        # an unknown below on its own.
+        if event_id in self._pending:
+            return (PRESERVED, "")
         try:
             await self._ensure_table()
 
