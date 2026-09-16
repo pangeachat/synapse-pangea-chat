@@ -43,7 +43,7 @@ that the new field grants it no power it did not have.)
 """
 
 import math
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Mapping, NamedTuple, Optional, Set, Tuple
 
 from synapse_pangea_chat.moderation.categories import (
     PROVIDER_CATEGORIES,
@@ -256,11 +256,25 @@ def decide(
     obvious. An absent `category_scores` redacts, which is what the module did
     before. A partially present one redacts, because an unscored category is
     an unknown and an unknown is not mildness.
+
+    **Each distinct category is weighed once.** The rule is `any` over the
+    categories, and `any` over a list equals `any` over its set, so the dedupe
+    changes no decision - what it removes is an amplification the sender
+    controls. A response is data from a service we do not run and the
+    transport caps the body at 1 MiB rather than at a category count, so
+    `["harassment"] * 75000` is a well-formed verdict; without this, each
+    occurrence became its own histogram observation, taken inline on the
+    reactor thread. Order is preserved, because the FIRST category to cross
+    its threshold is the one reported as the driver.
     """
     weighed = []
     crossed: Optional[Weighed] = None
     unreadable = False
+    seen: Set[Any] = set()
     for wire_name in categories:
+        if wire_name in seen:
+            continue
+        seen.add(wire_name)
         threshold = threshold_for(wire_name, thresholds)
         score = _readable_score(scores, wire_name)
         if score is None:

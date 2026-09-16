@@ -888,6 +888,54 @@ class TestSeverityGatesTheRedaction(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(self.reader.delta(SEVERITY_BASIS, basis=expected), 1.0)
 
+    async def test_a_repeated_category_is_weighed_once(self) -> None:
+        """A response is data from a service we do not run, and the transport
+        caps the body at 1 MiB rather than at a category count - so
+        `["harassment"] * 75000` is a well-formed verdict. Weighing each
+        occurrence meant one histogram observation per entry, inline on the
+        reactor thread, at a repetition the sender chooses.
+
+        Deduplicating is decision-preserving: the rule is `any` over the
+        categories and `any` over a list equals `any` over its set. What it
+        removes is the amplification.
+        """
+        before = self.reader.value(
+            CATEGORY_SCORE + "_count", category="harassment", outcome="at_or_above"
+        )
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["harassment"] * 500,
+                category_scores={"harassment": 0.99},
+            ),
+        )
+        after = self.reader.value(
+            CATEGORY_SCORE + "_count", category="harassment", outcome="at_or_above"
+        )
+        self.assertEqual(after - before, 1.0)
+        self._sent().assert_awaited_once()
+
+    def test_deduplication_does_not_change_any_decision(self) -> None:
+        """The property the dedupe rests on, asserted directly rather than
+        left to the argument above."""
+        thresholds = severity.DEFAULT_CATEGORY_THRESHOLDS
+        for categories, scores in (
+            (["harassment"], {"harassment": 0.99}),
+            (["harassment"], {"harassment": 0.01}),
+            (["harassment", "hate"], {"harassment": 0.01, "hate": 0.99}),
+            (["harassment", "hate"], {"harassment": 0.01, "hate": 0.01}),
+            (["harassment", "hate"], {"hate": 0.01}),
+            (["harassment"], None),
+        ):
+            with self.subTest(categories=categories):
+                once = severity.decide(categories, scores, thresholds)
+                thrice = severity.decide(categories * 3, scores, thresholds)
+                self.assertEqual(once.redact, thrice.redact)
+                self.assertEqual(once.basis, thrice.basis)
+                self.assertEqual(once.weighed, thrice.weighed)
+                self.assertEqual(once.driver, thrice.driver)
+
     async def test_a_category_label_never_carries_a_value_the_service_chose(
         self,
     ) -> None:
