@@ -443,6 +443,47 @@ def _displayed_reading(formatted: str) -> Tuple[str, bool]:
     return parser.result(), parser.rearranged
 
 
+#: The event type carrying a plaintext message. The gate for both tiers: what
+#: is inside it is read field by field, and nothing outside it is a message.
+MESSAGE_EVENT_TYPE = "m.room.message"
+#: The event type carrying a megolm envelope. Synapse holds the ciphertext and
+#: no plaintext, so neither tier can moderate one - see `_encryption_state`.
+ENCRYPTED_EVENT_TYPE = "m.room.encrypted"
+
+
+def _encryption_state(event: EventBase) -> Optional[str]:
+    """Which message-bearing event this is, in the counter's vocabulary, or
+    None when it is not a message at all.
+
+    **The limit this makes visible is structural and is not closed here.** In
+    an end-to-end encrypted room the homeserver receives an `m.room.encrypted`
+    event whose payload is a megolm envelope; it holds no key and no
+    plaintext, so there is nothing for a rule to match or for a classifier to
+    read. Neither tier can moderate one, and this module does not try: handing
+    a base64 envelope to `/choreo/moderate` would spend a request on
+    ciphertext and publish an encrypted room's traffic pattern to a third
+    party, and refusing the event instead would punish a sender who did
+    nothing wrong.
+
+    What WAS wrong is that the limit was silent. An operator who switched
+    moderation on had no series that distinguished "this room is clean" from
+    "we never read a word of it", and no way to put a number on the share of
+    traffic in the second state. The counter carries both halves of a ratio -
+    `encrypted / (encrypted + plaintext)` - because a numerator with no
+    denominator answers no question anybody asks.
+
+    A state event is neither. `check_event_for_spam` is offered every event on
+    the homeserver, and counting topic changes and membership as readable
+    traffic would swamp the denominator and leave the ratio meaning nothing.
+    """
+    event_type = getattr(event, "type", None)
+    if event_type == MESSAGE_EVENT_TYPE:
+        return "plaintext"
+    if event_type == ENCRYPTED_EVENT_TYPE:
+        return "encrypted"
+    return None
+
+
 class _Extracted(NamedTuple):
     """What extraction found, and whether it found all of it.
 
@@ -646,7 +687,7 @@ class ChatModeration:
         result says so. The caller counts the shortfall and Tier 2 still gets
         the message - an unknown is escalated, never dropped quietly.
         """
-        if event.type != "m.room.message":
+        if event.type != MESSAGE_EVENT_TYPE:
             return _Extracted(None, False)
         # `Mapping`, not `dict`: event content is not guaranteed to be a plain
         # dict. Synapse builds events through a Rust type whose `content` is a
@@ -708,6 +749,13 @@ class ChatModeration:
         try:
             if self._is_exempt_sender(event.sender):
                 return NOT_SPAM
+            # AFTER the exempt filter, deliberately: an exempt bot is
+            # unmoderated for a reason that has nothing to do with encryption,
+            # and folding the two together would report its traffic as a
+            # coverage gap E2EE caused.
+            encryption = _encryption_state(event)
+            if encryption is not None:
+                metrics.record_message_event("tier1", encryption)
             extracted = self._extract_text(event)
             if extracted.incomplete:
                 # Counted before the verdict, and whatever the verdict turns
@@ -779,6 +827,15 @@ class ChatModeration:
                 return
             if self._is_exempt_sender(event.sender):
                 return
+            # Counted here for the same reason and with the same placement as
+            # in Tier 1: after the exempt filter, before any decision, and on
+            # both halves of the ratio. An encrypted event goes no further -
+            # `_extract_text` gates on the event TYPE, so it was already never
+            # enqueued, and what changes is that the gap is now on a gauge
+            # rather than inferred from a queue that stayed empty.
+            encryption = _encryption_state(event)
+            if encryption is not None:
+                metrics.record_message_event("tier2", encryption)
             extracted = self._extract_text(event)
             if extracted.incomplete:
                 metrics.record_extraction_incomplete("tier2")

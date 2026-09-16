@@ -52,6 +52,32 @@ def _get_or_create(
 # operator cannot tell from "the thing never happens", and which is worse than
 # no series at all. They belong to the change that instruments the pre-filter.
 
+# The two tiers, named once. Every per-tier label set is this set: two
+# spellings of "which tier" drift apart the first time one of them gains a
+# value, and a label the validator does not know is a series nobody alerts on.
+TIERS = frozenset({"tier1", "tier2"})
+
+# --- What each tier could read -------------------------------------------
+
+MESSAGE_EVENTS = _get_or_create(
+    Counter,
+    "pangea_moderation_message_events_total",
+    "Message-bearing events each tier was offered, by whether the tier could "
+    "read them. `encrypted` is the structural limit: in an E2EE room Synapse "
+    "holds a megolm envelope and no plaintext, so neither tier can moderate "
+    "one. The point of the split is the RATIO - "
+    "encrypted/(encrypted+plaintext) is the share of traffic moderation is "
+    "blind to, and without a denominator that share was not computable from "
+    "any series at all. Counted after the exempt-sender filter, so an exempt "
+    "bot is not reported as a gap encryption caused.",
+    ["tier", "encryption"],
+)
+
+# Whether the tier could read the event, and the whole of the vocabulary. Not
+# a boolean label and not a bare `encrypted_total`: the question an operator
+# asks is a fraction, and a numerator with no denominator cannot answer one.
+ENCRYPTION_STATES = frozenset({"plaintext", "encrypted"})
+
 # --- Extraction ----------------------------------------------------------
 
 EXTRACTION_INCOMPLETE = _get_or_create(
@@ -64,7 +90,7 @@ EXTRACTION_INCOMPLETE = _get_or_create(
 
 # Both tiers, because the same message is read twice and either read can fail
 # on its own - and an operator needs to know which tier is blind.
-EXTRACTION_TIERS = frozenset({"tier1", "tier2"})
+EXTRACTION_TIERS = TIERS
 
 TIER1_FAILED = _get_or_create(
     Counter,
@@ -349,6 +375,21 @@ def record_drop(cause: str, count: int = 1) -> None:
     if cause not in DROP_CAUSES:
         raise ValueError(f"unknown moderation drop cause {cause!r}")
     TIER2_DROPPED.labels(cause=cause).inc(count)
+
+
+def record_message_event(tier: str, encryption: str) -> None:
+    """Count one message-bearing event a tier was offered.
+
+    Both labels are validated against closed sets, for the reason every label
+    here is: this pair exists to let an operator SEE the share of traffic
+    moderation cannot read, and a value filed under a label nobody knows about
+    is exactly the invisibility the counter was added to end.
+    """
+    if tier not in TIERS:
+        raise ValueError(f"unknown moderation tier {tier!r}")
+    if encryption not in ENCRYPTION_STATES:
+        raise ValueError(f"unknown moderation encryption state {encryption!r}")
+    MESSAGE_EVENTS.labels(tier=tier, encryption=encryption).inc()
 
 
 def record_extraction_incomplete(tier: str) -> None:
