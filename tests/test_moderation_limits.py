@@ -17,13 +17,20 @@ see about it.
 
 import unittest
 from typing import Any, Dict, Optional, Tuple, cast
+from unittest.mock import AsyncMock, create_autospec, patch
 
 from synapse.api.errors import Codes, SynapseError
 from synapse.events import EventBase
 from synapse.module_api import NOT_SPAM, ModuleApi
 
 from synapse_pangea_chat.config import PangeaChatConfig
-from synapse_pangea_chat.moderation import ChatModeration, refusal
+from synapse_pangea_chat.moderation import ChatModeration, refusal, severity
+from synapse_pangea_chat.moderation.categories import (
+    PROVIDER_CATEGORIES,
+    UNKNOWN_CATEGORY,
+)
+from synapse_pangea_chat.moderation.choreo_client import moderate_text
+from synapse_pangea_chat.moderation.dispatch import ModerationJob
 from synapse_pangea_chat.moderation.tier1_prefilter import (
     REASON_CONTACT_DETAILS,
     REASON_PROFANITY,
@@ -483,3 +490,483 @@ class TestABlockedLearnerIsToldWhy(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+MODERATE_TEXT = "synapse_pangea_chat.moderation.choreo_client.moderate_text"
+CATEGORY_SCORE = "pangea_moderation_tier2_category_score"
+SEVERITY_BASIS = "pangea_moderation_tier2_severity_basis_total"
+REDACTION_SKIPPED = "pangea_moderation_tier2_redaction_skipped_total"
+REDACTIONS = "pangea_moderation_tier2_redactions_total"
+SUPPRESSED = "pangea_moderation_tier2_suppressed_total"
+
+
+def _job(text: str = "x", **overrides: Any) -> ModerationJob:
+    fields: Dict[str, Any] = {
+        "event_id": "$evt1",
+        "room_id": "!room:example.org",
+        "sender": "@learner:example.org",
+        "text": text,
+        "enqueued_at": 0.0,
+    }
+    fields.update(overrides)
+    return ModerationJob(**fields)
+
+
+def _verdict(**overrides: Any) -> AsyncMock:
+    """An autospec of the real `moderate_text`, not a bare `AsyncMock`.
+
+    A bare mock accepts `access_t0ken=` as happily as `access_token=`, so a
+    test written against one cannot see a caller passing the wrong keyword.
+    """
+    result: Dict[str, Any] = {
+        "flagged": True,
+        "categories": ["harassment"],
+        "evaluated": True,
+    }
+    result.update(overrides)
+    mock = create_autospec(moderate_text)
+    mock.return_value = result
+    return cast(AsyncMock, mock)
+
+
+class TestSeverityGatesTheRedaction(unittest.IsolatedAsyncioTestCase):
+    """L1. Tier 2 redacted on a bare `flagged`, so a learner typing `shit` and
+    a targeted threat produced byte-identical verdicts and byte-identical
+    outcomes.
+
+    The evidence that separates them is `category_scores`, which the choreo
+    handler now reports. These tests hold both halves of the compatibility
+    contract at once: with the field, a per-category threshold decides; without
+    it - which is staging's state today - the module behaves exactly as it did
+    before any of this existed.
+    """
+
+    def setUp(self) -> None:
+        self.reader = MetricReader()
+        self.homeserver = HomeServerDouble()
+        self.api = module_api_double(self.homeserver)
+
+    def _module(self, **overrides: Any) -> ChatModeration:
+        return _tier2_module(self, _tier2_config(**overrides), api=self.api)
+
+    def _sent(self) -> Any:
+        return cast(AsyncMock, self.api.create_and_send_event_into_room)
+
+    async def _run(self, module: ChatModeration, verdict: AsyncMock) -> None:
+        with patch(MODERATE_TEXT, verdict):
+            await module._check_and_redact(_job("some message"))
+
+    # --- With scores present ---------------------------------------------
+
+    async def test_mild_swearing_is_left_standing(self) -> None:
+        """The reported defect, end to end. `harassment` at 0.31 is what the
+        provider returned for a learner typing `shit`; the default threshold
+        for that category is 0.70, so the message stays."""
+        self.reader.snapshot(REDACTION_SKIPPED, cause="below_threshold")
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(categories=["harassment"], category_scores={"harassment": 0.31}),
+        )
+        self._sent().assert_not_awaited()
+        self.assertEqual(
+            self.reader.delta(REDACTION_SKIPPED, cause="below_threshold"), 1.0
+        )
+
+    async def test_targeted_abuse_is_still_redacted(self) -> None:
+        """The same `flagged`, the same single category, three orders of
+        magnitude apart. This is the distinction that did not exist."""
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(categories=["harassment"], category_scores={"harassment": 0.993}),
+        )
+        self._sent().assert_awaited_once()
+
+    async def test_a_score_exactly_at_the_threshold_redacts(self) -> None:
+        """The comparison is `>=`, which is what makes a threshold of 0.0 mean
+        "every flag of this category redacts"."""
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(categories=["harassment"], category_scores={"harassment": 0.70}),
+        )
+        self._sent().assert_awaited_once()
+
+    async def test_one_severe_category_redacts_a_verdict_of_several(self) -> None:
+        """A message that is mildly rude AND a credible threat is a threat."""
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["harassment", "harassment/threatening"],
+                category_scores={"harassment": 0.2, "harassment/threatening": 0.45},
+            ),
+        )
+        self._sent().assert_awaited_once()
+
+    async def test_every_category_below_its_own_threshold_leaves_it_standing(
+        self,
+    ) -> None:
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["harassment", "hate"],
+                category_scores={"harassment": 0.2, "hate": 0.1},
+            ),
+        )
+        self._sent().assert_not_awaited()
+
+    async def test_the_child_safety_category_redacts_at_any_score(self) -> None:
+        """`sexual/minors` is set to 0.0 and is not a trade-off this platform
+        makes. A score low enough to clear every other category's bar still
+        redacts here."""
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["sexual/minors"], category_scores={"sexual/minors": 0.02}
+            ),
+        )
+        self._sent().assert_awaited_once()
+
+    async def test_a_threatening_subcategory_is_stricter_than_its_family(
+        self,
+    ) -> None:
+        """The same score, two categories, two outcomes - which is the whole
+        argument for per-category thresholds over one constant."""
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["harassment/threatening"],
+                category_scores={"harassment/threatening": 0.35},
+            ),
+        )
+        self._sent().assert_awaited_once()
+        self._sent().reset_mock()
+        await self._run(
+            module,
+            _verdict(
+                categories=["harassment"],
+                category_scores={"harassment": 0.35},
+                evaluated=True,
+            ),
+        )
+        self._sent().assert_not_awaited()
+
+    async def test_an_unrecognised_category_redacts_whatever_it_scored(self) -> None:
+        """A name outside the documented vocabulary is not evidence of
+        mildness, and a service must not get a softer disposition by inventing
+        one. This is also the injection case: the value never reaches a label
+        or a log line, only the `other` bucket."""
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["@alice:example.org"],
+                category_scores={"@alice:example.org": 0.0},
+            ),
+        )
+        self._sent().assert_awaited_once()
+
+    # --- Without scores: the un-upgraded choreo ---------------------------
+
+    async def test_a_verdict_with_no_scores_redacts_exactly_as_before(self) -> None:
+        """Staging's state today. The field is absent, there is no evidence
+        the message is mild, and the decision is the one the module always
+        took."""
+        self.reader.snapshot(SEVERITY_BASIS, basis="no_scores")
+        module = self._module()
+        await self._run(module, _verdict(categories=["harassment"]))
+        self._sent().assert_awaited_once()
+        self.assertEqual(self.reader.delta(SEVERITY_BASIS, basis="no_scores"), 1.0)
+
+    async def test_an_empty_score_map_redacts(self) -> None:
+        module = self._module()
+        await self._run(module, _verdict(categories=["harassment"], category_scores={}))
+        self._sent().assert_awaited_once()
+
+    async def test_a_null_score_map_redacts(self) -> None:
+        module = self._module()
+        await self._run(
+            module, _verdict(categories=["harassment"], category_scores=None)
+        )
+        self._sent().assert_awaited_once()
+
+    async def test_a_score_for_a_different_category_does_not_soften_this_one(
+        self,
+    ) -> None:
+        """No family fallback. `harassment/threatening` is not `harassment`,
+        and reading one's score for the other is the exact conflation the
+        scores exist to end - so the tripped category is unscored and redacts.
+        """
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["harassment/threatening"],
+                category_scores={"harassment": 0.01},
+            ),
+        )
+        self._sent().assert_awaited_once()
+
+    async def test_one_unscored_category_among_scored_ones_still_redacts(
+        self,
+    ) -> None:
+        """Absence of evidence is not evidence of mildness, even beside real
+        evidence of it."""
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["harassment", "hate"],
+                category_scores={"harassment": 0.01},
+            ),
+        )
+        self._sent().assert_awaited_once()
+
+    async def test_an_unusable_score_value_redacts(self) -> None:
+        """Every shape a score can arrive in that we cannot read as a number
+        in [0, 1]. Each of them is an unknown, and an unknown redacts - a
+        service cannot talk this module out of a redaction with a malformed
+        field."""
+        values = ("0.1", None, True, float("nan"), float("inf"), -0.5, 1.5, [0.1])
+        for index, value in enumerate(values):
+            with self.subTest(score=repr(value)):
+                self._sent().reset_mock()
+                module = self._module()
+                # A distinct event per case: the redaction claim is per event
+                # id and idempotent, so reusing one would let the first case's
+                # claim, not the score, decide every case after it.
+                with patch(
+                    MODERATE_TEXT,
+                    _verdict(
+                        categories=["harassment"],
+                        category_scores={"harassment": value},
+                    ),
+                ):
+                    await module._check_and_redact(
+                        _job("some message", event_id=f"$unusable{index}")
+                    )
+                self._sent().assert_awaited_once()
+
+    # --- Self-harm is untouched by any of it ------------------------------
+
+    async def test_a_self_harm_disclosure_is_preserved_at_any_score(self) -> None:
+        """The guarantee, re-asserted against the new branch. The preserve
+        runs BEFORE severity is consulted, so a score that would clear every
+        threshold in the table cannot reach the redaction path."""
+        self.reader.snapshot(SUPPRESSED, category="self_harm")
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["self-harm/intent"],
+                category_scores={"self-harm/intent": 1.0},
+            ),
+        )
+        self._sent().assert_not_awaited()
+        self.assertEqual(self.reader.delta(SUPPRESSED, category="self_harm"), 1.0)
+
+    async def test_a_severe_second_category_cannot_redact_a_disclosure(self) -> None:
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["harassment", "self-harm/intent"],
+                category_scores={"harassment": 1.0, "self-harm/intent": 0.01},
+            ),
+        )
+        self._sent().assert_not_awaited()
+
+    async def test_severity_is_never_consulted_for_a_preserved_verdict(self) -> None:
+        """Stronger than the outcome: no score is even WEIGHED, so there is no
+        threshold anybody could set that would participate in this decision."""
+        self.reader.snapshot(SEVERITY_BASIS, basis="above_threshold")
+        self.reader.snapshot(SEVERITY_BASIS, basis="below_threshold")
+        self.reader.snapshot(SEVERITY_BASIS, basis="no_scores")
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(categories=["self-harm"], category_scores={"self-harm": 0.999}),
+        )
+        for basis in ("above_threshold", "below_threshold", "no_scores"):
+            self.assertEqual(self.reader.delta(SEVERITY_BASIS, basis=basis), 0.0)
+
+    def test_a_threshold_cannot_be_configured_for_a_self_harm_category(self) -> None:
+        """Refused rather than accepted-and-inert: a setting that appears to
+        control the disposition of a disclosure would be a lie about what the
+        module does."""
+        for name in severity.PRESERVED_WIRE_CATEGORIES:
+            with self.subTest(category=name):
+                with self.assertRaises(ValueError) as caught:
+                    severity.validate_thresholds({name: 0.9})
+                self.assertIn("never redacted", str(caught.exception))
+
+    def test_every_self_harm_subcategory_is_covered(self) -> None:
+        """Derived from the vocabulary, so a sub-category the provider adds
+        under `self-harm/` is refused the day the vocabulary learns it."""
+        self.assertEqual(
+            set(severity.PRESERVED_WIRE_CATEGORIES),
+            {"self-harm", "self-harm/instructions", "self-harm/intent"},
+        )
+
+    # --- Observability ----------------------------------------------------
+
+    async def test_the_score_that_drove_a_redaction_is_recorded(self) -> None:
+        """An operator tunes the thresholds from this, so it has to carry the
+        number and not just the outcome."""
+        before = self.reader.value(
+            CATEGORY_SCORE + "_sum", category="harassment", outcome="at_or_above"
+        )
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(categories=["harassment"], category_scores={"harassment": 0.93}),
+        )
+        after = self.reader.value(
+            CATEGORY_SCORE + "_sum", category="harassment", outcome="at_or_above"
+        )
+        self.assertAlmostEqual(after - before, 0.93, places=6)
+
+    async def test_the_score_that_spared_a_message_is_recorded_too(self) -> None:
+        """Half a distribution cannot be tuned from. The messages left
+        standing are precisely the ones an operator lowering a threshold needs
+        to look at."""
+        before = self.reader.value(
+            CATEGORY_SCORE + "_sum", category="harassment", outcome="below"
+        )
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(categories=["harassment"], category_scores={"harassment": 0.31}),
+        )
+        after = self.reader.value(
+            CATEGORY_SCORE + "_sum", category="harassment", outcome="below"
+        )
+        self.assertAlmostEqual(after - before, 0.31, places=6)
+
+    async def test_every_weighed_category_is_observed_not_just_the_decider(
+        self,
+    ) -> None:
+        counts = {
+            category: self.reader.value(
+                CATEGORY_SCORE + "_count", category=category, outcome="at_or_above"
+            )
+            for category in ("harassment", "hate")
+        }
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["harassment", "hate"],
+                category_scores={"harassment": 0.99, "hate": 0.2},
+            ),
+        )
+        for category in ("harassment", "hate"):
+            after = self.reader.value(
+                CATEGORY_SCORE + "_count", category=category, outcome="at_or_above"
+            )
+            self.assertEqual(after - counts[category], 1.0, category)
+
+    async def test_the_basis_says_whether_thresholding_is_in_effect(self) -> None:
+        """The rollout signal: a deployment sitting at 100% `no_scores` has
+        thresholds configured and none of them doing anything."""
+        for scores, expected in (
+            ({"harassment": 0.99}, "above_threshold"),
+            ({"harassment": 0.01}, "below_threshold"),
+            (None, "no_scores"),
+        ):
+            with self.subTest(basis=expected):
+                self.reader.snapshot(SEVERITY_BASIS, basis=expected)
+                module = self._module()
+                await self._run(
+                    module,
+                    _verdict(categories=["harassment"], category_scores=scores),
+                )
+                self.assertEqual(self.reader.delta(SEVERITY_BASIS, basis=expected), 1.0)
+
+    async def test_a_category_label_never_carries_a_value_the_service_chose(
+        self,
+    ) -> None:
+        """Cardinality, and the injection route with it. The label is the
+        normalised name; an invented category lands in `other` or nowhere."""
+        module = self._module()
+        await self._run(
+            module,
+            _verdict(
+                categories=["!room:example.org"],
+                category_scores={"!room:example.org": 0.5},
+            ),
+        )
+        self.assertEqual(
+            self.reader.value(
+                CATEGORY_SCORE + "_count",
+                category="!room:example.org",
+                outcome="at_or_above",
+            ),
+            0.0,
+        )
+
+    # --- Config -----------------------------------------------------------
+
+    async def test_an_operator_can_move_a_threshold(self) -> None:
+        module = self._module(moderation_tier2_category_thresholds={"harassment": 0.25})
+        await self._run(
+            module,
+            _verdict(categories=["harassment"], category_scores={"harassment": 0.31}),
+        )
+        self._sent().assert_awaited_once()
+
+    def test_a_partial_override_keeps_every_other_default(self) -> None:
+        thresholds = severity.validate_thresholds({"harassment": 0.25})
+        self.assertEqual(thresholds["harassment"], 0.25)
+        self.assertEqual(
+            {key: value for key, value in thresholds.items() if key != "harassment"},
+            {
+                key: value
+                for key, value in severity.DEFAULT_CATEGORY_THRESHOLDS.items()
+                if key != "harassment"
+            },
+        )
+
+    def test_a_misspelled_category_is_refused_at_parse_time(self) -> None:
+        """Silent otherwise: the default underneath keeps applying and nothing
+        says the operator's change did nothing."""
+        with self.assertRaises(ValueError) as caught:
+            severity.validate_thresholds({"harrassment": 0.5})
+        self.assertIn("not a category this provider reports", str(caught.exception))
+
+    def test_an_out_of_range_or_non_numeric_threshold_is_refused(self) -> None:
+        for value in (-0.1, 1.1, "0.5", True, None, float("nan")):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    severity.validate_thresholds({"harassment": value})
+
+    def test_the_default_table_covers_every_category_that_can_be_redacted(
+        self,
+    ) -> None:
+        """Derived from the vocabulary, so a category the provider adds cannot
+        arrive with no threshold and fall through to a lookup that is not
+        there."""
+        redactable = {
+            name
+            for name in PROVIDER_CATEGORIES
+            if name not in severity.PRESERVED_WIRE_CATEGORIES
+        }
+        self.assertEqual(
+            redactable | {UNKNOWN_CATEGORY},
+            set(severity.DEFAULT_CATEGORY_THRESHOLDS),
+        )
+
+    def test_child_safety_is_the_strictest_setting_in_the_table(self) -> None:
+        """A property of the defaults rather than a restatement of one value:
+        an edit that loosened `sexual/minors` past any other category fails
+        here."""
+        minors = severity.DEFAULT_CATEGORY_THRESHOLDS["sexual/minors"]
+        for name, threshold in severity.DEFAULT_CATEGORY_THRESHOLDS.items():
+            if name == UNKNOWN_CATEGORY:
+                continue
+            self.assertLessEqual(minors, threshold, name)

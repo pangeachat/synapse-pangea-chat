@@ -151,6 +151,12 @@ class PangeaChatConfig:
     # rule and never the match, and for what an operator's override is
     # validated against at parse time.
     moderation_tier1_refusal_messages: Optional[Mapping[str, str]] = None
+    # How confident the provider has to be, per category, before Tier 2
+    # redacts. `None` means the built-in table, which lives in
+    # moderation/severity.py for the same import reason as the wording above.
+    # A self-harm category cannot be given one: that disposition is preserve
+    # at any score, and the key is refused rather than accepted and inert.
+    moderation_tier2_category_thresholds: Optional[Mapping[str, float]] = None
     # --- Tier 2 transport and concurrency ---
     # `on_new_event` is awaited inline by the notifier for every event on the
     # homeserver, so Tier 2 is a bounded queue drained by a fixed pool rather

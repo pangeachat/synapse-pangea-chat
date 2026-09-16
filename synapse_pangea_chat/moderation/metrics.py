@@ -23,6 +23,12 @@ from typing import Any, Dict, Iterable, Optional
 
 from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 
+from synapse_pangea_chat.moderation.severity import (
+    BASIS_ABOVE,
+    BASIS_BELOW,
+    BASIS_NO_SCORES,
+)
+
 
 def _get_or_create(
     collector_class: Any,
@@ -285,6 +291,68 @@ TIER2_QUEUE_WAIT = _get_or_create(
     buckets=(0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, float("inf")),
 )
 
+# --- Severity ------------------------------------------------------------
+
+TIER2_CATEGORY_SCORE = _get_or_create(
+    Histogram,
+    "pangea_moderation_tier2_category_score",
+    "The provider's confidence in each flagged category that Tier 2 weighed, "
+    "and which way the threshold went. This is the series an operator tunes "
+    "`moderation.tier2_category_thresholds` from: the defaults are a starting "
+    "position rather than a measurement, and the two distributions - what was "
+    "redacted and what was left standing - are what turn them into numbers "
+    "taken from this platform's own traffic. Every weighed category is "
+    "observed, not just the one that decided, because the question an "
+    "operator asks is about the distribution of evidence and not about which "
+    "entry happened to win. Absent entirely when the endpoint sends no "
+    '`category_scores`, which is what `severity_basis{basis="no_scores"}` '
+    "says out loud.",
+    ["category", "outcome"],
+    buckets=(
+        0.01,
+        0.05,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9,
+        0.95,
+        0.99,
+        1.0,
+    ),
+)
+
+# Which way the threshold went for this score. Two values, and they describe
+# the SEVERITY verdict rather than the message's fate: a category at or above
+# its threshold may still not be redacted, because the claim, the durable
+# preserve or a re-read can each stop the send afterwards. Labelling it with
+# the final outcome would make the histogram unusable for the one job it has,
+# which is tuning the threshold.
+SCORE_OUTCOMES = frozenset({"at_or_above", "below"})
+
+# Imported from the policy rather than restated here. A label set this file
+# spelled out on its own would drift from the decision it describes the first
+# time a basis was added, and a basis the validator does not know is a verdict
+# nobody can see - which is the whole failure this counter exists to end.
+SEVERITY_BASES = frozenset({BASIS_ABOVE, BASIS_BELOW, BASIS_NO_SCORES})
+
+TIER2_SEVERITY_BASIS = _get_or_create(
+    Counter,
+    "pangea_moderation_tier2_severity_basis_total",
+    "What decided each flagged verdict: the score cleared its category's "
+    "threshold, it fell below, or there was no usable score and the module "
+    "fell back to redacting the way it did before thresholds existed. The "
+    "third value is the one to watch during rollout - it is how an operator "
+    "tells a choreo that reports `category_scores` from one that does not, "
+    "and a deployment sitting at 100% `no_scores` has thresholds configured "
+    "and none of them in effect.",
+    ["basis"],
+)
+
 BREAKER_STATE_VALUES: Dict[str, int] = {
     "closed": 0,
     "half_open": 1,
@@ -356,6 +424,11 @@ REDACTION_SKIP_CAUSES = frozenset(
         # so there is no decision to take - not a redaction and not a
         # preserve.
         "unusable_verdict",
+        # Every flagged category scored strictly below its configured
+        # threshold, so the message stands. NOT a preserve - nothing durable
+        # is written and a later, more severe verdict on the same event
+        # decides on its own merits.
+        "below_threshold",
         # The disposition table could not be read, so we cannot establish that
         # this event was NOT preserved. The one place this module refuses to
         # act on an unknown rather than carrying on - see
@@ -448,6 +521,28 @@ def record_redaction_skip(cause: str) -> None:
     if cause not in REDACTION_SKIP_CAUSES:
         raise ValueError(f"unknown moderation redaction skip cause {cause!r}")
     TIER2_REDACTION_SKIPPED.labels(cause=cause).inc()
+
+
+def record_category_score(category: str, outcome: str, score: float) -> None:
+    """Observe one flagged category's score and which way its threshold went.
+
+    The category label is the NORMALISED name, never the wire name the service
+    sent: the normalisation is what bounds this label to seven values, and a
+    provider that invents a category must not be able to create a series by
+    doing so. `outcome` is validated for the reason every closed label set
+    here is - a value nobody knows about is a series nobody alerts on, and
+    this one exists to be read.
+    """
+    if outcome not in SCORE_OUTCOMES:
+        raise ValueError(f"unknown moderation score outcome {outcome!r}")
+    TIER2_CATEGORY_SCORE.labels(category=category, outcome=outcome).observe(score)
+
+
+def record_severity_basis(basis: str) -> None:
+    """Count what decided one flagged verdict."""
+    if basis not in SEVERITY_BASES:
+        raise ValueError(f"unknown moderation severity basis {basis!r}")
+    TIER2_SEVERITY_BASIS.labels(basis=basis).inc()
 
 
 def set_breaker_state(state: str) -> None:

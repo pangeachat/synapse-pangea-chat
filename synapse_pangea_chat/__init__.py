@@ -28,6 +28,7 @@ from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.moderation import ChatModeration, tier1_prefilter
 from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.moderation import refusal as moderation_refusal
+from synapse_pangea_chat.moderation import severity as moderation_severity
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
     PreviewWithCode,
@@ -74,6 +75,7 @@ _MODERATION_CONFIG_KEYS = frozenset(
         moderation_exempt.CONFIG_KEY,
         moderation_exempt.LEGACY_CONFIG_KEY,
         moderation_refusal.CONFIG_KEY,
+        moderation_severity.CONFIG_KEY,
     }
 )
 
@@ -957,6 +959,15 @@ class PangeaChat:
             moderation.get(moderation_refusal.CONFIG_KEY, None)
         )
 
+        # How severe a flagged category has to be before Tier 2 deletes the
+        # message. Validated here for the same reason as the wording above,
+        # and with one extra refusal: a self-harm category cannot be given a
+        # threshold, because that disposition is preserve at any score and a
+        # setting that appears to control it would be a lie.
+        moderation_tier2_category_thresholds = moderation_severity.validate_thresholds(
+            moderation.get(moderation_severity.CONFIG_KEY, None)
+        )
+
         # Bounds, not just types. Every one of these sizes a buffer, a pool or
         # a deadline, and a zero or a negative would not fail loudly - it
         # would produce a queue that accepts nothing, a pool with no workers,
@@ -1057,6 +1068,7 @@ class PangeaChat:
             moderation_exempt_user_id_globs=moderation_exempt_user_id_globs,
             moderation_redaction_reason_prefix=moderation_redaction_reason_prefix,
             moderation_tier1_refusal_messages=moderation_tier1_refusal_messages,
+            moderation_tier2_category_thresholds=moderation_tier2_category_thresholds,
             moderation_tier2_workers=moderation_tier2_workers,
             moderation_tier2_queue_size=moderation_tier2_queue_size,
             moderation_tier2_request_timeout_seconds=(

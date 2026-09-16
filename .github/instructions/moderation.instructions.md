@@ -112,6 +112,54 @@ Fires after an event persists, from a background task so event persistence never
 
 Category names are checked against the provider's documented vocabulary before they are used. A category is a free-form string from a service we do not run, and it ends up in a log line and in the redaction reason that lands in the room, so anything outside the documented list — including anything that is not a string — becomes the constant `other` and the value the service sent is discarded. A response of `{"flagged": true, "categories": ["@alice:example.org"]}` otherwise published that Matrix ID to the room and to the logs by a route no review of our own format strings would find. The client validates the response's shape at the same boundary: `flagged` must be a bool and `categories` a list of strings, or there is no verdict.
 
+**A flag is not a severity, and Tier 2 no longer treats it as one.** The
+endpoint answered `flagged` plus the tripped category names, and those two
+values were the whole of the evidence. Observed live: a learner typed `shit`,
+the handler answered `flagged: true, categories: ["harassment"]` — byte-for-byte
+what targeted abuse returns — and the module redacted it. In a language
+classroom mild swearing is ordinary conversation and deleting it is the wrong
+outcome, but nothing in the verdict could have produced a different one. The
+choreo handler now also reports `category_scores`, the provider's confidence
+for every category it scored under the same wire names, and
+`moderation/severity.py` applies a threshold to it **per category**.
+
+Per category and never one global constant, for the reason Gemini's safety
+settings are built that way: the two errors do not cost the same thing in
+every category. `sexual/minors` is set to `0.0` — any flag redacts, at any
+confidence, on a platform with minors on it. The threatening and violent
+sub-categories sit at `0.20`, the ordinary abuse taxonomy at `0.50`, and plain
+`harassment` at `0.70`, which is the classroom band: the observed mild case
+scored about 0.3 and targeted abuse scores above 0.99. A category outside the
+documented vocabulary redacts on any flag — an invented name is not evidence
+of mildness. **The numbers are a starting position, not a measurement**, which
+is why they are config (`moderation.tier2_category_thresholds`, validated at
+parse time, partial overrides merged over the defaults) and why
+`pangea_moderation_tier2_category_score{category, outcome}` records every
+weighed score on both branches: an operator replaces them with numbers from
+this platform's traffic, and half a distribution cannot be tuned from.
+
+**The absent field is the ordinary case, and it must not fail open.** An
+un-upgraded choreo — staging today — sends no `category_scores` at all. The
+rule is stated in the form that makes both compatibility properties obvious:
+**redact unless every tripped category has a readable score strictly below its
+own threshold.** No scores, an empty or null map, a score under a different
+category's name, one unscored category beside scored ones, or a value that is
+not a number in `[0, 1]` — each is an unknown, and an unknown redacts, which
+is exactly what the module did before any of this existed. Severity can make
+the module more permissive on EVIDENCE and never on the absence of it, so a
+service cannot talk it out of a redaction with a malformed field. There is no
+family fallback: `harassment/threatening` is not `harassment`, and reading
+one's score for the other is the conflation the scores exist to end.
+`pangea_moderation_tier2_severity_basis_total{basis}` is the rollout signal —
+a deployment sitting at 100% `no_scores` has thresholds configured and none of
+them in effect.
+
+**Severity is asked AFTER the preserve branch**, so a self-harm disclosure
+never reaches a threshold and no configurable value takes part in that
+decision. A threshold key for a self-harm category is refused at parse time
+rather than accepted and inert: a setting that appears to control the
+disposition of a disclosure would be a lie about what the module does.
+
 **Self-harm is preserved, not redacted, and the decision is durable.** A learner disclosing that they intend to harm themselves is asking for help, and the message is the only record that they did. Every category in the verdict is examined rather than the one summarised for the log line, so a verdict carrying both harassment and self-harm preserves.
 
 "Never redacted" is a guarantee only if it survives everything a process can lose, and on in-memory state it did not: preserving recorded no decision anywhere, so the same event delivered twice — `self-harm/intent` first, `harassment` second — was redacted by the second verdict, and a restart or a second instance lost the protection for the same reason. The decision is therefore a row in `pangea_moderation_disposition` (event id, room id, disposition, category, timestamp, claim id — never the sender's Matrix ID and never a word of the message), created on first use like `pangea_delete_user_schedule`.

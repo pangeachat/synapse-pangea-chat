@@ -48,8 +48,13 @@ from synapse.logging.context import run_in_background
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import NOT_SPAM, ModuleApi
 
-from synapse_pangea_chat.moderation import metrics
+from synapse_pangea_chat.moderation import metrics, severity
 from synapse_pangea_chat.moderation.breaker import CircuitBreaker
+from synapse_pangea_chat.moderation.categories import (
+    PROVIDER_CATEGORIES,
+    UNKNOWN_CATEGORY,
+    normalize_category,
+)
 from synapse_pangea_chat.moderation.choreo_client import (
     ChoreoChecker,
     assert_no_proxy_in_front_of,
@@ -535,6 +540,14 @@ class ChatModeration:
         self._refusal_messages = validate_refusal_messages(
             config.moderation_tier1_refusal_messages
         )
+        # Same reason again, and one more specific to this value: a threshold
+        # decides whether a message stays up, so a table that reached here
+        # unvalidated - a key naming no category, a value outside [0, 1] -
+        # must fail startup rather than govern a redaction from inside a
+        # `KeyError` nobody sees.
+        self._category_thresholds = severity.validate_thresholds(
+            config.moderation_tier2_category_thresholds
+        )
         # Keyed per instance so a Matrix ID cannot be recovered from a log
         # line by enumeration; see moderation.log_safety.
         self._log_digest_key = new_digest_key()
@@ -992,6 +1005,37 @@ class ChatModeration:
                 category,
             )
             return
+        # Severity, and only now. The preserve branch above has already
+        # returned, so a self-harm disclosure never reaches a threshold and no
+        # value an operator can configure takes part in that decision - which
+        # is asserted directly rather than left to this comment.
+        decision = severity.decide(
+            categories, result.get("category_scores"), self._category_thresholds
+        )
+        metrics.record_severity_basis(decision.basis)
+        outcome = "at_or_above" if decision.redact else "below"
+        for weighed in decision.weighed:
+            metrics.record_category_score(weighed.category, outcome, weighed.score)
+        if not decision.redact:
+            # Every flagged category scored below its own threshold. In a
+            # language classroom that is the ordinary case for mild swearing,
+            # which the provider reports under `harassment` with the same
+            # `flagged: true` a targeted threat gets.
+            #
+            # NOT a preserve: nothing durable is written, so a later and more
+            # severe verdict on the same event decides on its own merits.
+            metrics.record_redaction_skip("below_threshold")
+            driver = decision.driver
+            logger.info(
+                "tier2 flagged event %s in %s (category=%s, score=%.3f, "
+                "threshold=%.3f); below the redaction threshold, left standing",
+                job.event_id,
+                job.room_id,
+                driver.category if driver else category,
+                driver.score if driver else 0.0,
+                driver.threshold if driver else 0.0,
+            )
+            return
         # The ORDER matters. The re-read comes first and the claim second, so
         # there is no `await` between taking the claim and sending: a claim
         # taken and then abandoned at an await - a cancellation, a shutdown -
@@ -1006,11 +1050,24 @@ class ChatModeration:
         # closure and a captured Optional does not carry the narrowing with
         # it.
         claim_id: str = claim
+        # The score and the bar it cleared ride on the line that says a
+        # message was taken down, because "why was this deleted" is the
+        # question this record exists to answer and a category alone stopped
+        # being a whole answer the moment a threshold could have said
+        # otherwise. A float about content is not a word of it: no Matrix ID
+        # and no message text, same as every other line here. `no_scores`
+        # reports -1, which is not a score any provider can send and so cannot
+        # be mistaken for one.
+        driver = decision.driver
         logger.info(
-            "tier2 flagged event %s in %s (category=%s); redacting",
+            "tier2 flagged event %s in %s (category=%s, basis=%s, score=%.3f, "
+            "threshold=%.3f); redacting",
             job.event_id,
             job.room_id,
             category,
+            decision.basis,
+            driver.score if driver else -1.0,
+            driver.threshold if driver else -1.0,
         )
         reason = f"{self._config.moderation_redaction_reason_prefix}: {category}"
         # Self-redaction: sent as the offending sender so room power levels
@@ -1554,36 +1611,13 @@ _SURFACE_READERS = (
 )
 
 
-# The provider's documented category vocabulary, and the whole of it. A
-# category name is a string chosen by a service we do not run; it reaches a log
-# line and the redaction reason that lands in a room, so it is checked against
-# this list rather than trusted. A response of
-# `{"flagged": true, "categories": ["@alice:example.org"]}` otherwise logs that
-# Matrix ID verbatim and writes it into a room, and
-# `["<the message body>"]` does the same for a message body - by a route no
-# review of our own format strings would find, because our format string is
-# `category=%s` and looks harmless.
-_PROVIDER_CATEGORIES = frozenset(
-    {
-        "harassment",
-        "harassment/threatening",
-        "hate",
-        "hate/threatening",
-        "illicit",
-        "illicit/violent",
-        "self-harm",
-        "self-harm/instructions",
-        "self-harm/intent",
-        "sexual",
-        "sexual/minors",
-        "violence",
-        "violence/graphic",
-    }
-)
-# Where an unrecognised category lands: a bounded constant, never the string
-# the service sent. Per ADR-7b this is what makes an unknown category a
-# non-event for logs, for metric cardinality and for the redaction reason.
-UNKNOWN_CATEGORY = "other"
+# The provider's vocabulary, the unknown-category constant and the name
+# normalisation live in `moderation.categories`, because `moderation.severity`
+# needs all three and cannot import them from the package that imports it.
+# Re-exported under their original private names so nothing that already reads
+# them from here has to move.
+_PROVIDER_CATEGORIES = PROVIDER_CATEGORIES
+_normalize_category = normalize_category
 # Used when the service flags a message and names no category at all.
 UNNAMED_CATEGORY = "flagged"
 
@@ -1604,19 +1638,6 @@ _PRESERVE_RUN_ON = frozenset({"selfharm"})
 # the agreement matrix only means something if both sides saw the same text.
 # It also bounds the scan, which runs on the reactor thread inside the worker.
 MATCHER_MAX_CHARS = 10_000
-
-
-def _normalize_category(category: Any) -> str:
-    """Map a provider category name onto the orchestrator's flag vocabulary.
-
-    `self-harm/intent` -> `self_harm`, so both moderation code paths speak one
-    vocabulary. Anything outside the documented list - including anything that
-    is not a string - becomes `other`, and the value the service sent is
-    discarded here rather than carried one frame further.
-    """
-    if not isinstance(category, str) or category not in _PROVIDER_CATEGORIES:
-        return UNKNOWN_CATEGORY
-    return category.split("/", 1)[0].replace("-", "_")
 
 
 def _usable_categories(categories: Any) -> TypeGuard[List[str]]:
