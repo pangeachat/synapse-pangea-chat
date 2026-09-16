@@ -15,6 +15,9 @@ import psycopg2
 import requests
 from psycopg2.extensions import parse_dsn
 
+from synapse_pangea_chat.moderation import refusal as moderation_refusal
+from synapse_pangea_chat.moderation.tier1_prefilter import REASON_CONTACT_DETAILS
+
 from .base_e2e import BaseSynapseE2ETest
 from .mock_moderation_server import (
     FLAG_MARKER,
@@ -151,6 +154,28 @@ class TestModerationE2E(BaseSynapseE2ETest):
             )
             self.assertEqual(resp.status_code, 403)
             self.assertEqual(resp.json().get("errcode"), "M_FORBIDDEN")
+            # The statement of reasons, read off the wire a client reads it
+            # off. This is the only assertion that proves the whole chain -
+            # our tuple survives `spamchecker_callbacks`, reaches
+            # `handlers/message.py`, and our `error` REPLACES Synapse's fixed
+            # "rejected as probable spam" inside `cs_error`. A unit test can
+            # pin each link; only this one pins them joined together.
+            refusal_body = resp.json()
+            self.assertEqual(
+                refusal_body.get("error"),
+                moderation_refusal.DEFAULT_MESSAGES[REASON_CONTACT_DETAILS],
+            )
+            self.assertIs(refusal_body.get(moderation_refusal.AUTOMATED_FIELD), True)
+            self.assertEqual(
+                refusal_body.get(moderation_refusal.REASON_FIELD),
+                REASON_CONTACT_DETAILS,
+            )
+            # The rule family and nothing finer: no digit of the number the
+            # learner typed comes back to them.
+            self.assertFalse(
+                [ch for ch in str(refusal_body.get("error", "")) if ch.isdigit()],
+                f"a digit reached the learner's refusal: {refusal_body!r}",
+            )
 
             # --- Tier 1: clean message lands ---
             resp = self._send_message(room_id, token, "hola, ¿qué tal?", "txn-clean")

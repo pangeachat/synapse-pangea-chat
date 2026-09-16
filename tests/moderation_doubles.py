@@ -13,7 +13,45 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 from unittest.mock import create_autospec
 
+from synapse.api.errors import Codes
 from synapse.module_api import ModuleApi
+
+from synapse_pangea_chat.moderation.refusal import AUTOMATED_FIELD, REASON_FIELD
+from synapse_pangea_chat.moderation.tier1_prefilter import RULE_REASONS
+
+
+def tier1_refusal_code(result: Any) -> Codes:
+    """The error code from a Tier 1 refusal, with the wire contract asserted.
+
+    Tier 1 answers a block with `(Codes, JsonDict)` rather than a bare `Codes`,
+    because a bare one reaches the sender as Synapse's fixed "rejected as
+    probable spam" and tells a learner nothing - not what rule fired and not
+    that a machine decided it (DSA Art. 17; see `moderation/refusal.py`).
+
+    Every test that used to compare the return value against `Codes.FORBIDDEN`
+    reads it through here, so each of them now asserts MORE than it did: the
+    same code, plus a well-formed statement of reasons beside it. The four
+    isinstance tests are the ones `spamchecker_callbacks.py:385-395` applies
+    before it will pass a module's answer through - a value that fails any of
+    them is silently replaced with `Codes.FORBIDDEN, {}` and the reason never
+    leaves the process.
+    """
+    assert isinstance(result, tuple), f"Tier 1 did not return a tuple: {result!r}"
+    assert len(result) == 2, f"Tier 1 returned a {len(result)}-tuple: {result!r}"
+    code, body = result
+    assert isinstance(code, Codes), f"not a Codes: {code!r}"
+    assert isinstance(body, dict), f"not a dict: {body!r}"
+    message = body.get("error")
+    assert (
+        isinstance(message, str) and message.strip()
+    ), f"the refusal carries no reason a learner can read: {body!r}"
+    assert (
+        body.get(AUTOMATED_FIELD) is True
+    ), f"the refusal does not say a machine decided it: {body!r}"
+    assert (
+        body.get(REASON_FIELD) in RULE_REASONS
+    ), f"the refusal names no known rule: {body!r}"
+    return code
 
 
 def _fire_as_synapse_would(callback: Any, args: Any, kwargs: Any) -> None:

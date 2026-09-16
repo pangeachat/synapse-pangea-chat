@@ -51,6 +51,42 @@ Each check has a rule identifier, which is what appears in logs:
 | `contact_details` | phone numbers |
 | `profanity` | the wordlist |
 
+**A refused learner is told why, and told the rule rather than the match.** A
+bare `Codes.FORBIDDEN` reaches the sender as Synapse's fixed "This message has
+been rejected as probable spam", which every client renders as an unexplained
+red failure - no reason, no indication a machine decided it, nothing to do
+about it. DSA Art. 17 requires a statement of reasons on a restriction
+*including whether automated means were used*, and the Santa Clara Principles
+ask for the same. So Tier 1 returns the callback's other documented shape,
+`tuple[Codes, JsonDict]`, and the dict carries the sentence.
+
+The channel is narrower than it looks and is pinned by a test rather than
+assumed: `handlers/message.py` raises `SynapseError(403, "<a fixed string>",
+code, dict)` and that string is not ours to choose - but `SynapseError.
+error_dict` builds the body with `cs_error(msg, errcode, **additional_fields)`
+and `cs_error` writes its keyword arguments OVER the dict it has already
+built, so `error` in the additional fields replaces the generic sentence. A
+Synapse that reorders `cs_error` fails the suite instead of silently restoring
+"probable spam".
+
+What the sentence may say is bounded from the other side. A refusal addressed
+to the sender is also a query the sender controls: name the term that matched
+and every refusal becomes a free lookup against the wordlist, enumerable one
+message at a time. So the messages are **constant per rule** - two different
+blocked texts that trip the same rule produce byte-identical bodies, which is
+the property the tests assert rather than a substring scan, and it means the
+response carries zero bits about the message beyond which of the two rules
+fired. The text is never echoed. The wording is `moderation.tier1_refusal_
+messages`, keyed by rule identifier and validated at parse time against the
+rule table itself, so a misspelled key fails startup rather than leaving an
+operator's wording silently unused; a rule added to `_RULES` without a
+sentence fails a test rather than falling through to the unspecific one. The
+rule identifier also rides in `chat.pangea.moderation.rule` so a client can
+show the sentence in the learner's own language - which matters more here than
+most places, since the reader is by definition still learning the language it
+is written in - and `chat.pangea.moderation.automated` carries Art. 17's
+automated-means limb as a field rather than a phrase to parse out of prose.
+
 
 ### What Tier 1 deliberately does not block
 
@@ -168,6 +204,48 @@ The rule governs records this module creates. One channel sits outside it, and i
 
 - **Synapse's own records, on Synapse's own loggers.** `handle_new_client_event` logs "Denying new event … User &lt;mxid&gt; not in room …" before raising, and `run_as_background_process` calls `logger.exception` on whatever a background task lets escape. A filter on our loggers cannot touch either. The module's answer to the second is to let **no** exception escape a moderation frame — `_check_and_redact` catches `Exception`, not just `ModerationCheckError`, because the narrower catch made the rule depend on the HTTP client being perfect and a `UnicodeDecodeError` out of `json.loads` was the counterexample: it carried the response body into Synapse's logger. The first is written entirely outside our call stack and cannot be closed from here.
 - **An exception's `__context__` is a channel too, and `raise … from None` does not close it.** It clears `__cause__` and stops the traceback being *rendered* with the original; the original stays attached, and a `json.JSONDecodeError` carries the whole response body on `.doc`. And it cannot be fixed by arranging our own frames: the interpreter attaches the active exception at *raise* time, so clearing it in `__init__` is too early, and raising outside our own handler does not help when twisted resumes an awaiting coroutine from inside *its* handler. Shadowing the attribute with a property was worse — it conceals the chain from an ordinary read while `BaseException.__context__.__get__` still returns the original, which is a mask rather than a fix. Each module exception is therefore caught one frame out at the module's boundary, its real slots cleared, and re-raised bare, which does not re-attach.
+
+## Encrypted rooms: what neither tier can do, and how you can see it
+
+In an end-to-end encrypted room the homeserver receives an `m.room.encrypted`
+event carrying a megolm envelope. It holds no key and no plaintext, so there is
+nothing for a Tier 1 rule to match and nothing for Tier 2 to send. **Neither
+tier can moderate an E2EE room at all**, and that is a property of the
+protocol, not a gap in this module.
+
+The module does not work around it in either direction. It does not hand
+ciphertext to `/choreo/moderate` — that spends a request on a base64 envelope
+and publishes an encrypted room's traffic pattern to a third party — and it
+does not refuse encrypted events, because the sender did nothing wrong by
+encrypting and Tier 1 rejects before persist.
+
+What it does is make the gap countable.
+`pangea_moderation_message_events_total{tier, encryption}` counts every
+message-bearing event each tier was offered, split by whether it could read
+it, so `encrypted / (encrypted + plaintext)` is the share of traffic
+moderation is blind to. Both halves are counted because the question is a
+fraction: before this there was no pair of series from which one could be
+computed, and "the queue is empty" reads identically to "every room is clean".
+Counted after the exempt-sender filter, so a bot's traffic is not reported as
+a gap encryption caused, and only for `m.room.message` and `m.room.encrypted`,
+so state events do not swamp the denominator.
+
+**On this product the expected reading is zero, and that was verified rather
+than assumed.** E2EE is not off-by-default in the Flutter client, it is
+unreachable: `vod.init()` is commented out on the main isolate behind a
+`#Pangea` marker, so `client.encryptionEnabled` is false and the SDK builds no
+`Encryption` object at all; every room-creation path — DMs, group chats,
+spaces and course rooms, activity sessions, analytics rooms, and the report
+DM — either passes `enableEncryption: false` or never sends
+`m.room.encryption`; `Room.enableEncryption()` has no caller anywhere; and the
+encryption route, settings page and chat menu entry that upstream FluffyChat
+ships are deleted from the fork. The homeserver has no
+`encryption_enabled_by_default_for_room_type` set either. A counter pinned at
+zero is the point — it is the difference between knowing that and assuming it,
+and it is the first thing that would move if any of the above changed. (Note
+for whoever next touches the client: its inherited `PRIVACY.md` still claims
+the app "enables [E2EE] by default for private chats", which is not true of
+this build.)
 
 ## Deliberately out of scope here
 

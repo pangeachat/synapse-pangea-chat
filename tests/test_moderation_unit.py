@@ -82,6 +82,7 @@ from .moderation_doubles import (
     MetricReader,
     http_client_double,
     sqlite_engine,
+    tier1_refusal_code,
 )
 from .moderation_doubles import module_api as module_api_double
 
@@ -423,7 +424,9 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
     async def test_phone_number_forbidden(self) -> None:
         mod = _moderation(_config())
         self.assertEqual(
-            await mod.check_event_for_spam(_event("call me: 415-555-2671")),
+            tier1_refusal_code(
+                await mod.check_event_for_spam(_event("call me: 415-555-2671"))
+            ),
             Codes.FORBIDDEN,
         )
 
@@ -450,14 +453,19 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(sender=impostor):
                 event = _event("call me: 415-555-2671", sender=impostor)
-                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+                self.assertEqual(
+                    tier1_refusal_code(await mod.check_event_for_spam(event)),
+                    Codes.FORBIDDEN,
+                )
 
     async def test_exempt_glob_does_not_exempt_a_longer_localpart(self) -> None:
         """The same hole without the suffix: an exact glob must not act as a
         prefix. `@bot:example.org` is not `@bot2:example.org`."""
         mod = _moderation(_config(moderation_exempt_user_id_globs=["@bot:example.org"]))
         event = _event("call me: 415-555-2671", sender="@bot2:example.org")
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_exempt_sender_skips_tier2_as_well(self) -> None:
         """Both tiers consult the same matcher, so both are asserted."""
@@ -495,7 +503,9 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
         message (red-team finding: captions bypassed both tiers)."""
         mod = _moderation(_config())
         event = _event(content={"msgtype": "m.image", "body": "call 415-555-2671"})
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_benign_image_filename_passes(self) -> None:
         mod = _moderation(_config())
@@ -513,7 +523,9 @@ class TestCheckEventForSpam(unittest.IsolatedAsyncioTestCase):
                 "formatted_body": "<b>call 415-555-2671</b>",
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_fails_open_on_internal_error(self) -> None:
         mod = _moderation(_config())
@@ -2350,7 +2362,9 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
                 "formatted_body": self._BOMB,
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     def test_the_rewrite_does_not_merge_a_token_in_an_attribute(self) -> None:
         """The rewrite runs over the raw string before parsing, so it lands
@@ -2401,7 +2415,10 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
             "synapse_pangea_chat.moderation._displayed_reading",
             side_effect=RecursionError("boom"),
         ):
-            self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+            self.assertEqual(
+                tier1_refusal_code(await mod.check_event_for_spam(event)),
+                Codes.FORBIDDEN,
+            )
 
     async def test_each_field_of_a_surface_is_read_on_its_own(self) -> None:
         """The granularity IS the fix. A failure in one field must cost that
@@ -2439,7 +2456,8 @@ class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase)
                     "synapse_pangea_chat.moderation._SURFACE_READERS", tuple(table)
                 ):
                     self.assertEqual(
-                        await mod.check_event_for_spam(event), Codes.FORBIDDEN
+                        tier1_refusal_code(await mod.check_event_for_spam(event)),
+                        Codes.FORBIDDEN,
                     )
 
     async def test_a_surface_that_cannot_be_read_is_counted(self) -> None:
@@ -2668,7 +2686,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "m.new_content": {},
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_a_non_edit_relation_does_not_unlock_new_content(self) -> None:
         """A thread relation is a relation too, and it displays its own body."""
@@ -2681,7 +2701,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "m.relates_to": {"rel_type": "m.thread", "event_id": "$other"},
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_new_content_on_a_non_edit_is_not_moderated(self) -> None:
         """The permissive half of the relation rule, and the reason the rule is
@@ -2725,7 +2747,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_edit_also_moderates_the_fallback_body(self) -> None:
         """ADR-8a(0). An edit carries two displayed surfaces: `m.new_content`,
@@ -2741,7 +2765,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_a_surface_without_a_msgtype_is_still_read(self) -> None:
         """The outer body is benign here on purpose: with a blocking outer
@@ -2756,7 +2782,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_a_malformed_msgtype_does_not_cost_the_check(self) -> None:
         """A `msgtype` that is a list or an object is unhashable, and a set
@@ -2768,7 +2796,10 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 event = _event(
                     content={"msgtype": msgtype, "body": "call 415-555-2671"}
                 )
-                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+                self.assertEqual(
+                    tier1_refusal_code(await mod.check_event_for_spam(event)),
+                    Codes.FORBIDDEN,
+                )
 
     async def test_replacement_text_is_read_from_any_mapping(self) -> None:
         """Event content is not guaranteed to be a plain dict - Synapse's Rust
@@ -2794,7 +2825,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 }
             )
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_a_non_dict_mapping_outer_body_is_moderated(self) -> None:
         """The plain-message half of the same property."""
@@ -2804,7 +2837,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 {"msgtype": "m.text", "body": "call me: 415-555-2671"}
             )
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_entity_escaped_html_is_decoded_before_matching(self) -> None:
         """`&#52;15-555-2671` is displayed as a phone number. Matching the raw
@@ -2818,7 +2853,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "formatted_body": "<p>call &#52;15-555-2671 now</p>",
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_angle_brackets_in_text_do_not_eat_the_message(self) -> None:
         """`<415-555-2671 >` is displayed in full by every renderer: HTML5 says
@@ -2834,7 +2871,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "formatted_body": "compare <415-555-2671 > with the other one",
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_displayed_attribute_text_is_moderated(self) -> None:
         """An image's `alt` is rendered whenever the image does not load and is
@@ -2848,7 +2887,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "formatted_body": '<img src="mxc://x/y" alt="call 415-555-2671">',
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_an_unterminated_tag_is_not_displayed_and_not_matched(self) -> None:
         """The permissive direction, corrected. An earlier revision appended
@@ -2880,7 +2921,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "url": "mxc://example.org/x",
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_an_abruptly_closed_comment_does_not_hide_the_message(
         self,
@@ -2897,7 +2940,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "formatted_body": "<!-->call 415-555-2671<!-- -->",
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_a_cdata_section_does_not_hide_the_message(self) -> None:
         """HTML5 has no CDATA in an HTML body: `<![CDATA[` starts a bogus
@@ -2912,7 +2957,9 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 "formatted_body": "<![CDATA[>call 415-555-2671]]>",
             }
         )
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_spoiler_and_maths_attributes_are_moderated(self) -> None:
         """Element renders the spoiler's reason and the LaTeX source, so both
@@ -2931,7 +2978,10 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                         "formatted_body": formatted,
                     }
                 )
-                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+                self.assertEqual(
+                    tier1_refusal_code(await mod.check_event_for_spam(event)),
+                    Codes.FORBIDDEN,
+                )
 
     async def test_an_attribute_no_renderer_displays_is_not_matched(self) -> None:
         """`alt` on a `<b>` is shown by nothing. Treating the attribute NAME as
@@ -3097,12 +3147,17 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                 event = _event(
                     content={"msgtype": msgtype, "body": "call 415-555-2671"}
                 )
-                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+                self.assertEqual(
+                    tier1_refusal_code(await mod.check_event_for_spam(event)),
+                    Codes.FORBIDDEN,
+                )
 
     async def test_a_missing_msgtype_is_still_moderated(self) -> None:
         mod = _moderation(_config())
         event = _event(content={"body": "call 415-555-2671"})
-        self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+        self.assertEqual(
+            tier1_refusal_code(await mod.check_event_for_spam(event)), Codes.FORBIDDEN
+        )
 
     async def test_a_non_string_body_is_still_moderated(self) -> None:
         """Malformed is not absent. `EventValidator` requires `body` to be a
@@ -3112,7 +3167,10 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
             with self.subTest(body=body):
                 mod = _moderation(_config())
                 event = _event(content={"msgtype": "m.text", "body": body})
-                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+                self.assertEqual(
+                    tier1_refusal_code(await mod.check_event_for_spam(event)),
+                    Codes.FORBIDDEN,
+                )
 
     async def test_a_non_mapping_new_content_is_ignored_not_fatal(self) -> None:
         """The outer body must still be moderated whatever shape the junk
@@ -3128,7 +3186,10 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                         "m.relates_to": {"rel_type": "m.replace"},
                     }
                 )
-                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+                self.assertEqual(
+                    tier1_refusal_code(await mod.check_event_for_spam(event)),
+                    Codes.FORBIDDEN,
+                )
 
     async def test_a_non_mapping_relates_to_is_ignored_not_fatal(self) -> None:
         for junk in ("m.replace", ["m.replace"], 0):
@@ -3141,7 +3202,10 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                         "m.relates_to": junk,
                     }
                 )
-                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+                self.assertEqual(
+                    tier1_refusal_code(await mod.check_event_for_spam(event)),
+                    Codes.FORBIDDEN,
+                )
 
     async def test_html_that_a_renderer_normalises_is_still_matched(self) -> None:
         """Every case here reads as one phone number on screen, and each used
@@ -3167,7 +3231,10 @@ class TestExtraction(unittest.IsolatedAsyncioTestCase):
                         "formatted_body": formatted,
                     }
                 )
-                self.assertEqual(await mod.check_event_for_spam(event), Codes.FORBIDDEN)
+                self.assertEqual(
+                    tier1_refusal_code(await mod.check_event_for_spam(event)),
+                    Codes.FORBIDDEN,
+                )
 
     async def test_markup_a_renderer_hides_is_not_matched(self) -> None:
         """The permissive direction, and every one of these reads "hello" on

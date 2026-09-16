@@ -76,6 +76,10 @@ from synapse_pangea_chat.moderation.log_safety import (
     sender_digest,
 )
 from synapse_pangea_chat.moderation.profanity import contains_profanity
+from synapse_pangea_chat.moderation.refusal import refusal_body
+from synapse_pangea_chat.moderation.refusal import (
+    validate_messages as validate_refusal_messages,
+)
 from synapse_pangea_chat.moderation.tier1_prefilter import check_text
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
 
@@ -523,6 +527,14 @@ class ChatModeration:
         for exempt_glob in exempt_globs:
             validate_glob(exempt_glob)
         self._exempt_globs = list(exempt_globs)
+        # Validated here for the same reason as the globs above: config-parse
+        # time is where an operator's mistake is named, and this constructor is
+        # where a value that arrived by any other route - a test, a second
+        # entry point - has to fail rather than serve a learner a message
+        # nobody checked.
+        self._refusal_messages = validate_refusal_messages(
+            config.moderation_tier1_refusal_messages
+        )
         # Keyed per instance so a Matrix ID cannot be recovered from a log
         # line by enumeration; see moderation.log_safety.
         self._log_digest_key = new_digest_key()
@@ -745,7 +757,18 @@ class ChatModeration:
     # Tier 1 — deterministic pre-filter (blocks before persist)
     # ------------------------------------------------------------------
 
-    async def check_event_for_spam(self, event: EventBase) -> Union[str, Codes, bool]:
+    async def check_event_for_spam(
+        self, event: EventBase
+    ) -> Union[str, Codes, bool, Tuple[Codes, Dict[str, Any]]]:
+        """Tier 1's verdict, and - on a refusal - the reason for it.
+
+        The return type is the callback's own:
+        `Awaitable[str | Codes | tuple[Codes, JsonDict] | bool]`. A block
+        returns the tuple form, because a bare `Codes` reaches the sender as
+        Synapse's fixed "rejected as probable spam" and tells a learner
+        nothing about what happened or that a machine decided it. What the
+        dict may and may not say is `moderation.refusal`'s subject.
+        """
         try:
             if self._is_exempt_sender(event.sender):
                 return NOT_SPAM
@@ -780,7 +803,12 @@ class ChatModeration:
                     reason,
                     self._sender_digest(event.sender),
                 )
-                return Codes.FORBIDDEN
+                # The rule identifier goes to the SENDER, who already knows
+                # what they wrote, and nowhere else. It is not the same
+                # disclosure as the log line above, which sits beside a room
+                # id and would be an assertion about a message to somebody who
+                # never saw it.
+                return Codes.FORBIDDEN, refusal_body(reason, self._refusal_messages)
             return NOT_SPAM
         except Exception as exc:
             # silent-ok: fail-open by contract — a moderation bug must never

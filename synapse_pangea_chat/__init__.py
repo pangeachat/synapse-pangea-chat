@@ -27,6 +27,7 @@ from synapse_pangea_chat.grant_instructor_analytics_access import (
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.moderation import ChatModeration, tier1_prefilter
 from synapse_pangea_chat.moderation import exempt as moderation_exempt
+from synapse_pangea_chat.moderation import refusal as moderation_refusal
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
     PreviewWithCode,
@@ -72,6 +73,7 @@ _MODERATION_CONFIG_KEYS = frozenset(
         "tier2_supervisor_interval_seconds",
         moderation_exempt.CONFIG_KEY,
         moderation_exempt.LEGACY_CONFIG_KEY,
+        moderation_refusal.CONFIG_KEY,
     }
 )
 
@@ -947,6 +949,14 @@ class PangeaChat:
                 'Config "moderation.redaction_reason_prefix" must be a non-empty string'
             )
 
+        # What a refused learner is told. Validated here so a misspelled rule
+        # name fails startup: the default underneath an unrecognised key keeps
+        # working, so at runtime an override that never took effect is
+        # indistinguishable from one that did.
+        moderation_tier1_refusal_messages = moderation_refusal.validate_messages(
+            moderation.get(moderation_refusal.CONFIG_KEY, None)
+        )
+
         # Bounds, not just types. Every one of these sizes a buffer, a pool or
         # a deadline, and a zero or a negative would not fail loudly - it
         # would produce a queue that accepts nothing, a pool with no workers,
@@ -1046,6 +1056,7 @@ class PangeaChat:
             moderation_choreo_access_token=moderation_choreo_access_token,
             moderation_exempt_user_id_globs=moderation_exempt_user_id_globs,
             moderation_redaction_reason_prefix=moderation_redaction_reason_prefix,
+            moderation_tier1_refusal_messages=moderation_tier1_refusal_messages,
             moderation_tier2_workers=moderation_tier2_workers,
             moderation_tier2_queue_size=moderation_tier2_queue_size,
             moderation_tier2_request_timeout_seconds=(

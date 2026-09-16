@@ -9,7 +9,7 @@ Unified configuration combining all previously separate synapse module configs:
 - limit_user_directory (from synapse-limit-user-directory)
 """
 
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 import attr
 
@@ -143,6 +143,14 @@ class PangeaChatConfig:
     # this is not a regular expression.
     moderation_exempt_user_id_globs: List[str] = attr.Factory(list)
     moderation_redaction_reason_prefix: str = "Removed by Pangea content moderation"
+    # What a learner is told when Tier 1 refuses their message, keyed by rule
+    # identifier. `None` means "the built-in wording", and the wording itself
+    # lives in moderation/refusal.py rather than here: importing it into this
+    # file would pull the whole moderation package into an import this module
+    # is upstream of. See that file for the sentences, for why each names the
+    # rule and never the match, and for what an operator's override is
+    # validated against at parse time.
+    moderation_tier1_refusal_messages: Optional[Mapping[str, str]] = None
     # --- Tier 2 transport and concurrency ---
     # `on_new_event` is awaited inline by the notifier for every event on the
     # homeserver, so Tier 2 is a bounded queue drained by a fixed pool rather

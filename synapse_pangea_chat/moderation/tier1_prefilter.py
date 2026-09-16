@@ -139,6 +139,13 @@ _RULES: Tuple[Tuple[str, Callable[[str, Iterable[str]], bool]], ...] = (
     (REASON_PROFANITY, lambda text, _regions: contains_profanity(text)),
 )
 
+# The rule identifiers, derived from the table above rather than written out a
+# second time. Everything that has to enumerate the rules - the statement of
+# reasons a refused sender is given, and the test that each rule has one -
+# reads this, so a rule added to `_RULES` is enumerated by all of them on the
+# commit that adds it rather than the one that remembers this file.
+RULE_REASONS: Tuple[str, ...] = tuple(reason for reason, _rule in _RULES)
+
 
 def check_text(text: str, phone_regions: Iterable[str]) -> Optional[str]:
     """Return a reason code when the text trips a Tier 1 rule, else None.
