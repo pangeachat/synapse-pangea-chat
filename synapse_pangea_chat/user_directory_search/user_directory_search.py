@@ -160,6 +160,6 @@ class UserDirectorySearch(Resource):
             if not isinstance(parsed, dict):
                 return None
             return parsed
-        # silent-ok: malformed body - the caller answers 400
+        # silent-ok: any failure reading or parsing the body - the caller answers 400
         except Exception:
             return None

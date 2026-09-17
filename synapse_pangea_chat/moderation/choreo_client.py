@@ -1447,7 +1447,7 @@ class ChoreoChecker:
                 # The per-message figure is this divided by the batch size,
                 # and `TIER2_BATCH_SIZE` is the other half of that division.
                 metrics.TIER2_LATENCY.observe(max(self._clock.time() - started, 0.0))
-        # silent-ok: every branch below is recorded - refused/unsupported are labeled there, the rest reaches _record_failure (log + breaker) and the metrics
+        # silent-ok: every branch below is accounted for - refused/unsupported are labeled there; the rest goes to _record_failure (breaker + WARNING, or a once-per-cooldown ERROR for a config error) and the metrics
         except Exception as exc:
             reraise_if_cancelled(exc)
             if failure_kind(exc) == KIND_BATCH_REFUSED:
@@ -1546,7 +1546,7 @@ class ChoreoChecker:
                 )
             finally:
                 metrics.TIER2_LATENCY.observe(max(self._clock.time() - started, 0.0))
-        # silent-ok: recorded by _record_failure (log + breaker) and counted; None is the no-verdict answer
+        # silent-ok: _record_failure records it (breaker + WARNING, or a once-per-cooldown ERROR for a config error) and it is counted; None is the no-verdict answer
         except Exception as exc:
             reraise_if_cancelled(exc)
             # `Exception`, not `ModerationCheckError`, and the widening is the

@@ -137,7 +137,7 @@ async def get_inviter_user(api: ModuleApi, room_id: str) -> Optional[UserID]:
                 DEFAULT_INVITE_POWER_LEVEL,
             )
         )
-    except ValueError:
+    except (ValueError, TypeError):
         logger.warning(
             "Non-integer invite power level in room %s; using default", room_id
         )
@@ -151,7 +151,7 @@ async def get_inviter_user(api: ModuleApi, room_id: str) -> Optional[UserID]:
                 DEFAULT_USERS_DEFAULT_POWER_LEVEL,
             )
         )
-    except ValueError:
+    except (ValueError, TypeError):
         logger.warning(
             "Non-integer users_default power level in room %s; using default", room_id
         )

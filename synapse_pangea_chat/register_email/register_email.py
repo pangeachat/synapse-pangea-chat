@@ -276,6 +276,6 @@ class RegisterEmailRequestToken(Resource):
         try:
             body = request.content.read()
             return json.loads(body.decode("utf-8"))
-        # silent-ok: malformed body - the caller answers 400
+        # silent-ok: any failure reading or parsing the body - the caller answers 400
         except Exception:
             return None
