@@ -96,5 +96,7 @@ version.
 - **No rollback path once 1.159 runs**: the bump spans schema 89 → 94, far
   outside Synapse's downgrade window. Snapshot RDS before each environment's
   deploy; rollback = restore snapshot.
-- **`COMPAT.yml` stays at `min_synapse_version: 1.124.0`** until production is
-  on 1.159.0, then raise it to `1.159.0`.
+- **`COMPAT.yml` declares `min_synapse_version: 1.159.0`** (raised 2026-09-17,
+  #201) now that production runs 1.159.0 (pangeachat/ansible#253, 2026-09-10).
+  The floor was already real before the fleet caught up: `blocked_join_gate`
+  (#171) breaks `create_course_space` on 1.124 (pangeachat/.github#442).
