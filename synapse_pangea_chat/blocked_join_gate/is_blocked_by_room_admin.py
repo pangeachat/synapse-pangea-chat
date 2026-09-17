@@ -135,4 +135,5 @@ def _as_int(value: object, default: int) -> int:
     try:
         return int(value)  # type: ignore[call-overload]
     except (TypeError, ValueError):
+        logger.warning("Non-integer power level %r; using %d", value, default)
         return default

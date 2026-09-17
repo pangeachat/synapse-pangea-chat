@@ -17,6 +17,7 @@ def main() -> None:
         try:
             project_version = version("synapse_pangea_chat")
             print(f"Version {project_version}")
+        # silent-ok: the CLI prints the missing-version message instead
         except PackageNotFoundError:
             print("Version information not available.")
 

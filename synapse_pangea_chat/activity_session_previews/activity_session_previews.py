@@ -109,6 +109,7 @@ class ActivitySessionPreviews(Resource):
                 send_cors=True,
             )
 
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
             logger.info(
                 "Authentication failed for activity session previews request: %s", e

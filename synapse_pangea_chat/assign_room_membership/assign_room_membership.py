@@ -152,6 +152,7 @@ class AssignRoomMembership(Resource):
                 },
                 send_cors=True,
             )
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (
             MissingClientTokenError,
             InvalidClientTokenError,
@@ -174,6 +175,7 @@ class AssignRoomMembership(Resource):
     def _is_valid_room_id(self, room_id: str) -> bool:
         try:
             RoomID.from_string(room_id)
+        # silent-ok: validation only - the caller answers 400 for an invalid id
         except Exception:
             return False
         return True
@@ -250,7 +252,7 @@ class AssignRoomMembership(Resource):
             )
             return self._success_result(user_id, "invited")
         except Exception as e:
-            logger.info(
+            logger.warning(
                 "Failed assigning room membership for %s in %s: %s",
                 user_id,
                 room_id,
@@ -383,9 +385,12 @@ class AssignRoomMembership(Resource):
         return best_candidate[1]
 
     def _coerce_int(self, value: Any, default: int) -> int:
+        if value is None:
+            return default
         try:
             return int(value)
         except (TypeError, ValueError):
+            logger.warning("Non-integer power level %r; using %d", value, default)
             return default
 
     def _success_result(self, user_id: str, action: str) -> dict[str, Any]:

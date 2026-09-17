@@ -127,6 +127,7 @@ class FindUserByEmail(Resource):
                 {"address": address, "results": results},
                 send_cors=True,
             )
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (
             MissingClientTokenError,
             InvalidClientTokenError,

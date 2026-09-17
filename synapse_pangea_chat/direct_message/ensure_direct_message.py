@@ -125,6 +125,7 @@ class EnsureDirectMessage(Resource):
                 result,
                 send_cors=True,
             )
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (
             MissingClientTokenError,
             InvalidClientTokenError,
@@ -488,6 +489,7 @@ class EnsureDirectMessage(Resource):
         try:
             return int(value)
         except (TypeError, ValueError):
+            logger.warning("Non-integer power level %r; treating as 0", value)
             return 0
 
     async def _ensure_admin_power_levels(

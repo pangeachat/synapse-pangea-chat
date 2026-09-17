@@ -363,15 +363,9 @@ def _cancel_existing_timed_call(self: Any) -> None:
         return
 
     try:
-        is_active = timed_call.active()
-    except AttributeError:
-        is_active = False
-
-    if not is_active:
-        return
-
-    try:
         timed_call.cancel()
+    # Synapse's own HttpPusher.on_stop absorbs the same race the same way.
+    # silent-ok: the timer fired or was cancelled already
     except (AlreadyCalled, AlreadyCancelled):
         pass
 

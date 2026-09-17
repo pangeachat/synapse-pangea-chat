@@ -68,6 +68,7 @@ class PublicCourses(Resource):
 
             try:
                 limit = int(limit_str)
+            # silent-ok: a non-integer limit from the caller gets the default page size
             except (ValueError, TypeError):
                 limit = 10
 
@@ -117,6 +118,7 @@ class PublicCourses(Resource):
                 public_courses,
                 send_cors=True,
             )
+        # silent-ok: rate limit answered 429 - the intended result
         except RateLimitError:
             respond_with_json(
                 request,
@@ -124,6 +126,7 @@ class PublicCourses(Resource):
                 {"error": "Rate limited"},
                 send_cors=True,
             )
+        # silent-ok: the caller's bad cursor or filter, answered 400 (comment below)
         except InvalidCatalogParamError as e:
             # A cursor or filter the catalog cannot honor. Answering 200 with a
             # head-of-catalog or unfiltered page would look like a valid answer
@@ -134,6 +137,7 @@ class PublicCourses(Resource):
                 {"error": e.message, "errcode": "M_INVALID_PARAM"},
                 send_cors=True,
             )
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
             logger.info("Authentication failed for room preview request: %s", e)
             respond_with_json(

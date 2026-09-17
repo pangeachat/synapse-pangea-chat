@@ -211,6 +211,7 @@ def _bypasses_proxy(proxied: Any, host: str) -> bool:
         from synapse.http.proxyagent import proxy_bypass_environment
 
         return bool(proxy_bypass_environment(host, proxies=proxies))
+    # silent-ok: an unreadable no_proxy rule is no bypass; the request still goes through the proxy (docstring)
     except Exception:
         return False
 
@@ -1006,6 +1007,7 @@ async def _with_deadline(
         timer: Any = clock.call_later(
             _SecondsInterval(max(deadline - clock.time(), 0)), _expire
         )
+    # silent-ok: the clock is shut down - the deadline is applied immediately instead (below)
     except Exception:
         # `Clock.call_later` raises once the clock has been shut down, and the
         # exchange is already open by then. Reporting a failure and walking
@@ -1065,13 +1067,14 @@ async def _batch_refusal_kind(
             message="moderation refusal body timed out",
         )
         detail = json.loads(raw)
-    # silent-ok: not a failure to report. The refusal itself is already being
-    # raised by the caller with the kind this returns, and the only thing lost
-    # is the chance to distinguish the two refusals - which is exactly what
+    # Not a failure to report. The refusal itself is already being raised by
+    # the caller with the kind this returns, and the only thing lost is the
+    # chance to distinguish the two refusals - which is exactly what
     # `batch_refused` means. Logging it would name the peer's body by type at
     # best and quote it at worst (ADR-10). A cancellation is re-raised rather
     # than absorbed: it carries no response for a chain to leak, and it has to
     # reach the worker being stopped.
+    # silent-ok: the refusal is raised by the caller; only which refusal is lost
     except Exception as exc:
         reraise_if_cancelled(exc)
         return KIND_BATCH_REFUSED
@@ -1444,6 +1447,7 @@ class ChoreoChecker:
                 # The per-message figure is this divided by the batch size,
                 # and `TIER2_BATCH_SIZE` is the other half of that division.
                 metrics.TIER2_LATENCY.observe(max(self._clock.time() - started, 0.0))
+        # silent-ok: every branch below is recorded - refused/unsupported are labeled there, the rest reaches _record_failure (log + breaker) and the metrics
         except Exception as exc:
             reraise_if_cancelled(exc)
             if failure_kind(exc) == KIND_BATCH_REFUSED:
@@ -1542,6 +1546,7 @@ class ChoreoChecker:
                 )
             finally:
                 metrics.TIER2_LATENCY.observe(max(self._clock.time() - started, 0.0))
+        # silent-ok: recorded by _record_failure (log + breaker) and counted; None is the no-verdict answer
         except Exception as exc:
             reraise_if_cancelled(exc)
             # `Exception`, not `ModerationCheckError`, and the widening is the
