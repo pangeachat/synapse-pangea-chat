@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import warnings
 from typing import IO, Any, Dict, Optional, Tuple, Union, cast
 from unittest.mock import patch
@@ -104,6 +105,36 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             "Docker/Colima is the usual culprit) and re-run.\n"
             "Find it with: lsof -nP -iTCP:8008 -sTCP:LISTEN"
         )
+
+    async def _wait_for_background_updates(
+        self, db_url: str, timeout_seconds: float = 60.0
+    ) -> None:
+        """Block until Synapse has drained its startup background updates.
+
+        See the `background_updates` note in `start_test_synapse`: until the
+        user-directory rebuild has run, a test can watch its own registrations
+        vanish from the directory. Synapse deletes a row from
+        `background_updates` as each update completes, so an empty table is
+        the done signal.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        conn = psycopg2.connect(db_url)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                while True:
+                    cur.execute("SELECT update_name FROM background_updates")
+                    remaining = [row[0] for row in cur.fetchall()]
+                    if not remaining:
+                        return
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(
+                            "Synapse background updates still pending after "
+                            f"{timeout_seconds}s: {remaining}"
+                        )
+                    await asyncio.sleep(0.25)
+        finally:
+            conn.close()
 
     async def start_test_synapse(
         self,
@@ -228,6 +259,19 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             # 1.124, where Synapse ignores it.
             config["rc_room_creation"] = {"per_second": 1000, "burst_count": 1000}
 
+            # A fresh database boots with ~54 pending background updates, run
+            # one batch per sleep interval (1 s by default). Four of them
+            # rebuild the user directory, and `populate_user_directory_process_rooms`
+            # starts by deleting every row of user_directory /
+            # user_directory_search / users_who_share_private_rooms — about
+            # 5 s after startup locally, later and wider on a slow CI runner.
+            # A test registering users or sharing a room inside that window
+            # searches an empty directory, and a room created after the
+            # staging snapshot is never rebuilt into the shared-rooms table
+            # (CI runs 35238063832 attempts 1 and 2; main's runs for #191 and
+            # #207). Run the queue back-to-back so it drains before the first
+            # request, and `_wait_for_background_updates` below proves it did.
+            config["background_updates"] = {"sleep_enabled": False}
             if synapse_config_overrides:
                 for key, value in synapse_config_overrides.items():
                     config[key] = value
@@ -316,6 +360,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                     f"stderr_tail=\n{stderr_tail}"
                 )
 
+            await self._wait_for_background_updates(db_url)
             return (
                 postgres,
                 synapse_dir,
