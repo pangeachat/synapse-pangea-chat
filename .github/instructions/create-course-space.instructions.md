@@ -21,7 +21,7 @@ Lives in the `email_invite/` sub-package alongside `invite_by_email`.
 
 ### What it does
 
-1. Creates a private Matrix space with knock join rules, course plan state event, and power levels matching [client defaults](../../../client/lib/pangea/chat/constants/default_power_level.dart)
+1. Creates a private Matrix space with knock join rules, a course plan state event, and the power levels the client gives a course space it creates itself ([`defaultSpacePowerLevelsContent`](../../../client/lib/pangea/common/constants/default_power_level.dart), with `m.space.child` at 0). Every new space defaults `m.space.child` to 0: a regular member must be able to attach a room, because learners' activity sessions fan out into their courses as space children ([activities.instructions.md](../../../client/.github/instructions/activities.instructions.md)).
 2. Generates two unique access codes (student + admin) and sets both in join rules directly (bypasses `request_room_code`)
 3. Uploads course image as room avatar if provided
 4. Sends branded invite email to teacher via `invite_by_email` with the admin access code

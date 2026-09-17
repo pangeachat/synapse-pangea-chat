@@ -44,7 +44,10 @@ logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.email_invite.create_course_space"
 )
 
-# Matches client defaultSpacePowerLevels
+# Matches what the client creates a course space with (selected_course_page
+# passes spaceChild: 0 into its defaultSpacePowerLevelsContent). m.space.child
+# is 0 so a regular member can attach a room: learners' activity sessions fan
+# out into their courses as space children, and a member sits at users_default.
 DEFAULT_SPACE_POWER_LEVELS: Dict[str, Any] = {
     "ban": 50,
     "kick": 50,
@@ -53,7 +56,7 @@ DEFAULT_SPACE_POWER_LEVELS: Dict[str, Any] = {
     "events": {
         "m.room.power_levels": 100,
         "m.room.join_rules": 100,
-        "m.space.child": 50,
+        "m.space.child": 0,
     },
     "events_default": 0,
     "state_default": 50,

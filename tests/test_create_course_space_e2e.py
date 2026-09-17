@@ -58,6 +58,18 @@ class TestCreateCourseSpaceE2E(BaseSynapseE2ETest):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
+    def _get_power_levels(self, access_token: str, room_id: str) -> Dict[str, Any]:
+        """The stored ``m.room.power_levels`` content, read over the client API."""
+        room_id_path = quote(room_id, safe="")
+        response = requests.get(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}"
+            "/state/m.room.power_levels",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
     def _publish_to_directory(self, access_token: str, room_id: str) -> None:
         """Publish in the public room directory — half of the eligibility rule.
 
@@ -221,6 +233,61 @@ class TestCreateCourseSpaceE2E(BaseSynapseE2ETest):
 
             other = self._get_courses(token, target_language="fr")
             self.assertEqual(self._room_ids(other), [])
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+    async def test_members_can_add_space_children(self) -> None:
+        """A regular member can attach a room to a server-created course space.
+
+        Learners' activity sessions fan out into their courses as
+        ``m.space.child`` (client activities doc), and a member sits at the
+        default power level, so that write must cost 0. Asserted on the stored
+        power levels rather than the constant: the test is that Synapse
+        accepted and applied the override at creation.
+        """
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="teacher",
+                password="123123123",
+                admin=True,
+            )
+            _, token = await self.login_user(user="teacher", password="123123123")
+
+            created = self._create_course_space(
+                token,
+                title="Members add children",
+                teacher_email="teacher@example.com",
+                course_plan_id="plan-space-child",
+            )
+            power_levels = self._get_power_levels(token, created["room_id"])
+
+            self.assertEqual(power_levels["events"]["m.space.child"], 0)
+            # Only the child write is opened up; other state stays admin-gated.
+            self.assertEqual(power_levels["state_default"], 50)
+            self.assertEqual(power_levels["users_default"], 0)
         finally:
             self.stop_synapse(
                 server_process=server_process,
