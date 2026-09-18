@@ -130,6 +130,7 @@ def _validate_choreo_host(hostname: Optional[str], netloc: str) -> None:
         return
     try:
         ipaddress.ip_address(hostname)
+    # silent-ok: not an IP literal; validated as a hostname below
     except ValueError:
         pass
     else:

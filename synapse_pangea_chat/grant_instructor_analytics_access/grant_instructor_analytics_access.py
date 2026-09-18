@@ -224,7 +224,7 @@ class GrantInstructorAnalyticsAccess(Resource):
                         {"user_id": instructor_id, "action": action}
                     )
                 except Exception as e:
-                    logger.info(
+                    logger.warning(
                         "Failed force-joining %s into %s: %s",
                         instructor_id,
                         mx_analytics_room_id,
@@ -248,6 +248,7 @@ class GrantInstructorAnalyticsAccess(Resource):
                 },
                 send_cors=True,
             )
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (
             MissingClientTokenError,
             InvalidClientTokenError,
@@ -270,6 +271,7 @@ class GrantInstructorAnalyticsAccess(Resource):
     def _is_valid_room_id(self, room_id: str) -> bool:
         try:
             RoomID.from_string(room_id)
+        # silent-ok: validation only - the caller answers 400 for an invalid id
         except Exception:
             return False
         return True
@@ -277,6 +279,7 @@ class GrantInstructorAnalyticsAccess(Resource):
     def _is_valid_user_id(self, user_id: str) -> bool:
         try:
             UserID.from_string(user_id)
+        # silent-ok: validation only - the caller answers 400 for an invalid id
         except Exception:
             return False
         return True
@@ -403,7 +406,10 @@ class GrantInstructorAnalyticsAccess(Resource):
         return "joined"
 
     def _coerce_int(self, value: Any, default: int) -> int:
+        if value is None:
+            return default
         try:
             return int(value)
         except (TypeError, ValueError):
+            logger.warning("Non-integer power level %r; using %d", value, default)
             return default

@@ -352,7 +352,7 @@ def _bot_dm_rooms(user_id: str, content: Any, bot_user_id: str) -> List[str]:
         try:
             parsed = json.loads(content)
         except (TypeError, ValueError):
-            logger.debug(
+            logger.warning(
                 "Could not parse m.direct account data for %s, treating as not notified",
                 user_id,
             )

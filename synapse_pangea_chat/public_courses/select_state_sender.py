@@ -25,15 +25,17 @@ logger = logging.getLogger(
 
 
 def _coerce_int(value: Any, default: int) -> int:
-    if isinstance(value, bool):
+    if value is None:
         return default
-    if isinstance(value, int):
+    if isinstance(value, int) and not isinstance(value, bool):
         return value
     if isinstance(value, str):
         try:
             return int(value)
         except ValueError:
+            logger.warning("Non-integer power level %r; using %d", value, default)
             return default
+    logger.warning("Non-integer power level %r; using %d", value, default)
     return default
 
 

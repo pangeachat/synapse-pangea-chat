@@ -35,6 +35,7 @@ from synapse_pangea_chat.room_code.constants import (
 
 try:
     import sentry_sdk  # type: ignore[import-not-found]
+# silent-ok: sentry-sdk is an optional Synapse extra; without it captures are no-ops (below)
 except ImportError:
     # Sentry is an optional Synapse extra; without it captures are no-ops.
     sentry_sdk = None

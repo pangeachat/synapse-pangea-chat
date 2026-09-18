@@ -112,6 +112,7 @@ class RegisterEmailRequestToken(Resource):
             # --- Validate client_secret ---
             try:
                 assert_valid_client_secret(client_secret)
+            # silent-ok: validation error answered with its own status - the caller's error
             except SynapseError as e:
                 respond_with_json(
                     request,
@@ -132,6 +133,7 @@ class RegisterEmailRequestToken(Resource):
                     localpart=username,
                     inhibit_user_in_use_error=inhibit_user_in_use,
                 )
+            # silent-ok: validation error answered with its own status - the caller's error
             except SynapseError as e:
                 respond_with_json(
                     request,
@@ -160,6 +162,7 @@ class RegisterEmailRequestToken(Resource):
 
             try:
                 email = validate_email(email_raw)
+            # silent-ok: validation error answered with its own status - the caller's error
             except ValueError as e:
                 respond_with_json(
                     request,
@@ -248,6 +251,7 @@ class RegisterEmailRequestToken(Resource):
                 send_cors=True,
             )
 
+        # silent-ok: a SynapseError carries its own status and is answered with it
         except SynapseError as e:
             respond_with_json(
                 request,
@@ -272,5 +276,6 @@ class RegisterEmailRequestToken(Resource):
         try:
             body = request.content.read()
             return json.loads(body.decode("utf-8"))
+        # silent-ok: any failure reading or parsing the body - the caller answers 400
         except Exception:
             return None

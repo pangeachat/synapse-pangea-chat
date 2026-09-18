@@ -147,6 +147,7 @@ class PreviewWithCode(Resource):
                 {"rooms": previews},
                 send_cors=True,
             )
+        # silent-ok: the caller's auth failure, answered 403 (logged at INFO)
         except (
             MissingClientTokenError,
             InvalidClientTokenError,

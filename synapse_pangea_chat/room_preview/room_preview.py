@@ -90,6 +90,7 @@ class RoomPreview(Resource):
                 send_cors=True,
             )
 
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
             logger.info("Authentication failed for room preview request: %s", e)
             respond_with_json(

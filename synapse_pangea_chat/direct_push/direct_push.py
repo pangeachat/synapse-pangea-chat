@@ -108,6 +108,7 @@ class DirectPush(Resource):
             response = await self._send_push(target_user_id, device_id, body)
             respond_with_json(request, 200, response, send_cors=True)
 
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
             logger.info("Authentication failed: %s", e)
             respond_with_json(
@@ -130,6 +131,7 @@ class DirectPush(Resource):
             if not content:
                 return cast(SendPushRequest, {})
             parsed = json.loads(content)
+        # silent-ok: malformed body - the caller answers 400
         except (json.JSONDecodeError, ValueError):
             return None
 

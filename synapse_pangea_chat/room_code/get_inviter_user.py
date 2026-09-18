@@ -137,7 +137,10 @@ async def get_inviter_user(api: ModuleApi, room_id: str) -> Optional[UserID]:
                 DEFAULT_INVITE_POWER_LEVEL,
             )
         )
-    except ValueError:
+    except (ValueError, TypeError):
+        logger.warning(
+            "Non-integer invite power level in room %s; using default", room_id
+        )
         invite_power = DEFAULT_INVITE_POWER_LEVEL
 
     # extract default power level
@@ -148,7 +151,10 @@ async def get_inviter_user(api: ModuleApi, room_id: str) -> Optional[UserID]:
                 DEFAULT_USERS_DEFAULT_POWER_LEVEL,
             )
         )
-    except ValueError:
+    except (ValueError, TypeError):
+        logger.warning(
+            "Non-integer users_default power level in room %s; using default", room_id
+        )
         users_default = DEFAULT_USERS_DEFAULT_POWER_LEVEL
 
     # extract users power levels
@@ -192,6 +198,11 @@ async def get_inviter_user(api: ModuleApi, room_id: str) -> Optional[UserID]:
             try:
                 power_level = int(users_power_level[user_id])
             except (ValueError, TypeError):
+                logger.warning(
+                    "Non-integer power level for %s in room %s; using users_default",
+                    user_id,
+                    room_id,
+                )
                 power_level = users_default
         else:
             # User has default power level

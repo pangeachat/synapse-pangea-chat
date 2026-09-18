@@ -193,6 +193,7 @@ class InviteByEmail(Resource):
                 send_cors=True,
             )
 
+        # silent-ok: the caller's auth failure, answered 403
         except (
             MissingClientTokenError,
             InvalidClientTokenError,
@@ -227,11 +228,21 @@ class InviteByEmail(Resource):
                     try:
                         return int(users[user_id])
                     except (ValueError, TypeError):
-                        pass
+                        logger.warning(
+                            "Non-integer power level %r for %s in %s; using users_default",
+                            users[user_id],
+                            user_id,
+                            room_id,
+                        )
                 # Return users_default if user not explicitly listed
                 try:
                     return int(event.content.get("users_default", 0))
                 except (ValueError, TypeError):
+                    logger.warning(
+                        "Non-integer users_default %r in %s; treating as 0",
+                        event.content.get("users_default"),
+                        room_id,
+                    )
                     return 0
         return 0
 
@@ -321,6 +332,12 @@ class InviteByEmail(Resource):
             try:
                 pl_int = int(pl)
             except (ValueError, TypeError):
+                logger.warning(
+                    "Non-integer power level %r for %s in %s; skipping",
+                    pl,
+                    user_id,
+                    room_id,
+                )
                 continue
             if pl_int > highest_pl:
                 highest_pl = pl_int
@@ -338,6 +355,7 @@ class InviteByEmail(Resource):
                 continue
             try:
                 pl_int = int(pl)
+            # silent-ok: already reported by the first pass above
             except (ValueError, TypeError):
                 continue
             if pl_int == highest_pl:

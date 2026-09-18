@@ -38,6 +38,7 @@ def _coerce_int(value: Any) -> Optional[int]:
     try:
         return int(value)
     except (TypeError, ValueError):
+        logger.warning("Non-integer power level %r; ignoring", value)
         return None
 
 

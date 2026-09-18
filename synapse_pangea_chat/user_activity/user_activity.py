@@ -167,6 +167,7 @@ class UserActivity(_AdminResourceBase):
 
             respond_with_json(request, 200, data, send_cors=True)
 
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
             logger.info("Authentication failed: %s", e)
             respond_with_json(
@@ -228,6 +229,7 @@ class UserCourses(_AdminResourceBase):
 
             respond_with_json(request, 200, data, send_cors=True)
 
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
             logger.info("Authentication failed: %s", e)
             respond_with_json(
@@ -315,6 +317,7 @@ class CourseActivities(_AdminResourceBase):
 
             respond_with_json(request, 200, data, send_cors=True)
 
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
             logger.info("Authentication failed: %s", e)
             respond_with_json(
@@ -348,6 +351,7 @@ def _int_param(
         return default
     try:
         val = int(raw)
+    # silent-ok: a non-integer query param from the caller gets the documented default
     except (ValueError, TypeError):
         return default
     val = max(minimum, val)
@@ -405,6 +409,7 @@ def _optional_int_param(
         return None
     try:
         val = int(raw)
+    # silent-ok: a non-integer query param from the caller reads as not given (docstring)
     except (ValueError, TypeError):
         return None
     return max(minimum, val)

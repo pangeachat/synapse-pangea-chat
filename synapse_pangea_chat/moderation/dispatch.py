@@ -313,6 +313,7 @@ class Tier2Dispatcher:
             self._wakeup_call = self._clock.call_later(
                 _SecondsInterval(0.0), self._wake_available
             )
+        # silent-ok: Clock.call_later raises once the clock is shut down; False tells the caller nothing was scheduled
         except Exception:
             # `Clock.call_later` raises once the clock has been shut down.
             self._wakeup_call = None
@@ -335,6 +336,7 @@ class Tier2Dispatcher:
             return False
         try:
             return bool(call.active())
+        # silent-ok: a handle that cannot answer counts as not pending - the safe direction (docstring)
         except Exception:
             return False
 
@@ -365,6 +367,7 @@ class Tier2Dispatcher:
     def _discard_waiter(self, waiter: "defer.Deferred[None]") -> None:
         try:
             self._waiters.remove(waiter)
+        # silent-ok: already taken by _wake_one, the ordinary path
         except ValueError:
             # Already taken by `_wake_one`, which is the ordinary path.
             pass
@@ -558,13 +561,12 @@ class Tier2Dispatcher:
                 self._expire_linger,
                 waiter,
             )
+        # `Clock.call_later` raises once shut down, which happens on every
+        # ordinary stop; logging it would put a line on every worker on the
+        # way down, saying only that the process is stopping. The caller's
+        # answer to `False` is simply to dispatch the batch it already holds.
+        # silent-ok: not a failure to report - the process is stopping
         except Exception:
-            # silent-ok: not a failure to report — the clock has been shut
-            # down, which happens on every ordinary stop, and the caller's
-            # answer to `False` is simply to dispatch the batch it already
-            # holds. `Clock.call_later` raises once shut down; logging it
-            # would put a line on every worker on the way down, saying only
-            # that the process is stopping.
             return False
         self._waiters.append(waiter)
         try:
@@ -577,14 +579,12 @@ class Tier2Dispatcher:
             try:
                 if timer.active():
                     timer.cancel()
+            # The guarantee this `finally` exists for - ending the wait and
+            # taking the waiter out of the list - is already met above, and a
+            # failure to cancel a timer cannot cost a message: `_expire_linger`
+            # is a no-op on a Deferred that has already been called.
+            # silent-ok: best-effort cleanup of a timer that already did its job
             except Exception:
-                # silent-ok: best-effort cleanup of a timer that has already
-                # done its job or is about to be discarded with the clock.
-                # The guarantee this `finally` exists for - ending the wait
-                # and taking the waiter out of the list - is already met
-                # above, and a failure to cancel a timer cannot cost a
-                # message: `_expire_linger` is a no-op on a Deferred that has
-                # already been called.
                 pass
         return True
 
@@ -859,6 +859,7 @@ class Tier2Dispatcher:
             self._drain_deadline = reactor().callLater(
                 self._drain_timeout, self._on_drain_deadline
             )
+        # silent-ok: the reactor is stopping; _abandon_drain counts and logs whatever was in flight
         except Exception:
             # The reactor is already stopping, so there is no way to bound a
             # wait - and an unbounded one is worse than an abandoned one.
