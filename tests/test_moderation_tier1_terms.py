@@ -13,7 +13,7 @@ import json
 import time
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 from synapse_pangea_chat.moderation.profanity import contains_profanity
 from synapse_pangea_chat.moderation.tier1_prefilter import REASON_PROFANITY, check_text
@@ -139,6 +139,107 @@ _REASONS_FOR_TIER2 = {
     # Tier 1 does not rejoin such a run, so the form is Tier 2's whatever the
     # vote. See `_is_spelled_out`.
     "spelled_out",
+}
+
+# The Tier 2 reasons that rest on an ORDINARY SENSE of the term having been
+# named - as against the ones that rest on a limit of the matcher
+# (`no_word_boundary`, `too_short`, `spelled_out`), on the term being quoted
+# rather than used (`mention_not_use`), on it being a romanized spelling of a
+# slur (`romanization`), or on nothing having been established either way
+# (`model_review_not_promoted`, `awaiting_review`).
+#
+# `unadjudicated` belongs here and was missing, which is the whole reason this
+# is a named set. It reads "an ordinary sense is REPORTED and a non-native
+# curator cannot rule it out", which is a named reading held at arm's length,
+# not the absence of one - and leaving it out kept `b4ngsat` and `k0kot` in
+# Tier 1 while `bangsat` (a bedbug in Malay) and `kokot` (a dialectal rooster)
+# sat demoted, so `Room B4NGSAT is down the hall` was rejected before persist.
+_REASONS_THAT_NAME_AN_ORDINARY_SENSE = {
+    "benign_homograph",
+    "benign_sense_in_own_language",
+    "register",
+    "unadjudicated",
+    "identifier_reading",
+}
+
+
+# The terms the September 2026 model review named a CONCRETE benign reading
+# for, and the reading, pinned HERE rather than in the data.
+#
+# These readings used to live inside the per-model vote records embedded on
+# each term, and a deleted test derived `vetoed` / `not_promoted` from them
+# and required Tier 2. Removing the records removed that, and the cold
+# cross-model gate showed the cost: flip `chuja` to `tier1: true` - it still
+# says `Chuja, a Korean island name` in its own prose note - and the whole
+# suite stayed green while `We visited Chuja Island.` started blocking. A
+# reading a machine cannot read is not a gate.
+#
+# So the reading is pinned in the gate's own source, the way
+# `curator_attested` and the frequency thresholds are: re-promoting one of
+# these means deleting a line here, next to the sentence saying what it
+# lets through. A term that later produces a sentence which reproduces gets
+# a full `benign_reading` record in the data instead, with a source and a
+# live negative control; this is the floor under the ones that have not.
+_REVIEW_NAMED_A_BENIGN_READING = {
+    "Fotze": "de: Dialectal mouth or slap",
+    "chuj": "es: Chuj (Mayan people/language); en: Chuj (Mayan people/language); es: Chuj people and Mayan language; en: Chuj language name",
+    "chuja": "en: Chuja, a Korean island name",
+    "hovien": "fi: Of courts, genitive plural of hovi",
+    "ibne": "ar: possible romanization near ibn/ibna (son/daughter); ur: Romanized son of, used in names such as Ibne Safi",
+    "joder": "de: Joder, a surname",
+    "kaltak": "tr: saddle frame",
+    "merda": "ca: merda = shit (everyday word)",
+    "p e r k e l e": "fi: Satan/devil (Perkele also a thunder god); fi: The Devil in religious language",
+    "perkele": "fi: Satan/devil (Perkele also a thunder god); fi: The Devil in religious language",
+    "pê đê": "vi: letter names P and Đ; đê = dyke/levee",
+    "saatana": "fi: Satan/devil (Perkele also a thunder god); fi: Satan, a religious name",
+    "viado": "pt: striped fabric; also the base word for the animal 'deer'; pt: Striped or veined wool fabric",
+    "αρχίδι": "el: testicle (anatomical)",
+    "γαμώ": "el: (classical) to marry",
+    "καριολάρα": "el: bed (καριόλα) and its inflections; el: καριόλα = an (old-fashioned/dialectal) word for 'bed'",
+    "καριολίτσα": "el: bed (καριόλα) and its inflections; el: καριόλα = an (old-fashioned/dialectal) word for 'bed'",
+    "καριολίτσες": "el: bed (καριόλα) and its inflections; el: καριόλα = an (old-fashioned/dialectal) word for 'bed'",
+    "καριολών": "el: bed (καριόλα) and its inflections; el: καριόλα = an (old-fashioned/dialectal) word for 'bed'; el: Of beds, genitive plural",
+    "καριόλα μου": "el: bed (καριόλα) and its inflections; el: καριόλα = an (old-fashioned/dialectal) word for 'bed'",
+    "καριόλας": "el: bed (καριόλα) and its inflections; el: καριόλα = an (old-fashioned/dialectal) word for 'bed'; el: Of a bed, genitive singular",
+    "καριόλες": "el: bed (καριόλα) and its inflections; el: καριόλα = an (old-fashioned/dialectal) word for 'bed'; el: Beds, plural",
+    "καριόλες μου": "el: bed (καριόλα) and its inflections; el: καριόλα = an (old-fashioned/dialectal) word for 'bed'",
+    "кретена": "sr: cretin (medical/historical)",
+    "кретена̂": "sr: cretin (medical/historical)",
+    "кретене": "sr: cretin (medical/historical)",
+    "кретени": "sr: cretin (medical/historical)",
+    "кретенима": "sr: cretin (medical/historical)",
+    "кретеном": "sr: cretin (medical/historical)",
+    "кретену": "sr: cretin (medical/historical)",
+    "кретенчина": "sr: cretin (medical/historical)",
+    "педер": "ru: Peder, a masculine personal name",
+    "رنڈی": "ur: widow (historical); hi: widow (historical); ur: Woman or wife in older usage",
+    "ش ر م و ط ة": "ar: Rag or piece of worn cloth",
+    "شرموطة": "ar: Rag or piece of worn cloth",
+    "کھسرا": "ur: hijra/transgender community term",
+    "মাগিখোর": "bn: woman (dialectal/historical)",
+    "মাগী": "bn: woman (dialectal/historical); bn: Woman in older or coarse literary usage",
+    "মাগীকে": "bn: woman (dialectal/historical)",
+    "মাগীগুলো": "bn: woman (dialectal/historical)",
+    "মাগীগুলোর": "bn: woman (dialectal/historical)",
+    "মাগীটা": "bn: woman (dialectal/historical)",
+    "মাগীতে": "bn: woman (dialectal/historical)",
+    "মাগীদের": "bn: woman (dialectal/historical)",
+    "মাগীর": "bn: woman (dialectal/historical)",
+    "মাগীরা": "bn: woman (dialectal/historical)",
+    "개 새 끼": "ko: a dog's puppies (literal)",
+    "개새끼": "ko: a dog's puppies (literal)",
+    "개새끼가": "ko: a dog's puppies (literal)",
+    "개새끼는": "ko: a dog's puppies (literal)",
+    "개새끼들": "ko: a dog's puppies (literal)",
+    "개새끼들을": "ko: a dog's puppies (literal)",
+    "개새끼들이": "ko: a dog's puppies (literal)",
+    "개새끼를": "ko: a dog's puppies (literal)",
+    "개새끼에게": "ko: a dog's puppies (literal)",
+    "병신에게": "ko: year 丙申 / disabled (archaic)",
+    "병신은": "ko: year 丙申 / disabled (archaic); ko: The cyclical year 丙申 with a topic particle",
+    "병신을": "ko: year 丙申 / disabled (archaic); ko: The cyclical year 丙申 with an object particle",
+    "병신이": "ko: year 丙申 / disabled (archaic); ko: The cyclical year 丙申 with a subject particle",
 }
 
 
@@ -275,8 +376,21 @@ def _controls() -> List[Dict[str, str]]:
     cases = []
     for lang in _corpus()["languages"]:
         for case in lang["negative_controls"]:
-            cases.append({**case, "lang": lang["lang_name"]})
+            cases.append(
+                {**case, "lang": lang["lang_name"], "lang_code": lang["lang_code"]}
+            )
     return cases
+
+
+def _control_languages() -> Dict[str, Set[str]]:
+    """Which language section of the corpus each control sentence is filed
+    under. A reading in `de` whose control sits under Catalan is a record
+    that has drifted from its evidence, and the drift is the kind that reads
+    as fine."""
+    where: Dict[str, Set[str]] = {}
+    for case in _controls():
+        where.setdefault(case["sentence"], set()).add(case["lang_code"])
+    return where
 
 
 class TestNegativeControlsSurviveTier1(unittest.TestCase):
@@ -489,14 +603,41 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         """Obfuscated spellings are the one thing Tier 1 can block in every
         language without a reviewer, because a digit inside a word is not an
         orthography anywhere. If that stopped working, the blocking tier
-        would be English-only in practice as well as in principle."""
+        would be English-only in practice as well as in principle.
+
+        The floor moves when a term is correctly demoted - it stood at 20 and
+        eight leet forms then left Tier 1 with the words they spell - so it is
+        RE-DERIVED here, never lowered to fit a regression. What it was
+        standing in for is asserted directly beside it: the evasions Tier 1
+        catches have to span many languages and several techniques, which is
+        the claim a bare count only gestured at. A demotion that took the
+        spread down to English would pass a count and fail these.
+        """
         caught = [
             case
             for lang in _corpus()["languages"]
+            for kind in ("profanities", "evasions")
+            for case in lang[kind]
+            if case["tier"] == 1 and kind == "evasions"
+        ]
+        self.assertGreaterEqual(len(caught), 18)
+        languages = {
+            lang["lang_code"]
+            for lang in _corpus()["languages"]
             for case in lang["evasions"]
             if case["tier"] == 1
-        ]
-        self.assertGreaterEqual(len(caught), 20)
+        }
+        self.assertGreaterEqual(
+            len(languages),
+            15,
+            "Tier 1 catches obfuscated spellings in too few languages; the "
+            "blocking tier is becoming English-only in practice",
+        )
+        self.assertGreaterEqual(
+            len({case["technique"] for case in caught}),
+            5,
+            "the evasion techniques Tier 1 still catches have narrowed",
+        )
         for case in caught:
             with self.subTest(term=case["term"]):
                 self.assertTrue(matches_tier1(case["term"]))
@@ -775,6 +916,63 @@ class TestWhatKeepsATermOutOfTier1(unittest.TestCase):
         self.assertFalse(_is_spelled_out("hijo de puta"))
         self.assertFalse(_is_spelled_out("बहनचोद का"))
 
+    def test_no_term_the_review_named_a_reading_for_is_in_tier1(self) -> None:
+        """The other half of the same rule, for the readings that never
+        produced a sentence.
+
+        Fifty-nine terms had a concrete benign reading named in the model
+        review - `chuja` is a Korean island, `kaltak` a wooden saddle frame,
+        `kariola` a bed, `viado` a striped fabric, `magi` a woman in older
+        Bengali. None of them is in Tier 1 and none of them may go back,
+        whatever basis is written beside it later. `_REVIEW_NAMED_A_BENIGN_
+        READING` says which, and what the reading is.
+
+        Iterating the pinned list rather than the data is the point: a test
+        that iterated the data would pass the moment somebody deleted the
+        evidence along with the term's demotion, which is exactly the move
+        this exists to stop.
+        """
+        classified = {entry["term"]: entry for entry in universal_terms()}
+        self.assertEqual(
+            len(_REVIEW_NAMED_A_BENIGN_READING),
+            59,
+            "an entry has been dropped from the pinned readings",
+        )
+        for term, reading in _REVIEW_NAMED_A_BENIGN_READING.items():
+            with self.subTest(term=term):
+                entry = classified.get(term)
+                self.assertIsNotNone(
+                    entry, f"{term!r} has a named benign reading and no decision"
+                )
+                assert entry is not None
+                self.assertFalse(
+                    entry["tier1"],
+                    f"{term!r} has a named benign reading ({reading}) and Tier 1 "
+                    f"blocks it before the message is sent",
+                )
+                self.assertTrue(reading.strip(), "a pinned reading states itself")
+                self.assertIn(
+                    ":", reading, "a reading names the language it is a reading in"
+                )
+
+    def test_the_pinned_readings_are_readings_of_their_own_term(self) -> None:
+        """And the list cannot be filled with terms nobody carries.
+
+        Every pinned term is a real row of the classification and a real
+        wordlist term, so the count above is a count of live decisions rather
+        than of strings.
+        """
+        listed = {
+            term
+            for words in json.loads(_WORDLIST_PATH.read_text(encoding="utf-8")).values()
+            for term in words
+        }
+        self.assertEqual(
+            set(_REVIEW_NAMED_A_BENIGN_READING) - listed,
+            set(),
+            "a pinned reading names a term the wordlist does not carry",
+        )
+
     def test_a_recorded_benign_reading_demotes_the_term(self) -> None:
         """Over EVERY classified term, whatever basis promoted it.
 
@@ -823,6 +1021,12 @@ class TestWhatKeepsATermOutOfTier1(unittest.TestCase):
                         f"{reading['control']!r} is recorded as the sentence "
                         f"{entry['term']!r} blocked, and the term does not "
                         f"occur in it the way the matcher looks for it",
+                    )
+                    self.assertIn(
+                        reading["lang"],
+                        _control_languages()[reading["control"]],
+                        "the control is filed under a different language than "
+                        "the reading claims to be in",
                     )
         # And the rule rejects what it is for, on records.
         good = dict(recorded[0]["benign_reading"][0])
@@ -1170,15 +1374,82 @@ class TestTheVocabularySweep(unittest.TestCase):
     def test_every_sweep_demotion_names_a_real_collision(self) -> None:
         """A term demoted by the sweep records the word that demoted it, and
         the record is re-checked: the word is in that language's vocabulary,
-        and the term's needle blocks it."""
-        demoted = [entry for entry in universal_terms() if "sweep_collision" in entry]
-        for entry in demoted:
-            collision = entry["sweep_collision"]
+        and the term's needle blocks it.
+
+        Exercised on RECORDS as well as on the data, because the sweep has
+        demoted nothing so far - it is the tripwire for a future demotion, and
+        a loop over an empty list is not one. Same reason the native-review
+        rule is exercised on records: an assertion over an empty set protects
+        nothing, and this file has been caught by that before.
+        """
+        for entry in universal_terms():
+            if "sweep_collision" not in entry:
+                continue
             with self.subTest(term=entry["term"]):
-                self.assertFalse(entry["tier1"])
-                self.assertIn(collision["word"], _vocabulary(collision["lang"]))
-                self.assertEqual(needle(collision["word"]), entry["needle"])
-                self.assertIn(collision["word"], entry["note"])
+                self.assertIsNone(_sweep_collision_problem(entry))
+
+        # `cunt` is in the English vocabulary, which is what makes it usable
+        # as the record this rule is exercised on.
+        good: TermRecord = {
+            "term": "cunt",
+            "langs": ["en"],
+            "match": "token",
+            "needle": "cunt",
+            "tier1": False,
+            "reason": "benign_homograph",
+            "note": "the sweep blocks the ordinary word cunt in en",
+            "sweep_collision": {"lang": "en", "word": "cunt"},
+        }
+        self.assertIsNone(_sweep_collision_problem(good))
+        cases: List[Tuple[Dict[str, Any], str]] = [
+            ({"sweep_collision": None}, "record"),
+            ({"sweep_collision": {"lang": "xx", "word": "cunt"}}, "lang"),
+            ({"sweep_collision": {"lang": "en", "word": None}}, "word"),
+            ({"sweep_collision": {"lang": "en", "word": "  "}}, "word"),
+            # A term the sweep demoted that is still in Tier 1 is the whole
+            # thing this record exists to make impossible.
+            ({"tier1": True}, "tier1"),
+            (
+                {"sweep_collision": {"lang": "en", "word": "zzzzunlikelyzzzz"}},
+                "vocabulary",
+            ),
+            ({"needle": "cnut"}, "needle"),
+            ({"note": "a note that does not name the word"}, "note"),
+        ]
+        for override, expected in cases:
+            with self.subTest(override=override):
+                mutated = cast(TermRecord, {**good, **override})
+                self.assertEqual(_sweep_collision_problem(mutated), expected)
+
+
+def _sweep_collision_problem(entry: TermRecord) -> Optional[str]:
+    """Why this term's `sweep_collision` is not usable evidence, or None.
+
+    Typed and checked in the order a reader would object: whether there is a
+    record, whether it names a supported language and a word, whether the
+    term actually left Tier 1, and only then whether the word is real - in
+    that language's vocabulary, blocked by THIS needle, and named in the note
+    a reader sees.
+    """
+    collision = entry.get("sweep_collision")
+    if not isinstance(collision, dict):
+        return "record"
+    lang = collision.get("lang")
+    if lang not in _LANGS:
+        return "lang"
+    word = collision.get("word")
+    # Typed, not coerced: `str(None)` is a non-empty string.
+    if not isinstance(word, str) or not word.strip():
+        return "word"
+    if entry.get("tier1"):
+        return "tier1"
+    if word not in _vocabulary(str(lang)):
+        return "vocabulary"
+    if needle(word) != entry.get("needle"):
+        return "needle"
+    if word not in str(entry.get("note", "")):
+        return "note"
+    return None
 
 
 def _adjudicated_langs(entry: TermRecord) -> List[str]:
@@ -1281,7 +1552,7 @@ class TestTheMatchingRules(unittest.TestCase):
         for text in ("김 씨 발이 아파요", "민수 씨 발 아파요?", "개 새 끼"):
             with self.subTest(text=text):
                 self.assertFalse(matches_tier1(text))
-        for text in ("n 1 g g e r", "b 4 n g s a t", "б л 9 д ь"):
+        for text in ("n 1 g g e r", "p u k 1 m a k", "б л 9 д ь"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -1351,7 +1622,7 @@ class TestTheMatchingRules(unittest.TestCase):
         whole-run test let one short word in front defeat it: `p 1 c a`
         blocked and `Say a p 1 c a now` did not.
 
-        Driven on `b 4 n g s a t` because `p 1 c a` - the spelling the bug
+        Driven on `p u k 1 m a k` because `p 1 c a` - the spelling the bug
         was found on - is no longer in Tier 1, and neither is the `v 1 t t u`
         that stood here until `vittu` was demoted for the French surname.
         The rule is about runs, and a rule exercised on a term nobody
@@ -1359,10 +1630,10 @@ class TestTheMatchingRules(unittest.TestCase):
         Tier 1 still carries.
         """
         for text in (
-            "b 4 n g s a t",
-            "Say a b 4 n g s a t now",
+            "p u k 1 m a k",
+            "Say a p u k 1 m a k now",
             "x n 1 g g e r",
-            "a b b 4 n g s a t",
+            "a b p u k 1 m a k",
         ):
             with self.subTest(text=text):
                 self.assertEqual(check_text(text, _PHONE_REGIONS), REASON_PROFANITY)
@@ -1375,17 +1646,17 @@ class TestTheMatchingRules(unittest.TestCase):
 
         for formatted in (
             "<table><tr><td>n</td><td>1</td><td>g</td><td>g</td></tr></table>",
-            "<p>b</p><p>4</p><p>n</p><p>g</p><p>s</p><p>a</p><p>t</p>",
-            "<ol><li>b</li><li>4</li><li>n</li><li>g</li><li>s</li>"
-            "<li>a</li><li>t</li></ol>",
-            "b<br>4<br>n<br>g<br>s<br>a<br>t",
+            "<p>p</p><p>u</p><p>k</p><p>1</p><p>m</p><p>a</p><p>k</p>",
+            "<ol><li>p</li><li>u</li><li>k</li><li>1</li><li>m</li>"
+            "<li>a</li><li>k</li></ol>",
+            "p<br>u<br>k<br>1<br>m<br>a<br>k",
         ):
             with self.subTest(formatted=formatted):
                 self.assertIsNone(
                     check_text(_displayed_text(formatted), _PHONE_REGIONS)
                 )
         # And a word written with spaces inside it stays on one line.
-        self.assertEqual(check_text("b 4 n g s a t", _PHONE_REGIONS), REASON_PROFANITY)
+        self.assertEqual(check_text("p u k 1 m a k", _PHONE_REGIONS), REASON_PROFANITY)
 
     def test_a_rejoining_needs_whitespace_and_a_digit(self) -> None:
         """Both conditions, because each on its own blocks ordinary text.
@@ -1402,7 +1673,7 @@ class TestTheMatchingRules(unittest.TestCase):
             "Our domain is p1.ca and it works.",
             "p1-ca",
             "P3/DER",
-            "b4.ngsat",
+            "puk1.mak",
             "n1.gger",
             "p.1.c.a",
             "A 1 B 2 C 3",
@@ -1410,7 +1681,7 @@ class TestTheMatchingRules(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(check_text(text, _PHONE_REGIONS))
-        for text in ("b 4 n g s a t", "n 1 g g e r", "б л 9 д ь"):
+        for text in ("p u k 1 m a k", "n 1 g g e r", "б л 9 д ь"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -1507,7 +1778,7 @@ class TestTheMatchingRules(unittest.TestCase):
         `test_a_list_of_letters_is_not_an_evasion` and
         `test_a_rejoining_needs_whitespace_and_a_digit`.
         """
-        for text in ("n 1 g g e r", "b 4 n g s a t", "cuuuunt"):
+        for text in ("n 1 g g e r", "p u k 1 m a k", "cuuuunt"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -1601,6 +1872,15 @@ class TestALeetFormCarriesNoEvidenceOfItsOwn(unittest.TestCase):
         wordlist itself demotes for a recorded benign reading. `pica`, `geci`
         and `pondan` are demoted in the wordlist and would fail this test on
         that alone.
+
+        The second source is `_REASONS_THAT_NAME_AN_ORDINARY_SENSE`, and it is
+        a set rather than three names written here because it was three names
+        written here: `unadjudicated` was missing, so `b4ngsat` and `k0kot`
+        stayed in Tier 1 while `bangsat` (a bedbug in Malay) and `kokot` (a
+        dialectal rooster) sat demoted two rows away, and `Room B4NGSAT is
+        down the hall` was rejected before persist. The question the rule asks
+        is whether the word a needle spells has an ordinary reading, and the
+        reason a term was demoted for one is not part of that question.
         """
         readings = set(_policy()["skeletons_with_a_benign_reading"])
         self.assertTrue(readings, "the recorded readings list is empty")
@@ -1608,8 +1888,7 @@ class TestALeetFormCarriesNoEvidenceOfItsOwn(unittest.TestCase):
             entry["needle"]
             for entry in universal_terms()
             if not entry["tier1"]
-            and entry["reason"]
-            in {"benign_homograph", "benign_sense_in_own_language", "register"}
+            and entry["reason"] in _REASONS_THAT_NAME_AN_ORDINARY_SENSE
         }
         checked = 0
         for entry in _promoted():
