@@ -931,8 +931,17 @@ class TestWhatKeepsATermOutOfTier1(unittest.TestCase):
         that iterated the data would pass the moment somebody deleted the
         evidence along with the term's demotion, which is exactly the move
         this exists to stop.
+
+        Matched by NEEDLE rather than by the authored spelling, because the
+        matcher is. Keyed on the term string, the cold gate walked straight
+        round it: leave pinned `chuja` demoted, add a second row spelled
+        `Chuja` and promote that - the lookup misses, the suite stays green,
+        and `We visited Chuja Island.` blocks again. Two spellings of one
+        needle are one entry in the loaded core, so the veto has to be too.
         """
-        classified = {entry["term"]: entry for entry in universal_terms()}
+        by_needle: Dict[str, List[TermRecord]] = {}
+        for entry in universal_terms():
+            by_needle.setdefault(entry["needle"], []).append(entry)
         self.assertEqual(
             len(_REVIEW_NAMED_A_BENIGN_READING),
             59,
@@ -940,16 +949,17 @@ class TestWhatKeepsATermOutOfTier1(unittest.TestCase):
         )
         for term, reading in _REVIEW_NAMED_A_BENIGN_READING.items():
             with self.subTest(term=term):
-                entry = classified.get(term)
-                self.assertIsNotNone(
-                    entry, f"{term!r} has a named benign reading and no decision"
+                rows = by_needle.get(needle(term), [])
+                self.assertTrue(
+                    rows, f"{term!r} has a named benign reading and no decision"
                 )
-                assert entry is not None
-                self.assertFalse(
-                    entry["tier1"],
-                    f"{term!r} has a named benign reading ({reading}) and Tier 1 "
-                    f"blocks it before the message is sent",
-                )
+                for row in rows:
+                    self.assertFalse(
+                        row["tier1"],
+                        f"{row['term']!r} is the needle of {term!r}, which has a "
+                        f"named benign reading ({reading}), and Tier 1 blocks it "
+                        f"before the message is sent",
+                    )
                 self.assertTrue(reading.strip(), "a pinned reading states itself")
                 self.assertIn(
                     ":", reading, "a reading names the language it is a reading in"
@@ -996,6 +1006,16 @@ class TestWhatKeepsATermOutOfTier1(unittest.TestCase):
         recorded = [e for e in universal_terms() if "benign_reading" in e]
         self.assertTrue(recorded, "no recorded benign reading to check")
         controls = {case["sentence"] for case in _controls()}
+        # By NEEDLE, for the reason spelled out in the pinned-readings test:
+        # a second row spelling the same needle is the same entry in the
+        # loaded core, and promoting it would otherwise bypass the record.
+        vetoed = {entry["needle"] for entry in recorded}
+        for entry in universal_terms():
+            if entry["needle"] in vetoed and entry["tier1"]:
+                self.fail(
+                    f"{entry['term']!r} is in Tier 1 and its needle "
+                    f"{entry['needle']!r} carries a recorded benign reading"
+                )
         for entry in recorded:
             readings = entry["benign_reading"]
             with self.subTest(term=entry["term"]):
@@ -1897,6 +1917,18 @@ class TestALeetFormCarriesNoEvidenceOfItsOwn(unittest.TestCase):
         # through a leet spelling of it.
         demoted_for_a_reading |= {
             needle(term) for term in _REVIEW_NAMED_A_BENIGN_READING
+        }
+        # And every term carrying a `benign_reading` record, whatever its
+        # reason says. Selecting on `reason` alone was a second way round the
+        # same rule: the cold gate kept `cazzo`'s whole sourced record and
+        # control, relabelled its reason `model_review_not_promoted`, and
+        # re-promoted `c4zzo` - the suite stayed green and `Room C4ZZO is
+        # down the hall.` blocked. A term that carries the evidence carries
+        # it; the label beside it is not the evidence.
+        demoted_for_a_reading |= {
+            entry["needle"]
+            for entry in universal_terms()
+            if not entry["tier1"] and "benign_reading" in entry
         }
         checked = 0
         for entry in _promoted():
