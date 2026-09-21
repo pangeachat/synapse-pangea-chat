@@ -246,6 +246,131 @@ _REVIEW_NAMED_A_BENIGN_READING = {
 }
 
 
+# The kinds of benign reading that demote a term. A CLOSED vocabulary, and
+# closed is the whole of the point: there is no member for "the term is what
+# the thing was named", because that is not a reading of a different word.
+#
+# `different_word` is a separate lexeme spelled the same way - the nautical
+# verb `cazzare`, whose first person singular is `cazzo`. `different_sense`
+# is one form carrying a second ordinary sense of its own - `Schwuchtel`, a
+# frivolous person in Waldeck. `different_name` is a name built out of
+# something other than the term - `Maricon` from Maria Concepcion, `FASZ`
+# from the initials of a newspaper, `Chuj` from the Maya ethnonym.
+_READING_KINDS = {
+    "different_word",
+    "different_sense",
+    "different_name",
+}
+
+# What a reading's `own_origin` may not name.
+#
+# A benign reading has to say where the colliding word came from. When the
+# only answer is a published work, the thing was named WITH the term and the
+# reading is the term itself, mentioned rather than used - which is the one
+# shape this gate exists to reject. See
+# `TestAWorkTitleIsNotABenignReading` for the eleven terms that taught it.
+_A_WORK_IS_NOT_AN_ORIGIN = (
+    "novel",
+    "film",
+    "movie",
+    "album",
+    "song",
+    "track",
+    "single",
+    "book",
+    "magazine",
+    "quarterly",
+    "autobiography",
+    "pamphlet",
+    "racehorse",
+    "thoroughbred",
+    "isbn",
+    "title",
+)
+
+
+# The eleven terms a work title demoted, and what it was.
+#
+# Each left Tier 1 during the model review because the vulgar word names
+# something published: novels (`Hurensohn`, `L'Enculé`, `El hijo de puta
+# sentimental`), album tracks (`Figlio di puttana`, `Petit Pede`), an
+# artist's book (`Fils de pute`), a band (`Huora`), a magazine (`계간
+# 씨발아`), an autobiography (`Prezident, nebo buzerant?`), a pamphlet
+# (`Discurs sobre el fill de puta`) and a racehorse (`Filho da Puta`).
+#
+# A work title is not a benign reading, and neither is a proper name that is
+# simply the vulgar phrase itself. A benign reading demotes a term only when
+# the needle collides with a DIFFERENT word, sense or name that has its own
+# etymology - `cazzare` the verb for `cazzo`, the Chuj ethnonym for the
+# Polish `chuj-` paradigm. A work named with the vulgar word is the same
+# word, mentioned; and every profanity has titled something, so applied as a
+# demotion the rule empties Tier 1 of the primary insult of nearly every
+# Romance language, with a national library always able to supply the
+# citation.
+#
+# Pinned here with the sentence each term has to keep rejecting, because
+# these demotions carried sources, controls and catalogue numbers and read
+# as the most thorough in the file.
+_A_WORK_TITLE_IS_NOT_A_READING: Dict[str, Tuple[str, str]] = {
+    "hijo de puta": (
+        "El hijo de puta sentimental, Ildefonso Arenas's 2016 novel",
+        "Cállate, hijo de puta.",
+    ),
+    "fils de pute": (
+        "Fils de pute, Eric Pougeau's artist's book",
+        "Tais-toi, fils de pute.",
+    ),
+    "figlio di puttana": (
+        "Figlio di puttana, track six of Villa Inferno",
+        "Stai zitto, figlio di puttana.",
+    ),
+    "enculé": (
+        "L'Enculé, Marc-Edouard Nabe's novel",
+        "Tais-toi, enculé.",
+    ),
+    "pédé": (
+        "Petit Pede, a Renaud song",
+        "Tais-toi, pédé.",
+    ),
+    "huora": (
+        "Huora, a Tampere band",
+        "Ole hiljaa, huora.",
+    ),
+    "fill de puta": (
+        "Discurs sobre el fill de puta, Alberto Pimenta's pamphlet",
+        "Calla, fill de puta.",
+    ),
+    "buzerant": (
+        "Prezident, nebo buzerant?, Jiri Hromada's autobiography",
+        "Drž hubu, buzerant.",
+    ),
+    "filho da puta": (
+        "Filho da Puta, the Thoroughbred that won the 1815 St Leger",
+        "Cala-te, filho da puta.",
+    ),
+    "Hurensohn": (
+        "Hurensohn, Gabriel Loidolt's novel and the film of it",
+        "Halt die Klappe, du Hurensohn.",
+    ),
+    "씨발아": (
+        "계간 씨발아, an urban-farming quarterly",
+        "야 씨발아 그만해.",
+    ),
+}
+
+# And the leet spellings that were demoted only by inheriting one of the
+# readings above. A leet form inherits the readings of the word it spells,
+# which is the rule working: when the word it spells has no benign reading
+# after all, the inheritance has nothing to carry.
+_LEET_INHERITORS_OF_A_TITLE: Dict[str, Tuple[str, str]] = {
+    "h1jo de puta": ("hijo de puta", "Cállate, h1jo de puta."),
+    "f1ls de pute": ("fils de pute", "Tais-toi, f1ls de pute."),
+    "f1ll de puta": ("fill de puta", "Calla, f1ll de puta."),
+    "f1lho da puta": ("filho da puta", "Cala-te, f1lho da puta."),
+    "hu0ra": ("huora", "Ole hiljaa, hu0ra."),
+}
+
+
 # What a digit in a needle can be read as, for the leet-inheritance audit.
 # Built from the Tier 2 matcher's own substitutions so the audit cannot fall
 # behind the matcher - see `_deleet` for the two failures that taught this.
@@ -319,7 +444,7 @@ def _carries_the_term(entry: TermRecord, sentence: str) -> bool:
     `in`, because a substring test would accept `salope` inside `salopette`
     and this is the check that says a recorded control is evidence about
     THIS term. Phrase terms go through the phrase scan, which is what makes
-    `Filho da Puta won the 1815 St Leger.` count for `filho da puta`.
+    `Cala-te, filho da puta.` count for `filho da puta`.
     """
     spans = split_spans(sentence.casefold())
     stored = needle(entry["term"])
@@ -331,15 +456,27 @@ def _carries_the_term(entry: TermRecord, sentence: str) -> bool:
 def _reading_problem(reading: Dict[str, Any]) -> Optional[str]:
     """Why a recorded `benign_reading` is not usable evidence, or None.
 
-    Typed, because `str(None)` is a non-empty string and these five fields
-    are the whole of what makes a demotion auditable: which language, what the
-    word means there, who named it, the sentence that reproduced, and where
-    the reading is published."""
+    Typed, because `str(None)` is a non-empty string and these fields are the
+    whole of what makes a demotion auditable: which language, what the word
+    means there, who named it, the sentence that reproduced, where the reading
+    is published, what KIND of reading it is, and where the colliding word
+    came from.
+
+    The last two are what eleven demotions recorded on a work title did not
+    have to say, and could not have said. The kind comes from a closed
+    vocabulary with no member for a title, and the origin may not name a
+    published work: a thing titled WITH the vulgar word has no origin of its
+    own to state, because it is called that because of the term."""
     if reading.get("lang") not in _LANGS:
         return "lang"
-    for field in ("meaning", "named_by", "control", "source"):
+    for field in ("meaning", "named_by", "control", "source", "own_origin"):
         if not isinstance(reading.get(field), str) or not reading[field].strip():
             return field
+    if reading.get("reading_kind") not in _READING_KINDS:
+        return "reading_kind"
+    origin = str(reading["own_origin"]).casefold()
+    if any(word in origin for word in _A_WORK_IS_NOT_AN_ORIGIN):
+        return "own_origin_names_a_work"
     return None
 
 
@@ -1094,6 +1231,159 @@ class TestWhatKeepsATermOutOfTier1(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertEqual(_reading_problem({**good, field: None}), field)
                 self.assertEqual(_reading_problem({**good, field: " "}), field)
+
+
+class TestAWorkTitleIsNotABenignReading(unittest.TestCase):
+    """Naming a work is mention, not use, and it does not demote a term.
+
+    Eleven terms left Tier 1 because the vulgar word titles something - a
+    novel, a film, an album track, an artist's book, a band, a magazine, an
+    autobiography, a pamphlet, a racehorse. Each demotion carried a source,
+    a catalogue number and a live negative control, and read as the most
+    thorough work in the file. It was still the wrong rule: a work named
+    WITH the vulgar word is the same word being mentioned, not a different
+    word that happens to collide with it, and every profanity has titled
+    something. Applied as a demotion it empties Tier 1 of the primary insult
+    of nearly every Romance language, and a national library will always
+    supply the citation.
+
+    The distinction this file already drew elsewhere is the right one:
+    `stronzo` and `klootzak` stayed in Tier 1 because their literal senses -
+    `turd`, `scrotum` - are the same vulgar word, not a separate reading.
+    `cazzare`, the nautical verb whose first person singular is `cazzo`, IS
+    a separate reading and demotes.
+
+    Three assertions, because the failure had three shapes: the terms are
+    back and still block, the readings that demoted them are gone rather
+    than relabelled, and no reading anywhere may rest on a title again.
+    """
+
+    def test_the_overruled_terms_are_in_tier1_and_still_block(self) -> None:
+        """Iterating the PINNED list rather than the data, for the reason
+        `test_no_term_the_review_named_a_reading_for_is_in_tier1` gives: a
+        loop over the data passes the moment somebody deletes the row."""
+        by_term = {entry["term"]: entry for entry in universal_terms()}
+        self.assertEqual(
+            len(_A_WORK_TITLE_IS_NOT_A_READING),
+            11,
+            "an entry has been dropped from the overruled demotions",
+        )
+        pinned = {**_A_WORK_TITLE_IS_NOT_A_READING, **_LEET_INHERITORS_OF_A_TITLE}
+        for term, (what, sentence) in pinned.items():
+            with self.subTest(term=term):
+                entry = by_term.get(term)
+                self.assertIsNotNone(entry, f"{term!r} is not classified at all")
+                assert entry is not None
+                self.assertTrue(
+                    entry["tier1"],
+                    f"{term!r} was demoted for {what} and a work title is not "
+                    f"a benign reading",
+                )
+                self.assertTrue(what.strip(), "the overruled reading states itself")
+                self.assertTrue(
+                    _carries_the_term(entry, sentence),
+                    f"{sentence!r} is pinned as the sentence {term!r} must "
+                    f"reject and the term does not occur in it the way the "
+                    f"matcher looks for it",
+                )
+                self.assertEqual(
+                    check_text(sentence, _PHONE_REGIONS),
+                    REASON_PROFANITY,
+                    f"Tier 1 no longer rejects {sentence!r} before send",
+                )
+
+    def test_none_of_them_carries_a_benign_reading_again(self) -> None:
+        """By NEEDLE, so a second row spelling the same needle cannot carry
+        the record back in - the bypass the pinned-readings test names."""
+        overruled = {needle(term) for term in _A_WORK_TITLE_IS_NOT_A_READING}
+        overruled |= {needle(term) for term in _LEET_INHERITORS_OF_A_TITLE}
+        for entry in universal_terms():
+            if entry["needle"] not in overruled:
+                continue
+            with self.subTest(term=entry["term"]):
+                self.assertNotIn(
+                    "benign_reading",
+                    entry,
+                    "the work-title reading is recorded again on a term the "
+                    "ruling put back into Tier 1",
+                )
+
+    def test_no_recorded_reading_rests_on_a_work_title(self) -> None:
+        """The general rule, over every reading in the data and over
+        records.
+
+        A reading says which KIND it is, out of a closed vocabulary with no
+        member for a title, and where the colliding word came from. An
+        origin that has to name a published work is the title case: the
+        thing is called that BECAUSE of the term.
+
+        Exercised on constructed records as well, because a rule asserted
+        only over data that already complies is not one - the same reason
+        the native-review and sweep rules are exercised on records.
+        """
+        for entry in universal_terms():
+            for reading in entry.get("benign_reading", []):
+                with self.subTest(term=entry["term"], lang=reading.get("lang")):
+                    self.assertIn(reading.get("reading_kind"), _READING_KINDS)
+                    self.assertIsNone(_reading_problem(reading))
+        self.assertNotIn(
+            "work_title",
+            _READING_KINDS,
+            "the vocabulary of readings has grown a member for a title",
+        )
+        # The Hurensohn record, as it was written, against the rule.
+        titled = {
+            "lang": "de",
+            "meaning": "Hurensohn is Gabriel Loidolt's 1998 novel",
+            "named_by": "the cold cross-model gate on this change",
+            "control": "Hurensohn ist ein Roman von Gabriel Loidolt.",
+            "source": "https://www.filmdienst.de/film/details/523973/hurensohn",
+            "reading_kind": "different_name",
+            "own_origin": "the title of Gabriel Loidolt's 1998 novel",
+        }
+        self.assertEqual(_reading_problem(titled), "own_origin_names_a_work")
+        # And the shape that does demote: a different word, with an origin
+        # of its own.
+        separate = {
+            **titled,
+            "lang": "it",
+            "meaning": "first person singular of the nautical verb cazzare",
+            "control": "Io cazzo la randa.",
+            "source": "https://www.treccani.it/vocabolario/cazzare/",
+            "reading_kind": "different_word",
+            "own_origin": "the Italian nautical verb `cazzare`, to haul a "
+            "sheet tight",
+        }
+        self.assertIsNone(_reading_problem(separate))
+        for kind in (None, "", "work_title", "mention_not_use", "named_for_the_term"):
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    _reading_problem({**separate, "reading_kind": kind}),
+                    "reading_kind",
+                )
+        for origin in (None, " "):
+            with self.subTest(origin=origin):
+                self.assertEqual(
+                    _reading_problem({**separate, "own_origin": origin}),
+                    "own_origin",
+                )
+        for word in _A_WORK_IS_NOT_AN_ORIGIN:
+            with self.subTest(word=word):
+                self.assertEqual(
+                    _reading_problem({**separate, "own_origin": f"the {word} of it"}),
+                    "own_origin_names_a_work",
+                )
+
+    def test_the_policy_states_the_rule(self) -> None:
+        """The prose a reviewer reads has to carry it too, with an example
+        of each side - otherwise the next reviewer re-derives the wrong rule
+        from the same evidence, which is how this happened."""
+        rule = str(_policy()["a_work_title_is_not_a_benign_reading"]).lower()
+        self.assertIn("cazzare", rule)
+        self.assertIn("hurensohn", rule)
+        for kind in sorted(_READING_KINDS):
+            with self.subTest(kind=kind):
+                self.assertIn(kind, rule)
 
 
 class TestNoAcceptedFalsePositives(unittest.TestCase):

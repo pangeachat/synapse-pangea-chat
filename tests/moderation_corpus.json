@@ -76,8 +76,6 @@
    "Mathilde Vittu enseigne au conservatoire.",
    "Maricon is a Filipino given name.",
    "Saya membeli kue kontol kejepit di Bantul.",
-   "Filho da Puta won the 1815 St Leger.",
-   "Hurensohn ist ein Roman von Gabriel Loidolt.",
    "Voda curi u curak iza kuće.",
    "Kurwa is a village in Gorakhpur district.",
    "Хуй-нэн — шестой патриарх чань-буддизма.",
@@ -85,7 +83,6 @@
    "조정의 병신들이 권력을 쥐었다.",
    "임금은 병신들을 멀리하였다.",
    "Er ist eine rechte Schwuchtel, sagte man früher in Waldeck.",
-   "Kävin katsomassa Huora-yhtyeen keikkaa Tampereella.",
    "असम के चूतिया समुदाय को अनुसूचित जनजाति का दर्जा देने की मांग फिर से उठी है।",
    "آسام کی چوتیا سلطنت سولہویں صدی تک قائم رہی۔",
    "Większość Chujów zamieszkuje góry Gwatemali.",
@@ -100,19 +97,11 @@
    "Pan Čurák bydlí ve vedlejším domě.",
    "Город Бутаре с 2006 года официально называется Хуе.",
    "Хуи — это традиционное собрание у маори.",
-   "계간 씨발아 잡지를 샀다.",
    "غرفة 5ول في نهاية الممر.",
    "মীমাংসা দর্শনে চোদনা বলিতে বেদবাক্যের বিধিমূলক প্রেরণাকে বুঝায়।",
    "সেই বেদীয় চোদনার অন্তর্নিহিত দিকনির্দেশনা স্বরূপ আত্মপ্রকাশ করেন।",
-   "Éric Pougeau a publié Fils de pute aux éditions Dilecta en 2011.",
    "Рукоятка этого пичака сделана из рога яка и украшена бирюзой.",
-   "Je viens de finir L'Enculé, le roman de Marc-Édouard Nabe.",
-   "Estoy leyendo El hijo de puta sentimental, la novela de Ildefonso Arenas.",
-   "Figlio di puttana è la sesta traccia di Villa Inferno degli Zen Circus.",
-   "Наталья Сергеевна Пичко работает в университете.",
-   "Discurs sobre el fill de puta és la traducció catalana del pamflet d'Alberto Pimenta.",
-   "Petit pédé est une chanson de Renaud parue sur l'album Boucan d'enfer.",
-   "Kniha Jiřího Hromady se jmenuje Prezident, nebo buzerant?"
+   "Наталья Сергеевна Пичко работает в университете."
   ]
  },
  "languages": [
@@ -124,7 +113,7 @@
      "term": "fill de puta",
      "sentence": "Ets un fill de puta.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "puta",
@@ -150,7 +139,7 @@
      "term": "f1ll de puta",
      "base_term": "fill de puta",
      "technique": "leetspeak",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "marico",
@@ -178,13 +167,6 @@
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'puta' is on the Tier 2 list, which is the recall-oriented one.",
      "tier2_reason": "term_is_on_the_tier2_list"
-    },
-    {
-     "sentence": "Discurs sobre el fill de puta és la traducció catalana del pamflet d'Alberto Pimenta.",
-     "why_benign": "Discurs sobre el fill de puta, Alberto Pimenta, translated by Josep Vallespir Pons, Ed. Males Herbes, Barcelona 2024, ISBN 9788412782431, in the Catalan union catalogue (CCUC) and held by the Biblioteca Publica de Tarragona at 316.6 PIM",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`fill de puta` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -202,7 +184,7 @@
      "term": "Hurensohn",
      "sentence": "Hau ab, du Hurensohn.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "Scheiße",
@@ -273,13 +255,6 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`fasz` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
-    },
-    {
-     "sentence": "Hurensohn ist ein Roman von Gabriel Loidolt.",
-     "why_benign": "Hurensohn is the title of Gabriel Loidolt's novel and of Michael Sturminger's film of it, so naming the work is ordinary content.",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`Hurensohn` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     },
     {
      "sentence": "Er ist eine rechte Schwuchtel, sagte man früher in Waldeck.",
@@ -411,13 +386,6 @@
      "tier2_note": "`maricon` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     },
     {
-     "sentence": "Filho da Puta won the 1815 St Leger.",
-     "why_benign": "Filho da Puta was the Thoroughbred that won the 1815 St Leger Stakes; the phrase term matches the horse's name as a run of whole words.",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`filho da puta` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
-    },
-    {
      "sentence": "Kurwa is a village in Gorakhpur district.",
      "why_benign": "Kurwa is the name of villages in the Gorakhpur and Sant Kabir Nagar districts of Uttar Pradesh.",
      "tier2_matcher": "flags",
@@ -434,7 +402,7 @@
      "term": "hijo de puta",
      "sentence": "Eres un hijo de puta.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "puta",
@@ -466,7 +434,7 @@
      "term": "h1jo de puta",
      "base_term": "hijo de puta",
      "technique": "leetspeak",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "m a r i c ó n",
@@ -497,13 +465,6 @@
     {
      "sentence": "Jorge estudia jardinería.",
      "why_benign": "A common name and subject must not trigger “joder” fuzzily."
-    },
-    {
-     "sentence": "Estoy leyendo El hijo de puta sentimental, la novela de Ildefonso Arenas.",
-     "why_benign": "El hijo de puta sentimental is Ildefonso Arenas's novel, Edhasa (colección Tusitala), 2016, ISBN 978-84-350-1240-9, in the CEGAL booksellers' database and OpenLibrary. The phrase matches the three consecutive words inside the title",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`hijo de puta` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -515,7 +476,7 @@
      "term": "fils de pute",
      "sentence": "Espèce de fils de pute.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "salope",
@@ -527,7 +488,7 @@
      "term": "enculé",
      "sentence": "Dégage, enculé.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "putain",
@@ -539,7 +500,7 @@
      "term": "pédé",
      "sentence": "Ils l'ont insulté en disant pédé.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -547,7 +508,7 @@
      "term": "f1ls de pute",
      "base_term": "fils de pute",
      "technique": "leetspeak",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "e n c u l é",
@@ -592,27 +553,6 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`vittu` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
-    },
-    {
-     "sentence": "Éric Pougeau a publié Fils de pute aux éditions Dilecta en 2011.",
-     "why_benign": "Fils de pute is an artist's book by Éric Pougeau, Éditions Dilecta, 2011, ISBN 9782916275956, catalogued by the Bibliothèque nationale de France at ark:/12148/cb42568190v. The phrase term matches the title as a run of whole words - the same shape as the Hurensohn novel",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`fils de pute` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
-    },
-    {
-     "sentence": "Je viens de finir L'Enculé, le roman de Marc-Édouard Nabe.",
-     "why_benign": "L'Enculé is Marc-Édouard Nabe's 2011 novel, ISBN 9782953487916, catalogued by the Bibliothèque nationale de France. An apostrophe is a separator, so Tier 1 matched `enculé` as a whole token inside the title - the marie-salope shape. The same BnF query also returns `Enculé ! L'école est-elle homophobe ?`, an anti-homophobia book",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`enculé` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
-    },
-    {
-     "sentence": "Petit pédé est une chanson de Renaud parue sur l'album Boucan d'enfer.",
-     "why_benign": "Petit Pédé is track 2 of Renaud's album Boucan d'enfer, released 28 May 2002 on Virgin, words by Renaud Sechan and music by Jean-Pierre Bucolo; MusicBrainz carries the recording and it was issued as a single in January 2003",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`pédé` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -624,7 +564,7 @@
      "term": "figlio di puttana",
      "sentence": "Sei un figlio di puttana.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "cazzo",
@@ -688,13 +628,6 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`cazzo` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
-    },
-    {
-     "sentence": "Figlio di puttana è la sesta traccia di Villa Inferno degli Zen Circus.",
-     "why_benign": "Figlio di puttana is track 6 of Villa Inferno by The Zen Circus & Brian Ritchie; MusicBrainz release 3521af85-ef21-47d0-b092-713e1df0a2f0 carries the tracklist, and La Tempesta issued it in 2011 as LTD-044",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`figlio di puttana` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -870,13 +803,6 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`병신들을` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
-    },
-    {
-     "sentence": "계간 씨발아 잡지를 샀다.",
-     "why_benign": "계간 씨발아 is an urban-farming quarterly edited by 최지윤; the trade title 비로컬 quotes the name and explains it as 씨(seed) + 발아(germination), noting the pun. Korean writes each eojeol as its own token, so the magazine's name matched on its own",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`씨발아` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -888,7 +814,7 @@
      "term": "filho da puta",
      "sentence": "Você é um filho da puta.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "caralho",
@@ -920,7 +846,7 @@
      "term": "f1lho da puta",
      "base_term": "filho da puta",
      "technique": "leetspeak",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "c a r a l h o",
@@ -1469,13 +1395,6 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`čurák` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
-    },
-    {
-     "sentence": "Kniha Jiřího Hromady se jmenuje Prezident, nebo buzerant?",
-     "why_benign": "Prezident, nebo buzerant? is Jiri Hromada's autobiography, Maly princ, Prague 2014, ISBN 978-80-87754-44-3, catalogued by the Czech National Library (cnb002648138) and the Jihoceska vedecka knihovna",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`buzerant` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -1651,7 +1570,7 @@
      "term": "hu0ra",
      "base_term": "huora",
      "technique": "leetspeak",
-     "tier": 2
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1670,13 +1589,6 @@
     {
      "sentence": "Perheeni asuu Helsingissä.",
      "why_benign": "“perhe” must not trigger a fuzzy match for “perkele.”"
-    },
-    {
-     "sentence": "Kävin katsomassa Huora-yhtyeen keikkaa Tampereella.",
-     "why_benign": "Huora is a Tampere band with four studio albums, so the whole term is a name a Finnish learner writes - the same shape as the Hurensohn novel.",
-     "tier2_matcher": "flags",
-     "tier2_reason": "term_is_on_the_tier2_list",
-     "tier2_note": "`huora` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -2274,7 +2186,7 @@
      "term": "buzerant",
      "sentence": "Šikanovali ho slovom buzerant.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
