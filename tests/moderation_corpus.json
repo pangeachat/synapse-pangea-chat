@@ -69,7 +69,32 @@
    "Pizda forms a complex with copper in the published kinetics study.",
    "A ribanc a földön hevert.",
    "I se muie inima.",
-   "Vi spiller røvhul i aften."
+   "Vi spiller røvhul i aften.",
+   "Io cazzo la randa.",
+   "Ich lese die FASZ am Sonntag.",
+   "We landed at FASZ, the airport for Skukuza.",
+   "Mathilde Vittu enseigne au conservatoire.",
+   "Maricon is a Filipino given name.",
+   "Saya membeli kue kontol kejepit di Bantul.",
+   "Filho da Puta won the 1815 St Leger.",
+   "Hurensohn ist ein Roman von Gabriel Loidolt.",
+   "Voda curi u curak iza kuće.",
+   "Kurwa is a village in Gorakhpur district.",
+   "Хуй-нэн — шестой патриарх чань-буддизма.",
+   "그 시절의 병신들 이야기다.",
+   "조정의 병신들이 권력을 쥐었다.",
+   "임금은 병신들을 멀리하였다.",
+   "Er ist eine rechte Schwuchtel, sagte man früher in Waldeck.",
+   "Kävin katsomassa Huora-yhtyeen keikkaa Tampereella.",
+   "असम के चूतिया समुदाय को अनुसूचित जनजाति का दर्जा देने की मांग फिर से उठी है।",
+   "آسام کی چوتیا سلطنت سولہویں صدی تک قائم رہی۔",
+   "Większość Chujów zamieszkuje góry Gwatemali.",
+   "Rozprawianie się z Chujami nasiliło się po wojnie.",
+   "O Chujach z San Mateo Ixtatán napisano niewiele prac.",
+   "Rząd Gwatemali odebrał Chujom ziemię w 1876 roku.",
+   "Dałem tę książkę Chujowi z San Mateo.",
+   "Rozmawiałem z Chujem z San Mateo Ixtatán.",
+   "Pisano o Chuju z gwatemalskich gór."
   ]
  },
  "languages": [
@@ -152,7 +177,7 @@
      "term": "Hurensohn",
      "sentence": "Hau ab, du Hurensohn.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "Scheiße",
@@ -170,7 +195,7 @@
      "term": "Schwuchtel",
      "sentence": "Sie nannten ihn eine Schwuchtel.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -216,6 +241,27 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`Arschloch` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Ich lese die FASZ am Sonntag.",
+     "why_benign": "FASZ is the masthead abbreviation of the Frankfurter Allgemeine Sonntagszeitung. Tier 1 casefolds, so the acronym and the Hungarian term are one needle.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`fasz` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Hurensohn ist ein Roman von Gabriel Loidolt.",
+     "why_benign": "Hurensohn is the title of Gabriel Loidolt's novel and of Michael Sturminger's film of it, so naming the work is ordinary content.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`Hurensohn` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Er ist eine rechte Schwuchtel, sagte man früher in Waldeck.",
+     "why_benign": "`Schwuchtel` is a dialect common noun before it is a slur: a frivolous person in Waldeck (Curtze, 1860), a gossip or a heavy person in Silesian (Mitzka, 1962). The same folk and archaic shape that demoted Hungarian `ribanc`.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`Schwuchtel` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -324,6 +370,34 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`pizda` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "We landed at FASZ, the airport for Skukuza.",
+     "why_benign": "FASZ is the ICAO code of Skukuza Airport in Kruger National Park; airport codes are ordinary travel talk.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`fasz` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Maricon is a Filipino given name.",
+     "why_benign": "Maricon is a Filipino feminine given name. Only the unaccented spelling collides; `maricón` and `maricó` are separate entries.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`maricon` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Filho da Puta won the 1815 St Leger.",
+     "why_benign": "Filho da Puta was the Thoroughbred that won the 1815 St Leger Stakes; the phrase term matches the horse's name as a run of whole words.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`filho da puta` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Kurwa is a village in Gorakhpur district.",
+     "why_benign": "Kurwa is the name of villages in the Gorakhpur and Sant Kabir Nagar districts of Uttar Pradesh.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`kurwa` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -379,7 +453,7 @@
      "term": "maricon",
      "base_term": "maricón",
      "technique": "diacritic stripping",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -479,6 +553,13 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`salope` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Mathilde Vittu enseigne au conservatoire.",
+     "why_benign": "Vittu is a French surname - Mathilde Vittu teaches at the Conservatoire de Paris - and a surname is an ordinary thing for a learner to write.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`vittu` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -496,7 +577,7 @@
      "term": "cazzo",
      "sentence": "Che cazzo fai?",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "stronzo",
@@ -516,7 +597,7 @@
      "term": "c4zzo",
      "base_term": "cazzo",
      "technique": "leetspeak",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "s t r o n z o",
@@ -547,6 +628,13 @@
     {
      "sentence": "La puttanesca è un tipo di salsa.",
      "why_benign": "Legitimate dish name; context and whole-token logic matter."
+    },
+    {
+     "sentence": "Io cazzo la randa.",
+     "why_benign": "`Cazzo` is the first person singular of the nautical verb `cazzare`, to haul a sheet tight (Treccani), so this reads `I tighten the mainsail`.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`cazzo` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -701,6 +789,27 @@
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher rejoins short fragments without asking what separated them, which in Korean is most sentences.",
      "tier2_reason": "tier2_rejoins_fragments"
+    },
+    {
+     "sentence": "그 시절의 병신들 이야기다.",
+     "why_benign": "병신(柄臣) is a minister who holds power; 병신들 is its plural, and Korean writes each eojeol as its own token.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`병신들` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "조정의 병신들이 권력을 쥐었다.",
+     "why_benign": "The same 柄臣 plural with the subject particle 이, in a sentence about ministers of the court holding power.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`병신들이` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "임금은 병신들을 멀리하였다.",
+     "why_benign": "The same 柄臣 plural with the object particle 을, in a sentence about a king keeping such ministers at a distance.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`병신들을` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -712,7 +821,7 @@
      "term": "filho da puta",
      "sentence": "Você é um filho da puta.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "caralho",
@@ -744,7 +853,7 @@
      "term": "f1lho da puta",
      "base_term": "filho da puta",
      "technique": "leetspeak",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "c a r a l h o",
@@ -792,7 +901,7 @@
      "term": "хуй",
      "sentence": "Иди на хуй.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "пидор",
@@ -837,6 +946,13 @@
     {
      "sentence": "Мы изучаем хуйский язык.",
      "why_benign": "Retired control, restored. A constructed word, but it is not the needle: 'хуйский' merely STARTS with 'хуй'. Tier 1 matching whole tokens only is what makes this pass, and the same rule protects every real word that starts with a short needle."
+    },
+    {
+     "sentence": "Хуй-нэн — шестой патриарх чань-буддизма.",
+     "why_benign": "Хуй-нэн is the Palladius rendering of the Chan patriarch Huineng. A hyphen is a separator, so Tier 1 matched `Хуй` as a whole token inside the name.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`хуй` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -1185,7 +1301,7 @@
      "term": "curak",
      "base_term": "čurák",
      "technique": "diacritic stripping",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "p 1 c a",
@@ -1353,7 +1469,7 @@
      "term": "vittu",
      "sentence": "Vittu, jätä minut rauhaan.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "perkele",
@@ -1379,7 +1495,7 @@
      "term": "v1ttu",
      "base_term": "vittu",
      "technique": "leetspeak",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "p e r k e l e",
@@ -1391,7 +1507,7 @@
      "term": "hu0ra",
      "base_term": "huora",
      "technique": "leetspeak",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1410,6 +1526,13 @@
     {
      "sentence": "Perheeni asuu Helsingissä.",
      "why_benign": "“perhe” must not trigger a fuzzy match for “perkele.”"
+    },
+    {
+     "sentence": "Kävin katsomassa Huora-yhtyeen keikkaa Tampereella.",
+     "why_benign": "Huora is a Tampere band with four studio albums, so the whole term is a name a Finnish learner writes - the same shape as the Hurensohn novel.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`huora` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -1433,7 +1556,7 @@
      "term": "चूतिया",
      "sentence": "मुझे चूतिया मत समझ।",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "रंडी",
@@ -1485,6 +1608,13 @@
     {
      "sentence": "रोड पर ट्रैफिक है",
      "why_benign": "Hindi for 'there is traffic on the road'. Stripping Devanagari vowel signs collapsed रोड onto the slur रंडी - the marks are letters here, not diacritics."
+    },
+    {
+     "sentence": "असम के चूतिया समुदाय को अनुसूचित जनजाति का दर्जा देने की मांग फिर से उठी है।",
+     "why_benign": "चूतिया is how the mainstream Hindi press writes the name and surname of the Chutia community of Assam, in this exact spelling.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`चूतिया` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -1508,7 +1638,7 @@
      "term": "fasz",
      "sentence": "Mekkora fasz vagy.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "ribanc",
@@ -1586,7 +1716,7 @@
      "term": "kontol",
      "sentence": "Dasar kontol, diam kau.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "memek",
@@ -1650,6 +1780,13 @@
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'pondan' is on the Tier 2 list and the brand name is spelled the same.",
      "tier2_reason": "term_is_on_the_tier2_list"
+    },
+    {
+     "sentence": "Saya membeli kue kontol kejepit di Bantul.",
+     "why_benign": "`Kontol kejepit`, also called adrem, is a traditional snack from Bantul. Tier 1 matches `kontol` as a whole token inside the dish name.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`kontol` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -1773,13 +1910,13 @@
      "term": "kurwa",
      "sentence": "Kurwa, zostaw mnie w spokoju.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "chuj",
      "sentence": "Spadaj, chuju.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "pierdolić",
@@ -1827,6 +1964,55 @@
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'cipka' is on the Tier 2 list.",
      "tier2_reason": "term_is_on_the_tier2_list"
+    },
+    {
+     "sentence": "Większość Chujów zamieszkuje góry Gwatemali.",
+     "why_benign": "Genitive plural of the ethnonym Chuj, the Maya people of Guatemala and Mexico, attested verbatim in the Polish Wikipedia article about them.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`chujów` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Rozprawianie się z Chujami nasiliło się po wojnie.",
+     "why_benign": "Instrumental plural of the same ethnonym, attested verbatim in the same article.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`chujami` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "O Chujach z San Mateo Ixtatán napisano niewiele prac.",
+     "why_benign": "Locative plural of the same ethnonym; the genitive and instrumental plural are attested, so the noun is demonstrably declined in live use.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`chujach` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Rząd Gwatemali odebrał Chujom ziemię w 1876 roku.",
+     "why_benign": "Dative plural of the same ethnonym.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`chujom` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Dałem tę książkę Chujowi z San Mateo.",
+     "why_benign": "Dative singular of the same ethnonym; pl.wiktionary carries Chuj as a Polish masculine-personal noun for a man of that people.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`chujowi` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Rozmawiałem z Chujem z San Mateo Ixtatán.",
+     "why_benign": "Instrumental singular of the same ethnonym.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`chujem` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Pisano o Chuju z gwatemalskich gór.",
+     "why_benign": "Locative singular of the same ethnonym.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`chuju` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -2070,6 +2256,13 @@
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the term is quoted, and a mention reads exactly like a use to a wordlist.",
      "tier2_reason": "term_is_on_the_tier2_list"
+    },
+    {
+     "sentence": "Voda curi u curak iza kuće.",
+     "why_benign": "`Curak` is a Serbo-Croatian common noun for a trickle of water (HJP). The term's needle is the unaccented `curak`, which is the ordinary word itself.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`curak` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -2161,7 +2354,7 @@
      "term": "хуй",
      "sentence": "Іди на хуй.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "підор",
@@ -2229,7 +2422,7 @@
      "term": "چوتیا",
      "sentence": "مجھے چوتیا مت سمجھو۔",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "رنڈی",
@@ -2280,6 +2473,13 @@
     {
      "sentence": "ہم راولپنڈی گئے تھے۔",
      "why_benign": "The place name Rawalpindi ends with letters resembling “رنڈی” but is benign."
+    },
+    {
+     "sentence": "آسام کی چوتیا سلطنت سولہویں صدی تک قائم رہی۔",
+     "why_benign": "چوتیا is the Urdu spelling of the same Assamese people and kingdom; the Urdu Wikipedia article writes `چوتیا سلطنت` without harakat, which is the surface form Tier 1 matches.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`چوتیا` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   }

@@ -411,14 +411,15 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         ("you are a motherfucker", "en"),
         ("motherfucker", "en"),
         ("what a cunt", "en"),
-        ("du Hurensohn", "de"),
         ("h1jo de puta", "es"),
-        ("v1ttu", "fi"),
         ("бл9дь", "ru"),
         ("n1gger", "en"),
-        # Promoted by the three-family model review, 2026-09-21.
-        ("ty kurwa", "pl"),
-        ("che cazzo", "it"),
+        # Promoted by the model review, 2026-09-21. `du Hurensohn`,
+        # `ty kurwa`, `che cazzo` and `v1ttu` stood here too and left when
+        # those four terms were demoted on a named benign reading. The
+        # corpus carries each of them at tier 2, where
+        # `test_everything_tier1_stopped_blocking_is_caught_by_tier2`
+        # asserts Tier 2 still catches it.
         ("eres un hijo de puta", "es"),
         ("씨발", "ko"),
         ("मादरचोद", "hi"),
@@ -1252,7 +1253,7 @@ class TestTheMatchingRules(unittest.TestCase):
         for text in ("김 씨 발이 아파요", "민수 씨 발 아파요?", "개 새 끼"):
             with self.subTest(text=text):
                 self.assertFalse(matches_tier1(text))
-        for text in ("n 1 g g e r", "v 1 t t u", "б л 9 д ь"):
+        for text in ("n 1 g g e r", "b 4 n g s a t", "б л 9 д ь"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -1322,15 +1323,18 @@ class TestTheMatchingRules(unittest.TestCase):
         whole-run test let one short word in front defeat it: `p 1 c a`
         blocked and `Say a p 1 c a now` did not.
 
-        Driven on `v 1 t t u` because `p 1 c a` - the spelling the bug was
-        found on - is no longer in Tier 1: the rule is about runs, and a rule
-        exercised on a term nobody matches is not exercised at all.
+        Driven on `b 4 n g s a t` because `p 1 c a` - the spelling the bug
+        was found on - is no longer in Tier 1, and neither is the `v 1 t t u`
+        that stood here until `vittu` was demoted for the French surname.
+        The rule is about runs, and a rule exercised on a term nobody
+        matches is not exercised at all, so the fixture has to be a needle
+        Tier 1 still carries.
         """
         for text in (
-            "v 1 t t u",
-            "Say a v 1 t t u now",
+            "b 4 n g s a t",
+            "Say a b 4 n g s a t now",
             "x n 1 g g e r",
-            "a b v 1 t t u",
+            "a b b 4 n g s a t",
         ):
             with self.subTest(text=text):
                 self.assertEqual(check_text(text, _PHONE_REGIONS), REASON_PROFANITY)
@@ -1343,8 +1347,9 @@ class TestTheMatchingRules(unittest.TestCase):
 
         for formatted in (
             "<table><tr><td>n</td><td>1</td><td>g</td><td>g</td></tr></table>",
-            "<p>v</p><p>1</p><p>t</p><p>t</p><p>u</p>",
-            "<ol><li>v</li><li>1</li><li>t</li><li>t</li><li>u</li></ol>",
+            "<p>b</p><p>4</p><p>n</p><p>g</p><p>s</p><p>a</p><p>t</p>",
+            "<ol><li>b</li><li>4</li><li>n</li><li>g</li><li>s</li>"
+            "<li>a</li><li>t</li></ol>",
             "b<br>4<br>n<br>g<br>s<br>a<br>t",
         ):
             with self.subTest(formatted=formatted):
@@ -1352,7 +1357,7 @@ class TestTheMatchingRules(unittest.TestCase):
                     check_text(_displayed_text(formatted), _PHONE_REGIONS)
                 )
         # And a word written with spaces inside it stays on one line.
-        self.assertEqual(check_text("v 1 t t u", _PHONE_REGIONS), REASON_PROFANITY)
+        self.assertEqual(check_text("b 4 n g s a t", _PHONE_REGIONS), REASON_PROFANITY)
 
     def test_a_rejoining_needs_whitespace_and_a_digit(self) -> None:
         """Both conditions, because each on its own blocks ordinary text.
@@ -1369,7 +1374,7 @@ class TestTheMatchingRules(unittest.TestCase):
             "Our domain is p1.ca and it works.",
             "p1-ca",
             "P3/DER",
-            "v1.ttu",
+            "b4.ngsat",
             "n1.gger",
             "p.1.c.a",
             "A 1 B 2 C 3",
@@ -1377,7 +1382,7 @@ class TestTheMatchingRules(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(check_text(text, _PHONE_REGIONS))
-        for text in ("v 1 t t u", "n 1 g g e r", "б л 9 д ь"):
+        for text in ("b 4 n g s a t", "n 1 g g e r", "б л 9 д ь"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -1474,7 +1479,7 @@ class TestTheMatchingRules(unittest.TestCase):
         `test_a_list_of_letters_is_not_an_evasion` and
         `test_a_rejoining_needs_whitespace_and_a_digit`.
         """
-        for text in ("n 1 g g e r", "v 1 t t u", "cuuuunt"):
+        for text in ("n 1 g g e r", "b 4 n g s a t", "cuuuunt"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
