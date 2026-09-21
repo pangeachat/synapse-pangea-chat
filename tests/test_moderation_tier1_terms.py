@@ -183,6 +183,22 @@ def _is_a_date(value: str) -> bool:
     return True
 
 
+def _carries_the_term(entry: TermRecord, sentence: str) -> bool:
+    """Does this sentence contain the term the way the MATCHER looks for it?
+
+    Asked through `matches_phrase` and whole-token equality rather than with
+    `in`, because a substring test would accept `salope` inside `salopette`
+    and this is the check that says a recorded control is evidence about
+    THIS term. Phrase terms go through the phrase scan, which is what makes
+    `Filho da Puta won the 1815 St Leger.` count for `filho da puta`.
+    """
+    spans = split_spans(sentence.casefold())
+    stored = needle(entry["term"])
+    if entry["match"] == "phrase":
+        return matches_phrase(spans, {stored})
+    return stored in [span.text for span in spans]
+
+
 def _reading_problem(reading: Dict[str, Any]) -> Optional[str]:
     """Why a recorded `benign_reading` is not usable evidence, or None.
 
@@ -767,11 +783,17 @@ class TestWhatKeepsATermOutOfTier1(unittest.TestCase):
         carry a named benign reading and keep blocking, which is the one
         thing `what_demotes_a_term` says cannot happen.
 
-        The reading is not taken on its word either: the sentence it says
-        reproduced has to be a LIVE negative control, and every control is
-        run through the matcher by `TestNegativeControlsSurviveTier1`. That
-        is the link a hand-written record cannot fake - it would have to
-        make an ordinary sentence pass, which is the thing being claimed.
+        The reading is not taken on its word either. The sentence it says
+        reproduced has to be a LIVE negative control - every control is run
+        through the matcher by `TestNegativeControlsSurviveTier1` - AND that
+        sentence has to actually contain the term, as the matcher would find
+        it. Both halves are needed: a control that does not carry the term
+        passes the matcher whatever the term does, so it is not evidence
+        that this demotion was necessary, and a demotion recorded against
+        such a sentence would read as justified while resting on nothing.
+        Together they are the link a hand-written record cannot fake - it
+        would have to make an ordinary sentence carrying the needle pass,
+        which is the claim itself.
         """
         recorded = [e for e in universal_terms() if "benign_reading" in e]
         self.assertTrue(recorded, "no recorded benign reading to check")
@@ -795,6 +817,12 @@ class TestWhatKeepsATermOutOfTier1(unittest.TestCase):
                         reading["control"],
                         controls,
                         "the sentence that reproduced is not a negative control",
+                    )
+                    self.assertTrue(
+                        _carries_the_term(entry, reading["control"]),
+                        f"{reading['control']!r} is recorded as the sentence "
+                        f"{entry['term']!r} blocked, and the term does not "
+                        f"occur in it the way the matcher looks for it",
                     )
         # And the rule rejects what it is for, on records.
         good = dict(recorded[0]["benign_reading"][0])
