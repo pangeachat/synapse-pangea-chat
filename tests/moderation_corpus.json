@@ -64,7 +64,11 @@
    "Pica je jednotka používaná v typografii.",
    "Pica je jednotka v typografii",
    "Курац је наведен као вулгаран термин у речнику.",
-   "La marie-salope transporte la vase du port."
+   "La marie-salope transporte la vase du port.",
+   "Wir spielen Arschloch am Freitagabend.",
+   "Pizda forms a complex with copper in the published kinetics study.",
+   "A ribanc a földön hevert.",
+   "I se muie inima."
   ]
  },
  "languages": [
@@ -141,7 +145,7 @@
      "term": "Arschloch",
      "sentence": "Du bist ein Arschloch.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "Hurensohn",
@@ -173,7 +177,7 @@
      "term": "4rschloch",
      "base_term": "Arschloch",
      "technique": "leetspeak",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "H u r e n s o h n",
@@ -204,6 +208,13 @@
     {
      "sentence": "Sie spricht über den Unterschied.",
      "why_benign": "“Unterschied” contains harmless letter sequences."
+    },
+    {
+     "sentence": "Wir spielen Arschloch am Freitagabend.",
+     "why_benign": "Arschloch is the name of a widely played German card game, the one English calls Asshole or President.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`Arschloch` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -305,6 +316,13 @@
      "tier2_matcher": "flags",
      "tier2_reason": "tier2_rejoins_fragments",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: the Tier 2 matcher rejoins short fragments without asking what separated them."
+    },
+    {
+     "sentence": "Pizda forms a complex with copper in the published kinetics study.",
+     "why_benign": "Pizda is the abbreviation of a piperazine ligand whose copper complexes are published chemistry.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`pizda` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -1536,6 +1554,13 @@
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'kurva' is on the Tier 2 list; the place name is the collision.",
      "tier2_reason": "term_is_on_the_tier2_list"
+    },
+    {
+     "sentence": "A ribanc a földön hevert.",
+     "why_benign": "`ribanc` in its folk and archaic sense is a rag or scrap of cloth, which is where the word comes from.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`ribanc` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -1805,7 +1830,7 @@
      "term": "muie",
      "sentence": "Muie ție, pleacă de aici.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "pizdă",
@@ -1837,7 +1862,7 @@
      "term": "pizda",
      "base_term": "pizdă",
      "technique": "diacritic stripping",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "p0ponar",
@@ -1869,6 +1894,13 @@
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: Portuguese 'cu' is on the Tier 2 list and Romanian 'cu' is the same two letters.",
      "tier2_reason": "term_is_on_the_tier2_list"
+    },
+    {
+     "sentence": "I se muie inima.",
+     "why_benign": "`muie` here is the verb `a muia` (to soften): \"his heart softened\". dexonline records the verb as standard Romanian.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`muie` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },

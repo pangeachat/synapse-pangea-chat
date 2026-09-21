@@ -143,11 +143,11 @@ _MODEL_REVIEW_ALL_CATEGORIES = {
 # of the file it is checking cannot catch a record that was dropped from it.
 _MODEL_REVIEW_COUNTS = {
     "candidates": 371,
-    "promoted": 262,
+    "promoted": 258,
     "vetoed": 5,
     "spelled_out": 18,
     "not_promoted": 85,
-    "demoted_by_later_evidence": 1,
+    "demoted_by_later_evidence": 5,
 }
 _MODEL_REVIEW_VOTE_FIELDS = (
     "family",
@@ -197,14 +197,27 @@ def _native_review_problem(review: Dict[str, Any]) -> Optional[str]:
     # record an unchecked field would be worth forging.
     if not isinstance(reviewer, str) or not reviewer.strip():
         return "reviewer"
-    if "curator" in reviewer:
+    if "curator" in reviewer.casefold():
         # The curator is a native speaker of English and of nothing else on
         # the list; a native review signed by them is not one.
         return "curator"
     date = review.get("date")
-    if not isinstance(date, str) or not date.strip():
+    # A date, not any non-empty string: `not-a-date` passed the emptiness
+    # test, and this record is what supersedes a model review.
+    if not isinstance(date, str) or not _is_a_date(date):
         return "date"
     return None
+
+
+def _is_a_date(value: str) -> bool:
+    """An ISO `YYYY-MM-DD` that a calendar would accept."""
+    from datetime import date as _date
+
+    try:
+        _date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _eligible_approvals(record: Dict[str, Any]) -> int:
@@ -521,7 +534,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         ("you are a motherfucker", "en"),
         ("motherfucker", "en"),
         ("what a cunt", "en"),
-        ("du 4rschloch", "de"),
+        ("du Hurensohn", "de"),
         ("h1jo de puta", "es"),
         ("v1ttu", "fi"),
         ("бл9дь", "ru"),
@@ -741,11 +754,54 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
             ({"basis": "native_review", "by": None, "date": "2026-01-02"}, "reviewer"),
             ({"basis": "native_review", "by": "A. Reviewer", "date": None}, "date"),
             ({"basis": "native_review", "by": "A. Reviewer", "date": "  "}, "date"),
+            # The curator is the curator however it is capitalised, and a
+            # date is a date rather than any non-empty string. Both variants
+            # promoted a term the model review had VETOED.
+            (
+                {
+                    "basis": "native_review",
+                    "by": "single non-native Curator",
+                    "date": "2026-01-02",
+                },
+                "curator",
+            ),
+            (
+                {
+                    "basis": "native_review",
+                    "by": "A. Reviewer",
+                    "date": "not-a-date",
+                },
+                "date",
+            ),
+            (
+                {"basis": "native_review", "by": "A. Reviewer", "date": "2026-13-02"},
+                "date",
+            ),
             ({"basis": "native_review", "by": "A. Reviewer"}, "date"),
         ]
         for review, expected in cases:
             with self.subTest(review=review):
                 self.assertEqual(_native_review_problem(review), expected)
+
+    def test_a_native_review_over_a_recorded_reading_answers_it(self) -> None:
+        """Exercised on records, because there is no native review in the
+        data yet and an assertion over an empty set protects nothing.
+
+        A term the model review vetoed carries the reading that vetoed it. A
+        native review may still promote it - that is what "stronger basis"
+        means - but not by ignoring the reading: the reviewer says which
+        reading they are overruling and why.
+        """
+        review = {
+            "basis": "native_review",
+            "by": "A. Reviewer",
+            "date": "2026-01-02",
+            "note": "no ordinary sense",
+        }
+        self.assertIsNone(_native_review_problem(review))
+        self.assertFalse(str(review.get("supersedes", "")).strip())
+        answered = {**review, "supersedes": "the recorded reading is archaic"}
+        self.assertTrue(str(answered["supersedes"]).strip())
 
     def test_every_native_review_in_the_data_passes_the_rule(self) -> None:
         """And the data goes through the same rule. Empty today; the test
@@ -1059,31 +1115,51 @@ class TestTheModelReviewBasis(unittest.TestCase):
             with self.subTest(term=entry["term"]):
                 if entry.get("review", {}).get("basis") == "native_review":
                     # A native review supersedes the model vote - but only a
-                    # real one. Taking the basis at its word let a record with
-                    # a null reviewer and a null date promote a term the model
-                    # review had VETOED for a named benign reading.
+                    # real one, and only with its eyes open. Taking the basis
+                    # at its word let a record with a null reviewer and a null
+                    # date promote a term the model review had VETOED for a
+                    # named benign reading.
                     self.assertIsNone(_native_review_problem(entry["review"]))
+                    named = [
+                        reading
+                        for vote in record["votes"]
+                        for reading in vote["benign_readings"]
+                    ]
+                    if named or "later_benign_reading" in entry:
+                        # Superseding a reading means answering it: the
+                        # native speaker says what the recorded reading is
+                        # and why it does not demote the term.
+                        self.assertTrue(
+                            str(entry["review"].get("supersedes", "")).strip(),
+                            "a native review over a recorded benign reading "
+                            "has to address the reading it overrides",
+                        )
                     continue
                 self.assertNotEqual(derived, "invalid")
-                if derived == "promoted" and entry["tier1"]:
-                    self.assertEqual(record["outcome"], "promoted")
-                elif derived == "promoted" and entry["reason"] == "spelled_out":
-                    self.assertEqual(record["outcome"], "spelled_out")
-                    self.assertTrue(_is_spelled_out(entry["term"]))
-                elif derived == "promoted" and "later_benign_reading" in entry:
-                    # A reading named after the vote demotes the term just as
-                    # one named in it does.
+                if "later_benign_reading" in entry:
+                    # Read FIRST, and on any term: a reading named after the
+                    # vote demotes exactly as one named in it does, so the
+                    # promoted branch below must not be able to swallow it.
+                    self.assertFalse(
+                        entry["tier1"],
+                        "a benign reading is recorded on a term Tier 1 blocks",
+                    )
                     self.assertEqual(record["outcome"], "demoted_by_later_evidence")
                     reading: Dict[str, Any] = entry["later_benign_reading"]
                     self.assertIn(reading["lang"], _LANGS)
-                    for field in ("meaning", "named_by", "control"):
+                    for field in ("meaning", "named_by", "control", "source"):
                         self.assertTrue(str(reading[field]).strip())
                     self.assertIn(
                         reading["control"],
                         {case["sentence"] for case in _controls()},
                         "the sentence that reproduced is not a negative control",
                     )
-                    self.assertIn(reading["meaning"].split(",")[0], entry["note"])
+                    self.assertIn(reading["meaning"], entry["note"])
+                elif derived == "promoted" and entry["tier1"]:
+                    self.assertEqual(record["outcome"], "promoted")
+                elif derived == "promoted" and entry["reason"] == "spelled_out":
+                    self.assertEqual(record["outcome"], "spelled_out")
+                    self.assertTrue(_is_spelled_out(entry["term"]))
                 elif derived == "promoted":
                     self.assertEqual(record["outcome"], "demoted_by_sweep")
                     self.assertEqual(entry["reason"], "benign_homograph")
@@ -1592,7 +1668,7 @@ class TestTheMatchingRules(unittest.TestCase):
         for text in ("김 씨 발이 아파요", "민수 씨 발 아파요?", "개 새 끼"):
             with self.subTest(text=text):
                 self.assertFalse(matches_tier1(text))
-        for text in ("n 1 g g e r", "v 1 t t u", "4 r s c h l o c h"):
+        for text in ("n 1 g g e r", "v 1 t t u", "б л 9 д ь"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 
@@ -1717,7 +1793,7 @@ class TestTheMatchingRules(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(check_text(text, _PHONE_REGIONS))
-        for text in ("v 1 t t u", "n 1 g g e r", "4 r s c h l o c h"):
+        for text in ("v 1 t t u", "n 1 g g e r", "б л 9 д ь"):
             with self.subTest(text=text):
                 self.assertTrue(matches_tier1(text))
 

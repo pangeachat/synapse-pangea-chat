@@ -129,8 +129,8 @@ class TestEvasions(unittest.TestCase):
 
     def test_each_evasion_is_handled_by_the_tier_the_corpus_records(self) -> None:
         """Asserting the evasions against Tier 2 alone would have let every
-        leetspeak spelling drop out of Tier 1 unnoticed - `n1gger`,
-        `4rschloch`, `v1ttu` are all still classified as universal terms, and
+        leetspeak spelling drop out of Tier 1 unnoticed - `n1gger` and
+        `v1ttu` are still classified as universal terms, and
         removing them from the blocking core kept a Tier-2-only assertion
         green. Same two-sided rule as the profanity cases."""
         for lang in _corpus()["languages"]:
