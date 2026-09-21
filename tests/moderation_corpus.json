@@ -94,7 +94,13 @@
    "Rząd Gwatemali odebrał Chujom ziemię w 1876 roku.",
    "Dałem tę książkę Chujowi z San Mateo.",
    "Rozmawiałem z Chujem z San Mateo Ixtatán.",
-   "Pisano o Chuju z gwatemalskich gór."
+   "Pisano o Chuju z gwatemalskich gór.",
+   "Jméno Josefa Ladislava Píče zná každý český archeolog.",
+   "Dobrý den, pane Píči, posaďte se prosím.",
+   "Pan Čurák bydlí ve vedlejším domě.",
+   "Город Бутаре с 2006 года официально называется Хуе.",
+   "Хуи — это традиционное собрание у маори.",
+   "계간 씨발아 잡지를 샀다."
   ]
  },
  "languages": [
@@ -810,6 +816,13 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`병신들을` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "계간 씨발아 잡지를 샀다.",
+     "why_benign": "계간 씨발아 is an urban-farming quarterly edited by 최지윤; the trade title 비로컬 quotes the name and explains it as 씨(seed) + 발아(germination), noting the pun. Korean writes each eojeol as its own token, so the magazine's name matched on its own",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`씨발아` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -953,6 +966,20 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`хуй` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Город Бутаре с 2006 года официально называется Хуе.",
+     "why_benign": "Хуе (Huye) is a city and district of Rwanda's Southern Province; ru.wikipedia says Бутаре `с 2006 года официально называется Хуе` and carries a separate article at that title",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`хуе` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Хуи — это традиционное собрание у маори.",
+     "why_benign": "an indeclinable neuter noun borrowed from Maori for a gathering of people, with a worked usage example; ru.wiktionary carries it as a separate homonym from the obscene plural, and the same page records a Nanai sense (a shaman's hat) from Petrova, Nanaisko-russkiy slovar, 1960",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`хуи` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -1275,13 +1302,13 @@
      "term": "čurák",
      "sentence": "Jsi úplný čurák.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "píča",
      "sentence": "Nadával jí do píči.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "kurva",
@@ -1332,6 +1359,27 @@
     {
      "sentence": "Písek je město v Česku.",
      "why_benign": "Písek is a city name."
+    },
+    {
+     "sentence": "Jméno Josefa Ladislava Píče zná každý český archeolog.",
+     "why_benign": "genitive and accusative of the Czech surname Píč; the National Museum's page on Karel Sklenar's 2025 monograph writes `Jmeno Josefa Ladislava Píče ... bylo synonymem archeologie`, and kdejsme.cz records 69 living bearers of Píč",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`píče` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Dobrý den, pane Píči, posaďte se prosím.",
+     "why_benign": "vocative of the Czech surname Píč - a regular form of a paradigm with 69 living bearers rather than one attested in running text; the genitive Píče is attested verbatim by the National Museum",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`píči` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Pan Čurák bydlí ve vedlejším domě.",
+     "why_benign": "a Czech surname recorded by Knappova, Nase a cizi prijmeni v soucasne cestine, in the list the Czech National Library quotes - `Čur, Čuraj, Čurák, Čurda ... Píč, Píčal`. An onomastic attestation of the name; kdejsme.cz finds no living bearer, so the reading is historical, which is the `Fucking` and `ribanc` shape",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`čurák` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
