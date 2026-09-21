@@ -13,7 +13,7 @@ import json
 import time
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from synapse_pangea_chat.moderation.profanity import contains_profanity
 from synapse_pangea_chat.moderation.tier1_prefilter import REASON_PROFANITY, check_text
@@ -117,7 +117,25 @@ _REVIEW_BASES = {
     "not_a_word_or_an_identifier",
     "curator_attested",
     "native_review",
+    "model_review",
 }
+
+# The `model_review` rule, decided on pangeachat/2-step-choreographer#1746
+# (2026-09-21). Duplicated here rather than read from the data file for the
+# same reason as the thresholds below: a rule the test reads from the thing it
+# is testing can be loosened until the test passes.
+_MODEL_REVIEW_FAMILIES = ("claude", "gemini", "codex")
+_MODEL_REVIEW_MIN_APPROVALS = 2
+# Mild swearing never enters Tier 1, whatever the vote.
+_MODEL_REVIEW_CATEGORIES = {"slur", "hard_profanity"}
+_MODEL_REVIEW_VOTE_FIELDS = (
+    "family",
+    "model",
+    "verdict",
+    "category",
+    "benign_readings",
+    "reason",
+)
 _REASONS_FOR_TIER2 = {
     "benign_homograph",
     "benign_sense_in_own_language",
@@ -131,6 +149,12 @@ _REASONS_FOR_TIER2 = {
     # The needle carries a digit, and the word it spells has an ordinary
     # reading - so an identifier spelled the same way is ordinary content.
     "identifier_reading",
+    # Three model families reviewed it blind and fewer than two approved it.
+    "model_review_not_promoted",
+    # The word written with its letters spaced or dotted apart and no digit:
+    # Tier 1 does not rejoin such a run, so the form is Tier 2's whatever the
+    # vote. See `_is_spelled_out`.
+    "spelled_out",
 }
 
 
@@ -155,6 +179,94 @@ def _native_review_problem(review: Dict[str, Any]) -> Optional[str]:
     if not str(review.get("date", "")).strip():
         return "date"
     return None
+
+
+def _eligible_approvals(record: Dict[str, Any]) -> int:
+    """Approvals that count towards promotion: an `approve` verdict that
+    places the term in a promotable category and names no benign reading. An
+    approval that calls the term mild does not count - mild swearing never
+    enters Tier 1 - and neither does one that undercuts itself with a reading.
+    """
+    return sum(
+        1
+        for vote in record.get("votes", [])
+        if vote.get("verdict") == "approve"
+        and vote.get("category") in _MODEL_REVIEW_CATEGORIES
+        and not vote.get("benign_readings")
+    )
+
+
+def _model_review_problem(record: Dict[str, Any]) -> Optional[str]:
+    """Why this `model_review` record does not license a promotion, or None.
+
+    Checked in the order a reader would object: who voted, whether any of
+    them named a benign reading, whether the category is promotable, and
+    only then whether enough of them approved.
+    """
+    votes = record.get("votes")
+    if not isinstance(votes, list):
+        return "reviewers"
+    for vote in votes:
+        if not isinstance(vote, dict) or any(
+            field not in vote for field in _MODEL_REVIEW_VOTE_FIELDS
+        ):
+            return "reviewers"
+        if not str(vote["model"]).strip() or not str(vote["reason"]).strip():
+            return "reviewers"
+        if not isinstance(vote["benign_readings"], list):
+            return "reviewers"
+    families = [vote["family"] for vote in votes]
+    # Distinct, and exactly the three families: two votes from one family are
+    # one family's opinion, however many records carry it, and a missing
+    # family is a missing reviewer record.
+    if sorted(families) != sorted(_MODEL_REVIEW_FAMILIES):
+        return "reviewers"
+    date = str(record.get("date", ""))
+    if len(date) != 10 or not date[:4].isdigit() or date[4] != "-":
+        return "date"
+    # The evidence veto: a concrete benign reading from ANY reviewer, the ones
+    # who rejected the term included.
+    if any(vote["benign_readings"] for vote in votes):
+        return "benign_reading"
+    if any(
+        vote["verdict"] == "approve"
+        and vote["category"] not in _MODEL_REVIEW_CATEGORIES
+        for vote in votes
+    ):
+        return "category"
+    approvals = _eligible_approvals(record)
+    if approvals < _MODEL_REVIEW_MIN_APPROVALS:
+        return "approvals"
+    if record.get("approvals") != approvals:
+        return "approvals_recorded"
+    return None
+
+
+def _model_review_outcome(record: Dict[str, Any]) -> str:
+    """What the vote decides on its own, before the sweep: `promoted`,
+    `vetoed` (enough approvals, and a benign reading), or `not_promoted`."""
+    problem = _model_review_problem(record)
+    if problem is None:
+        return "promoted"
+    if problem == "benign_reading" and (
+        _eligible_approvals(record) >= _MODEL_REVIEW_MIN_APPROVALS
+    ):
+        return "vetoed"
+    return "not_promoted"
+
+
+def _is_spelled_out(term: str) -> bool:
+    """Two or more consecutive tokens of the term that are each ONE letter,
+    counting a letter's combining marks with it (`चू` is one akshara)."""
+    import unicodedata
+
+    run = 0
+    for token in split_spans(term.casefold()):
+        base = [c for c in token.text if not unicodedata.category(c).startswith("M")]
+        run = run + 1 if len(base) == 1 else 0
+        if run >= 2:
+            return True
+    return False
 
 
 def _policy() -> Dict[str, Any]:
@@ -350,16 +462,23 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         ("v1ttu", "fi"),
         ("бл9дь", "ru"),
         ("n1gger", "en"),
+        # Promoted by the three-family model review, 2026-09-21.
+        ("ty kurwa", "pl"),
+        ("che cazzo", "it"),
+        ("eres un hijo de puta", "es"),
+        ("씨발", "ko"),
+        ("मादरचोद", "hi"),
     ]
 
     def test_everything_tier1_stopped_blocking_is_caught_by_tier2(self) -> None:
         """The whole bargain, asserted over the whole corpus.
 
-        Tier 1 now blocks plain words in English only, because English is the
-        only language anyone on this change can attest. That is a large
-        recall loss at the blocking tier, and it is acceptable only because
-        Tier 2 catches every one of them - which is what this asserts, case
-        by case, rather than assuming.
+        Tier 1 blocks plain words only where a basis in the policy covers
+        them - the English curator's three, and since 2026-09-21 the terms a
+        three-family model review promoted. Everything else stays out of the
+        blocking tier, and that is acceptable only because Tier 2 catches
+        every one of them - which is what this asserts, case by case, rather
+        than assuming.
         """
         moved = [
             case
@@ -377,6 +496,23 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
                     self.tier2.matcher_hit(text),
                     f"{case['term']!r} left Tier 1 and Tier 2 does not catch it",
                 )
+
+    def test_every_case_the_corpus_places_in_tier1_is_blocked(self) -> None:
+        """The other direction of the same record: a case the corpus says
+        Tier 1 blocks is blocked, so moving a case to tier 1 is a claim the
+        matcher has to make good on, not an edit to the record alone."""
+        caught = [
+            case
+            for lang in _corpus()["languages"]
+            for kind in ("profanities", "evasions")
+            for case in lang[kind]
+            if case["tier"] == 1
+        ]
+        self.assertTrue(caught)
+        for case in caught:
+            text = case.get("sentence", case["term"])
+            with self.subTest(term=case["term"]):
+                self.assertEqual(check_text(text, _PHONE_REGIONS), REASON_PROFANITY)
 
     def test_the_evasion_spellings_are_still_rejected_before_send(self) -> None:
         """Obfuscated spellings are the one thing Tier 1 can block in every
@@ -503,8 +639,8 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
     def test_the_native_review_rule_rejects_what_it_is_for(self) -> None:
         """Asserted against the RULE, because the data has no native reviews.
 
-        There are none yet - that is the point of the promotion policy, and it
-        is why 29 languages carry no plain-word terms in Tier 1. So the
+        There are none yet - the plain-word terms outside English reached
+        Tier 1 on the weaker `model_review` basis instead. So the
         previous version of this test iterated an empty set: every subTest was
         skipped, nothing was asserted, and the day somebody adds a native
         review with no reviewer named it would have passed. The rule is
@@ -557,6 +693,260 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
             }
         )
         self.assertEqual(carried, _policy()["tier1_languages"])
+
+
+def _vote(
+    family: str,
+    verdict: str = "approve",
+    category: str = "hard_profanity",
+    benign: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    return {
+        "family": family,
+        "model": f"{family} test model",
+        "verdict": verdict,
+        "category": category,
+        "benign_readings": benign or [],
+        "reason": "a recorded reason",
+    }
+
+
+def _model_record(*votes: Dict[str, Any], approvals: int = 2) -> Dict[str, Any]:
+    return {
+        "date": "2026-09-21",
+        "decision": "pangeachat/2-step-choreographer#1746",
+        "approvals": approvals,
+        "votes": list(votes),
+    }
+
+
+def _two_of_three() -> List[Dict[str, Any]]:
+    return [
+        _vote("claude"),
+        _vote("gemini", category="slur"),
+        _vote("codex", verdict="reject"),
+    ]
+
+
+class TestTheModelReviewBasis(unittest.TestCase):
+    """`model_review`: three model families reviewed each term blind to each
+    other, and the product owner accepted that in place of native review
+    (pangeachat/2-step-choreographer#1746, 2026-09-21). The four rules the
+    engineering owner fixed are what this class holds the data to:
+
+    1. only a slur or hard profanity may be promoted - mild swearing never is;
+    2. at least two DISTINCT families approve;
+    3. a concrete benign reading from ANY reviewer demotes, whatever the vote;
+    4. the vocabulary sweep is the final arbiter (`TestTheVocabularySweep`).
+
+    It is a weaker basis than `native_review` and is recorded as such.
+    """
+
+    def test_the_rule_accepts_two_distinct_family_approvals(self) -> None:
+        self.assertIsNone(_model_review_problem(_model_record(*_two_of_three())))
+        self.assertEqual(
+            _model_review_outcome(_model_record(*_two_of_three())), "promoted"
+        )
+
+    def test_the_rule_rejects_what_it_is_for(self) -> None:
+        """Asserted on records, so each clause is exercised whatever the data
+        happens to hold."""
+        one_approval = [
+            _vote("claude"),
+            _vote("gemini", verdict="reject"),
+            _vote("codex", verdict="reject"),
+        ]
+        mild = [
+            _vote("claude", category="mild_profanity"),
+            _vote("gemini", category="mild_profanity"),
+            _vote("codex", verdict="reject"),
+        ]
+        # One reviewer calls it mild while approving it. Mild never enters
+        # Tier 1, so the approval is evidence against promotion, not for it.
+        one_mild = [
+            _vote("claude"),
+            _vote("gemini", category="mild_profanity"),
+            _vote("codex", verdict="reject"),
+        ]
+        # The third family approves with a mild category beside two eligible
+        # approvals: the evidence says the word may be mild, and mild never
+        # enters Tier 1.
+        mild_beside_two = [
+            _vote("claude"),
+            _vote("gemini"),
+            _vote("codex", category="mild_profanity"),
+        ]
+        benign_from_a_rejecter = [
+            _vote("claude"),
+            _vote("gemini"),
+            _vote(
+                "codex",
+                verdict="reject",
+                benign=[{"lang": "de", "meaning": "a surname"}],
+            ),
+        ]
+        benign_from_an_approver = [
+            _vote("claude", benign=[{"lang": "pl", "meaning": "a kiss"}]),
+            _vote("gemini"),
+            _vote("codex"),
+        ]
+        same_family_twice = [
+            _vote("claude"),
+            _vote("claude"),
+            _vote("codex", verdict="reject"),
+        ]
+        missing_family = [_vote("claude"), _vote("gemini")]
+        unknown_family = [_vote("claude"), _vote("gemini"), _vote("llama")]
+        missing_field = _two_of_three()
+        del missing_field[1]["category"]
+        no_model = _two_of_three()
+        no_model[0]["model"] = " "
+        readings_not_a_list = _two_of_three()
+        readings_not_a_list[2]["benign_readings"] = "none"
+        cases: List[Tuple[Dict[str, Any], str]] = [
+            (_model_record(*one_approval, approvals=1), "approvals"),
+            (_model_record(*mild), "category"),
+            (_model_record(*one_mild, approvals=1), "category"),
+            (_model_record(*mild_beside_two, approvals=2), "category"),
+            (_model_record(*benign_from_a_rejecter), "benign_reading"),
+            (_model_record(*benign_from_an_approver, approvals=3), "benign_reading"),
+            (_model_record(*same_family_twice), "reviewers"),
+            (_model_record(*missing_family), "reviewers"),
+            (_model_record(*unknown_family, approvals=3), "reviewers"),
+            (_model_record(*missing_field), "reviewers"),
+            (_model_record(*no_model), "reviewers"),
+            (_model_record(*readings_not_a_list), "reviewers"),
+            # The stored count must be the count of the votes it sits beside.
+            (_model_record(*_two_of_three(), approvals=3), "approvals_recorded"),
+            ({**_model_record(*_two_of_three()), "date": ""}, "date"),
+            ({**_model_record(*_two_of_three()), "date": "yesterday"}, "date"),
+            ({"date": "2026-09-21", "approvals": 2}, "reviewers"),
+            ({}, "reviewers"),
+        ]
+        for record, expected in cases:
+            with self.subTest(expected=expected, record=record):
+                self.assertEqual(_model_review_problem(record), expected)
+
+    def test_the_outcome_follows_the_vote_and_the_veto(self) -> None:
+        self.assertEqual(
+            _model_review_outcome(
+                _model_record(
+                    _vote("claude"),
+                    _vote("gemini", verdict="reject"),
+                    _vote("codex", verdict="reject"),
+                    approvals=1,
+                )
+            ),
+            "not_promoted",
+        )
+        self.assertEqual(
+            _model_review_outcome(
+                _model_record(
+                    _vote("claude"),
+                    _vote("gemini"),
+                    _vote(
+                        "codex",
+                        verdict="reject",
+                        benign=[{"lang": "ru", "meaning": "a given name"}],
+                    ),
+                )
+            ),
+            "vetoed",
+        )
+
+    def test_every_model_review_promotion_in_the_data_passes_the_rule(self) -> None:
+        promoted = [
+            entry for entry in _promoted() if entry["review"]["basis"] == "model_review"
+        ]
+        self.assertTrue(promoted, "no term is promoted on the model_review basis")
+        for entry in promoted:
+            with self.subTest(term=entry["term"]):
+                record = entry.get("model_review")
+                self.assertIsNotNone(record, "promoted with no vote record")
+                assert record is not None
+                self.assertIsNone(_model_review_problem(record))
+                self.assertEqual(record["outcome"], "promoted")
+                self.assertEqual(entry["review"]["date"], record["date"])
+
+    def test_every_vote_record_agrees_with_the_decision_on_the_term(self) -> None:
+        """The record and the tier have to say the same thing, in both
+        directions: a term the vote did not promote is Tier 2's, a vetoed term
+        names the reading and the model that supplied it, and a term the vote
+        promoted is in Tier 1 unless the sweep demoted it - in which case the
+        colliding word is recorded (and re-checked by the sweep test)."""
+        reviewed = [entry for entry in universal_terms() if "model_review" in entry]
+        self.assertTrue(reviewed, "no term carries a model_review record")
+        for entry in reviewed:
+            record = entry["model_review"]
+            derived = _model_review_outcome(record)
+            with self.subTest(term=entry["term"]):
+                if entry.get("review", {}).get("basis") == "native_review":
+                    continue  # a native review supersedes the model vote
+                if derived == "promoted" and entry["tier1"]:
+                    self.assertEqual(record["outcome"], "promoted")
+                elif derived == "promoted" and entry["reason"] == "spelled_out":
+                    self.assertEqual(record["outcome"], "spelled_out")
+                    self.assertTrue(_is_spelled_out(entry["term"]))
+                elif derived == "promoted":
+                    self.assertEqual(record["outcome"], "demoted_by_sweep")
+                    self.assertEqual(entry["reason"], "benign_homograph")
+                    self.assertTrue(entry.get("sweep_collision"))
+                elif derived == "vetoed":
+                    self.assertFalse(entry["tier1"])
+                    self.assertEqual(record["outcome"], "vetoed")
+                    self.assertIn(
+                        entry["reason"],
+                        {"benign_homograph", "benign_sense_in_own_language"},
+                    )
+                    for vote in record["votes"]:
+                        for reading in vote["benign_readings"]:
+                            self.assertIn(vote["family"], entry["note"])
+                            self.assertIn(reading["meaning"], entry["note"])
+                else:
+                    self.assertFalse(entry["tier1"])
+                    self.assertEqual(record["outcome"], "not_promoted")
+                    self.assertEqual(entry["reason"], "model_review_not_promoted")
+
+    def test_a_spelled_out_form_is_never_promoted(self) -> None:
+        """A term written with its letters spaced or dotted apart - `k u r w
+        a`, `đ.ị.t mẹ`, `चू ति या` - is a spelled-out run, and Tier 1 acts on
+        one only when it carries a digit (`_matches_split_word`), and never
+        across the syllables of an abugida or Hangul. Promoting such a form
+        would either do nothing - the classification claiming a block the
+        matcher never makes - or, through the phrase bucket, rejoin syllables
+        across spaces, which is the `민수 씨 발 아파요?` defect. So the
+        vote's promotion of these forms is recorded and not applied, and the
+        compact form carries the term."""
+        spelled = [e for e in universal_terms() if e["reason"] == "spelled_out"]
+        self.assertTrue(spelled, "no spelled-out form recorded to check")
+        for entry in spelled:
+            with self.subTest(term=entry["term"]):
+                self.assertFalse(entry["tier1"])
+                self.assertTrue(_is_spelled_out(entry["term"]))
+                self.assertFalse(any(char.isdigit() for char in entry["needle"]))
+        for entry in _promoted():
+            if any(char.isdigit() for char in entry["needle"]):
+                continue
+            with self.subTest(term=entry["term"]):
+                self.assertFalse(
+                    _is_spelled_out(entry["term"]),
+                    "a spelled-out form with no digit is in Tier 1",
+                )
+        self.assertTrue(_is_spelled_out("k u r w a"))
+        self.assertTrue(_is_spelled_out("đ.ị.t mẹ"))
+        self.assertTrue(_is_spelled_out("चू ति या"))
+        self.assertFalse(_is_spelled_out("hijo de puta"))
+        self.assertFalse(_is_spelled_out("बहनचोद का"))
+
+    def test_the_recorded_approval_count_is_the_votes(self) -> None:
+        """The vote is recorded as it was, not rounded up: every promotion is
+        exactly the approvals its votes carry, which the rule re-derives."""
+        for entry in _promoted():
+            if entry["review"]["basis"] != "model_review":
+                continue
+            record = entry["model_review"]
+            with self.subTest(term=entry["term"]):
+                self.assertEqual(record["approvals"], _eligible_approvals(record))
 
 
 class TestNoAcceptedFalsePositives(unittest.TestCase):
@@ -693,11 +1083,28 @@ class TestTheCollisionGate(unittest.TestCase):
             floors[4] and floors[3],
             "the alphabet floors are exercised by real terms",
         )
-        self.assertEqual(
-            floors[2],
-            [],
-            "nothing written in a script without word spacing is in Tier 1",
-        )
+        # The two-character floor covers Hangul, kana and ideographs alike.
+        # Korean is written with spaces between words, so a whole-token Hangul
+        # needle has a boundary to respect and the model review promoted some;
+        # Chinese and Japanese are not, and nothing written in kana or an
+        # ideograph may be in Tier 1. Asserted per character, so a needle
+        # mixing Hangul with a kana or an ideograph fails too.
+        self.assertTrue(floors[2], "the Hangul floor is exercised by real terms")
+        for stored in floors[2]:
+            with self.subTest(needle=stored):
+                self.assertFalse(
+                    any(
+                        0x3040 <= ord(char) <= 0x30FF
+                        or 0x3400 <= ord(char) <= 0x9FFF
+                        or 0xF900 <= ord(char) <= 0xFAFF
+                        for char in stored
+                    ),
+                    "nothing written in a script without word spacing is in " "Tier 1",
+                )
+                self.assertTrue(
+                    all(0xAC00 <= ord(char) <= 0xD7AF for char in stored),
+                    "a two-character needle is whole Hangul syllables",
+                )
 
     def test_recorded_needles_match_what_the_matcher_computes(self) -> None:
         for entry in universal_terms():
@@ -800,6 +1207,100 @@ class TestTheFrequencyTripwire(unittest.TestCase):
         self.assertEqual(policy["thresholds"]["large_list"], _LARGE_LIST_THRESHOLD)
         self.assertEqual(sorted(policy["languages"]), sorted(_LANGS))
         self.assertEqual(sorted(policy["large_list_languages"]), sorted(_LARGE_LIST))
+
+
+_SWEEP_TOP_N = 30000
+
+
+def _vocabulary(lang: str) -> List[str]:
+    import warnings
+
+    from wordfreq import top_n_list
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return list(top_n_list(_WORDFREQ_LANG.get(lang, lang), _SWEEP_TOP_N))
+
+
+class TestTheVocabularySweep(unittest.TestCase):
+    """The final arbiter: wordfreq's 30,000 most frequent words in every
+    supported language, each run through the matcher Tier 1 uses.
+
+    A promoted term may block a word from that list only when the word IS the
+    term - the swear itself, frequent in its own language - or when it is a
+    collision the collision gate made someone adjudicate as `no_benign_sense`.
+    Any other hit is an ordinary word blocked before send, and the rule for
+    that is fixed: the term is demoted, whatever the vote. It is never
+    exempted here, and the list is never trimmed to let a term through.
+
+    Where the tripwire above asks "is this form frequent somewhere else?", this
+    asks "what does the matcher actually do to the vocabulary?" - which also
+    catches what the per-term measurement cannot, such as a phrase needle
+    written as one token in another language.
+    """
+
+    def setUp(self) -> None:
+        if importlib.util.find_spec("wordfreq") is None:
+            self.fail(
+                "the vocabulary sweep needs wordfreq[cjk]; install the dev "
+                "extras with `pip install -e '.[dev]'`. Skipping it instead "
+                "would leave the promoted terms unswept"
+            )
+
+    def test_no_ordinary_word_in_any_language_is_blocked(self) -> None:
+        by_needle: Dict[str, List[TermRecord]] = {}
+        for entry in _promoted():
+            by_needle.setdefault(entry["needle"], []).append(entry)
+        blocked = 0
+        for lang in _LANGS:
+            words = _vocabulary(lang)
+            self.assertGreater(len(words), 10000, f"no vocabulary for {lang}")
+            for word in words:
+                if not matches_tier1(word):
+                    continue
+                blocked += 1
+                owners = by_needle.get(needle(word), [])
+                with self.subTest(lang=lang, word=word):
+                    self.assertTrue(
+                        owners,
+                        "an ordinary word blocks and no promoted term's needle "
+                        "is that word",
+                    )
+                    self.assertTrue(
+                        any(
+                            lang in owner["langs"] or lang in _adjudicated_langs(owner)
+                            for owner in owners
+                        ),
+                        f"{word!r} is in the {lang} vocabulary and Tier 1 "
+                        f"blocks it through "
+                        f"{sorted(owner['term'] for owner in owners)}, which is "
+                        f"not a {lang} term and carries no adjudication for "
+                        f"{lang}; the term is demoted",
+                    )
+        # The terms themselves are in the vocabulary (`cunt` is), so a sweep
+        # that blocks nothing at all has stopped exercising the matcher.
+        self.assertGreater(blocked, 0, "the sweep blocked nothing at all")
+
+    def test_every_sweep_demotion_names_a_real_collision(self) -> None:
+        """A term demoted by the sweep records the word that demoted it, and
+        the record is re-checked: the word is in that language's vocabulary,
+        and the term's needle blocks it."""
+        demoted = [entry for entry in universal_terms() if "sweep_collision" in entry]
+        for entry in demoted:
+            collision = entry["sweep_collision"]
+            with self.subTest(term=entry["term"]):
+                self.assertFalse(entry["tier1"])
+                self.assertIn(collision["word"], _vocabulary(collision["lang"]))
+                self.assertEqual(needle(collision["word"]), entry["needle"])
+                self.assertIn(collision["word"], entry["note"])
+
+
+def _adjudicated_langs(entry: TermRecord) -> List[str]:
+    adjudication = entry.get("adjudication") or {}
+    if adjudication.get("outcome") != "no_benign_sense":
+        return []
+    langs = adjudication.get("langs", [])
+    return [str(lang) for lang in langs] if isinstance(langs, list) else []
 
 
 class TestTier1TakesNoLanguage(unittest.TestCase):
@@ -1024,10 +1525,12 @@ class TestTheMatchingRules(unittest.TestCase):
                 self.assertTrue(matches_tier1(text))
 
     def test_only_letters_of_an_alphabet_are_treated_as_fragments(self) -> None:
-        """Asserted on the rule itself, because no term written in one of
-        those scripts is in Tier 1 today - there is no reviewer for one - so
-        an end-to-end assertion would pass with the rule deleted, and would
-        keep passing until the day somebody adds a Korean term back.
+        """Asserted on the rule itself, because an end-to-end assertion
+        depends on which terms happen to be promoted. Korean, Hindi, Bengali
+        and Arabic terms are in Tier 1 since the model review, but only as
+        whole tokens or whole-word phrases; a spaced-out spelling in those
+        scripts is still never rejoined, and the spelled-out forms the vote
+        approved are recorded as `spelled_out` rather than promoted.
 
         Punctuation is not proof of an evasion either: `민수 씨,발 아파요?` is
         the same ordinary sentence with a comma in it.
@@ -1080,11 +1583,31 @@ class TestTheMatchingRules(unittest.TestCase):
             if entry["tier1"] and entry["match"] == "phrase"
         ]
         self.assertTrue(live, "no phrase term left to exercise the rule")
+        standalone_checked = 0
         for entry in live:
             words = entry["term"].split()
+            across = ". ".join(words)
             with self.subTest(term=entry["term"]):
                 self.assertTrue(matches_tier1(" ".join(words)))
-                self.assertFalse(matches_tier1(". ".join(words)))
+                # The rule itself, on this phrase alone: it forms across a
+                # space and not across the full stop.
+                self.assertTrue(
+                    matches_phrase(
+                        split_spans(" ".join(words).casefold()), {entry["needle"]}
+                    )
+                )
+                self.assertFalse(
+                    matches_phrase(split_spans(across.casefold()), {entry["needle"]})
+                )
+                # And end to end, wherever no word of the phrase is itself a
+                # Tier 1 term - `बहनचोद का` is blocked across a full stop
+                # because `बहनचोद` is, not because the phrase formed.
+                if not any(matches_tier1(word) for word in words):
+                    standalone_checked += 1
+                    self.assertFalse(matches_tier1(across))
+        self.assertTrue(
+            standalone_checked, "no phrase is exercised end to end across a stop"
+        )
 
     def test_letters_split_apart_are_still_caught(self) -> None:
         """A rejoining Tier 1 acts on is across WHITESPACE ALONE and carries a

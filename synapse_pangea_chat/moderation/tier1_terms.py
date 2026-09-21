@@ -45,6 +45,7 @@ from collections import deque
 from functools import lru_cache
 from pathlib import Path
 from typing import (
+    Any,
     Deque,
     Dict,
     FrozenSet,
@@ -102,10 +103,17 @@ class TermRecord(TypedDict, total=False):
     note: str
     #: Present only on a promoted term: the positive evidence for promoting
     #: it. `basis` is one of `not_a_word_or_an_identifier`,
-    #: `curator_attested` or `native_review`.
+    #: `curator_attested`, `model_review` or `native_review`.
     review: Dict[str, str]
     collisions: Dict[str, float]
     adjudication: Dict[str, object]
+    #: The three-family model vote, on every term that went through it -
+    #: promoted or not, so nobody re-reviews a term blind. Data for the gate;
+    #: the matcher never reads it.
+    model_review: Dict[str, Any]
+    #: The ordinary word, and its language, that made the vocabulary sweep
+    #: demote a term the vote had promoted.
+    sweep_collision: Dict[str, str]
 
 
 # Invisible characters carry no meaning; an evader puts them inside a word.

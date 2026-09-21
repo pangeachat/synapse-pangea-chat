@@ -75,7 +75,7 @@
      "term": "fill de puta",
      "sentence": "Ets un fill de puta.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "puta",
@@ -93,7 +93,7 @@
      "term": "maricó",
      "sentence": "L'han insultat dient-li maricó.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -140,13 +140,13 @@
      "term": "Arschloch",
      "sentence": "Du bist ein Arschloch.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "Hurensohn",
      "sentence": "Hau ab, du Hurensohn.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "Scheiße",
@@ -164,7 +164,7 @@
      "term": "Schwuchtel",
      "sentence": "Sie nannten ihn eine Schwuchtel.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -315,7 +315,7 @@
      "term": "hijo de puta",
      "sentence": "Eres un hijo de puta.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "puta",
@@ -327,7 +327,7 @@
      "term": "maricón",
      "sentence": "Lo insultaron llamándolo maricón.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "coño",
@@ -359,7 +359,7 @@
      "term": "maricon",
      "base_term": "maricón",
      "technique": "diacritic stripping",
-     "tier": 2
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -389,19 +389,19 @@
      "term": "fils de pute",
      "sentence": "Espèce de fils de pute.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "salope",
      "sentence": "Il l'a harcelée en la traitant de salope.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "enculé",
      "sentence": "Dégage, enculé.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "putain",
@@ -413,7 +413,7 @@
      "term": "pédé",
      "sentence": "Ils l'ont insulté en disant pédé.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -463,25 +463,25 @@
      "term": "figlio di puttana",
      "sentence": "Sei un figlio di puttana.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "cazzo",
      "sentence": "Che cazzo fai?",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "stronzo",
      "sentence": "Vattene, stronzo.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "frocio",
      "sentence": "Lo hanno insultato chiamandolo frocio.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -501,7 +501,7 @@
      "term": "froccio",
      "base_term": "frocio",
      "technique": "doubled consonant",
-     "tier": 2
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -596,13 +596,13 @@
      "term": "씨발",
      "sentence": "씨발, 당장 꺼져.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "개새끼",
      "sentence": "이 개새끼야, 그만해.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "병신",
@@ -685,13 +685,13 @@
      "term": "filho da puta",
      "sentence": "Você é um filho da puta.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "caralho",
      "sentence": "Que caralho você está fazendo?",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "viado",
@@ -759,25 +759,25 @@
      "term": "блядь",
      "sentence": "Блядь, оставь меня в покое.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "хуй",
      "sentence": "Иди на хуй.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "пидор",
      "sentence": "Его оскорбили словом «пидор».",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "ебать",
      "sentence": "Ебать, что здесь случилось?",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -821,19 +821,19 @@
      "term": "đụ má",
      "sentence": "Đụ má, tránh xa tao ra.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "địt mẹ",
      "sentence": "Địt mẹ mày, im đi.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "con đĩ",
      "sentence": "Cô ấy bị xúc phạm là con đĩ.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "đồ chó",
@@ -990,7 +990,7 @@
      "term": "كس أمك",
      "sentence": "ابتعد عني يا كس أمك.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "شرموطة",
@@ -1002,7 +1002,7 @@
      "term": "منيوك",
      "sentence": "اخرس يا منيوك.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "خول",
@@ -1014,7 +1014,7 @@
      "term": "ابن القحبة",
      "sentence": "أنت ابن القحبة.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -1022,7 +1022,7 @@
      "term": "koss omak",
      "base_term": "كس أمك",
      "technique": "Latin-script transliteration",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "ش ر م و ط ة",
@@ -1064,19 +1064,19 @@
      "term": "মাদারচোদ",
      "sentence": "তুই একটা মাদারচোদ।",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "খানকির পোলা",
      "sentence": "দূর হ, খানকির পোলা।",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "চোদনা",
      "sentence": "ওকে চোদনা বলে গালি দিয়েছে।",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "মাগী",
@@ -1126,19 +1126,19 @@
      "term": "zmrd",
      "sentence": "Vypadni, ty zmrde.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "čurák",
      "sentence": "Jsi úplný čurák.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "píča",
      "sentence": "Nadával jí do píči.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "kurva",
@@ -1158,7 +1158,7 @@
      "term": "curak",
      "base_term": "čurák",
      "technique": "diacritic stripping",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "p 1 c a",
@@ -1213,7 +1213,7 @@
      "term": "røvhul",
      "sentence": "Du er et røvhul.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -1263,7 +1263,7 @@
      "term": "πουτάνα",
      "sentence": "Την παρενόχλησαν λέγοντάς την πουτάνα.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "αρχίδι",
@@ -1275,7 +1275,7 @@
      "term": "πούστης",
      "sentence": "Τον έβρισαν λέγοντάς τον πούστη.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -1289,7 +1289,7 @@
      "term": "πουστης",
      "base_term": "πούστης",
      "technique": "diacritic stripping",
-     "tier": 2
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -1319,7 +1319,7 @@
      "term": "vittu",
      "sentence": "Vittu, jätä minut rauhaan.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "perkele",
@@ -1387,19 +1387,19 @@
      "term": "मादरचोद",
      "sentence": "तू मादरचोद है।",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "बहनचोद",
      "sentence": "भाग यहाँ से, बहनचोद।",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "चूतिया",
      "sentence": "मुझे चूतिया मत समझ।",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "रंडी",
@@ -1474,7 +1474,7 @@
      "term": "fasz",
      "sentence": "Mekkora fasz vagy.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "ribanc",
@@ -1545,7 +1545,7 @@
      "term": "kontol",
      "sentence": "Dasar kontol, diam kau.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "memek",
@@ -1557,7 +1557,7 @@
      "term": "lonte",
      "sentence": "Dia dilecehkan dengan sebutan lonte.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "bencong",
@@ -1620,7 +1620,7 @@
      "term": "pukimak",
      "sentence": "Diamlah, pukimak.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "lancau",
@@ -1682,7 +1682,7 @@
      "term": "klootzak",
      "sentence": "Ga weg, klootzak.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "hoer",
@@ -1732,19 +1732,19 @@
      "term": "kurwa",
      "sentence": "Kurwa, zostaw mnie w spokoju.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "chuj",
      "sentence": "Spadaj, chuju.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "pierdolić",
      "sentence": "Przestań pierdolić.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "cipa",
@@ -1797,25 +1797,25 @@
      "term": "muie",
      "sentence": "Muie ție, pleacă de aici.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "pizdă",
      "sentence": "A insultat-o spunându-i pizdă.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "futut",
      "sentence": "Ce joc futut!",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "poponar",
      "sentence": "L-au insultat spunându-i poponar.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -1829,7 +1829,7 @@
      "term": "pizda",
      "base_term": "pizdă",
      "technique": "diacritic stripping",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "p0ponar",
@@ -1890,13 +1890,13 @@
      "term": "jebať",
      "sentence": "Choď sa jebať.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "buzerant",
      "sentence": "Šikanovali ho slovom buzerant.",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -1956,7 +1956,7 @@
      "term": "јебем ти матер",
      "sentence": "Јебем ти матер, губи се.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "пичка",
@@ -1988,7 +1988,7 @@
      "term": "jebem ti mater",
      "base_term": "јебем ти матер",
      "technique": "Latin-script transliteration",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "п и ч к а",
@@ -2033,19 +2033,19 @@
      "term": "orospu çocuğu",
      "sentence": "Defol, orospu çocuğu.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "siktir",
      "sentence": "Siktir git buradan.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "amına koyayım",
      "sentence": "Amına koyayım, yine bozuldu.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "ibne",
@@ -2077,7 +2077,7 @@
      "term": "amina koyayim",
      "base_term": "amına koyayım",
      "technique": "diacritic stripping",
-     "tier": 2
+     "tier": 1
     }
    ],
    "negative_controls": [
@@ -2107,25 +2107,25 @@
      "term": "блядь",
      "sentence": "Блядь, залиш мене в спокої.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "хуй",
      "sentence": "Іди на хуй.",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "підор",
      "sentence": "Його ображали словом «підор».",
      "severity": "slur",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "їбати",
      "sentence": "Їбати, що тут сталося?",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     }
    ],
    "evasions": [
@@ -2169,19 +2169,19 @@
      "term": "ماں چود",
      "sentence": "دفع ہو جا، ماں چود۔",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "بہن چود",
      "sentence": "خاموش ہو جا، بہن چود۔",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "چوتیا",
      "sentence": "مجھے چوتیا مت سمجھو۔",
      "severity": "profanity",
-     "tier": 2
+     "tier": 1
     },
     {
      "term": "رنڈی",
