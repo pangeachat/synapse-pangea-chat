@@ -633,7 +633,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         would be English-only in practice as well as in principle.
 
         The floor moves when a term is correctly demoted - it stood at 20 and
-        eleven leet forms then left Tier 1 with the words they spell - so it
+        twelve leet forms then left Tier 1 with the words they spell - so it
         is RE-DERIVED here, never lowered to fit a regression. What it was
         standing in for is asserted directly beside it: the evasions Tier 1
         catches have to span many languages and several techniques, which is
@@ -642,10 +642,13 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
 
         The spread numbers move the same way and for the same reason, and
         they are worth watching rather than nudging: 16 languages, then 15,
-        now 14 of the thirty. Each step followed a term leaving Tier 1 on a
-        sourced reading, not a matcher regression - but the day one of these
-        falls WITHOUT a demotion beside it in the same change, the blocking
-        tier has broken rather than narrowed.
+        then 14, now 13 of the thirty. Each step followed a term leaving
+        Tier 1 on a sourced reading, not a matcher regression - but the day
+        one of these falls WITHOUT a demotion beside it in the same change,
+        the blocking tier has broken rather than narrowed. The direction is
+        one-way and the reason is structural: the readings keep being found
+        because they are there, and every profanity of every language has
+        been the title of something.
         """
         caught = [
             case
@@ -654,7 +657,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
             for case in lang[kind]
             if case["tier"] == 1 and kind == "evasions"
         ]
-        self.assertGreaterEqual(len(caught), 15)
+        self.assertGreaterEqual(len(caught), 14)
         languages = {
             lang["lang_code"]
             for lang in _corpus()["languages"]
@@ -663,7 +666,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         }
         self.assertGreaterEqual(
             len(languages),
-            14,
+            13,
             "Tier 1 catches obfuscated spellings in too few languages; the "
             "blocking tier is becoming English-only in practice",
         )

@@ -109,7 +109,10 @@
    "Je viens de finir L'Enculé, le roman de Marc-Édouard Nabe.",
    "Estoy leyendo El hijo de puta sentimental, la novela de Ildefonso Arenas.",
    "Figlio di puttana è la sesta traccia di Villa Inferno degli Zen Circus.",
-   "Наталья Сергеевна Пичко работает в университете."
+   "Наталья Сергеевна Пичко работает в университете.",
+   "Discurs sobre el fill de puta és la traducció catalana del pamflet d'Alberto Pimenta.",
+   "Petit pédé est une chanson de Renaud parue sur l'album Boucan d'enfer.",
+   "Kniha Jiřího Hromady se jmenuje Prezident, nebo buzerant?"
   ]
  },
  "languages": [
@@ -121,7 +124,7 @@
      "term": "fill de puta",
      "sentence": "Ets un fill de puta.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "puta",
@@ -147,7 +150,7 @@
      "term": "f1ll de puta",
      "base_term": "fill de puta",
      "technique": "leetspeak",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "marico",
@@ -175,6 +178,13 @@
      "tier2_matcher": "flags",
      "tier2_note": "Tier 2 still flags this sentence, and that is recorded rather than hidden: flagging in Tier 2 means the LLM reads the message in context, not that anything is blocked. Only Tier 1 blocks, and Tier 1 must not fire here. Why it flags: 'puta' is on the Tier 2 list, which is the recall-oriented one.",
      "tier2_reason": "term_is_on_the_tier2_list"
+    },
+    {
+     "sentence": "Discurs sobre el fill de puta és la traducció catalana del pamflet d'Alberto Pimenta.",
+     "why_benign": "Discurs sobre el fill de puta, Alberto Pimenta, translated by Josep Vallespir Pons, Ed. Males Herbes, Barcelona 2024, ISBN 9788412782431, in the Catalan union catalogue (CCUC) and held by the Biblioteca Publica de Tarragona at 316.6 PIM",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`fill de puta` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -529,7 +539,7 @@
      "term": "pédé",
      "sentence": "Ils l'ont insulté en disant pédé.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -596,6 +606,13 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`enculé` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Petit pédé est une chanson de Renaud parue sur l'album Boucan d'enfer.",
+     "why_benign": "Petit Pédé is track 2 of Renaud's album Boucan d'enfer, released 28 May 2002 on Virgin, words by Renaud Sechan and music by Jean-Pierre Bucolo; MusicBrainz carries the recording and it was issued as a single in January 2003",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`pédé` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -1452,6 +1469,13 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`čurák` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Kniha Jiřího Hromady se jmenuje Prezident, nebo buzerant?",
+     "why_benign": "Prezident, nebo buzerant? is Jiri Hromada's autobiography, Maly princ, Prague 2014, ISBN 978-80-87754-44-3, catalogued by the Czech National Library (cnb002648138) and the Jihoceska vedecka knihovna",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`buzerant` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -2250,7 +2274,7 @@
      "term": "buzerant",
      "sentence": "Šikanovali ho slovom buzerant.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
