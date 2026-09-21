@@ -101,7 +101,10 @@
    "Город Бутаре с 2006 года официально называется Хуе.",
    "Хуи — это традиционное собрание у маори.",
    "계간 씨발아 잡지를 샀다.",
-   "غرفة 5ول في نهاية الممر."
+   "غرفة 5ول في نهاية الممر.",
+   "মীমাংসা দর্শনে চোদনা বলিতে বেদবাক্যের বিধিমূলক প্রেরণাকে বুঝায়।",
+   "সেই বেদীয় চোদনার অন্তর্নিহিত দিকনির্দেশনা স্বরূপ আত্মপ্রকাশ করেন।",
+   "Éric Pougeau a publié Fils de pute aux éditions Dilecta en 2011."
   ]
  },
  "languages": [
@@ -490,7 +493,7 @@
      "term": "fils de pute",
      "sentence": "Espèce de fils de pute.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "salope",
@@ -522,7 +525,7 @@
      "term": "f1ls de pute",
      "base_term": "fils de pute",
      "technique": "leetspeak",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "e n c u l é",
@@ -567,6 +570,13 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`vittu` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Éric Pougeau a publié Fils de pute aux éditions Dilecta en 2011.",
+     "why_benign": "Fils de pute is an artist's book by Éric Pougeau, Éditions Dilecta, 2011, ISBN 9782916275956, catalogued by the Bibliothèque nationale de France at ark:/12148/cb42568190v. The phrase term matches the title as a run of whole words - the same shape as the Hurensohn novel",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`fils de pute` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -1254,7 +1264,7 @@
      "term": "চোদনা",
      "sentence": "ওকে চোদনা বলে গালি দিয়েছে।",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "মাগী",
@@ -1293,6 +1303,20 @@
     {
      "sentence": "আমি বাংলা ভাষা শিখছি।",
      "why_benign": "Ordinary learner sentence."
+    },
+    {
+     "sentence": "মীমাংসা দর্শনে চোদনা বলিতে বেদবাক্যের বিধিমূলক প্রেরণাকে বুঝায়।",
+     "why_benign": "the Sanskrit tatsama codanā - injunction, prompting, a scriptural commandment; the central Mimamsa term in `codana-lakshano 'rtho dharmah` (Monier-Williams). Bengali philosophical prose carries it: modernsanskrit.com gives it as the ninth purpose of a royal edict in the Arthashastra, `ইদং ক্রিয়তাম্ ইতি চোদনা`",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`চোদনা` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "সেই বেদীয় চোদনার অন্তর্নিহিত দিকনির্দেশনা স্বরূপ আত্মপ্রকাশ করেন।",
+     "why_benign": "genitive of the same Sanskrit tatsama codanā; sahityasamrat.in writes `সেই বেদীয় চোদনার অন্তর্নিহিত দিকনির্দেশনা` in a discussion of dharma in Mimamsa",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`চোদনার` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },

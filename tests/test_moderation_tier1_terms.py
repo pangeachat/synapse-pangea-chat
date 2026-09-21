@@ -606,7 +606,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         would be English-only in practice as well as in principle.
 
         The floor moves when a term is correctly demoted - it stood at 20 and
-        nine leet forms then left Tier 1 with the words they spell - so it is
+        ten leet forms then left Tier 1 with the words they spell - so it is
         RE-DERIVED here, never lowered to fit a regression. What it was
         standing in for is asserted directly beside it: the evasions Tier 1
         catches have to span many languages and several techniques, which is
@@ -620,7 +620,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
             for case in lang[kind]
             if case["tier"] == 1 and kind == "evasions"
         ]
-        self.assertGreaterEqual(len(caught), 17)
+        self.assertGreaterEqual(len(caught), 16)
         languages = {
             lang["lang_code"]
             for lang in _corpus()["languages"]
