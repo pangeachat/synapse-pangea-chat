@@ -128,6 +128,26 @@ _MODEL_REVIEW_FAMILIES = ("claude", "gemini", "codex")
 _MODEL_REVIEW_MIN_APPROVALS = 2
 # Mild swearing never enters Tier 1, whatever the vote.
 _MODEL_REVIEW_CATEGORIES = {"slur", "hard_profanity"}
+_MODEL_REVIEW_VERDICTS = {"approve", "reject"}
+# The vocabulary the reviewers were given. A category outside it is a record
+# nobody can read, not a quiet rejection.
+_MODEL_REVIEW_ALL_CATEGORIES = {
+    "slur",
+    "hard_profanity",
+    "mild_profanity",
+    "not_profanity",
+    "unsure",
+}
+# What the vote decided, recomputed from the records by the tests and
+# recorded in the policy block. Duplicated here on purpose: a count read out
+# of the file it is checking cannot catch a record that was dropped from it.
+_MODEL_REVIEW_COUNTS = {
+    "candidates": 371,
+    "promoted": 263,
+    "vetoed": 5,
+    "spelled_out": 18,
+    "not_promoted": 85,
+}
 _MODEL_REVIEW_VOTE_FIELDS = (
     "family",
     "model",
@@ -196,12 +216,18 @@ def _eligible_approvals(record: Dict[str, Any]) -> int:
     )
 
 
-def _model_review_problem(record: Dict[str, Any]) -> Optional[str]:
-    """Why this `model_review` record does not license a promotion, or None.
+def _model_review_record_problem(record: Dict[str, Any]) -> Optional[str]:
+    """Why this `model_review` record is not a complete, readable record of
+    the vote, or None.
 
-    Checked in the order a reader would object: who voted, whether any of
-    them named a benign reading, whether the category is promotable, and
-    only then whether enough of them approved.
+    Separate from the promotion rule below, and checked on EVERY record
+    rather than only on the promoted ones: a record is the evidence that a
+    term was reviewed and what the reviewers said, and a term the vote did
+    not promote is exactly the one whose record nobody would miss. A
+    structurally broken record used to read as "not promoted", which is the
+    shape of a record that quietly stops being evidence - values of `null`
+    for a rejecting reviewer's verdict, category, model and reason passed,
+    and so did an approval count that was simply wrong on a demoted term.
     """
     votes = record.get("votes")
     if not isinstance(votes, list):
@@ -211,9 +237,23 @@ def _model_review_problem(record: Dict[str, Any]) -> Optional[str]:
             field not in vote for field in _MODEL_REVIEW_VOTE_FIELDS
         ):
             return "reviewers"
-        if not str(vote["model"]).strip() or not str(vote["reason"]).strip():
+        # Typed, not coerced: `str(None)` is a non-empty string, so a `null`
+        # model or reason passed a truthiness test on the coercion.
+        if any(
+            not isinstance(vote[field], str) or not vote[field].strip()
+            for field in ("family", "model", "reason")
+        ):
             return "reviewers"
-        if not isinstance(vote["benign_readings"], list):
+        if vote["verdict"] not in _MODEL_REVIEW_VERDICTS:
+            return "verdict"
+        if vote["category"] not in _MODEL_REVIEW_ALL_CATEGORIES:
+            return "category_vocabulary"
+        if not isinstance(vote["benign_readings"], list) or any(
+            not isinstance(reading, dict)
+            or not str(reading.get("lang", "")).strip()
+            or not str(reading.get("meaning", "")).strip()
+            for reading in vote["benign_readings"]
+        ):
             return "reviewers"
     families = [vote["family"] for vote in votes]
     # Distinct, and exactly the three families: two votes from one family are
@@ -224,6 +264,22 @@ def _model_review_problem(record: Dict[str, Any]) -> Optional[str]:
     date = str(record.get("date", ""))
     if len(date) != 10 or not date[:4].isdigit() or date[4] != "-":
         return "date"
+    if record.get("approvals") != _eligible_approvals(record):
+        return "approvals_recorded"
+    return None
+
+
+def _model_review_problem(record: Dict[str, Any]) -> Optional[str]:
+    """Why this `model_review` record does not license a promotion, or None.
+
+    Checked in the order a reader would object: whether the record is a
+    record at all, whether any reviewer named a benign reading, whether the
+    category is promotable, and only then whether enough of them approved.
+    """
+    structure = _model_review_record_problem(record)
+    if structure is not None:
+        return structure
+    votes = record["votes"]
     # The evidence veto: a concrete benign reading from ANY reviewer, the ones
     # who rejected the term included.
     if any(vote["benign_readings"] for vote in votes):
@@ -234,17 +290,18 @@ def _model_review_problem(record: Dict[str, Any]) -> Optional[str]:
         for vote in votes
     ):
         return "category"
-    approvals = _eligible_approvals(record)
-    if approvals < _MODEL_REVIEW_MIN_APPROVALS:
+    if _eligible_approvals(record) < _MODEL_REVIEW_MIN_APPROVALS:
         return "approvals"
-    if record.get("approvals") != approvals:
-        return "approvals_recorded"
     return None
 
 
 def _model_review_outcome(record: Dict[str, Any]) -> str:
     """What the vote decides on its own, before the sweep: `promoted`,
-    `vetoed` (enough approvals, and a benign reading), or `not_promoted`."""
+    `vetoed` (enough approvals, and a benign reading), `not_promoted`, or
+    `invalid` for a record that is not a readable record of a vote - which is
+    never an outcome, and must not read as one."""
+    if _model_review_record_problem(record) is not None:
+        return "invalid"
     problem = _model_review_problem(record)
     if problem is None:
         return "promoted"
@@ -803,19 +860,40 @@ class TestTheModelReviewBasis(unittest.TestCase):
         no_model[0]["model"] = " "
         readings_not_a_list = _two_of_three()
         readings_not_a_list[2]["benign_readings"] = "none"
+        # A reading has to be readable to be evidence: an empty meaning
+        # names nothing and a bare string says nothing about which language.
+        readings_unreadable = _two_of_three()
+        readings_unreadable[2]["benign_readings"] = [{"lang": "de", "meaning": " "}]
+        readings_bare = _two_of_three()
+        readings_bare[2]["benign_readings"] = ["a surname"]
+        # `null` in a rejecting reviewer's fields: the record stops being a
+        # record of anything, and `str(None)` is a non-empty string, so a
+        # coerced truthiness test accepted all four.
+        null_fields = _two_of_three()
+        null_fields[2]["model"] = None
+        null_verdict = _two_of_three()
+        null_verdict[2]["verdict"] = None
+        null_category = _two_of_three()
+        null_category[2]["category"] = None
         cases: List[Tuple[Dict[str, Any], str]] = [
             (_model_record(*one_approval, approvals=1), "approvals"),
-            (_model_record(*mild), "category"),
+            (_model_record(*mild, approvals=0), "category"),
             (_model_record(*one_mild, approvals=1), "category"),
             (_model_record(*mild_beside_two, approvals=2), "category"),
             (_model_record(*benign_from_a_rejecter), "benign_reading"),
-            (_model_record(*benign_from_an_approver, approvals=3), "benign_reading"),
+            (_model_record(*benign_from_an_approver, approvals=2), "benign_reading"),
             (_model_record(*same_family_twice), "reviewers"),
             (_model_record(*missing_family), "reviewers"),
             (_model_record(*unknown_family, approvals=3), "reviewers"),
             (_model_record(*missing_field), "reviewers"),
             (_model_record(*no_model), "reviewers"),
             (_model_record(*readings_not_a_list), "reviewers"),
+            (_model_record(*readings_unreadable), "reviewers"),
+            (_model_record(*readings_bare), "reviewers"),
+            (_model_record(*null_fields), "reviewers"),
+            (_model_record(*null_verdict), "verdict"),
+            (_model_record(*null_category), "category_vocabulary"),
+            (_model_record(*_two_of_three(), approvals=0), "approvals_recorded"),
             # The stored count must be the count of the votes it sits beside.
             (_model_record(*_two_of_three(), approvals=3), "approvals_recorded"),
             ({**_model_record(*_two_of_three()), "date": ""}, "date"),
@@ -854,6 +932,22 @@ class TestTheModelReviewBasis(unittest.TestCase):
             "vetoed",
         )
 
+    def test_a_record_that_is_not_a_record_is_never_an_outcome(self) -> None:
+        """A structurally broken record used to derive `not_promoted`, which
+        reads as a decision and is not one. The outcome of an unreadable
+        record is `invalid`, and every record in the data is checked against
+        the structure rule whatever its outcome."""
+        broken: List[Dict[str, Any]] = [
+            {"outcome": "not_promoted"},
+            {},
+            _model_record(_vote("claude"), _vote("gemini")),
+            {**_model_record(*_two_of_three()), "approvals": 999},
+        ]
+        for record in broken:
+            with self.subTest(record=record):
+                self.assertIsNotNone(_model_review_record_problem(record))
+                self.assertEqual(_model_review_outcome(record), "invalid")
+
     def test_every_model_review_promotion_in_the_data_passes_the_rule(self) -> None:
         promoted = [
             entry for entry in _promoted() if entry["review"]["basis"] == "model_review"
@@ -867,6 +961,60 @@ class TestTheModelReviewBasis(unittest.TestCase):
                 self.assertIsNone(_model_review_problem(record))
                 self.assertEqual(record["outcome"], "promoted")
                 self.assertEqual(entry["review"]["date"], record["date"])
+
+    def test_every_vote_record_is_a_complete_record_of_the_vote(self) -> None:
+        """Completeness is checked on EVERY reviewed term, promoted or not.
+
+        A record is the evidence that a term was reviewed and what was said
+        about it, and the whole point of keeping it on a term the vote did
+        not promote is that nobody reviews it blind a second time. Checking
+        it only where it licenses a promotion left the records that carry no
+        privilege free to rot: a rejecting reviewer's verdict, category,
+        model and reason could all be `null`, a whole record could be
+        replaced by `{"outcome": "not_promoted"}` or deleted, and a demoted
+        term's approval count could say anything at all.
+        """
+        reviewed = [entry for entry in universal_terms() if "model_review" in entry]
+        self.assertEqual(
+            len(reviewed),
+            _MODEL_REVIEW_COUNTS["candidates"],
+            "a vote record has been dropped from the classification",
+        )
+        for entry in reviewed:
+            with self.subTest(term=entry["term"]):
+                self.assertIsNone(_model_review_record_problem(entry["model_review"]))
+                self.assertNotEqual(
+                    _model_review_outcome(entry["model_review"]), "invalid"
+                )
+        # And the other direction: a term whose decision cites the model
+        # review cannot have lost the record it cites.
+        for entry in universal_terms():
+            cites = (
+                entry["reason"]
+                in {
+                    "model_review_not_promoted",
+                    "spelled_out",
+                }
+                or entry.get("review", {}).get("basis") == "model_review"
+            )
+            if not cites:
+                continue
+            with self.subTest(term=entry["term"]):
+                self.assertIn("model_review", entry, "cites a vote it does not carry")
+
+    def test_the_recorded_outcome_counts_are_what_the_data_holds(self) -> None:
+        """The vote's arithmetic, recomputed and pinned in two places. A
+        record that is deleted, or an outcome quietly rewritten, changes one
+        of these numbers."""
+        counts: Dict[str, int] = {"candidates": 0}
+        for entry in universal_terms():
+            record = entry.get("model_review")
+            if record is None:
+                continue
+            counts["candidates"] += 1
+            counts[record["outcome"]] = counts.get(record["outcome"], 0) + 1
+        self.assertEqual(counts, _MODEL_REVIEW_COUNTS)
+        self.assertEqual(_policy()["model_review"]["counts"], _MODEL_REVIEW_COUNTS)
 
     def test_every_vote_record_agrees_with_the_decision_on_the_term(self) -> None:
         """The record and the tier have to say the same thing, in both
@@ -882,6 +1030,7 @@ class TestTheModelReviewBasis(unittest.TestCase):
             with self.subTest(term=entry["term"]):
                 if entry.get("review", {}).get("basis") == "native_review":
                     continue  # a native review supersedes the model vote
+                self.assertNotEqual(derived, "invalid")
                 if derived == "promoted" and entry["tier1"]:
                     self.assertEqual(record["outcome"], "promoted")
                 elif derived == "promoted" and entry["reason"] == "spelled_out":
