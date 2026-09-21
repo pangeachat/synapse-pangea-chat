@@ -45,7 +45,6 @@ from collections import deque
 from functools import lru_cache
 from pathlib import Path
 from typing import (
-    Any,
     Deque,
     Dict,
     FrozenSet,
@@ -107,17 +106,16 @@ class TermRecord(TypedDict, total=False):
     review: Dict[str, str]
     collisions: Dict[str, float]
     adjudication: Dict[str, object]
-    #: The three-family model vote, on every term that went through it -
-    #: promoted or not, so nobody re-reviews a term blind. Data for the gate;
-    #: the matcher never reads it.
-    model_review: Dict[str, Any]
     #: The ordinary word, and its language, that made the vocabulary sweep
-    #: demote a term the vote had promoted.
+    #: demote a term.
     sweep_collision: Dict[str, str]
-    #: A benign reading named after the vote had promoted the term, which
-    #: demotes it the same way one named in the vote does: the language, the
-    #: meaning, who named it, and the sentence that reproduced.
-    later_benign_reading: Dict[str, str]
+    #: Why this term is NOT in Tier 1: one or more named benign readings of
+    #: the surface form Tier 1 matches. Each carries the language, the
+    #: meaning, who named it, the sentence that reproduced - which has to be
+    #: a live negative control - and where the reading is published. A list,
+    #: because one string can have two: `fasz` is a newspaper's masthead and
+    #: an ICAO code.
+    benign_reading: List[Dict[str, str]]
 
 
 # Invisible characters carry no meaning; an evader puts them inside a word.
