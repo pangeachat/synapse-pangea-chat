@@ -114,6 +114,10 @@ class TermRecord(TypedDict, total=False):
     #: The ordinary word, and its language, that made the vocabulary sweep
     #: demote a term the vote had promoted.
     sweep_collision: Dict[str, str]
+    #: A benign reading named after the vote had promoted the term, which
+    #: demotes it the same way one named in the vote does: the language, the
+    #: meaning, who named it, and the sentence that reproduced.
+    later_benign_reading: Dict[str, str]
 
 
 # Invisible characters carry no meaning; an evader puts them inside a word.

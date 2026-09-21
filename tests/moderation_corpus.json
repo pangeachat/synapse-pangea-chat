@@ -63,7 +63,8 @@
    "Merg cu tine",
    "Pica je jednotka používaná v typografii.",
    "Pica je jednotka v typografii",
-   "Курац је наведен као вулгаран термин у речнику."
+   "Курац је наведен као вулгаран термин у речнику.",
+   "La marie-salope transporte la vase du port."
   ]
  },
  "languages": [
@@ -395,7 +396,7 @@
      "term": "salope",
      "sentence": "Il l'a harcelée en la traitant de salope.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "enculé",
@@ -452,6 +453,13 @@
     {
      "sentence": "Il a calculé la pente.",
      "why_benign": "Normal vocabulary with no offensive meaning."
+    },
+    {
+     "sentence": "La marie-salope transporte la vase du port.",
+     "why_benign": "A marie-salope is a hopper barge that carries dredged silt (Larousse); Tier 1 matches `salope` as a whole token inside the compound, so the term is Tier 2's.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`salope` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },

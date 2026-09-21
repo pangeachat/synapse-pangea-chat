@@ -143,10 +143,11 @@ _MODEL_REVIEW_ALL_CATEGORIES = {
 # of the file it is checking cannot catch a record that was dropped from it.
 _MODEL_REVIEW_COUNTS = {
     "candidates": 371,
-    "promoted": 263,
+    "promoted": 262,
     "vetoed": 5,
     "spelled_out": 18,
     "not_promoted": 85,
+    "demoted_by_later_evidence": 1,
 }
 _MODEL_REVIEW_VOTE_FIELDS = (
     "family",
@@ -189,14 +190,19 @@ def _native_review_problem(review: Dict[str, Any]) -> Optional[str]:
     be exercised on records whether or not the data happens to contain any -
     see `test_the_native_review_rule_rejects_what_it_is_for`.
     """
-    reviewer = str(review.get("by", "")).strip()
-    if not reviewer:
+    reviewer = review.get("by")
+    # Typed, not coerced: `str(None)` is a non-empty string, so a `null`
+    # reviewer or date passed a truthiness test on the coercion - and a
+    # native review is what supersedes a model one, so it is exactly the
+    # record an unchecked field would be worth forging.
+    if not isinstance(reviewer, str) or not reviewer.strip():
         return "reviewer"
     if "curator" in reviewer:
         # The curator is a native speaker of English and of nothing else on
         # the list; a native review signed by them is not one.
         return "curator"
-    if not str(review.get("date", "")).strip():
+    date = review.get("date")
+    if not isinstance(date, str) or not date.strip():
         return "date"
     return None
 
@@ -250,8 +256,9 @@ def _model_review_record_problem(record: Dict[str, Any]) -> Optional[str]:
             return "category_vocabulary"
         if not isinstance(vote["benign_readings"], list) or any(
             not isinstance(reading, dict)
-            or not str(reading.get("lang", "")).strip()
-            or not str(reading.get("meaning", "")).strip()
+            or reading.get("lang") not in _LANGS
+            or not isinstance(reading.get("meaning"), str)
+            or not reading["meaning"].strip()
             for reading in vote["benign_readings"]
         ):
             return "reviewers"
@@ -619,6 +626,18 @@ class TestEveryTermIsClassified(unittest.TestCase):
             "classified terms that are no longer in the wordlist",
         )
 
+    def test_each_term_is_classified_exactly_once(self) -> None:
+        """One row per term, so a count over rows is a count over terms. Two
+        rows for one term let a record be deleted from one term and made up
+        on another without changing any total - and the matcher would load
+        whichever row happened to say `tier1`."""
+        terms = [entry["term"] for entry in universal_terms()]
+        self.assertEqual(
+            sorted(terms),
+            sorted(set(terms)),
+            "a term is classified twice",
+        )
+
     def test_every_decision_states_a_reason_from_the_agreed_vocabulary(self) -> None:
         for entry in universal_terms():
             with self.subTest(term=entry["term"]):
@@ -704,7 +723,7 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
         exercised on records instead, which is what the data will be checked
         against when it finally has one.
         """
-        cases = [
+        cases: List[Tuple[Dict[str, Any], Optional[str]]] = [
             (
                 {"basis": "native_review", "by": "A. Reviewer", "date": "2026-01-02"},
                 None,
@@ -719,6 +738,8 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
                 },
                 "curator",
             ),
+            ({"basis": "native_review", "by": None, "date": "2026-01-02"}, "reviewer"),
+            ({"basis": "native_review", "by": "A. Reviewer", "date": None}, "date"),
             ({"basis": "native_review", "by": "A. Reviewer", "date": "  "}, "date"),
             ({"basis": "native_review", "by": "A. Reviewer"}, "date"),
         ]
@@ -864,6 +885,12 @@ class TestTheModelReviewBasis(unittest.TestCase):
         # names nothing and a bare string says nothing about which language.
         readings_unreadable = _two_of_three()
         readings_unreadable[2]["benign_readings"] = [{"lang": "de", "meaning": " "}]
+        readings_null = _two_of_three()
+        readings_null[2]["benign_readings"] = [{"lang": None, "meaning": None}]
+        readings_unsupported = _two_of_three()
+        readings_unsupported[2]["benign_readings"] = [
+            {"lang": "xx", "meaning": "a word somewhere"}
+        ]
         readings_bare = _two_of_three()
         readings_bare[2]["benign_readings"] = ["a surname"]
         # `null` in a rejecting reviewer's fields: the record stops being a
@@ -889,6 +916,8 @@ class TestTheModelReviewBasis(unittest.TestCase):
             (_model_record(*no_model), "reviewers"),
             (_model_record(*readings_not_a_list), "reviewers"),
             (_model_record(*readings_unreadable), "reviewers"),
+            (_model_record(*readings_null), "reviewers"),
+            (_model_record(*readings_unsupported), "reviewers"),
             (_model_record(*readings_bare), "reviewers"),
             (_model_record(*null_fields), "reviewers"),
             (_model_record(*null_verdict), "verdict"),
@@ -1029,13 +1058,32 @@ class TestTheModelReviewBasis(unittest.TestCase):
             derived = _model_review_outcome(record)
             with self.subTest(term=entry["term"]):
                 if entry.get("review", {}).get("basis") == "native_review":
-                    continue  # a native review supersedes the model vote
+                    # A native review supersedes the model vote - but only a
+                    # real one. Taking the basis at its word let a record with
+                    # a null reviewer and a null date promote a term the model
+                    # review had VETOED for a named benign reading.
+                    self.assertIsNone(_native_review_problem(entry["review"]))
+                    continue
                 self.assertNotEqual(derived, "invalid")
                 if derived == "promoted" and entry["tier1"]:
                     self.assertEqual(record["outcome"], "promoted")
                 elif derived == "promoted" and entry["reason"] == "spelled_out":
                     self.assertEqual(record["outcome"], "spelled_out")
                     self.assertTrue(_is_spelled_out(entry["term"]))
+                elif derived == "promoted" and "later_benign_reading" in entry:
+                    # A reading named after the vote demotes the term just as
+                    # one named in it does.
+                    self.assertEqual(record["outcome"], "demoted_by_later_evidence")
+                    reading: Dict[str, Any] = entry["later_benign_reading"]
+                    self.assertIn(reading["lang"], _LANGS)
+                    for field in ("meaning", "named_by", "control"):
+                        self.assertTrue(str(reading[field]).strip())
+                    self.assertIn(
+                        reading["control"],
+                        {case["sentence"] for case in _controls()},
+                        "the sentence that reproduced is not a negative control",
+                    )
+                    self.assertIn(reading["meaning"].split(",")[0], entry["note"])
                 elif derived == "promoted":
                     self.assertEqual(record["outcome"], "demoted_by_sweep")
                     self.assertEqual(entry["reason"], "benign_homograph")
