@@ -108,7 +108,8 @@
    "Рукоятка этого пичака сделана из рога яка и украшена бирюзой.",
    "Je viens de finir L'Enculé, le roman de Marc-Édouard Nabe.",
    "Estoy leyendo El hijo de puta sentimental, la novela de Ildefonso Arenas.",
-   "Figlio di puttana è la sesta traccia di Villa Inferno degli Zen Circus."
+   "Figlio di puttana è la sesta traccia di Villa Inferno degli Zen Circus.",
+   "Наталья Сергеевна Пичко работает в университете."
   ]
  },
  "languages": [
@@ -1023,6 +1024,13 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`пичака` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Наталья Сергеевна Пичко работает в университете.",
+     "why_benign": "Пичко is a Russian surname - Пичко Наталья Сергеевна is the acting director of a Ukhta State Technical University branch, on the university's own staff page. The same string is the Serbian vocative of пичка, so Tier 1 cannot tell them apart: it consults no language.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`пичко` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },

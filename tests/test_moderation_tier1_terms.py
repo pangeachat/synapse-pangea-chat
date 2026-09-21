@@ -15,6 +15,9 @@ import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
+from synapse_pangea_chat.moderation.profanity import (
+    _SUBSTITUTIONS as _TIER2_SUBSTITUTIONS,
+)
 from synapse_pangea_chat.moderation.profanity import contains_profanity
 from synapse_pangea_chat.moderation.tier1_prefilter import REASON_PROFANITY, check_text
 from synapse_pangea_chat.moderation.tier1_terms import (
@@ -241,6 +244,31 @@ _REVIEW_NAMED_A_BENIGN_READING = {
     "병신을": "ko: year 丙申 / disabled (archaic); ko: The cyclical year 丙申 with an object particle",
     "병신이": "ko: year 丙申 / disabled (archaic); ko: The cyclical year 丙申 with a subject particle",
 }
+
+
+# What a digit in a needle can be read as, for the leet-inheritance audit.
+# Built from the Tier 2 matcher's own substitutions so the audit cannot fall
+# behind the matcher - see `_deleet` for the two failures that taught this.
+_DIGIT_READINGS: Dict[str, List[str]] = {
+    digit: [letter]
+    for digit, letter in sorted(_TIER2_SUBSTITUTIONS.items())
+    if digit.isdigit()
+}
+for _digit, _extra in {
+    # A second Latin reading production does not need and a reader does.
+    "1": "l",
+    # Arabizi: the digit stands for an Arabic letter with no Latin shape.
+    "2": "ء",
+    "3": "ع",
+    "5": "خ",
+    "6": "ط",
+    "7": "ح",
+    "8": "غ",
+    "9": "ق",
+    # Cyrillic, which is how `бл9дь` is written.
+    "9r": "я",
+}.items():
+    _DIGIT_READINGS.setdefault(_digit.rstrip("r"), []).append(_extra)
 
 
 def _corpus() -> Dict[str, Any]:
@@ -1991,6 +2019,37 @@ class TestALeetFormCarriesNoEvidenceOfItsOwn(unittest.TestCase):
         )
         self.assertIn("خ", _deleet("5"), "the Arabizi readings are gone from the table")
 
+    def test_the_audit_folds_every_digit_the_tier2_matcher_folds(self) -> None:
+        """The audit may be WIDER than the Tier 2 matcher and never narrower.
+
+        Narrower is the bug that has now happened twice: production folds
+        `7` to `t`, this table said only `ح`, and a needle spelled `kal7ak`
+        was invisible to the inheritance audit while `kaltak` - a wooden
+        saddle frame - sat pinned as a named benign reading. The table is
+        built from production's map for that reason, and this is what fails
+        if the two are ever separated again, including by someone adding a
+        substitution to `profanity.py` alone.
+        """
+        folded = {
+            digit: letter
+            for digit, letter in _TIER2_SUBSTITUTIONS.items()
+            if digit.isdigit()
+        }
+        self.assertTrue(folded, "the Tier 2 matcher folds no digits at all")
+        for digit, letter in sorted(folded.items()):
+            with self.subTest(digit=digit):
+                self.assertIn(
+                    letter,
+                    _deleet(digit),
+                    f"the Tier 2 matcher reads {digit!r} as {letter!r} and this "
+                    f"audit does not, so a needle spelled with it is invisible "
+                    f"to the inheritance rule",
+                )
+        # And the readings this audit adds on top are still there.
+        self.assertIn("l", _deleet("1"))
+        self.assertIn("خ", _deleet("5"))
+        self.assertIn("я", _deleet("9"))
+
     def test_the_readings_that_demoted_a_term_are_each_recorded(self) -> None:
         """And the list is not a place to quietly drop an entry.
 
@@ -2093,31 +2152,30 @@ def _deleet(text: str) -> set:
     the second reason that term has no business blocking a message before it
     is sent.
 
-    The ARABIZI column is here because leaving it out silently switched the
-    audit off for a whole script. In Arabizi a digit stands for an Arabic
-    letter with no Latin shape - `5` is خ, `3` is ع, `7` is ح - and the table
-    knew only the Latin `5` -> `s`. So `_deleet("5ول")` returned `{"sول"}`,
-    never `خول`, and `5ول` stayed in Tier 1 while `خول` sat demoted for an
-    ordinary Urdu sense. `Room 5ول is down the hall.` was rejected before
-    persist. A reading the table cannot produce is a rule that does not run,
-    which is why `test_the_deleetings_cover_the_evasions_the_corpus_records`
-    now makes the table prove it can reach every base the corpus names.
+    The table is BUILT from the Tier 2 matcher's own substitutions rather
+    than written out here, because writing it out here is how it fell behind
+    twice. `7` folds to `t` in production and this table said only `ح`, so a
+    needle spelled `kal7ak` was invisible to the audit while `kaltak` - a
+    wooden saddle frame - sat pinned two files away. Before that the whole
+    Arabizi column was missing: `_deleet("5ول")` returned `{"sول"}`, never
+    `خول`, and `5ول` stayed in Tier 1 while `خول` sat demoted for an ordinary
+    Urdu sense, so `Room 5ول is down the hall.` was rejected before persist.
+    A reading the table cannot produce is a rule that does not run, and it
+    does not run quietly.
 
-    Widening this only ever demotes more, never fewer: another reading is
-    another skeleton to check a promoted needle against.
+    Two things are added on top of production's map, and only two. Every
+    reading it has ONE of but a reader has two - `1` is `i` in production and
+    is also `l`, which is what makes `v1ado` read as `vlado`, a Slavic given
+    name. And the ARABIZI column, where a digit stands for an Arabic letter
+    with no Latin shape at all (`5` is خ, `3` is ع, `7` is ح), which the Tier
+    2 matcher has no reason to carry and this audit does.
+
+    Widening only ever demotes more, never fewer: another reading is another
+    skeleton to check a promoted needle against. And
+    `test_the_audit_folds_every_digit_the_tier2_matcher_folds` fails if
+    production learns a substitution this does not.
     """
-    readings = {
-        "0": ["o"],
-        "1": ["i", "l"],
-        "2": ["ء", "أ"],
-        "3": ["e", "ع"],
-        "4": ["a"],
-        "5": ["s", "خ"],
-        "6": ["ط"],
-        "7": ["ح"],
-        "8": ["غ"],
-        "9": ["я", "ق"],
-    }
+    readings = _DIGIT_READINGS
     out = {""}
     for char in text:
         choices = readings.get(char, [char])
