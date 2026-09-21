@@ -143,11 +143,11 @@ _MODEL_REVIEW_ALL_CATEGORIES = {
 # of the file it is checking cannot catch a record that was dropped from it.
 _MODEL_REVIEW_COUNTS = {
     "candidates": 371,
-    "promoted": 258,
+    "promoted": 257,
     "vetoed": 5,
     "spelled_out": 18,
     "not_promoted": 85,
-    "demoted_by_later_evidence": 5,
+    "demoted_by_later_evidence": 6,
 }
 _MODEL_REVIEW_VOTE_FIELDS = (
     "family",
@@ -281,9 +281,13 @@ def _model_review_record_problem(record: Dict[str, Any]) -> Optional[str]:
     # family is a missing reviewer record.
     if sorted(families) != sorted(_MODEL_REVIEW_FAMILIES):
         return "reviewers"
-    date = str(record.get("date", ""))
-    if len(date) != 10 or not date[:4].isdigit() or date[4] != "-":
+    date = record.get("date")
+    # A calendar date: `2026-99-99` satisfied a shape test and is not one.
+    if not isinstance(date, str) or not _is_a_date(date):
         return "date"
+    for field in ("term", "decision"):
+        if not isinstance(record.get(field), str) or not record[field].strip():
+            return "metadata"
     if record.get("approvals") != _eligible_approvals(record):
         return "approvals_recorded"
     return None
@@ -312,6 +316,32 @@ def _model_review_problem(record: Dict[str, Any]) -> Optional[str]:
         return "category"
     if _eligible_approvals(record) < _MODEL_REVIEW_MIN_APPROVALS:
         return "approvals"
+    return None
+
+
+def _later_reading_problem(reading: Dict[str, Any]) -> Optional[str]:
+    """Why a `later_benign_reading` is not usable evidence, or None.
+
+    Typed, because `str(None)` is a non-empty string and these four fields
+    are the whole of what makes a demotion after the vote auditable: which
+    language, what the word means there, who named it, and the sentence that
+    reproduced."""
+    if reading.get("lang") not in _LANGS:
+        return "lang"
+    for field in ("meaning", "named_by", "control", "source"):
+        if not isinstance(reading.get(field), str) or not reading[field].strip():
+            return field
+    return None
+
+
+def _native_override_problem(review: Dict[str, Any]) -> Optional[str]:
+    """A native review may overrule a recorded benign reading - that is what
+    the stronger basis means - but not silently: it says which reading it
+    overrules. `null`, `false`, `{}` and `[]` are not an explanation, and
+    `str(None)` is a non-empty string, so this is typed."""
+    supersedes = review.get("supersedes")
+    if not isinstance(supersedes, str) or not supersedes.strip():
+        return "supersedes"
     return None
 
 
@@ -792,16 +822,28 @@ class TestPromotionNeedsPositiveEvidence(unittest.TestCase):
         means - but not by ignoring the reading: the reviewer says which
         reading they are overruling and why.
         """
-        review = {
+        review: Dict[str, Any] = {
             "basis": "native_review",
             "by": "A. Reviewer",
             "date": "2026-01-02",
             "note": "no ordinary sense",
         }
         self.assertIsNone(_native_review_problem(review))
-        self.assertFalse(str(review.get("supersedes", "")).strip())
-        answered = {**review, "supersedes": "the recorded reading is archaic"}
-        self.assertTrue(str(answered["supersedes"]).strip())
+        # A record that says nothing about the reading it overrules, in
+        # every shape that used to pass for saying something.
+        empty: List[Any] = [None, "", "   ", False, {}, [], 0]
+        for supersedes in empty:
+            with self.subTest(supersedes=supersedes):
+                self.assertEqual(
+                    _native_override_problem({**review, "supersedes": supersedes}),
+                    "supersedes",
+                )
+        self.assertEqual(_native_override_problem(review), "supersedes")
+        self.assertIsNone(
+            _native_override_problem(
+                {**review, "supersedes": "the recorded reading is archaic"}
+            )
+        )
 
     def test_every_native_review_in_the_data_passes_the_rule(self) -> None:
         """And the data goes through the same rule. Empty today; the test
@@ -847,6 +889,7 @@ def _vote(
 
 def _model_record(*votes: Dict[str, Any], approvals: int = 2) -> Dict[str, Any]:
     return {
+        "term": "a term",
         "date": "2026-09-21",
         "decision": "pangeachat/2-step-choreographer#1746",
         "approvals": approvals,
@@ -983,6 +1026,13 @@ class TestTheModelReviewBasis(unittest.TestCase):
             (_model_record(*_two_of_three(), approvals=3), "approvals_recorded"),
             ({**_model_record(*_two_of_three()), "date": ""}, "date"),
             ({**_model_record(*_two_of_three()), "date": "yesterday"}, "date"),
+            # A shape is not a date, and a record says which term it is for
+            # and what decision it was taken under: without the term, a vote
+            # record can be moved onto another term and every count still
+            # balances.
+            ({**_model_record(*_two_of_three()), "date": "2026-99-99"}, "date"),
+            ({**_model_record(*_two_of_three()), "term": ""}, "metadata"),
+            ({**_model_record(*_two_of_three()), "decision": None}, "metadata"),
             ({"date": "2026-09-21", "approvals": 2}, "reviewers"),
             ({}, "reviewers"),
         ]
@@ -1068,6 +1118,12 @@ class TestTheModelReviewBasis(unittest.TestCase):
         for entry in reviewed:
             with self.subTest(term=entry["term"]):
                 self.assertIsNone(_model_review_record_problem(entry["model_review"]))
+                self.assertEqual(
+                    entry["model_review"]["term"],
+                    entry["term"],
+                    "the vote record names a different term than the one it "
+                    "sits on, so a record has been moved",
+                )
                 self.assertNotEqual(
                     _model_review_outcome(entry["model_review"]), "invalid"
                 )
@@ -1129,32 +1185,20 @@ class TestTheModelReviewBasis(unittest.TestCase):
                         # Superseding a reading means answering it: the
                         # native speaker says what the recorded reading is
                         # and why it does not demote the term.
-                        self.assertTrue(
-                            str(entry["review"].get("supersedes", "")).strip(),
+                        self.assertIsNone(
+                            _native_override_problem(entry["review"]),
                             "a native review over a recorded benign reading "
                             "has to address the reading it overrides",
                         )
                     continue
                 self.assertNotEqual(derived, "invalid")
                 if "later_benign_reading" in entry:
-                    # Read FIRST, and on any term: a reading named after the
-                    # vote demotes exactly as one named in it does, so the
-                    # promoted branch below must not be able to swallow it.
-                    self.assertFalse(
-                        entry["tier1"],
-                        "a benign reading is recorded on a term Tier 1 blocks",
-                    )
+                    # Read FIRST: a reading named after the vote demotes
+                    # exactly as one named in it does, so the promoted branch
+                    # below must not be able to swallow it. The reading
+                    # itself is checked over every term, reviewed or not, by
+                    # `test_a_reading_named_after_the_vote_demotes_the_term`.
                     self.assertEqual(record["outcome"], "demoted_by_later_evidence")
-                    reading: Dict[str, Any] = entry["later_benign_reading"]
-                    self.assertIn(reading["lang"], _LANGS)
-                    for field in ("meaning", "named_by", "control", "source"):
-                        self.assertTrue(str(reading[field]).strip())
-                    self.assertIn(
-                        reading["control"],
-                        {case["sentence"] for case in _controls()},
-                        "the sentence that reproduced is not a negative control",
-                    )
-                    self.assertIn(reading["meaning"], entry["note"])
                 elif derived == "promoted" and entry["tier1"]:
                     self.assertEqual(record["outcome"], "promoted")
                 elif derived == "promoted" and entry["reason"] == "spelled_out":
@@ -1210,6 +1254,41 @@ class TestTheModelReviewBasis(unittest.TestCase):
         self.assertTrue(_is_spelled_out("चू ति या"))
         self.assertFalse(_is_spelled_out("hijo de puta"))
         self.assertFalse(_is_spelled_out("बहनचोद का"))
+
+    def test_a_reading_named_after_the_vote_demotes_the_term(self) -> None:
+        """Over EVERY classified term, not only the model-reviewed ones.
+
+        Scoping this to terms carrying a vote record left the older core -
+        the curator's three English words and the digit-basis terms - able to
+        carry a named benign reading and keep blocking, which is the one
+        thing `what_demotes_a_term` says cannot happen.
+        """
+        recorded = [e for e in universal_terms() if "later_benign_reading" in e]
+        self.assertTrue(recorded, "no reading named after a vote to check")
+        controls = {case["sentence"] for case in _controls()}
+        for entry in recorded:
+            reading: Dict[str, Any] = entry["later_benign_reading"]
+            with self.subTest(term=entry["term"]):
+                self.assertFalse(
+                    entry["tier1"],
+                    "a benign reading is recorded on a term Tier 1 blocks",
+                )
+                self.assertIsNone(_later_reading_problem(reading))
+                self.assertIn(
+                    reading["control"],
+                    controls,
+                    "the sentence that reproduced is not a negative control",
+                )
+                self.assertIn(reading["meaning"], entry["note"])
+        # And the rule rejects what it is for, on records.
+        good = dict(recorded[0]["later_benign_reading"])
+        self.assertIsNone(_later_reading_problem(good))
+        self.assertEqual(_later_reading_problem({**good, "lang": None}), "lang")
+        self.assertEqual(_later_reading_problem({**good, "lang": "xx"}), "lang")
+        for field in ("meaning", "named_by", "control", "source"):
+            with self.subTest(field=field):
+                self.assertEqual(_later_reading_problem({**good, field: None}), field)
+                self.assertEqual(_later_reading_problem({**good, field: " "}), field)
 
     def test_the_recorded_approval_count_is_the_votes(self) -> None:
         """The vote is recorded as it was, not rounded up: every promotion is

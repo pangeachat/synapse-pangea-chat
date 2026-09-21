@@ -68,7 +68,8 @@
    "Wir spielen Arschloch am Freitagabend.",
    "Pizda forms a complex with copper in the published kinetics study.",
    "A ribanc a földön hevert.",
-   "I se muie inima."
+   "I se muie inima.",
+   "Vi spiller røvhul i aften."
   ]
  },
  "languages": [
@@ -1239,7 +1240,7 @@
      "term": "røvhul",
      "sentence": "Du er et røvhul.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     }
    ],
    "evasions": [
@@ -1272,6 +1273,13 @@
     {
      "sentence": "Rødbeder smager godt.",
      "why_benign": "Ordinary word beginning with “rød,” not “røv.”"
+    },
+    {
+     "sentence": "Vi spiller røvhul i aften.",
+     "why_benign": "Røvhul is the Danish name of the card game English calls Asshole or President.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`røvhul` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
