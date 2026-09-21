@@ -541,16 +541,15 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         ("you are a motherfucker", "en"),
         ("motherfucker", "en"),
         ("what a cunt", "en"),
-        ("h1jo de puta", "es"),
         ("бл9дь", "ru"),
         ("n1gger", "en"),
         # Promoted by the model review, 2026-09-21. `du Hurensohn`,
-        # `ty kurwa`, `che cazzo` and `v1ttu` stood here too and left when
-        # those four terms were demoted on a named benign reading. The
-        # corpus carries each of them at tier 2, where
-        # `test_everything_tier1_stopped_blocking_is_caught_by_tier2`
-        # asserts Tier 2 still catches it.
-        ("eres un hijo de puta", "es"),
+        # `ty kurwa`, `che cazzo`, `v1ttu`, `eres un hijo de puta` and
+        # `h1jo de puta` stood here too and left as those terms were demoted
+        # on a named benign reading. The corpus carries each of them at tier
+        # 2, where `test_everything_tier1_stopped_blocking_is_caught_by_tier2`
+        # asserts Tier 2 still catches it - which is where a demoted term
+        # goes, not where it disappears.
         ("씨발", "ko"),
         ("मादरचोद", "hi"),
     ]
@@ -606,12 +605,19 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         would be English-only in practice as well as in principle.
 
         The floor moves when a term is correctly demoted - it stood at 20 and
-        ten leet forms then left Tier 1 with the words they spell - so it is
-        RE-DERIVED here, never lowered to fit a regression. What it was
+        eleven leet forms then left Tier 1 with the words they spell - so it
+        is RE-DERIVED here, never lowered to fit a regression. What it was
         standing in for is asserted directly beside it: the evasions Tier 1
         catches have to span many languages and several techniques, which is
         the claim a bare count only gestured at. A demotion that took the
         spread down to English would pass a count and fail these.
+
+        The spread numbers move the same way and for the same reason, and
+        they are worth watching rather than nudging: 16 languages, then 15,
+        now 14 of the thirty. Each step followed a term leaving Tier 1 on a
+        sourced reading, not a matcher regression - but the day one of these
+        falls WITHOUT a demotion beside it in the same change, the blocking
+        tier has broken rather than narrowed.
         """
         caught = [
             case
@@ -620,7 +626,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
             for case in lang[kind]
             if case["tier"] == 1 and kind == "evasions"
         ]
-        self.assertGreaterEqual(len(caught), 16)
+        self.assertGreaterEqual(len(caught), 15)
         languages = {
             lang["lang_code"]
             for lang in _corpus()["languages"]
@@ -629,7 +635,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         }
         self.assertGreaterEqual(
             len(languages),
-            15,
+            14,
             "Tier 1 catches obfuscated spellings in too few languages; the "
             "blocking tier is becoming English-only in practice",
         )

@@ -104,7 +104,11 @@
    "غرفة 5ول في نهاية الممر.",
    "মীমাংসা দর্শনে চোদনা বলিতে বেদবাক্যের বিধিমূলক প্রেরণাকে বুঝায়।",
    "সেই বেদীয় চোদনার অন্তর্নিহিত দিকনির্দেশনা স্বরূপ আত্মপ্রকাশ করেন।",
-   "Éric Pougeau a publié Fils de pute aux éditions Dilecta en 2011."
+   "Éric Pougeau a publié Fils de pute aux éditions Dilecta en 2011.",
+   "Рукоятка этого пичака сделана из рога яка и украшена бирюзой.",
+   "Je viens de finir L'Enculé, le roman de Marc-Édouard Nabe.",
+   "Estoy leyendo El hijo de puta sentimental, la novela de Ildefonso Arenas.",
+   "Figlio di puttana è la sesta traccia di Villa Inferno degli Zen Circus."
   ]
  },
  "languages": [
@@ -419,7 +423,7 @@
      "term": "hijo de puta",
      "sentence": "Eres un hijo de puta.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "puta",
@@ -451,7 +455,7 @@
      "term": "h1jo de puta",
      "base_term": "hijo de puta",
      "technique": "leetspeak",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "m a r i c ó n",
@@ -482,6 +486,13 @@
     {
      "sentence": "Jorge estudia jardinería.",
      "why_benign": "A common name and subject must not trigger “joder” fuzzily."
+    },
+    {
+     "sentence": "Estoy leyendo El hijo de puta sentimental, la novela de Ildefonso Arenas.",
+     "why_benign": "El hijo de puta sentimental is Ildefonso Arenas's novel, Edhasa (colección Tusitala), 2016, ISBN 978-84-350-1240-9, in the CEGAL booksellers' database and OpenLibrary. The phrase matches the three consecutive words inside the title",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`hijo de puta` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -505,7 +516,7 @@
      "term": "enculé",
      "sentence": "Dégage, enculé.",
      "severity": "slur",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "putain",
@@ -577,6 +588,13 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`fils de pute` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Je viens de finir L'Enculé, le roman de Marc-Édouard Nabe.",
+     "why_benign": "L'Enculé is Marc-Édouard Nabe's 2011 novel, ISBN 9782953487916, catalogued by the Bibliothèque nationale de France. An apostrophe is a separator, so Tier 1 matched `enculé` as a whole token inside the title - the marie-salope shape. The same BnF query also returns `Enculé ! L'école est-elle homophobe ?`, an anti-homophobia book",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`enculé` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -588,7 +606,7 @@
      "term": "figlio di puttana",
      "sentence": "Sei un figlio di puttana.",
      "severity": "profanity",
-     "tier": 1
+     "tier": 2
     },
     {
      "term": "cazzo",
@@ -652,6 +670,13 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`cazzo` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Figlio di puttana è la sesta traccia di Villa Inferno degli Zen Circus.",
+     "why_benign": "Figlio di puttana is track 6 of Villa Inferno by The Zen Circus & Brian Ritchie; MusicBrainz release 3521af85-ef21-47d0-b092-713e1df0a2f0 carries the tracklist, and La Tempesta issued it in 2011 as LTD-044",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`figlio di puttana` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
@@ -991,6 +1016,13 @@
      "tier2_matcher": "flags",
      "tier2_reason": "term_is_on_the_tier2_list",
      "tier2_note": "`хуи` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
+    },
+    {
+     "sentence": "Рукоятка этого пичака сделана из рога яка и украшена бирюзой.",
+     "why_benign": "genitive singular of пичак, a Central Asian knife - ru.wikipedia lemmatizes it as `Пчак или пичак`. Gafforova's 2021 paper in Историческая этнология writes `большого кинжального ножа (пичака)` on p. 91, and inflects the noun through пичаком, пичаки. The same string is the Serbian genitive plural of пичка, which is a real cross-language homograph and exactly why Tier 1 cannot take it: the matcher consults no language",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`пичака` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
