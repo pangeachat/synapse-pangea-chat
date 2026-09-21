@@ -1125,6 +1125,47 @@ class TestTier2Dispatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["content"]["redacts"], job.event_id)
         self.assertIn("harassment", sent["content"]["reason"])
 
+    async def test_a_flagged_edit_redacts_the_edit_not_the_original(self) -> None:
+        """The edit disposition decided on 2-step-choreographer#1746
+        (2026-09-21): a harmful edit is judged on the revision readers see,
+        and the redaction targets the EDIT event. Clients then fall back to
+        the previous revision, so a benign original keeps its original.
+
+        Driven from `on_new_event`, so the event id the job carries is the
+        one the module actually took from the edit, not one this test chose.
+        """
+        api = _module_api()
+        mod = _tier2_module(self, api, self._tier2_config())
+        assert mod._dispatcher is not None
+        queued: List[ModerationJob] = []
+        with patch.object(mod._dispatcher, "enqueue", side_effect=queued.append):
+            await mod.on_new_event(
+                _event(
+                    event_id="$edit",
+                    content={
+                        "msgtype": "m.text",
+                        "body": "* you are worthless",
+                        "m.new_content": {
+                            "msgtype": "m.text",
+                            "body": "you are worthless",
+                        },
+                        "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
+                    },
+                ),
+                {},
+            )
+        self.assertEqual([job.event_id for job in queued], ["$edit"])
+        self.assertIn("you are worthless", queued[0].text)
+        with patch(MODERATE_TEXT, self._verdict()):
+            await mod._check_and_redact(queued[0])
+        send = cast(AsyncMock, api.create_and_send_event_into_room)
+        send.assert_awaited_once()
+        await_args = send.await_args
+        assert await_args is not None
+        sent = await_args.args[0]
+        self.assertEqual(sent["redacts"], "$edit")
+        self.assertEqual(sent["content"]["redacts"], "$edit")
+
     async def test_self_harm_is_preserved_not_redacted(self) -> None:
         """A disclosure of self-harm stays in the room.
 
