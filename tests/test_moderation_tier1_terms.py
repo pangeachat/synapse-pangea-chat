@@ -606,7 +606,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
         would be English-only in practice as well as in principle.
 
         The floor moves when a term is correctly demoted - it stood at 20 and
-        eight leet forms then left Tier 1 with the words they spell - so it is
+        nine leet forms then left Tier 1 with the words they spell - so it is
         RE-DERIVED here, never lowered to fit a regression. What it was
         standing in for is asserted directly beside it: the evasions Tier 1
         catches have to span many languages and several techniques, which is
@@ -620,7 +620,7 @@ class TestTier1StillBlocksProfanity(unittest.TestCase):
             for case in lang[kind]
             if case["tier"] == 1 and kind == "evasions"
         ]
-        self.assertGreaterEqual(len(caught), 18)
+        self.assertGreaterEqual(len(caught), 17)
         languages = {
             lang["lang_code"]
             for lang in _corpus()["languages"]
@@ -1890,6 +1890,14 @@ class TestALeetFormCarriesNoEvidenceOfItsOwn(unittest.TestCase):
             if not entry["tier1"]
             and entry["reason"] in _REASONS_THAT_NAME_AN_ORDINARY_SENSE
         }
+        # And the readings the model review named, which carry no reason of
+        # their own - `joder` is pinned as a German surname and sits under
+        # `model_review_not_promoted`. Without this the pinned list stopped a
+        # term being re-promoted directly and let the same reading back in
+        # through a leet spelling of it.
+        demoted_for_a_reading |= {
+            needle(term) for term in _REVIEW_NAMED_A_BENIGN_READING
+        }
         checked = 0
         for entry in _promoted():
             if entry["review"]["basis"] != "not_a_word_or_an_identifier":
@@ -1905,6 +1913,45 @@ class TestALeetFormCarriesNoEvidenceOfItsOwn(unittest.TestCase):
                     "content and Tier 1 must not reject it before persist",
                 )
         self.assertTrue(checked, "no promoted term claims the narrowed basis")
+
+    def test_the_deleetings_cover_the_evasions_the_corpus_records(self) -> None:
+        """The audit above is only as wide as `_deleet`, so the table has to
+        prove it can reach the bases the corpus already names.
+
+        Restricted to the evasions the corpus records as a PURE digit
+        substitution. The others name a second transformation in their own
+        `technique` field - a transliteration (`b3henchod` for `बहनचोद`), a
+        diacritic stripping (`0rospu cocugu` for `orospu çocuğu`), a spacing
+        (`p 1 c a`) - and de-leeting alone cannot undo those, which is the
+        corpus saying so rather than this test giving up.
+
+        Without this, a digit reading the table does not know switches the
+        audit off for that needle and nothing says a word: `5` meant only `s`
+        here, so the whole Arabizi column was invisible and `5ول` kept
+        blocking `Room 5ول is down the hall.` while `خول` was demoted.
+        """
+        pure = {"leetspeak", "Arabizi numeral substitution"}
+        checked = 0
+        for lang in _corpus()["languages"]:
+            for case in lang["evasions"]:
+                stored = needle(case["term"])
+                if case["technique"] not in pure:
+                    continue
+                if not any(char.isdigit() for char in stored):
+                    continue
+                checked += 1
+                with self.subTest(term=case["term"]):
+                    self.assertIn(
+                        needle(case["base_term"]),
+                        _deleet(stored),
+                        f"{case['term']!r} is recorded as a digit substitution "
+                        f"for {case['base_term']!r} and `_deleet` cannot produce "
+                        f"it, so the inheritance audit does not see this needle",
+                    )
+        self.assertGreaterEqual(
+            checked, 15, "too few digit evasions to exercise the table"
+        )
+        self.assertIn("خ", _deleet("5"), "the Arabizi readings are gone from the table")
 
     def test_the_readings_that_demoted_a_term_are_each_recorded(self) -> None:
         """And the list is not a place to quietly drop an entry.
@@ -2003,18 +2050,35 @@ class TestALeetFormCarriesNoEvidenceOfItsOwn(unittest.TestCase):
 def _deleet(text: str) -> set:
     """Every plain spelling a leet needle could be written from.
 
-    The substitutions are the ones the wordlist actually uses, and both
-    readings of `1` are tried: `v1ado` is `viado` and also `vlado`, a Slavic
-    given name, which is the second reason that term has no business blocking
-    a message before it is sent.
+    Every reading of a digit is tried, not one per digit. `1` is `i` and also
+    `l`: `v1ado` is `viado` and also `vlado`, a Slavic given name, which is
+    the second reason that term has no business blocking a message before it
+    is sent.
+
+    The ARABIZI column is here because leaving it out silently switched the
+    audit off for a whole script. In Arabizi a digit stands for an Arabic
+    letter with no Latin shape - `5` is خ, `3` is ع, `7` is ح - and the table
+    knew only the Latin `5` -> `s`. So `_deleet("5ول")` returned `{"sول"}`,
+    never `خول`, and `5ول` stayed in Tier 1 while `خول` sat demoted for an
+    ordinary Urdu sense. `Room 5ول is down the hall.` was rejected before
+    persist. A reading the table cannot produce is a rule that does not run,
+    which is why `test_the_deleetings_cover_the_evasions_the_corpus_records`
+    now makes the table prove it can reach every base the corpus names.
+
+    Widening this only ever demotes more, never fewer: another reading is
+    another skeleton to check a promoted needle against.
     """
     readings = {
         "0": ["o"],
         "1": ["i", "l"],
-        "3": ["e"],
+        "2": ["ء", "أ"],
+        "3": ["e", "ع"],
         "4": ["a"],
-        "5": ["s"],
-        "9": ["я"],
+        "5": ["s", "خ"],
+        "6": ["ط"],
+        "7": ["ح"],
+        "8": ["غ"],
+        "9": ["я", "ق"],
     }
     out = {""}
     for char in text:

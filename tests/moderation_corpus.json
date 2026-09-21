@@ -100,7 +100,8 @@
    "Pan Čurák bydlí ve vedlejším domě.",
    "Город Бутаре с 2006 года официально называется Хуе.",
    "Хуи — это традиционное собрание у маори.",
-   "계간 씨발아 잡지를 샀다."
+   "계간 씨발아 잡지를 샀다.",
+   "غرفة 5ول في نهاية الممر."
   ]
  },
  "languages": [
@@ -1204,7 +1205,7 @@
      "term": "5ول",
      "base_term": "خول",
      "technique": "Arabizi numeral substitution",
-     "tier": 1
+     "tier": 2
     }
    ],
    "negative_controls": [
@@ -1223,6 +1224,13 @@
     {
      "sentence": "أدرس علم الاجتماع في الجامعة.",
      "why_benign": "Normal learner sentence with no abuse."
+    },
+    {
+     "sentence": "غرفة 5ول في نهاية الممر.",
+     "why_benign": "A room code. `5ول` is the Arabizi spelling of `خول`, which is demoted for an ordinary Urdu sense, and a leet form inherits the readings of the word it spells - so an identifier written this way is ordinary content. The non-ASCII needle is why the data-driven identifier test cannot reach this one and it is written out.",
+     "tier2_matcher": "flags",
+     "tier2_reason": "term_is_on_the_tier2_list",
+     "tier2_note": "`5ول` is on the Tier 2 wordlist, which is where the term now lives: Tier 2 reads the sentence in context and does not block."
     }
    ]
   },
