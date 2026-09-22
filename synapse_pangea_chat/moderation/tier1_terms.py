@@ -102,10 +102,20 @@ class TermRecord(TypedDict, total=False):
     note: str
     #: Present only on a promoted term: the positive evidence for promoting
     #: it. `basis` is one of `not_a_word_or_an_identifier`,
-    #: `curator_attested` or `native_review`.
+    #: `curator_attested`, `model_review` or `native_review`.
     review: Dict[str, str]
     collisions: Dict[str, float]
     adjudication: Dict[str, object]
+    #: The ordinary word, and its language, that made the vocabulary sweep
+    #: demote a term.
+    sweep_collision: Dict[str, str]
+    #: Why this term is NOT in Tier 1: one or more named benign readings of
+    #: the surface form Tier 1 matches. Each carries the language, the
+    #: meaning, who named it, the sentence that reproduced - which has to be
+    #: a live negative control - and where the reading is published. A list,
+    #: because one string can have two: `fasz` is a newspaper's masthead and
+    #: an ICAO code.
+    benign_reading: List[Dict[str, str]]
 
 
 # Invisible characters carry no meaning; an evader puts them inside a word.

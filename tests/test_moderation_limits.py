@@ -50,7 +50,11 @@ CONTACT_DETAILS_TEXTS = (
     "text 212-555-0182 after class",
 )
 PROFANITY_TEXTS = (
-    "v 1 t t u",
+    # A spelled-out run carrying a digit, and a compact leet token: the two
+    # shapes Tier 1 blocks on. `v 1 t t u` stood here until `vittu` was demoted
+    # for the French surname and `b 4 n g s a t` until `b4ngsat` left with the
+    # Malay bedbug, so the fixture has to be a needle Tier 1 still carries.
+    "p u k 1 m a k",
     "n1gger",
 )
 
