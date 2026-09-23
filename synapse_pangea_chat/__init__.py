@@ -33,6 +33,7 @@ from synapse_pangea_chat.nudge_delivery import (
     DeliverNudge,
     NudgeClick,
     NudgeUnsubscribe,
+    PrepareNudge,
 )
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
@@ -449,6 +450,11 @@ class PangeaChat:
         )
 
         # --- Nudge Delivery ---
+        self.prepare_nudge_resource = PrepareNudge(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/prepare_nudge",
+            resource=self.prepare_nudge_resource,
+        )
         self.deliver_nudge_resource = DeliverNudge(
             api, config, self.direct_push_resource
         )

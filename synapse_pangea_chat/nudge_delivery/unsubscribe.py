@@ -18,6 +18,7 @@ from synapse.http.server import respond_with_html
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
+from synapse.util.async_helpers import Linearizer
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.nudge_delivery.categories import (
@@ -67,6 +68,12 @@ class NudgeUnsubscribe(Resource):
         self._api = api
         self._config = config
         self._app_name = api._hs.config.email.email_app_name
+        # Read-merge-write per person, serialized: two unsubscribes racing
+        # (a category refusal and the global off) must both survive. The
+        # module runs on the main process, so a process-local lock suffices.
+        self._write_lock = Linearizer(
+            name="nudge_unsubscribe", clock=api._hs.get_clock()
+        )
         [self._confirm_html, self._done_html, self._invalid_html] = api.read_templates(
             [
                 "nudge_unsubscribe_confirm.html",
@@ -181,21 +188,22 @@ class NudgeUnsubscribe(Resource):
         self, user_id: str, category: str, *, all_off: bool
     ) -> Dict[str, Any]:
         manager = self._api.account_data_manager
-        current = parse_preferences(
-            await manager.get_global(
-                user_id, COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE
+        async with self._write_lock.queue(user_id):
+            current = parse_preferences(
+                await manager.get_global(
+                    user_id, COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE
+                )
             )
-        )
-        updated = with_refusal(
-            current,
-            categories=() if all_off else (category,),
-            all_off=True if all_off else None,
-            now_ms=now_ms(self._api),
-            source=SOURCE_UNSUBSCRIBE_LINK,
-        )
-        await manager.put_global(
-            user_id, COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE, updated
-        )
+            updated = with_refusal(
+                current,
+                categories=() if all_off else (category,),
+                all_off=True if all_off else None,
+                now_ms=now_ms(self._api),
+                source=SOURCE_UNSUBSCRIBE_LINK,
+            )
+            await manager.put_global(
+                user_id, COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE, updated
+            )
         logger.info(
             "communication preference updated via unsubscribe link: category=%s all_off=%s",
             category,

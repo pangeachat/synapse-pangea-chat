@@ -26,6 +26,34 @@ class TestNudgeDeliveryE2E(BaseSynapseE2ETest):
         super().setUp()
         reset_confirmed_users_for_tests()
 
+    def _prepare(self, admin_token, user_id="@alice:my.domain.name"):
+        return requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/prepare_nudge",
+            json={"user_id": user_id},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+    async def test_prepare_installs_the_suppression_rule_once(self):
+        started, alice, admin = await self._boot()
+        try:
+            first = self._prepare(admin)
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertTrue(first.json()["push_rule_installed"])
+            self.assertTrue(first.json()["suppression_enabled"])
+            second = self._prepare(admin)
+            self.assertEqual(second.status_code, 200, second.text)
+            self.assertFalse(second.json()["push_rule_installed"])
+            rules = requests.get(
+                f"{self.server_url}/_matrix/client/v3/pushrules/global/override/p.rule.bot_notice",
+                headers={"Authorization": f"Bearer {alice}"},
+            )
+            self.assertEqual(rules.status_code, 200, rules.text)
+            self.assertEqual(rules.json()["actions"], ["dont_notify"])
+            bad = self._prepare(admin, user_id="nope")
+            self.assertEqual(bad.status_code, 400)
+        finally:
+            self._stop(started)
+
     def _deliver(self, admin_token, **overrides):
         body = {
             "user_id": "@alice:my.domain.name",

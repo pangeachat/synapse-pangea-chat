@@ -53,6 +53,7 @@ def _api(
 ):
     api = MagicMock()
     api._hs.get_clock.return_value.time_msec.return_value = NOW_MS
+    api._hs.get_clock.return_value.sleep = AsyncMock()
     api._hs.config.server.public_baseurl = public_baseurl
     api._hs.config.server.presence_enabled = True
     api._hs.config.server.track_presence = True
@@ -547,3 +548,35 @@ class TestParsePreferencesFrozen(unittest.TestCase):
             {"refused": ("activity_nudges", "bogus"), "all_off": False}
         )
         self.assertEqual(prefs.refused, frozenset({"activity_nudges"}))
+
+
+class TestPrepareNudge(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        reset_confirmed_users_for_tests()
+
+    async def test_installs_rule_and_reports(self):
+        from synapse_pangea_chat.nudge_delivery.prepare import PrepareNudge
+
+        handler = PrepareNudge(_api(), _config())
+        with patch(
+            "synapse_pangea_chat.nudge_delivery.prepare.ensure_bot_notice_push_rule",
+            new=AsyncMock(return_value=True),
+        ) as ensure:
+            result = await handler.prepare(USER)
+        ensure.assert_awaited_once()
+        self.assertEqual(
+            result,
+            {"user_id": USER, "push_rule_installed": True, "suppression_enabled": True},
+        )
+
+    async def test_suppression_off_installs_nothing(self):
+        from synapse_pangea_chat.nudge_delivery.prepare import PrepareNudge
+
+        handler = PrepareNudge(_api(), _config(nudge_suppress_notice_push_rules=False))
+        with patch(
+            "synapse_pangea_chat.nudge_delivery.prepare.ensure_bot_notice_push_rule",
+            new=AsyncMock(return_value=True),
+        ) as ensure:
+            result = await handler.prepare(USER)
+        ensure.assert_not_awaited()
+        self.assertFalse(result["suppression_enabled"])

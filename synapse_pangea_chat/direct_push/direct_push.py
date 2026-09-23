@@ -263,6 +263,29 @@ class DirectPush(Resource):
             }
         }
 
+    @staticmethod
+    def _sygnal_accepted(payload: Dict[str, Any], raw_body: bytes) -> bool:
+        """A 200 from Sygnal is not a delivery: its body lists pushkeys the
+        gateway rejected (an expired or unregistered device token). A push to
+        a rejected key was not sent, so the caller must not count it, or the
+        nudge delivery would report ``push`` and skip its email fallback."""
+        if not raw_body.strip():
+            return True
+        try:
+            parsed = json.loads(raw_body)
+        except ValueError:
+            logger.warning("Sygnal returned a non-JSON body; counting as failed")
+            return False
+        rejected = parsed.get("rejected") if isinstance(parsed, dict) else None
+        if not rejected:
+            return True
+        devices = payload.get("notification", {}).get("devices", [])
+        sent_keys = {d.get("pushkey") for d in devices if isinstance(d, dict)}
+        if sent_keys & set(rejected):
+            logger.warning("Sygnal rejected pushkey(s) for this device; not sent")
+            return False
+        return True
+
     async def _post_to_sygnal(self, payload: Dict[str, Any]) -> bool:
         try:
             agent = Agent(reactor)
@@ -283,13 +306,13 @@ class DirectPush(Resource):
                 )
             )
 
-            await make_deferred_yieldable(readBody(response))
+            raw_body = await make_deferred_yieldable(readBody(response))
 
             if response.code >= 400:
                 logger.warning("Sygnal returned %s", response.code)
                 return False
 
-            return True
+            return self._sygnal_accepted(payload, raw_body)
         except Exception:  # noqa: BLE001
             logger.exception("Error posting to Sygnal")
             return False

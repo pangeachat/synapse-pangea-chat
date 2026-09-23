@@ -11,7 +11,7 @@ For Synapse Admin API, Module API, and Matrix spec documentation links, see [syn
 
 ## Deliver a nudge
 
-`POST /_synapse/client/pangea/v1/deliver_nudge` — server admin only, rate-limited per caller with the direct-push limits.
+`POST /_synapse/client/pangea/v1/prepare_nudge` before the notice, then `POST /_synapse/client/pangea/v1/deliver_nudge` after it — both server admin only, rate-limited per caller with the direct-push limits.
 
 The bot calls it after recording the nudge as a `p.room.notice` in the person's bot DM. The request names the person, the catalog **category** (must be one the bot delivers: a nudge category or `trial_marketing`), the **variant**, the L1 **body**, the notice's event and room ids, the `pangea.*` metadata the client routes on, and the activity and session ids for the email deep link. Optional: a title, an email subject, a call-to-action label.
 
@@ -19,7 +19,7 @@ Exactly one channel carries the nudge, decided in this order, and the response n
 
 1. **`refused`** — the person's preferences refuse the category (or the global off covers it). Nothing is sent and no push rule is touched.
 2. **`in_app`** — the person is currently active (Synapse presence). The notice already in their DM is the delivery.
-3. **`push`** — at least one enabled HTTP pusher accepted the push (Sygnal returned success). Email pushers are never counted: they cannot be posted to Sygnal.
+3. **`push`** — at least one enabled HTTP pusher accepted the push: Sygnal returned success **and** did not list the device's pushkey as rejected. A rejected pushkey (an expired or unregistered device token) is a failed push, so the person falls through to email rather than being counted as reached. Email pushers are never counted: they cannot be posted to Sygnal.
 4. **`email`** — no working push device, and `nudge_email_enabled` is on, and the person has a verified email address.
 5. **`none`** — with a reason code: `email_disabled`, `no_email_address`, `no_public_baseurl`, `no_token_secret`, `send_failed`, prefixed `push_failed_then_` when a push device existed but every push failed.
 
@@ -38,7 +38,7 @@ Refusal state is one global account-data event per user, `pangea.communication_p
 
 `GET` and `POST /_synapse/client/pangea/v1/unsubscribe?t=<token>` — unauthenticated, rate-limited per client address.
 
-Every nudge email carries a link here in its footer and in the `List-Unsubscribe` / `List-Unsubscribe-Post: List-Unsubscribe=One-Click` headers. **GET only shows a confirmation page**; **POST performs the refusal** — a mail scanner that prefetches the link must not unsubscribe anyone (RFC 8058, and the org rule that no emailed link acts on GET). The page offers the category refusal and the global off; the one-click POST from a mail client refuses the category. A bad or expired token gets a 400 page pointing at the in-app screen.
+Every nudge email carries a link here in its footer and in the `List-Unsubscribe` / `List-Unsubscribe-Post: List-Unsubscribe=One-Click` headers. **GET only shows a confirmation page**; **POST performs the refusal** — a mail scanner that prefetches the link must not unsubscribe anyone (RFC 8058, and the org rule that no emailed link acts on GET). The page offers the category refusal and the global off; the one-click POST from a mail client refuses the category. A bad or expired token gets a 400 page pointing at the in-app screen. The read-merge-write of the store is serialized per person, so two unsubscribes racing each other (a category refusal and the global off) both survive; the module runs on the main process, which is what makes a process-local lock sufficient.
 
 ## The click record
 
@@ -52,7 +52,7 @@ Both links are HMAC-signed tokens naming the person, the action, and an expiry (
 
 ## Keeping Synapse's own pipeline off bot notices
 
-A `p.room.notice` in a DM would otherwise flow through Synapse's rule-driven notification pipeline — the email pusher mailing it as a missed message with no unsubscribe, an HTTP pusher pushing it a second time. On the first delivery to a person, the module installs a per-user override push rule (`p.rule.bot_notice`: `dont_notify` for that event type), idempotently, the same shape as the analytics-invite suppression. `nudge_suppress_notice_push_rules` turns the installation off; the rules already installed stay.
+A `p.room.notice` in a DM would otherwise flow through Synapse's rule-driven notification pipeline — the email pusher mailing it as a missed message with no unsubscribe, an HTTP pusher pushing it a second time. The module installs a per-user override push rule (`p.rule.bot_notice`: `dont_notify` for that event type), idempotently, the same shape as the analytics-invite suppression. Synapse evaluates push actions when an event is persisted, so the rule must exist **before** the notice does: the bot calls `POST /_synapse/client/pangea/v1/prepare_nudge` (server admin only, same rate limit) for a person before recording their first notice, once per person per bot process, and `deliver_nudge` installs the rule again as a backstop. `nudge_suppress_notice_push_rules` turns the installation off; the rules already installed stay.
 
 ## Direct push (`send_push`)
 
