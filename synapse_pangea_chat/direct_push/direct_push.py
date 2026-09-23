@@ -145,8 +145,9 @@ class DirectPush(Resource):
         target_user_id: str,
         device_id: Optional[str],
         req_body: SendPushRequest,
+        pusher_kinds: Optional[tuple[str, ...]] = None,
     ) -> SendPushResponse:
-        pushers = await self._get_pushers(target_user_id, device_id)
+        pushers = await self._get_pushers(target_user_id, device_id, pusher_kinds)
 
         response: SendPushResponse = {
             "user_id": target_user_id,
@@ -196,12 +197,23 @@ class DirectPush(Resource):
         return response
 
     async def _get_pushers(
-        self, user_id: str, device_id: Optional[str]
+        self,
+        user_id: str,
+        device_id: Optional[str],
+        pusher_kinds: Optional[tuple[str, ...]] = None,
     ) -> list[Dict[str, Any]]:
+        """The user's enabled pushers, optionally only of the given kinds
+        (``"http"`` for push devices; ``"email"`` pushers cannot be posted to
+        Sygnal and only ever count as failures)."""
         pushers_iter = await self._datastores.main.get_pushers_by_user_id(user_id)
         pushers = []
         for pusher in pushers_iter:
             if not pusher.enabled:
+                continue
+            if (
+                pusher_kinds is not None
+                and getattr(pusher, "kind", None) not in pusher_kinds
+            ):
                 continue
             if device_id and pusher.device_id != device_id:
                 continue

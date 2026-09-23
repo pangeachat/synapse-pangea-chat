@@ -50,7 +50,12 @@ include = ["synapse_pangea_chat*"]
 # and because that tier fails open, the only symptom is a warning per message
 # and a moderation tier that is quietly not running.
 [tool.setuptools.package-data]
-synapse_pangea_chat = ["moderation/*.json"]
+synapse_pangea_chat = [
+  "moderation/*.json",
+  # Nudge email and unsubscribe page templates, read at runtime.
+  "nudge_delivery/templates/*.html",
+  "nudge_delivery/templates/*.txt",
+]
 
 [tool.setuptools_scm]
 

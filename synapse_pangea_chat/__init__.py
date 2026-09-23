@@ -29,6 +29,11 @@ from synapse_pangea_chat.moderation import ChatModeration, tier1_prefilter
 from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.moderation import refusal as moderation_refusal
 from synapse_pangea_chat.moderation import severity as moderation_severity
+from synapse_pangea_chat.nudge_delivery import (
+    DeliverNudge,
+    NudgeClick,
+    NudgeUnsubscribe,
+)
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
     PreviewWithCode,
@@ -443,6 +448,25 @@ class PangeaChat:
             resource=self.direct_push_resource,
         )
 
+        # --- Nudge Delivery ---
+        self.deliver_nudge_resource = DeliverNudge(
+            api, config, self.direct_push_resource
+        )
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/deliver_nudge",
+            resource=self.deliver_nudge_resource,
+        )
+        self.nudge_unsubscribe_resource = NudgeUnsubscribe(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/unsubscribe",
+            resource=self.nudge_unsubscribe_resource,
+        )
+        self.nudge_click_resource = NudgeClick(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/n",
+            resource=self.nudge_click_resource,
+        )
+
         # --- Server-side chat moderation ---
         # Constructed only when a tier is enabled: construction is what
         # registers the callbacks, so dark config stays truly dark.
@@ -782,6 +806,49 @@ class PangeaChat:
             if not send_push_sygnal_url.strip():
                 raise ValueError('Config "send_push_sygnal_url" must not be empty')
 
+        # --- nudge_delivery config ---
+        nudge_email_enabled = config.get("nudge_email_enabled", False)
+        if not isinstance(nudge_email_enabled, bool):
+            raise ValueError('Config "nudge_email_enabled" must be a boolean')
+        nudge_suppress_notice_push_rules = config.get(
+            "nudge_suppress_notice_push_rules", True
+        )
+        if not isinstance(nudge_suppress_notice_push_rules, bool):
+            raise ValueError(
+                'Config "nudge_suppress_notice_push_rules" must be a boolean'
+            )
+        nudge_token_secret = config.get("nudge_token_secret")
+        if nudge_token_secret is not None and (
+            not isinstance(nudge_token_secret, str) or not nudge_token_secret.strip()
+        ):
+            raise ValueError('Config "nudge_token_secret" must be a non-empty string')
+        nudge_token_ttl_days = config.get("nudge_token_ttl_days", 90)
+        if not isinstance(nudge_token_ttl_days, int) or nudge_token_ttl_days < 1:
+            raise ValueError('Config "nudge_token_ttl_days" must be an integer >= 1')
+        nudge_email_postal_address = config.get("nudge_email_postal_address")
+        if nudge_email_postal_address is not None and not isinstance(
+            nudge_email_postal_address, str
+        ):
+            raise ValueError('Config "nudge_email_postal_address" must be a string')
+        nudge_public_requests_per_burst = config.get(
+            "nudge_public_requests_per_burst", 30
+        )
+        if (
+            not isinstance(nudge_public_requests_per_burst, int)
+            or nudge_public_requests_per_burst < 1
+        ):
+            raise ValueError('Config "nudge_public_requests_per_burst" must be >= 1')
+        nudge_public_burst_duration_seconds = config.get(
+            "nudge_public_burst_duration_seconds", 60
+        )
+        if (
+            not isinstance(nudge_public_burst_duration_seconds, int)
+            or nudge_public_burst_duration_seconds < 1
+        ):
+            raise ValueError(
+                'Config "nudge_public_burst_duration_seconds" must be >= 1'
+            )
+
         # --- blocked_join_gate config ---
         blocked_join_gate_enabled = config.get("blocked_join_gate_enabled", True)
         if not isinstance(blocked_join_gate_enabled, bool):
@@ -1114,6 +1181,13 @@ class PangeaChat:
             send_push_requests_per_burst=send_push_requests_per_burst,
             send_push_burst_duration_seconds=send_push_burst_duration_seconds,
             send_push_sygnal_url=send_push_sygnal_url,
+            nudge_email_enabled=nudge_email_enabled,
+            nudge_suppress_notice_push_rules=nudge_suppress_notice_push_rules,
+            nudge_token_secret=nudge_token_secret,
+            nudge_token_ttl_days=nudge_token_ttl_days,
+            nudge_email_postal_address=nudge_email_postal_address,
+            nudge_public_requests_per_burst=nudge_public_requests_per_burst,
+            nudge_public_burst_duration_seconds=nudge_public_burst_duration_seconds,
             delayed_push_enabled=delayed_push_enabled,
             delayed_push_delay_ms=delayed_push_delay_ms,
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,
