@@ -5,6 +5,8 @@ from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from twisted.internet import defer
+
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.direct_push.direct_push import DirectPush
 
@@ -258,7 +260,9 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
         handler = _make_handler("https://sygnal.custom.test/_matrix/push/v1/notify")
         fake_response = SimpleNamespace(code=200)
         fake_agent = MagicMock()
-        fake_agent.request = AsyncMock(return_value=fake_response)
+        # Twisted's Agent returns Deferreds, not coroutines; the handler relies
+        # on that to hand them to `make_deferred_yieldable`.
+        fake_agent.request = MagicMock(return_value=defer.succeed(fake_response))
 
         with (
             unittest.mock.patch(
@@ -267,14 +271,14 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
             ),
             unittest.mock.patch(
                 "synapse_pangea_chat.direct_push.direct_push.readBody",
-                new=AsyncMock(return_value=b"{}"),
+                new=MagicMock(return_value=defer.succeed(b"{}")),
             ),
         ):
             result = await handler._post_to_sygnal({"notification": {}})
 
         self.assertTrue(result)
-        fake_agent.request.assert_awaited_once()
+        fake_agent.request.assert_called_once()
         self.assertEqual(
-            fake_agent.request.await_args.args[1],
+            fake_agent.request.call_args.args[1],
             b"https://sygnal.custom.test/_matrix/push/v1/notify",
         )

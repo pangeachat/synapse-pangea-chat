@@ -7,9 +7,12 @@ on the leaked context and permanently kills any ``looping_call`` that fires in
 the leaked window ("Looping call died"). Resources must launch handlers via
 ``synapse.logging.context.run_in_background`` instead.
 
-Two tests, because there are two shapes of the same defect. The first covers
-the HTTP resources, which is where commit ``33f7ead`` found it. The second
-covers Tier-2 moderation, which has the harder version of the problem: a
+Three tests, because there are three shapes of the same defect. The first
+covers the HTTP resources, which is where commit ``33f7ead`` found it. The
+second covers the module's own outbound HTTP calls: a raw Twisted ``Agent``
+Deferred awaited without ``make_deferred_yieldable`` leaks for as long as the
+remote takes to answer, which is where production found it again (#214). The
+third covers Tier-2 moderation, which has the harder version of the problem: a
 producer running inside the notifier hands work to a pool of long-lived
 consumers across a reactor boundary, and every handoff - the wakeup, the
 request deferred, the timeout cancellation, the drain - is a place a context
@@ -19,7 +22,9 @@ with dead workers.
 """
 
 import asyncio
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -100,6 +105,132 @@ class TestLogcontextLeak(BaseSynapseE2ETest):
                 + "\n".join(leaked),
             )
         finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
+
+class _SlowSygnal:
+    """A Sygnal stand-in that holds each notify for a while before answering.
+
+    The hold is the point: a leak in an outbound call lasts exactly as long as
+    the call is awaited, so an instant answer leaves a window too short for
+    any `looping_call` to fire in, and the test passes against the defect.
+    """
+
+    def __init__(self, hold_seconds: float) -> None:
+        stub = self
+        self.hold_seconds = hold_seconds
+        self.notifies = 0
+
+        class _Handler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                time.sleep(stub.hold_seconds)
+                stub.notifies += 1
+                payload = b'{"rejected": []}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_port}/_matrix/push/v1/notify"
+
+    def start(self) -> "_SlowSygnal":
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        return self
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+class TestOutboundCallLogcontext(BaseSynapseE2ETest):
+    """The module's own outbound HTTP calls, not just its request plumbing.
+
+    `send_push` is where production found it (SYNAPSE-BT, #214): the handler
+    was launched correctly, but it then awaited a raw Twisted `Agent` Deferred,
+    which leaves the request's context on the reactor until Sygnal answers.
+    """
+
+    async def test_send_push_to_sygnal_does_not_leak_logcontext(self) -> None:
+        postgres = synapse_dir = config_path = None
+        server_process = stdout_thread = stderr_thread = None
+        sygnal = _SlowSygnal(hold_seconds=1.5).start()
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse(
+                module_config={"send_push_sygnal_url": sygnal.url}
+            )
+
+            await self.register_user(
+                config_path, synapse_dir, "alice", "pw", admin=False
+            )
+            await self.register_user(
+                config_path, synapse_dir, "admin", "pw", admin=True
+            )
+            _, alice_token = await self.login_user("alice", "pw")
+            _, admin_token = await self.login_user("admin", "pw")
+
+            pusher = requests.post(
+                f"{self.server_url}/_matrix/client/v3/pushers/set",
+                json={
+                    "kind": "http",
+                    "app_id": "com.talktolearn.chat",
+                    "app_display_name": "Pangea Chat",
+                    "device_display_name": "Test iPhone",
+                    "pushkey": "pushkey-1",
+                    "lang": "en",
+                    "data": {"url": sygnal.url},
+                },
+                headers={"Authorization": f"Bearer {alice_token}"},
+            )
+            self.assertEqual(pusher.status_code, 200, pusher.text)
+
+            # Several held pushes, so the leaked windows add up to longer than
+            # Synapse's 5-second timers (client IPs, typing timeouts), which
+            # therefore fire inside one if the leak is there.
+            for _ in range(6):
+                response = requests.post(
+                    f"{self.server_url}/_synapse/client/pangea/v1/send_push",
+                    json={"user_id": "@alice:my.domain.name", "body": "Test"},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+
+            # The outbound call ACTUALLY RAN; a push that never reached Sygnal
+            # has no leak window to test.
+            self.assertEqual(sygnal.notifies, 6)
+
+            await asyncio.sleep(2)
+            leaked = [
+                line
+                for line in self.server_stdout_lines + self.server_stderr_lines
+                if any(marker in line for marker in LEAK_MARKERS)
+            ]
+            self.assertEqual(
+                leaked,
+                [],
+                "send_push leaked its logcontext while awaiting Sygnal:\n"
+                + "\n".join(leaked),
+            )
+        finally:
+            sygnal.stop()
             self.stop_synapse(
                 server_process=server_process,
                 stdout_thread=stdout_thread,
