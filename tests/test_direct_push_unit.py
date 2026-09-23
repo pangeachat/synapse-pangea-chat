@@ -282,3 +282,19 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
             fake_agent.request.call_args.args[1],
             b"https://sygnal.custom.test/_matrix/push/v1/notify",
         )
+
+
+class TestSygnalRejections(unittest.TestCase):
+    def test_rejected_pushkey_is_not_sent(self):
+        from synapse_pangea_chat.direct_push.direct_push import DirectPush
+
+        payload = {"notification": {"devices": [{"pushkey": "key-1"}]}}
+        self.assertFalse(
+            DirectPush._sygnal_accepted(payload, b'{"rejected": ["key-1"]}')
+        )
+        self.assertTrue(
+            DirectPush._sygnal_accepted(payload, b'{"rejected": ["other"]}')
+        )
+        self.assertTrue(DirectPush._sygnal_accepted(payload, b'{"rejected": []}'))
+        self.assertTrue(DirectPush._sygnal_accepted(payload, b""))
+        self.assertFalse(DirectPush._sygnal_accepted(payload, b"not json"))
