@@ -60,7 +60,10 @@ def _api(
     api._hs.config.email.email_app_name = "Pangea Chat"
     api._hs.config.key.macaroon_secret_key = b"macaroon"
     api._hs.get_presence_handler.return_value.current_state_for_user = AsyncMock(
-        return_value=SimpleNamespace(currently_active=currently_active)
+        return_value=SimpleNamespace(
+            state="online" if currently_active else "offline",
+            currently_active=currently_active,
+        )
     )
     api._hs.get_datastores.return_value.main.user_get_threepids = AsyncMock(
         return_value=list(threepids)
@@ -580,3 +583,48 @@ class TestPrepareNudge(unittest.IsolatedAsyncioTestCase):
             result = await handler.prepare(USER)
         ensure.assert_not_awaited()
         self.assertFalse(result["suppression_enabled"])
+
+
+class TestInAppRequiresOnline(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_currently_active_while_offline_is_not_in_app(self):
+        api = _api(currently_active=True)
+        api._hs.get_presence_handler.return_value.current_state_for_user = AsyncMock(
+            return_value=SimpleNamespace(state="offline", currently_active=True)
+        )
+        handler = DeliverNudge(api, _config(), _direct_push(0, 0))
+        self.assertFalse(await handler._is_in_app(USER))
+
+
+class TestEmailSubjectIsOneLine(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        reset_confirmed_users_for_tests()
+
+    async def test_multiline_body_becomes_a_single_line_subject(self):
+        api = _api(
+            threepids=[SimpleNamespace(medium="email", address="alice@example.test")]
+        )
+        handler = DeliverNudge(
+            api, _config(nudge_email_enabled=True), _direct_push(0, 0)
+        )
+        with patch(
+            "synapse_pangea_chat.nudge_delivery.deliver.ensure_bot_notice_push_rule",
+            new=AsyncMock(return_value=False),
+        ):
+            result = await handler.deliver(
+                {
+                    "user_id": USER,
+                    "category": "activity_nudges",
+                    "variant": "do_activity",
+                    "body": "Line one\r\nline two\n\nline three",
+                }
+            )
+        self.assertEqual(result["channel"], CHANNEL_EMAIL)
+        send_email = api._hs.get_send_email_handler.return_value.send_email
+        subject = send_email.await_args.kwargs.get("subject")
+        if subject is None:
+            subject = next(
+                a
+                for a in send_email.await_args.args
+                if isinstance(a, str) and "Line one" in a
+            )
+        self.assertEqual(subject, "Line one line two line three")

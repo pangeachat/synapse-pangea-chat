@@ -14,6 +14,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, cast
 
+from synapse.api.constants import PresenceState
 from synapse.api.errors import (
     AuthError,
     InvalidClientTokenError,
@@ -245,7 +246,12 @@ class DeliverNudge(Resource):
                 "presence lookup failed for nudge delivery: %s", type(e).__name__
             )
             return False
-        return bool(getattr(state, "currently_active", False))
+        # `currently_active` can survive an offline transition, so the state
+        # itself must be online too; otherwise an offline person would read
+        # as in-app and get nothing.
+        return getattr(state, "state", None) == PresenceState.ONLINE and bool(
+            getattr(state, "currently_active", False)
+        )
 
     async def _first_email_address(self, user_id: str) -> Optional[str]:
         threepids = await self._store.user_get_threepids(user_id)
@@ -309,7 +315,9 @@ class DeliverNudge(Resource):
             or _optional_str(body.get("title"))
             or body["body"].strip()
         )
-        subject = subject[:MAX_SUBJECT_LENGTH]
+        # A Subject header cannot carry line breaks; a multi-line body used
+        # as the fallback subject would make the mailer reject the message.
+        subject = " ".join(subject.split())[:MAX_SUBJECT_LENGTH]
         template_vars = {
             "app_name": self._app_name,
             "title": _optional_str(body.get("title")),

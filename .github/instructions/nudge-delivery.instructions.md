@@ -18,7 +18,7 @@ The bot calls it after recording the nudge as a `p.room.notice` in the person's 
 Exactly one channel carries the nudge, decided in this order, and the response names which:
 
 1. **`refused`** — the person's preferences refuse the category (or the global off covers it). Nothing is sent and no push rule is touched.
-2. **`in_app`** — the person is currently active (Synapse presence). The notice already in their DM is the delivery.
+2. **`in_app`** — the person is online and currently active (Synapse presence; both flags, since `currently_active` can outlive an offline transition). The notice already in their DM is the delivery.
 3. **`push`** — at least one enabled HTTP pusher accepted the push: Sygnal returned success **and** did not list the device's pushkey as rejected. A rejected pushkey (an expired or unregistered device token) is a failed push, so the person falls through to email rather than being counted as reached. Email pushers are never counted: they cannot be posted to Sygnal.
 4. **`email`** — no working push device, and `nudge_email_enabled` is on, and the person has a verified email address.
 5. **`none`** — with a reason code: `email_disabled`, `no_email_address`, `no_public_baseurl`, `no_token_secret`, `send_failed`, prefixed `push_failed_then_` when a push device existed but every push failed.
