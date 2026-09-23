@@ -21,7 +21,7 @@ from synapse.handlers.admin import ExfiltrationWriter
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
-from synapse.logging.context import run_in_background
+from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.media.filepath import MediaFilePaths
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import ModuleApi
@@ -523,25 +523,29 @@ class ExportUserData(Resource):
             ],
         )
 
-        response = await agent.request(
-            b"POST",
-            f"{cms_base_url}/api/user-exports".encode("utf-8"),
-            Headers(
-                {
-                    b"Content-Type": [
-                        f"multipart/form-data; boundary={boundary.decode()}".encode(
-                            "utf-8"
-                        )
-                    ],
-                    b"Authorization": [
-                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
-                    ],
-                }
-            ),
-            _BytesProducer(multipart_body),
+        response = await make_deferred_yieldable(
+            agent.request(
+                b"POST",
+                f"{cms_base_url}/api/user-exports".encode("utf-8"),
+                Headers(
+                    {
+                        b"Content-Type": [
+                            f"multipart/form-data; boundary={boundary.decode()}".encode(
+                                "utf-8"
+                            )
+                        ],
+                        b"Authorization": [
+                            f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
+                                "utf-8"
+                            )
+                        ],
+                    }
+                ),
+                _BytesProducer(multipart_body),
+            )
         )
 
-        resp_body = await readBody(response)
+        resp_body = await make_deferred_yieldable(readBody(response))
         if response.code >= 400:
             raise RuntimeError(
                 f"CMS create export record failed ({response.code}): "
@@ -602,23 +606,27 @@ class ExportUserData(Resource):
         agent = Agent(reactor)
         encoded_user_id = quote(user_id, safe="")
 
-        response = await agent.request(
-            b"GET",
-            (
-                f"{cms_base_url}/api/matrix-users"
-                f"?where[username][equals]={encoded_user_id}&limit=1"
-            ).encode("utf-8"),
-            Headers(
-                {
-                    b"Authorization": [
-                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
-                    ],
-                }
-            ),
-            None,
+        response = await make_deferred_yieldable(
+            agent.request(
+                b"GET",
+                (
+                    f"{cms_base_url}/api/matrix-users"
+                    f"?where[username][equals]={encoded_user_id}&limit=1"
+                ).encode("utf-8"),
+                Headers(
+                    {
+                        b"Authorization": [
+                            f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
+                                "utf-8"
+                            )
+                        ],
+                    }
+                ),
+                None,
+            )
         )
 
-        resp_body = await readBody(response)
+        resp_body = await make_deferred_yieldable(readBody(response))
         if response.code >= 400:
             raise RuntimeError(
                 f"CMS matrix-user lookup failed ({response.code}): "
@@ -656,21 +664,25 @@ class ExportUserData(Resource):
             payload["error"] = error
         body_bytes = json.dumps(payload).encode("utf-8")
 
-        response = await agent.request(
-            b"PATCH",
-            f"{cms_base_url}/api/user-exports/{record_id}".encode("utf-8"),
-            Headers(
-                {
-                    b"Content-Type": [b"application/json"],
-                    b"Authorization": [
-                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
-                    ],
-                }
-            ),
-            _BytesProducer(body_bytes),
+        response = await make_deferred_yieldable(
+            agent.request(
+                b"PATCH",
+                f"{cms_base_url}/api/user-exports/{record_id}".encode("utf-8"),
+                Headers(
+                    {
+                        b"Content-Type": [b"application/json"],
+                        b"Authorization": [
+                            f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode(
+                                "utf-8"
+                            )
+                        ],
+                    }
+                ),
+                _BytesProducer(body_bytes),
+            )
         )
 
-        resp_body = await readBody(response)
+        resp_body = await make_deferred_yieldable(readBody(response))
         if response.code >= 400:
             raise RuntimeError(
                 f"CMS update export status failed ({response.code}): "

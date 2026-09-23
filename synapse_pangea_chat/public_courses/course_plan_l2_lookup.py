@@ -57,6 +57,7 @@ async def _cms_get_plans(
     cms_base_url: str,
     cms_api_key: str,
 ) -> List[Dict[str, Any]]:
+    from synapse.logging.context import make_deferred_yieldable
     from twisted.internet import reactor
     from twisted.web.client import Agent, readBody
     from twisted.web.http_headers import Headers
@@ -72,20 +73,22 @@ async def _cms_get_plans(
     )
     url = f"{cms_base_url}/api/{collection}?{query}"
 
-    response = await agent.request(
-        b"GET",
-        url.encode("utf-8"),
-        Headers(
-            {
-                b"Authorization": [
-                    f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
-                ],
-            }
-        ),
-        None,
+    response = await make_deferred_yieldable(
+        agent.request(
+            b"GET",
+            url.encode("utf-8"),
+            Headers(
+                {
+                    b"Authorization": [
+                        f"{CMS_AUTH_COLLECTION} API-Key {cms_api_key}".encode("utf-8")
+                    ],
+                }
+            ),
+            None,
+        )
     )
 
-    body = await readBody(response)
+    body = await make_deferred_yieldable(readBody(response))
     if response.code >= 400:
         raise CoursePlanLookupError(
             f"CMS {collection} lookup failed ({response.code}): "

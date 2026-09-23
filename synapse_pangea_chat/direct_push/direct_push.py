@@ -15,7 +15,7 @@ from synapse.api.errors import (
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
-from synapse.logging.context import run_in_background
+from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.module_api import ModuleApi
 from twisted.internet import reactor
 from twisted.web.client import Agent, FileBodyProducer, readBody
@@ -262,14 +262,16 @@ class DirectPush(Resource):
 
             producer = FileBodyProducer(BytesIO(body_bytes))
 
-            response = await agent.request(
-                b"POST",
-                url,
-                Headers({b"Content-Type": [b"application/json"]}),
-                producer,
+            response = await make_deferred_yieldable(
+                agent.request(
+                    b"POST",
+                    url,
+                    Headers({b"Content-Type": [b"application/json"]}),
+                    producer,
+                )
             )
 
-            await readBody(response)
+            await make_deferred_yieldable(readBody(response))
 
             if response.code >= 400:
                 logger.warning("Sygnal returned %s", response.code)
