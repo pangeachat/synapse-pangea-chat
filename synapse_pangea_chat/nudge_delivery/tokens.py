@@ -50,7 +50,9 @@ def verify_token(
     if not isinstance(token, str) or token.count(".") != 1:
         return None
     payload_part, signature = token.split(".", 1)
-    if not payload_part or not signature:
+    if not payload_part or not signature or not token.isascii():
+        # A non-ASCII token is not one we issued; refusing it here keeps the
+        # signature step from raising on it and the caller answers "invalid link".
         return None
     expected = _signature(secret, payload_part)
     if not hmac.compare_digest(expected, signature):

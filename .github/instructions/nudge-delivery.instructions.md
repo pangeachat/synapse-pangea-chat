@@ -60,6 +60,8 @@ A `p.room.notice` in a DM would otherwise flow through Synapse's rule-driven not
 
 ## Configuration
 
+Turning `nudge_email_enabled` on without `nudge_email_postal_address` is a configuration error: the address is a content requirement on marketing-classified mail, so the module refuses to start email delivery without one rather than send a footer that lacks it.
+
 `nudge_email_enabled` (default off — enabling it is a rollout decision recorded in a deploy-note), `nudge_suppress_notice_push_rules` (default on), `nudge_token_secret`, `nudge_token_ttl_days`, `nudge_email_postal_address` (shown in the footer; a CAN-SPAM content requirement for marketing-classified categories), and the public-link rate limits `nudge_public_requests_per_burst` / `nudge_public_burst_duration_seconds`. The email leg also needs the homeserver's `public_baseurl` and working `email` (SMTP) config, both of which the deployments already have. Templates ship inside the package and are read through the module API's template loader.
 
 ## Key Files

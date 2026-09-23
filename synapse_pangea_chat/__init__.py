@@ -836,6 +836,16 @@ class PangeaChat:
             nudge_email_postal_address, str
         ):
             raise ValueError('Config "nudge_email_postal_address" must be a string')
+        if nudge_email_enabled and not (
+            isinstance(nudge_email_postal_address, str)
+            and nudge_email_postal_address.strip()
+        ):
+            # Marketing-classified mail must carry the sender's postal address;
+            # refusing to enable email without one keeps that invariant in config.
+            raise ValueError(
+                'Config "nudge_email_postal_address" is required when '
+                '"nudge_email_enabled" is true'
+            )
         nudge_public_requests_per_burst = config.get(
             "nudge_public_requests_per_burst", 30
         )

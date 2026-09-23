@@ -628,3 +628,21 @@ class TestEmailSubjectIsOneLine(unittest.IsolatedAsyncioTestCase):
                 if isinstance(a, str) and "Line one" in a
             )
         self.assertEqual(subject, "Line one line two line three")
+
+
+class TestReviewRoundThree(unittest.TestCase):
+    def test_non_ascii_token_is_invalid_not_an_error(self):
+        from synapse_pangea_chat.nudge_delivery.tokens import verify_token
+
+        self.assertIsNone(verify_token(b"s", "é.x", now_ms=NOW_MS))
+        self.assertIsNone(verify_token(b"s", "abc.é", now_ms=NOW_MS))
+
+    def test_email_requires_postal_address(self):
+        from synapse_pangea_chat import PangeaChat
+
+        with self.assertRaisesRegex(ValueError, "nudge_email_postal_address"):
+            PangeaChat.parse_config({"nudge_email_enabled": True})
+        config = PangeaChat.parse_config(
+            {"nudge_email_enabled": True, "nudge_email_postal_address": "1 Main St"}
+        )
+        self.assertTrue(config.nudge_email_enabled)
