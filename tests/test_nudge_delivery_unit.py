@@ -640,9 +640,14 @@ class TestReviewRoundThree(unittest.TestCase):
     def test_email_requires_postal_address(self):
         from synapse_pangea_chat import PangeaChat
 
+        base = {"cms_base_url": "x", "cms_service_api_key": "y"}
         with self.assertRaisesRegex(ValueError, "nudge_email_postal_address"):
-            PangeaChat.parse_config({"nudge_email_enabled": True})
+            PangeaChat.parse_config({**base, "nudge_email_enabled": True})
         config = PangeaChat.parse_config(
-            {"nudge_email_enabled": True, "nudge_email_postal_address": "1 Main St"}
+            {
+                **base,
+                "nudge_email_enabled": True,
+                "nudge_email_postal_address": "1 Main St",
+            }
         )
         self.assertTrue(config.nudge_email_enabled)
