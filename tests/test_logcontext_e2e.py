@@ -3,15 +3,18 @@
 Handlers launched with a bare ``defer.ensureDeferred`` leave the request's
 logcontext set on the reactor. Synapse logs "Expected logging context ... was
 lost" for every such request, and since 1.159 a hardened ``clock.py`` asserts
-on the leaked context and permanently kills any ``looping_call`` that fires in
-the leaked window ("Looping call died"). Resources must launch handlers via
+on the leaked context: any ``looping_call`` that fires in the leaked window
+stops for good ("Looping call died"), and any one-shot ``call_later`` that
+fires in it never runs. Resources must launch handlers via
 ``synapse.logging.context.run_in_background`` instead.
 
 Three tests, because there are three shapes of the same defect. The first
 covers the HTTP resources, which is where commit ``33f7ead`` found it. The
 second covers the module's own outbound HTTP calls: a raw Twisted ``Agent``
-Deferred awaited without ``make_deferred_yieldable`` leaks for as long as the
-remote takes to answer, which is where production found it again (#214). The
+Deferred awaited without ``make_deferred_yieldable``, after an earlier
+Synapse-aware await has resumed the coroutine from the reactor, hands the
+request's context back to the reactor for as long as the remote takes to
+answer. That is where production found it again (#214). The
 third covers Tier-2 moderation, which has the harder version of the problem: a
 producer running inside the notifier hands work to a pool of long-lived
 consumers across a reactor boundary, and every handoff - the wakeup, the
@@ -47,10 +50,17 @@ from .mock_moderation_server import FLAG_MARKER, MockModerationServer
 # current - a client request's, or ours. Asserting on it would make this gate
 # fail against stock Synapse, which is a broken gate rather than a strict one.
 # Re-measure before adding it; do not add it because it looks like it belongs.
+#
+# `leaked their logcontext to us` is the tail every 1.159 `clock.py` sentinel
+# assert shares - `looping_call`, `call_later` and `add_system_event_trigger`.
+# Only the first also logs "Looping call died"; a one-shot `call_later` that
+# fires in a leaked window just raises that assert into the reactor and never
+# runs, so without this marker a lost one-shot timer passes the gate.
 LEAK_MARKERS = (
     "Expected logging context",
     "Looping call died",
     "Background process re-entered without a proc",
+    "leaked their logcontext to us",
 )
 
 
