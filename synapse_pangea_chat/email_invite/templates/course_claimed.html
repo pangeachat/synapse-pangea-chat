@@ -1,48 +1,27 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Invite your students</title>
-  </head>
-  <body style="margin:0;padding:0;background:#f4f2fb;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#1a1a2e;font-size:16px;line-height:1.6;">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f2fb;">
-      <tr>
-        <td align="center" style="padding:32px 16px;">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#ffffff;border-radius:12px;">
-            <tr>
-              <td style="padding:28px 28px 8px 28px;font-weight:700;color:#5E3ACF;font-size:18px;">{{ app_name }}</td>
-            </tr>
-            <tr>
-              <td style="padding:8px 28px 0 28px;font-size:20px;font-weight:700;">Invite your students</td>
-            </tr>
-            <tr>
-              <td style="padding:12px 28px 0 28px;"><strong>{{ course_title }}</strong> is now held by {% if claimed_by_display_name %}{{ claimed_by_display_name }} ({{ claimed_by_user_id }}){% else %}{{ claimed_by_user_id }}{% endif %}.</td>
-            </tr>
-            <tr>
-              <td style="padding:16px 28px 0 28px;">Share this link with your students:</td>
-            </tr>
-            <tr>
-              <td style="padding:8px 28px 0 28px;">
-                <div style="background:#f4f2fb;border-radius:8px;padding:12px 14px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:15px;word-break:break-all;"><a href="{{ class_url }}" style="color:#5E3ACF;">{{ class_url }}</a></div>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:16px 28px 0 28px;">Or give them the class code <strong style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:18px;letter-spacing:1px;">{{ class_code }}</strong> to enter in the app.</td>
-            </tr>
-            <tr>
-              <td style="padding:16px 28px 28px 28px;color:#44445a;">Everyone who joins with this link or code joins as a student. If you didn't open the course yourself, reply to this email and we'll sort it out.</td>
-            </tr>
-          </table>
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;">
-            <tr>
-              <td style="padding:16px 12px;font-size:12px;line-height:1.5;color:#6b6b80;">
-                You're receiving this because a course was requested for this address. Questions? Reply to this email.
-              </td>
-            </tr>
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>
+{% extends "_course_email_base.html" %}
+{% block title %}Invite your students{% endblock %}
+{% block body %}
+                <p style="font-size: 20px; font-weight: 700; margin-bottom: 12px">
+                  Invite your students
+                </p>
+                <p>
+                  <strong>{{ course_title }}</strong> is now held by
+                  {% if claimed_by_display_name %}{{ claimed_by_display_name }} ({{ claimed_by_user_id }}){% else %}{{ claimed_by_user_id }}{% endif %}.
+                </p>
+                <p style="margin-bottom: 8px">Share this link with your students:</p>
+                <div class="feature">
+                  <p style="margin: 0; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 15px; word-break: break-all">
+                    <a href="{{ class_url }}" style="color: #5e3acf">{{ class_url }}</a>
+                  </p>
+                </div>
+                <p>
+                  Or give them the class code
+                  <strong style="font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 18px; letter-spacing: 1px">{{ class_code }}</strong>
+                  to enter in the app.
+                </p>
+                <p style="font-size: 14px; color: #666">
+                  Everyone who joins with this link or code joins as a student. If
+                  you didn't open the course yourself, reply to this email and
+                  we'll sort it out.
+                </p>
+{% endblock %}
