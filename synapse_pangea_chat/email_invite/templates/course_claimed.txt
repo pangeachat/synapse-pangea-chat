@@ -9,6 +9,3 @@ Students will be directed to make an account, automatically enrolled in your cla
 Your students will receive a free 7-day trial on account creation and can subscribe in-app afterwards. If you'd like to cover your students' seats, just hit reply for an invoice, to redeem a promotional offer, or any other questions.
 
 This course was opened by {% if claimed_by_display_name %}{{ claimed_by_display_name }} ({{ claimed_by_user_id }}){% else %}{{ claimed_by_user_id }}{% endif %}. If that wasn't you, reply to this email.
-
---
-You're receiving this because a course was requested for this address. Questions? Reply to this email.

@@ -9,6 +9,3 @@ Open the course to become its teacher. If you don't have a {{ app_name }} accoun
 
 Open your course:
 {{ claim_url }}
-
---
-You're receiving this because a course was requested for this address. Questions? Reply to this email.
