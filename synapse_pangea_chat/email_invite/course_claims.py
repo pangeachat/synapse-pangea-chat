@@ -9,14 +9,15 @@ It lives in a module table rather than in room state because every member of a
 course can read its room state, and the address must not be visible to the
 students who join (create-course-space.instructions.md).
 
-The row does three jobs beyond holding the address:
+The row does four jobs beyond holding the address:
 
-- It makes the claim single use under concurrency. The admin code is burned
-  from join rules only after the claimer is promoted, so two requests that both
-  read the code before the burn would otherwise both be promoted; the
-  conditional update in ``claim`` lets one account through. It applies only to
-  the admin code the course was created with (``admin_code_sha256``): a later
-  admin code, granted deliberately to a co-teacher, is not a claim.
+- It holds the claim code. A requested course's admin code is never written
+  to room state: every member can read ``m.room.join_rules``, so a student who
+  joined with the class code could read it there and claim the course. Only
+  its digest is kept, here, and ``rooms_for_admin_code`` is how
+  ``knock_with_code`` finds the room. Promotion spends it.
+- It makes the claim single use under concurrency: the conditional update in
+  ``claim`` lets one account through.
 - It makes the claim notice send once. ``reserve_notice`` takes a lease before
   a send, so two requests from the claimer, or two workers retrying, cannot
   both send it.
@@ -60,8 +61,17 @@ _INSERT_SQL = """
     VALUES (?, ?, ?, ?)
 """
 
+_ROOMS_FOR_CODE_SQL = """
+    SELECT room_id FROM pangea_course_claim
+    WHERE admin_code_sha256 = ? AND promoted_at_ms IS NULL
+"""
+
+_CODE_IN_USE_SQL = """
+    SELECT 1 FROM pangea_course_claim WHERE admin_code_sha256 = ?
+"""
+
 _SELECT_SQL = """
-    SELECT admin_code_sha256, claimed_by
+    SELECT claimed_by
     FROM pangea_course_claim
     WHERE room_id = ?
 """
@@ -123,6 +133,8 @@ _OUTSTANDING_SQL = """
 STATEMENTS = (
     _CREATE_TABLE_SQL,
     _INSERT_SQL,
+    _ROOMS_FOR_CODE_SQL,
+    _CODE_IN_USE_SQL,
     _SELECT_SQL,
     _CLAIM_SQL,
     _PROMOTED_SQL,
@@ -141,11 +153,7 @@ def admin_code_digest(admin_code: str) -> str:
 
 @attr.s(frozen=True, auto_attribs=True)
 class CourseClaim:
-    admin_code_sha256: str
     claimed_by: Optional[str]
-
-    def is_for_code(self, admin_code: str) -> bool:
-        return admin_code_digest(admin_code) == self.admin_code_sha256
 
 
 @attr.s(frozen=True, auto_attribs=True)
@@ -172,7 +180,11 @@ class CourseClaimStore:
         self._table_ready = True
 
     async def record(
-        self, room_id: str, requested_email: str, admin_code: str, now_ms: int
+        self,
+        room_id: str,
+        requested_email: Optional[str],
+        admin_code: str,
+        now_ms: int,
     ) -> None:
         await self._ensure_table()
 
@@ -184,12 +196,37 @@ class CourseClaimStore:
 
         await self._db_pool.runInteraction("pangea_course_claim_record", _insert)
 
+    async def rooms_for_admin_code(self, admin_code: str) -> List[str]:
+        """Rooms whose unspent claim code this is."""
+        await self._ensure_table()
+        digest = admin_code_digest(admin_code)
+
+        def _select(txn: Any) -> List[str]:
+            txn.execute(_ROOMS_FOR_CODE_SQL, (digest,))
+            return [row[0] for row in txn.fetchall()]
+
+        return await self._db_pool.runInteraction(
+            "pangea_course_claim_rooms_for_code", _select
+        )
+
+    async def code_in_use(self, admin_code: str) -> bool:
+        await self._ensure_table()
+        digest = admin_code_digest(admin_code)
+
+        def _select(txn: Any) -> bool:
+            txn.execute(_CODE_IN_USE_SQL, (digest,))
+            return txn.fetchone() is not None
+
+        return await self._db_pool.runInteraction(
+            "pangea_course_claim_code_in_use", _select
+        )
+
     async def get(self, room_id: str) -> Optional[CourseClaim]:
         """The claim record for a room, or None when the room has none.
 
-        A room has none unless ``create_course_space`` made it for a requested
-        address: courses teachers create in the client carry an admin code too,
-        and their admin codes are not claims.
+        A room has none unless ``create_course_space`` made it: courses
+        teachers create in the client carry their admin code in join rules,
+        and it is not a claim.
         """
         await self._ensure_table()
 
@@ -198,7 +235,7 @@ class CourseClaimStore:
             row = txn.fetchone()
             if row is None:
                 return None
-            return CourseClaim(admin_code_sha256=row[0], claimed_by=row[1])
+            return CourseClaim(claimed_by=row[0])
 
         return await self._db_pool.runInteraction("pangea_course_claim_get", _select)
 

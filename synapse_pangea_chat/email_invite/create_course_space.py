@@ -39,7 +39,6 @@ from synapse_pangea_chat.grant_instructor_analytics_access.grant_instructor_anal
 )
 from synapse_pangea_chat.room_code.constants import (
     ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
-    ADMIN_ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
     EVENT_TYPE_M_ROOM_JOIN_RULES,
     KNOCK_JOIN_RULE_VALUE,
 )
@@ -217,14 +216,15 @@ class CreateCourseSpace(Resource):
 
             # Build initial state events for the space
             initial_state = [
-                # Join rules with knock + both access codes
+                # Join rules with knock + the class code only. The admin code
+                # is the claim, and every member can read join rules, so it is
+                # kept in the claim record instead (course_claims).
                 {
                     "type": EVENT_TYPE_M_ROOM_JOIN_RULES,
                     "state_key": "",
                     "content": {
                         "join_rule": KNOCK_JOIN_RULE_VALUE,
                         ACCESS_CODE_JOIN_RULE_CONTENT_KEY: student_code,
-                        ADMIN_ACCESS_CODE_JOIN_RULE_CONTENT_KEY: admin_code,
                     },
                 },
                 # Course plan association
@@ -298,15 +298,38 @@ class CreateCourseSpace(Resource):
             # the claim, and whoever reads it can spend it.
             logger.info(f"Course space created: room_id={room_id}")
 
+            # The claim record is where the admin code lives, so without it
+            # the course cannot be claimed at all. Failing here is loud, and
+            # names the room so it can be repaired rather than recreated.
+            try:
+                await self._claim_store.record(
+                    room_id,
+                    teacher_email,
+                    admin_code,
+                    self._api._hs.get_clock().time_msec(),
+                )
+            except Exception as e:
+                logger.error(f"Failed to record the claim for {room_id}: {e}")
+                _capture_exception(e)
+                respond_with_json(
+                    request,
+                    500,
+                    {
+                        "error": "Course space created but its claim could not be recorded",
+                        "room_id": room_id,
+                    },
+                    send_cors=True,
+                )
+                return
+
             emailed = False
             if teacher_email is not None:
-                emailed = await self._record_and_email(
+                emailed = await self._send_claim_link(
                     room_id=room_id,
                     teacher_email=teacher_email,
                     title=title.strip(),
                     description=description if isinstance(description, str) else "",
                     request_summary=request_summary,
-                    admin_code=admin_code,
                     claim_url=admin_join_url,
                 )
 
@@ -345,7 +368,7 @@ class CreateCourseSpace(Resource):
                 send_cors=True,
             )
 
-    async def _record_and_email(
+    async def _send_claim_link(
         self,
         *,
         room_id: str,
@@ -353,29 +376,14 @@ class CreateCourseSpace(Resource):
         title: str,
         description: str,
         request_summary: str | None,
-        admin_code: str,
         claim_url: str,
     ) -> bool:
-        """Record the requesting address, then send it the claim link.
+        """Email the claim link to the requesting address.
 
-        The record comes first: a claim link whose claim could not send the
-        class code would leave the teacher holding a course with no way to
-        invite anyone, so without a record no link goes out. Either failure is
-        captured and reported as ``emailed: false`` rather than failing the
-        request, because the space already exists and a retry would make a
-        second one.
+        A failure is captured and reported as ``emailed: false`` rather than
+        failing the request: the space and its claim exist, and a retry would
+        make a second one.
         """
-        try:
-            await self._claim_store.record(
-                room_id,
-                teacher_email,
-                admin_code,
-                self._api._hs.get_clock().time_msec(),
-            )
-        except Exception as e:
-            logger.error(f"Failed to record the requesting address for {room_id}: {e}")
-            _capture_exception(e)
-            return False
         try:
             await self._mailer.send_course_ready(
                 email_address=teacher_email,
@@ -400,6 +408,6 @@ class CreateCourseSpace(Resource):
             matches = await get_rooms_with_access_code(
                 access_code=code, room_store=self._datastores.main
             )
-            if len(matches) == 0:
+            if len(matches) == 0 and not await self._claim_store.code_in_use(code):
                 return code
         return None

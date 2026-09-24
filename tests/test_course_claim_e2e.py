@@ -158,17 +158,30 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 self.assertIn("Spanish 1 practice for my class", ready_text)
                 self.assertNotIn(class_code, ready_text)
 
-                # The requesting address is not in room state.
+                # Neither the requesting address nor the claim code is in room
+                # state: every member can read it.
                 state = self._room_get(bot, room_id, "state")
                 self.assertNotIn(REQUESTED, json.dumps(state))
+                self.assertNotIn(admin_code, json.dumps(state).lower())
+                join_rules = self._room_get(bot, room_id, "state/m.room.join_rules")
+                self.assertNotIn("admin_access_code", join_rules)
 
                 # The class code never grants admin, whatever the order.
                 await self._join_with_code(student, class_code, room_id)
                 self.assertEqual(self._power_level(bot, room_id, student_id), 0)
                 self.assertEqual(len(sink.messages_to(REQUESTED)), 1)
 
-                # The claim link makes its user admin and sends email 2.
-                await self._join_with_code(teacher, admin_code, room_id)
+                # The teacher tries their class link first, as a member...
+                await self._join_with_code(teacher, class_code, room_id)
+                self.assertEqual(self._power_level(bot, room_id, teacher_id), 0)
+                self.assertEqual(len(sink.messages_to(REQUESTED)), 1)
+
+                # ...then the claim link makes them admin and sends email 2.
+                response = self._post(
+                    KNOCK_WITH_CODE_PATH, teacher, {"access_code": admin_code}
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["already_joined"], [room_id])
                 self.assertEqual(self._power_level(bot, room_id, teacher_id), 100)
 
                 claimed = sink.wait_for(REQUESTED, "Invite your students")
@@ -222,7 +235,7 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                     postgres=postgres,
                 )
 
-    async def test_no_address_means_no_email_and_no_record(self) -> None:
+    async def test_no_address_means_no_email(self) -> None:
         postgres = None
         synapse_dir = None
         server_process = None
@@ -257,7 +270,11 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 self.assertFalse(response.json()["emailed"])
                 await asyncio.sleep(1)
                 self.assertEqual(sink.messages_to(REQUESTED), [])
-                self.assertIsNone(self._claim_row(response.json()["room_id"]))
+                # The claim is recorded (it is where the admin code lives), with
+                # no address and so no notice ever owed.
+                row = self._claim_row(response.json()["room_id"])
+                self.assertIsNotNone(row)
+                self.assertIsNone(row[0])
             finally:
                 self.stop_synapse(
                     server_process=server_process,

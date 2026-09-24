@@ -140,10 +140,9 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestRecordAndEmail(unittest.IsolatedAsyncioTestCase):
-    """The claim link goes out only once the requesting address is recorded,
-    because the claim is what sends the class link, to that address
-    (create-course-space.instructions.md)."""
+class TestSendClaimLink(unittest.IsolatedAsyncioTestCase):
+    """A failed claim-link email is captured and reported, never raised: the
+    space and its claim already exist (create-course-space.instructions.md)."""
 
     def _resource(self) -> Any:
         from unittest.mock import AsyncMock, MagicMock
@@ -153,57 +152,37 @@ class TestRecordAndEmail(unittest.IsolatedAsyncioTestCase):
             CreateCourseSpace,
         )
 
-        api = MagicMock()
-        api._hs.get_clock.return_value.time_msec.return_value = 5
-        store = MagicMock()
-        store.record = AsyncMock()
         mailer = MagicMock()
         mailer.send_course_ready = AsyncMock()
-        resource = CreateCourseSpace(api, PangeaChatConfig(), store, mailer)
-        return resource, store, mailer
+        return (
+            CreateCourseSpace(MagicMock(), PangeaChatConfig(), MagicMock(), mailer),
+            mailer,
+        )
 
     async def _run(self, resource: Any) -> bool:
-        return await resource._record_and_email(
+        return await resource._send_claim_link(
             room_id="!r:x",
             teacher_email="teacher@school.example",
             title="Spanish 1",
             description="Lessons 1 to 6",
             request_summary="Spanish 1 practice",
-            admin_code="adm1nab",
             claim_url="https://app.pangea.chat/adm1nab",
         )
 
-    async def test_records_then_sends_the_claim_link(self) -> None:
-        resource, store, mailer = self._resource()
+    async def test_sends_the_claim_link(self) -> None:
+        resource, mailer = self._resource()
 
         self.assertTrue(await self._run(resource))
 
-        store.record.assert_awaited_once_with(
-            "!r:x", "teacher@school.example", "adm1nab", 5
-        )
         sent = mailer.send_course_ready.await_args.kwargs
         self.assertEqual(sent["email_address"], "teacher@school.example")
         self.assertEqual(sent["claim_url"], "https://app.pangea.chat/adm1nab")
         self.assertEqual(sent["request_summary"], "Spanish 1 practice")
 
-    async def test_no_record_means_no_email(self) -> None:
-        from unittest.mock import patch
-
-        resource, store, mailer = self._resource()
-        store.record.side_effect = RuntimeError("db down")
-
-        with patch(
-            "synapse_pangea_chat.email_invite.create_course_space._capture_exception"
-        ) as capture:
-            self.assertFalse(await self._run(resource))
-
-        mailer.send_course_ready.assert_not_called()
-        capture.assert_called_once()
-
     async def test_failed_send_is_captured_and_reported(self) -> None:
         from unittest.mock import patch
 
-        resource, _, mailer = self._resource()
+        resource, mailer = self._resource()
         mailer.send_course_ready.side_effect = RuntimeError("smtp down")
 
         with patch(

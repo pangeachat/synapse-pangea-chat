@@ -4,10 +4,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse_pangea_chat.config import PangeaChatConfig
-from synapse_pangea_chat.email_invite.course_claims import (
-    CourseClaim,
-    admin_code_digest,
-)
+from synapse_pangea_chat.email_invite.course_claims import CourseClaim
 from synapse_pangea_chat.room_code.get_rooms_with_access_code import RoomCodeMatch
 from synapse_pangea_chat.room_code.knock_with_code import KnockWithCode
 
@@ -19,8 +16,19 @@ CODE = "vldcde1"
 MODULE = "synapse_pangea_chat.room_code.knock_with_code"
 
 
-def _claim_store(claim: CourseClaim | None = None, wins: bool = True) -> MagicMock:
+def _claim_store(
+    claim: CourseClaim | None = None,
+    wins: bool = True,
+    claim_rooms: list[str] | None = None,
+) -> MagicMock:
     store = MagicMock()
+    # The rooms whose claim code was submitted: by default the claim's own
+    # room when there is a claim, none otherwise.
+    store.rooms_for_admin_code = AsyncMock(
+        return_value=claim_rooms
+        if claim_rooms is not None
+        else ([ROOM_1] if claim is not None else [])
+    )
     store.get = AsyncMock(return_value=claim)
     store.claim = AsyncMock(return_value=wins)
     store.mark_promoted = AsyncMock()
@@ -188,12 +196,9 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
             ),
             patch(f"{MODULE}.get_user_room_membership", AsyncMock(return_value=None)),
             patch(f"{MODULE}.is_blocked_by_room_admin", AsyncMock(return_value=False)),
-            patch(
-                f"{MODULE}.get_rooms_with_access_code",
-                AsyncMock(
-                    return_value=[RoomCodeMatch(room_id=ROOM_1, is_admin_code=True)]
-                ),
-            ),
+            # A claim code is not in join rules; it is found through the
+            # claim record (the store's rooms_for_admin_code).
+            patch(f"{MODULE}.get_rooms_with_access_code", AsyncMock(return_value=[])),
             patch(f"{MODULE}.invite_user_to_room", self.invite),
             patch(f"{MODULE}.promote_user_to_admin", self.promote),
             patch(f"{MODULE}.burn_admin_code", self.burn),
@@ -208,12 +213,12 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
         return args[1], args[2]
 
     @staticmethod
-    def _claim(code: str = CODE, claimed_by: str | None = None) -> CourseClaim:
-        return CourseClaim(
-            admin_code_sha256=admin_code_digest(code), claimed_by=claimed_by
-        )
+    def _claim(claimed_by: str | None = None) -> CourseClaim:
+        return CourseClaim(claimed_by=claimed_by)
 
-    async def test_claim_promotes_then_sends_the_notice(self) -> None:
+    async def test_claim_promotes_spends_the_code_and_sends_the_notice(
+        self,
+    ) -> None:
         store = _claim_store(self._claim())
         notifier = _notifier()
 
@@ -222,25 +227,18 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
         status, body = self._response()
         self.assertEqual(status, 200)
         self.assertEqual(body["rooms"], [ROOM_1])
+        store.rooms_for_admin_code.assert_awaited_once_with(CODE)
         store.claim.assert_awaited_once_with(ROOM_1, USER, 1_000)
         self.promote.assert_awaited_once()
-        self.burn.assert_awaited_once()
+        # Spent in the claim record; nothing in join rules to burn.
         store.mark_promoted.assert_awaited_once_with(ROOM_1, USER, 1_000)
+        self.burn.assert_not_called()
         notifier.notify.assert_awaited_once_with(ROOM_1, USER)
 
-    async def test_codes_match_case_insensitively(self) -> None:
-        store = _claim_store(self._claim(CODE.upper()))
-        notifier = _notifier()
-
-        await _handler(store, notifier)._async_render_POST(MagicMock())
-
-        store.claim.assert_awaited_once()
-        notifier.notify.assert_awaited_once()
-
     async def test_claim_held_by_someone_else_is_a_spent_code(self) -> None:
-        # Two requests read the admin code before the burn landed; the one
-        # that lost the claim is neither invited nor promoted, and is told the
-        # code does not exist, which is what it will be a moment later.
+        # Two requests hold the claim code at once; the one that lost the
+        # claim is neither invited nor promoted, and is told the code does not
+        # exist, which is what it will be a moment later.
         store = _claim_store(self._claim(claimed_by="@other:x"), wins=False)
         notifier = _notifier()
 
@@ -251,37 +249,49 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
         self.invite.assert_not_called()
         self.promote.assert_not_called()
-        self.burn.assert_not_called()
         notifier.notify.assert_not_called()
 
-    async def test_a_later_admin_code_is_an_ordinary_grant(self) -> None:
-        # After the claim, a course admin issues a new admin code for a
-        # co-teacher. It is not the code the course was created with, so the
-        # claim record does not apply: promote and burn, no claim, no notice.
-        store = _claim_store(self._claim("0ther1c", claimed_by="@first:x"), wins=False)
+    async def test_an_admin_code_in_join_rules_is_an_ordinary_grant(self) -> None:
+        # A co-teacher code set on a claimed course, or any client-created
+        # course's admin code: found in join rules, not in the claim record.
+        # Promote and burn, no claim, no notice.
+        store = _claim_store(None)
         notifier = _notifier()
 
-        await _handler(store, notifier)._async_render_POST(MagicMock())
+        with patch(
+            f"{MODULE}.get_rooms_with_access_code",
+            AsyncMock(return_value=[RoomCodeMatch(room_id=ROOM_1, is_admin_code=True)]),
+        ):
+            await _handler(store, notifier)._async_render_POST(MagicMock())
 
         status, body = self._response()
         self.assertEqual(status, 200)
         self.assertEqual(body["rooms"], [ROOM_1])
+        store.get.assert_not_called()
         store.claim.assert_not_called()
         self.promote.assert_awaited_once()
         self.burn.assert_awaited_once()
         notifier.notify.assert_not_called()
 
-    async def test_admin_code_of_a_client_created_course_sends_nothing(self) -> None:
-        store = _claim_store(None)
+    async def test_a_joined_member_holding_the_claim_code_claims(self) -> None:
+        # The teacher who tried their class link before opening the claim
+        # link, or a claimer retrying a failed promotion. The code is in no
+        # state a member can read, so holding it is still the inbox proof.
+        store = _claim_store(self._claim())
         notifier = _notifier()
 
-        await _handler(store, notifier)._async_render_POST(MagicMock())
+        with patch(
+            f"{MODULE}.get_user_room_membership", AsyncMock(return_value="join")
+        ):
+            await _handler(store, notifier)._async_render_POST(MagicMock())
 
-        status, _ = self._response()
+        status, body = self._response()
         self.assertEqual(status, 200)
-        store.claim.assert_not_called()
+        self.assertEqual(body["already_joined"], [ROOM_1])
+        self.assertEqual(body["rooms"], [])
+        self.invite.assert_not_called()
         self.promote.assert_awaited_once()
-        notifier.notify.assert_not_called()
+        notifier.notify.assert_awaited_once_with(ROOM_1, USER)
 
     async def test_failed_promotion_is_not_announced_and_keeps_the_code(
         self,
@@ -297,28 +307,9 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 500)
         self.assertEqual(body["failed"], [ROOM_1])
         store.mark_promoted.assert_not_called()
-        self.burn.assert_not_called()
         notifier.notify.assert_not_called()
 
-    async def test_the_notice_is_owed_before_the_code_is_burned(self) -> None:
-        store = _claim_store(self._claim())
-        order: list[str] = []
-
-        def owed(*_: object) -> None:
-            order.append("owed")
-
-        def burned(**_: object) -> bool:
-            order.append("burned")
-            return True
-
-        store.mark_promoted.side_effect = owed
-        self.burn.side_effect = burned
-
-        await _handler(store, _notifier())._async_render_POST(MagicMock())
-
-        self.assertEqual(order, ["owed", "burned"])
-
-    async def test_failed_owed_record_leaves_the_code_unburned(self) -> None:
+    async def test_failed_spend_is_not_announced(self) -> None:
         store = _claim_store(self._claim())
         store.mark_promoted.side_effect = RuntimeError("db down")
         notifier = _notifier()
@@ -327,28 +318,11 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
 
         status, _ = self._response()
         self.assertEqual(status, 500)
-        self.burn.assert_not_called()
         notifier.notify.assert_not_called()
-
-    async def test_a_joined_claimer_can_retry_a_failed_promotion(self) -> None:
-        store = _claim_store(self._claim(claimed_by=USER))
-        notifier = _notifier()
-
-        with patch(
-            f"{MODULE}.get_user_room_membership", AsyncMock(return_value="join")
-        ):
-            await _handler(store, notifier)._async_render_POST(MagicMock())
-
-        status, body = self._response()
-        self.assertEqual(status, 200)
-        self.assertEqual(body["already_joined"], [ROOM_1])
-        self.invite.assert_not_called()
-        self.promote.assert_awaited_once()
-        notifier.notify.assert_awaited_once_with(ROOM_1, USER)
 
     async def test_failed_invite_leaves_the_claim_unannounced(self) -> None:
         # The claim is taken before the invite; if the invite fails, the
-        # claimer is not promoted and nothing marks the notice owed.
+        # claimer is not promoted and the code is not spent.
         store = _claim_store(self._claim())
         notifier = _notifier()
         self.invite.side_effect = RuntimeError("boom")

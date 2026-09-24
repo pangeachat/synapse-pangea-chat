@@ -22,7 +22,7 @@ Lives in the `email_invite/` sub-package alongside `invite_by_email`.
 ### What it does
 
 1. Creates a private Matrix space with knock join rules, a course plan state event, and the power levels the client gives a course space it creates itself ([`defaultSpacePowerLevelsContent`](../../../client/lib/pangea/common/constants/default_power_level.dart), with `m.space.child` at 0). Every new space defaults `m.space.child` to 0: a regular member must be able to attach a room, because learners' activity sessions fan out into their courses as space children ([activities.instructions.md](../../../client/.github/instructions/activities.instructions.md)). The space also requires instructor analytics access to join, as a course created in the client does ([course-analytics-access](../../../.github/.github/instructions/course-analytics-access.instructions.md)).
-2. Generates the class code and a single-use admin code and sets both in join rules directly (bypasses `request_room_code`), and records the address the course was created for
+2. Generates the class code and a single-use admin code. The class code goes in join rules directly (bypasses `request_room_code`); the admin code is kept out of room state, in a server-side claim record with the address the course was created for ([knock-with-code](knock-with-code.instructions.md), "Claiming a course")
 3. Uploads course image as room avatar if provided
 4. Sends the teacher the first email: their course is ready, with the admin link behind a button and no class code. The second email, carrying the class code, is sent when the course is claimed ([knock-with-code](knock-with-code.instructions.md))
 
@@ -42,7 +42,7 @@ If the teacher doesn't have a Pangea account, the client handles this: the code 
 
 ## Dependencies
 
-- **The two emails** are sent through Synapse's own mail path (the homeserver's `email` config), so they go out from its sender and stream. A failed first email is captured and answered as `emailed: false` rather than failing the request, because the space already exists and a retry would make a second one. The address is recorded before the first email is sent; if the record fails, no email goes out, since a claim with no record could not send the class link.
+- **The two emails** are sent through Synapse's own mail path (the homeserver's `email` config), so they go out from its sender and stream. A failed first email is captured and answered as `emailed: false` rather than failing the request, because the space already exists and a retry would make a second one. The claim record is written before the first email; if it cannot be written the request fails and names the room, because the admin code lives in that record and the course could not otherwise be claimed.
 - **Email templates** ship inside the package (`email_invite/templates/`), as the nudge emails' do, and are read through the module API's template loader. They are not in [synapse-templates](../../../synapse-templates/): that repo is pinned to a tag per environment, so a template there would need a tag and an inventory bump in each environment before the module that sends it could load.
 
 ## Future Work

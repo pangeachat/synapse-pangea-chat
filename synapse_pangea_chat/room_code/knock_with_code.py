@@ -47,6 +47,7 @@ except ImportError:
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.get_inviter_user import promote_user_to_admin
 from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
+    RoomCodeMatch,
     get_rooms_with_access_code,
 )
 from synapse_pangea_chat.room_code.invite_user_to_room import invite_user_to_room
@@ -165,6 +166,16 @@ class KnockWithCode(Resource):
                     send_cors=True,
                 )
                 return
+            # A requested course's claim code is not in join rules (members
+            # can read those); it is looked up in the claim record.
+            claim_room_ids = set(
+                await self._claim_store.rooms_for_admin_code(access_code)
+            )
+            state_room_ids = {match.room_id for match in matches}
+            matches = list(matches) + [
+                RoomCodeMatch(room_id=room_id, is_admin_code=True)
+                for room_id in sorted(claim_room_ids - state_room_ids)
+            ]
             if len(matches) == 0:
                 # 404, not 400: the request is well-formed — the code just
                 # doesn't exist. The errcode lets clients show a "check the
@@ -190,9 +201,9 @@ class KnockWithCode(Resource):
             # returned to the client — the refusal must not reveal the block
             # (see blocked-join-gate.instructions.md).
             blocked_rooms: List[str] = []
-            # Requested courses whose claim another account already holds. The
-            # admin code is burned right after a claim, so this is the narrow
-            # window before the burn lands; the code is spent either way.
+            # Requested courses whose claim another account already holds: the
+            # narrow window between that account taking the claim and its
+            # promotion spending the code. The code is spent either way.
             spent_rooms: List[str] = []
             for match in matches:
                 try:
@@ -201,17 +212,16 @@ class KnockWithCode(Resource):
                         user_id=requester_id,
                         room_id=match.room_id,
                     )
-                    # Only the admin code a requested course was created with
-                    # is a claim; a later one, granted to a co-teacher, is an
-                    # ordinary admin grant.
+                    # Only the code a requested course was created with is a
+                    # claim; an admin code in join rules, such as one granted
+                    # later to a co-teacher, is an ordinary admin grant.
                     claim: Optional[CourseClaim] = None
-                    if match.is_admin_code:
+                    if match.room_id in claim_room_ids:
                         claim = await self._claim_store.get(match.room_id)
-                        if claim is not None and not claim.is_for_code(access_code):
-                            claim = None
-                    # A claimer who joined but whose promotion failed must be
-                    # able to resubmit the link, so a held claim does not stop
-                    # at "already joined".
+                    # Holding the claim code proves the requesting inbox, and
+                    # it is in no state a member can read, so a member who
+                    # joined first (the teacher trying their class link, or a
+                    # claimer whose promotion failed) can still claim with it.
                     if membership == MEMBERSHIP_JOIN and claim is None:
                         already_joined_rooms.append(match.room_id)
                         continue
@@ -257,13 +267,17 @@ class KnockWithCode(Resource):
                             user_to_promote=requester_id,
                             invite_power=100,
                         )
-                        if claim is not None:
-                            # A claim is announced only once it is real, and
-                            # is recorded as owed before the code is burned:
-                            # after the burn nothing can resubmit it, so a
-                            # record written later could be lost for good.
-                            # Failing here leaves the code unburned and the
-                            # claim held, so the claimer can retry.
+                        if claim is None:
+                            await burn_admin_code(
+                                api=self._api,
+                                room_id=match.room_id,
+                                burner_user_id=requester_id,
+                            )
+                        else:
+                            # A claim is spent, and its notice made owed, only
+                            # once the promotion is real, in one write. Failing
+                            # here leaves the code unspent and the claim held,
+                            # so the claimer can retry.
                             if not promoted:
                                 raise ClaimPromotionFailed(
                                     f"Promoting the claimer of {match.room_id} failed"
@@ -273,12 +287,6 @@ class KnockWithCode(Resource):
                                 requester_id,
                                 self._api._hs.get_clock().time_msec(),
                             )
-                        await burn_admin_code(
-                            api=self._api,
-                            room_id=match.room_id,
-                            burner_user_id=requester_id,
-                        )
-                        if claim is not None:
                             # In the background: the code is spent, so a join
                             # held open on a slow mail server and timed out
                             # could not be retried. The notice is already

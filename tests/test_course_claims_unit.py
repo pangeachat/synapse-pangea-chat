@@ -55,11 +55,26 @@ class TestStoreAgainstADatabase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.store.claim(self.ROOM, user, 1))
         await self.store.mark_promoted(self.ROOM, user, 2)
 
-    async def test_the_record_matches_only_the_original_code(self) -> None:
-        claim = await self.store.get(self.ROOM)
-        assert claim is not None
-        self.assertTrue(claim.is_for_code("ADM1NAB"))
-        self.assertFalse(claim.is_for_code("0ther1c"))
+    async def test_the_claim_code_finds_its_room_until_it_is_spent(self) -> None:
+        self.assertEqual(await self.store.rooms_for_admin_code("ADM1NAB"), [self.ROOM])
+        self.assertEqual(await self.store.rooms_for_admin_code("0ther1c"), [])
+        self.assertTrue(await self.store.code_in_use(self.CODE))
+
+        await self._claim_and_promote()
+
+        self.assertEqual(await self.store.rooms_for_admin_code(self.CODE), [])
+        # Spent, but still taken: a new course must not reuse it.
+        self.assertTrue(await self.store.code_in_use(self.CODE))
+
+    async def test_a_course_with_no_address_owes_no_notice(self) -> None:
+        await self.store.record("!quiet:x", None, "qu1etab", 0)
+        self.assertTrue(await self.store.claim("!quiet:x", self.TEACHER, 1))
+        await self.store.mark_promoted("!quiet:x", self.TEACHER, 2)
+
+        self.assertIsNone(
+            await self.store.reserve_notice("!quiet:x", self.TEACHER, 10, self.LEASE)
+        )
+        self.assertEqual(await self.store.outstanding_notices(10), [])
 
     async def test_one_account_takes_the_claim_and_may_retake_it(self) -> None:
         self.assertTrue(await self.store.claim(self.ROOM, self.TEACHER, 1))
