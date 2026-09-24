@@ -6,8 +6,6 @@
 {{ cta_url }}
 
 --
-You're receiving this because you have a {{ app_name }} account and {{ category_label }} are on.
-Stop {{ category_label }}: {{ unsubscribe_url }}
-Or change what you receive in the app under Settings > Notifications.
+Unsubscribe: {{ unsubscribe_url }}
 {% if postal_address %}{{ postal_address }}
 {% endif %}

@@ -27,7 +27,7 @@ The response also carries the push transport summary (same shape as `send_push`)
 
 ## Email appearance
 
-Nudge emails use the standard [Pangea Brand template](../../../admin/email-marketing/templates/base.html), including its logo, header, gold accents, NSF badge, and company footer. The message body and call to action occupy its content area; the reason for receiving the email and the unsubscribe link remain specific to the nudge category.
+Nudge emails use the standard [Pangea Brand template](../../../admin/email-marketing/templates/base.html), including its logo, header, gold accents, NSF badge, and company footer. The message body and call to action occupy its content area; the footer shows a simple “Unsubscribe” link, which retains its category-specific destination.
 
 ## The refusal store
 
