@@ -6,8 +6,9 @@ if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
 import logging
-from typing import List
+from typing import List, Optional
 
+from synapse.api.constants import EventTypes
 from synapse.api.errors import (
     AuthError,
     Codes,
@@ -20,14 +21,23 @@ from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
+from synapse.types import UserID
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.blocked_join_gate import is_blocked_by_room_admin
+from synapse_pangea_chat.email_invite.build_join_url import build_join_url
+from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
+from synapse_pangea_chat.email_invite.course_claims import (
+    CourseClaim,
+    CourseClaimStore,
+)
 from synapse_pangea_chat.room_code.burn_admin_code import burn_admin_code
 from synapse_pangea_chat.room_code.constants import (
+    ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
     ERRCODE_BANNED_FROM_ROOM,
     ERRCODE_CODE_NOT_FOUND,
     ERRCODE_INVITE_FAILED,
+    EVENT_TYPE_M_ROOM_JOIN_RULES,
     MEMBERSHIP_BAN,
     MEMBERSHIP_INVITE,
     MEMBERSHIP_JOIN,
@@ -66,12 +76,20 @@ def _capture_exception(e: Exception) -> None:
 class KnockWithCode(Resource):
     isLeaf = True
 
-    def __init__(self, api: ModuleApi, config: PangeaChatConfig):
+    def __init__(
+        self,
+        api: ModuleApi,
+        config: PangeaChatConfig,
+        claim_store: CourseClaimStore,
+        mailer: CourseClaimMailer,
+    ):
         super().__init__()
         self._api = api
         self._config = config
         self._auth = self._api._hs.get_auth()
         self._datastores = self._api._hs.get_datastores()
+        self._claim_store = claim_store
+        self._mailer = mailer
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -172,6 +190,10 @@ class KnockWithCode(Resource):
             # returned to the client — the refusal must not reveal the block
             # (see blocked-join-gate.instructions.md).
             blocked_rooms: List[str] = []
+            # Requested courses whose claim another account already holds. The
+            # admin code is burned right after a claim, so this is the narrow
+            # window before the burn lands; the code is spent either way.
+            spent_rooms: List[str] = []
             for match in matches:
                 try:
                     membership = await get_user_room_membership(
@@ -197,6 +219,16 @@ class KnockWithCode(Resource):
                     ):
                         blocked_rooms.append(match.room_id)
                         continue
+                    claim: Optional[CourseClaim] = None
+                    if match.is_admin_code:
+                        claim = await self._claim_store.get(match.room_id)
+                        if claim is not None and not await self._claim_store.claim(
+                            match.room_id,
+                            requester_id,
+                            self._api._hs.get_clock().time_msec(),
+                        ):
+                            spent_rooms.append(match.room_id)
+                            continue
                     if membership != MEMBERSHIP_INVITE:
                         # An already-invited user holds the invite the
                         # endpoint exists to issue; re-inviting is at best
@@ -223,6 +255,10 @@ class KnockWithCode(Resource):
                             room_id=match.room_id,
                             burner_user_id=requester_id,
                         )
+                        if claim is not None and not claim.notice_sent:
+                            await self._send_claim_notice(
+                                match.room_id, requester_id, claim
+                            )
                 except Exception as e:
                     # A failed room must not block the others, but it must
                     # not vanish either: capture it, and count it so an
@@ -259,6 +295,26 @@ class KnockWithCode(Resource):
                         "errcode": ERRCODE_INVITE_FAILED,
                         "error": "Failed to invite to any room matching the code",
                         "failed": failed_rooms,
+                    },
+                    send_cors=True,
+                )
+                return
+            if (
+                spent_rooms
+                and not invited_rooms
+                and not already_joined_rooms
+                and not banned_rooms
+                and not failed_rooms
+                and not blocked_rooms
+            ):
+                # The admin code was used a moment ago by someone else: to
+                # this requester it is a code that no longer exists.
+                respond_with_json(
+                    request,
+                    404,
+                    {
+                        "errcode": ERRCODE_CODE_NOT_FOUND,
+                        "error": f"No rooms found with the access code: {access_code}",
                     },
                     send_cors=True,
                 )
@@ -314,3 +370,56 @@ class KnockWithCode(Resource):
                 {"error": "Internal server error"},
                 send_cors=True,
             )
+
+    async def _send_claim_notice(
+        self, room_id: str, claimer_id: str, claim: CourseClaim
+    ) -> None:
+        """Email the class link to the address the course was requested from.
+
+        It goes to that address, not the claimer's account, and names the
+        claimer, so it doubles as the claim notice (knock-with-code, "Claiming
+        a course"). A failure is captured and never fails the claim: the
+        claimer is already the course's admin, and the class code is in the
+        app for them either way.
+        """
+        if claim.requested_email is None:
+            return
+        try:
+            state = await self._api.get_room_state(
+                room_id=room_id,
+                event_filter=[
+                    (EVENT_TYPE_M_ROOM_JOIN_RULES, None),
+                    (EventTypes.Name, None),
+                ],
+            )
+            class_code: Optional[str] = None
+            title = ""
+            for event in state.values():
+                if event.type == EVENT_TYPE_M_ROOM_JOIN_RULES:
+                    class_code = event.content.get(ACCESS_CODE_JOIN_RULE_CONTENT_KEY)
+                elif event.type == EventTypes.Name:
+                    title = event.content.get("name") or ""
+            if not isinstance(class_code, str) or not class_code:
+                raise ValueError(f"Claimed course {room_id} has no class code")
+            display_name: Optional[str] = None
+            if self._api.is_mine(claimer_id):
+                profile = await self._api.get_profile_for_user(
+                    UserID.from_string(claimer_id).localpart
+                )
+                display_name = profile.display_name
+            await self._mailer.send_course_claimed(
+                email_address=claim.requested_email,
+                course_title=title,
+                claimed_by_user_id=claimer_id,
+                claimed_by_display_name=display_name,
+                class_url=build_join_url(self._config.app_base_url, class_code),
+                class_code=class_code,
+            )
+            await self._claim_store.mark_notice_sent(
+                room_id, claimer_id, self._api._hs.get_clock().time_msec()
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to send the claim notice for {room_id}: {type(e).__name__}"
+            )
+            _capture_exception(e)

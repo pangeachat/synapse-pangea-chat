@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Your course is ready</title>
+  </head>
+  <body style="margin:0;padding:0;background:#f4f2fb;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#1a1a2e;font-size:16px;line-height:1.6;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f2fb;">
+      <tr>
+        <td align="center" style="padding:32px 16px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#ffffff;border-radius:12px;">
+            <tr>
+              <td style="padding:28px 28px 8px 28px;font-weight:700;color:#5E3ACF;font-size:18px;">{{ app_name }}</td>
+            </tr>
+            <tr>
+              <td style="padding:8px 28px 0 28px;font-size:20px;font-weight:700;">Your course is ready</td>
+            </tr>
+            {% if request_summary %}
+            <tr>
+              <td style="padding:12px 28px 0 28px;">You asked for: {{ request_summary }}</td>
+            </tr>
+            {% endif %}
+            <tr>
+              <td style="padding:16px 28px 0 28px;">
+                <div style="border-left:4px solid #FDBF01;padding:4px 0 4px 14px;">
+                  <div style="font-weight:700;">{{ course_title }}</div>
+                  {% if course_description %}<div style="color:#44445a;">{{ course_description }}</div>{% endif %}
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:16px 28px 4px 28px;">Open the course to become its teacher. If you don't have a {{ app_name }} account yet, you'll create one first.</td>
+            </tr>
+            <tr>
+              <td style="padding:20px 28px 8px 28px;">
+                <a href="{{ claim_url }}" style="display:inline-block;background:#5E3ACF;color:#ffffff;text-decoration:none;padding:12px 22px;border-radius:8px;font-weight:600;">Open your course</a>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:12px 28px 28px 28px;color:#44445a;">This button is just for you. Your students get their own link, which we'll email you once you've opened the course.</td>
+            </tr>
+          </table>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;">
+            <tr>
+              <td style="padding:16px 12px;font-size:12px;line-height:1.5;color:#6b6b80;">
+                You're receiving this because a course was requested for this address. Questions? Reply to this email.
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

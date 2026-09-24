@@ -1,0 +1,13 @@
+Invite your students
+
+{{ course_title }} is now held by {% if claimed_by_display_name %}{{ claimed_by_display_name }} ({{ claimed_by_user_id }}){% else %}{{ claimed_by_user_id }}{% endif %}.
+
+Share this link with your students:
+{{ class_url }}
+
+Or give them the class code {{ class_code }} to enter in the app.
+
+Everyone who joins with this link or code joins as a student. If you didn't open the course yourself, reply to this email and we'll sort it out.
+
+--
+You're receiving this because a course was requested for this address. Questions? Reply to this email.

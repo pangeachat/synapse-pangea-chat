@@ -55,6 +55,9 @@ synapse_pangea_chat = [
   # Nudge email and unsubscribe page templates, read at runtime.
   "nudge_delivery/templates/*.html",
   "nudge_delivery/templates/*.txt",
+  # The requested-course claim emails (course ready, course claimed).
+  "email_invite/templates/*.html",
+  "email_invite/templates/*.txt",
 ]
 
 [tool.setuptools_scm]

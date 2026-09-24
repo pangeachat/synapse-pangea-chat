@@ -18,6 +18,8 @@ from synapse_pangea_chat.delete_user import DeleteUser
 from synapse_pangea_chat.direct_message import EnsureDirectMessage
 from synapse_pangea_chat.direct_push import DirectPush
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
+from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
+from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.email_policy import EmailPolicy
 from synapse_pangea_chat.export_user_data import ExportUserData
 from synapse_pangea_chat.find_user_by_email import FindUserByEmail
@@ -319,8 +321,17 @@ class PangeaChat:
             resource=self.activity_session_previews_resource,
         )
 
+        # --- Requested-course claim (shared by Room Code and Create Course Space) ---
+        # One store and one mailer: create_course_space records the requesting
+        # address and sends the claim link; knock_with_code takes the claim and
+        # sends the class link (knock-with-code.instructions.md).
+        course_claim_store = CourseClaimStore(api._hs)
+        course_claim_mailer = CourseClaimMailer(api)
+
         # --- Room Code ---
-        self.knock_with_code_resource = KnockWithCode(api, config)
+        self.knock_with_code_resource = KnockWithCode(
+            api, config, course_claim_store, course_claim_mailer
+        )
         self.request_code_resource = RequestRoomCode(api, config)
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/knock_with_code",
@@ -339,7 +350,9 @@ class PangeaChat:
         )
 
         # --- Create Course Space ---
-        self.create_course_space_resource = CreateCourseSpace(api, config)
+        self.create_course_space_resource = CreateCourseSpace(
+            api, config, course_claim_store, course_claim_mailer
+        )
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/create_course_space",
             resource=self.create_course_space_resource,
