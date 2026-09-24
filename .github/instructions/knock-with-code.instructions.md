@@ -64,11 +64,11 @@ A course created for a teacher who does not yet have an account (the [teacher fu
 
 **The class code never grants admin.** Anyone who joins with the class code, in any order, joins as an ordinary member. Sharing it early cannot hand the course to a student.
 
-**The second email doubles as the claim notice.** It goes to the address the course was created for, not to whoever claimed it, and says which account now holds the course. It is sent once; after it goes out the address is cleared from the record, which keeps who claimed the course and when. A course a teacher created in the client has no such record, so using its admin code promotes and burns as before and sends nothing. If the claim link was forwarded and used by someone else, the teacher learns it from that email and can reply. The bot keeps full power in every space it creates, so a course claimed by the wrong person can always be repaired server-side.
+**The second email doubles as the claim notice.** It goes to the address the course was created for, not to whoever claimed it, and says which account now holds the course. It is sent once, and a send that fails is retried in the background, so a mail outage delays the notice rather than losing it: by then the admin code is spent, and there is no other way for the teacher to find out. After it goes out the address is cleared from the record, which keeps who claimed the course and when. A course a teacher created in the client has no such record, so using its admin code promotes and burns as before and sends nothing. If the claim link was forwarded and used by someone else, the teacher learns it from that email and can reply. The bot keeps full power in every space it creates, so a course claimed by the wrong person can always be repaired server-side.
 
 **Following the link only opens the app; it never claims anything by itself.** University mail filters fetch every link in a message before a person sees it. The claim happens when a signed-in person submits the code in the app, so a filter fetching the link cannot spend the admin code.
 
-Granting admin to someone else later, such as a co-teacher, is a separate deliberate act. The class code is never that path.
+Granting admin to someone else later, such as a co-teacher, is a separate deliberate act. The class code is never that path. A new admin code set on a claimed course is that act, not a second claim: the claim record belongs to the admin code the course was created with, so a later one promotes as any admin code does, and sends nothing.
 
 ---
 

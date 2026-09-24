@@ -19,6 +19,7 @@ from synapse_pangea_chat.direct_message import EnsureDirectMessage
 from synapse_pangea_chat.direct_push import DirectPush
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
+from synapse_pangea_chat.email_invite.course_claim_notice import CourseClaimNotifier
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.email_policy import EmailPolicy
 from synapse_pangea_chat.export_user_data import ExportUserData
@@ -327,10 +328,14 @@ class PangeaChat:
         # sends the class link (knock-with-code.instructions.md).
         course_claim_store = CourseClaimStore(api._hs)
         course_claim_mailer = CourseClaimMailer(api)
+        course_claim_notifier = CourseClaimNotifier(
+            api, config, course_claim_store, course_claim_mailer
+        )
+        course_claim_notifier.start_retry_loop()
 
         # --- Room Code ---
         self.knock_with_code_resource = KnockWithCode(
-            api, config, course_claim_store, course_claim_mailer
+            api, config, course_claim_store, course_claim_notifier
         )
         self.request_code_resource = RequestRoomCode(api, config)
         api.register_web_resource(

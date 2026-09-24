@@ -306,6 +306,7 @@ class CreateCourseSpace(Resource):
                     title=title.strip(),
                     description=description if isinstance(description, str) else "",
                     request_summary=request_summary,
+                    admin_code=admin_code,
                     claim_url=admin_join_url,
                 )
 
@@ -352,6 +353,7 @@ class CreateCourseSpace(Resource):
         title: str,
         description: str,
         request_summary: str | None,
+        admin_code: str,
         claim_url: str,
     ) -> bool:
         """Record the requesting address, then send it the claim link.
@@ -365,7 +367,10 @@ class CreateCourseSpace(Resource):
         """
         try:
             await self._claim_store.record(
-                room_id, teacher_email, self._api._hs.get_clock().time_msec()
+                room_id,
+                teacher_email,
+                admin_code,
+                self._api._hs.get_clock().time_msec(),
             )
         except Exception as e:
             logger.error(f"Failed to record the requesting address for {room_id}: {e}")

@@ -9,19 +9,33 @@ It lives in a module table rather than in room state because every member of a
 course can read its room state, and the address must not be visible to the
 students who join (create-course-space.instructions.md).
 
-The row is also what makes the claim single use under concurrency. The admin
-code is burned from join rules only after the claimer is promoted, so two
-requests that both read the code before the burn would otherwise both be
-promoted; the conditional update in ``claim`` lets exactly one of them through.
+The row does three jobs beyond holding the address:
+
+- It makes the claim single use under concurrency. The admin code is burned
+  from join rules only after the claimer is promoted, so two requests that both
+  read the code before the burn would otherwise both be promoted; the
+  conditional update in ``claim`` lets one account through. It applies only to
+  the admin code the course was created with (``admin_code_sha256``): a later
+  admin code, granted deliberately to a co-teacher, is not a claim.
+- It makes the claim notice send once. ``reserve_notice`` takes a lease before
+  a send, so two requests from the claimer, or two workers retrying, cannot
+  both send it.
+- It keeps a failed notice owed. A notice whose send failed stays unsent, and
+  ``outstanding_notices`` hands it to the background retry once its lease runs
+  out, up to ``MAX_NOTICE_ATTEMPTS``.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import hashlib
+from typing import Any, List, Optional, Tuple
 
 import attr
 
 COURSE_CLAIM_TABLE = "pangea_course_claim"
+
+#: Sends of one claim notice before the retry gives up on it.
+MAX_NOTICE_ATTEMPTS = 8
 
 # Literal statements rather than f-strings over the table name: see
 # moderation/disposition.py for why, and `STATEMENTS` for the drift test.
@@ -29,20 +43,25 @@ _CREATE_TABLE_SQL = """
     CREATE TABLE IF NOT EXISTS pangea_course_claim (
         room_id TEXT PRIMARY KEY,
         requested_email TEXT,
+        admin_code_sha256 TEXT NOT NULL,
         created_at_ms BIGINT NOT NULL,
         claimed_by TEXT,
         claimed_at_ms BIGINT,
+        promoted_at_ms BIGINT,
+        notice_attempts INTEGER NOT NULL DEFAULT 0,
+        notice_leased_until_ms BIGINT,
         notice_sent_at_ms BIGINT
     )
 """
 
 _INSERT_SQL = """
-    INSERT INTO pangea_course_claim (room_id, requested_email, created_at_ms)
-    VALUES (?, ?, ?)
+    INSERT INTO pangea_course_claim
+        (room_id, requested_email, admin_code_sha256, created_at_ms)
+    VALUES (?, ?, ?, ?)
 """
 
 _SELECT_SQL = """
-    SELECT requested_email, claimed_by, notice_sent_at_ms
+    SELECT admin_code_sha256, claimed_by
     FROM pangea_course_claim
     WHERE room_id = ?
 """
@@ -55,13 +74,49 @@ _CLAIM_SQL = """
     WHERE room_id = ? AND (claimed_by IS NULL OR claimed_by = ?)
 """
 
+# Promotion is what makes the notice owed: a claim whose invite failed has not
+# happened yet, and the retry must not announce it.
+_PROMOTED_SQL = """
+    UPDATE pangea_course_claim
+    SET promoted_at_ms = ?
+    WHERE room_id = ? AND claimed_by = ? AND promoted_at_ms IS NULL
+"""
+
+_RESERVE_NOTICE_SQL = """
+    UPDATE pangea_course_claim
+    SET notice_leased_until_ms = ?, notice_attempts = notice_attempts + 1
+    WHERE room_id = ? AND claimed_by = ?
+        AND promoted_at_ms IS NOT NULL
+        AND notice_sent_at_ms IS NULL
+        AND requested_email IS NOT NULL
+        AND notice_attempts < ?
+        AND (notice_leased_until_ms IS NULL OR notice_leased_until_ms <= ?)
+"""
+
+_SELECT_NOTICE_SQL = """
+    SELECT requested_email, notice_attempts
+    FROM pangea_course_claim
+    WHERE room_id = ?
+"""
+
 # Once the notice is sent the address has done its job, so it is cleared: a
 # claimed course keeps who claimed it and when, and no longer holds anybody's
 # email address.
 _NOTICE_SENT_SQL = """
     UPDATE pangea_course_claim
-    SET notice_sent_at_ms = ?, requested_email = NULL
+    SET notice_sent_at_ms = ?, requested_email = NULL,
+        notice_leased_until_ms = NULL
     WHERE room_id = ? AND claimed_by = ?
+"""
+
+_OUTSTANDING_SQL = """
+    SELECT room_id, claimed_by
+    FROM pangea_course_claim
+    WHERE promoted_at_ms IS NOT NULL
+        AND notice_sent_at_ms IS NULL
+        AND requested_email IS NOT NULL
+        AND notice_attempts < ?
+        AND (notice_leased_until_ms IS NULL OR notice_leased_until_ms <= ?)
 """
 
 #: Every statement above, for the drift test.
@@ -70,15 +125,33 @@ STATEMENTS = (
     _INSERT_SQL,
     _SELECT_SQL,
     _CLAIM_SQL,
+    _PROMOTED_SQL,
+    _RESERVE_NOTICE_SQL,
+    _SELECT_NOTICE_SQL,
     _NOTICE_SENT_SQL,
+    _OUTSTANDING_SQL,
 )
+
+
+def admin_code_digest(admin_code: str) -> str:
+    # Codes match case-insensitively (get_rooms_with_access_code), so the
+    # digest is of the lower-cased code.
+    return hashlib.sha256(admin_code.lower().encode()).hexdigest()
 
 
 @attr.s(frozen=True, auto_attribs=True)
 class CourseClaim:
-    requested_email: Optional[str]
+    admin_code_sha256: str
     claimed_by: Optional[str]
-    notice_sent: bool
+
+    def is_for_code(self, admin_code: str) -> bool:
+        return admin_code_digest(admin_code) == self.admin_code_sha256
+
+
+@attr.s(frozen=True, auto_attribs=True)
+class NoticeReservation:
+    requested_email: str
+    attempt: int
 
 
 class CourseClaimStore:
@@ -98,11 +171,16 @@ class CourseClaimStore:
         await self._db_pool.runInteraction("pangea_course_claim_create", _create)
         self._table_ready = True
 
-    async def record(self, room_id: str, requested_email: str, now_ms: int) -> None:
+    async def record(
+        self, room_id: str, requested_email: str, admin_code: str, now_ms: int
+    ) -> None:
         await self._ensure_table()
 
         def _insert(txn: Any) -> None:
-            txn.execute(_INSERT_SQL, (room_id, requested_email, now_ms))
+            txn.execute(
+                _INSERT_SQL,
+                (room_id, requested_email, admin_code_digest(admin_code), now_ms),
+            )
 
         await self._db_pool.runInteraction("pangea_course_claim_record", _insert)
 
@@ -111,7 +189,7 @@ class CourseClaimStore:
 
         A room has none unless ``create_course_space`` made it for a requested
         address: courses teachers create in the client carry an admin code too,
-        and their claims send no notice.
+        and their admin codes are not claims.
         """
         await self._ensure_table()
 
@@ -120,11 +198,7 @@ class CourseClaimStore:
             row = txn.fetchone()
             if row is None:
                 return None
-            return CourseClaim(
-                requested_email=row[0],
-                claimed_by=row[1],
-                notice_sent=row[2] is not None,
-            )
+            return CourseClaim(admin_code_sha256=row[0], claimed_by=row[1])
 
         return await self._db_pool.runInteraction("pangea_course_claim_get", _select)
 
@@ -138,6 +212,46 @@ class CourseClaimStore:
 
         return await self._db_pool.runInteraction("pangea_course_claim_claim", _claim)
 
+    async def mark_promoted(self, room_id: str, user_id: str, now_ms: int) -> None:
+        await self._ensure_table()
+
+        def _mark(txn: Any) -> None:
+            txn.execute(_PROMOTED_SQL, (now_ms, room_id, user_id))
+
+        await self._db_pool.runInteraction("pangea_course_claim_promoted", _mark)
+
+    async def reserve_notice(
+        self, room_id: str, user_id: str, now_ms: int, lease_ms: int
+    ) -> Optional[NoticeReservation]:
+        """Take the lease on sending this claim's notice, if it is owed.
+
+        None when it is not owed, or when another request or worker holds the
+        lease. The lease is released by ``mark_notice_sent``, or by running
+        out, which is what lets a failed send be retried.
+        """
+        await self._ensure_table()
+
+        def _reserve(txn: Any) -> Optional[NoticeReservation]:
+            txn.execute(
+                _RESERVE_NOTICE_SQL,
+                (
+                    now_ms + lease_ms,
+                    room_id,
+                    user_id,
+                    MAX_NOTICE_ATTEMPTS,
+                    now_ms,
+                ),
+            )
+            if txn.rowcount != 1:
+                return None
+            txn.execute(_SELECT_NOTICE_SQL, (room_id,))
+            row = txn.fetchone()
+            return NoticeReservation(requested_email=row[0], attempt=row[1])
+
+        return await self._db_pool.runInteraction(
+            "pangea_course_claim_reserve_notice", _reserve
+        )
+
     async def mark_notice_sent(self, room_id: str, user_id: str, now_ms: int) -> None:
         await self._ensure_table()
 
@@ -145,3 +259,15 @@ class CourseClaimStore:
             txn.execute(_NOTICE_SENT_SQL, (now_ms, room_id, user_id))
 
         await self._db_pool.runInteraction("pangea_course_claim_notice_sent", _mark)
+
+    async def outstanding_notices(self, now_ms: int) -> List[Tuple[str, str]]:
+        """(room_id, claimer) for every owed notice whose lease has run out."""
+        await self._ensure_table()
+
+        def _select(txn: Any) -> List[Tuple[str, str]]:
+            txn.execute(_OUTSTANDING_SQL, (MAX_NOTICE_ATTEMPTS, now_ms))
+            return [(row[0], row[1]) for row in txn.fetchall()]
+
+        return await self._db_pool.runInteraction(
+            "pangea_course_claim_outstanding", _select
+        )

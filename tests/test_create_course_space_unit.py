@@ -169,6 +169,7 @@ class TestRecordAndEmail(unittest.IsolatedAsyncioTestCase):
             title="Spanish 1",
             description="Lessons 1 to 6",
             request_summary="Spanish 1 practice",
+            admin_code="adm1nab",
             claim_url="https://app.pangea.chat/adm1nab",
         )
 
@@ -177,7 +178,9 @@ class TestRecordAndEmail(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await self._run(resource))
 
-        store.record.assert_awaited_once_with("!r:x", "teacher@school.example", 5)
+        store.record.assert_awaited_once_with(
+            "!r:x", "teacher@school.example", "adm1nab", 5
+        )
         sent = mailer.send_course_ready.await_args.kwargs
         self.assertEqual(sent["email_address"], "teacher@school.example")
         self.assertEqual(sent["claim_url"], "https://app.pangea.chat/adm1nab")

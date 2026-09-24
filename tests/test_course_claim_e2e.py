@@ -125,7 +125,7 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 _, bot = await self.login_user("bot", PASSWORD)
                 teacher_id, teacher = await self.login_user("teacher", PASSWORD)
                 student_id, student = await self.login_user("student", PASSWORD)
-                _, latecomer = await self.login_user("latecomer", PASSWORD)
+                latecomer_id, latecomer = await self.login_user("latecomer", PASSWORD)
 
                 response = self._post(
                     CREATE_COURSE_SPACE_PATH,
@@ -192,6 +192,26 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                     KNOCK_WITH_CODE_PATH, latecomer, {"access_code": admin_code}
                 )
                 self.assertEqual(spent.status_code, 404, spent.text)
+                self.assertEqual(len(sink.messages_to(REQUESTED)), 2)
+
+                # A later admin code, set by the teacher for a co-teacher, is an
+                # ordinary grant: it promotes, and it is not a claim.
+                co_teacher_code = "c0teach"
+                response = requests.put(
+                    f"{self.server_url}/_matrix/client/v3/rooms/"
+                    f"{quote(room_id, safe='')}/state/m.room.join_rules",
+                    json={
+                        "join_rule": "knock",
+                        "access_code": class_code,
+                        "admin_access_code": co_teacher_code,
+                    },
+                    headers={"Authorization": f"Bearer {teacher}"},
+                    timeout=10,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                await self._join_with_code(latecomer, co_teacher_code, room_id)
+                self.assertEqual(self._power_level(bot, room_id, latecomer_id), 100)
+                await asyncio.sleep(1)
                 self.assertEqual(len(sink.messages_to(REQUESTED)), 2)
             finally:
                 self.stop_synapse(
