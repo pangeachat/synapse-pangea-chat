@@ -19,8 +19,10 @@ import logging
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 from synapse.api.constants import EventTypes
+from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import ModuleApi
+from synapse.util.async_helpers import timeout_deferred
 
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
@@ -52,6 +54,11 @@ logger = logging.getLogger(
 
 #: How long one send holds the notice before another may try it.
 NOTICE_LEASE_MS = 10 * 60 * 1000
+#: How long a send may take. Synapse's mailer bounds the connection but not the
+#: SMTP transaction, so a stalled server could otherwise outlive the lease, let
+#: a second sender in, and hold up the retry loop. Well inside the lease, so a
+#: send that is given up on ends before anyone else may start one.
+SEND_TIMEOUT_SECONDS = 120
 #: How often the retry looks for owed notices.
 RETRY_INTERVAL_SECONDS = 5 * 60
 
@@ -117,11 +124,17 @@ class CourseClaimNotifier:
                 return
             attempt = reservation.attempt
             course_title, class_code = await self._course_title_and_class_code(room_id)
-            await self._mailer.send_course_claimed(
+            send = run_in_background(
+                self._mailer.send_course_claimed,
                 email_address=reservation.requested_email,
                 course_title=course_title,
                 class_url=build_join_url(self._config.app_base_url, class_code),
                 class_code=class_code,
+            )
+            await make_deferred_yieldable(
+                timeout_deferred(
+                    deferred=send, timeout=SEND_TIMEOUT_SECONDS, clock=self._clock
+                )
             )
             await self._store.mark_notice_sent(
                 room_id, claimer_id, self._clock.time_msec()
