@@ -96,6 +96,7 @@ def main():
             try:
                 server.serve_forever()
             except KeyboardInterrupt:
+                # silent-ok: Ctrl-C is the documented normal shutdown action.
                 pass
 
 
