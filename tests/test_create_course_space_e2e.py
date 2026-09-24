@@ -297,6 +297,67 @@ class TestCreateCourseSpaceE2E(BaseSynapseE2ETest):
                 postgres=postgres,
             )
 
+    async def test_course_requires_analytics_access_to_join(self) -> None:
+        """A server-created course requires instructor analytics access to join.
+
+        This is what a course created in the client gets (the client writes
+        ``pangea.course_settings`` with ``require_analytics_access`` on at
+        creation), and it is what lets the teacher see their students' analytics
+        from the first join. Without the event the toggle reads as off: the
+        course-analytics-access doc defines the default as false, so an absent
+        event and an explicit false behave the same, which is why this asserts
+        the stored event exists and is true rather than merely not false.
+        """
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+
+            await self.register_user(
+                config_path=config_path,
+                dir=synapse_dir,
+                user="teacher",
+                password="123123123",
+                admin=True,
+            )
+            _, token = await self.login_user(user="teacher", password="123123123")
+
+            created = self._create_course_space(
+                token,
+                title="Analytics required",
+                teacher_email="teacher@example.com",
+                course_plan_id="plan-analytics",
+            )
+            room_id_path = quote(created["room_id"], safe="")
+            response = requests.get(
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}"
+                "/state/pangea.course_settings",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIs(response.json().get("require_analytics_access"), True)
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
