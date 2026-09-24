@@ -283,6 +283,69 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
         self.promote.assert_awaited_once()
         notifier.notify.assert_not_called()
 
+    async def test_failed_promotion_is_not_announced_and_keeps_the_code(
+        self,
+    ) -> None:
+        # promote_user_to_admin reports failure by returning False.
+        store = _claim_store(self._claim())
+        notifier = _notifier()
+        self.promote.return_value = False
+
+        await _handler(store, notifier)._async_render_POST(MagicMock())
+
+        status, body = self._response()
+        self.assertEqual(status, 500)
+        self.assertEqual(body["failed"], [ROOM_1])
+        store.mark_promoted.assert_not_called()
+        self.burn.assert_not_called()
+        notifier.notify.assert_not_called()
+
+    async def test_the_notice_is_owed_before_the_code_is_burned(self) -> None:
+        store = _claim_store(self._claim())
+        order: list[str] = []
+
+        def owed(*_: object) -> None:
+            order.append("owed")
+
+        def burned(**_: object) -> bool:
+            order.append("burned")
+            return True
+
+        store.mark_promoted.side_effect = owed
+        self.burn.side_effect = burned
+
+        await _handler(store, _notifier())._async_render_POST(MagicMock())
+
+        self.assertEqual(order, ["owed", "burned"])
+
+    async def test_failed_owed_record_leaves_the_code_unburned(self) -> None:
+        store = _claim_store(self._claim())
+        store.mark_promoted.side_effect = RuntimeError("db down")
+        notifier = _notifier()
+
+        await _handler(store, notifier)._async_render_POST(MagicMock())
+
+        status, _ = self._response()
+        self.assertEqual(status, 500)
+        self.burn.assert_not_called()
+        notifier.notify.assert_not_called()
+
+    async def test_a_joined_claimer_can_retry_a_failed_promotion(self) -> None:
+        store = _claim_store(self._claim(claimed_by=USER))
+        notifier = _notifier()
+
+        with patch(
+            f"{MODULE}.get_user_room_membership", AsyncMock(return_value="join")
+        ):
+            await _handler(store, notifier)._async_render_POST(MagicMock())
+
+        status, body = self._response()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["already_joined"], [ROOM_1])
+        self.invite.assert_not_called()
+        self.promote.assert_awaited_once()
+        notifier.notify.assert_awaited_once_with(ROOM_1, USER)
+
     async def test_failed_invite_leaves_the_claim_unannounced(self) -> None:
         # The claim is taken before the invite; if the invite fails, the
         # claimer is not promoted and nothing marks the notice owed.

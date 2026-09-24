@@ -60,6 +60,11 @@ logger = logging.getLogger(
 )
 
 
+class ClaimPromotionFailed(Exception):
+    """The claimer of a requested course could not be promoted; the claim is
+    held for them and the admin code left unburned, so they can retry."""
+
+
 def _capture_exception(e: Exception) -> None:
     # respond_with_json paths never propagate to Synapse's request-level
     # Sentry capture, so failures this handler absorbs must be captured
@@ -196,7 +201,18 @@ class KnockWithCode(Resource):
                         user_id=requester_id,
                         room_id=match.room_id,
                     )
-                    if membership == MEMBERSHIP_JOIN:
+                    # Only the admin code a requested course was created with
+                    # is a claim; a later one, granted to a co-teacher, is an
+                    # ordinary admin grant.
+                    claim: Optional[CourseClaim] = None
+                    if match.is_admin_code:
+                        claim = await self._claim_store.get(match.room_id)
+                        if claim is not None and not claim.is_for_code(access_code):
+                            claim = None
+                    # A claimer who joined but whose promotion failed must be
+                    # able to resubmit the link, so a held claim does not stop
+                    # at "already joined".
+                    if membership == MEMBERSHIP_JOIN and claim is None:
                         already_joined_rooms.append(match.room_id)
                         continue
                     if membership == MEMBERSHIP_BAN:
@@ -214,22 +230,14 @@ class KnockWithCode(Resource):
                     ):
                         blocked_rooms.append(match.room_id)
                         continue
-                    # Only the admin code a requested course was created with
-                    # is a claim; a later one, granted to a co-teacher, is an
-                    # ordinary admin grant.
-                    claim: Optional[CourseClaim] = None
-                    if match.is_admin_code:
-                        claim = await self._claim_store.get(match.room_id)
-                        if claim is not None and not claim.is_for_code(access_code):
-                            claim = None
-                        if claim is not None and not await self._claim_store.claim(
-                            match.room_id,
-                            requester_id,
-                            self._api._hs.get_clock().time_msec(),
-                        ):
-                            spent_rooms.append(match.room_id)
-                            continue
-                    if membership != MEMBERSHIP_INVITE:
+                    if claim is not None and not await self._claim_store.claim(
+                        match.room_id,
+                        requester_id,
+                        self._api._hs.get_clock().time_msec(),
+                    ):
+                        spent_rooms.append(match.room_id)
+                        continue
+                    if membership not in (MEMBERSHIP_INVITE, MEMBERSHIP_JOIN):
                         # An already-invited user holds the invite the
                         # endpoint exists to issue; re-inviting is at best
                         # redundant and at worst a failure that hid the room
@@ -240,28 +248,44 @@ class KnockWithCode(Resource):
                             user_id=requester_id,
                             room_id=match.room_id,
                         )
-                    invited_rooms.append(match.room_id)
 
                     # Admin code: promote to admin and burn the code
                     if match.is_admin_code:
-                        await promote_user_to_admin(
+                        promoted = await promote_user_to_admin(
                             api=self._api,
                             room_id=match.room_id,
                             user_to_promote=requester_id,
                             invite_power=100,
                         )
+                        if claim is not None:
+                            # A claim is announced only once it is real, and
+                            # is recorded as owed before the code is burned:
+                            # after the burn nothing can resubmit it, so a
+                            # record written later could be lost for good.
+                            # Failing here leaves the code unburned and the
+                            # claim held, so the claimer can retry.
+                            if not promoted:
+                                raise ClaimPromotionFailed(
+                                    f"Promoting the claimer of {match.room_id} failed"
+                                )
+                            await self._claim_store.mark_promoted(
+                                match.room_id,
+                                requester_id,
+                                self._api._hs.get_clock().time_msec(),
+                            )
                         await burn_admin_code(
                             api=self._api,
                             room_id=match.room_id,
                             burner_user_id=requester_id,
                         )
                         if claim is not None:
-                            await self._claim_store.mark_promoted(
-                                match.room_id,
-                                requester_id,
-                                self._api._hs.get_clock().time_msec(),
-                            )
                             await self._notifier.notify(match.room_id, requester_id)
+                    # Listed only once everything for the room has succeeded,
+                    # so a room is in exactly one list.
+                    if membership == MEMBERSHIP_JOIN:
+                        already_joined_rooms.append(match.room_id)
+                    else:
+                        invited_rooms.append(match.room_id)
                 except Exception as e:
                     # A failed room must not block the others, but it must
                     # not vanish either: capture it, and count it so an
