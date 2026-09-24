@@ -5,7 +5,8 @@
                   Your course is ready
                 </p>
                 {% if request_summary %}
-                <p>You asked for: {{ request_summary }}</p>
+                <p style="margin-bottom: 4px; font-size: 14px; color: #666">Your request:</p>
+                <p style="font-style: italic">&ldquo;{{ request_summary }}&rdquo;</p>
                 {% endif %}
                 <div class="feature">
                   <p style="margin: 0 0 6px; font-weight: 700; color: #1a1a2e">

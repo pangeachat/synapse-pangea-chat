@@ -1,6 +1,6 @@
 Your course is ready
 {% if request_summary %}
-You asked for: {{ request_summary }}
+Your request: "{{ request_summary }}"
 {% endif %}
 {{ course_title }}
 {% if course_description %}{{ course_description }}
