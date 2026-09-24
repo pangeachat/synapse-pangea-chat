@@ -31,7 +31,7 @@ dev = [
   # ModuleNotFoundError and drop out of the gate's coverage silently.
   "wordfreq[cjk] == 3.1.1",
   # for type checking
-  "mypy == 1.6.1",
+  "mypy == 2.1.0",
   # for linting
   "black == 23.10.0",
   "ruff == 0.1.1",
