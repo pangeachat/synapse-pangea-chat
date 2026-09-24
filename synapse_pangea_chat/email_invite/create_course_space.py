@@ -28,6 +28,10 @@ from synapse.types import create_requester
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
+from synapse_pangea_chat.grant_instructor_analytics_access.grant_instructor_analytics_access import (
+    COURSE_SETTINGS_STATE_EVENT_TYPE,
+    REQUIRE_ANALYTICS_ACCESS_KEY,
+)
 from synapse_pangea_chat.room_code.constants import (
     ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
     ADMIN_ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
@@ -188,6 +192,15 @@ class CreateCourseSpace(Resource):
                     "type": PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
                     "state_key": "",
                     "content": course_plan_content,
+                },
+                # Require instructor analytics access to join, as a course the
+                # client creates does. The setting defaults to off when the
+                # event is absent, so it has to be written here or the
+                # teacher sees no student analytics.
+                {
+                    "type": COURSE_SETTINGS_STATE_EVENT_TYPE,
+                    "state_key": "",
+                    "content": {REQUIRE_ANALYTICS_ACCESS_KEY: True},
                 },
             ]
 
