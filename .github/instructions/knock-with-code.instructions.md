@@ -54,25 +54,21 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 
 ---
 
----
+## Claiming a course: a private claim link, then the class link
 
-## Claiming a course: one code, two outcomes
+A course created for a teacher who does not yet have an account (the [teacher funnel](../../../.github/.github/instructions/teacher-funnel.instructions.md)'s course request flow) has nobody to administer it: the bot creates the space, so the bot is its only admin. The teacher has to be able to take ownership by following an ordinary link, before they have any standing in the room.
 
-A course created for a teacher who does not yet have an account (the [course request](../../../.github/.github/instructions/teacher-funnel.instructions.md) flow) has nobody to administer it: the bot creates the space, so the bot is its only admin. The teacher has to be able to take ownership by following an ordinary link, before they have any standing in the room.
+**The claim link and the class link are two codes, and the teacher never holds both at once.** A new course carries a single-use admin code and a class code. The teacher is sent the admin code first, as a link behind a button in the email that tells them their course is ready. The class code reaches them afterwards, in a second email that Synapse sends once the course has been claimed. The first email has nothing in it that belongs with students, so there is nothing to confuse and nothing to warn about.
 
-**One code does both jobs.** The code in a course's invitation is the same code the teacher later gives their class. What differs is not the link but who is using it: the teacher's first join claims the course and makes them its admin; every join after that, and every join by anyone else, is an ordinary member join. A teacher never has two codes to tell apart, and there is no private link that must not be forwarded.
+**Holding the claim link is the proof of identity.** The admin code is sent only to the address the course was requested from, so using it shows control of that inbox. This is deliberately not a match against the teacher's Pangea account: a teacher who requested a course from one address and signs in with another, such as a personal address at a booth and school single sign-on in class, still claims their course. Whoever uses the admin code first becomes the course's admin, and the code is spent.
 
-**Promotion is gated on identity, never on being first.** The claim is granted only to a user whose account identifies them as the teacher the course was created for. Anyone else who uses the code first, including a student the code was shared with early, joins as an ordinary member and the claim stays open.
+**The class code never grants admin.** Anyone who joins with the class code, in any order, joins as an ordinary member. Sharing it early cannot hand the course to a student.
 
-This gate is the whole point of the design, so it is worth stating what it prevents. The obvious rule — "the first person through the door is the teacher" — fails exactly when a teacher does the natural thing and posts the class code to their LMS before opening it themselves. The first student to click then owns the course: they can remove the teacher, and the teacher cannot undo it. Making the shared artifact safe to share, whatever order it is used in, is worth the cost of the gate.
+**The second email doubles as the claim notice.** It goes to the address the course was created for, not to whoever claimed it, and says which account now holds the course. If the claim link was forwarded and used by someone else, the teacher learns it from that email and can reply. The bot keeps full power in every space it creates, so a course claimed by the wrong person can always be repaired server-side.
 
-**When identity cannot be matched, nobody is promoted.** A teacher whose account does not match the course's expected identity is not refused entry: they join as an ordinary member, and the claim remains open for a later attempt or a manual grant. Failing closed here leaves a course with no human admin, which is recoverable; failing open hands a class to a stranger, which is not. The bot retains full power in every space it creates, so an unclaimed or wrongly-held course can always be repaired server-side.
+**Following the link only opens the app; it never claims anything by itself.** University mail filters fetch every link in a message before a person sees it. The claim happens when a signed-in person submits the code in the app, so a filter fetching the link cannot spend the admin code.
 
-**A claim is single use.** Once a course has been claimed, the claim is spent and the code continues to work as the class code alone. Adding a second teacher later is a separate, deliberate act, not a side effect of the class code.
-
-### The separate admin code
-
-A distinct admin code remains supported alongside the class code, for granting course admin to someone deliberately — a co-teacher, or a teacher whose claim could not be identity-matched. It is not what a new course's invitation carries, and it is not shown to students. It behaves as the claim above does: single use, spent when used.
+Granting admin to someone else later, such as a co-teacher, is a separate deliberate act. The class code is never that path.
 
 ---
 
