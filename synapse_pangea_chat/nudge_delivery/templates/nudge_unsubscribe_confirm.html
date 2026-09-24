@@ -1,16 +1,46 @@
 {% extends "nudge_preferences_base.html" %}
 {% block content %}
-        <p class="eyebrow">Your inbox, your choice</p>
         <h1>Email preferences</h1>
-        <p>Choose which emails you’d like to stop.</p>
         <form method="post">
           <input type="hidden" name="t" value="{{ token }}" />
-          <div class="choice">
-            <p class="choice-label">This email type</p>
-            <p class="category">{{ category_label }}</p>
-            <button class="primary" type="submit" name="scope" value="category">Unsubscribe</button>
+          <input type="hidden" name="scope" value="preferences" />
+          <label class="toggle-row master">
+            <span class="toggle-copy">Reminders and offers</span>
+            <input class="switch" type="checkbox" role="switch" id="reminders" name="reminders_enabled" value="yes" {% if not all_off %}checked{% else %}disabled{% endif %} />
+          </label>
+          <div class="preferences" id="categories">
+            {% for row in preference_rows %}
+            <label class="toggle-row">
+              <span class="toggle-copy">{{ row.label }}{% if not row.enabled %}<small>Unsubscribed</small>{% endif %}</span>
+              <input class="switch" type="checkbox" role="switch" name="enabled" value="{{ row.id }}" {% if row.enabled %}checked{% else %}disabled{% endif %} />
+            </label>
+            {% endfor %}
           </div>
-          <button class="secondary" type="submit" name="scope" value="all">Stop all reminders and offers</button>
+          <div class="other-messages">
+            <label class="toggle-row"><span class="toggle-copy">Missed-message emails<small>Managed separately</small></span><input class="switch" type="checkbox" role="switch" disabled /></label>
+            <label class="toggle-row"><span class="toggle-copy">Course invitations<small>Managed separately</small></span><input class="switch" type="checkbox" role="switch" disabled /></label>
+            <label class="toggle-row"><span class="toggle-copy">Account emails<small>Always on</small></span><input class="switch" type="checkbox" role="switch" checked disabled /></label>
+          </div>
+          <button class="primary" type="submit">Save preferences</button>
         </form>
-        <p class="note">You’ll still receive chat messages, course invitations, and account emails.</p>
+        <script>
+          const master = document.getElementById('reminders');
+          const switches = document.querySelectorAll('#categories .switch:not(:disabled)');
+          function updateCategories() {
+            switches.forEach(control => {
+              if (!master.checked) {
+                if (!control.disabled) control.dataset.previous = String(control.checked);
+                control.checked = false;
+                control.disabled = true;
+              } else {
+                control.disabled = false;
+                if (control.dataset.previous !== undefined) control.checked = control.dataset.previous === 'true';
+                delete control.dataset.previous;
+              }
+            });
+            document.getElementById('categories').classList.toggle('muted', !master.checked);
+          }
+          master.addEventListener('change', updateCategories);
+          updateCategories();
+        </script>
 {% endblock %}

@@ -158,6 +158,33 @@ class TestNudgeEmailSMTP(BaseSynapseE2ETest):
                     "refused"
                 ],
             )
+            from synapse_pangea_chat.nudge_delivery.categories import (
+                GLOBAL_OFF_CATEGORIES,
+            )
+
+            saved = requests.post(
+                unsub,
+                data={
+                    "scope": "preferences",
+                    "reminders_enabled": "yes",
+                    "enabled": sorted(
+                        GLOBAL_OFF_CATEGORIES - {"teacher_setup", "activity_nudges"}
+                    ),
+                },
+                timeout=20,
+            )
+            self.assertEqual(saved.status_code, 200)
+            self.assertIn("Preferences saved", saved.text)
+            stored = requests.get(account_path, headers=headers, timeout=20).json()[
+                "account_data"
+            ]["global"]["pangea.communication_preferences"]
+            self.assertEqual(
+                stored["refused"], ["activity_nudges", "suggestions", "teacher_setup"]
+            )
+            self.assertFalse(stored["all_off"])
+            self.assertIn("Privacy", saved.text)
+            self.assertIn("Terms", saved.text)
+            self.assertIn("NSF.png", saved.text)
             if output := os.environ.get("NUDGE_EMAIL_CAPTURE_DIR"):
                 destination = Path(output)
                 destination.mkdir(parents=True, exist_ok=True)

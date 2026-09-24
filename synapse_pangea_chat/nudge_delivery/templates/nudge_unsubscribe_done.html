@@ -2,8 +2,10 @@
 {% block title %}Preferences updated{% endblock %}
 {% block content %}
         <div class="status" aria-hidden="true">✓</div>
-        <h1>You’re unsubscribed</h1>
-        {% if all_off %}
+        <h1>{% if preferences_saved %}Preferences saved{% else %}You’re unsubscribed{% endif %}</h1>
+        {% if preferences_saved %}
+        <p>Your unsubscribe choices have been saved.</p>
+        {% elif all_off %}
         <p>You won’t receive reminders or offers from {{ app_name }} anymore.</p>
         {% else %}
         <p>You won’t receive {{ category_label }} anymore.</p>

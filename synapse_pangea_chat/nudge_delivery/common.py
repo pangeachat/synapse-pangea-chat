@@ -84,3 +84,23 @@ def app_url(
     if session_room_id:
         url += "?" + urlencode({"roomid": session_room_id})
     return url
+
+
+def preference_rows(raw_preferences):
+    """Display the opt-out categories with their effective persisted state."""
+    from synapse_pangea_chat.nudge_delivery.categories import (
+        GLOBAL_OFF_CATEGORIES,
+        is_refused,
+        parse_preferences,
+    )
+
+    preferences = parse_preferences(raw_preferences)
+    return [
+        {
+            "id": category,
+            "label": label,
+            "enabled": not is_refused(preferences, category),
+        }
+        for category, label in CATEGORY_LABELS.items()
+        if category in GLOBAL_OFF_CATEGORIES
+    ]

@@ -26,7 +26,7 @@ def adapt(source: str) -> str:
         "{{ TrackView }}": "",
         address: "{{ postal_address | default(brand_postal_address) }}",
         "You're receiving this email because you've previously\n                  expressed interest in Pangea Chat.<br />": "",
-        "Manage preferences or unsubscribe": "{% block unsubscribe_label %}Manage preferences or unsubscribe{% endblock %}",
+        "Manage preferences or unsubscribe": "Unsubscribe",
     }
     for old, new in replacements.items():
         if source.count(old) != 1:
@@ -47,14 +47,35 @@ def main() -> None:
     args = parser.parse_args()
     source = (args.admin / "email-marketing/templates/base.html").read_text()
     result = adapt(source)
+    footer_start = result.index(
+        '                <div\n                  class="nsf-badge"'
+    )
+    footer_end = result.index("              </td>", footer_start)
+    footer = result[footer_start:footer_end]
+    footer = footer.replace(
+        '<p style="margin-top: 12px; font-size: 12px; color: #aaa">',
+        '{% if show_unsubscribe | default(true) %}<p style="margin-top: 12px; font-size: 12px; color: #aaa">',
+    )
+    footer = footer.replace(
+        '                <p style="margin-top: 16px;',
+        '                {% endif %}\n                <p style="margin-top: 16px;',
+    )
+    preamble = "\n".join(result.splitlines()[:2]) + "\n"
+    result = (
+        result[:footer_start]
+        + '                {% include "brand_footer.html" %}\n'
+        + result[footer_end:]
+    )
+    outputs = {DEST: result, DEST.with_name("brand_footer.html"): preamble + footer}
     if args.check:
-        if DEST.read_text() != result:
+        if any(path.read_text() != content for path, content in outputs.items()):
             raise SystemExit(
                 "Brand template differs; run import_brand_email.py without --check"
             )
         print("Brand template matches admin source")
     else:
-        DEST.write_text(result)
+        for path, content in outputs.items():
+            path.write_text(content)
         print(
             f"Imported brand template (source SHA256 {hashlib.sha256(source.encode()).hexdigest()})"
         )

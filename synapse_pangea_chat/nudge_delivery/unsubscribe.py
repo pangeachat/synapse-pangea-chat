@@ -23,6 +23,7 @@ from twisted.web.resource import Resource
 
 from synapse_pangea_chat.nudge_delivery.categories import (
     COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE,
+    GLOBAL_OFF_CATEGORIES,
     REFUSABLE_CATEGORIES,
     SOURCE_UNSUBSCRIBE_LINK,
     parse_preferences,
@@ -33,6 +34,7 @@ from synapse_pangea_chat.nudge_delivery.common import (
     TOKEN_KIND_UNSUBSCRIBE,
     category_label,
     now_ms,
+    preference_rows,
     token_secret,
 )
 from synapse_pangea_chat.nudge_delivery.rate_limit import SlidingWindowRateLimiter
@@ -131,12 +133,17 @@ class NudgeUnsubscribe(Resource):
             if payload is None:
                 self._respond_invalid(request)
                 return
+            raw_preferences = await self._api.account_data_manager.get_global(
+                payload["u"], COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE
+            )
             respond_with_html(
                 request,
                 200,
                 self._confirm_html.render(
                     app_name=self._app_name,
                     token=token,
+                    preference_rows=preference_rows(raw_preferences),
+                    all_off=parse_preferences(raw_preferences).all_off,
                     category_label=category_label(payload["c"]),
                 ),
             )
@@ -168,14 +175,38 @@ class NudgeUnsubscribe(Resource):
                 self._respond_invalid(request)
                 return
             scope = _first_arg(args, b"scope") or SCOPE_CATEGORY
-            await self.apply(payload["u"], payload["c"], all_off=scope == SCOPE_ALL)
+            if scope == "preferences":
+                try:
+                    enabled = {
+                        value.decode("utf-8") for value in args.get(b"enabled", [])
+                    }
+                except UnicodeDecodeError:
+                    respond_with_html(request, 400, "Invalid preference selection")
+                    return
+                if not enabled <= GLOBAL_OFF_CATEGORIES:
+                    respond_with_html(request, 400, "Invalid preference selection")
+                    return
+                all_off = _first_arg(args, b"reminders_enabled") != "yes"
+                await self.apply(
+                    payload["u"],
+                    payload["c"],
+                    all_off=all_off,
+                    categories=GLOBAL_OFF_CATEGORIES - enabled,
+                )
+            elif scope in (SCOPE_CATEGORY, SCOPE_ALL):
+                all_off = scope == SCOPE_ALL
+                await self.apply(payload["u"], payload["c"], all_off=all_off)
+            else:
+                respond_with_html(request, 400, "Invalid preference scope")
+                return
             respond_with_html(
                 request,
                 200,
                 self._done_html.render(
                     app_name=self._app_name,
                     category_label=category_label(payload["c"]),
-                    all_off=scope == SCOPE_ALL,
+                    all_off=all_off,
+                    preferences_saved=scope == "preferences",
                 ),
             )
         except Exception:  # noqa: BLE001
@@ -185,7 +216,12 @@ class NudgeUnsubscribe(Resource):
             )
 
     async def apply(
-        self, user_id: str, category: str, *, all_off: bool
+        self,
+        user_id: str,
+        category: str,
+        *,
+        all_off: bool,
+        categories: Optional[frozenset[str]] = None,
     ) -> Dict[str, Any]:
         manager = self._api.account_data_manager
         async with self._write_lock.queue(user_id):
@@ -196,7 +232,9 @@ class NudgeUnsubscribe(Resource):
             )
             updated = with_refusal(
                 current,
-                categories=() if all_off else (category,),
+                categories=categories
+                if categories is not None
+                else (() if all_off else (category,)),
                 all_off=True if all_off else None,
                 now_ms=now_ms(self._api),
                 source=SOURCE_UNSUBSCRIBE_LINK,

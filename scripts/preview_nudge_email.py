@@ -5,6 +5,7 @@ No credentials or mail transport. --data accepts a JSON object of template value
 
 import argparse
 import json
+import sys
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,6 +14,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoes
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = ROOT / "synapse_pangea_chat/nudge_delivery/templates"
+sys.path.insert(0, str(ROOT))
 
 
 def template_context(data_path: Path | None = None):
@@ -59,8 +61,13 @@ class PreviewHandler(BaseHTTPRequestHandler):
             html, plain = render(self.data_path)
             if self.path == "/unsubscribe":
                 env, values = template_context(self.data_path)
+                from synapse_pangea_chat.nudge_delivery.common import preference_rows
+
                 html = env.get_template("nudge_unsubscribe_confirm.html").render(
-                    **values, token="local-preview-only"
+                    **values,
+                    token="local-preview-only",
+                    preference_rows=preference_rows({}),
+                    all_off=False,
                 )
         except Exception as error:
             self.log_error("Render failed: %s", error)

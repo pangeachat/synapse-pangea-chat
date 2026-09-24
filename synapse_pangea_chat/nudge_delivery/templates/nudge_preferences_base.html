@@ -9,7 +9,7 @@
       * { box-sizing: border-box; }
       body { margin: 0; padding: 64px 24px; }
       .page { width: 100%; max-width: 520px; margin: 0 auto; }
-      .brand { display: inline-flex; margin-bottom: 28px; padding: 14px 20px; background: #5e3acf; border-radius: 14px; }
+      .brand { display: flex; width: fit-content; margin: 0 auto 28px; border-radius: 6px; }
       .brand img { display: block; width: 184px; height: auto; }
       .card { background: #fff; border: 1px solid #e8e3f0; border-radius: 24px; padding: 36px; box-shadow: 0 8px 32px #29203f06; }
       .eyebrow { margin: 0 0 12px; color: #6944c7; font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
@@ -28,16 +28,31 @@
       .note { padding-top: 24px; margin-top: 28px; border-top: 1px solid #eeeaf3; font-size: 13px; }
       footer { padding: 24px 12px; text-align: center; font-size: 12px; color: #777084; line-height: 1.6; }
       .status { display: grid; place-items: center; width: 48px; height: 48px; background: #f0eafb; color: #5e3acf; border-radius: 50%; margin-bottom: 24px; font-size: 24px; }
+      .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 66px; padding: 14px 0; cursor: pointer; }
+      .toggle-copy { font-size: 15px; font-weight: 500; line-height: 1.4; }
+      .toggle-copy::first-letter { text-transform: uppercase; }
+      .toggle-copy small { display: block; font-size: 12px; font-weight: 400; color: #777084; margin-top: 4px; }
+      .master { border-bottom: 1px solid #e8e3f0; margin-top: 16px; }
+      .master .toggle-copy { font-weight: 650; }
+      .preferences { padding: 8px 0; }
+      .other-messages { border-top: 1px solid #e8e3f0; padding-top: 8px; }
+      .switch { appearance: none; -webkit-appearance: none; flex: 0 0 52px; width: 52px; height: 32px; border: 2px solid #79747e; border-radius: 20px; background: #e7e0ec; position: relative; cursor: pointer; margin: 0; transition: background .15s; }
+      .switch::before { content: ""; display: block; position: absolute; width: 16px; height: 16px; top: 6px; left: 6px; background: #79747e; border-radius: 50%; transition: transform .15s; }
+      .switch:checked { background: #33d057; border-color: #33d057; }
+      .switch:checked::before { width: 24px; height: 24px; top: 2px; left: 2px; transform: translateX(20px); background: #fff; box-shadow: 0 1px 2px #0002; }
+      .switch:disabled { opacity: .38; cursor: default; }
+      .muted .toggle-copy { color: #898391; }
+      @media (prefers-reduced-motion: reduce) { .switch, .switch::before, button { transition: none; } }
       @media (max-width: 560px) { body { padding: 28px 16px; } .brand { margin-bottom: 24px; } .card { padding: 28px 24px; border-radius: 20px; } h1 { font-size: 27px; } }
     </style>
   </head>
   <body>
     <div class="page">
       <a class="brand" href="https://pangea.chat" aria-label="{{ app_name }} home">
-        <img src="https://assets.pangea.chat/brand/Medium-Dark-Horizontal-Logo.png" alt="{{ app_name }}" />
+        <img src="https://assets.pangea.chat/brand/Medium-Light-Horizontal-Logo.png" alt="{{ app_name }}" />
       </a>
       <main class="card">{% block content %}{% endblock %}</main>
-      <footer>Pangea Chat · Language learning through conversation</footer>
+      <footer>{% set show_unsubscribe = false %}{% include "brand_footer.html" %}</footer>
     </div>
   </body>
 </html>
