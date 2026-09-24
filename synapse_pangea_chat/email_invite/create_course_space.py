@@ -37,6 +37,7 @@ from synapse_pangea_chat.grant_instructor_analytics_access.grant_instructor_anal
     COURSE_SETTINGS_STATE_EVENT_TYPE,
     REQUIRE_ANALYTICS_ACCESS_KEY,
 )
+from synapse_pangea_chat.room_code.code_lookup import code_is_taken
 from synapse_pangea_chat.room_code.constants import (
     ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
     EVENT_TYPE_M_ROOM_JOIN_RULES,
@@ -44,9 +45,6 @@ from synapse_pangea_chat.room_code.constants import (
 )
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.generate_room_code import generate_access_code
-from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
-    get_rooms_with_access_code,
-)
 
 try:
     import sentry_sdk  # type: ignore[import-not-found]
@@ -405,9 +403,6 @@ class CreateCourseSpace(Resource):
         """Generate an access code that doesn't conflict with existing ones."""
         for _ in range(10):
             code = generate_access_code()
-            matches = await get_rooms_with_access_code(
-                access_code=code, room_store=self._datastores.main
-            )
-            if len(matches) == 0 and not await self._claim_store.code_in_use(code):
+            if not await code_is_taken(code, self._datastores.main, self._claim_store):
                 return code
         return None

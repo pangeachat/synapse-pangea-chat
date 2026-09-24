@@ -44,12 +44,9 @@ try:
 except ImportError:
     # Sentry is an optional Synapse extra; without it captures are no-ops.
     sentry_sdk = None
+from synapse_pangea_chat.room_code.code_lookup import rooms_for_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.get_inviter_user import promote_user_to_admin
-from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
-    RoomCodeMatch,
-    get_rooms_with_access_code,
-)
 from synapse_pangea_chat.room_code.invite_user_to_room import invite_user_to_room
 from synapse_pangea_chat.room_code.is_rate_limited import is_rate_limited
 from synapse_pangea_chat.room_code.user_is_room_member import (
@@ -154,11 +151,12 @@ class KnockWithCode(Resource):
                 )
                 return
 
-            # Get the rooms with the access code
-            matches = await get_rooms_with_access_code(
-                access_code=access_code, room_store=self._datastores.main
+            # Join rules, and the claim record for a requested course's claim
+            # code, which members must not be able to read (code_lookup).
+            found = await rooms_for_code(
+                access_code, self._datastores.main, self._claim_store
             )
-            if matches is None:
+            if found is None:
                 respond_with_json(
                     request,
                     500,
@@ -166,16 +164,7 @@ class KnockWithCode(Resource):
                     send_cors=True,
                 )
                 return
-            # A requested course's claim code is not in join rules (members
-            # can read those); it is looked up in the claim record.
-            claim_room_ids = set(
-                await self._claim_store.rooms_for_admin_code(access_code)
-            )
-            state_room_ids = {match.room_id for match in matches}
-            matches = list(matches) + [
-                RoomCodeMatch(room_id=room_id, is_admin_code=True)
-                for room_id in sorted(claim_room_ids - state_room_ids)
-            ]
+            matches, claim_room_ids = found
             if len(matches) == 0:
                 # 404, not 400: the request is well-formed — the code just
                 # doesn't exist. The errcode lets clients show a "check the

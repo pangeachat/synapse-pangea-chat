@@ -337,7 +337,7 @@ class PangeaChat:
         self.knock_with_code_resource = KnockWithCode(
             api, config, course_claim_store, course_claim_notifier
         )
-        self.request_code_resource = RequestRoomCode(api, config)
+        self.request_code_resource = RequestRoomCode(api, config, course_claim_store)
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/knock_with_code",
             resource=self.knock_with_code_resource,
@@ -348,7 +348,9 @@ class PangeaChat:
         )
 
         # --- Preview With Code ---
-        self.preview_with_code_resource = PreviewWithCode(api, config)
+        self.preview_with_code_resource = PreviewWithCode(
+            api, config, course_claim_store
+        )
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/preview_with_code",
             resource=self.preview_with_code_resource,

@@ -14,6 +14,7 @@ ROOM_2 = "!room2:my.domain.name"
 CODE = "vldcde1"
 
 MODULE = "synapse_pangea_chat.room_code.knock_with_code"
+LOOKUP = "synapse_pangea_chat.room_code.code_lookup"
 
 
 def _claim_store(
@@ -87,7 +88,7 @@ class TestKnockWithCodeResponses(unittest.IsolatedAsyncioTestCase):
         return args[1], args[2]
 
     async def test_unmatched_code_answers_404_with_errcode(self) -> None:
-        with patch(f"{MODULE}.get_rooms_with_access_code", AsyncMock(return_value=[])):
+        with patch(f"{LOOKUP}.get_rooms_with_access_code", AsyncMock(return_value=[])):
             await _handler()._async_render_POST(MagicMock())
         status, body = self._response()
         self.assertEqual(status, 404)
@@ -97,7 +98,7 @@ class TestKnockWithCodeResponses(unittest.IsolatedAsyncioTestCase):
         matches = [RoomCodeMatch(room_id=ROOM_1, is_admin_code=False)]
         with (
             patch(
-                f"{MODULE}.get_rooms_with_access_code", AsyncMock(return_value=matches)
+                f"{LOOKUP}.get_rooms_with_access_code", AsyncMock(return_value=matches)
             ),
             patch(
                 f"{MODULE}.invite_user_to_room",
@@ -122,7 +123,7 @@ class TestKnockWithCodeResponses(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                f"{MODULE}.get_rooms_with_access_code", AsyncMock(return_value=matches)
+                f"{LOOKUP}.get_rooms_with_access_code", AsyncMock(return_value=matches)
             ),
             patch(f"{MODULE}.invite_user_to_room", AsyncMock(side_effect=invite)),
         ):
@@ -143,7 +144,7 @@ class TestKnockWithCodeResponses(unittest.IsolatedAsyncioTestCase):
         invite = AsyncMock()
         with (
             patch(
-                f"{MODULE}.get_rooms_with_access_code", AsyncMock(return_value=matches)
+                f"{LOOKUP}.get_rooms_with_access_code", AsyncMock(return_value=matches)
             ),
             patch(
                 f"{MODULE}.get_user_room_membership", AsyncMock(return_value="invite")
@@ -165,7 +166,7 @@ class TestKnockWithCodeResponses(unittest.IsolatedAsyncioTestCase):
         invite = AsyncMock()
         with (
             patch(
-                f"{MODULE}.get_rooms_with_access_code", AsyncMock(return_value=matches)
+                f"{LOOKUP}.get_rooms_with_access_code", AsyncMock(return_value=matches)
             ),
             patch(f"{MODULE}.is_blocked_by_room_admin", AsyncMock(return_value=True)),
             patch(f"{MODULE}.invite_user_to_room", invite),
@@ -198,7 +199,7 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
             patch(f"{MODULE}.is_blocked_by_room_admin", AsyncMock(return_value=False)),
             # A claim code is not in join rules; it is found through the
             # claim record (the store's rooms_for_admin_code).
-            patch(f"{MODULE}.get_rooms_with_access_code", AsyncMock(return_value=[])),
+            patch(f"{LOOKUP}.get_rooms_with_access_code", AsyncMock(return_value=[])),
             patch(f"{MODULE}.invite_user_to_room", self.invite),
             patch(f"{MODULE}.promote_user_to_admin", self.promote),
             patch(f"{MODULE}.burn_admin_code", self.burn),
@@ -259,7 +260,7 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
         notifier = _notifier()
 
         with patch(
-            f"{MODULE}.get_rooms_with_access_code",
+            f"{LOOKUP}.get_rooms_with_access_code",
             AsyncMock(return_value=[RoomCodeMatch(room_id=ROOM_1, is_admin_code=True)]),
         ):
             await _handler(store, notifier)._async_render_POST(MagicMock())

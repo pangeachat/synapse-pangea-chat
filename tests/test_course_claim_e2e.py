@@ -166,6 +166,15 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 join_rules = self._room_get(bot, room_id, "state/m.room.join_rules")
                 self.assertNotIn("admin_access_code", join_rules)
 
+                # The claim code previews the course, though it is in no state.
+                preview = self._post(
+                    "/_synapse/client/pangea/v1/preview_with_code",
+                    latecomer,
+                    {"access_code": admin_code},
+                )
+                self.assertEqual(preview.status_code, 200, preview.text)
+                self.assertIn(room_id, preview.text)
+
                 # The class code never grants admin, whatever the order.
                 await self._join_with_code(student, class_code, room_id)
                 self.assertEqual(self._power_level(bot, room_id, student_id), 0)
