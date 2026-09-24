@@ -526,3 +526,7 @@ Synapse developers (assuming a Unix-like shell):
     python -m build
     twine upload dist/synapse_room_preview-$version*
     ```
+
+## Local email previews
+
+[Preview and capture nudge emails locally](scripts/EMAIL_PREVIEW.md) for template and copy iteration without deploying or sending external mail.

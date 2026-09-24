@@ -25,6 +25,10 @@ Exactly one channel carries the nudge, decided in this order, and the response n
 
 The response also carries the push transport summary (same shape as `send_push`) and the email outcome, so the bot can log the channel per nudge. Presence being disabled, or a presence read failing, counts as "not in the app" — a nudge the person is due must not be lost to a presence outage, and the cost of being wrong is one push to someone who is online.
 
+## Email appearance
+
+Nudge emails use the standard [Pangea Brand template](../../../admin/email-marketing/templates/base.html), including its logo, header, gold accents, NSF badge, and company footer. The message body and call to action occupy its content area; the reason for receiving the email and the unsubscribe link remain specific to the nudge category.
+
 ## The refusal store
 
 Refusal state is one global account-data event per user, `pangea.communication_preferences`: the refused categories, an `all_off` flag, when it changed, and which surface changed it (`unsubscribe_link` or `app`). It is the store the in-app preference screen reads and writes and the store this module reads before every send, so the two surfaces cannot disagree. Rules the store enforces:
