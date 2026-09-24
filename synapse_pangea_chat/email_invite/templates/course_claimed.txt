@@ -1,13 +1,14 @@
-Invite your students
+Congratulations! Your task-based conversation journey is ready to go!
 
-{{ course_title }} is now held by {% if claimed_by_display_name %}{{ claimed_by_display_name }} ({{ claimed_by_user_id }}){% else %}{{ claimed_by_user_id }}{% endif %}.
+You can invite your students to {{ course_title }} by sharing the link below:
 
-Share this link with your students:
 {{ class_url }}
 
-Or give them the class code {{ class_code }} to enter in the app.
+Students will be directed to make an account, automatically enrolled in your class and be conversing in curriculum-aligned conversation activities in no time.
 
-Everyone who joins with this link or code joins as a student. If you didn't open the course yourself, reply to this email and we'll sort it out.
+Your students will receive a free 7-day trial on account creation and can subscribe in-app afterwards. If you'd like to cover your students' seats, just hit reply for an invoice, to redeem a promotional offer, or any other questions.
+
+This course was opened by {% if claimed_by_display_name %}{{ claimed_by_display_name }} ({{ claimed_by_user_id }}){% else %}{{ claimed_by_user_id }}{% endif %}. If that wasn't you, reply to this email.
 
 --
 You're receiving this because a course was requested for this address. Questions? Reply to this email.
