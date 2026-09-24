@@ -1,7 +1,10 @@
 """POST /_synapse/client/pangea/v1/create_course_space
 
-Creates a private Matrix space for a custom course request, generates student
-and admin access codes, and sends a branded invite email to the teacher.
+Creates a private Matrix space for a custom course request and generates its
+class code and single-use admin code. When the request carries the address the
+course was requested from, records it and emails that address the claim link
+(the admin code); the class code is emailed on the claim, by knock_with_code.
+See create-course-space.instructions.md and knock-with-code.instructions.md.
 """
 
 from __future__ import annotations
@@ -28,25 +31,44 @@ from synapse.types import create_requester
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
+from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
+from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.grant_instructor_analytics_access.grant_instructor_analytics_access import (
     COURSE_SETTINGS_STATE_EVENT_TYPE,
     REQUIRE_ANALYTICS_ACCESS_KEY,
 )
+from synapse_pangea_chat.room_code.code_lookup import code_is_taken
 from synapse_pangea_chat.room_code.constants import (
     ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
-    ADMIN_ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
     EVENT_TYPE_M_ROOM_JOIN_RULES,
     KNOCK_JOIN_RULE_VALUE,
 )
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.generate_room_code import generate_access_code
-from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
-    get_rooms_with_access_code,
-)
+
+try:
+    import sentry_sdk  # type: ignore[import-not-found]
+# silent-ok: sentry-sdk is an optional Synapse extra; without it captures are no-ops (below)
+except ImportError:
+    sentry_sdk = None
 
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.email_invite.create_course_space"
 )
+
+
+def _capture_exception(e: Exception) -> None:
+    # The course is created and answered 200 even when its email fails, so the
+    # failure never reaches Synapse's request-level capture.
+    if sentry_sdk is not None:
+        sentry_sdk.capture_exception(e)
+
+
+def _optional_str(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
 
 # Matches what the client creates a course space with (selected_course_page
 # passes spaceChild: 0 into its defaultSpacePowerLevelsContent). m.space.child
@@ -99,12 +121,20 @@ def build_course_plan_content(
 class CreateCourseSpace(Resource):
     isLeaf = True
 
-    def __init__(self, api: ModuleApi, config: PangeaChatConfig):
+    def __init__(
+        self,
+        api: ModuleApi,
+        config: PangeaChatConfig,
+        claim_store: CourseClaimStore,
+        mailer: CourseClaimMailer,
+    ):
         super().__init__()
         self._api = api
         self._config = config
         self._auth = self._api._hs.get_auth()
         self._datastores = self._api._hs.get_datastores()
+        self._claim_store = claim_store
+        self._mailer = mailer
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -136,15 +166,22 @@ class CreateCourseSpace(Resource):
                 )
                 return
 
+            # Optional: a course created without the requesting address sends
+            # no email and stays bot-administered until admin is granted
+            # deliberately (create-course-space.instructions.md).
             teacher_email = body.get("teacher_email")
-            if not isinstance(teacher_email, str) or not teacher_email.strip():
+            if teacher_email is not None and (
+                not isinstance(teacher_email, str) or "@" not in teacher_email
+            ):
                 respond_with_json(
                     request,
                     400,
-                    {"error": "Missing or empty 'teacher_email'"},
+                    {"error": "'teacher_email' must be an email address"},
                     send_cors=True,
                 )
                 return
+            teacher_email = _optional_str(teacher_email)
+            request_summary = _optional_str(body.get("request_summary"))
 
             description = body.get("description", "")
             course_plan_id = body.get("course_plan_id", "")
@@ -177,14 +214,15 @@ class CreateCourseSpace(Resource):
 
             # Build initial state events for the space
             initial_state = [
-                # Join rules with knock + both access codes
+                # Join rules with knock + the class code only. The admin code
+                # is the claim, and every member can read join rules, so it is
+                # kept in the claim record instead (course_claims).
                 {
                     "type": EVENT_TYPE_M_ROOM_JOIN_RULES,
                     "state_key": "",
                     "content": {
                         "join_rule": KNOCK_JOIN_RULE_VALUE,
                         ACCESS_CODE_JOIN_RULE_CONTENT_KEY: student_code,
-                        ADMIN_ACCESS_CODE_JOIN_RULE_CONTENT_KEY: admin_code,
                     },
                 },
                 # Course plan association
@@ -254,12 +292,44 @@ class CreateCourseSpace(Resource):
             # hardcoded host (see build_join_url).
             admin_join_url = build_join_url(self._config.app_base_url, admin_code)
 
-            # TODO: Send invite email to teacher via invite_by_email
-            # (placeholder — invite_by_email endpoint is a separate session)
-            logger.info(
-                f"Course space created: room_id={room_id}, "
-                f"teacher_email={teacher_email}, admin_join_url={admin_join_url}"
-            )
+            # The address and the claim link stay out of the log: the link is
+            # the claim, and whoever reads it can spend it.
+            logger.info(f"Course space created: room_id={room_id}")
+
+            # The claim record is where the admin code lives, so without it
+            # the course cannot be claimed at all. Failing here is loud, and
+            # names the room so it can be repaired rather than recreated.
+            try:
+                await self._claim_store.record(
+                    room_id,
+                    teacher_email,
+                    admin_code,
+                    self._api._hs.get_clock().time_msec(),
+                )
+            except Exception as e:
+                logger.error(f"Failed to record the claim for {room_id}: {e}")
+                _capture_exception(e)
+                respond_with_json(
+                    request,
+                    500,
+                    {
+                        "error": "Course space created but its claim could not be recorded",
+                        "room_id": room_id,
+                    },
+                    send_cors=True,
+                )
+                return
+
+            emailed = False
+            if teacher_email is not None:
+                emailed = await self._send_claim_link(
+                    room_id=room_id,
+                    teacher_email=teacher_email,
+                    title=title.strip(),
+                    description=description if isinstance(description, str) else "",
+                    request_summary=request_summary,
+                    claim_url=admin_join_url,
+                )
 
             respond_with_json(
                 request,
@@ -269,6 +339,7 @@ class CreateCourseSpace(Resource):
                     "student_access_code": student_code,
                     "admin_access_code": admin_code,
                     "admin_join_url": admin_join_url,
+                    "emailed": emailed,
                 },
                 send_cors=True,
             )
@@ -295,13 +366,43 @@ class CreateCourseSpace(Resource):
                 send_cors=True,
             )
 
+    async def _send_claim_link(
+        self,
+        *,
+        room_id: str,
+        teacher_email: str,
+        title: str,
+        description: str,
+        request_summary: str | None,
+        claim_url: str,
+    ) -> bool:
+        """Email the claim link to the requesting address.
+
+        A failure is captured and reported as ``emailed: false`` rather than
+        failing the request: the space and its claim exist, and a retry would
+        make a second one.
+        """
+        try:
+            await self._mailer.send_course_ready(
+                email_address=teacher_email,
+                course_title=title,
+                course_description=description,
+                request_summary=request_summary,
+                claim_url=claim_url,
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to send the course-ready email for {room_id}: "
+                f"{type(e).__name__}"
+            )
+            _capture_exception(e)
+            return False
+        return True
+
     async def _generate_unique_code(self) -> str | None:
         """Generate an access code that doesn't conflict with existing ones."""
         for _ in range(10):
             code = generate_access_code()
-            matches = await get_rooms_with_access_code(
-                access_code=code, room_store=self._datastores.main
-            )
-            if len(matches) == 0:
+            if not await code_is_taken(code, self._datastores.main, self._claim_store):
                 return code
         return None

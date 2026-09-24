@@ -138,3 +138,152 @@ class TestCatalogReadsWhatWeWrite(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSendClaimLink(unittest.IsolatedAsyncioTestCase):
+    """A failed claim-link email is captured and reported, never raised: the
+    space and its claim already exist (create-course-space.instructions.md)."""
+
+    def _resource(self) -> Any:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from synapse_pangea_chat.config import PangeaChatConfig
+        from synapse_pangea_chat.email_invite.create_course_space import (
+            CreateCourseSpace,
+        )
+
+        mailer = MagicMock()
+        mailer.send_course_ready = AsyncMock()
+        return (
+            CreateCourseSpace(MagicMock(), PangeaChatConfig(), MagicMock(), mailer),
+            mailer,
+        )
+
+    async def _run(self, resource: Any) -> bool:
+        return await resource._send_claim_link(
+            room_id="!r:x",
+            teacher_email="teacher@school.example",
+            title="Spanish 1",
+            description="Lessons 1 to 6",
+            request_summary="Spanish 1 practice",
+            claim_url="https://app.pangea.chat/adm1nab",
+        )
+
+    async def test_sends_the_claim_link(self) -> None:
+        resource, mailer = self._resource()
+
+        self.assertTrue(await self._run(resource))
+
+        sent = mailer.send_course_ready.await_args.kwargs
+        self.assertEqual(sent["email_address"], "teacher@school.example")
+        self.assertEqual(sent["claim_url"], "https://app.pangea.chat/adm1nab")
+        self.assertEqual(sent["request_summary"], "Spanish 1 practice")
+
+    async def test_failed_send_is_captured_and_reported(self) -> None:
+        from unittest.mock import patch
+
+        resource, mailer = self._resource()
+        mailer.send_course_ready.side_effect = RuntimeError("smtp down")
+
+        with patch(
+            "synapse_pangea_chat.email_invite.create_course_space._capture_exception"
+        ) as capture:
+            self.assertFalse(await self._run(resource))
+
+        capture.assert_called_once()
+
+
+class TestClaimEmailTemplates(unittest.TestCase):
+    """The rendered emails: the first carries the claim link and nothing for
+    students; the second carries the class link."""
+
+    @staticmethod
+    def _env() -> Any:
+        import jinja2
+
+        from synapse_pangea_chat.email_invite.course_claim_emails import (
+            TEMPLATES_DIR,
+        )
+
+        return jinja2.Environment(
+            loader=jinja2.FileSystemLoader(TEMPLATES_DIR),
+            autoescape=jinja2.select_autoescape(["html"]),
+        )
+
+    def test_course_ready_carries_the_claim_link_and_no_class_code(self) -> None:
+        env = self._env()
+        for name in ("course_ready.html", "course_ready.txt"):
+            with self.subTest(template=name):
+                out = env.get_template(name).render(
+                    app_name="Pangea Chat",
+                    course_title="Spanish 1",
+                    course_description="Lessons 1 to 6",
+                    request_summary="Spanish 1 practice",
+                    claim_url="https://app.pangea.chat/adm1nab",
+                )
+                self.assertIn("https://app.pangea.chat/adm1nab", out)
+                self.assertIn("Spanish 1", out)
+                self.assertNotIn("class code", out.lower())
+
+    def test_course_claimed_carries_class_link_and_claimer(self) -> None:
+        env = self._env()
+        for name in ("course_claimed.html", "course_claimed.txt"):
+            with self.subTest(template=name):
+                out = env.get_template(name).render(
+                    app_name="Pangea Chat",
+                    course_title="Spanish 1",
+                    class_url="https://app.pangea.chat/cls4abc",
+                    class_code="cls4abc",
+                )
+                self.assertIn("https://app.pangea.chat/cls4abc", out)
+                self.assertIn("cls4abc", out)
+
+    def test_html_escapes_request_text(self) -> None:
+        out = (
+            self._env()
+            .get_template("course_ready.html")
+            .render(
+                app_name="Pangea Chat",
+                course_title="<b>x</b>",
+                course_description="",
+                request_summary="<script>alert(1)</script>",
+                claim_url="https://app.pangea.chat/adm1nab",
+            )
+        )
+        self.assertNotIn("<script>", out)
+        self.assertNotIn("<b>x</b>", out)
+
+
+class TestMailerBound(unittest.IsolatedAsyncioTestCase):
+    """Every claim email is bounded: Synapse's mailer does not time out a
+    stalled SMTP transaction (course_claim_emails)."""
+
+    async def test_a_stalled_send_raises_instead_of_hanging(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from twisted.internet import defer
+
+        from synapse_pangea_chat.email_invite import course_claim_emails
+
+        api = MagicMock()
+        api.read_templates.return_value = [MagicMock() for _ in range(4)]
+        mailer = course_claim_emails.CourseClaimMailer(api)
+
+        with patch.object(
+            course_claim_emails,
+            "timeout_deferred",
+            return_value=defer.fail(defer.TimeoutError()),
+        ) as bounded:
+            with self.assertRaises(defer.TimeoutError):
+                await mailer.send_course_ready(
+                    email_address="teacher@school.example",
+                    course_title="Spanish 1",
+                    course_description="",
+                    request_summary=None,
+                    claim_url="https://app.pangea.chat/adm1nab",
+                )
+
+        self.assertEqual(
+            bounded.call_args.kwargs["timeout"],
+            course_claim_emails.SEND_TIMEOUT_SECONDS,
+        )

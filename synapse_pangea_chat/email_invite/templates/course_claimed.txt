@@ -1,0 +1,9 @@
+Congratulations! Your task-based conversation journey is ready to go!
+
+You can invite your students to {{ course_title }} by sharing the link below:
+
+{{ class_url }}
+
+Students will be directed to make an account, automatically enrolled in your class and be conversing in curriculum-aligned conversation activities in no time.
+
+Your students will receive a free 7-day trial on account creation and can subscribe in-app afterwards. If you'd like to cover your students' seats, just hit reply for an invoice, to redeem a promotional offer, or any other questions.

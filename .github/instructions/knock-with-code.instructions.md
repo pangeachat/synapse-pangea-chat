@@ -60,19 +60,23 @@ A course created for a teacher who does not yet have an account (the [teacher fu
 
 **The claim link and the class link are two codes, and the teacher never holds both at once.** A new course carries a single-use admin code and a class code. The teacher is sent the admin code first, as a link behind a button in the email that tells them their course is ready. The class code reaches them afterwards, in a second email that Synapse sends once the course has been claimed. The first email has nothing in it that belongs with students, so there is nothing to confuse and nothing to warn about.
 
-**Holding the claim link is the proof of identity.** The admin code is sent only to the address the course was requested from, so using it shows control of that inbox. This is deliberately not a match against the teacher's Pangea account: a teacher who requested a course from one address and signs in with another, such as a personal address at a booth and school single sign-on in class, still claims their course. Whoever uses the admin code first becomes the course's admin, and the code is spent.
+**Holding the claim link is the proof of identity.** The admin code is sent only to the address the course was requested from, so using it shows control of that inbox. This is deliberately not a match against the teacher's Pangea account: a teacher who requested a course from one address and signs in with another, such as a personal address at a booth and school single sign-on in class, still claims their course. Whoever uses the admin code first becomes the course's admin, and the code is spent. Two people using it at the same moment cannot both become admin: the second is answered as for a code that does not exist, which is what it is a moment later.
+
+**The claim code is kept out of room state.** Every member can read a course's join rules, so an admin code stored there could be read by a student who joined with the class code, and used. A requested course's admin code lives only in a server-side claim record, and that is where this endpoint looks it up. Because nobody can read it from the course, a member who already joined, such as a teacher who tried their class link before opening the claim link, can still claim with it.
 
 **The class code never grants admin.** Anyone who joins with the class code, in any order, joins as an ordinary member. Sharing it early cannot hand the course to a student.
 
-**The second email doubles as the claim notice.** It goes to the address the course was created for, not to whoever claimed it, and says which account now holds the course. If the claim link was forwarded and used by someone else, the teacher learns it from that email and can reply. The bot keeps full power in every space it creates, so a course claimed by the wrong person can always be repaired server-side.
+**The second email goes to the requesting address.** It carries the class link, and it is sent to the address the course was created for, not to whoever claimed it, so the teacher receives it even if the claim link was forwarded and used by someone else. It does not name the account that claimed the course (Will, 2026-09-24). It is sent once, and a send that fails is retried in the background, so a mail outage delays it rather than losing it: by then the admin code is spent, and the class link reaches the teacher no other way. A send that stalls is given up on and retried; if the mail server later completes the stalled one, the teacher gets the email twice. That is accepted: the email carries nothing single use, and losing it is worse than repeating it. After it goes out the address is cleared from the record, which keeps who claimed the course and when. A course a teacher created in the client has no such record, so using its admin code promotes and burns as before and sends nothing. The bot keeps full power in every space it creates, so a course claimed by the wrong person can always be repaired server-side.
 
 **Following the link only opens the app; it never claims anything by itself.** University mail filters fetch every link in a message before a person sees it. The claim happens when a signed-in person submits the code in the app, so a filter fetching the link cannot spend the admin code.
 
-Granting admin to someone else later, such as a co-teacher, is a separate deliberate act. The class code is never that path.
+Granting admin to someone else later, such as a co-teacher, is a separate deliberate act. The class code is never that path. A new admin code set on a claimed course is that act, not a second claim: the claim record belongs to the admin code the course was created with, so a later one promotes as any admin code does, and sends nothing.
 
 ---
 
 ## Access Code Storage
+
+A requested course's claim code is the exception: it is not in join rules, for the reason in "Claiming a course" above. Everything below describes the class code and client-set admin codes.
 
 Access codes live in the `content.access_code` field of the room's `m.room.join_rules` state event. This is a Pangea-custom extension — the Matrix spec does not define this field. The code is set client-side when a course admin creates or configures a course.
 

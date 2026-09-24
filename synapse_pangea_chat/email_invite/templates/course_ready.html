@@ -1,0 +1,46 @@
+{% extends "_course_email_base.html" %}
+{% block title %}Your course is ready{% endblock %}
+{% block body %}
+                <p style="font-size: 20px; font-weight: 700; margin-bottom: 12px">
+                  Your course is ready
+                </p>
+                {% if request_summary %}
+                <p style="margin-bottom: 4px; font-size: 14px; color: #666">Your request:</p>
+                <p style="font-style: italic">&ldquo;{{ request_summary }}&rdquo;</p>
+                {% endif %}
+                <div class="feature">
+                  <p style="margin: 0 0 6px; font-weight: 700; color: #1a1a2e">
+                    {{ course_title }}
+                  </p>
+                  {% if course_description %}
+                  <p style="margin: 0; color: #333; font-size: 16px; line-height: 1.5">
+                    {{ course_description }}
+                  </p>
+                  {% endif %}
+                </div>
+                <p>
+                  Open the course to become its teacher. If you don't have a
+                  {{ app_name }} account yet, you'll create one first.
+                </p>
+                <div class="cta-block">
+                  <!--[if mso]>
+                    <v:roundrect
+                      xmlns:v="urn:schemas-microsoft-com:vml"
+                      xmlns:w="urn:schemas-microsoft-com:office:word"
+                      href="{{ claim_url }}"
+                      style="height: 48px; v-text-anchor: middle; width: 220px"
+                      arcsize="38%"
+                      fillcolor="#5e3acf"
+                      stroke="f"
+                    >
+                      <w:anchorlock />
+                      <center style="color: #ffffff; font-family: sans-serif; font-size: 16px; font-weight: 600">
+                        Open your course
+                      </center>
+                    </v:roundrect>
+                  <![endif]-->
+                  <!--[if !mso]><!-->
+                  <a href="{{ claim_url }}" class="cta-button">Open your course</a>
+                  <!--<![endif]-->
+                </div>
+{% endblock %}
