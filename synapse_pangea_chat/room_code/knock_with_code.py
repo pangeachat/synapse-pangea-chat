@@ -6,7 +6,7 @@ if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from synapse.api.errors import (
     AuthError,
@@ -23,6 +23,11 @@ from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.blocked_join_gate import is_blocked_by_room_admin
+from synapse_pangea_chat.email_invite.course_claim_notice import CourseClaimNotifier
+from synapse_pangea_chat.email_invite.course_claims import (
+    CourseClaim,
+    CourseClaimStore,
+)
 from synapse_pangea_chat.room_code.burn_admin_code import burn_admin_code
 from synapse_pangea_chat.room_code.constants import (
     ERRCODE_BANNED_FROM_ROOM,
@@ -39,11 +44,9 @@ try:
 except ImportError:
     # Sentry is an optional Synapse extra; without it captures are no-ops.
     sentry_sdk = None
+from synapse_pangea_chat.room_code.code_lookup import rooms_for_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.get_inviter_user import promote_user_to_admin
-from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
-    get_rooms_with_access_code,
-)
 from synapse_pangea_chat.room_code.invite_user_to_room import invite_user_to_room
 from synapse_pangea_chat.room_code.is_rate_limited import is_rate_limited
 from synapse_pangea_chat.room_code.user_is_room_member import (
@@ -53,6 +56,11 @@ from synapse_pangea_chat.room_code.user_is_room_member import (
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.room_code.knock_with_code"
 )
+
+
+class ClaimPromotionFailed(Exception):
+    """The claimer of a requested course could not be promoted; the claim is
+    held for them and the admin code left unburned, so they can retry."""
 
 
 def _capture_exception(e: Exception) -> None:
@@ -66,12 +74,20 @@ def _capture_exception(e: Exception) -> None:
 class KnockWithCode(Resource):
     isLeaf = True
 
-    def __init__(self, api: ModuleApi, config: PangeaChatConfig):
+    def __init__(
+        self,
+        api: ModuleApi,
+        config: PangeaChatConfig,
+        claim_store: CourseClaimStore,
+        notifier: CourseClaimNotifier,
+    ):
         super().__init__()
         self._api = api
         self._config = config
         self._auth = self._api._hs.get_auth()
         self._datastores = self._api._hs.get_datastores()
+        self._claim_store = claim_store
+        self._notifier = notifier
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -135,11 +151,12 @@ class KnockWithCode(Resource):
                 )
                 return
 
-            # Get the rooms with the access code
-            matches = await get_rooms_with_access_code(
-                access_code=access_code, room_store=self._datastores.main
+            # Join rules, and the claim record for a requested course's claim
+            # code, which members must not be able to read (code_lookup).
+            found = await rooms_for_code(
+                access_code, self._datastores.main, self._claim_store
             )
-            if matches is None:
+            if found is None:
                 respond_with_json(
                     request,
                     500,
@@ -147,6 +164,7 @@ class KnockWithCode(Resource):
                     send_cors=True,
                 )
                 return
+            matches, claim_room_ids = found
             if len(matches) == 0:
                 # 404, not 400: the request is well-formed — the code just
                 # doesn't exist. The errcode lets clients show a "check the
@@ -172,6 +190,10 @@ class KnockWithCode(Resource):
             # returned to the client — the refusal must not reveal the block
             # (see blocked-join-gate.instructions.md).
             blocked_rooms: List[str] = []
+            # Requested courses whose claim another account already holds: the
+            # narrow window between that account taking the claim and its
+            # promotion spending the code. The code is spent either way.
+            spent_rooms: List[str] = []
             for match in matches:
                 try:
                     membership = await get_user_room_membership(
@@ -179,7 +201,17 @@ class KnockWithCode(Resource):
                         user_id=requester_id,
                         room_id=match.room_id,
                     )
-                    if membership == MEMBERSHIP_JOIN:
+                    # Only the code a requested course was created with is a
+                    # claim; an admin code in join rules, such as one granted
+                    # later to a co-teacher, is an ordinary admin grant.
+                    claim: Optional[CourseClaim] = None
+                    if match.room_id in claim_room_ids:
+                        claim = await self._claim_store.get(match.room_id)
+                    # Holding the claim code proves the requesting inbox, and
+                    # it is in no state a member can read, so a member who
+                    # joined first (the teacher trying their class link, or a
+                    # claimer whose promotion failed) can still claim with it.
+                    if membership == MEMBERSHIP_JOIN and claim is None:
                         already_joined_rooms.append(match.room_id)
                         continue
                     if membership == MEMBERSHIP_BAN:
@@ -197,7 +229,14 @@ class KnockWithCode(Resource):
                     ):
                         blocked_rooms.append(match.room_id)
                         continue
-                    if membership != MEMBERSHIP_INVITE:
+                    if claim is not None and not await self._claim_store.claim(
+                        match.room_id,
+                        requester_id,
+                        self._api._hs.get_clock().time_msec(),
+                    ):
+                        spent_rooms.append(match.room_id)
+                        continue
+                    if membership not in (MEMBERSHIP_INVITE, MEMBERSHIP_JOIN):
                         # An already-invited user holds the invite the
                         # endpoint exists to issue; re-inviting is at best
                         # redundant and at worst a failure that hid the room
@@ -208,21 +247,49 @@ class KnockWithCode(Resource):
                             user_id=requester_id,
                             room_id=match.room_id,
                         )
-                    invited_rooms.append(match.room_id)
 
                     # Admin code: promote to admin and burn the code
                     if match.is_admin_code:
-                        await promote_user_to_admin(
+                        promoted = await promote_user_to_admin(
                             api=self._api,
                             room_id=match.room_id,
                             user_to_promote=requester_id,
                             invite_power=100,
                         )
-                        await burn_admin_code(
-                            api=self._api,
-                            room_id=match.room_id,
-                            burner_user_id=requester_id,
-                        )
+                        if claim is None:
+                            await burn_admin_code(
+                                api=self._api,
+                                room_id=match.room_id,
+                                burner_user_id=requester_id,
+                            )
+                        else:
+                            # A claim is spent, and its notice made owed, only
+                            # once the promotion is real, in one write. Failing
+                            # here leaves the code unspent and the claim held,
+                            # so the claimer can retry.
+                            if not promoted:
+                                raise ClaimPromotionFailed(
+                                    f"Promoting the claimer of {match.room_id} failed"
+                                )
+                            await self._claim_store.mark_promoted(
+                                match.room_id,
+                                requester_id,
+                                self._api._hs.get_clock().time_msec(),
+                            )
+                            # In the background: the code is spent, so a join
+                            # held open on a slow mail server and timed out
+                            # could not be retried. The notice is already
+                            # recorded as owed; the retry loop covers a send
+                            # that does not finish.
+                            run_in_background(
+                                self._notifier.notify, match.room_id, requester_id
+                            )
+                    # Listed only once everything for the room has succeeded,
+                    # so a room is in exactly one list.
+                    if membership == MEMBERSHIP_JOIN:
+                        already_joined_rooms.append(match.room_id)
+                    else:
+                        invited_rooms.append(match.room_id)
                 except Exception as e:
                     # A failed room must not block the others, but it must
                     # not vanish either: capture it, and count it so an
@@ -259,6 +326,26 @@ class KnockWithCode(Resource):
                         "errcode": ERRCODE_INVITE_FAILED,
                         "error": "Failed to invite to any room matching the code",
                         "failed": failed_rooms,
+                    },
+                    send_cors=True,
+                )
+                return
+            if (
+                spent_rooms
+                and not invited_rooms
+                and not already_joined_rooms
+                and not banned_rooms
+                and not failed_rooms
+                and not blocked_rooms
+            ):
+                # The admin code was used a moment ago by someone else: to
+                # this requester it is a code that no longer exists.
+                respond_with_json(
+                    request,
+                    404,
+                    {
+                        "errcode": ERRCODE_CODE_NOT_FOUND,
+                        "error": f"No rooms found with the access code: {access_code}",
                     },
                     send_cors=True,
                 )

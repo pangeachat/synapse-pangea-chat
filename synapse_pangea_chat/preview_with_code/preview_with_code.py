@@ -16,12 +16,11 @@ from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.preview_with_code.get_preview import get_room_preview_for_code
 from synapse_pangea_chat.preview_with_code.is_rate_limited import is_rate_limited
+from synapse_pangea_chat.room_code.code_lookup import rooms_for_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
-from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
-    get_rooms_with_access_code,
-)
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -34,12 +33,15 @@ logger = logging.getLogger(
 class PreviewWithCode(Resource):
     isLeaf = True
 
-    def __init__(self, api: ModuleApi, config: PangeaChatConfig):
+    def __init__(
+        self, api: ModuleApi, config: PangeaChatConfig, claim_store: CourseClaimStore
+    ):
         super().__init__()
         self._api = api
         self._config = config
         self._auth = self._api._hs.get_auth()
         self._datastores = self._api._hs.get_datastores()
+        self._claim_store = claim_store
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -101,10 +103,10 @@ class PreviewWithCode(Resource):
                 )
                 return
 
-            matches = await get_rooms_with_access_code(
-                access_code=access_code, room_store=self._datastores.main
+            found = await rooms_for_code(
+                access_code, self._datastores.main, self._claim_store
             )
-            if matches is None:
+            if found is None:
                 respond_with_json(
                     request,
                     500,
@@ -112,6 +114,7 @@ class PreviewWithCode(Resource):
                     send_cors=True,
                 )
                 return
+            matches, _ = found
             if len(matches) == 0:
                 respond_with_json(
                     request,

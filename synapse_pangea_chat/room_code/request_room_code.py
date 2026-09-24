@@ -20,10 +20,9 @@ from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
+from synapse_pangea_chat.room_code.code_lookup import code_is_taken
 from synapse_pangea_chat.room_code.generate_room_code import generate_access_code
-from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
-    get_rooms_with_access_code,
-)
 
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.room_code.request_room_code"
@@ -33,12 +32,15 @@ logger = logging.getLogger(
 class RequestRoomCode(Resource):
     isLeaf = True
 
-    def __init__(self, api: ModuleApi, config: PangeaChatConfig):
+    def __init__(
+        self, api: ModuleApi, config: PangeaChatConfig, claim_store: CourseClaimStore
+    ):
         super().__init__()
         self._api = api
         self._config = config
         self._auth = self._api._hs.get_auth()
         self._datastores = self._api._hs.get_datastores()
+        self._claim_store = claim_store
 
     def render_GET(self, request: SynapseRequest):
         run_in_background(self._async_render_GET, request)
@@ -54,11 +56,11 @@ class RequestRoomCode(Resource):
             while access_code is None and tries < max_tries:
                 _access_code = generate_access_code()
 
-                # Get the rooms with the access code
-                room_ids = await get_rooms_with_access_code(
-                    access_code=_access_code, room_store=self._datastores.main
-                )
-                if len(room_ids) == 0:
+                # Free in join rules and among claim codes, which are not
+                # in join rules (code_lookup).
+                if not await code_is_taken(
+                    _access_code, self._datastores.main, self._claim_store
+                ):
                     access_code = _access_code
                 tries += 1
             if access_code is None:

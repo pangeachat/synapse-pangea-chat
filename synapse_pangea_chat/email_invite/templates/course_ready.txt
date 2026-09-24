@@ -1,0 +1,11 @@
+Your course is ready
+{% if request_summary %}
+Your request: "{{ request_summary }}"
+{% endif %}
+{{ course_title }}
+{% if course_description %}{{ course_description }}
+{% endif %}
+Open the course to become its teacher. If you don't have a {{ app_name }} account yet, you'll create one first.
+
+Open your course:
+{{ claim_url }}

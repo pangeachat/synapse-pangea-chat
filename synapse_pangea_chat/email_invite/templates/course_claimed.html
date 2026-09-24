@@ -1,0 +1,28 @@
+{% extends "_course_email_base.html" %}
+{% block title %}Your course is ready to go{% endblock %}
+{% block body %}
+                <p style="font-size: 20px; font-weight: 700; margin-bottom: 12px">
+                  Congratulations! Your task-based conversation journey is ready
+                  to go!
+                </p>
+                <p style="margin-bottom: 8px">
+                  You can invite your students to <strong>{{ course_title }}</strong>
+                  by sharing the link below:
+                </p>
+                <div class="feature">
+                  <p style="margin: 0; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 15px; word-break: break-all">
+                    <a href="{{ class_url }}" style="color: #5e3acf">{{ class_url }}</a>
+                  </p>
+                </div>
+                <p>
+                  Students will be directed to make an account, automatically
+                  enrolled in your class and be conversing in curriculum-aligned
+                  conversation activities in no time.
+                </p>
+                <p>
+                  Your students will receive a free 7-day trial on account
+                  creation and can subscribe in-app afterwards. If you'd like to
+                  cover your students' seats, just hit reply for an invoice, to
+                  redeem a promotional offer, or any other questions.
+                </p>
+{% endblock %}
