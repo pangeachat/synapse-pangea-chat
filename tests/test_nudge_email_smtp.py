@@ -139,7 +139,7 @@ class TestNudgeEmailSMTP(BaseSynapseE2ETest):
             )
             confirmation = requests.get(unsub, timeout=20)
             self.assertEqual(confirmation.status_code, 200)
-            self.assertIn("Stop conversation and course suggestions", confirmation.text)
+            self.assertIn("conversation and course suggestions", confirmation.text)
             account_path = (
                 f"{self.server_url}/_synapse/admin/v1/users/{user}/accountdata"
             )

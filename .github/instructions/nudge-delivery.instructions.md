@@ -44,6 +44,8 @@ Refusal state is one global account-data event per user, `pangea.communication_p
 
 Every nudge email carries a link here in its footer and in the `List-Unsubscribe` / `List-Unsubscribe-Post: List-Unsubscribe=One-Click` headers. **GET only shows a confirmation page**; **POST performs the refusal** — a mail scanner that prefetches the link must not unsubscribe anyone (RFC 8058, and the org rule that no emailed link acts on GET). The page offers the category refusal and the global off; the one-click POST from a mail client refuses the category. A bad or expired token gets a 400 page pointing at the in-app screen. The read-merge-write of the store is serialized per person, so two unsubscribes racing each other (a category refusal and the global off) both survive; the module runs on the main process, which is what makes a process-local lock sufficient.
 
+The confirmation, success, and expired-link pages share a branded, responsive layout. The confirmation separates the current category from the global stop option. Do not promise in-app re-enabling until [client#9234](https://github.com/pangeachat/client/issues/9234) ships.
+
 ## The click record
 
 `GET /_synapse/client/pangea/v1/n?t=<token>` — unauthenticated, rate-limited per client address.
