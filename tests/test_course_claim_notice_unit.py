@@ -8,9 +8,9 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse_pangea_chat.config import PangeaChatConfig
+from synapse_pangea_chat.email_invite.course_claim_emails import SEND_TIMEOUT_SECONDS
 from synapse_pangea_chat.email_invite.course_claim_notice import (
     NOTICE_LEASE_MS,
-    SEND_TIMEOUT_SECONDS,
     ClaimNoticeAbandoned,
     CourseClaimNotifier,
 )
@@ -88,22 +88,7 @@ class TestNotify(unittest.IsolatedAsyncioTestCase):
         self.capture.assert_called_once()
         store.mark_notice_sent.assert_not_called()
 
-    async def test_a_send_that_times_out_is_captured_and_left_owed(self) -> None:
-        from twisted.internet import defer
-
-        notifier, store, _ = _notifier(NoticeReservation(REQUESTED, 1))
-
-        with patch(
-            f"{MODULE}.timeout_deferred",
-            return_value=defer.fail(defer.TimeoutError()),
-        ) as bounded:
-            await notifier.notify(ROOM, CLAIMER)
-
-        self.assertEqual(bounded.call_args.kwargs["timeout"], SEND_TIMEOUT_SECONDS)
-        self.capture.assert_called_once()
-        store.mark_notice_sent.assert_not_called()
-
-    def test_a_send_is_bounded_well_inside_its_lease(self) -> None:
+    def test_the_lease_outlasts_the_mailers_bound(self) -> None:
         self.assertLess(SEND_TIMEOUT_SECONDS * 1000 * 2, NOTICE_LEASE_MS)
 
     async def test_last_attempt_failing_is_reported_as_abandoned(self) -> None:

@@ -252,3 +252,38 @@ class TestClaimEmailTemplates(unittest.TestCase):
         )
         self.assertNotIn("<script>", out)
         self.assertNotIn("<b>x</b>", out)
+
+
+class TestMailerBound(unittest.IsolatedAsyncioTestCase):
+    """Every claim email is bounded: Synapse's mailer does not time out a
+    stalled SMTP transaction (course_claim_emails)."""
+
+    async def test_a_stalled_send_raises_instead_of_hanging(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from twisted.internet import defer
+
+        from synapse_pangea_chat.email_invite import course_claim_emails
+
+        api = MagicMock()
+        api.read_templates.return_value = [MagicMock() for _ in range(4)]
+        mailer = course_claim_emails.CourseClaimMailer(api)
+
+        with patch.object(
+            course_claim_emails,
+            "timeout_deferred",
+            return_value=defer.fail(defer.TimeoutError()),
+        ) as bounded:
+            with self.assertRaises(defer.TimeoutError):
+                await mailer.send_course_ready(
+                    email_address="teacher@school.example",
+                    course_title="Spanish 1",
+                    course_description="",
+                    request_summary=None,
+                    claim_url="https://app.pangea.chat/adm1nab",
+                )
+
+        self.assertEqual(
+            bounded.call_args.kwargs["timeout"],
+            course_claim_emails.SEND_TIMEOUT_SECONDS,
+        )
