@@ -58,7 +58,7 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 
 ## Claiming a course: one code, two outcomes
 
-A course created for a teacher who does not yet have an account (the [course request](../../../.github/.github/instructions/course-request.instructions.md) flow) has nobody to administer it: the bot creates the space, so the bot is its only admin. The teacher has to be able to take ownership by following an ordinary link, before they have any standing in the room.
+A course created for a teacher who does not yet have an account (the [course request](../../../.github/.github/instructions/teacher-funnel.instructions.md) flow) has nobody to administer it: the bot creates the space, so the bot is its only admin. The teacher has to be able to take ownership by following an ordinary link, before they have any standing in the room.
 
 **One code does both jobs.** The code in a course's invitation is the same code the teacher later gives their class. What differs is not the link but who is using it: the teacher's first join claims the course and makes them its admin; every join after that, and every join by anyone else, is an ordinary member join. A teacher never has two codes to tell apart, and there is no private link that must not be forwarded.
 

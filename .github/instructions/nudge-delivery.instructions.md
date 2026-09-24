@@ -5,7 +5,7 @@ description: "Nudge delivery — the Synapse module's contracts for carrying a b
 
 # Nudge Delivery — Synapse Module
 
-The delivery half of the org design: [user-communication-controls](../../../.github/.github/instructions/user-communication-controls.instructions.md) says everything learner-facing travels the Synapse path with refusals in first-party account data, and [engagement-decisions](../../../.github/.github/instructions/engagement-decisions.instructions.md) fixes the channel order — in-app when present, push when a working device exists, email otherwise. This module implements both for the bot's nudges. Category and variant names are the org catalog's; nothing here defines one.
+The delivery half of the org design: [user-communication-controls](../../../.github/.github/instructions/user-communication-controls.instructions.md) says everything learner-facing travels the Synapse path with refusals in first-party account data, and fixes the channel order — in-app when present, push when a working device exists, email otherwise. This module implements both for the bot's nudges. Category and variant names are the org catalog's; nothing here defines one.
 
 For Synapse Admin API, Module API, and Matrix spec documentation links, see [synapse-docs.instructions.md](../../../.github/.github/instructions/synapse-docs.instructions.md).
 
