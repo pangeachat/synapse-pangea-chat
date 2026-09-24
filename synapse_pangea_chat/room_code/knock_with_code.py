@@ -279,7 +279,14 @@ class KnockWithCode(Resource):
                             burner_user_id=requester_id,
                         )
                         if claim is not None:
-                            await self._notifier.notify(match.room_id, requester_id)
+                            # In the background: the code is spent, so a join
+                            # held open on a slow mail server and timed out
+                            # could not be retried. The notice is already
+                            # recorded as owed; the retry loop covers a send
+                            # that does not finish.
+                            run_in_background(
+                                self._notifier.notify, match.room_id, requester_id
+                            )
                     # Listed only once everything for the room has succeeded,
                     # so a room is in exactly one list.
                     if membership == MEMBERSHIP_JOIN:
