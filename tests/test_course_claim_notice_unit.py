@@ -36,10 +36,6 @@ def _notifier(
     name = MagicMock(type="m.room.name")
     name.content = {"name": "Spanish 1"}
     api.get_room_state = AsyncMock(return_value={"j": join_rules, "n": name})
-    api.is_mine.return_value = True
-    api.get_profile_for_user = AsyncMock(
-        return_value=MagicMock(display_name="Ms. Rivera")
-    )
     store = MagicMock()
     store.reserve_notice = AsyncMock(return_value=reservation)
     store.mark_notice_sent = AsyncMock()
@@ -69,8 +65,6 @@ class TestNotify(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["email_address"], REQUESTED)
         self.assertEqual(sent["class_code"], "cls4abc")
         self.assertEqual(sent["class_url"], "https://app.pangea.chat/cls4abc")
-        self.assertEqual(sent["claimed_by_user_id"], CLAIMER)
-        self.assertEqual(sent["claimed_by_display_name"], "Ms. Rivera")
         self.assertEqual(sent["course_title"], "Spanish 1")
         store.mark_notice_sent.assert_awaited_once_with(ROOM, CLAIMER, 1_000)
         self.capture.assert_not_called()

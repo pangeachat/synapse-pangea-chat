@@ -3,7 +3,7 @@
 knock-with-code.instructions.md ("Claiming a course"): the requesting address
 gets the claim link first and nothing for students; whoever uses it first
 becomes admin; the class code never grants admin; the class link then goes to
-the requesting address and names the claimer. create-course-space: the address
+the requesting address. create-course-space: the address
 stays out of room state.
 
 The homeserver sends through a local SMTP sink, so the assertions are on the
@@ -198,7 +198,6 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 assert claimed is not None
                 claimed_text = body_text(claimed)
                 self.assertIn(f"{APP_BASE_URL}/{class_code}", claimed_text)
-                self.assertIn(teacher_id, claimed_text)
                 self.assertNotIn(admin_code, claimed_text)
 
                 # The address is cleared once it has done its job.

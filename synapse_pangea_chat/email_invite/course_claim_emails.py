@@ -3,10 +3,8 @@
 1. Course ready: sent by ``create_course_space`` to the requesting address. It
    carries only the claim link, behind a button, and nothing that belongs with
    students.
-2. Course claimed: sent by ``knock_with_code`` when the admin code is used, to
-   the requesting address rather than the claiming account. It carries the class
-   link and code, and names the account that now holds the course, so it doubles
-   as the claim notice.
+2. Course claimed: sent once the admin code is used, to the requesting address
+   rather than the claiming account. It carries the class link.
 
 Both go through Synapse's own mail path (the homeserver's ``email`` config), and
 the templates ship inside the package, as the nudge emails' do.
@@ -78,16 +76,12 @@ class CourseClaimMailer:
         *,
         email_address: str,
         course_title: str,
-        claimed_by_user_id: str,
-        claimed_by_display_name: Optional[str],
         class_url: str,
         class_code: str,
     ) -> None:
         template_vars = {
             "app_name": self._app_name,
             "course_title": course_title,
-            "claimed_by_user_id": claimed_by_user_id,
-            "claimed_by_display_name": claimed_by_display_name,
             "class_url": class_url,
             "class_code": class_code,
         }

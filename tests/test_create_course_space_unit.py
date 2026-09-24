@@ -195,7 +195,7 @@ class TestSendClaimLink(unittest.IsolatedAsyncioTestCase):
 
 class TestClaimEmailTemplates(unittest.TestCase):
     """The rendered emails: the first carries the claim link and nothing for
-    students; the second carries the class link and names the claimer."""
+    students; the second carries the class link."""
 
     @staticmethod
     def _env() -> Any:
@@ -232,15 +232,11 @@ class TestClaimEmailTemplates(unittest.TestCase):
                 out = env.get_template(name).render(
                     app_name="Pangea Chat",
                     course_title="Spanish 1",
-                    claimed_by_user_id="@rivera:pangea.chat",
-                    claimed_by_display_name="Ms. Rivera",
                     class_url="https://app.pangea.chat/cls4abc",
                     class_code="cls4abc",
                 )
                 self.assertIn("https://app.pangea.chat/cls4abc", out)
                 self.assertIn("cls4abc", out)
-                self.assertIn("@rivera:pangea.chat", out)
-                self.assertIn("Ms. Rivera", out)
 
     def test_html_escapes_request_text(self) -> None:
         out = (

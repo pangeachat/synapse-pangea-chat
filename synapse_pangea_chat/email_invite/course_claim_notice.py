@@ -1,11 +1,11 @@
 """Sending the claim notice, once, with a retry for a failed send.
 
 The notice is the second email of a requested course's claim: the class link,
-sent to the address the course was requested from and naming the account that
-claimed it (knock-with-code.instructions.md, "Claiming a course"). It is how the
-requesting teacher learns their course was claimed, so a transient mail failure
-must not lose it: the admin code is already burned by then, and resubmitting
-the link answers "code not found".
+sent to the address the course was requested from
+(knock-with-code.instructions.md, "Claiming a course"). It is how the teacher
+gets the link to share, so a transient mail failure must not lose it: the admin
+code is already spent by then, and resubmitting the link answers "code not
+found".
 
 ``notify`` sends it under a lease from the claim store. ``knock_with_code``
 calls it right after the claim; a looping call retries every owed notice whose
@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Any, Optional, cast
 from synapse.api.constants import EventTypes
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import ModuleApi
-from synapse.types import UserID
 
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
@@ -121,8 +120,6 @@ class CourseClaimNotifier:
             await self._mailer.send_course_claimed(
                 email_address=reservation.requested_email,
                 course_title=course_title,
-                claimed_by_user_id=claimer_id,
-                claimed_by_display_name=await self._display_name(claimer_id),
                 class_url=build_join_url(self._config.app_base_url, class_code),
                 class_code=class_code,
             )
@@ -160,11 +157,3 @@ class CourseClaimNotifier:
         if not isinstance(class_code, str) or not class_code:
             raise ValueError(f"Claimed course {room_id} has no class code")
         return title, class_code
-
-    async def _display_name(self, user_id: str) -> Optional[str]:
-        if not self._api.is_mine(user_id):
-            return None
-        profile = await self._api.get_profile_for_user(
-            UserID.from_string(user_id).localpart
-        )
-        return profile.display_name

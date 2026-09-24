@@ -28,7 +28,7 @@ Lives in the `email_invite/` sub-package alongside `invite_by_email`.
 
 ## Who the course is created for
 
-The endpoint is told the address the course was requested from and records it. That address is where the claim link goes, and where the claim notice goes once the course is claimed; the teacher's Pangea account is never matched against it. It is recorded because nobody from the course is a member until the claim, so at claim time there is nowhere else to find it.
+The endpoint is told the address the course was requested from and records it. That address is where the claim link goes, and where the class link goes once the course is claimed; the teacher's Pangea account is never matched against it. It is recorded because nobody from the course is a member until the claim, so at claim time there is nowhere else to find it.
 
 The address is kept out of room state. Every member of a course can read its room state, so an address stored there would be visible to every student who joins.
 
