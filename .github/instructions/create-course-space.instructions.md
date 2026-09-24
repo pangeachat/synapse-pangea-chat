@@ -4,7 +4,7 @@ applyTo: "synapse_pangea_chat/email_invite/create_course_space.py,synapse_pangea
 
 # Create Course Space — Synapse Module
 
-Cross-repo design: [course-request.instructions.md](../../../.github/.github/instructions/course-request.instructions.md)
+Cross-repo design: [course-request.instructions.md](../../../.github/.github/instructions/teacher-funnel.instructions.md)
 
 ## Endpoint
 
