@@ -10,7 +10,7 @@ Use the repo's development `.venv` (setup in `.github/instructions/testing.instr
 
 Open http://127.0.0.1:8765 and refresh after editing a template. The server reads the shipped Jinja templates on each request, binds only to loopback, and serves HTML at `/email.html` and plain text at `/email.txt`. Ctrl-C stops it. `--port 0` chooses an available port and prints it.
 
-Use `--data /path/to/copy.json` to override `title`, `body`, `cta_label`, `category_label`, or other template values. Changes to that JSON also appear on refresh. The default CTA and unsubscribe destinations are inert local preview links. Without `--serve`, the command writes `email.html` and `email.txt` to `/tmp/pangea-nudge-preview`; choose another directory with `--output`.
+Use `--data /path/to/copy.json` to override `title`, `body`, `cta_label`, `category_label`, or other template values. Changes to that JSON also appear on refresh. The default CTA is an inert local link. The Unsubscribe link opens `/unsubscribe`, rendering the actual confirmation template. Submitting either choice returns a preview-only message and never changes preferences. Without `--serve`, the command writes `email.html` and `email.txt` to `/tmp/pangea-nudge-preview`; choose another directory with `--output`.
 
 Browser previews cover layout, responsive CSS, and the browser's light/dark appearance. They do not emulate Gmail or Outlook's HTML transformations.
 

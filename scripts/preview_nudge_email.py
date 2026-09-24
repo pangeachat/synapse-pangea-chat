@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = ROOT / "synapse_pangea_chat/nudge_delivery/templates"
 
 
-def render(data_path: Path | None = None) -> tuple[str, str]:
+def template_context(data_path: Path | None = None):
     env = Environment(
         loader=FileSystemLoader(TEMPLATES),
         autoescape=select_autoescape(),
@@ -27,7 +27,7 @@ def render(data_path: Path | None = None) -> tuple[str, str]:
         "body": "A little practice goes a long way. Start a conversation and try something new today.",
         "cta_label": "Open Pangea Chat",
         "cta_url": "http://127.0.0.1/preview-only/cta",
-        "unsubscribe_url": "http://127.0.0.1/preview-only/unsubscribe",
+        "unsubscribe_url": "/unsubscribe",
         "category_label": "conversation and course suggestions",
     }
     values["postal_address"] = (
@@ -35,6 +35,11 @@ def render(data_path: Path | None = None) -> tuple[str, str]:
     )
     if data_path:
         values.update(json.loads(data_path.read_text()))
+    return env, values
+
+
+def render(data_path: Path | None = None) -> tuple[str, str]:
+    env, values = template_context(data_path)
     return tuple(
         env.get_template("nudge_email." + extension).render(**values)
         for extension in ("html", "txt")
@@ -47,11 +52,16 @@ class PreviewHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def do_GET(self):
-        if self.path not in ("/", "/email.html", "/email.txt"):
+        if self.path not in ("/", "/email.html", "/email.txt", "/unsubscribe"):
             self.send_error(404, "Preview-only link; no action performed")
             return
         try:
             html, plain = render(self.data_path)
+            if self.path == "/unsubscribe":
+                env, values = template_context(self.data_path)
+                html = env.get_template("nudge_unsubscribe_confirm.html").render(
+                    **values, token="local-preview-only"
+                )
         except Exception as error:
             self.log_error("Render failed: %s", error)
             self.send_error(500, "Template render failed; see terminal")
@@ -69,6 +79,9 @@ class PreviewHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        self.send_error(405, "Local preview only: no email preferences were changed")
 
 
 def main():
