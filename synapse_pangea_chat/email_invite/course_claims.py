@@ -11,11 +11,16 @@ students who join (create-course-space.instructions.md).
 
 The row does four jobs beyond holding the address:
 
-- It holds the claim code. A requested course's admin code is never written
-  to room state: every member can read ``m.room.join_rules``, so a student who
-  joined with the class code could read it there and claim the course. Only
-  its digest is kept, here, and ``rooms_for_admin_code`` is how
-  ``knock_with_code`` finds the room. Promotion spends it.
+- It holds the claim codes. A requested course's admin codes are never
+  written to room state: every member can read ``m.room.join_rules``, so a
+  student who joined with the class code could read one there and claim the
+  course. Only their digests are kept, one row each in
+  ``pangea_course_claim_code``: the code the course was created with, and one
+  more for every reminder (``add_code``). ``rooms_for_admin_code`` is how
+  ``knock_with_code`` finds the room from any of them. Promotion spends them
+  all at once. ``pangea_course_claim.admin_code_sha256`` still holds the
+  creation code for rows written before the code table existed; the table is
+  backfilled from it and it is otherwise unread.
 - It makes the claim single use under concurrency: the conditional update in
   ``claim`` lets one account through.
 - It makes the claim notice send once. ``reserve_notice`` takes a lease before
@@ -34,6 +39,7 @@ from typing import Any, List, Optional, Tuple
 import attr
 
 COURSE_CLAIM_TABLE = "pangea_course_claim"
+COURSE_CLAIM_CODE_TABLE = "pangea_course_claim_code"
 
 #: Sends of one claim notice before the retry gives up on it.
 MAX_NOTICE_ATTEMPTS = 8
@@ -55,6 +61,40 @@ _CREATE_TABLE_SQL = """
     )
 """
 
+_CREATE_CODE_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS pangea_course_claim_code (
+        admin_code_sha256 TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL,
+        created_at_ms BIGINT NOT NULL
+    )
+"""
+
+_CREATE_CODE_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS pangea_course_claim_code_room_idx
+    ON pangea_course_claim_code (room_id)
+"""
+
+# Courses created before the code table carry their one code in the claim row.
+# Copied over on every start; the NOT EXISTS makes it a no-op once done.
+_BACKFILL_CODES_SQL = """
+    INSERT INTO pangea_course_claim_code (admin_code_sha256, room_id, created_at_ms)
+    SELECT k.admin_code_sha256, k.room_id, k.created_at_ms
+    FROM pangea_course_claim k
+    WHERE NOT EXISTS (
+        SELECT 1 FROM pangea_course_claim_code c
+        WHERE c.admin_code_sha256 = k.admin_code_sha256
+    )
+"""
+
+_INSERT_CODE_SQL = """
+    INSERT INTO pangea_course_claim_code (admin_code_sha256, room_id, created_at_ms)
+    VALUES (?, ?, ?)
+"""
+
+_DELETE_CODE_SQL = """
+    DELETE FROM pangea_course_claim_code WHERE admin_code_sha256 = ?
+"""
+
 _INSERT_SQL = """
     INSERT INTO pangea_course_claim
         (room_id, requested_email, admin_code_sha256, created_at_ms)
@@ -62,12 +102,20 @@ _INSERT_SQL = """
 """
 
 _ROOMS_FOR_CODE_SQL = """
-    SELECT room_id FROM pangea_course_claim
-    WHERE admin_code_sha256 = ? AND promoted_at_ms IS NULL
+    SELECT c.room_id
+    FROM pangea_course_claim_code c
+    JOIN pangea_course_claim k ON k.room_id = c.room_id
+    WHERE c.admin_code_sha256 = ? AND k.promoted_at_ms IS NULL
 """
 
 _CODE_IN_USE_SQL = """
-    SELECT 1 FROM pangea_course_claim WHERE admin_code_sha256 = ?
+    SELECT 1 FROM pangea_course_claim_code WHERE admin_code_sha256 = ?
+"""
+
+_REMINDER_SQL = """
+    SELECT requested_email, claimed_by
+    FROM pangea_course_claim
+    WHERE room_id = ?
 """
 
 _SELECT_SQL = """
@@ -132,9 +180,15 @@ _OUTSTANDING_SQL = """
 #: Every statement above, for the drift test.
 STATEMENTS = (
     _CREATE_TABLE_SQL,
+    _CREATE_CODE_TABLE_SQL,
+    _CREATE_CODE_INDEX_SQL,
+    _BACKFILL_CODES_SQL,
+    _INSERT_CODE_SQL,
+    _DELETE_CODE_SQL,
     _INSERT_SQL,
     _ROOMS_FOR_CODE_SQL,
     _CODE_IN_USE_SQL,
+    _REMINDER_SQL,
     _SELECT_SQL,
     _CLAIM_SQL,
     _PROMOTED_SQL,
@@ -157,6 +211,14 @@ class CourseClaim:
 
 
 @attr.s(frozen=True, auto_attribs=True)
+class ReminderTarget:
+    """What a reminder needs from a room's claim record."""
+
+    requested_email: Optional[str]
+    claimed: bool
+
+
+@attr.s(frozen=True, auto_attribs=True)
 class NoticeReservation:
     requested_email: str
     attempt: int
@@ -175,6 +237,9 @@ class CourseClaimStore:
 
         def _create(txn: Any) -> None:
             txn.execute(_CREATE_TABLE_SQL)
+            txn.execute(_CREATE_CODE_TABLE_SQL)
+            txn.execute(_CREATE_CODE_INDEX_SQL)
+            txn.execute(_BACKFILL_CODES_SQL)
 
         await self._db_pool.runInteraction("pangea_course_claim_create", _create)
         self._table_ready = True
@@ -188,13 +253,48 @@ class CourseClaimStore:
     ) -> None:
         await self._ensure_table()
 
+        digest = admin_code_digest(admin_code)
+
         def _insert(txn: Any) -> None:
-            txn.execute(
-                _INSERT_SQL,
-                (room_id, requested_email, admin_code_digest(admin_code), now_ms),
-            )
+            txn.execute(_INSERT_SQL, (room_id, requested_email, digest, now_ms))
+            txn.execute(_INSERT_CODE_SQL, (digest, room_id, now_ms))
 
         await self._db_pool.runInteraction("pangea_course_claim_record", _insert)
+
+    async def add_code(self, room_id: str, admin_code: str, now_ms: int) -> None:
+        """Another claim code for a course: valid until the course is claimed."""
+        await self._ensure_table()
+        digest = admin_code_digest(admin_code)
+
+        def _insert(txn: Any) -> None:
+            txn.execute(_INSERT_CODE_SQL, (digest, room_id, now_ms))
+
+        await self._db_pool.runInteraction("pangea_course_claim_add_code", _insert)
+
+    async def remove_code(self, admin_code: str) -> None:
+        """Withdraw a code that was never delivered."""
+        await self._ensure_table()
+        digest = admin_code_digest(admin_code)
+
+        def _delete(txn: Any) -> None:
+            txn.execute(_DELETE_CODE_SQL, (digest,))
+
+        await self._db_pool.runInteraction("pangea_course_claim_remove_code", _delete)
+
+    async def reminder_target(self, room_id: str) -> Optional[ReminderTarget]:
+        """None when the room has no claim record."""
+        await self._ensure_table()
+
+        def _select(txn: Any) -> Optional[ReminderTarget]:
+            txn.execute(_REMINDER_SQL, (room_id,))
+            row = txn.fetchone()
+            if row is None:
+                return None
+            return ReminderTarget(requested_email=row[0], claimed=row[1] is not None)
+
+        return await self._db_pool.runInteraction(
+            "pangea_course_claim_reminder_target", _select
+        )
 
     async def rooms_for_admin_code(self, admin_code: str) -> List[str]:
         """Rooms whose unspent claim code this is."""

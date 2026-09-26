@@ -266,7 +266,7 @@ class TestMailerBound(unittest.IsolatedAsyncioTestCase):
         from synapse_pangea_chat.email_invite import course_claim_emails
 
         api = MagicMock()
-        api.read_templates.return_value = [MagicMock() for _ in range(4)]
+        api.read_templates.return_value = [MagicMock() for _ in range(6)]
         mailer = course_claim_emails.CourseClaimMailer(api)
 
         with patch.object(

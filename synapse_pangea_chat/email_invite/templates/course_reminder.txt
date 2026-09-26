@@ -1,0 +1,4 @@
+{% for paragraph in paragraphs %}{{ paragraph }}
+
+{% endfor %}{{ cta_label }}:
+{{ claim_url }}

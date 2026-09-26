@@ -37,14 +37,13 @@ from synapse_pangea_chat.grant_instructor_analytics_access.grant_instructor_anal
     COURSE_SETTINGS_STATE_EVENT_TYPE,
     REQUIRE_ANALYTICS_ACCESS_KEY,
 )
-from synapse_pangea_chat.room_code.code_lookup import code_is_taken
+from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 from synapse_pangea_chat.room_code.constants import (
     ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
     EVENT_TYPE_M_ROOM_JOIN_RULES,
     KNOCK_JOIN_RULE_VALUE,
 )
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
-from synapse_pangea_chat.room_code.generate_room_code import generate_access_code
 
 try:
     import sentry_sdk  # type: ignore[import-not-found]
@@ -192,7 +191,9 @@ class CreateCourseSpace(Resource):
             )
 
             # Generate two unique access codes
-            student_code = await self._generate_unique_code()
+            student_code = await new_unique_code(
+                self._datastores.main, self._claim_store
+            )
             if student_code is None:
                 respond_with_json(
                     request,
@@ -202,7 +203,7 @@ class CreateCourseSpace(Resource):
                 )
                 return
 
-            admin_code = await self._generate_unique_code()
+            admin_code = await new_unique_code(self._datastores.main, self._claim_store)
             if admin_code is None:
                 respond_with_json(
                     request,
@@ -398,11 +399,3 @@ class CreateCourseSpace(Resource):
             _capture_exception(e)
             return False
         return True
-
-    async def _generate_unique_code(self) -> str | None:
-        """Generate an access code that doesn't conflict with existing ones."""
-        for _ in range(10):
-            code = generate_access_code()
-            if not await code_is_taken(code, self._datastores.main, self._claim_store):
-                return code
-        return None
