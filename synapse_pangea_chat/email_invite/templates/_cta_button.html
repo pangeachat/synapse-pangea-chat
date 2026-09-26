@@ -1,0 +1,24 @@
+{#- The standard call-to-action button, with the Outlook (VML) fallback. -#}
+{% macro cta_button(url, label) %}
+                <div class="cta-block">
+                  <!--[if mso]>
+                    <v:roundrect
+                      xmlns:v="urn:schemas-microsoft-com:vml"
+                      xmlns:w="urn:schemas-microsoft-com:office:word"
+                      href="{{ url }}"
+                      style="height: 48px; v-text-anchor: middle; width: 220px"
+                      arcsize="38%"
+                      fillcolor="#5e3acf"
+                      stroke="f"
+                    >
+                      <w:anchorlock />
+                      <center style="color: #ffffff; font-family: sans-serif; font-size: 16px; font-weight: 600">
+                        {{ label }}
+                      </center>
+                    </v:roundrect>
+                  <![endif]-->
+                  <!--[if !mso]><!-->
+                  <a href="{{ url }}" class="cta-button">{{ label }}</a>
+                  <!--<![endif]-->
+                </div>
+{%- endmacro %}

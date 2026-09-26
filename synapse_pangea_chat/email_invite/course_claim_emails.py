@@ -5,6 +5,9 @@
    students.
 2. Course claimed: sent once the admin code is used, to the requesting address
    rather than the claiming account. It carries the class link.
+3. Claim reminder: sent on a server admin's request to a course not yet
+   claimed, with a new claim link. The caller renders its words, so it does not
+   change when the message catalog's templates arrive.
 
 Both go through Synapse's own mail path (the homeserver's ``email`` config), and
 the templates ship inside the package, as the nudge emails' do.
@@ -20,6 +23,7 @@ may still deliver later.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Optional
 
 from synapse.logging.context import make_deferred_yieldable, run_in_background
@@ -39,6 +43,13 @@ def _subject_title(title: str) -> str:
     return " ".join(title.split())[:MAX_SUBJECT_TITLE_LENGTH]
 
 
+def reminder_paragraphs(body: str) -> list[str]:
+    """A reminder body's paragraphs: separated by a blank line, each with its
+    own line breaks folded into spaces."""
+    blocks = [" ".join(block.split()) for block in re.split(r"\n\s*\n", body)]
+    return [block for block in blocks if block]
+
+
 class CourseClaimMailer:
     def __init__(self, api: ModuleApi) -> None:
         hs: Any = api._hs
@@ -50,12 +61,16 @@ class CourseClaimMailer:
             self._ready_text,
             self._claimed_html,
             self._claimed_text,
+            self._reminder_html,
+            self._reminder_text,
         ] = api.read_templates(
             [
                 "course_ready.html",
                 "course_ready.txt",
                 "course_claimed.html",
                 "course_claimed.txt",
+                "course_reminder.html",
+                "course_reminder.txt",
             ],
             custom_template_directory=TEMPLATES_DIR,
         )
@@ -104,6 +119,30 @@ class CourseClaimMailer:
             app_name=self._app_name,
             html=self._claimed_html.render(**template_vars),
             text=self._claimed_text.render(**template_vars),
+        )
+
+    async def send_course_reminder(
+        self,
+        *,
+        email_address: str,
+        subject: str,
+        body: str,
+        cta_label: str,
+        claim_url: str,
+    ) -> None:
+        template_vars = {
+            "app_name": self._app_name,
+            "subject": subject,
+            "paragraphs": reminder_paragraphs(body),
+            "cta_label": cta_label,
+            "claim_url": claim_url,
+        }
+        await self._send(
+            email_address=email_address,
+            subject=_subject_title(subject),
+            app_name=self._app_name,
+            html=self._reminder_html.render(**template_vars),
+            text=self._reminder_text.render(**template_vars),
         )
 
     async def _send(self, **kwargs: Any) -> None:

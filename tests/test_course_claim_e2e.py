@@ -26,6 +26,8 @@ CREATE_COURSE_SPACE_PATH = "/_synapse/client/pangea/v1/create_course_space"
 KNOCK_WITH_CODE_PATH = "/_synapse/client/pangea/v1/knock_with_code"
 APP_BASE_URL = "https://app.example.test"
 REQUESTED = "requester@school.example"
+REMINDER_PATH = "/_synapse/client/pangea/v1/send_course_claim_reminder"
+PREVIEW_PATH = "/_synapse/client/pangea/v1/preview_with_code"
 PASSWORD = "123123123"
 
 
@@ -234,6 +236,99 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 self.assertEqual(self._power_level(bot, room_id, latecomer_id), 100)
                 await asyncio.sleep(1)
                 self.assertEqual(len(sink.messages_to(REQUESTED)), 2)
+            finally:
+                self.stop_synapse(
+                    server_process=server_process,
+                    stdout_thread=stdout_thread,
+                    stderr_thread=stderr_thread,
+                    synapse_dir=synapse_dir,
+                    postgres=postgres,
+                )
+
+    async def test_a_reminder_link_claims_and_spends_the_first(self) -> None:
+        """create-course-space "Claim reminders": a reminder carries a new
+        claim link; every link works until the claim, which spends them all."""
+        postgres = None
+        synapse_dir = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+
+        with SmtpSink() as sink:
+            try:
+                (
+                    postgres,
+                    synapse_dir,
+                    config_path,
+                    server_process,
+                    stdout_thread,
+                    stderr_thread,
+                ) = await self.start_test_synapse(
+                    module_config={"app_base_url": APP_BASE_URL},
+                    synapse_config_overrides={"email": sink.synapse_email_config()},
+                )
+                for user, admin in (("bot", True), ("teacher", False)):
+                    await self.register_user(
+                        config_path=config_path,
+                        dir=synapse_dir,
+                        user=user,
+                        password=PASSWORD,
+                        admin=admin,
+                    )
+                _, bot = await self.login_user("bot", PASSWORD)
+                teacher_id, teacher = await self.login_user("teacher", PASSWORD)
+
+                response = self._post(
+                    CREATE_COURSE_SPACE_PATH,
+                    bot,
+                    {"title": "Spanish 1", "teacher_email": REQUESTED},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                room_id = response.json()["room_id"]
+                first_code = response.json()["admin_access_code"]
+                self.assertIsNotNone(sink.wait_for(REQUESTED, "Your course is ready"))
+
+                reminder_body = {
+                    "room_id": room_id,
+                    "subject": "Your course is waiting",
+                    "body": "Your course is ready.\n\nOpen it to become its teacher.",
+                    "cta_label": "Open your course",
+                }
+                # Only a server admin may send one.
+                refused = self._post(REMINDER_PATH, teacher, reminder_body)
+                self.assertEqual(refused.status_code, 403, refused.text)
+
+                sent = self._post(REMINDER_PATH, bot, reminder_body)
+                self.assertEqual(sent.status_code, 200, sent.text)
+                self.assertEqual(sent.json(), {"sent": True})
+                reminder = sink.wait_for(REQUESTED, "Your course is waiting")
+                self.assertIsNotNone(reminder)
+                assert reminder is not None
+                reminder_text = body_text(reminder)
+                self.assertIn("Open it to become its teacher.", reminder_text)
+                prefix = f"{APP_BASE_URL}/"
+                start = reminder_text.index(prefix) + len(prefix)
+                reminder_code = reminder_text[start : start + 7]
+                self.assertNotEqual(reminder_code.lower(), first_code.lower())
+
+                # Both links open the course until it is claimed.
+                for code in (first_code, reminder_code):
+                    preview = self._post(PREVIEW_PATH, bot, {"access_code": code})
+                    self.assertEqual(preview.status_code, 200, preview.text)
+                    self.assertIn(room_id, preview.text)
+
+                # Claiming with the reminder's link spends the first one too.
+                await self._join_with_code(teacher, reminder_code, room_id)
+                self.assertEqual(self._power_level(bot, room_id, teacher_id), 100)
+                self.assertIsNotNone(sink.wait_for(REQUESTED, "Invite your students"))
+                spent = self._post(
+                    KNOCK_WITH_CODE_PATH, teacher, {"access_code": first_code}
+                )
+                self.assertEqual(spent.status_code, 404, spent.text)
+
+                # A claimed course takes no more reminders.
+                after = self._post(REMINDER_PATH, bot, reminder_body)
+                self.assertEqual(after.status_code, 409, after.text)
             finally:
                 self.stop_synapse(
                     server_process=server_process,

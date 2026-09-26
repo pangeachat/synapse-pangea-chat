@@ -1,5 +1,5 @@
 ---
-applyTo: "synapse_pangea_chat/email_invite/create_course_space.py,synapse_pangea_chat/room_code/knock_with_code.py,synapse_pangea_chat/room_code/get_rooms_with_access_code.py"
+applyTo: "synapse_pangea_chat/email_invite/create_course_space.py,synapse_pangea_chat/email_invite/course_claim_reminder.py,synapse_pangea_chat/room_code/knock_with_code.py,synapse_pangea_chat/room_code/get_rooms_with_access_code.py"
 ---
 
 # Create Course Space — Synapse Module
@@ -25,6 +25,19 @@ Lives in the `email_invite/` sub-package alongside `invite_by_email`.
 2. Generates the class code and a single-use admin code. The class code goes in join rules directly (bypasses `request_room_code`); the admin code is kept out of room state, in a server-side claim record with the address the course was created for ([knock-with-code](knock-with-code.instructions.md), "Claiming a course")
 3. Uploads course image as room avatar if provided
 4. Sends the teacher the first email: their course is ready, with the admin link behind a button and no class code. The second email, carrying the class code, is sent when the course is claimed ([knock-with-code](knock-with-code.instructions.md))
+
+## Claim reminders
+
+`POST /_synapse/client/pangea/v1/send_course_claim_reminder`
+
+Sends the requesting address a reminder carrying a new claim link for a course not yet claimed ([knock-with-code](knock-with-code.instructions.md), "A reminder carries a new claim link"). Also how a first email that failed to send is sent again.
+
+- **Auth**: Bearer token of a server admin (the bot).
+- **Input**: `room_id`, and the rendered message: `subject`, `body` (plain text; a blank line separates paragraphs) and `cta_label`. The claim link is the button's target and is never passed in. The caller renders the text so the endpoint does not change when the message catalog's templates arrive.
+- **Output**: whether it was sent. Never the code or the link.
+- **Refused**: a room with no claim record, a course already claimed, and a course recorded without an address.
+
+The caller records the send in the Notification_Log, as it does the delivery: Synapse does not write to the CMS.
 
 ## Who the course is created for
 

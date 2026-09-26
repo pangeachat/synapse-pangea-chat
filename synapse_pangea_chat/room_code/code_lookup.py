@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, List, Optional, Set, Tuple
 
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
+from synapse_pangea_chat.room_code.generate_room_code import generate_access_code
 from synapse_pangea_chat.room_code.get_rooms_with_access_code import (
     RoomCodeMatch,
     get_rooms_with_access_code,
@@ -51,3 +52,19 @@ async def code_is_taken(
     if matches is None or len(matches) > 0:
         return True
     return await claim_store.code_in_use(access_code)
+
+
+#: Attempts before giving up on finding a free code.
+MAX_CODE_ATTEMPTS = 10
+
+
+async def new_unique_code(
+    room_store: Any, claim_store: CourseClaimStore
+) -> Optional[str]:
+    """A freshly generated code nobody holds, or None after
+    ``MAX_CODE_ATTEMPTS`` collisions."""
+    for _ in range(MAX_CODE_ATTEMPTS):
+        code = generate_access_code()
+        if not await code_is_taken(code, room_store, claim_store):
+            return code
+    return None

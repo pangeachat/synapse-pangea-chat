@@ -1,0 +1,9 @@
+{% extends "_course_email_base.html" %}
+{% from "_cta_button.html" import cta_button %}
+{% block title %}{{ subject }}{% endblock %}
+{% block body %}
+                {% for paragraph in paragraphs %}
+                <p>{{ paragraph }}</p>
+                {% endfor %}
+{{ cta_button(claim_url, cta_label) }}
+{% endblock %}

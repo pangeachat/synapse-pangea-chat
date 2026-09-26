@@ -20,6 +20,9 @@ from synapse_pangea_chat.direct_push import DirectPush
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
 from synapse_pangea_chat.email_invite.course_claim_notice import CourseClaimNotifier
+from synapse_pangea_chat.email_invite.course_claim_reminder import (
+    SendCourseClaimReminder,
+)
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.email_policy import EmailPolicy
 from synapse_pangea_chat.export_user_data import ExportUserData
@@ -363,6 +366,13 @@ class PangeaChat:
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/create_course_space",
             resource=self.create_course_space_resource,
+        )
+        self.send_course_claim_reminder_resource = SendCourseClaimReminder(
+            api, config, course_claim_store, course_claim_mailer
+        )
+        api.register_web_resource(
+            path="/_synapse/client/pangea/v1/send_course_claim_reminder",
+            resource=self.send_course_claim_reminder_resource,
         )
 
         # --- Invite By Email ---

@@ -21,8 +21,7 @@ from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
-from synapse_pangea_chat.room_code.code_lookup import code_is_taken
-from synapse_pangea_chat.room_code.generate_room_code import generate_access_code
+from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.room_code.request_room_code"
@@ -50,19 +49,11 @@ class RequestRoomCode(Resource):
         try:
             await self._auth.get_user_by_req(request)
 
-            access_code = None
-            tries = 0
-            max_tries = 10
-            while access_code is None and tries < max_tries:
-                _access_code = generate_access_code()
-
-                # Free in join rules and among claim codes, which are not
-                # in join rules (code_lookup).
-                if not await code_is_taken(
-                    _access_code, self._datastores.main, self._claim_store
-                ):
-                    access_code = _access_code
-                tries += 1
+            # Free in join rules and among claim codes, which are not in join
+            # rules (code_lookup).
+            access_code = await new_unique_code(
+                self._datastores.main, self._claim_store
+            )
             if access_code is None:
                 respond_with_json(
                     request,
