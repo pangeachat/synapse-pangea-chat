@@ -1,15 +1,7 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Link expired – {{ app_name }}</title>
-  </head>
-  <body style="margin:0;padding:32px 16px;background:#f4f2fb;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#1a1a2e;">
-    <div style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:12px;padding:28px;">
-      <div style="font-weight:700;color:#5E3ACF;font-size:18px;">{{ app_name }}</div>
-      <h1 style="font-size:20px;margin:16px 0 8px 0;">This link has expired</h1>
-      <p style="margin:0;">Use the link in a more recent email, or change what you receive in the app under Settings &rsaquo; Notifications.</p>
-    </div>
-  </body>
-</html>
+{% extends "nudge_preferences_base.html" %}
+{% block title %}Link expired{% endblock %}
+{% block content %}
+        <div class="status" aria-hidden="true">↗</div>
+        <h1>This link has expired</h1>
+        <p>Try the link in a more recent email.</p>
+{% endblock %}

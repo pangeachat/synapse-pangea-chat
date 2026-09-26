@@ -154,7 +154,7 @@ class TestNudgeDeliveryE2E(BaseSynapseE2ETest):
             url = f"{self.server_url}/_synapse/client/pangea/v1/unsubscribe"
             page = requests.get(url, params={"t": token})
             self.assertEqual(page.status_code, 200)
-            self.assertIn("Stop activity reminders", page.text)
+            self.assertIn("activity reminders", page.text)
 
             # GET must not have acted.
             before = requests.get(

@@ -25,6 +25,10 @@ Exactly one channel carries the nudge, decided in this order, and the response n
 
 The response also carries the push transport summary (same shape as `send_push`) and the email outcome, so the bot can log the channel per nudge. Presence being disabled, or a presence read failing, counts as "not in the app" — a nudge the person is due must not be lost to a presence outage, and the cost of being wrong is one push to someone who is online.
 
+## Email appearance
+
+Nudge emails use the standard [Pangea Brand template](../../../admin/email-marketing/templates/base.html), including its logo, header, gold accents, NSF badge, and company footer. The message body and call to action occupy its content area; the footer shows a simple “Unsubscribe” link, which retains its category-specific destination.
+
 ## The refusal store
 
 Refusal state is one global account-data event per user, `pangea.communication_preferences`: the refused categories, an `all_off` flag, when it changed, and which surface changed it (`unsubscribe_link` or `app`). It is the store the in-app preference screen reads and writes and the store this module reads before every send, so the two surfaces cannot disagree. Rules the store enforces:
@@ -39,6 +43,8 @@ Refusal state is one global account-data event per user, `pangea.communication_p
 `GET` and `POST /_synapse/client/pangea/v1/unsubscribe?t=<token>` — unauthenticated, rate-limited per client address.
 
 Every nudge email carries a link here in its footer and in the `List-Unsubscribe` / `List-Unsubscribe-Post: List-Unsubscribe=One-Click` headers. **GET only shows a confirmation page**; **POST performs the refusal** — a mail scanner that prefetches the link must not unsubscribe anyone (RFC 8058, and the org rule that no emailed link acts on GET). The page offers the category refusal and the global off; the one-click POST from a mail client refuses the category. A bad or expired token gets a 400 page pointing at the in-app screen. The read-merge-write of the store is serialized per person, so two unsubscribes racing each other (a category refusal and the global off) both survive; the module runs on the main process, which is what makes a process-local lock sufficient.
+
+The confirmation, success, and expired-link pages share a branded, responsive layout. The confirmation shows Material-style green switches for each reminder and offer category, plus a master switch and one Save preferences action. It reads current preferences and can add several refusals in one submission; already-refused categories stay off and cannot be re-enabled from a logged-out link. Missed-message and course-invitation controls remain unavailable until their send paths honor this store; account emails are always on. The page shares the brand email footer, including NSF proof, company address, copyright, privacy and terms links. Do not promise in-app re-enabling until [client#9234](https://github.com/pangeachat/client/issues/9234) ships.
 
 ## The click record
 

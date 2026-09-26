@@ -474,6 +474,66 @@ class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0][0], 400)
         api.account_data_manager.put_global.assert_not_awaited()
 
+    async def test_preferences_form_adds_multiple_refusals_without_reenabling(self):
+        from urllib.parse import urlencode
+
+        api = _api(account_data={"refused": ["suggestions"], "all_off": False})
+        enabled = sorted(
+            categories.GLOBAL_OFF_CATEGORIES - {"activity_nudges", "teacher_setup"}
+        )
+        body = urlencode(
+            {
+                "t": self._token(),
+                "scope": "preferences",
+                "reminders_enabled": "yes",
+                "enabled": enabled,
+            },
+            doseq=True,
+        ).encode()
+        captured = []
+        with _capture_html(
+            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", captured
+        ):
+            await self._handler(api)._async_render_POST(_FakeRequest(body=body))
+        self.assertEqual(captured[0][0], 200)
+        content = api.account_data_manager.put_global.await_args.args[2]
+        self.assertEqual(
+            content["refused"], ["activity_nudges", "suggestions", "teacher_setup"]
+        )
+        self.assertFalse(content["all_off"])
+
+    async def test_preferences_form_cannot_clear_existing_global_off(self):
+        from urllib.parse import urlencode
+
+        api = _api(account_data={"all_off": True})
+        body = urlencode(
+            {
+                "t": self._token(),
+                "scope": "preferences",
+                "reminders_enabled": "yes",
+                "enabled": sorted(categories.GLOBAL_OFF_CATEGORIES),
+            },
+            doseq=True,
+        ).encode()
+        with _capture_html(
+            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", []
+        ):
+            await self._handler(api)._async_render_POST(_FakeRequest(body=body))
+        self.assertTrue(
+            api.account_data_manager.put_global.await_args.args[2]["all_off"]
+        )
+
+    async def test_preferences_form_rejects_unknown_categories(self):
+        api = _api()
+        captured = []
+        body = f"t={self._token()}&scope=preferences&enabled=credential".encode()
+        with _capture_html(
+            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", captured
+        ):
+            await self._handler(api)._async_render_POST(_FakeRequest(body=body))
+        self.assertEqual(captured[0][0], 400)
+        api.account_data_manager.put_global.assert_not_awaited()
+
 
 class TestClick(unittest.IsolatedAsyncioTestCase):
     def _token(self, **extra):
