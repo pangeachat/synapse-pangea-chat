@@ -1,12 +1,28 @@
 ---
-applyTo: "synapse_pangea_chat/email_invite/create_course_space.py,synapse_pangea_chat/email_invite/course_claim_reminder.py,synapse_pangea_chat/room_code/knock_with_code.py,synapse_pangea_chat/room_code/get_rooms_with_access_code.py"
+applyTo: "synapse_pangea_chat/email_invite/**"
 ---
 
 # Create Course Space — Synapse Module
 
 Cross-repo design: [teacher-funnel.instructions.md](../../../.github/.github/instructions/teacher-funnel.instructions.md)
 
-## Endpoint
+## Deferred v2 preparation
+
+A requested course is ready when its content and settings are prepared and its invitation is durable. Its Matrix space is created when the first instructor claims it. Unclaimed invitations do not depend on the conversational bot being online or remaining a room member.
+
+The preparation record has a stable invitation ID and stores the quest reference, title, description, target language, optional image and request summary, requesting address, and private claim-code fingerprints. The room ID is absent until provisioning. Synapse receives the prepared details from the caller and does not fetch from or write to CMS. The requesting address and claim codes never appear in room state.
+
+Keep the existing v1 creation endpoint unchanged for compatibility with callers that require an immediate room ID. Add a v2 preparation contract at the same endpoint name: an authorized server operator supplies a stable request key, requesting address, quest reference, title, target-language code and optional presentation fields. It returns the invitation ID, preparation status and email-delivery result, without raw codes or a placeholder room ID. The stable key is scoped to the creating service and identifies a requested course rather than an address. Repeating unchanged input returns the same invitation and its current status without resending; changed input under the same key is a conflict. A delivery whose outcome is uncertain remains explicitly uncertain until reconciled.
+
+An authorized operator can read current status through `GET /_synapse/client/pangea/v2/course_invitations/{invitation_id}`. It returns preparation/provisioning/completion/revocation status, the room ID when known, the reserved claimant reference when present, and delivery-attempt references, timestamps and outcomes. Outcomes distinguish unsent, accepted by the mail transport, failed and uncertain; transport acceptance is not proof of inbox receipt. It never returns addresses or raw codes. Status reads have no send or provisioning side effects and are authoritative for reporting and reconciliation, including after completion. A legacy room ID can be used as the reference to read its room-backed claim status. An authorized operator can revoke a deferred invitation through DELETE on its status resource; revocation prevents further claims and does not remove existing room membership.
+
+Persist the invitation before emailing. Failed first delivery leaves it prepared and eligible for an explicit resend, not marked delivered. The v2 reminder endpoint accepts an invitation ID; v1 continues to resolve a room ID to its legacy invitation. Both mint a new code for the same invitation and email the requesting address, returning the send result without the code. Missing, revoked or completed invitations are refused. Recover a partial claim before sending another reminder.
+
+The caller continues applying the communication controls and funnel timing and recording actual decisions in Notification_Log. CMS and contact records mirror invitation and eventual room references; they do not authorize a claim. Ending the outreach schedule does not revoke the invitation.
+
+Claiming and recovery are governed by [knock-with-code](knock-with-code.instructions.md#claiming-a-course).
+
+## Legacy v1 endpoint
 
 `POST /_synapse/client/pangea/v1/create_course_space`
 
@@ -60,5 +76,4 @@ If the teacher doesn't have a Pangea account, the client handles this: the code 
 
 ## Future Work
 
-- A teacher-facing way to grant course admin to a co-teacher, so a second teacher does not need an operator — issue TBD
 - Automated pipeline trigger (webhook from CMS on status change) — issue TBD

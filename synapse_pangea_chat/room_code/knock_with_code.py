@@ -14,6 +14,7 @@ from synapse.api.errors import (
     InvalidClientCredentialsError,
     InvalidClientTokenError,
     MissingClientTokenError,
+    SynapseError,
 )
 from synapse.http import server
 from synapse.http.server import respond_with_json
@@ -46,7 +47,12 @@ except ImportError:
     sentry_sdk = None
 from synapse_pangea_chat.room_code.code_lookup import rooms_for_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
-from synapse_pangea_chat.room_code.get_inviter_user import promote_user_to_admin
+from synapse_pangea_chat.room_code.get_inviter_user import (
+    get_inviter_user,
+    promote_user_to_admin,
+    was_previously_admin,
+)
+from synapse_pangea_chat.room_code.instructor_access import is_joined_instructor
 from synapse_pangea_chat.room_code.invite_user_to_room import invite_user_to_room
 from synapse_pangea_chat.room_code.is_rate_limited import is_rate_limited
 from synapse_pangea_chat.room_code.user_is_room_member import (
@@ -80,6 +86,7 @@ class KnockWithCode(Resource):
         config: PangeaChatConfig,
         claim_store: CourseClaimStore,
         notifier: CourseClaimNotifier,
+        provisioner=None,
     ):
         super().__init__()
         self._api = api
@@ -88,6 +95,7 @@ class KnockWithCode(Resource):
         self._datastores = self._api._hs.get_datastores()
         self._claim_store = claim_store
         self._notifier = notifier
+        self._provisioner = provisioner
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -142,14 +150,26 @@ class KnockWithCode(Resource):
                 or not access_code.isalnum()
                 or not any(char.isdigit() for char in access_code)  # At least one digit
             ):
-                logger.warning(f"Invalid 'access_code': {access_code}")
+                logger.warning("Invalid access_code")
                 respond_with_json(
                     request,
                     400,
-                    {"error": f"Invalid 'access_code': {access_code}"},
+                    {"error": "Invalid access_code"},
                     send_cors=True,
                 )
                 return
+
+            if self._provisioner is not None:
+                invitation = await self._claim_store.invitations.for_code(access_code)
+                if invitation is not None:
+                    room = await self._provisioner.claim(invitation, requester_id)
+                    respond_with_json(
+                        request,
+                        200,
+                        {"rooms": [], "already_joined": [room], "banned": []},
+                        send_cors=True,
+                    )
+                    return
 
             # Join rules, and the claim record for a requested course's claim
             # code, which members must not be able to read (code_lookup).
@@ -175,7 +195,7 @@ class KnockWithCode(Resource):
                     404,
                     {
                         "errcode": ERRCODE_CODE_NOT_FOUND,
-                        "error": f"No rooms found with the access code: {access_code}",
+                        "error": "No rooms found with the access code",
                     },
                     send_cors=True,
                 )
@@ -207,11 +227,46 @@ class KnockWithCode(Resource):
                     claim: Optional[CourseClaim] = None
                     if match.room_id in claim_room_ids:
                         claim = await self._claim_store.get(match.room_id)
+                    if claim is not None and claim.promoted_at_ms is not None:
+                        state = await self._api.get_room_state(match.room_id)
+                        if claim.claimed_by == requester_id and is_joined_instructor(
+                            state, requester_id
+                        ):
+                            already_joined_rooms.append(match.room_id)
+                        else:
+                            spent_rooms.append(match.room_id)
+                        continue
+                    if claim is not None and membership == "leave":
+                        raise ClaimPromotionFailed(
+                            "Claimant left or was removed; operator recovery required"
+                        )
+                    if (
+                        claim is not None
+                        and claim.claimed_by == requester_id
+                        and membership == MEMBERSHIP_JOIN
+                    ):
+                        state = await self._api.get_room_state(match.room_id)
+                        power = state.get(("m.room.power_levels", ""))
+                        if (
+                            power
+                            and power.content.get("users", {}).get(requester_id, 0)
+                            < 100
+                            and await was_previously_admin(
+                                self._api, match.room_id, requester_id
+                            )
+                        ):
+                            raise ClaimPromotionFailed(
+                                "Claimant was demoted; operator recovery required"
+                            )
                     # Holding the claim code proves the requesting inbox, and
                     # it is in no state a member can read, so a member who
                     # joined first (the teacher trying their class link, or a
                     # claimer whose promotion failed) can still claim with it.
-                    if membership == MEMBERSHIP_JOIN and claim is None:
+                    if (
+                        membership == MEMBERSHIP_JOIN
+                        and claim is None
+                        and not match.is_admin_code
+                    ):
                         already_joined_rooms.append(match.room_id)
                         continue
                     if membership == MEMBERSHIP_BAN:
@@ -248,28 +303,47 @@ class KnockWithCode(Resource):
                             room_id=match.room_id,
                         )
 
+                    if claim is not None and membership != MEMBERSHIP_JOIN:
+                        await self._api.update_room_membership(
+                            sender=requester_id,
+                            target=requester_id,
+                            room_id=match.room_id,
+                            new_membership=MEMBERSHIP_JOIN,
+                        )
+                        membership = MEMBERSHIP_JOIN
                     # Admin code: promote to admin and burn the code
                     if match.is_admin_code:
+                        if await get_inviter_user(self._api, match.room_id) is None:
+                            raise ClaimPromotionFailed(
+                                "No authorized administrator remains"
+                            )
                         promoted = await promote_user_to_admin(
                             api=self._api,
                             room_id=match.room_id,
                             user_to_promote=requester_id,
                             invite_power=100,
                         )
+                        if not promoted:
+                            raise ClaimPromotionFailed("Instructor grant failed")
                         if claim is None:
-                            await burn_admin_code(
+                            burned = await burn_admin_code(
                                 api=self._api,
                                 room_id=match.room_id,
                                 burner_user_id=requester_id,
                             )
+                            if not burned:
+                                raise ClaimPromotionFailed(
+                                    "Instructor code could not be spent"
+                                )
                         else:
                             # A claim is spent, and its notice made owed, only
                             # once the promotion is real, in one write. Failing
                             # here leaves the code unspent and the claim held,
                             # so the claimer can retry.
-                            if not promoted:
+                            state = await self._api.get_room_state(match.room_id)
+                            if not is_joined_instructor(state, requester_id):
                                 raise ClaimPromotionFailed(
-                                    f"Promoting the claimer of {match.room_id} failed"
+                                    "Claimant authority could not be verified"
                                 )
                             await self._claim_store.mark_promoted(
                                 match.room_id,
@@ -345,7 +419,7 @@ class KnockWithCode(Resource):
                     404,
                     {
                         "errcode": ERRCODE_CODE_NOT_FOUND,
-                        "error": f"No rooms found with the access code: {access_code}",
+                        "error": "No rooms found with the access code",
                     },
                     send_cors=True,
                 )
@@ -392,6 +466,10 @@ class KnockWithCode(Resource):
                 send_cors=True,
             )
 
+        except SynapseError as e:
+            if e.code >= 500:
+                _capture_exception(e)
+            respond_with_json(request, e.code, e.error_dict(None), send_cors=True)
         except Exception as e:
             logger.error(f"Error processing request: {e}")
             _capture_exception(e)
