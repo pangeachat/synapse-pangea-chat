@@ -24,6 +24,8 @@ from synapse_pangea_chat.email_invite.course_claim_reminder import (
     SendCourseClaimReminder,
 )
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
+from synapse_pangea_chat.email_invite.course_invitation_api import CourseInvitationAPI
+from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
 from synapse_pangea_chat.email_policy import EmailPolicy
 from synapse_pangea_chat.export_user_data import ExportUserData
 from synapse_pangea_chat.find_user_by_email import FindUserByEmail
@@ -335,10 +337,32 @@ class PangeaChat:
             api, config, course_claim_store, course_claim_mailer
         )
         course_claim_notifier.start_retry_loop()
+        provisioner = CourseProvisioner(
+            api,
+            course_claim_store.invitations,
+            course_claim_store,
+            course_claim_notifier,
+        )
+        for endpoint, mode in (
+            ("create_course_space", "prepare"),
+            ("send_course_claim_reminder", "reminder"),
+            ("course_invitations", "status"),
+        ):
+            api.register_web_resource(
+                path="/_synapse/client/pangea/v2/" + endpoint,
+                resource=CourseInvitationAPI(
+                    api,
+                    config,
+                    course_claim_store,
+                    course_claim_store.invitations,
+                    course_claim_mailer,
+                    mode,
+                ),
+            )
 
         # --- Room Code ---
         self.knock_with_code_resource = KnockWithCode(
-            api, config, course_claim_store, course_claim_notifier
+            api, config, course_claim_store, course_claim_notifier, provisioner
         )
         self.request_code_resource = RequestRoomCode(api, config, course_claim_store)
         api.register_web_resource(
@@ -352,7 +376,7 @@ class PangeaChat:
 
         # --- Preview With Code ---
         self.preview_with_code_resource = PreviewWithCode(
-            api, config, course_claim_store
+            api, config, course_claim_store, provisioner
         )
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/preview_with_code",

@@ -1,19 +1,17 @@
 import logging
 from typing import Optional
 
+from synapse.api.constants import EventTypes
 from synapse.module_api import ModuleApi
 from synapse.types import UserID, create_requester
 
 from synapse_pangea_chat.room_code.constants import (
-    DEFAULT_INVITE_POWER_LEVEL,
-    DEFAULT_USERS_DEFAULT_POWER_LEVEL,
-    EVENT_TYPE_M_ROOM_MEMBER,
     EVENT_TYPE_M_ROOM_POWER_LEVELS,
-    INVITE_POWER_LEVEL_KEY,
-    MEMBERSHIP_CONTENT_KEY,
-    MEMBERSHIP_JOIN,
-    USERS_DEFAULT_POWER_LEVEL_KEY,
     USERS_POWER_LEVEL_KEY,
+)
+from synapse_pangea_chat.room_code.instructor_access import (
+    is_joined_instructor,
+    user_power,
 )
 
 logger = logging.getLogger(
@@ -113,125 +111,44 @@ async def promote_user_to_admin(
 
 
 async def get_inviter_user(api: ModuleApi, room_id: str) -> Optional[UserID]:
-    # inviter must be local and have sufficient power to invite
-
-    # extract room power levels
-    power_levels_state_events = await api.get_room_state(
-        room_id=room_id,
-        event_filter=[(EVENT_TYPE_M_ROOM_POWER_LEVELS, None)],
-    )
-    power_levels = None
-    for state_event in power_levels_state_events.values():
-        if state_event.type != EVENT_TYPE_M_ROOM_POWER_LEVELS:
-            continue
-        power_levels = state_event.content
-        break
-    if not power_levels:
+    state = await api.get_room_state(room_id=room_id)
+    power = state.get((EventTypes.PowerLevels, ""))
+    threshold = max(100, power.content.get("invite", 0) if power else 100)
+    candidates = [
+        key
+        for kind, key in state
+        if kind == EventTypes.Member
+        and api.is_mine(key)
+        and is_joined_instructor(state, key)
+        and user_power(state, key) >= threshold
+    ]
+    if not candidates:
+        logger.warning("No eligible joined administrator in %s", room_id)
         return None
-
-    # extract power required to invite
-    try:
-        invite_power = int(
-            power_levels.get(
-                INVITE_POWER_LEVEL_KEY,
-                DEFAULT_INVITE_POWER_LEVEL,
-            )
-        )
-    except (ValueError, TypeError):
-        logger.warning(
-            "Non-integer invite power level in room %s; using default", room_id
-        )
-        invite_power = DEFAULT_INVITE_POWER_LEVEL
-
-    # extract default power level
-    try:
-        users_default = int(
-            power_levels.get(
-                USERS_DEFAULT_POWER_LEVEL_KEY,
-                DEFAULT_USERS_DEFAULT_POWER_LEVEL,
-            )
-        )
-    except (ValueError, TypeError):
-        logger.warning(
-            "Non-integer users_default power level in room %s; using default", room_id
-        )
-        users_default = DEFAULT_USERS_DEFAULT_POWER_LEVEL
-
-    # extract users power levels
-    users_power_level = power_levels.get(USERS_POWER_LEVEL_KEY, None)
-    if not isinstance(users_power_level, dict):
-        users_power_level = {}
-
-    # Get all room members to consider users with default power level
-    member_state_events = await api.get_room_state(
-        room_id=room_id,
-        event_filter=[(EVENT_TYPE_M_ROOM_MEMBER, None)],
+    return UserID.from_string(
+        sorted(candidates, key=lambda user: (-user_power(state, user), user))[0]
     )
 
-    # Build a set of local joined members
-    local_joined_members: set[str] = set()
-    for state_event in member_state_events.values():
-        if state_event.type != EVENT_TYPE_M_ROOM_MEMBER:
-            continue
-        membership = state_event.content.get(MEMBERSHIP_CONTENT_KEY)
-        if membership != MEMBERSHIP_JOIN:
-            continue
-        user_id = state_event.state_key
-        if not isinstance(user_id, str):
-            continue
-        # Only consider local users
-        if not api.is_mine(user_id):
-            continue
-        local_joined_members.add(user_id)
 
-    if not local_joined_members:
-        logger.warning(f"No local joined members found in room {room_id}")
-        return None
+async def was_previously_admin(api: ModuleApi, room_id: str, user_id: str) -> bool:
+    """Conservative withdrawal check before resuming a partial legacy grant."""
+    import json
 
-    # Find the local user with the highest power level
-    local_user_id_with_highest_power = None
-    highest_local_power = None
-
-    for user_id in local_joined_members:
-        # Get user's power level (from explicit setting or default)
-        if user_id in users_power_level:
-            try:
-                power_level = int(users_power_level[user_id])
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Non-integer power level for %s in room %s; using users_default",
-                    user_id,
-                    room_id,
-                )
-                power_level = users_default
-        else:
-            # User has default power level
-            power_level = users_default
-
-        # Track the highest power level among local members
-        if highest_local_power is None or power_level > highest_local_power:
-            highest_local_power = power_level
-            local_user_id_with_highest_power = user_id
-
-    if local_user_id_with_highest_power is None or highest_local_power is None:
-        logger.warning(f"No local user found in room {room_id}")
-        return None
-
-    logger.info(
-        f"Found local user {local_user_id_with_highest_power} with power {highest_local_power} "
-        f"in room {room_id}, invite power required: {invite_power}"
-    )
-
-    # Check if the user with the highest power level can invite
-    if highest_local_power < invite_power:
-        # Promote the user to have sufficient power to invite
-        promoted = await promote_user_to_admin(
-            api=api,
-            room_id=room_id,
-            user_to_promote=local_user_id_with_highest_power,
-            invite_power=invite_power,
+    def select(txn):
+        txn.execute(
+            """SELECT j.json FROM event_json j JOIN state_events s ON s.event_id = j.event_id
+            WHERE j.room_id = ? AND s.type = 'm.room.power_levels'""",
+            (room_id,),
         )
-        if not promoted:
-            return None
+        for row in txn.fetchall():
+            content = json.loads(row[0]).get("content", {})
+            if (
+                content.get("users", {}).get(user_id, content.get("users_default", 0))
+                >= 100
+            ):
+                return True
+        return False
 
-    return UserID.from_string(local_user_id_with_highest_power)
+    return await api._hs.get_datastores().main.db_pool.runInteraction(
+        "pangea_claim_prior_rights", select
+    )

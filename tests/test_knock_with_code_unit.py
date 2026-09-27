@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse_pangea_chat.config import PangeaChatConfig
@@ -46,6 +47,15 @@ def _handler(
     claim_store: MagicMock | None = None, notifier: MagicMock | None = None
 ) -> KnockWithCode:
     api = MagicMock()
+    api.update_room_membership = AsyncMock()
+    api.get_room_state = AsyncMock(
+        return_value={
+            ("m.room.member", USER): SimpleNamespace(content={"membership": "join"}),
+            ("m.room.power_levels", ""): SimpleNamespace(
+                content={"users": {USER: 100}}
+            ),
+        }
+    )
     requester = MagicMock()
     requester.user.to_string.return_value = USER
     api._hs.get_auth.return_value.get_user_by_req = AsyncMock(return_value=requester)
@@ -185,7 +195,7 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         self.respond = MagicMock()
-        self.promote = AsyncMock()
+        self.promote = AsyncMock(return_value=True)
         self.burn = AsyncMock(return_value=True)
         self.invite = AsyncMock()
         patches = [
@@ -202,6 +212,7 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
             patch(f"{LOOKUP}.get_rooms_with_access_code", AsyncMock(return_value=[])),
             patch(f"{MODULE}.invite_user_to_room", self.invite),
             patch(f"{MODULE}.promote_user_to_admin", self.promote),
+            patch(f"{MODULE}.get_inviter_user", AsyncMock(return_value="@admin:x")),
             patch(f"{MODULE}.burn_admin_code", self.burn),
         ]
         for p in patches:
@@ -227,7 +238,8 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
 
         status, body = self._response()
         self.assertEqual(status, 200)
-        self.assertEqual(body["rooms"], [ROOM_1])
+        self.assertEqual(body["rooms"], [])
+        self.assertEqual(body["already_joined"], [ROOM_1])
         store.rooms_for_admin_code.assert_awaited_once_with(CODE)
         store.claim.assert_awaited_once_with(ROOM_1, USER, 1_000)
         self.promote.assert_awaited_once()
@@ -307,6 +319,27 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
         status, body = self._response()
         self.assertEqual(status, 500)
         self.assertEqual(body["failed"], [ROOM_1])
+        store.mark_promoted.assert_not_called()
+        notifier.notify.assert_not_called()
+
+    async def test_failed_code_burn_is_not_reported_as_success(self) -> None:
+        self.burn.return_value = False
+        with patch(
+            f"{LOOKUP}.get_rooms_with_access_code",
+            AsyncMock(return_value=[RoomCodeMatch(room_id=ROOM_1, is_admin_code=True)]),
+        ):
+            await _handler()._async_render_POST(MagicMock())
+        status, body = self._response()
+        self.assertEqual(status, 500)
+        self.assertEqual(body["errcode"], "ORG.PANGEA.INVITE_FAILED")
+
+    async def test_rights_withdrawn_before_completion_are_not_announced(self) -> None:
+        store = _claim_store(self._claim())
+        notifier = _notifier()
+        handler = _handler(store, notifier)
+        with patch.object(handler._api, "get_room_state", AsyncMock(return_value={})):
+            await handler._async_render_POST(MagicMock())
+        self.assertEqual(self._response()[0], 500)
         store.mark_promoted.assert_not_called()
         notifier.notify.assert_not_called()
 

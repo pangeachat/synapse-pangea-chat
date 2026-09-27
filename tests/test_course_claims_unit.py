@@ -76,7 +76,12 @@ class TestStoreAgainstADatabase(unittest.IsolatedAsyncioTestCase):
 
         for code in (self.CODE, "r3mind1", "r3mind2"):
             with self.subTest(code=code):
-                self.assertEqual(await self.store.rooms_for_admin_code(code), [])
+                self.assertEqual(
+                    await self.store.rooms_for_admin_code(code), [self.ROOM]
+                )
+                claim = await self.store.get(self.ROOM)
+                assert claim is not None
+                self.assertIsNotNone(claim.promoted_at_ms)
                 self.assertTrue(await self.store.code_in_use(code))
 
     async def test_a_withdrawn_code_opens_nothing(self) -> None:
@@ -108,7 +113,10 @@ class TestStoreAgainstADatabase(unittest.IsolatedAsyncioTestCase):
 
         await self._claim_and_promote()
 
-        self.assertEqual(await self.store.rooms_for_admin_code(self.CODE), [])
+        self.assertEqual(await self.store.rooms_for_admin_code(self.CODE), [self.ROOM])
+        claim = await self.store.get(self.ROOM)
+        assert claim is not None
+        self.assertIsNotNone(claim.promoted_at_ms)
         # Spent, but still taken: a new course must not reuse it.
         self.assertTrue(await self.store.code_in_use(self.CODE))
 

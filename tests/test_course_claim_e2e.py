@@ -144,6 +144,14 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 self.assertEqual(response.status_code, 200, response.text)
                 created = response.json()
                 room_id = created["room_id"]
+                legacy_status = requests.get(
+                    f"{self.server_url}/_synapse/client/pangea/v2/course_invitations/{quote(room_id, safe='')}",
+                    headers={"Authorization": f"Bearer {bot}"},
+                    timeout=10,
+                )
+                self.assertEqual(legacy_status.status_code, 200, legacy_status.text)
+                self.assertEqual(legacy_status.json()["status"], "prepared")
+                self.assertNotIn(REQUESTED, legacy_status.text)
                 class_code = created["student_access_code"]
                 admin_code = created["admin_access_code"]
                 self.assertTrue(created["emailed"])
@@ -318,13 +326,19 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                     self.assertIn(room_id, preview.text)
 
                 # Claiming with the reminder's link spends the first one too.
-                await self._join_with_code(teacher, reminder_code, room_id)
+                claimed = self._post(
+                    KNOCK_WITH_CODE_PATH, teacher, {"access_code": reminder_code}
+                )
+                self.assertEqual(claimed.status_code, 200, claimed.text)
+                self.assertEqual(claimed.json()["already_joined"], [room_id])
+                self._join(teacher, room_id)
                 self.assertEqual(self._power_level(bot, room_id, teacher_id), 100)
                 self.assertIsNotNone(sink.wait_for(REQUESTED, "Invite your students"))
                 spent = self._post(
                     KNOCK_WITH_CODE_PATH, teacher, {"access_code": first_code}
                 )
-                self.assertEqual(spent.status_code, 404, spent.text)
+                self.assertEqual(spent.status_code, 200, spent.text)
+                self.assertEqual(spent.json()["already_joined"], [room_id])
 
                 # A claimed course takes no more reminders.
                 after = self._post(REMINDER_PATH, bot, reminder_body)

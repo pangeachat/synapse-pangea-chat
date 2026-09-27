@@ -105,7 +105,7 @@ _ROOMS_FOR_CODE_SQL = """
     SELECT c.room_id
     FROM pangea_course_claim_code c
     JOIN pangea_course_claim k ON k.room_id = c.room_id
-    WHERE c.admin_code_sha256 = ? AND k.promoted_at_ms IS NULL
+    WHERE c.admin_code_sha256 = ?
 """
 
 _CODE_IN_USE_SQL = """
@@ -119,7 +119,7 @@ _REMINDER_SQL = """
 """
 
 _SELECT_SQL = """
-    SELECT claimed_by
+    SELECT claimed_by, promoted_at_ms
     FROM pangea_course_claim
     WHERE room_id = ?
 """
@@ -208,6 +208,7 @@ def admin_code_digest(admin_code: str) -> str:
 @attr.s(frozen=True, auto_attribs=True)
 class CourseClaim:
     claimed_by: Optional[str]
+    promoted_at_ms: Optional[int] = None
 
 
 @attr.s(frozen=True, auto_attribs=True)
@@ -230,6 +231,9 @@ class CourseClaimStore:
     def __init__(self, homeserver: Any) -> None:
         self._db_pool = homeserver.get_datastores().main.db_pool
         self._table_ready = False
+        from .course_invitations import CourseInvitationStore
+
+        self.invitations = CourseInvitationStore(homeserver)
 
     async def _ensure_table(self) -> None:
         if self._table_ready:
@@ -319,7 +323,7 @@ class CourseClaimStore:
 
         return await self._db_pool.runInteraction(
             "pangea_course_claim_code_in_use", _select
-        )
+        ) or await self.invitations.code_in_use(admin_code)
 
     async def get(self, room_id: str) -> Optional[CourseClaim]:
         """The claim record for a room, or None when the room has none.
@@ -335,7 +339,7 @@ class CourseClaimStore:
             row = txn.fetchone()
             if row is None:
                 return None
-            return CourseClaim(claimed_by=row[0])
+            return CourseClaim(claimed_by=row[0], promoted_at_ms=row[1])
 
         return await self._db_pool.runInteraction("pangea_course_claim_get", _select)
 
@@ -408,3 +412,35 @@ class CourseClaimStore:
         return await self._db_pool.runInteraction(
             "pangea_course_claim_outstanding", _select
         )
+
+    async def status(self, room_id: str):
+        """Private legacy claim status for operator reconciliation and cleanup."""
+        await self._ensure_table()
+
+        def select(txn):
+            txn.execute(
+                "SELECT claimed_by, promoted_at_ms, created_at_ms FROM pangea_course_claim WHERE room_id = ?",
+                (room_id,),
+            )
+            row = txn.fetchone()
+            if row is None:
+                from synapse.api.errors import SynapseError
+
+                raise SynapseError(
+                    404, "No claim record for this room", "ORG.PANGEA.NO_CLAIM_RECORD"
+                )
+            claimant, completed, created = row
+            return {
+                "invitation_id": room_id,
+                "room_id": room_id,
+                "claimant": claimant,
+                "status": "completed"
+                if completed is not None
+                else ("provisioning" if claimant else "prepared"),
+                "created_at_ms": created,
+                "completed_at_ms": completed,
+                "deliveries": [],
+                "delivery_outcome": "uncertain",
+            }
+
+        return await self._db_pool.runInteraction("pangea_legacy_claim_status", select)

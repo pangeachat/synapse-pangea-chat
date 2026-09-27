@@ -151,17 +151,7 @@ class TestE2E(BaseSynapseE2ETest):
         self.assertEqual(response.status_code, 200)
 
     async def test_e2e_knock_with_code_admin_left(self) -> None:
-        """
-        Test knock with code when ALL admins (users with power level >= invite power)
-        have left the room.
-
-        Scenario:
-        1. User1 (admin, power level 100) creates the room
-        2. User2 (non-admin, power level 0) is invited and joins the room
-        3. User1 (the only admin) leaves the room
-        4. User3 knocks with the correct access code
-        5. Expected: User2 should be promoted to have invite power, then invite User3
-        """
+        """Without a joined administrator, refuse entry and preserve student power."""
         postgres = None
         synapse_dir = None
         server_process = None
@@ -249,27 +239,20 @@ class TestE2E(BaseSynapseE2ETest):
             # Now only User2 remains, with power level 0 (below invite power of 50)
             await self.leave_room(room_id=room_id, access_token=user_1_access_token)
 
-            # User3 knocks with the correct access code
-            # Expected behavior: User2 (power level 0) should be promoted to power level 50
-            # to be able to invite User3
-            await self.knock_with_code(access_code, user_3_access_token)
-
-            # Wait for the invite - should work because User2 gets promoted to invite User3
-            received_invitation = await self.wait_for_room_invitation(
-                room_id=room_id,
-                user_id=user_3_id,
-                access_token=user_2_access_token,
+            # A valid code cannot manufacture an administrator from a student.
+            response = requests.post(
+                f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+                headers={"Authorization": f"Bearer {user_3_access_token}"},
+                json={"access_code": access_code},
+                timeout=10,
             )
-            if not received_invitation:
-                self.fail(
-                    "User 3 was not invited to the room. "
-                    "Expected: User2 should be promoted and invite User3 after all admins left."
-                )
-            else:
-                logger.info(
-                    "User 3 was invited to the room successfully after all admins left - "
-                    "User2 was promoted to invite power level"
-                )
+            self.assertEqual(response.status_code, 500, response.text)
+            self.assertEqual(response.json()["errcode"], "ORG.PANGEA.INVITE_FAILED")
+            levels = await self.get_room_power_levels(room_id, user_2_access_token)
+            self.assertEqual(
+                levels.get("users", {}).get(user_2_id, levels.get("users_default", 0)),
+                0,
+            )
 
         finally:
             self.stop_synapse(
@@ -281,18 +264,7 @@ class TestE2E(BaseSynapseE2ETest):
             )
 
     async def test_e2e_knock_with_code_admin_left_default_power(self) -> None:
-        """
-        Test knock with code when admin leaves and remaining user has DEFAULT power level
-        (not explicitly set in the users dict).
-
-        Scenario:
-        1. User1 (admin, power level 100) creates the room
-        2. User2 is invited and joins (has default power level, NOT explicitly set)
-        3. Power levels only set user1=100, user2 is NOT in the users dict
-        4. User1 leaves the room
-        5. User3 knocks with the correct access code
-        6. Expected: User2 (with default power level) should be found, promoted, and invite User3
-        """
+        """Without a joined administrator, refuse entry and preserve student power."""
         postgres = None
         synapse_dir = None
         server_process = None
@@ -377,25 +349,20 @@ class TestE2E(BaseSynapseE2ETest):
             # Now only User2 remains, with DEFAULT power level (not in users dict)
             await self.leave_room(room_id=room_id, access_token=user_1_access_token)
 
-            # User3 knocks with the correct access code
-            # Expected: User2 (default power level) should be found, promoted, and invite User3
-            await self.knock_with_code(access_code, user_3_access_token)
-
-            # Wait for the invite
-            received_invitation = await self.wait_for_room_invitation(
-                room_id=room_id,
-                user_id=user_3_id,
-                access_token=user_2_access_token,
+            # A valid code cannot manufacture an administrator from a student.
+            response = requests.post(
+                f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+                headers={"Authorization": f"Bearer {user_3_access_token}"},
+                json={"access_code": access_code},
+                timeout=10,
             )
-            if not received_invitation:
-                self.fail(
-                    "User 3 was not invited to the room. "
-                    "Expected: User2 (with default power level) should be found, promoted, and invite User3."
-                )
-            else:
-                logger.info(
-                    "User 3 was invited successfully - User2 with default power level was found and promoted"
-                )
+            self.assertEqual(response.status_code, 500, response.text)
+            self.assertEqual(response.json()["errcode"], "ORG.PANGEA.INVITE_FAILED")
+            levels = await self.get_room_power_levels(room_id, user_2_access_token)
+            self.assertEqual(
+                levels.get("users", {}).get(user_2_id, levels.get("users_default", 0)),
+                0,
+            )
 
         finally:
             self.stop_synapse(
@@ -824,20 +791,8 @@ class TestE2E(BaseSynapseE2ETest):
         self.assertEqual(response.status_code, 200)
         return response.json()
 
-    async def test_e2e_knock_with_code_promotes_user_to_admin(self) -> None:
-        """
-        Test that when the admin (user A) leaves a room and rejoins with a code,
-        the remaining member (user B) who doesn't have sufficient power to invite
-        is promoted to admin so they can send the invite.
-
-        Scenario:
-        1. User A creates a room and invites User B
-        2. User A has admin power (100), User B has default power (0)
-        3. User A leaves the room
-        4. User A rejoins with access code
-        5. Expected: get_inviter_user should promote User B to have invite power,
-           then return User B as the inviter
-        """
+    async def test_e2e_knock_with_code_does_not_promote_remaining_student(self) -> None:
+        """Without a joined administrator, refuse entry and preserve student power."""
         postgres = None
         synapse_dir = None
         server_process = None
@@ -928,41 +883,19 @@ class TestE2E(BaseSynapseE2ETest):
             # Step 3: User A leaves the room
             await self.leave_room(room_id=room_id, access_token=user_a_access_token)
 
-            # Step 4: User A rejoins using the access code
-            # This should trigger the new logic where User B is promoted to admin
-            await self.knock_with_code(access_code, user_a_access_token)
-
-            # Step 5: Wait for User A to receive an invitation
-            received_invitation = await self.wait_for_room_invitation(
-                room_id=room_id,
-                user_id=user_a_id,
-                access_token=user_b_access_token,
+            # A valid code cannot manufacture an administrator from a student.
+            response = requests.post(
+                f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+                headers={"Authorization": f"Bearer {user_a_access_token}"},
+                json={"access_code": access_code},
+                timeout=10,
             )
-
-            if not received_invitation:
-                self.fail(
-                    "User A was not invited to the room. "
-                    "Expected User B to be promoted to admin and send the invite."
-                )
-            else:
-                logger.info("User A was successfully invited back to the room!")
-
-            # Verify that User B now has sufficient power to invite (was promoted)
-            power_levels_after = await self.get_room_power_levels(
-                room_id=room_id, access_token=user_b_access_token
-            )
-            user_b_power_after = power_levels_after.get("users", {}).get(user_b_id, 0)
-            invite_power_required_after = power_levels_after.get("invite", 0)
-
-            self.assertGreaterEqual(
-                user_b_power_after,
-                invite_power_required_after,
-                f"User B should have been promoted to have invite power. "
-                f"User B power: {user_b_power_after}, Invite required: {invite_power_required_after}",
-            )
-            logger.info(
-                f"Final power levels - User B: {user_b_power_after}, "
-                f"Invite required: {invite_power_required_after}"
+            self.assertEqual(response.status_code, 500, response.text)
+            self.assertEqual(response.json()["errcode"], "ORG.PANGEA.INVITE_FAILED")
+            levels = await self.get_room_power_levels(room_id, user_b_access_token)
+            self.assertEqual(
+                levels.get("users", {}).get(user_b_id, levels.get("users_default", 0)),
+                0,
             )
 
         finally:

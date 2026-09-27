@@ -1,5 +1,5 @@
 ---
-applyTo: "synapse_pangea_chat/room_code/**"
+applyTo: "synapse_pangea_chat/room_code/**,synapse_pangea_chat/preview_with_code/**"
 ---
 
 # Room Code — knock_with_code & request_room_code
@@ -33,7 +33,7 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 3. Query Synapse DB for rooms whose `m.room.join_rules` state event contains a matching `access_code` (case-insensitive). Uses the latest state event per room.
 4. A well-formed code that matches no room responds `404` with `{ errcode: "ORG.PANGEA.CODE_NOT_FOUND" }`. 404 and not 400 because the request is fine — the code doesn't exist; the errcode lets the client tell a wrong code (an expected user mistake, shown as "check the code") apart from a malformed request (a client bug). A whole classroom mistyping one board-written code produced the 2026-08-31 burst that motivated this split (issue #197 / client#8693).
 5. For each matched room:
-   - If user is already a member → add to `already_joined` list.
+   - If user is already a member with an ordinary class code → add to `already_joined`. Process private claims and additional-instructor grants before this shortcut.
    - If user is BANNED from the room → add to `banned` list, skip the invite (Synapse would reject it; without this the failure is indistinguishable from a nonexistent code — issue #127 / client#6820).
    - If user is already INVITED → add to `rooms` without issuing a second invite. The client's own `/join` succeeds for an invited user, so the flow is idempotent across link re-clicks, a second device, and a knock racing the client's join (issue #148).
    - Otherwise → find a room member with invite power, issue `update_room_membership(invite)` on their behalf.
@@ -54,25 +54,33 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 
 ---
 
-## Claiming a course: a private claim link, then the class link
+## Claiming a course
 
-A course created for a teacher who does not yet have an account (the [teacher funnel](../../../.github/.github/instructions/teacher-funnel.instructions.md)'s course request flow) has nobody to administer it: the bot creates the space, so the bot is its only admin. The teacher has to be able to take ownership by following an ordinary link, before they have any standing in the room.
+Preparation and operator contracts are governed by [create-course-space](create-course-space.instructions.md).
 
-**The claim link and the class link are two codes, and the teacher never holds both at once.** A new course carries a single-use admin code and a class code. The teacher is sent the admin code first, as a link behind a button in the email that tells them their course is ready. The class code reaches them afterwards, in a second email that Synapse sends once the course has been claimed. The first email has nothing in it that belongs with students, so there is nothing to confuse and nothing to warn about.
+Preserve the current bare seven-character link and authenticated v1 `knock_with_code` request. Resolve codes across private invitation fingerprints and existing room codes, with shared collision checks. Link fetching and previews never reserve a claimant, create a room or spend a code. For a valid prepared/provisioning invitation, the authenticated v1 code-preview endpoint returns 409 with `ORG.PANGEA.COURSE_NOT_CREATED`, without a fabricated room ID, administrator or state events. After completion, only a replay-authorized winner may use that private code for the existing room preview; unavailable private codes disclose no invitation details. Ordinary room-code previews keep their existing response. The current app's join path does not depend on this preview endpoint.
 
-**Holding the claim link is the proof of identity.** The admin code is sent only to the address the course was requested from, so using it shows control of that inbox. This is deliberately not a match against the teacher's Pangea account: a teacher who requested a course from one address and signs in with another, such as a personal address at a booth and school single sign-on in class, still claims their course. Whoever first uses a claim link sent for the course becomes its admin, and every claim link the course has is spent. Two people claiming at the same moment cannot both become admin: the second is answered as for a code that does not exist, which is what it is a moment later.
+The first valid authenticated claim reserves the invitation for that account, without matching its account email to the requesting address. Concurrent claims by other accounts cannot create a room or obtain rights. The winning account creates the prepared Matrix course as its joined creator and administrator. Preserve course settings and ordinary class-code permissions. Joining the conversational bot happens separately and cannot gate claiming or ownership.
 
-**The claim code is kept out of room state.** Every member can read a course's join rules, so an admin code stored there could be read by a student who joined with the class code, and used. A requested course's admin codes live only in a server-side claim record, as fingerprints, and that is where this endpoint looks them up. Because nobody can read it from the course, a member who already joined, such as a teacher who tried their class link before opening the claim link, can still claim with it.
+Room creation and invitation completion must recover across workers, request timeouts and process crashes. A durable association with the invitation must identify a room created before the final invitation update. A retry recovers that same room; it does not make another. If creation's outcome is uncertain, return a recoverable server error and reconcile before trying to create again. A worker lease expiring does not transfer the claim to another account or justify duplicate creation.
 
-**A reminder carries a new claim link.** No plain admin code is kept anywhere: it exists only in the email it was sent in. A reminder to a course not yet claimed is sent with another single-use admin code for the same course, minted when the reminder is sent, and its fingerprint is added to the course's claim record. Every claim link sent for a course stays valid until the course is claimed, so the first email's button keeps working after a reminder, and the claim spends them all. Synapse sends the reminder to the requesting address when a server admin asks it to, from the parts of the message the caller renders; its answer says only whether it was sent, never the code or the link. A course already claimed, or with no claim record, is refused. Decided 2026-09-26 over keeping the code encrypted: a code that is never stored cannot leak from storage.
+Explicit invitation revocation and deliberate membership removal, leaving or demotion take precedence during partial claims as well as after completion. Recovery must distinguish a provisioning step that never succeeded from later withdrawal of rights; it must not automatically restore rights once withdrawn. If that distinction cannot be established, stop recovery for operator investigation. A server administrator may revoke a stranded invitation or repair its recorded provisioning operation after verifying the evidence. A lease timeout never changes the winning account; assigning someone else requires a separate explicit administrative action.
 
-**The class code never grants admin.** Anyone who joins with the class code, in any order, joins as an ordinary member. Sharing it early cannot hand the course to a student.
+Complete the claim only after joined membership, instructor rights and required course settings are durable and verified. Return its room in the existing `already_joined` field. Keep `rooms` and `banned` compatible; do not introduce an asynchronous polling response or report successful empty results while provisioning runs. The current client can handle already-joined rooms before local sync catches up, but this requires end-to-end verification on supported apps.
 
-**The second email goes to the requesting address.** It carries the class link, and it is sent to the address the course was created for, not to whoever claimed it, so the teacher receives it even if the claim link was forwarded and used by someone else. It does not name the account that claimed the course (Will, 2026-09-24). It is sent once, and a send that fails is retried in the background, so a mail outage delays it rather than losing it: by then the admin code is spent, and the class link reaches the teacher no other way. A send that stalls is given up on and retried; if the mail server later completes the stalled one, the teacher gets the email twice. That is accepted: the email carries nothing single use, and losing it is worse than repeating it. After it goes out the address is cleared from the record, which keeps who claimed the course and when. A course a teacher created in the client has no such record, so using its admin code promotes and burns as before and sends nothing. The bot keeps full power in every space it creates, so a course claimed by the wrong person can always be repaired server-side.
+After completion every link for that invitation loses its ability to grant rights. The same winning account may replay to retrieve the existing room only while it still has joined membership and instructor rights. Removal or demotion cannot be undone by an old claim code. Other accounts receive the same response as an unavailable code. A lost success response or repeat submission does not send another share kit.
 
-**Following the link only opens the app; it never claims anything by itself.** University mail filters fetch every link in a message before a person sees it. The claim happens when a signed-in person submits the code in the app, so a filter fetching the link cannot spend the admin code.
+A missing prepared specification, failed provisioning or failed rights verification is a server error, not a nonexistent code or a completed claim. The winning account retains the ability to resume partial work without a replacement email.
 
-Granting admin to someone else later, such as a co-teacher, is a separate deliberate act. The class code is never that path. A new admin code set on a claimed course is that act, not a second claim: the claim record belongs to the admin code the course was created with, so a later one promotes as any admin code does, and sends nothing.
+## Codes, share kit and existing courses
+
+Store only private fingerprints of claim codes; do not log raw codes or access tokens. Earlier reminder links work for the same invitation until completion or explicit revocation. The class code is created with the room and grants only ordinary membership. The initial email carries the claim CTA; the class link follows after ownership is established.
+
+Completion durably records that the share-kit email is owed to the original requesting address, even when another account accepted a forwarded link. It does not name that account. Sending uses exclusive reservation and independent retries; an ambiguous mail timeout may duplicate a share kit but must not recreate a course. Clear the requesting address after successful delivery while retaining claim and room references for audit and authorized replay.
+
+Additional-instructor invitations target an existing course and authorize a role grant. They never provision a replacement course, transfer first ownership or send the first-owner share kit. An existing student can accept an authorized instructor grant. Existing-room invitations use a currently eligible joined administrator as sender, which need not be the bot or an online client. Preserve bans, blocks and grant revocation. A room without an eligible administrator requires explicit recovery. Existing client-issued admin codes remain supported; this change does not require a new co-teacher UI.
+
+Legacy room-backed claims remain valid. Courses with human members or activity preserve their room identity and history. Empty legacy courses require verified repair or explicit migration before another usable claim is promised. Migration preserves invitation/code associations; it never silently replaces an active classroom.
 
 ---
 
@@ -88,7 +96,7 @@ The `get_rooms_with_access_code` query reads directly from the Synapse event tab
 
 ## Invite Mechanics
 
-The server needs a real user with invite power to issue the invite (Synapse's `update_room_membership` requires a sender). [`get_inviter_user`](../../synapse_pangea_chat/room_code/get_inviter_user.py) finds a joined member whose power level meets the room's invite threshold. If no such user exists, the room counts as failed (`NoInviterAvailableError`) and follows the failed-room handling above — it is never reported as invited.
+The server needs a real user with invite power to issue the invite (Synapse's `update_room_membership` requires a sender). [`get_inviter_user`](../../synapse_pangea_chat/room_code/get_inviter_user.py) finds a local joined administrator whose power level meets the room's invite threshold. It never promotes a remaining member to manufacture an inviter; an empty room or one without an eligible administrator requires explicit recovery. If no such user exists, the room counts as failed (`NoInviterAvailableError`) and follows the failed-room handling above — it is never reported as invited.
 
 ---
 
@@ -102,7 +110,3 @@ Per-user in-memory rate limiting. Configurable via module config:
 Returns HTTP 429 when exceeded.
 
 ---
-
-## Future Work
-
-_(No open issues at this time.)_
