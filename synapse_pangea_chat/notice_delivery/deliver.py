@@ -1,11 +1,11 @@
-"""``POST /_synapse/client/pangea/v1/deliver_nudge`` — deliver one bot nudge on
+"""``POST /_synapse/client/pangea/v1/deliver_notice`` — deliver one bot notice on
 one channel, chosen by availability.
 
-The bot has already recorded the nudge as a ``p.room.notice`` in the person's
+The bot has already recorded the notice as a ``p.room.notice`` in the person's
 DM; this endpoint carries it the rest of the way: refused → nothing; in the
 app right now → nothing more (the notice is the delivery); a working push
 device → push; otherwise email, if the person has an address and email is
-enabled. It never sends on two channels for one nudge.
+enabled. It never sends on two channels for one notice.
 """
 
 from __future__ import annotations
@@ -30,14 +30,14 @@ from twisted.web.resource import Resource
 from synapse_pangea_chat.direct_push.direct_push import DirectPush
 from synapse_pangea_chat.direct_push.is_rate_limited import is_rate_limited
 from synapse_pangea_chat.direct_push.types import SendPushRequest
-from synapse_pangea_chat.nudge_delivery.categories import (
+from synapse_pangea_chat.notice_delivery.categories import (
     COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE,
     DELIVERABLE_CATEGORIES,
     GLOBAL_OFF_CATEGORIES,
     is_refused,
     parse_preferences,
 )
-from synapse_pangea_chat.nudge_delivery.common import (
+from synapse_pangea_chat.notice_delivery.common import (
     TEMPLATES_DIR,
     TOKEN_KIND_CLICK,
     TOKEN_KIND_UNSUBSCRIBE,
@@ -48,13 +48,13 @@ from synapse_pangea_chat.nudge_delivery.common import (
     token_secret,
     unsubscribe_url,
 )
-from synapse_pangea_chat.nudge_delivery.push_rule import ensure_bot_notice_push_rule
-from synapse_pangea_chat.nudge_delivery.tokens import MILLISECONDS_PER_DAY, sign_token
+from synapse_pangea_chat.notice_delivery.push_rule import ensure_bot_notice_push_rule
+from synapse_pangea_chat.notice_delivery.tokens import MILLISECONDS_PER_DAY, sign_token
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
-logger = logging.getLogger("synapse.module.synapse_pangea_chat.nudge_delivery.deliver")
+logger = logging.getLogger("synapse.module.synapse_pangea_chat.notice_delivery.deliver")
 
 BOT_NOTICE_EVENT_TYPE = "p.room.notice"
 EMAIL_MEDIUM = "email"
@@ -73,7 +73,7 @@ def _optional_str(value: Any) -> Optional[str]:
     return None
 
 
-class DeliverNudge(Resource):
+class DeliverNotice(Resource):
     isLeaf = True
 
     def __init__(
@@ -89,7 +89,7 @@ class DeliverNudge(Resource):
         self._send_email_handler = self._hs.get_send_email_handler()
         self._app_name = self._hs.config.email.email_app_name
         [self._email_html, self._email_text] = api.read_templates(
-            ["nudge_email.html", "nudge_email.txt"],
+            ["notice_email.html", "notice_email.txt"],
             custom_template_directory=TEMPLATES_DIR,
         )
 
@@ -135,7 +135,7 @@ class DeliverNudge(Resource):
                 send_cors=True,
             )
         except Exception:  # noqa: BLE001
-            logger.exception("Error in deliver_nudge endpoint")
+            logger.exception("Error in deliver_notice endpoint")
             respond_with_json(
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
@@ -190,7 +190,7 @@ class DeliverNudge(Resource):
             )
             return result
 
-        if self._config.nudge_suppress_notice_push_rules:
+        if self._config.notice_suppress_notice_push_rules:
             result["push_rule_installed"] = await ensure_bot_notice_push_rule(
                 self._api, user_id
             )
@@ -240,10 +240,10 @@ class DeliverNudge(Resource):
                 user_id
             )
         except Exception as e:  # noqa: BLE001
-            # A presence read that fails must not block a nudge the person is
+            # A presence read that fails must not block a notice the person is
             # otherwise due; the worst case is one push to someone in the app.
             logger.warning(
-                "presence lookup failed for nudge delivery: %s", type(e).__name__
+                "presence lookup failed for notice delivery: %s", type(e).__name__
             )
             return False
         # `currently_active` can survive an offline transition, so the state
@@ -268,24 +268,24 @@ class DeliverNudge(Resource):
     async def _send_email(
         self, body: Dict[str, Any], *, user_id: str, category: str
     ) -> Dict[str, Any]:
-        if not self._config.nudge_email_enabled:
+        if not self._config.notice_email_enabled:
             return {"sent": False, "reason": "email_disabled"}
         secret = token_secret(self._api, self._config)
         if secret is None:
             logger.error(
-                "nudge email skipped: no token secret (nudge_token_secret or macaroon secret)"
+                "notice email skipped: no token secret (notice_token_secret or macaroon secret)"
             )
             return {"sent": False, "reason": "no_token_secret"}
         base = public_baseurl(self._api)
         if base is None:
-            logger.error("nudge email skipped: public_baseurl is not configured")
+            logger.error("notice email skipped: public_baseurl is not configured")
             return {"sent": False, "reason": "no_public_baseurl"}
         address = await self._first_email_address(user_id)
         if address is None:
             return {"sent": False, "reason": "no_email_address"}
 
         now = now_ms(self._api)
-        ttl_ms = self._config.nudge_token_ttl_days * MILLISECONDS_PER_DAY
+        ttl_ms = self._config.notice_token_ttl_days * MILLISECONDS_PER_DAY
         variant = _optional_str(body.get("variant"))
         click_token = sign_token(
             secret,
@@ -326,7 +326,7 @@ class DeliverNudge(Resource):
             "cta_url": cta_url,
             "unsubscribe_url": unsub_url,
             "category_label": category_label(category),
-            "postal_address": self._config.nudge_email_postal_address or "",
+            "postal_address": self._config.notice_email_postal_address or "",
         }
         headers = {
             "List-Unsubscribe": f"<{unsub_url}>",
@@ -343,7 +343,7 @@ class DeliverNudge(Resource):
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "nudge email send failed for category=%s: %s",
+                "notice email send failed for category=%s: %s",
                 category,
                 type(e).__name__,
             )

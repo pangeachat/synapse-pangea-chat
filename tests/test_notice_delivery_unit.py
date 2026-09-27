@@ -6,22 +6,22 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse_pangea_chat import PangeaChat
-from synapse_pangea_chat.nudge_delivery import categories, tokens
-from synapse_pangea_chat.nudge_delivery.click import NudgeClick
-from synapse_pangea_chat.nudge_delivery.common import app_url
-from synapse_pangea_chat.nudge_delivery.deliver import (
+from synapse_pangea_chat.notice_delivery import categories, tokens
+from synapse_pangea_chat.notice_delivery.click import NoticeClick
+from synapse_pangea_chat.notice_delivery.common import app_url
+from synapse_pangea_chat.notice_delivery.deliver import (
     CHANNEL_EMAIL,
     CHANNEL_IN_APP,
     CHANNEL_NONE,
     CHANNEL_PUSH,
     CHANNEL_REFUSED,
-    DeliverNudge,
+    DeliverNotice,
 )
-from synapse_pangea_chat.nudge_delivery.push_rule import (
+from synapse_pangea_chat.notice_delivery.push_rule import (
     ensure_bot_notice_push_rule,
     reset_confirmed_users_for_tests,
 )
-from synapse_pangea_chat.nudge_delivery.unsubscribe import NudgeUnsubscribe
+from synapse_pangea_chat.notice_delivery.unsubscribe import NoticeUnsubscribe
 
 SECRET = b"unit-test-secret"
 NOW_MS = 1_700_000_000_000
@@ -30,13 +30,13 @@ USER = "@alice:my.domain.name"
 
 def _config(**overrides):
     config = MagicMock()
-    config.nudge_email_enabled = True
-    config.nudge_suppress_notice_push_rules = True
-    config.nudge_token_secret = SECRET.decode()
-    config.nudge_token_ttl_days = 90
-    config.nudge_email_postal_address = "1 Test St"
-    config.nudge_public_requests_per_burst = 30
-    config.nudge_public_burst_duration_seconds = 60
+    config.notice_email_enabled = True
+    config.notice_suppress_notice_push_rules = True
+    config.notice_token_secret = SECRET.decode()
+    config.notice_token_ttl_days = 90
+    config.notice_email_postal_address = "1 Test St"
+    config.notice_public_requests_per_burst = 30
+    config.notice_public_burst_duration_seconds = 60
     config.app_base_url = "https://app.example.test"
     config.send_push_sygnal_url = "https://sygnal.example.test"
     for key, value in overrides.items():
@@ -181,27 +181,54 @@ class TestAppUrl(unittest.TestCase):
 
 
 class TestConfig(unittest.TestCase):
+    def test_legacy_notice_configuration_aliases(self):
+        base = {"cms_base_url": "x", "cms_service_api_key": "y"}
+        values = {
+            "email_enabled": True,
+            "email_postal_address": "1 Test Street",
+            "suppress_notice_push_rules": False,
+            "token_secret": "old-signing-key",
+            "token_ttl_days": 120,
+            "public_requests_per_burst": 40,
+            "public_burst_duration_seconds": 90,
+        }
+        legacy = {f"nudge_{key}": value for key, value in values.items()}
+        canonical = {f"notice_{key}": value for key, value in values.items()}
+        self.assertEqual(
+            PangeaChat.parse_config({**base, **legacy}),
+            PangeaChat.parse_config({**base, **canonical}),
+        )
+        self.assertEqual(
+            PangeaChat.parse_config({**base, **legacy, **canonical}),
+            PangeaChat.parse_config({**base, **canonical}),
+        )
+        with self.assertRaisesRegex(ValueError, "Conflicting config keys"):
+            PangeaChat.parse_config(
+                {**base, **legacy, **canonical, "notice_token_secret": "different"}
+            )
+        self.assertNotIn("notice_token_secret", legacy)
+
     def test_defaults_and_validation(self):
         config = PangeaChat.parse_config(
             {"cms_base_url": "x", "cms_service_api_key": "y"}
         )
-        self.assertFalse(config.nudge_email_enabled)
-        self.assertTrue(config.nudge_suppress_notice_push_rules)
-        self.assertEqual(config.nudge_token_ttl_days, 90)
-        with self.assertRaisesRegex(ValueError, "nudge_token_ttl_days"):
+        self.assertFalse(config.notice_email_enabled)
+        self.assertTrue(config.notice_suppress_notice_push_rules)
+        self.assertEqual(config.notice_token_ttl_days, 90)
+        with self.assertRaisesRegex(ValueError, "notice_token_ttl_days"):
             PangeaChat.parse_config(
                 {
                     "cms_base_url": "x",
                     "cms_service_api_key": "y",
-                    "nudge_token_ttl_days": 0,
+                    "notice_token_ttl_days": 0,
                 }
             )
-        with self.assertRaisesRegex(ValueError, "nudge_email_enabled"):
+        with self.assertRaisesRegex(ValueError, "notice_email_enabled"):
             PangeaChat.parse_config(
                 {
                     "cms_base_url": "x",
                     "cms_service_api_key": "y",
-                    "nudge_email_enabled": "yes",
+                    "notice_email_enabled": "yes",
                 }
             )
 
@@ -235,12 +262,12 @@ class TestPushRule(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await ensure_bot_notice_push_rule(api, USER))
 
 
-class TestDeliverNudge(unittest.IsolatedAsyncioTestCase):
+class TestDeliverNotice(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         reset_confirmed_users_for_tests()
 
     def _handler(self, api, config=None, sent=0, attempted=None):
-        return DeliverNudge(api, config or _config(), _direct_push(sent, attempted))
+        return DeliverNotice(api, config or _config(), _direct_push(sent, attempted))
 
     def _body(self, **overrides):
         body = {
@@ -257,24 +284,24 @@ class TestDeliverNudge(unittest.IsolatedAsyncioTestCase):
         return body
 
     def test_validate(self):
-        self.assertEqual(DeliverNudge._validate({}), "Missing user_id")
+        self.assertEqual(DeliverNotice._validate({}), "Missing user_id")
         self.assertIn(
             "category",
-            DeliverNudge._validate(
+            DeliverNotice._validate(
                 {"user_id": USER, "category": "credential", "body": "x"}
             ),
         )
         self.assertEqual(
-            DeliverNudge._validate({"user_id": USER, "category": "suggestions"}),
+            DeliverNotice._validate({"user_id": USER, "category": "suggestions"}),
             "Missing body",
         )
-        self.assertIsNone(DeliverNudge._validate(self._body()))
+        self.assertIsNone(DeliverNotice._validate(self._body()))
 
     async def test_refused_category_sends_nothing(self):
         api = _api(account_data={"refused": ["activity_nudges"]})
         handler = self._handler(api, sent=1)
         with patch(
-            "synapse_pangea_chat.nudge_delivery.deliver.ensure_bot_notice_push_rule",
+            "synapse_pangea_chat.notice_delivery.deliver.ensure_bot_notice_push_rule",
             new=AsyncMock(),
         ) as rule:
             result = await handler.deliver(self._body())
@@ -293,7 +320,7 @@ class TestDeliverNudge(unittest.IsolatedAsyncioTestCase):
         api = _api(currently_active=True)
         handler = self._handler(api, sent=1)
         with patch(
-            "synapse_pangea_chat.nudge_delivery.deliver.ensure_bot_notice_push_rule",
+            "synapse_pangea_chat.notice_delivery.deliver.ensure_bot_notice_push_rule",
             new=AsyncMock(return_value=True),
         ):
             result = await handler.deliver(self._body())
@@ -308,7 +335,7 @@ class TestDeliverNudge(unittest.IsolatedAsyncioTestCase):
         )
         handler = self._handler(api, sent=1)
         with patch(
-            "synapse_pangea_chat.nudge_delivery.deliver.ensure_bot_notice_push_rule",
+            "synapse_pangea_chat.notice_delivery.deliver.ensure_bot_notice_push_rule",
             new=AsyncMock(return_value=False),
         ):
             result = await handler.deliver(self._body())
@@ -323,7 +350,7 @@ class TestDeliverNudge(unittest.IsolatedAsyncioTestCase):
         )
         handler = self._handler(api, sent=0, attempted=0)
         with patch(
-            "synapse_pangea_chat.nudge_delivery.deliver.ensure_bot_notice_push_rule",
+            "synapse_pangea_chat.notice_delivery.deliver.ensure_bot_notice_push_rule",
             new=AsyncMock(return_value=False),
         ):
             result = await handler.deliver(self._body(title="Your next activity"))
@@ -344,10 +371,10 @@ class TestDeliverNudge(unittest.IsolatedAsyncioTestCase):
             threepids=[SimpleNamespace(medium="email", address="alice@example.test")]
         )
         handler = self._handler(
-            api, config=_config(nudge_email_enabled=False), sent=0, attempted=0
+            api, config=_config(notice_email_enabled=False), sent=0, attempted=0
         )
         with patch(
-            "synapse_pangea_chat.nudge_delivery.deliver.ensure_bot_notice_push_rule",
+            "synapse_pangea_chat.notice_delivery.deliver.ensure_bot_notice_push_rule",
             new=AsyncMock(return_value=False),
         ):
             result = await handler.deliver(self._body())
@@ -358,7 +385,7 @@ class TestDeliverNudge(unittest.IsolatedAsyncioTestCase):
         api = _api(threepids=[SimpleNamespace(medium="msisdn", address="+1555")])
         handler = self._handler(api, sent=0, attempted=1)
         with patch(
-            "synapse_pangea_chat.nudge_delivery.deliver.ensure_bot_notice_push_rule",
+            "synapse_pangea_chat.notice_delivery.deliver.ensure_bot_notice_push_rule",
             new=AsyncMock(return_value=False),
         ):
             result = await handler.deliver(self._body())
@@ -386,7 +413,7 @@ def _capture_html(monkey_target, request_holder):
 
 class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
     def _handler(self, api):
-        return NudgeUnsubscribe(api, _config())
+        return NoticeUnsubscribe(api, _config())
 
     def _token(self, category="activity_nudges", kind="unsub"):
         return tokens.sign_token(
@@ -398,20 +425,22 @@ class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
         handler = self._handler(api)
         captured = []
         with _capture_html(
-            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", captured
+            "synapse_pangea_chat.notice_delivery.unsubscribe.respond_with_html",
+            captured,
         ):
             await handler._async_render_GET(
                 _FakeRequest(args={b"t": [self._token().encode()]})
             )
         self.assertEqual(captured[0][0], 200)
-        self.assertIn("nudge_unsubscribe_confirm.html", captured[0][1])
+        self.assertIn("notice_unsubscribe_confirm.html", captured[0][1])
         api.account_data_manager.put_global.assert_not_awaited()
 
     async def test_get_with_bad_token_is_400(self):
         api = _api()
         captured = []
         with _capture_html(
-            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", captured
+            "synapse_pangea_chat.notice_delivery.unsubscribe.respond_with_html",
+            captured,
         ):
             await self._handler(api)._async_render_GET(
                 _FakeRequest(args={b"t": [b"junk"]})
@@ -423,7 +452,8 @@ class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
         captured = []
         body = f"t={self._token()}&scope=category".encode()
         with _capture_html(
-            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", captured
+            "synapse_pangea_chat.notice_delivery.unsubscribe.respond_with_html",
+            captured,
         ):
             await self._handler(api)._async_render_POST(_FakeRequest(body=body))
         self.assertEqual(captured[0][0], 200)
@@ -445,7 +475,8 @@ class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
             args={b"t": [self._token().encode()]}, body=b"List-Unsubscribe=One-Click"
         )
         with _capture_html(
-            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", captured
+            "synapse_pangea_chat.notice_delivery.unsubscribe.respond_with_html",
+            captured,
         ):
             await self._handler(api)._async_render_POST(request)
         self.assertEqual(captured[0][0], 200)
@@ -457,7 +488,8 @@ class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
         captured = []
         body = f"t={self._token()}&scope=all".encode()
         with _capture_html(
-            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", captured
+            "synapse_pangea_chat.notice_delivery.unsubscribe.respond_with_html",
+            captured,
         ):
             await self._handler(api)._async_render_POST(_FakeRequest(body=body))
         content = api.account_data_manager.put_global.await_args.args[2]
@@ -468,7 +500,8 @@ class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
         captured = []
         body = f"t={self._token(kind='click')}".encode()
         with _capture_html(
-            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", captured
+            "synapse_pangea_chat.notice_delivery.unsubscribe.respond_with_html",
+            captured,
         ):
             await self._handler(api)._async_render_POST(_FakeRequest(body=body))
         self.assertEqual(captured[0][0], 400)
@@ -492,7 +525,8 @@ class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
         ).encode()
         captured = []
         with _capture_html(
-            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", captured
+            "synapse_pangea_chat.notice_delivery.unsubscribe.respond_with_html",
+            captured,
         ):
             await self._handler(api)._async_render_POST(_FakeRequest(body=body))
         self.assertEqual(captured[0][0], 200)
@@ -516,7 +550,7 @@ class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
             doseq=True,
         ).encode()
         with _capture_html(
-            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", []
+            "synapse_pangea_chat.notice_delivery.unsubscribe.respond_with_html", []
         ):
             await self._handler(api)._async_render_POST(_FakeRequest(body=body))
         self.assertTrue(
@@ -528,7 +562,8 @@ class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
         captured = []
         body = f"t={self._token()}&scope=preferences&enabled=credential".encode()
         with _capture_html(
-            "synapse_pangea_chat.nudge_delivery.unsubscribe.respond_with_html", captured
+            "synapse_pangea_chat.notice_delivery.unsubscribe.respond_with_html",
+            captured,
         ):
             await self._handler(api)._async_render_POST(_FakeRequest(body=body))
         self.assertEqual(captured[0][0], 400)
@@ -551,10 +586,10 @@ class TestClick(unittest.IsolatedAsyncioTestCase):
 
     async def test_records_open_then_redirects_to_activity(self):
         api = _api()
-        handler = NudgeClick(api, _config())
+        handler = NoticeClick(api, _config())
         redirects = []
         with patch(
-            "synapse_pangea_chat.nudge_delivery.click.respond_with_redirect",
+            "synapse_pangea_chat.notice_delivery.click.respond_with_redirect",
             new=lambda request, url, *a, **k: redirects.append(url),
         ):
             await handler._async_render_GET(
@@ -571,10 +606,10 @@ class TestClick(unittest.IsolatedAsyncioTestCase):
 
     async def test_bad_token_redirects_home_without_record(self):
         api = _api()
-        handler = NudgeClick(api, _config())
+        handler = NoticeClick(api, _config())
         redirects = []
         with patch(
-            "synapse_pangea_chat.nudge_delivery.click.respond_with_redirect",
+            "synapse_pangea_chat.notice_delivery.click.respond_with_redirect",
             new=lambda request, url, *a, **k: redirects.append(url),
         ):
             await handler._async_render_GET(_FakeRequest(args={b"t": [b"junk"]}))
@@ -586,10 +621,10 @@ class TestClick(unittest.IsolatedAsyncioTestCase):
         api.create_and_send_event_into_room = AsyncMock(
             side_effect=RuntimeError("not in room")
         )
-        handler = NudgeClick(api, _config())
+        handler = NoticeClick(api, _config())
         redirects = []
         with patch(
-            "synapse_pangea_chat.nudge_delivery.click.respond_with_redirect",
+            "synapse_pangea_chat.notice_delivery.click.respond_with_redirect",
             new=lambda request, url, *a, **k: redirects.append(url),
         ):
             await handler._async_render_GET(
@@ -605,7 +640,7 @@ if __name__ == "__main__":
 
 class TestParsePreferencesFrozen(unittest.TestCase):
     def test_frozen_tuple_refusals_are_read(self) -> None:
-        from synapse_pangea_chat.nudge_delivery.categories import parse_preferences
+        from synapse_pangea_chat.notice_delivery.categories import parse_preferences
 
         prefs = parse_preferences(
             {"refused": ("activity_nudges", "bogus"), "all_off": False}
@@ -613,16 +648,16 @@ class TestParsePreferencesFrozen(unittest.TestCase):
         self.assertEqual(prefs.refused, frozenset({"activity_nudges"}))
 
 
-class TestPrepareNudge(unittest.IsolatedAsyncioTestCase):
+class TestPrepareNotice(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         reset_confirmed_users_for_tests()
 
     async def test_installs_rule_and_reports(self):
-        from synapse_pangea_chat.nudge_delivery.prepare import PrepareNudge
+        from synapse_pangea_chat.notice_delivery.prepare import PrepareNotice
 
-        handler = PrepareNudge(_api(), _config())
+        handler = PrepareNotice(_api(), _config())
         with patch(
-            "synapse_pangea_chat.nudge_delivery.prepare.ensure_bot_notice_push_rule",
+            "synapse_pangea_chat.notice_delivery.prepare.ensure_bot_notice_push_rule",
             new=AsyncMock(return_value=True),
         ) as ensure:
             result = await handler.prepare(USER)
@@ -633,11 +668,13 @@ class TestPrepareNudge(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_suppression_off_installs_nothing(self):
-        from synapse_pangea_chat.nudge_delivery.prepare import PrepareNudge
+        from synapse_pangea_chat.notice_delivery.prepare import PrepareNotice
 
-        handler = PrepareNudge(_api(), _config(nudge_suppress_notice_push_rules=False))
+        handler = PrepareNotice(
+            _api(), _config(notice_suppress_notice_push_rules=False)
+        )
         with patch(
-            "synapse_pangea_chat.nudge_delivery.prepare.ensure_bot_notice_push_rule",
+            "synapse_pangea_chat.notice_delivery.prepare.ensure_bot_notice_push_rule",
             new=AsyncMock(return_value=True),
         ) as ensure:
             result = await handler.prepare(USER)
@@ -651,7 +688,7 @@ class TestInAppRequiresOnline(unittest.IsolatedAsyncioTestCase):
         api._hs.get_presence_handler.return_value.current_state_for_user = AsyncMock(
             return_value=SimpleNamespace(state="offline", currently_active=True)
         )
-        handler = DeliverNudge(api, _config(), _direct_push(0, 0))
+        handler = DeliverNotice(api, _config(), _direct_push(0, 0))
         self.assertFalse(await handler._is_in_app(USER))
 
 
@@ -663,11 +700,11 @@ class TestEmailSubjectIsOneLine(unittest.IsolatedAsyncioTestCase):
         api = _api(
             threepids=[SimpleNamespace(medium="email", address="alice@example.test")]
         )
-        handler = DeliverNudge(
-            api, _config(nudge_email_enabled=True), _direct_push(0, 0)
+        handler = DeliverNotice(
+            api, _config(notice_email_enabled=True), _direct_push(0, 0)
         )
         with patch(
-            "synapse_pangea_chat.nudge_delivery.deliver.ensure_bot_notice_push_rule",
+            "synapse_pangea_chat.notice_delivery.deliver.ensure_bot_notice_push_rule",
             new=AsyncMock(return_value=False),
         ):
             result = await handler.deliver(
@@ -692,7 +729,7 @@ class TestEmailSubjectIsOneLine(unittest.IsolatedAsyncioTestCase):
 
 class TestReviewRoundThree(unittest.TestCase):
     def test_non_ascii_token_is_invalid_not_an_error(self):
-        from synapse_pangea_chat.nudge_delivery.tokens import verify_token
+        from synapse_pangea_chat.notice_delivery.tokens import verify_token
 
         self.assertIsNone(verify_token(b"s", "é.x", now_ms=NOW_MS))
         self.assertIsNone(verify_token(b"s", "abc.é", now_ms=NOW_MS))
@@ -701,13 +738,13 @@ class TestReviewRoundThree(unittest.TestCase):
         from synapse_pangea_chat import PangeaChat
 
         base = {"cms_base_url": "x", "cms_service_api_key": "y"}
-        with self.assertRaisesRegex(ValueError, "nudge_email_postal_address"):
-            PangeaChat.parse_config({**base, "nudge_email_enabled": True})
+        with self.assertRaisesRegex(ValueError, "notice_email_postal_address"):
+            PangeaChat.parse_config({**base, "notice_email_enabled": True})
         config = PangeaChat.parse_config(
             {
                 **base,
-                "nudge_email_enabled": True,
-                "nudge_email_postal_address": "1 Main St",
+                "notice_email_enabled": True,
+                "notice_email_postal_address": "1 Main St",
             }
         )
-        self.assertTrue(config.nudge_email_enabled)
+        self.assertTrue(config.notice_email_enabled)

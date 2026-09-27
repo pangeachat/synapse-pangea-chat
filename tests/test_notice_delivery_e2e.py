@@ -1,7 +1,9 @@
 import requests
 
-from synapse_pangea_chat.nudge_delivery import tokens
-from synapse_pangea_chat.nudge_delivery.push_rule import reset_confirmed_users_for_tests
+from synapse_pangea_chat.notice_delivery import tokens
+from synapse_pangea_chat.notice_delivery.push_rule import (
+    reset_confirmed_users_for_tests,
+)
 
 from .base_e2e import BaseSynapseE2ETest
 
@@ -10,7 +12,7 @@ APP_BASE_URL = "https://app.example.test"
 PREFERENCES_TYPE = "pangea.communication_preferences"
 
 
-class TestNudgeDeliveryE2E(BaseSynapseE2ETest):
+class TestNoticeDeliveryE2E(BaseSynapseE2ETest):
     """Deliver, unsubscribe, and click against a real Synapse (no SMTP: the
     email leg is covered by the unit tests; here email stays disabled)."""
 
@@ -18,7 +20,7 @@ class TestNudgeDeliveryE2E(BaseSynapseE2ETest):
     def _module_config():
         return {
             "send_push_sygnal_url": "https://sygnal.example.test/_matrix/push/v1/notify",
-            "nudge_token_secret": E2E_SECRET,
+            "notice_token_secret": E2E_SECRET,
             "app_base_url": APP_BASE_URL,
         }
 
@@ -28,7 +30,7 @@ class TestNudgeDeliveryE2E(BaseSynapseE2ETest):
 
     def _prepare(self, admin_token, user_id="@alice:my.domain.name"):
         return requests.post(
-            f"{self.server_url}/_synapse/client/pangea/v1/prepare_nudge",
+            f"{self.server_url}/_synapse/client/pangea/v1/prepare_notice",
             json={"user_id": user_id},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
@@ -63,7 +65,7 @@ class TestNudgeDeliveryE2E(BaseSynapseE2ETest):
         }
         body.update(overrides)
         return requests.post(
-            f"{self.server_url}/_synapse/client/pangea/v1/deliver_nudge",
+            f"{self.server_url}/_synapse/client/pangea/v1/deliver_notice",
             json=body,
             headers={"Authorization": f"Bearer {admin_token}"},
         )
@@ -99,6 +101,47 @@ class TestNudgeDeliveryE2E(BaseSynapseE2ETest):
         try:
             self.assertEqual(self._deliver(alice_token).status_code, 403)
             self.assertEqual(self._deliver("not-a-token").status_code, 401)
+        finally:
+            self._stop(started)
+
+    async def test_legacy_routes_share_authentication_and_refusals(self):
+        started, alice, admin = await self._boot()
+        try:
+            response = requests.put(
+                f"{self.server_url}/_matrix/client/v3/user/@alice:my.domain.name/account_data/{PREFERENCES_TYPE}",
+                json={"version": 1, "refused": ["activity_nudges"]},
+                headers={"Authorization": f"Bearer {alice}"},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            for route in ("deliver_nudge", "deliver_notice"):
+                url = f"{self.server_url}/_synapse/client/pangea/v1/{route}"
+                body = {
+                    "user_id": "@alice:my.domain.name",
+                    "category": "activity_nudges",
+                    "body": "Test",
+                }
+                denied = requests.post(
+                    url, json=body, headers={"Authorization": f"Bearer {alice}"}
+                )
+                self.assertEqual(denied.status_code, 403, denied.text)
+                delivered = requests.post(
+                    url, json=body, headers={"Authorization": f"Bearer {admin}"}
+                )
+                self.assertEqual(delivered.status_code, 200, delivered.text)
+                self.assertEqual(delivered.json()["channel"], "refused")
+                self.assertEqual(delivered.json()["reason"], "category_refused")
+            for route in ("prepare_nudge", "prepare_notice"):
+                url = f"{self.server_url}/_synapse/client/pangea/v1/{route}"
+                body = {"user_id": "@alice:my.domain.name"}
+                denied = requests.post(
+                    url, json=body, headers={"Authorization": f"Bearer {alice}"}
+                )
+                self.assertEqual(denied.status_code, 403, denied.text)
+                prepared = requests.post(
+                    url, json=body, headers={"Authorization": f"Bearer {admin}"}
+                )
+                self.assertEqual(prepared.status_code, 200, prepared.text)
+                self.assertTrue(prepared.json()["suppression_enabled"])
         finally:
             self._stop(started)
 

@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEST = ROOT / "synapse_pangea_chat/nudge_delivery/templates/brand_base.html"
+DEST = ROOT / "synapse_pangea_chat/notice_delivery/templates/brand_base.html"
 
 
 def adapt(source: str) -> str:

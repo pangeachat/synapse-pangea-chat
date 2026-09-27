@@ -1,12 +1,12 @@
 """Keep Synapse's own notification pipeline off the bot's notices.
 
-A bot nudge is a ``p.room.notice`` event in the person's bot DM. The bot
-delivers it deliberately — direct push, or the nudge email — so Synapse's
+A bot notice is a ``p.room.notice`` event in the person's bot DM. The bot
+delivers it deliberately — direct push, or the notice email — so Synapse's
 rule-driven pipeline must not also act on it: the email pusher would mail it as
 a missed message (with no unsubscribe, on the transactional stream) and an HTTP
 pusher would push it a second time. A per-user override rule that says
 ``dont_notify`` for that event type closes both paths. Installed lazily, the
-first time a nudge is delivered to the person, and idempotent — the same shape
+first time a notice is delivered to the person, and idempotent — the same shape
 as the analytics-invite suppression rule.
 """
 
@@ -19,7 +19,7 @@ from synapse.module_api import ModuleApi
 from synapse.push.rulekinds import PRIORITY_CLASS_MAP
 
 logger = logging.getLogger(
-    "synapse.module.synapse_pangea_chat.nudge_delivery.push_rule"
+    "synapse.module.synapse_pangea_chat.notice_delivery.push_rule"
 )
 
 BOT_NOTICE_EVENT_TYPE = "p.room.notice"

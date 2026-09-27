@@ -10,7 +10,7 @@
    change when the message catalog's templates arrive.
 
 Both go through Synapse's own mail path (the homeserver's ``email`` config), and
-the templates ship inside the package, as the nudge emails' do.
+the templates ship inside the package, as the notice emails' do.
 
 Every send is bounded by ``SEND_TIMEOUT_SECONDS``. Synapse's mailer bounds the
 SMTP connection but not the transaction, so a server that accepts and then

@@ -52,9 +52,9 @@ include = ["synapse_pangea_chat*"]
 [tool.setuptools.package-data]
 synapse_pangea_chat = [
   "moderation/*.json",
-  # Nudge email and unsubscribe page templates, read at runtime.
-  "nudge_delivery/templates/*.html",
-  "nudge_delivery/templates/*.txt",
+  # Notice email and unsubscribe page templates, read at runtime.
+  "notice_delivery/templates/*.html",
+  "notice_delivery/templates/*.txt",
   # The requested-course claim emails (course ready, course claimed).
   "email_invite/templates/*.html",
   "email_invite/templates/*.txt",

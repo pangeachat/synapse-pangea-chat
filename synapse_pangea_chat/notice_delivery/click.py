@@ -1,4 +1,4 @@
-"""``GET /_synapse/client/pangea/v1/n?t=…`` — the nudge email's click-through.
+"""``GET /_synapse/client/pangea/v1/n?t=…`` — the notice email's click-through.
 
 Records the open as the same first-party ``p.room.notice.opened`` event the
 client writes on a push tap — so an email click feeds cooldown and backoff
@@ -19,19 +19,19 @@ from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
-from synapse_pangea_chat.nudge_delivery.common import (
+from synapse_pangea_chat.notice_delivery.common import (
     TOKEN_KIND_CLICK,
     app_url,
     now_ms,
     token_secret,
 )
-from synapse_pangea_chat.nudge_delivery.rate_limit import SlidingWindowRateLimiter
-from synapse_pangea_chat.nudge_delivery.tokens import verify_token
+from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
+from synapse_pangea_chat.notice_delivery.tokens import verify_token
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
-logger = logging.getLogger("synapse.module.synapse_pangea_chat.nudge_delivery.click")
+logger = logging.getLogger("synapse.module.synapse_pangea_chat.notice_delivery.click")
 
 BOT_NOTICE_OPENED_EVENT_TYPE = "p.room.notice.opened"
 
@@ -48,7 +48,7 @@ def _first_arg(request: SynapseRequest, key: bytes) -> Optional[str]:
         return None
 
 
-class NudgeClick(Resource):
+class NoticeClick(Resource):
     isLeaf = True
 
     def __init__(self, api: ModuleApi, config: "PangeaChatConfig"):
@@ -56,8 +56,8 @@ class NudgeClick(Resource):
         self._api = api
         self._config = config
         self._rate_limiter = SlidingWindowRateLimiter(
-            requests_per_burst=config.nudge_public_requests_per_burst,
-            burst_duration_seconds=config.nudge_public_burst_duration_seconds,
+            requests_per_burst=config.notice_public_requests_per_burst,
+            burst_duration_seconds=config.notice_public_burst_duration_seconds,
         )
 
     def render_GET(self, request: SynapseRequest):
@@ -77,7 +77,7 @@ class NudgeClick(Resource):
                 # An expired or forged link still lands the person in the app;
                 # only the open goes unrecorded.
                 logger.warning(
-                    "nudge click link invalid or expired; redirecting without record"
+                    "notice click link invalid or expired; redirecting without record"
                 )
                 respond_with_redirect(request, destination.encode("utf-8"))
                 return
@@ -89,14 +89,14 @@ class NudgeClick(Resource):
             await self.record_open(payload)
             respond_with_redirect(request, destination.encode("utf-8"))
         except Exception:  # noqa: BLE001
-            logger.exception("Error handling nudge click")
+            logger.exception("Error handling notice click")
             respond_with_redirect(request, destination.encode("utf-8"))
 
     def _verify(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
         secret = token_secret(self._api, self._config)
         if secret is None:
             logger.error(
-                "nudge click link cannot be verified: no token secret configured"
+                "notice click link cannot be verified: no token secret configured"
             )
             return None
         payload = verify_token(secret, token, now_ms=now_ms(self._api))
@@ -111,7 +111,9 @@ class NudgeClick(Resource):
         room_id = payload.get("r")
         notice_event_id = payload.get("e")
         if not isinstance(room_id, str) or not isinstance(notice_event_id, str):
-            logger.warning("nudge click carried no notice reference; open not recorded")
+            logger.warning(
+                "notice click carried no notice reference; open not recorded"
+            )
             return False
         try:
             await self._api.create_and_send_event_into_room(
@@ -127,6 +129,6 @@ class NudgeClick(Resource):
                 }
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning("nudge open not recorded: %s", type(e).__name__)
+            logger.warning("notice open not recorded: %s", type(e).__name__)
             return False
         return True
