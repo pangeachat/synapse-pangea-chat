@@ -25,8 +25,8 @@ from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
-from synapse_pangea_chat.direct_push.is_rate_limited import is_rate_limited
 from synapse_pangea_chat.notice_delivery.push_rule import ensure_bot_notice_push_rule
+from synapse_pangea_chat.notice_delivery.rate_limit import AdminRateLimiter
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -42,6 +42,9 @@ class PrepareNotice(Resource):
         self._api = api
         self._config = config
         self._auth = api._hs.get_auth()
+        self._limiter = AdminRateLimiter(
+            config.notice_admin_requests_per_minute, config.notice_admin_burst
+        )
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -56,7 +59,7 @@ class PrepareNotice(Resource):
                     request, 403, {"error": "Admin access required"}, send_cors=True
                 )
                 return
-            if is_rate_limited(requester_id, self._config):
+            if self._limiter.is_rate_limited(requester_id):
                 respond_with_json(
                     request, 429, {"error": "Rate limited"}, send_cors=True
                 )

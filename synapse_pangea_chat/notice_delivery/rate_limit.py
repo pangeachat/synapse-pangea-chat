@@ -6,6 +6,29 @@ import time
 from typing import Dict, List
 
 
+class AdminRateLimiter:
+    """Token bucket independent of direct push and public link traffic."""
+
+    def __init__(self, per_minute: int, burst: int):
+        self._rate = per_minute / 60
+        self._burst = burst
+        self._buckets: Dict[str, tuple[float, float]] = {}
+
+    def is_rate_limited(self, key: str) -> bool:
+        now = time.monotonic()
+        # Idle callers regain a full bucket, so their records can be evicted.
+        self._buckets = {
+            k: v
+            for k, v in self._buckets.items()
+            if now - v[1] < self._burst / self._rate
+        }
+        tokens, last = self._buckets.get(key, (float(self._burst), now))
+        tokens = min(self._burst, tokens + (now - last) * self._rate)
+        limited = tokens < 1
+        self._buckets[key] = (tokens if limited else tokens - 1, now)
+        return limited
+
+
 class SlidingWindowRateLimiter:
     def __init__(self, *, requests_per_burst: int, burst_duration_seconds: int):
         self._requests_per_burst = requests_per_burst

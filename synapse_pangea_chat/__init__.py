@@ -926,6 +926,16 @@ class PangeaChat:
             )
 
         # --- blocked_join_gate config ---
+        notice_admin_limits = {}
+        for key, default in (
+            ("notice_admin_requests_per_minute", 600),
+            ("notice_admin_burst", 100),
+        ):
+            value = config.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f'Config "{key}" must be an integer >= 1')
+            notice_admin_limits[key] = value
+
         blocked_join_gate_enabled = config.get("blocked_join_gate_enabled", True)
         if not isinstance(blocked_join_gate_enabled, bool):
             raise ValueError('Config "blocked_join_gate_enabled" must be a boolean')
@@ -1264,6 +1274,10 @@ class PangeaChat:
             notice_email_postal_address=notice_email_postal_address,
             notice_public_requests_per_burst=notice_public_requests_per_burst,
             notice_public_burst_duration_seconds=notice_public_burst_duration_seconds,
+            notice_admin_requests_per_minute=notice_admin_limits[
+                "notice_admin_requests_per_minute"
+            ],
+            notice_admin_burst=notice_admin_limits["notice_admin_burst"],
             delayed_push_enabled=delayed_push_enabled,
             delayed_push_delay_ms=delayed_push_delay_ms,
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,

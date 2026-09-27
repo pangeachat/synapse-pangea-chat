@@ -25,7 +25,7 @@ def adapt(source: str) -> str:
         "{{ ManageURL }}": "{{ unsubscribe_url }}",
         "{{ TrackView }}": "",
         address: "{{ postal_address | default(brand_postal_address) }}",
-        "You're receiving this email because you've previously\n                  expressed interest in Pangea Chat.<br />": "",
+        "You're receiving this email because you've previously\n                  expressed interest in Pangea Chat.<br />": "{% if receiving_reason | default('') %}{{ receiving_reason }}<br />{% endif %}",
         "Manage preferences or unsubscribe": "Unsubscribe",
     }
     for old, new in replacements.items():

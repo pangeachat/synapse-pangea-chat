@@ -37,6 +37,8 @@ def _config(**overrides):
     config.notice_email_postal_address = "1 Test St"
     config.notice_public_requests_per_burst = 30
     config.notice_public_burst_duration_seconds = 60
+    config.notice_admin_requests_per_minute = 600
+    config.notice_admin_burst = 100
     config.app_base_url = "https://app.example.test"
     config.send_push_sygnal_url = "https://sygnal.example.test"
     for key, value in overrides.items():
