@@ -529,4 +529,4 @@ Synapse developers (assuming a Unix-like shell):
 
 ## Local email previews
 
-[Preview and capture nudge emails locally](scripts/EMAIL_PREVIEW.md) for template and copy iteration without deploying or sending external mail.
+[Preview and capture notice emails locally](scripts/EMAIL_PREVIEW.md) for template and copy iteration without deploying or sending external mail.

@@ -1,6 +1,6 @@
 """Real local delivery, captured at SMTP. Optionally export the received MIME.
 
-NUDGE_EMAIL_CAPTURE_DIR=/tmp/pangea-nudge-capture python -m unittest tests.test_nudge_email_smtp
+NOTICE_EMAIL_CAPTURE_DIR=/tmp/pangea-nudge-capture python -m unittest tests.test_notice_email_smtp
 """
 
 import os
@@ -14,8 +14,8 @@ from urllib.parse import parse_qs, urlparse
 import requests
 from jinja2 import Environment, FileSystemLoader
 
-from synapse_pangea_chat.nudge_delivery.common import TEMPLATES_DIR
-from synapse_pangea_chat.nudge_delivery.tokens import verify_token
+from synapse_pangea_chat.notice_delivery.common import TEMPLATES_DIR
+from synapse_pangea_chat.notice_delivery.tokens import verify_token
 
 from .base_e2e import BaseSynapseE2ETest
 from .test_register_email_e2e import MockSMTPServer
@@ -31,7 +31,7 @@ class Links(HTMLParser):
             self.urls.extend(value for key, value in attrs if key == "href")
 
 
-class TestNudgeEmailSMTP(BaseSynapseE2ETest):
+class TestNoticeEmailSMTP(BaseSynapseE2ETest):
     async def test_real_delivery_has_brand_mime_and_working_unsubscribe(self):
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
@@ -47,9 +47,9 @@ class TestNudgeEmailSMTP(BaseSynapseE2ETest):
         )
         started = await self.start_test_synapse(
             module_config={
-                "nudge_email_enabled": True,
-                "nudge_email_postal_address": brand_address,
-                "nudge_token_secret": "local-test-secret",
+                "notice_email_enabled": True,
+                "notice_email_postal_address": brand_address,
+                "notice_token_secret": "local-test-secret",
                 "app_base_url": "http://127.0.0.1/preview-only",
             },
             synapse_config_overrides={
@@ -92,7 +92,7 @@ class TestNudgeEmailSMTP(BaseSynapseE2ETest):
             )
             self.assertEqual(response.status_code, 201, response.text)
             response = requests.post(
-                f"{self.server_url}/_synapse/client/pangea/v1/deliver_nudge",
+                f"{self.server_url}/_synapse/client/pangea/v1/deliver_notice",
                 headers=headers,
                 json={
                     "user_id": user,
@@ -158,7 +158,7 @@ class TestNudgeEmailSMTP(BaseSynapseE2ETest):
                     "refused"
                 ],
             )
-            from synapse_pangea_chat.nudge_delivery.categories import (
+            from synapse_pangea_chat.notice_delivery.categories import (
                 GLOBAL_OFF_CATEGORIES,
             )
 
@@ -185,7 +185,7 @@ class TestNudgeEmailSMTP(BaseSynapseE2ETest):
             self.assertIn("Privacy", saved.text)
             self.assertIn("Terms", saved.text)
             self.assertIn("NSF.png", saved.text)
-            if output := os.environ.get("NUDGE_EMAIL_CAPTURE_DIR"):
+            if output := os.environ.get("NOTICE_EMAIL_CAPTURE_DIR"):
                 destination = Path(output)
                 destination.mkdir(parents=True, exist_ok=True)
                 (destination / "email.eml").write_bytes(raw)

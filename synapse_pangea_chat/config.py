@@ -113,22 +113,22 @@ class PangeaChatConfig:
     send_push_burst_duration_seconds: int = 1
     send_push_sygnal_url: Optional[str] = None
 
-    # --- nudge_delivery config ---
-    # Email is the fallback channel for bot nudges when a person has no push
+    # --- notice_delivery config ---
+    # Email is the fallback channel for notices when a person has no push
     # device. Off by default: turning it on is a rollout decision (deploy-note).
-    nudge_email_enabled: bool = False
+    notice_email_enabled: bool = False
     # Install the per-user push rule that keeps Synapse's own mailer and
     # rule-driven push off p.room.notice events (the bot delivers those itself).
-    nudge_suppress_notice_push_rules: bool = True
+    notice_suppress_notice_push_rules: bool = True
     # HMAC key for unsubscribe and click links; falls back to the homeserver's
     # macaroon secret when unset.
-    nudge_token_secret: Optional[str] = None
-    nudge_token_ttl_days: int = 90
+    notice_token_secret: Optional[str] = None
+    notice_token_ttl_days: int = 90
     # Shown in the email footer; a CAN-SPAM requirement for marketing-classified
     # categories, harmless on the rest.
-    nudge_email_postal_address: Optional[str] = None
-    nudge_public_requests_per_burst: int = 30
-    nudge_public_burst_duration_seconds: int = 60
+    notice_email_postal_address: Optional[str] = None
+    notice_public_requests_per_burst: int = 30
+    notice_public_burst_duration_seconds: int = 60
 
     # --- delayed_push config ---
     delayed_push_enabled: bool = False

@@ -35,11 +35,11 @@ from synapse_pangea_chat.moderation import ChatModeration, tier1_prefilter
 from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.moderation import refusal as moderation_refusal
 from synapse_pangea_chat.moderation import severity as moderation_severity
-from synapse_pangea_chat.nudge_delivery import (
-    DeliverNudge,
-    NudgeClick,
-    NudgeUnsubscribe,
-    PrepareNudge,
+from synapse_pangea_chat.notice_delivery import (
+    DeliverNotice,
+    NoticeClick,
+    NoticeUnsubscribe,
+    PrepareNotice,
 )
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
@@ -479,28 +479,38 @@ class PangeaChat:
             resource=self.direct_push_resource,
         )
 
-        # --- Nudge Delivery ---
-        self.prepare_nudge_resource = PrepareNudge(api, config)
+        # --- Notice Delivery ---
+        self.prepare_notice_resource = PrepareNotice(api, config)
         self._api.register_web_resource(
-            path="/_synapse/client/pangea/v1/prepare_nudge",
-            resource=self.prepare_nudge_resource,
+            path="/_synapse/client/pangea/v1/prepare_notice",
+            resource=self.prepare_notice_resource,
         )
-        self.deliver_nudge_resource = DeliverNudge(
+        self.deliver_notice_resource = DeliverNotice(
             api, config, self.direct_push_resource
         )
         self._api.register_web_resource(
-            path="/_synapse/client/pangea/v1/deliver_nudge",
-            resource=self.deliver_nudge_resource,
+            path="/_synapse/client/pangea/v1/deliver_notice",
+            resource=self.deliver_notice_resource,
         )
-        self.nudge_unsubscribe_resource = NudgeUnsubscribe(api, config)
+        # Existing callers use these routes until their next deployment.
+        # Both names share the resource, including authentication and limits.
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/prepare_nudge",
+            resource=self.prepare_notice_resource,
+        )
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/deliver_nudge",
+            resource=self.deliver_notice_resource,
+        )
+        self.notice_unsubscribe_resource = NoticeUnsubscribe(api, config)
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/unsubscribe",
-            resource=self.nudge_unsubscribe_resource,
+            resource=self.notice_unsubscribe_resource,
         )
-        self.nudge_click_resource = NudgeClick(api, config)
+        self.notice_click_resource = NoticeClick(api, config)
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/n",
-            resource=self.nudge_click_resource,
+            resource=self.notice_click_resource,
         )
 
         # --- Server-side chat moderation ---
@@ -547,6 +557,26 @@ class PangeaChat:
 
     @staticmethod
     def parse_config(config: Dict[str, Any]) -> PangeaChatConfig:
+        config = dict(config)
+        for suffix in (
+            "email_enabled",
+            "suppress_notice_push_rules",
+            "token_secret",
+            "token_ttl_days",
+            "email_postal_address",
+            "public_requests_per_burst",
+            "public_burst_duration_seconds",
+        ):
+            legacy_key = f"nudge_{suffix}"
+            canonical_key = f"notice_{suffix}"
+            if legacy_key not in config:
+                continue
+            if canonical_key in config and config[canonical_key] != config[legacy_key]:
+                raise ValueError(
+                    f'Conflicting config keys "{legacy_key}" and "{canonical_key}"'
+                )
+            config[canonical_key] = config[legacy_key]
+
         # --- public_courses config ---
         public_courses_burst_duration_seconds = config.get(
             "public_courses_burst_duration_seconds", 120
@@ -842,57 +872,57 @@ class PangeaChat:
             if not send_push_sygnal_url.strip():
                 raise ValueError('Config "send_push_sygnal_url" must not be empty')
 
-        # --- nudge_delivery config ---
-        nudge_email_enabled = config.get("nudge_email_enabled", False)
-        if not isinstance(nudge_email_enabled, bool):
-            raise ValueError('Config "nudge_email_enabled" must be a boolean')
-        nudge_suppress_notice_push_rules = config.get(
-            "nudge_suppress_notice_push_rules", True
+        # --- notice_delivery config ---
+        notice_email_enabled = config.get("notice_email_enabled", False)
+        if not isinstance(notice_email_enabled, bool):
+            raise ValueError('Config "notice_email_enabled" must be a boolean')
+        notice_suppress_notice_push_rules = config.get(
+            "notice_suppress_notice_push_rules", True
         )
-        if not isinstance(nudge_suppress_notice_push_rules, bool):
+        if not isinstance(notice_suppress_notice_push_rules, bool):
             raise ValueError(
-                'Config "nudge_suppress_notice_push_rules" must be a boolean'
+                'Config "notice_suppress_notice_push_rules" must be a boolean'
             )
-        nudge_token_secret = config.get("nudge_token_secret")
-        if nudge_token_secret is not None and (
-            not isinstance(nudge_token_secret, str) or not nudge_token_secret.strip()
+        notice_token_secret = config.get("notice_token_secret")
+        if notice_token_secret is not None and (
+            not isinstance(notice_token_secret, str) or not notice_token_secret.strip()
         ):
-            raise ValueError('Config "nudge_token_secret" must be a non-empty string')
-        nudge_token_ttl_days = config.get("nudge_token_ttl_days", 90)
-        if not isinstance(nudge_token_ttl_days, int) or nudge_token_ttl_days < 1:
-            raise ValueError('Config "nudge_token_ttl_days" must be an integer >= 1')
-        nudge_email_postal_address = config.get("nudge_email_postal_address")
-        if nudge_email_postal_address is not None and not isinstance(
-            nudge_email_postal_address, str
+            raise ValueError('Config "notice_token_secret" must be a non-empty string')
+        notice_token_ttl_days = config.get("notice_token_ttl_days", 90)
+        if not isinstance(notice_token_ttl_days, int) or notice_token_ttl_days < 1:
+            raise ValueError('Config "notice_token_ttl_days" must be an integer >= 1')
+        notice_email_postal_address = config.get("notice_email_postal_address")
+        if notice_email_postal_address is not None and not isinstance(
+            notice_email_postal_address, str
         ):
-            raise ValueError('Config "nudge_email_postal_address" must be a string')
-        if nudge_email_enabled and not (
-            isinstance(nudge_email_postal_address, str)
-            and nudge_email_postal_address.strip()
+            raise ValueError('Config "notice_email_postal_address" must be a string')
+        if notice_email_enabled and not (
+            isinstance(notice_email_postal_address, str)
+            and notice_email_postal_address.strip()
         ):
             # Marketing-classified mail must carry the sender's postal address;
             # refusing to enable email without one keeps that invariant in config.
             raise ValueError(
-                'Config "nudge_email_postal_address" is required when '
-                '"nudge_email_enabled" is true'
+                'Config "notice_email_postal_address" is required when '
+                '"notice_email_enabled" is true'
             )
-        nudge_public_requests_per_burst = config.get(
-            "nudge_public_requests_per_burst", 30
+        notice_public_requests_per_burst = config.get(
+            "notice_public_requests_per_burst", 30
         )
         if (
-            not isinstance(nudge_public_requests_per_burst, int)
-            or nudge_public_requests_per_burst < 1
+            not isinstance(notice_public_requests_per_burst, int)
+            or notice_public_requests_per_burst < 1
         ):
-            raise ValueError('Config "nudge_public_requests_per_burst" must be >= 1')
-        nudge_public_burst_duration_seconds = config.get(
-            "nudge_public_burst_duration_seconds", 60
+            raise ValueError('Config "notice_public_requests_per_burst" must be >= 1')
+        notice_public_burst_duration_seconds = config.get(
+            "notice_public_burst_duration_seconds", 60
         )
         if (
-            not isinstance(nudge_public_burst_duration_seconds, int)
-            or nudge_public_burst_duration_seconds < 1
+            not isinstance(notice_public_burst_duration_seconds, int)
+            or notice_public_burst_duration_seconds < 1
         ):
             raise ValueError(
-                'Config "nudge_public_burst_duration_seconds" must be >= 1'
+                'Config "notice_public_burst_duration_seconds" must be >= 1'
             )
 
         # --- blocked_join_gate config ---
@@ -1227,13 +1257,13 @@ class PangeaChat:
             send_push_requests_per_burst=send_push_requests_per_burst,
             send_push_burst_duration_seconds=send_push_burst_duration_seconds,
             send_push_sygnal_url=send_push_sygnal_url,
-            nudge_email_enabled=nudge_email_enabled,
-            nudge_suppress_notice_push_rules=nudge_suppress_notice_push_rules,
-            nudge_token_secret=nudge_token_secret,
-            nudge_token_ttl_days=nudge_token_ttl_days,
-            nudge_email_postal_address=nudge_email_postal_address,
-            nudge_public_requests_per_burst=nudge_public_requests_per_burst,
-            nudge_public_burst_duration_seconds=nudge_public_burst_duration_seconds,
+            notice_email_enabled=notice_email_enabled,
+            notice_suppress_notice_push_rules=notice_suppress_notice_push_rules,
+            notice_token_secret=notice_token_secret,
+            notice_token_ttl_days=notice_token_ttl_days,
+            notice_email_postal_address=notice_email_postal_address,
+            notice_public_requests_per_burst=notice_public_requests_per_burst,
+            notice_public_burst_duration_seconds=notice_public_burst_duration_seconds,
             delayed_push_enabled=delayed_push_enabled,
             delayed_push_delay_ms=delayed_push_delay_ms,
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,

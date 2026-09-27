@@ -1,4 +1,4 @@
-"""Render the shipped nudge templates; optionally serve reloadable local previews.
+"""Render the shipped notice templates; optionally serve reloadable local previews.
 
 No credentials or mail transport. --data accepts a JSON object of template values.
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
 ROOT = Path(__file__).resolve().parents[1]
-TEMPLATES = ROOT / "synapse_pangea_chat/nudge_delivery/templates"
+TEMPLATES = ROOT / "synapse_pangea_chat/notice_delivery/templates"
 sys.path.insert(0, str(ROOT))
 
 
@@ -43,7 +43,7 @@ def template_context(data_path: Path | None = None):
 def render(data_path: Path | None = None) -> tuple[str, str]:
     env, values = template_context(data_path)
     return tuple(
-        env.get_template("nudge_email." + extension).render(**values)
+        env.get_template("notice_email." + extension).render(**values)
         for extension in ("html", "txt")
     )
 
@@ -61,9 +61,9 @@ class PreviewHandler(BaseHTTPRequestHandler):
             html, plain = render(self.data_path)
             if self.path == "/unsubscribe":
                 env, values = template_context(self.data_path)
-                from synapse_pangea_chat.nudge_delivery.common import preference_rows
+                from synapse_pangea_chat.notice_delivery.common import preference_rows
 
-                html = env.get_template("nudge_unsubscribe_confirm.html").render(
+                html = env.get_template("notice_unsubscribe_confirm.html").render(
                     **values,
                     token="local-preview-only",
                     preference_rows=preference_rows({}),
@@ -95,7 +95,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path)
     parser.add_argument(
-        "--output", type=Path, default=Path("/tmp/pangea-nudge-preview")
+        "--output", type=Path, default=Path("/tmp/pangea-notice-preview")
     )
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--port", type=int, default=8765)

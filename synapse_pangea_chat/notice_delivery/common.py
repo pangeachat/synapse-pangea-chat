@@ -1,4 +1,4 @@
-"""Shared plumbing for the nudge-delivery endpoints: secrets, URLs, the clock."""
+"""Shared plumbing for the notice-delivery endpoints: secrets, URLs, the clock."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def category_label(category: str) -> str:
 def token_secret(api: ModuleApi, config: "PangeaChatConfig") -> Optional[bytes]:
     """The HMAC key for signed links: the module's own secret if configured,
     else the homeserver's macaroon secret, which every deployment already has."""
-    configured = getattr(config, "nudge_token_secret", None)
+    configured = getattr(config, "notice_token_secret", None)
     if isinstance(configured, str) and configured.strip():
         return configured.encode("utf-8")
     fallback = getattr(api._hs.config.key, "macaroon_secret_key", None)
@@ -88,7 +88,7 @@ def app_url(
 
 def preference_rows(raw_preferences):
     """Display the opt-out categories with their effective persisted state."""
-    from synapse_pangea_chat.nudge_delivery.categories import (
+    from synapse_pangea_chat.notice_delivery.categories import (
         GLOBAL_OFF_CATEGORIES,
         is_refused,
         parse_preferences,

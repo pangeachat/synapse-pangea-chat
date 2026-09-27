@@ -2,17 +2,17 @@ import unittest
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
-from synapse_pangea_chat.nudge_delivery.common import TEMPLATES_DIR
+from synapse_pangea_chat.notice_delivery.common import TEMPLATES_DIR
 
 
-class TestNudgeEmailTemplate(unittest.TestCase):
+class TestNoticeEmailTemplate(unittest.TestCase):
     def test_brand_shell_keeps_escaped_content_and_first_party_links(self):
         env = Environment(
             loader=FileSystemLoader(TEMPLATES_DIR),
             autoescape=select_autoescape(),
             undefined=StrictUndefined,
         )
-        html = env.get_template("nudge_email.html").render(
+        html = env.get_template("notice_email.html").render(
             app_name="Pangea Chat",
             title="Practice <today>",
             body="<script>alert(1)</script> & hello",

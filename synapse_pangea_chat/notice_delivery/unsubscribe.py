@@ -21,7 +21,7 @@ from synapse.module_api import ModuleApi
 from synapse.util.async_helpers import Linearizer
 from twisted.web.resource import Resource
 
-from synapse_pangea_chat.nudge_delivery.categories import (
+from synapse_pangea_chat.notice_delivery.categories import (
     COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE,
     GLOBAL_OFF_CATEGORIES,
     REFUSABLE_CATEGORIES,
@@ -29,7 +29,7 @@ from synapse_pangea_chat.nudge_delivery.categories import (
     parse_preferences,
     with_refusal,
 )
-from synapse_pangea_chat.nudge_delivery.common import (
+from synapse_pangea_chat.notice_delivery.common import (
     TEMPLATES_DIR,
     TOKEN_KIND_UNSUBSCRIBE,
     category_label,
@@ -37,14 +37,14 @@ from synapse_pangea_chat.nudge_delivery.common import (
     preference_rows,
     token_secret,
 )
-from synapse_pangea_chat.nudge_delivery.rate_limit import SlidingWindowRateLimiter
-from synapse_pangea_chat.nudge_delivery.tokens import verify_token
+from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
+from synapse_pangea_chat.notice_delivery.tokens import verify_token
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
 logger = logging.getLogger(
-    "synapse.module.synapse_pangea_chat.nudge_delivery.unsubscribe"
+    "synapse.module.synapse_pangea_chat.notice_delivery.unsubscribe"
 )
 
 SCOPE_CATEGORY = "category"
@@ -62,7 +62,7 @@ def _first_arg(args: Dict[bytes, list], key: bytes) -> Optional[str]:
         return None
 
 
-class NudgeUnsubscribe(Resource):
+class NoticeUnsubscribe(Resource):
     isLeaf = True
 
     def __init__(self, api: ModuleApi, config: "PangeaChatConfig"):
@@ -74,19 +74,19 @@ class NudgeUnsubscribe(Resource):
         # (a category refusal and the global off) must both survive. The
         # module runs on the main process, so a process-local lock suffices.
         self._write_lock = Linearizer(
-            name="nudge_unsubscribe", clock=api._hs.get_clock()
+            name="notice_unsubscribe", clock=api._hs.get_clock()
         )
         [self._confirm_html, self._done_html, self._invalid_html] = api.read_templates(
             [
-                "nudge_unsubscribe_confirm.html",
-                "nudge_unsubscribe_done.html",
-                "nudge_link_invalid.html",
+                "notice_unsubscribe_confirm.html",
+                "notice_unsubscribe_done.html",
+                "notice_link_invalid.html",
             ],
             custom_template_directory=TEMPLATES_DIR,
         )
         self._rate_limiter = SlidingWindowRateLimiter(
-            requests_per_burst=config.nudge_public_requests_per_burst,
-            burst_duration_seconds=config.nudge_public_burst_duration_seconds,
+            requests_per_burst=config.notice_public_requests_per_burst,
+            burst_duration_seconds=config.notice_public_burst_duration_seconds,
         )
 
     def render_GET(self, request: SynapseRequest):

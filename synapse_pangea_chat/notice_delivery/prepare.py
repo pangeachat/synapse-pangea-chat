@@ -3,7 +3,7 @@
 Synapse evaluates push actions when an event is persisted, so the per-user
 rule that keeps its own mailer and pushers off ``p.room.notice`` has to exist
 before the bot records the notice; installing it at delivery time (which
-``deliver_nudge`` still does, as a backstop) is one notice too late for a
+``deliver_notice`` still does, as a backstop) is one notice too late for a
 first-time recipient. The bot calls this once per person per process.
 """
 
@@ -26,15 +26,15 @@ from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.direct_push.is_rate_limited import is_rate_limited
-from synapse_pangea_chat.nudge_delivery.push_rule import ensure_bot_notice_push_rule
+from synapse_pangea_chat.notice_delivery.push_rule import ensure_bot_notice_push_rule
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
-logger = logging.getLogger("synapse.module.synapse_pangea_chat.nudge_delivery.prepare")
+logger = logging.getLogger("synapse.module.synapse_pangea_chat.notice_delivery.prepare")
 
 
-class PrepareNudge(Resource):
+class PrepareNotice(Resource):
     isLeaf = True
 
     def __init__(self, api: ModuleApi, config: "PangeaChatConfig"):
@@ -79,7 +79,7 @@ class PrepareNudge(Resource):
                 send_cors=True,
             )
         except Exception:  # noqa: BLE001
-            logger.exception("Error in prepare_nudge endpoint")
+            logger.exception("Error in prepare_notice endpoint")
             respond_with_json(
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
@@ -96,10 +96,10 @@ class PrepareNudge(Resource):
 
     async def prepare(self, user_id: str) -> Dict[str, Any]:
         installed = False
-        if self._config.nudge_suppress_notice_push_rules:
+        if self._config.notice_suppress_notice_push_rules:
             installed = await ensure_bot_notice_push_rule(self._api, user_id)
         return {
             "user_id": user_id,
             "push_rule_installed": installed,
-            "suppression_enabled": self._config.nudge_suppress_notice_push_rules,
+            "suppression_enabled": self._config.notice_suppress_notice_push_rules,
         }

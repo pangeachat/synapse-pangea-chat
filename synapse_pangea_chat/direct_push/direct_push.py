@@ -268,7 +268,7 @@ class DirectPush(Resource):
         """A 200 from Sygnal is not a delivery: its body lists pushkeys the
         gateway rejected (an expired or unregistered device token). A push to
         a rejected key was not sent, so the caller must not count it, or the
-        nudge delivery would report ``push`` and skip its email fallback."""
+        notice delivery would report ``push`` and skip its email fallback."""
         if not raw_body.strip():
             return True
         try:

@@ -1,4 +1,4 @@
-"""Per-key sliding-window rate limiter for the unauthenticated nudge links."""
+"""Per-key sliding-window rate limiter for the unauthenticated notice links."""
 
 from __future__ import annotations
 
