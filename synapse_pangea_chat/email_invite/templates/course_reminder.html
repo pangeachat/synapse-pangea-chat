@@ -5,5 +5,28 @@
                 {% for paragraph in paragraphs %}
                 <p>{{ paragraph }}</p>
                 {% endfor %}
+                {#- Email clients strip video players, so a video is its
+                    thumbnail (play button drawn into the image) linking out. -#}
+                {% if video %}
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin: 8px 0 24px">
+                  <tr>
+                    <td>
+                      <a href="{{ video.url }}" target="_blank" style="display: block; text-decoration: none">
+                        <img
+                          src="{{ video.thumbnail_url }}"
+                          width="520"
+                          alt="{{ video.title }} (video)"
+                          style="display: block; width: 100%; max-width: 520px; height: auto; border: 0; border-radius: 12px"
+                        />
+                      </a>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td style="padding-top: 10px; font-size: 14px">
+                      <a href="{{ video.url }}" target="_blank" style="color: #5e3acf; font-weight: 600">Watch: {{ video.title }}</a>
+                    </td>
+                  </tr>
+                </table>
+                {% endif %}
 {{ cta_button(claim_url, cta_label) }}
 {% endblock %}

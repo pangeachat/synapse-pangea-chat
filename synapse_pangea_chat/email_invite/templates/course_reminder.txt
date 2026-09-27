@@ -1,4 +1,7 @@
 {% for paragraph in paragraphs %}{{ paragraph }}
 
-{% endfor %}{{ cta_label }}:
+{% endfor %}{% if video %}Watch: {{ video.title }}
+{{ video.url }}
+
+{% endif %}{{ cta_label }}:
 {{ claim_url }}
