@@ -6,6 +6,8 @@
 {{ cta_url }}
 
 --
+{% if receiving_reason | default('') %}{{ receiving_reason }}
+{% endif %}
 Unsubscribe: {{ unsubscribe_url }}
 {% if postal_address %}{{ postal_address }}
 {% endif %}

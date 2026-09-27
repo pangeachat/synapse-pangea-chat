@@ -241,7 +241,7 @@ class DirectPush(Resource):
                 "room_id": req_body.get("room_id"),
                 "type": req_body.get("type", "m.room.message"),
                 "sender": "@bot:pangea.chat",
-                "sender_display_name": "Pangea Bot",
+                "sender_display_name": req_body.get("title") or "Pangea Bot",
                 "room_name": "",
                 "room_avatar_url": None,
                 "prio": req_body.get("prio", "high"),

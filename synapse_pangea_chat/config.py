@@ -129,6 +129,8 @@ class PangeaChatConfig:
     notice_email_postal_address: Optional[str] = None
     notice_public_requests_per_burst: int = 30
     notice_public_burst_duration_seconds: int = 60
+    notice_admin_requests_per_minute: int = 600
+    notice_admin_burst: int = 100
 
     # --- delayed_push config ---
     delayed_push_enabled: bool = False

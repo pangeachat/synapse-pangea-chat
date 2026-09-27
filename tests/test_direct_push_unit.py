@@ -197,6 +197,7 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
             {
                 "room_id": "!room:test",
                 "body": "hello",
+                "title": "A new activity",
                 "content": {"format": "org.matrix.custom.html"},
                 "type": "m.room.message",
                 "prio": "high",
@@ -210,6 +211,9 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(payload["notification"]["event_id"], "event-1")
+        self.assertEqual(
+            payload["notification"]["sender_display_name"], "A new activity"
+        )
         self.assertEqual(payload["notification"]["room_id"], "!room:test")
         self.assertEqual(payload["notification"]["content"]["body"], "hello")
         self.assertEqual(

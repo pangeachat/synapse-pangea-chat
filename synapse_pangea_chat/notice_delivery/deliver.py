@@ -1,15 +1,8 @@
-"""``POST /_synapse/client/pangea/v1/deliver_notice`` — deliver one bot notice on
-one channel, chosen by availability.
-
-The bot has already recorded the notice as a ``p.room.notice`` in the person's
-DM; this endpoint carries it the rest of the way: refused → nothing; in the
-app right now → nothing more (the notice is the delivery); a working push
-device → push; otherwise email, if the person has an address and email is
-enabled. It never sends on two channels for one notice.
-"""
+"""Admin HTTP adapter and shared delivery service for persisted notices."""
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, cast
@@ -28,7 +21,6 @@ from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.direct_push.direct_push import DirectPush
-from synapse_pangea_chat.direct_push.is_rate_limited import is_rate_limited
 from synapse_pangea_chat.direct_push.types import SendPushRequest
 from synapse_pangea_chat.notice_delivery.categories import (
     COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE,
@@ -48,7 +40,18 @@ from synapse_pangea_chat.notice_delivery.common import (
     token_secret,
     unsubscribe_url,
 )
+from synapse_pangea_chat.notice_delivery.delivery_log import (
+    DeliveryConflict,
+    DeliveryLog,
+    DeliveryLogError,
+)
 from synapse_pangea_chat.notice_delivery.push_rule import ensure_bot_notice_push_rule
+from synapse_pangea_chat.notice_delivery.rate_limit import AdminRateLimiter
+from synapse_pangea_chat.notice_delivery.request import (
+    EMAIL_ONLY,
+    NoticeRequest,
+    is_structured,
+)
 from synapse_pangea_chat.notice_delivery.tokens import MILLISECONDS_PER_DAY, sign_token
 
 if TYPE_CHECKING:
@@ -86,6 +89,10 @@ class DeliverNotice(Resource):
         self._auth = self._hs.get_auth()
         self._store = self._hs.get_datastores().main
         self._direct_push = direct_push
+        self._limiter = AdminRateLimiter(
+            config.notice_admin_requests_per_minute, config.notice_admin_burst
+        )
+        self._delivery_log = DeliveryLog(api, config)
         self._send_email_handler = self._hs.get_send_email_handler()
         self._app_name = self._hs.config.email.email_app_name
         [self._email_html, self._email_text] = api.read_templates(
@@ -106,7 +113,7 @@ class DeliverNotice(Resource):
                     request, 403, {"error": "Admin access required"}, send_cors=True
                 )
                 return
-            if is_rate_limited(requester_id, self._config):
+            if self._limiter.is_rate_limited(requester_id):
                 respond_with_json(
                     request, 429, {"error": "Rate limited"}, send_cors=True
                 )
@@ -125,6 +132,18 @@ class DeliverNotice(Resource):
 
             response = await self.deliver(body)
             respond_with_json(request, 200, response, send_cors=True)
+        except ValueError as error:
+            respond_with_json(request, 400, {"error": str(error)}, send_cors=True)
+        except DeliveryConflict as error:
+            respond_with_json(request, 409, {"error": str(error)}, send_cors=True)
+        except DeliveryLogError:
+            logger.exception("Notice delivery log unavailable; delivery not started")
+            respond_with_json(
+                request,
+                503,
+                {"error": "Delivery log unavailable; reconcile run before retry"},
+                send_cors=True,
+            )
         # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
             logger.info("Authentication failed: %s", e)
@@ -152,6 +171,12 @@ class DeliverNotice(Resource):
 
     @staticmethod
     def _validate(body: Dict[str, Any]) -> Optional[str]:
+        if is_structured(body):
+            try:
+                NoticeRequest.parse(body)
+            except ValueError as error:
+                return str(error)
+            return None
         if not _optional_str(body.get("user_id")):
             return "Missing user_id"
         category = _optional_str(body.get("category"))
@@ -165,6 +190,62 @@ class DeliverNotice(Resource):
         return None
 
     async def deliver(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Shared entry point for HTTP operators and trusted internal flows."""
+        error = self._validate(body)
+        if error:
+            raise ValueError(error)
+        req = NoticeRequest.parse(body) if is_structured(body) else None
+        record_id = None
+        if req is not None:
+            await self._validate_notice(req)
+            record_id, previous = await self._delivery_log.reserve(req)
+            if previous is not None:
+                return {
+                    **previous,
+                    "notification_log_id": record_id,
+                    "log_status": "complete",
+                    "duplicate": True,
+                }
+        result = await self._deliver_once(body, req)
+        if req is not None and record_id is not None:
+            result.update(
+                notification_log_id=record_id, log_status="complete", duplicate=False
+            )
+            try:
+                await self._delivery_log.finish(record_id, req, result)
+            except Exception:
+                # Delivery already happened. Report it, preserve the reservation,
+                # and never turn a logging outage into a second transport send.
+                logger.exception(
+                    "Notice delivered but Notification_Log finalization failed: %s",
+                    record_id,
+                )
+                result["log_status"] = "pending_reconciliation"
+        return result
+
+    async def _validate_notice(self, req: NoticeRequest) -> None:
+        event = await self._store.get_event(req.notice_event_id, allow_none=True)
+        if (
+            event is None
+            or event.type != BOT_NOTICE_EVENT_TYPE
+            or event.room_id != req.notice_room_id
+        ):
+            raise ValueError(
+                "notice_event_id must reference p.room.notice in notice_room_id"
+            )
+        if not await self._api.is_user_admin(event.sender):
+            raise ValueError("Referenced notice must have an admin sender")
+        membership, _ = await self._store.get_local_current_membership_for_user_in_room(
+            req.user_id, req.notice_room_id
+        )
+        if membership != "join":
+            raise ValueError(
+                "Recipient must be a joined local member of the notice room"
+            )
+
+    async def _deliver_once(
+        self, body: Dict[str, Any], req: Optional[NoticeRequest]
+    ) -> Dict[str, Any]:
         user_id = body["user_id"].strip()
         category = body["category"].strip()
         result: Dict[str, Any] = {
@@ -195,18 +276,41 @@ class DeliverNotice(Resource):
                 self._api, user_id
             )
 
-        if await self._is_in_app(user_id):
+        method = (
+            req.method
+            if req
+            else ("email-only" if category in EMAIL_ONLY else "use-available")
+        )
+        if body.get("variant") == "allow_notifications":
+            method = "in-app-only"
+        if method == "in-app-only" or (
+            method == "use-available" and await self._is_in_app(user_id)
+        ):
             result["channel"] = CHANNEL_IN_APP
-            result["reason"] = "currently_active"
+            result["reason"] = (
+                "in_app_only" if method == "in-app-only" else "currently_active"
+            )
+            return result
+
+        if method == "email-only":
+            email = await self._send_email(
+                body, user_id=user_id, category=category, req=req
+            )
+            result["email"] = email
+            result["channel"] = CHANNEL_EMAIL if email["sent"] else CHANNEL_NONE
+            result["reason"] = email["reason"]
             return result
 
         push_request: Dict[str, Any] = {
             "user_id": user_id,
-            "body": body["body"],
+            "body": req.push.body if req and req.push else body["body"],
+            "title": req.push.title if req and req.push else body.get("title"),
             "room_id": _optional_str(body.get("notice_room_id")),
             "event_id": _optional_str(body.get("notice_event_id")),
             "type": BOT_NOTICE_EVENT_TYPE,
-            "content": body.get("content") or {},
+            "content": req.push.content
+            if req and req.push
+            else body.get("content") or {},
             "prio": "high",
         }
         push = await self._direct_push._send_push(
@@ -217,7 +321,15 @@ class DeliverNotice(Resource):
             result["channel"] = CHANNEL_PUSH
             return result
 
-        email = await self._send_email(body, user_id=user_id, category=category)
+        if method == "push-only":
+            result["reason"] = (
+                "no_push_device" if push["attempted"] == 0 else "push_failed"
+            )
+            return result
+
+        email = await self._send_email(
+            body, user_id=user_id, category=category, req=req
+        )
         result["email"] = email
         if email["sent"]:
             result["channel"] = CHANNEL_EMAIL
@@ -266,7 +378,12 @@ class DeliverNotice(Resource):
         return None
 
     async def _send_email(
-        self, body: Dict[str, Any], *, user_id: str, category: str
+        self,
+        body: Dict[str, Any],
+        *,
+        user_id: str,
+        category: str,
+        req: Optional[NoticeRequest] = None,
     ) -> Dict[str, Any]:
         if not self._config.notice_email_enabled:
             return {"sent": False, "reason": "email_disabled"}
@@ -310,10 +427,15 @@ class DeliverNotice(Resource):
         cta_url = click_url(base, click_token)
         unsub_url = unsubscribe_url(base, unsubscribe_token)
 
+        email_content = req.email if req else None
         subject = (
-            _optional_str(body.get("email_subject"))
-            or _optional_str(body.get("title"))
-            or body["body"].strip()
+            email_content.subject
+            if email_content
+            else (
+                _optional_str(body.get("email_subject"))
+                or _optional_str(body.get("title"))
+                or body["body"].strip()
+            )
         )
         # A Subject header cannot carry line breaks; a multi-line body used
         # as the fallback subject would make the mailer reject the message.
@@ -321,13 +443,31 @@ class DeliverNotice(Resource):
         template_vars = {
             "app_name": self._app_name,
             "title": _optional_str(body.get("title")),
-            "body": body["body"].strip(),
+            "body": body.get("body", "").strip(),
             "cta_label": _optional_str(body.get("cta_label")) or "Open Pangea Chat",
             "cta_url": cta_url,
             "unsubscribe_url": unsub_url,
             "category_label": category_label(category),
             "postal_address": self._config.notice_email_postal_address or "",
+            "receiving_reason": body.get("receiving_reason", ""),
         }
+        if email_content:
+            # Literal replacement only: never execute caller HTML as Jinja.
+            replacements = {
+                "{{cta_url}}": cta_url,
+                "{{unsubscribe_url}}": unsub_url,
+                "{{receiving_reason}}": email_content.receiving_reason,
+                "{{postal_address}}": self._config.notice_email_postal_address or "",
+            }
+            rendered_html, rendered_text = email_content.html, email_content.text
+            for slot, value in replacements.items():
+                rendered_html = rendered_html.replace(
+                    slot, html.escape(value, quote=True)
+                )
+                rendered_text = rendered_text.replace(slot, value)
+        else:
+            rendered_html = self._email_html.render(**template_vars)
+            rendered_text = self._email_text.render(**template_vars)
         headers = {
             "List-Unsubscribe": f"<{unsub_url}>",
             "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
@@ -337,8 +477,8 @@ class DeliverNotice(Resource):
                 email_address=address,
                 subject=subject,
                 app_name=self._app_name,
-                html=self._email_html.render(**template_vars),
-                text=self._email_text.render(**template_vars),
+                html=rendered_html,
+                text=rendered_text,
                 additional_headers=headers,
             )
         except Exception as e:  # noqa: BLE001

@@ -11,11 +11,15 @@ For Synapse Admin API, Module API, and Matrix spec documentation links, see [syn
 
 ## Deliver a notice
 
-`POST /_synapse/client/pangea/v1/prepare_notice` before the notice, then `POST /_synapse/client/pangea/v1/deliver_notice` after it — both server admin only, rate-limited per caller with the direct-push limits.
+`POST /_synapse/client/pangea/v1/prepare_notice` before the notice, then `POST /_synapse/client/pangea/v1/deliver_notice` after it — both server admin only. Automated flows and operators use the same delivery service. Each endpoint has an independent configurable per-caller limit, defaulting to 600 requests per minute with a burst of 100; neither spends the direct-push allowance.
 
-The bot calls it after recording the notice as a `p.room.notice` in the person's bot DM. The request names the person, the catalog **category** (must be one the bot delivers: a nudge category or `trial_marketing`), the **variant**, the L1 **body**, the notice's event and room ids, the `pangea.*` metadata the client routes on, and the activity and session ids for the email deep link. Optional: a title, an email subject, a call-to-action label.
+The caller records a `p.room.notice` in the person's bot DM first. The request names the person, catalog category and variant, notice event and room, and activity and session ids for the email target. Availability-based sends require push title/body and email subject/HTML/plain text; forced sends require their selected channel's content and may include both. Missing content is rejected before delivery. Category restrictions and refusals apply to forced sends too. The in-app-only `allow_notifications` variant cannot be pushed or emailed. Credential mail and consuming course-claim links retain their existing dedicated paths.
 
-Exactly one channel carries the notice, decided in this order, and the response names which:
+Caller-rendered email carries `{{cta_url}}` and `{{unsubscribe_url}}` in both HTML and plain text. Synapse supplies those signed links, the sender and unsubscribe headers; caller content is never evaluated as a server-side template. Email uses the brand template with a caller-supplied receiving reason. The existing flat body/subject format remains a compatibility path for deployed bot callers while they migrate to structured content.
+
+Structured delivery includes the decision's run, runner, funnel, state and copy key. Synapse records delivery in the existing [Notification_Log](../../../cms/.github/instructions/notification-log.instructions.md), returning its record id; callers do not write a second row. It reserves the run/person before sending. A retry cannot send that decision again, including when delivery or its final log write has an uncertain outcome. An unresolved reservation requires reconciliation, not automatic resending. The decision runner still records skips that never reach delivery and later engagement outcomes. Legacy callers without decision context retain caller-owned logging until migrated.
+
+For `use-available`, exactly one channel carries the notice, decided in this order, and the response names which:
 
 1. **`refused`** — the person's preferences refuse the category (or the global off covers it). Nothing is sent and no push rule is touched.
 2. **`in_app`** — the person is online and currently active (Synapse presence; both flags, since `currently_active` can outlive an offline transition). The notice already in their DM is the delivery.
@@ -23,7 +27,7 @@ Exactly one channel carries the notice, decided in this order, and the response 
 4. **`email`** — no working push device, and `notice_email_enabled` is on, and the person has a verified email address.
 5. **`none`** — with a reason code: `email_disabled`, `no_email_address`, `no_public_baseurl`, `no_token_secret`, `send_failed`, prefixed `push_failed_then_` when a push device existed but every push failed.
 
-The response also carries the push transport summary (same shape as `send_push`) and the email outcome, so the bot can log the channel per notice. Presence being disabled, or a presence read failing, counts as "not in the app" — a notice the person is due must not be lost to a presence outage, and the cost of being wrong is one push to someone who is online.
+The response also carries the push transport summary (same shape as `send_push`) and the email outcome. Forced push never falls through to email; forced email does not attempt push. Email-only categories use email regardless of presence. Presence being disabled, or a presence read failing, counts as "not in the app" — a notice the person is due must not be lost to a presence outage, and the cost of being wrong is one push to someone who is online.
 
 The former `deliver_nudge` and `prepare_nudge` URLs remain compatibility aliases of the same resources. Configuration accepts the former `nudge_*` keys as aliases for `notice_*`; conflicting values are rejected. Existing signed email links and catalog category identifiers remain valid.
 
