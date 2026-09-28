@@ -80,6 +80,7 @@ class TestE2E(BaseSynapseE2ETest):
             headers={"Authorization": f"Bearer {access_token}"},
         )
         self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["errcode"], "M_INVALID_PARAM")
 
     async def wait_for_room_invitation(
         self, room_id: str, user_id: str, access_token: str

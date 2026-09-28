@@ -104,6 +104,30 @@ class TestKnockWithCodeResponses(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 404)
         self.assertEqual(body["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
 
+    async def test_text_that_is_not_a_code_answers_400_invalid_param(self) -> None:
+        # Learners type course names into the code field ("Semana 6",
+        # CLIENT-EWS); the errcode tells the client that is their input,
+        # not a request it built wrong.
+        for typed in ["Semana 6", "SPA206ASHE", "abcdefg"]:
+            self.respond.reset_mock()
+            with patch(
+                f"{MODULE}.extract_body_json",
+                AsyncMock(return_value={"access_code": typed}),
+            ):
+                await _handler()._async_render_POST(MagicMock())
+            status, body = self._response()
+            self.assertEqual(status, 400, typed)
+            self.assertEqual(body["errcode"], "M_INVALID_PARAM", typed)
+
+    async def test_request_without_a_code_answers_400_without_errcode(self) -> None:
+        # Only a client bug can omit the field, so it must stay
+        # distinguishable from a learner's malformed code.
+        with patch(f"{MODULE}.extract_body_json", AsyncMock(return_value={})):
+            await _handler()._async_render_POST(MagicMock())
+        status, body = self._response()
+        self.assertEqual(status, 400)
+        self.assertNotIn("errcode", body)
+
     async def test_all_invites_failed_answers_500_with_failed_rooms(self) -> None:
         matches = [RoomCodeMatch(room_id=ROOM_1, is_admin_code=False)]
         with (
