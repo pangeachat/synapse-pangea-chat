@@ -29,9 +29,9 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 **Logic**:
 
 1. Rate-limit check (configurable burst window per user).
-2. Validate code format: exactly 7 chars, alphanumeric, at least one digit. A malformed code responds `400`.
+2. Validate code format: exactly 7 chars, alphanumeric, at least one digit. A malformed code responds `400` with `{ errcode: "M_INVALID_PARAM" }`. This check is the only place the format rule lives. The client sends whatever the learner typed without checking it, so a malformed code is usually a learner entering something that isn't a code, such as a course name. The errcode marks it as the learner's input. The other 400s (missing `access_code`, not a string, invalid JSON) carry no errcode, because only a client bug causes them.
 3. Query Synapse DB for rooms whose `m.room.join_rules` state event contains a matching `access_code` (case-insensitive). Uses the latest state event per room.
-4. A well-formed code that matches no room responds `404` with `{ errcode: "ORG.PANGEA.CODE_NOT_FOUND" }`. 404 and not 400 because the request is fine — the code doesn't exist; the errcode lets the client tell a wrong code (an expected user mistake, shown as "check the code") apart from a malformed request (a client bug). A whole classroom mistyping one board-written code produced the 2026-08-31 burst that motivated this split (issue #197 / client#8693).
+4. A well-formed code that matches no room responds `404` with `{ errcode: "ORG.PANGEA.CODE_NOT_FOUND" }`. 404 and not 400 because the request is fine — the code doesn't exist; the errcode lets the client tell a wrong code (an expected user mistake, shown as "check the code") apart from a server-side failure. A whole classroom mistyping one board-written code produced the 2026-08-31 burst that motivated this split (issue #197 / client#8693).
 5. For each matched room:
    - If user is already a member with an ordinary class code → add to `already_joined`. Process private claims and additional-instructor grants before this shortcut.
    - If user is BANNED from the room → add to `banned` list, skip the invite (Synapse would reject it; without this the failure is indistinguishable from a nonexistent code — issue #127 / client#6820).

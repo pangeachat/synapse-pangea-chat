@@ -150,11 +150,15 @@ class KnockWithCode(Resource):
                 or not access_code.isalnum()
                 or not any(char.isdigit() for char in access_code)  # At least one digit
             ):
+                # The client sends whatever the learner typed, so this is
+                # usually a learner entering something that isn't a code (a
+                # course name) — the errcode marks it as their input. The
+                # other 400s above carry none: only a client bug causes them.
                 logger.warning("Invalid access_code")
                 respond_with_json(
                     request,
                     400,
-                    {"error": "Invalid access_code"},
+                    {"errcode": Codes.INVALID_PARAM, "error": "Invalid access_code"},
                     send_cors=True,
                 )
                 return
