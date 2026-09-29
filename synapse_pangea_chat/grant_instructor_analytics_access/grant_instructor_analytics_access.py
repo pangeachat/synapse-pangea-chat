@@ -24,6 +24,7 @@ from synapse_pangea_chat.analytics_push_suppression import (
     ensure_analytics_invite_push_rule,
 )
 from synapse_pangea_chat.blocked_join_gate import server_initiated_entry
+from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 
 if TYPE_CHECKING:
@@ -39,15 +40,6 @@ MEMBERSHIP_KNOCK = "knock"
 
 COURSE_SETTINGS_STATE_EVENT_TYPE = "pangea.course_settings"
 REQUIRE_ANALYTICS_ACCESS_KEY = "require_analytics_access"
-
-
-def _is_probable_bot_user_id(user_id: str) -> bool:
-    if not user_id.startswith("@") or ":" not in user_id:
-        return False
-    localpart = user_id[1:].split(":", 1)[0]
-    return (
-        localpart == "bot" or localpart.startswith("bot-") or localpart.endswith("-bot")
-    )
 
 
 class GrantInstructorAnalyticsAccess(Resource):
@@ -363,7 +355,7 @@ class GrantInstructorAnalyticsAccess(Resource):
             if power > caller_power
             and user_id != caller_id
             and self._api.is_mine(user_id)
-            and not _is_probable_bot_user_id(user_id)
+            and not is_probable_bot_user_id(user_id)
         ]
         if not candidates:
             return []

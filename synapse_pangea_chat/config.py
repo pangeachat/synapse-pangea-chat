@@ -103,6 +103,13 @@ class PangeaChatConfig:
     find_user_by_email_requests_per_burst: int = 10
     find_user_by_email_burst_duration_seconds: int = 60
 
+    # --- course_member_emails config ---
+    # A course admin reads the sign-in email of each student in the course.
+    # Off by default: turning it on is an owner decision (privacy).
+    course_member_emails_enabled: bool = False
+    course_member_emails_requests_per_burst: int = 20
+    course_member_emails_burst_duration_seconds: int = 60
+
     # --- invite_by_email config ---
     invite_by_email_requests_per_burst: int = 5
     invite_by_email_burst_duration_seconds: int = 60

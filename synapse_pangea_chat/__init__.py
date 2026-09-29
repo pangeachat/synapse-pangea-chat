@@ -11,6 +11,7 @@ from synapse_pangea_chat.activity_session_previews import ActivitySessionPreview
 from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
 from synapse_pangea_chat.blocked_join_gate import BlockedJoinGate
 from synapse_pangea_chat.config import PangeaChatConfig
+from synapse_pangea_chat.course_member_emails import CourseMemberEmails
 from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 from synapse_pangea_chat.delete_room import DeleteRoom
@@ -434,6 +435,15 @@ class PangeaChat:
             resource=self.find_user_by_email_resource,
         )
 
+        # --- Course Member Emails ---
+        # Registered only when enabled, so the path does not exist otherwise.
+        if config.course_member_emails_enabled:
+            self.course_member_emails_resource = CourseMemberEmails(api, config)
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/course_member_emails",
+                resource=self.course_member_emails_resource,
+            )
+
         # --- User Activity ---
         self.user_activity_resource = UserActivity(api, config)
         self._api.register_web_resource(
@@ -854,6 +864,33 @@ class PangeaChat:
         ):
             raise ValueError(
                 "find_user_by_email_burst_duration_seconds must be an integer >= 1"
+            )
+
+        # --- course_member_emails config ---
+        course_member_emails_enabled = config.get("course_member_emails_enabled", False)
+        if not isinstance(course_member_emails_enabled, bool):
+            raise ValueError('Config "course_member_emails_enabled" must be a boolean')
+        course_member_emails_requests_per_burst = config.get(
+            "course_member_emails_requests_per_burst", 20
+        )
+        if (
+            isinstance(course_member_emails_requests_per_burst, bool)
+            or not isinstance(course_member_emails_requests_per_burst, int)
+            or course_member_emails_requests_per_burst < 1
+        ):
+            raise ValueError(
+                "course_member_emails_requests_per_burst must be an integer >= 1"
+            )
+        course_member_emails_burst_duration_seconds = config.get(
+            "course_member_emails_burst_duration_seconds", 60
+        )
+        if (
+            isinstance(course_member_emails_burst_duration_seconds, bool)
+            or not isinstance(course_member_emails_burst_duration_seconds, int)
+            or course_member_emails_burst_duration_seconds < 1
+        ):
+            raise ValueError(
+                "course_member_emails_burst_duration_seconds must be an integer >= 1"
             )
 
         # --- register_email config ---
@@ -1282,6 +1319,9 @@ class PangeaChat:
             user_directory_search_burst_duration_seconds=user_directory_search_burst_duration_seconds,
             find_user_by_email_requests_per_burst=find_user_by_email_requests_per_burst,
             find_user_by_email_burst_duration_seconds=find_user_by_email_burst_duration_seconds,
+            course_member_emails_enabled=course_member_emails_enabled,
+            course_member_emails_requests_per_burst=course_member_emails_requests_per_burst,
+            course_member_emails_burst_duration_seconds=course_member_emails_burst_duration_seconds,
             register_email_requests_per_burst=register_email_requests_per_burst,
             register_email_burst_duration_seconds=register_email_burst_duration_seconds,
             email_policy_enabled=email_policy_enabled,

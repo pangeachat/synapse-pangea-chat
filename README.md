@@ -14,6 +14,7 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 | [Delete Room](#delete-room)                   | `synapse_pangea_chat/delete_room/`          | `POST /_synapse/client/pangea/v1/delete_room`             | Room deletion for highest-power-level members     |
 | [Delete User](#delete-user)                   | `synapse_pangea_chat/delete_user/`          | `POST /_synapse/client/pangea/v1/delete_user`             | Delete user associations then deactivate account   |
 | [Find User By Email](#find-user-by-email)     | `synapse_pangea_chat/find_user_by_email/`   | `POST /_synapse/client/pangea/v1/find_user_by_email`      | Server-admin lookup of the account holding an email |
+| [Course Member Emails](#course-member-emails) | `synapse_pangea_chat/course_member_emails/` | `POST /_synapse/client/pangea/v1/course_member_emails`    | A course admin reads their joined students' sign-in emails (off by default) |
 | [Direct Message](#direct-message)             | `synapse_pangea_chat/direct_message/`       | `POST /_synapse/client/pangea/v1/ensure_direct_message`   | Create or repair a 1:1 DM for two local users     |
 | [Delayed Push](#delayed-push)                 | `synapse_pangea_chat/delayed_push/`         | _(HttpPusher monkey patch)_                               | Delay HTTP pushes while users are active          |
 | [Limit User Directory](#limit-user-directory) | `synapse_pangea_chat/limit_user_directory/` | _(spam checker)_                                          | Filter user directory by public profile attribute |
@@ -63,6 +64,11 @@ modules:
       # --- Find User By Email ---
       find_user_by_email_requests_per_burst: 10 # default: 10
       find_user_by_email_burst_duration_seconds: 60 # default: 60
+
+      # --- Course Member Emails (disabled by default) ---
+      course_member_emails_enabled: false # default: false
+      course_member_emails_requests_per_burst: 20 # default: 20
+      course_member_emails_burst_duration_seconds: 60 # default: 60
 
       # --- Limit User Directory (disabled when path is null) ---
       limit_user_directory_public_attribute_search_path: "profile.user_settings.public"
@@ -388,6 +394,30 @@ Resolve an email address to the local account that has it bound. Synapse's admin
 ```
 
 Matching is case-insensitive and whole-address only — no domain or substring search. An address with no live account returns an empty `results`, not a 404. Synapse removes threepid bindings when an account is deactivated, so an empty result means "no live account", not "never registered".
+
+---
+
+## Course Member Emails
+
+A course admin reads the sign-in email of each student currently in their course, for the teacher dashboard's Students page. Off by default (`course_member_emails_enabled`); when off, the route does not exist. Design: [course-member-emails.instructions.md](.github/instructions/course-member-emails.instructions.md).
+
+**Route:** `POST /_synapse/client/pangea/v1/course_member_emails`
+
+**Course admins only** (power level 100 in the course space, or a creator in room versions where creators hold unlimited power). Every refusal, including an unknown room or a caller who is not in it, is the same `403` with the same body. Rate limited per caller (default 20 calls per 60 seconds, `429` beyond).
+
+**Body:**
+
+```json
+{ "room_id": "!course:example.com" }
+```
+
+**Response (200):**
+
+```json
+{ "members": [{ "user_id": "@student:example.com", "email": "student@school.edu" }] }
+```
+
+Lists members whose current membership is `join`, excluding the caller, bots, and other course admins. A member with no bound email is omitted. Addresses are never logged.
 
 ---
 
