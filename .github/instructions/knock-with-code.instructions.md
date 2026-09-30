@@ -30,7 +30,7 @@ Standard Matrix knock requires an admin to manually approve every join request. 
 
 1. Rate-limit check (configurable burst window per user).
 2. Validate code format: exactly 7 chars, alphanumeric, at least one digit. A malformed code responds `400` with `{ errcode: "M_INVALID_PARAM" }`. This check is the only place the format rule lives. The client sends whatever the learner typed without checking it, so a malformed code is usually a learner entering something that isn't a code, such as a course name. The errcode marks it as the learner's input. The other 400s (missing `access_code`, not a string, invalid JSON) carry no errcode, because only a client bug causes them.
-3. Query Synapse DB for rooms whose `m.room.join_rules` state event contains a matching `access_code` (case-insensitive). Uses the latest state event per room.
+3. Find the rooms whose current `m.room.join_rules` carries the code as `access_code` or `admin_access_code`, ignoring case. See "Code Lookup" below.
 4. A well-formed code that matches no room responds `404` with `{ errcode: "ORG.PANGEA.CODE_NOT_FOUND" }`. 404 and not 400 because the request is fine — the code doesn't exist; the errcode lets the client tell a wrong code (an expected user mistake, shown as "check the code") apart from a server-side failure. A whole classroom mistyping one board-written code produced the 2026-08-31 burst that motivated this split (issue #197 / client#8693).
 5. For each matched room:
    - If user is already a member with an ordinary class code → add to `already_joined`. Process private claims and additional-instructor grants before this shortcut.
@@ -90,7 +90,18 @@ A requested course's claim code is the exception: it is not in join rules, for t
 
 Access codes live in the `content.access_code` field of the room's `m.room.join_rules` state event. This is a Pangea-custom extension — the Matrix spec does not define this field. The code is set client-side when a course admin creates or configures a course.
 
-The `get_rooms_with_access_code` query reads directly from the Synapse event tables (`events` + `state_events` + `event_json`) with DB-engine-specific JSON extraction (PostgreSQL `jsonb` / SQLite `json_extract`).
+### Code Lookup
+
+`knock_with_code`, `preview_with_code`, `request_room_code`'s collision check and `create_course_space` all find rooms by code through [`get_rooms_with_access_code`](../../synapse_pangea_chat/room_code/get_rooms_with_access_code.py). Scanning every room's join rules on each call cost about 100–200 ms of database CPU per code, and that cost grew with the number of courses. It ran on Synapse's shared database, so a class entering codes at once slowed `/sync` and message sending for everyone (#163).
+
+Each Synapse process instead keeps a [`CodeIndex`](../../synapse_pangea_chat/room_code/code_index.py) in memory. It maps each code to the rooms that have carried it, and records how far through Synapse's event stream it is complete. The index only suggests candidates; the room's current join rules decide.
+
+- **Every hit is confirmed.** Before we act on a candidate, we re-read that room's current join rules and check the code. Whether the code is an admin code also comes from those rules. A rotated code, a used admin code or a deleted course is never accepted from a stale index.
+- **Every miss is checked against the database.** If no candidate survives, the index reads the join-rules changes committed since its last position, then checks again. A course created a moment ago on another process resolves on the first try. The index takes the committed position before reading, so an event that commits late is read twice rather than skipped.
+- **Misses that arrive together share one catch-up.** A classroom mistyping one code costs a couple of queries, not one per student.
+- **The index loads on first use.** The first lookup after a process starts reads every code. There is no startup step and no fallback to the old scan. The checks above mean a stale index can slow a lookup but can't make its answer wrong, so a bug is handled by a revert.
+
+**Known limit:** the catch-up only sees newer changes. A state reset that points a room back to an older join-rules event would go unseen until the process restarts, and a valid code could report "not found" until then. Federation is off, which makes this close to impossible, and every deploy restarts the process.
 
 ---
 
