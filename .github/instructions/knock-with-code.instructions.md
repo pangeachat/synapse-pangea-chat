@@ -92,16 +92,16 @@ Access codes live in the `content.access_code` field of the room's `m.room.join_
 
 ### Code Lookup
 
-`knock_with_code`, `preview_with_code`, `request_room_code`'s collision check and `create_course_space` all find rooms by code through [`get_rooms_with_access_code`](../../synapse_pangea_chat/room_code/get_rooms_with_access_code.py). Scanning every room's join rules on each call cost about 100–200 ms of database CPU per code, and that cost grew with the number of courses. It ran on Synapse's shared database, so a class entering codes at once slowed `/sync` and message sending for everyone (#163).
+Every code lookup goes through [`get_rooms_with_access_code`](../../synapse_pangea_chat/room_code/get_rooms_with_access_code.py): `knock_with_code`, `preview_with_code`, and the collision check that every new code passes. Scanning every room's join rules on each call cost about 100–200 ms of database CPU per code, and that cost grew with the number of courses. It ran on Synapse's shared database, so a class entering codes at once slowed `/sync` and message sending for everyone (#163).
 
-Each Synapse process instead keeps a [`CodeIndex`](../../synapse_pangea_chat/room_code/code_index.py) in memory. It maps each code to the rooms that have carried it, and records how far through Synapse's event stream it is complete. The index only suggests candidates; the room's current join rules decide.
+Each Synapse process instead keeps a [`CodeIndex`](../../synapse_pangea_chat/room_code/code_index.py) in memory. It maps each code to the rooms whose current join rules carry it, and records how far through Synapse's event stream it is complete. The index only suggests candidates; the room's current join rules decide.
 
 - **Every hit is confirmed.** Before we act on a candidate, we re-read that room's current join rules and check the code. Whether the code is an admin code also comes from those rules. A rotated code, a used admin code or a deleted course is never accepted from a stale index.
 - **Every miss is checked against the database.** If no candidate survives, the index reads the join-rules changes committed since its last position, then checks again. A course created a moment ago on another process resolves on the first try. The index takes the committed position before reading, so an event that commits late is read twice rather than skipped.
 - **Misses that arrive together share one catch-up.** A classroom mistyping one code costs a couple of queries, not one per student.
 - **The index loads on first use.** The first lookup after a process starts reads every code. There is no startup step and no fallback to the old scan. The checks above mean a stale index can slow a lookup but can't make its answer wrong, so a bug is handled by a revert.
 
-**Known limit:** the catch-up only sees newer changes. A state reset that points a room back to an older join-rules event would go unseen until the process restarts, and a valid code could report "not found" until then. Federation is off, which makes this close to impossible, and every deploy restarts the process.
+**Known limits:** the catch-up only sees newer changes. A state reset that points a room back to an older join-rules event would go unseen until the process restarts, and a valid code could report "not found" until then. Federation is off, which makes this close to impossible, and every deploy restarts the process. An upgraded room copies its predecessor's join rules, so both rooms carry the same code. A lookup then returns only the room the index already holds. The client never upgrades rooms.
 
 ---
 
