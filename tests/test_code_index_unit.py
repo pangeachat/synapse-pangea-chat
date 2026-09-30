@@ -24,6 +24,8 @@ class FakeStore:
         self.refresh_args: List[Tuple[Any, ...]] = []
         # When set, refresh queries wait on this until the test fires it.
         self.hold_refreshes: Optional["defer.Deferred[None]"] = None
+        # The refresh (counting from 1) that raises, if any.
+        self.fail_refresh: Optional[int] = None
         self.hs = SimpleNamespace(get_clock=lambda: Clock(cast(Any, reactor), "test"))
         self.database_engine = SimpleNamespace(supports_using_any_list=False)
         self.db_pool = SimpleNamespace(execute=self._execute)
@@ -40,19 +42,26 @@ class FakeStore:
             wanted = set(args)
         else:
             self.refresh_args.append(args)
-            if self.hold_refreshes is not None:
-                await self.hold_refreshes
+            number = len(self.refresh_args)
             after = args[0] if args else None
             wanted = {
                 room_id
                 for room_id, (stream, _) in self.rooms.items()
                 if after is None or stream > after
             }
-        return [
+        # The query sees the rows committed when it starts, not ones that
+        # commit while it waits.
+        rows = [
             (room_id, json.dumps({"content": content}))
             for room_id, (_, content) in self.rooms.items()
             if room_id in wanted
         ]
+        if desc != "pangea_code_index_confirm":
+            if self.hold_refreshes is not None:
+                await self.hold_refreshes
+            if number == self.fail_refresh:
+                raise RuntimeError("db down")
+        return rows
 
 
 class TestCodeIndex(unittest.TestCase):
@@ -147,6 +156,51 @@ class TestCodeIndex(unittest.TestCase):
         for d in [first, *waiting]:
             self.assertEqual(self.result(d), [])
         self.assertEqual(len(self.store.refresh_args), 2)
+
+    def release_held_refreshes(self) -> None:
+        held, self.store.hold_refreshes = self.store.hold_refreshes, None
+        assert held is not None
+        held.callback(None)
+        self.reactor.advance(0)
+
+    def test_a_row_committed_during_a_refresh_is_caught_next_time(self) -> None:
+        # The committed position is read before the query. Reading it after
+        # would record 2 and skip "!b:x", which the query never saw.
+        self.store.set_rules("!a:x", 1, access_code="abc1234")
+        self.store.hold_refreshes = defer.Deferred()
+        loading = self.lookup("abc1234")
+        self.reactor.advance(0)
+        self.store.set_rules("!b:x", 2, access_code="new1234")
+        self.release_held_refreshes()
+        self.result(loading)
+
+        self.assertEqual(
+            self.result(self.lookup("new1234")),
+            [RoomCodeMatch(room_id="!b:x", is_admin_code=False)],
+        )
+        self.assertEqual(self.store.refresh_args, [(), (1,)])
+
+    def test_a_failed_shared_refresh_does_not_answer_for_its_waiters(self) -> None:
+        # Refresh 1 is in flight when "!b:x" commits; the two lookups behind it
+        # share refresh 2, which fails. The waiter must run refresh 3 rather
+        # than answer "not found" from the stale index.
+        self.store.hold_refreshes = defer.Deferred()
+        self.store.fail_refresh = 2
+        first = self.lookup("new1234")
+        self.reactor.advance(0)
+        self.store.set_rules("!b:x", 2, access_code="new1234")
+        failing = self.lookup("new1234")
+        waiting = self.lookup("new1234")
+        self.release_held_refreshes()
+
+        self.assertEqual(self.result(first), [])
+        with self.assertRaises(RuntimeError):
+            self.result(failing)
+        self.assertEqual(
+            self.result(waiting),
+            [RoomCodeMatch(room_id="!b:x", is_admin_code=False)],
+        )
+        self.assertEqual(len(self.store.refresh_args), 3)
 
 
 if __name__ == "__main__":

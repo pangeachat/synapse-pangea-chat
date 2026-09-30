@@ -90,7 +90,13 @@ class CodeIndex:
             if self._refreshes_started >= wanted:
                 return
             self._refreshes_started += 1
-            await self._refresh()
+            try:
+                await self._refresh()
+            except BaseException:
+                # A failed refresh answers for nobody: the next waiter must
+                # run its own rather than trust the stale index.
+                self._refreshes_started -= 1
+                raise
 
     async def _refresh(self) -> None:
         # Read the committed position before the rows. Events can commit out of
