@@ -643,6 +643,68 @@ class TestE2E(BaseSynapseE2ETest):
                 postgres=postgres,
             )
 
+    async def test_e2e_code_index_follows_new_and_rotated_codes(self) -> None:
+        """After the first lookup loads the code index, a course created later
+        resolves on the first try, and a rotated code stops working while its
+        replacement works (knock-with-code.instructions.md, "Code Lookup")."""
+        postgres = None
+        server_process = None
+        stdout_thread = None
+        stderr_thread = None
+        synapse_dir = None
+        try:
+            (
+                postgres,
+                synapse_dir,
+                config_path,
+                server_process,
+                stdout_thread,
+                stderr_thread,
+            ) = await self.start_test_synapse()
+            tokens = {}
+            for user in ("test1", "test2", "test3"):
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user=user,
+                    password="123123123",
+                    admin=user == "test1",
+                )
+                _, tokens[user] = await self.login_user(user=user, password="123123123")
+
+            first_room = await self.create_private_room(tokens["test1"])
+            await self.set_room_knockable_with_code(
+                first_room, tokens["test1"], "old1abc"
+            )
+            await self.knock_with_code("old1abc", tokens["test2"])
+
+            second_room = await self.create_private_room(tokens["test1"])
+            await self.set_room_knockable_with_code(
+                second_room, tokens["test1"], "new2abc"
+            )
+            await self.knock_with_code("new2abc", tokens["test3"])
+
+            await self.set_room_knockable_with_code(
+                first_room, tokens["test1"], "rot3abc"
+            )
+            response = requests.post(
+                "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code",
+                json={"access_code": "old1abc"},
+                headers={"Authorization": f"Bearer {tokens['test3']}"},
+                timeout=10,
+            )
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.json()["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
+            await self.knock_with_code("ROT3ABC", tokens["test3"])
+        finally:
+            self.stop_synapse(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
+
     async def test_e2e_code_of_fully_left_room_answers_404(self) -> None:
         """When every local member has left a coded room, Synapse drops the
         room from the current-state the code query reads, so the code answers
