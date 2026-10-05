@@ -2,3 +2,5 @@
 
 {% endfor %}{{ cta_label }}:
 {{ claim_url }}
+
+{% include "_claim_code.txt" %}

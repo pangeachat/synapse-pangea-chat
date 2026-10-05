@@ -1,13 +1,15 @@
 """The two emails of a requested course's claim (knock-with-code, "Claiming a course").
 
 1. Course ready: sent by ``create_course_space`` to the requesting address. It
-   carries only the claim link, behind a button, and nothing that belongs with
-   students.
+   carries the claim twice, as a link behind a button and as a printed code
+   with store links for a teacher who installs the app first, and nothing that
+   belongs with students.
 2. Course claimed: sent once the admin code is used, to the requesting address
    rather than the claiming account. It carries the class link.
 3. Claim reminder: sent on a server admin's request to a course not yet
-   claimed, with a new claim link. The caller renders its words, so it does not
-   change when the message catalog's templates arrive.
+   claimed, with a new claim link and code, carried as the first email carries
+   them. The caller renders its words, so it does not change when the message
+   catalog's templates arrive.
 
 Both go through Synapse's own mail path (the homeserver's ``email`` config), and
 the templates ship inside the package, as the notice emails' do.
@@ -37,10 +39,24 @@ MAX_SUBJECT_TITLE_LENGTH = 100
 #: How long a send may take before the caller stops waiting.
 SEND_TIMEOUT_SECONDS = 120
 
+#: Where a teacher without the app gets it. One store listing serves every
+#: environment, so these are not per-environment config.
+APP_STORE_URL = "https://apps.apple.com/app/id1445118630"
+GOOGLE_PLAY_URL = "https://play.google.com/store/apps/details?id=com.talktolearn.chat"
+
 
 def _subject_title(title: str) -> str:
     # A Subject header cannot carry line breaks.
     return " ".join(title.split())[:MAX_SUBJECT_TITLE_LENGTH]
+
+
+def _claim_template_vars(claim_url: str, claim_code: str) -> dict[str, str]:
+    return {
+        "claim_url": claim_url,
+        "claim_code": claim_code,
+        "app_store_url": APP_STORE_URL,
+        "google_play_url": GOOGLE_PLAY_URL,
+    }
 
 
 def reminder_paragraphs(body: str) -> list[str]:
@@ -83,13 +99,14 @@ class CourseClaimMailer:
         course_description: str,
         request_summary: Optional[str],
         claim_url: str,
+        claim_code: str,
     ) -> None:
         template_vars = {
             "app_name": self._app_name,
             "course_title": course_title,
             "course_description": course_description,
             "request_summary": request_summary,
-            "claim_url": claim_url,
+            **_claim_template_vars(claim_url, claim_code),
         }
         await self._send(
             email_address=email_address,
@@ -129,13 +146,14 @@ class CourseClaimMailer:
         body: str,
         cta_label: str,
         claim_url: str,
+        claim_code: str,
     ) -> None:
         template_vars = {
             "app_name": self._app_name,
             "subject": subject,
             "paragraphs": reminder_paragraphs(body),
             "cta_label": cta_label,
-            "claim_url": claim_url,
+            **_claim_template_vars(claim_url, claim_code),
         }
         await self._send(
             email_address=email_address,

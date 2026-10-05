@@ -330,6 +330,7 @@ class CreateCourseSpace(Resource):
                     description=description if isinstance(description, str) else "",
                     request_summary=request_summary,
                     claim_url=admin_join_url,
+                    claim_code=admin_code,
                 )
 
             respond_with_json(
@@ -376,8 +377,9 @@ class CreateCourseSpace(Resource):
         description: str,
         request_summary: str | None,
         claim_url: str,
+        claim_code: str,
     ) -> bool:
-        """Email the claim link to the requesting address.
+        """Email the claim link and code to the requesting address.
 
         A failure is captured and reported as ``emailed: false`` rather than
         failing the request: the space and its claim exist, and a retry would
@@ -390,6 +392,7 @@ class CreateCourseSpace(Resource):
                 course_description=description,
                 request_summary=request_summary,
                 claim_url=claim_url,
+                claim_code=claim_code,
             )
         except Exception as e:
             logger.error(

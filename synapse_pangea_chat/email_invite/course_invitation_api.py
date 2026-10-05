@@ -177,10 +177,11 @@ class CourseInvitationAPI(Resource):
                     course_description=spec["description"],
                     request_summary=spec["request_summary"] or None,
                     claim_url=url,
+                    claim_code=code,
                 )
             else:
                 await self.mailer.send_course_reminder(
-                    email_address=email, claim_url=url, **rendered
+                    email_address=email, claim_url=url, claim_code=code, **rendered
                 )
         except Exception as error:
             # A transport exception may follow acceptance. Keep the link valid

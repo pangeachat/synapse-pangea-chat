@@ -9,3 +9,5 @@ Open the course to become its teacher. If you don't have a {{ app_name }} accoun
 
 Open your course:
 {{ claim_url }}
+
+{% include "_claim_code.txt" %}
