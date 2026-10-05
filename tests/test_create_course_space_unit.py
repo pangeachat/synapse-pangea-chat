@@ -240,6 +240,7 @@ class TestClaimEmailTemplates(unittest.TestCase):
                 )
                 self.assertIn("https://app.pangea.chat/cls4abc", out)
                 self.assertIn("cls4abc", out)
+                self.assertNotIn("Apple Inc.", out)
 
     def test_html_escapes_request_text(self) -> None:
         out = (
@@ -308,6 +309,10 @@ class TestClaimEmailsPrintTheCode(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("course code", without_link)
                     self.assertIn(course_claim_emails.APP_STORE_URL, out)
                     self.assertIn(course_claim_emails.GOOGLE_PLAY_URL, out)
+                    if part == "html":
+                        self.assertIn(course_claim_emails.APP_STORE_BADGE_URL, out)
+                        self.assertIn(course_claim_emails.GOOGLE_PLAY_BADGE_URL, out)
+                        self.assertIn("trademarks of Apple Inc.", out)
 
 
 class TestMailerBound(unittest.IsolatedAsyncioTestCase):

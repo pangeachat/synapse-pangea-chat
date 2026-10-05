@@ -2,8 +2,8 @@
 
 1. Course ready: sent by ``create_course_space`` to the requesting address. It
    carries the claim twice, as a link behind a button and as a printed code
-   with store links for a teacher who installs the app first, and nothing that
-   belongs with students.
+   with store badges for a teacher who installs the app first, and nothing
+   that belongs with students.
 2. Course claimed: sent once the admin code is used, to the requesting address
    rather than the claiming account. It carries the class link.
 3. Claim reminder: sent on a server admin's request to a course not yet
@@ -44,6 +44,10 @@ SEND_TIMEOUT_SECONDS = 120
 APP_STORE_URL = "https://apps.apple.com/app/id1445118630"
 GOOGLE_PLAY_URL = "https://play.google.com/store/apps/details?id=com.talktolearn.chat"
 
+#: Each store's official badge, from the brand library (business ``brand/``).
+APP_STORE_BADGE_URL = "https://assets.pangea.chat/brand/App-Store-Badge.png"
+GOOGLE_PLAY_BADGE_URL = "https://assets.pangea.chat/brand/Google-Play-Badge.png"
+
 
 def _subject_title(title: str) -> str:
     # A Subject header cannot carry line breaks.
@@ -56,6 +60,8 @@ def _claim_template_vars(claim_url: str, claim_code: str) -> dict[str, str]:
         "claim_code": claim_code,
         "app_store_url": APP_STORE_URL,
         "google_play_url": GOOGLE_PLAY_URL,
+        "app_store_badge_url": APP_STORE_BADGE_URL,
+        "google_play_badge_url": GOOGLE_PLAY_BADGE_URL,
     }
 
 
