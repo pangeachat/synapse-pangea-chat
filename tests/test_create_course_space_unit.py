@@ -228,6 +228,41 @@ class TestClaimEmailTemplates(unittest.TestCase):
                 self.assertIn("Spanish 1", out)
                 self.assertNotIn("class code", out.lower())
 
+    def test_only_a_prepared_invitation_says_signing_in_claims_it(self) -> None:
+        """A room-backed course is claimed only by its link, so its email must
+        not promise that signing in with the address claims it."""
+        env = self._env()
+        for name in ("course_ready.html", "course_ready.txt"):
+            for claims_by_address in (True, False):
+                with self.subTest(template=name, claims_by_address=claims_by_address):
+                    out = env.get_template(name).render(
+                        app_name="Pangea Chat",
+                        course_title="Spanish 1",
+                        course_description="",
+                        request_summary=None,
+                        claim_url="https://app.pangea.chat/adm1nab",
+                        claim_code="adm1nab",
+                        claims_by_address=claims_by_address,
+                    )
+                    words = " ".join(out.split())
+                    self.assertEqual(
+                        "sign in with this address" in words, claims_by_address
+                    )
+                    # Signing in claims the course, so the code is only for
+                    # a different address; without that, every app-first
+                    # teacher needs it.
+                    self.assertEqual(
+                        "Signing in with a different address?" in words,
+                        claims_by_address,
+                    )
+                    self.assertEqual(
+                        "If you install the app before you open your course" in words,
+                        not claims_by_address,
+                    )
+                    self.assertIn(
+                        "adm1nab", out.replace("https://app.pangea.chat/adm1nab", "")
+                    )
+
     def test_course_claimed_carries_class_link_and_claimer(self) -> None:
         env = self._env()
         for name in ("course_claimed.html", "course_claimed.txt"):
@@ -279,33 +314,39 @@ class TestClaimEmailsPrintTheCode(unittest.IsolatedAsyncioTestCase):
         mailer = course_claim_emails.CourseClaimMailer(api)
         send = AsyncMock()
         mailer._send = send  # type: ignore[method-assign]
-        claim = {
-            "claim_url": "https://app.pangea.chat/adm1nab",
-            "claim_code": "adm1nab",
-        }
+        claim_url = "https://app.pangea.chat/adm1nab"
+        claim_code = "adm1nab"
 
-        await mailer.send_course_ready(
-            email_address="teacher@school.example",
-            course_title="Spanish 1",
-            course_description="",
-            request_summary=None,
-            **claim,
-        )
+        for claims_by_address in (False, True):
+            await mailer.send_course_ready(
+                email_address="teacher@school.example",
+                course_title="Spanish 1",
+                course_description="",
+                request_summary=None,
+                claim_url=claim_url,
+                claim_code=claim_code,
+                claims_by_address=claims_by_address,
+            )
         await mailer.send_course_reminder(
             email_address="teacher@school.example",
             subject="Your course is waiting",
             body="Open it to become its teacher.",
             cta_label="Open your course",
-            **claim,
+            claim_url=claim_url,
+            claim_code=claim_code,
         )
 
-        self.assertEqual(send.await_count, 2)
+        self.assertEqual(send.await_count, 3)
         for sent in send.await_args_list:
             for part in ("html", "text"):
                 out = sent.kwargs[part]
-                with self.subTest(subject=sent.kwargs["subject"], part=part):
-                    without_link = out.replace(claim["claim_url"], "")
-                    self.assertIn(claim["claim_code"], without_link)
+                with self.subTest(
+                    subject=sent.kwargs["subject"],
+                    part=part,
+                    sign_in_wording="sign in with this address" in out,
+                ):
+                    without_link = out.replace(claim_url, "")
+                    self.assertIn(claim_code, without_link)
                     self.assertIn("course code", without_link)
                     self.assertIn(course_claim_emails.APP_STORE_URL, out)
                     self.assertIn(course_claim_emails.GOOGLE_PLAY_URL, out)

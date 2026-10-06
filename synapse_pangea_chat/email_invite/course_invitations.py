@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from synapse.api.errors import SynapseError
+from synapse.util.threepids import canonicalise_email
 
 from synapse_pangea_chat.email_invite.course_claims import admin_code_digest
 
@@ -138,6 +139,31 @@ class CourseInvitationStore:
 
     async def code_in_use(self, code):
         return await self.for_code(code) is not None
+
+    async def prepared_for_emails(self, emails):
+        """Prepared invitations requested from any of ``emails``.
+
+        Addresses are compared as Synapse stores verified ones
+        (``canonicalise_email``): SQL ``LOWER`` folds only ASCII, so a
+        requested ``JÖRG@schule.de`` would miss the stored ``jörg@schule.de``.
+        Completed invitations have no address left to match, and revoked ones
+        are excluded by status.
+        """
+        await self.ensure()
+        wanted = {canonicalise_email(email) for email in emails}
+        if not wanted:
+            return []
+
+        def select(txn):
+            txn.execute(
+                SELECT
+                + "WHERE status = 'prepared' AND requested_email IS NOT NULL"
+                + " ORDER BY created_at_ms, invitation_id"
+            )
+            return [self.row(r) for r in txn.fetchall()]
+
+        rows = await self.db.runInteraction("pangea_invitation_for_emails", select)
+        return [r for r in rows if canonicalise_email(r["requested_email"]) in wanted]
 
     async def reserve_creation(self, invitation_id, user):
         await self.ensure()

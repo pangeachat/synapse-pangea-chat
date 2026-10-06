@@ -19,6 +19,7 @@ from synapse_pangea_chat.delete_user import DeleteUser
 from synapse_pangea_chat.direct_message import EnsureDirectMessage
 from synapse_pangea_chat.direct_push import DirectPush
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
+from synapse_pangea_chat.email_invite.claim_by_email import ClaimByEmail
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
 from synapse_pangea_chat.email_invite.course_claim_notice import CourseClaimNotifier
 from synapse_pangea_chat.email_invite.course_claim_reminder import (
@@ -343,6 +344,10 @@ class PangeaChat:
             course_claim_store.invitations,
             course_claim_store,
             course_claim_notifier,
+        )
+        # Registers its own sign-in and verified-address callbacks.
+        self.claim_by_email = ClaimByEmail(
+            api, course_claim_store.invitations, provisioner
         )
         for endpoint, mode in (
             ("create_course_space", "prepare"),

@@ -64,7 +64,11 @@ class CourseProvisioner:
             "pangea_invitation_recover_room", find
         )
 
-    async def claim(self, invitation, user):
+    async def claim(self, invitation, user, defer_to_concurrent=False):
+        """The claimed room. With ``defer_to_concurrent``, None when another
+        request by the same account reserved this invitation after the caller
+        read it as prepared: that request is creating the room, and recovery
+        would find none yet."""
         await self.claims._ensure_table()
         # Generate before reserving: failure to find a free class code cannot
         # strand a creation operation that has not yet started.
@@ -74,7 +78,8 @@ class CourseProvisioner:
         ):
             raise unavailable()
         class_code = None
-        if invitation["status"] == "prepared":
+        read_as_prepared = invitation["status"] == "prepared"
+        if read_as_prepared:
             class_code = await new_unique_code(self.store, self.claims)
             if not class_code:
                 raise recovery_required()
@@ -85,6 +90,8 @@ class CourseProvisioner:
             if not await self.authorized(invitation, user):
                 raise unavailable()
             return invitation["room_id"]
+        if defer_to_concurrent and read_as_prepared and not create:
+            return None
         if create:
             spec = invitation["specification"]
             power = deepcopy(DEFAULT_SPACE_POWER_LEVELS)
