@@ -312,7 +312,17 @@ class TestClaimEmailsPrintTheCode(unittest.IsolatedAsyncioTestCase):
                     if part == "html":
                         self.assertIn(course_claim_emails.APP_STORE_BADGE_URL, out)
                         self.assertIn(course_claim_emails.GOOGLE_PLAY_BADGE_URL, out)
-                        self.assertIn("trademarks of Apple Inc.", out)
+                        flat = " ".join(out.split())
+                        self.assertIn(
+                            "App Store is a trademark of Apple Inc., registered"
+                            " in the U.S. and other countries.",
+                            flat,
+                        )
+                        self.assertIn(
+                            "Google Play and the Google Play logo are"
+                            " trademarks of Google LLC.",
+                            flat,
+                        )
 
 
 class TestMailerBound(unittest.IsolatedAsyncioTestCase):
