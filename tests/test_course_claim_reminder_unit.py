@@ -79,6 +79,7 @@ class TestSendCourseClaimReminder(unittest.IsolatedAsyncioTestCase):
         sent = mailer.send_course_reminder.await_args.kwargs
         self.assertEqual(sent["email_address"], "t@school.example")
         self.assertEqual(sent["claim_url"], "https://app.pangea.chat/n3wcod1")
+        self.assertEqual(sent["claim_code"], "n3wcod1")
         self.assertEqual(sent["subject"], BODY["subject"])
         self.assertEqual(sent["cta_label"], BODY["cta_label"])
         self.assertNotIn("n3wcod1", str(body))
@@ -173,6 +174,7 @@ class TestReminderTemplate(unittest.TestCase):
             "paragraphs": reminder_paragraphs("First <b>line</b>\nwraps.\n \nSecond."),
             "cta_label": "Open your course",
             "claim_url": "https://app.pangea.chat/n3wcod1",
+            "claim_code": "n3wcod1",
         }
         html = env.get_template("course_reminder.html").render(**values)
         text = env.get_template("course_reminder.txt").render(**values)

@@ -1,0 +1,5 @@
+You can also use the {{ app_name }} app:
+App Store: {{ app_store_url }}
+Google Play: {{ google_play_url }}
+
+If you install the app before you open your course, enter this code when it asks for a course code: {{ claim_code }}

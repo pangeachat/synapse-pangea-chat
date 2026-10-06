@@ -149,6 +149,9 @@
         .body-content p {
           color: #e0e0e0 !important;
         }
+        .body-content a:not(.cta-button) {
+          color: #dbc9ff !important;
+        }
         .feature {
           background-color: #2a2644 !important;
         }
@@ -324,6 +327,16 @@
                 <p style="margin-top: 16px; font-size: 12px; color: #bbb">
                   &copy; 2026 Pangea Chat, LLC. All rights reserved.
                 </p>
+                {#- Each store's credit line, worded as its badge guidelines
+                    give it, goes with the legal notices wherever the badges
+                    appear (_claim_code.html). #}
+                {% if app_store_badge_url %}
+                <p style="margin-top: 8px; font-size: 11px; color: #bbb">
+                  App Store is a trademark of Apple Inc., registered in the
+                  U.S. and other countries. Google Play and the Google Play
+                  logo are trademarks of Google LLC.
+                </p>
+                {% endif %}
               </td>
             </tr>
 

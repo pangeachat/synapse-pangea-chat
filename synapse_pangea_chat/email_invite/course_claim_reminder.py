@@ -196,6 +196,7 @@ class SendCourseClaimReminder(Resource):
                     body=text,
                     cta_label=cta_label,
                     claim_url=build_join_url(self._config.app_base_url, code),
+                    claim_code=code,
                 )
             except Exception as e:
                 # The code reached nobody, so it is withdrawn rather than left

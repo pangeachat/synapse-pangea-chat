@@ -167,6 +167,7 @@ class TestSendClaimLink(unittest.IsolatedAsyncioTestCase):
             description="Lessons 1 to 6",
             request_summary="Spanish 1 practice",
             claim_url="https://app.pangea.chat/adm1nab",
+            claim_code="adm1nab",
         )
 
     async def test_sends_the_claim_link(self) -> None:
@@ -177,6 +178,7 @@ class TestSendClaimLink(unittest.IsolatedAsyncioTestCase):
         sent = mailer.send_course_ready.await_args.kwargs
         self.assertEqual(sent["email_address"], "teacher@school.example")
         self.assertEqual(sent["claim_url"], "https://app.pangea.chat/adm1nab")
+        self.assertEqual(sent["claim_code"], "adm1nab")
         self.assertEqual(sent["request_summary"], "Spanish 1 practice")
 
     async def test_failed_send_is_captured_and_reported(self) -> None:
@@ -220,6 +222,7 @@ class TestClaimEmailTemplates(unittest.TestCase):
                     course_description="Lessons 1 to 6",
                     request_summary="Spanish 1 practice",
                     claim_url="https://app.pangea.chat/adm1nab",
+                    claim_code="adm1nab",
                 )
                 self.assertIn("https://app.pangea.chat/adm1nab", out)
                 self.assertIn("Spanish 1", out)
@@ -237,6 +240,7 @@ class TestClaimEmailTemplates(unittest.TestCase):
                 )
                 self.assertIn("https://app.pangea.chat/cls4abc", out)
                 self.assertIn("cls4abc", out)
+                self.assertNotIn("Apple Inc.", out)
 
     def test_html_escapes_request_text(self) -> None:
         out = (
@@ -248,10 +252,77 @@ class TestClaimEmailTemplates(unittest.TestCase):
                 course_description="",
                 request_summary="<script>alert(1)</script>",
                 claim_url="https://app.pangea.chat/adm1nab",
+                claim_code="adm1nab",
             )
         )
         self.assertNotIn("<script>", out)
         self.assertNotIn("<b>x</b>", out)
+
+
+class TestClaimEmailsPrintTheCode(unittest.IsolatedAsyncioTestCase):
+    """The first email and a reminder both print the claim code and link to
+    the stores: a store install does not carry the link, so a teacher who
+    installs the app first types the code (create-course-space.instructions.md).
+    """
+
+    async def test_ready_and_reminder_print_the_code_and_store_links(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from synapse_pangea_chat.email_invite import course_claim_emails
+
+        env = TestClaimEmailTemplates._env()
+        api = MagicMock()
+        api._hs.config.email.email_app_name = "Pangea Chat"
+        api.read_templates.side_effect = lambda names, custom_template_directory: [
+            env.get_template(name) for name in names
+        ]
+        mailer = course_claim_emails.CourseClaimMailer(api)
+        send = AsyncMock()
+        mailer._send = send  # type: ignore[method-assign]
+        claim = {
+            "claim_url": "https://app.pangea.chat/adm1nab",
+            "claim_code": "adm1nab",
+        }
+
+        await mailer.send_course_ready(
+            email_address="teacher@school.example",
+            course_title="Spanish 1",
+            course_description="",
+            request_summary=None,
+            **claim,
+        )
+        await mailer.send_course_reminder(
+            email_address="teacher@school.example",
+            subject="Your course is waiting",
+            body="Open it to become its teacher.",
+            cta_label="Open your course",
+            **claim,
+        )
+
+        self.assertEqual(send.await_count, 2)
+        for sent in send.await_args_list:
+            for part in ("html", "text"):
+                out = sent.kwargs[part]
+                with self.subTest(subject=sent.kwargs["subject"], part=part):
+                    without_link = out.replace(claim["claim_url"], "")
+                    self.assertIn(claim["claim_code"], without_link)
+                    self.assertIn("course code", without_link)
+                    self.assertIn(course_claim_emails.APP_STORE_URL, out)
+                    self.assertIn(course_claim_emails.GOOGLE_PLAY_URL, out)
+                    if part == "html":
+                        self.assertIn(course_claim_emails.APP_STORE_BADGE_URL, out)
+                        self.assertIn(course_claim_emails.GOOGLE_PLAY_BADGE_URL, out)
+                        flat = " ".join(out.split())
+                        self.assertIn(
+                            "App Store is a trademark of Apple Inc., registered"
+                            " in the U.S. and other countries.",
+                            flat,
+                        )
+                        self.assertIn(
+                            "Google Play and the Google Play logo are"
+                            " trademarks of Google LLC.",
+                            flat,
+                        )
 
 
 class TestMailerBound(unittest.IsolatedAsyncioTestCase):
@@ -281,6 +352,7 @@ class TestMailerBound(unittest.IsolatedAsyncioTestCase):
                     course_description="",
                     request_summary=None,
                     claim_url="https://app.pangea.chat/adm1nab",
+                    claim_code="adm1nab",
                 )
 
         self.assertEqual(

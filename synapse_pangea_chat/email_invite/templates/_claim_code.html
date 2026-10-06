@@ -1,0 +1,25 @@
+{#- For a teacher who installs the app before opening the claim link: a store
+    install does not carry the link, so the app's course-code step takes the
+    printed code instead (create-course-space.instructions.md). The badges are
+    each store's official artwork, which neither store allows to be changed;
+    Google's must be no smaller than Apple's beside it (business brand/README.md). -#}
+                <p style="margin-bottom: 12px">You can also use the {{ app_name }} app:</p>
+                <table role="presentation" cellpadding="0" cellspacing="0" style="margin: 0 0 16px">
+                  <tr>
+                    <td style="padding-right: 12px; vertical-align: middle">
+                      <a href="{{ app_store_url }}" target="_blank"><img src="{{ app_store_badge_url }}" width="120" height="40" border="0" alt="Download on the App Store" style="display: block; height: 40px; width: 120px" /></a>
+                    </td>
+                    <td style="vertical-align: middle">
+                      <a href="{{ google_play_url }}" target="_blank"><img src="{{ google_play_badge_url }}" width="134" height="40" border="0" alt="Get it on Google Play" style="display: block; height: 40px; width: 134px" /></a>
+                    </td>
+                  </tr>
+                </table>
+                <p style="margin-bottom: 8px">
+                  If you install the app before you open your course, enter this
+                  code when it asks for a course code:
+                </p>
+                <div class="feature" style="text-align: center">
+                  <p style="margin: 0; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 26px; font-weight: 700; letter-spacing: 4px">
+                    {{ claim_code }}
+                  </p>
+                </div>
