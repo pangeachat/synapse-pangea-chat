@@ -1,6 +1,6 @@
 """Real Synapse/Postgres/SMTP coverage of claiming a prepared course by verified
-address: when one is added to an account, when an account signs in, and what
-another account's link gets afterwards."""
+address: when one is added to an account, when an account signs in, when an
+email sign-up completes, and what another account's link gets afterwards."""
 
 import re
 from urllib.parse import quote
@@ -153,6 +153,90 @@ class TestClaimByEmailE2E(BaseSynapseE2ETest):
                 _, tokens["other"] = await self.login_user("other", "123123123")
                 self.assertEqual(self.joined_rooms(tokens["other"]), [])
                 self.assertEqual(self.status(op, untouched)["status"], "prepared")
+            finally:
+                self.stop_synapse(
+                    server_process=server_process,
+                    stdout_thread=stdout_thread,
+                    stderr_thread=stderr_thread,
+                    synapse_dir=synapse_dir,
+                    postgres=postgres,
+                )
+
+    async def test_email_sign_up_claims_before_any_login(self):
+        """The app signs in from the /register response, which runs no login
+        callback: the claim has to come from Synapse storing the address."""
+        signup = "signup@school.example"
+        secret = "claim-by-email-secret"
+        register = "/_matrix/client/v3/register"
+        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
+        with SmtpSink() as sink:
+            try:
+                (
+                    postgres,
+                    synapse_dir,
+                    config_path,
+                    server_process,
+                    stdout_thread,
+                    stderr_thread,
+                ) = await self.start_test_synapse(
+                    module_config={"app_base_url": APP},
+                    synapse_config_overrides={
+                        "email": sink.synapse_email_config(),
+                        "enable_registration": True,
+                        "registrations_require_3pid": ["email"],
+                        **RATE_LIMITS,
+                    },
+                )
+                await self.register_user(
+                    config_path=config_path,
+                    dir=synapse_dir,
+                    user="operator",
+                    password="123123123",
+                    admin=True,
+                )
+                _, op = await self.login_user("operator", "123123123")
+                ident = self.prepare(op, "signup", signup)
+
+                account = {"username": "signup", "password": "123123123"}
+                started = requests.post(self.server_url + register, json=account)
+                self.assertEqual(started.status_code, 401, started.text)
+                requested = requests.post(
+                    self.server_url + register + "/email/requestToken",
+                    json={"client_secret": secret, "email": signup, "send_attempt": 1},
+                )
+                self.assertEqual(requested.status_code, 200, requested.text)
+                sid = requested.json()["sid"]
+                validation = sink.wait_for(signup, "Validate")
+                self.assertIsNotNone(validation)
+                token = re.search(
+                    r"submit_token\?\S*?token=([A-Za-z0-9]+)", body_text(validation)
+                ).group(1)
+                confirmed = requests.get(
+                    self.server_url
+                    + "/_matrix/client/unstable/registration/email/submit_token",
+                    params={"token": token, "client_secret": secret, "sid": sid},
+                )
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
+                completed = requests.post(
+                    self.server_url + register,
+                    json={
+                        **account,
+                        "auth": {
+                            "type": "m.login.email.identity",
+                            "threepid_creds": {"sid": sid, "client_secret": secret},
+                            "session": started.json()["session"],
+                        },
+                    },
+                )
+                self.assertEqual(completed.status_code, 200, completed.text)
+
+                claimed = self.status(op, ident)
+                self.assertEqual(claimed["status"], "completed", claimed)
+                self.assertEqual(claimed["claimant"], completed.json()["user_id"])
+                self.assertEqual(
+                    self.joined_rooms(completed.json()["access_token"]),
+                    [claimed["room_id"]],
+                )
             finally:
                 self.stop_synapse(
                     server_process=server_process,

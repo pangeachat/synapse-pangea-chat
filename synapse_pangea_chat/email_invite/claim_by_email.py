@@ -70,8 +70,12 @@ class ClaimByEmail:
 
     async def claim_for(self, user_id: str) -> None:
         # Synapse awaits these callbacks inside the sign-in or registration
-        # request and does not catch what they raise, so nothing may escape: a
-        # failed claim must not fail the sign-in. The link still claims it.
+        # request. It does not catch what `on_user_login` raises, so nothing
+        # may escape: a failed claim must not fail the sign-in. A failure
+        # before the reservation leaves the invitation prepared, for the link
+        # or the next sign-in. One after it leaves a partial claim that later
+        # sign-ins skip: this account's link resumes it if the room was
+        # created, and otherwise an operator must, as for a failed link claim.
         # Awaited rather than backgrounded so the course exists before the
         # sign-in response, and a Google sign-in's later login events find it
         # already claimed.

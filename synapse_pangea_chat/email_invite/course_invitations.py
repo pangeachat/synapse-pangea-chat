@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from synapse.api.errors import SynapseError
+from synapse.util.threepids import canonicalise_email
 
 from synapse_pangea_chat.email_invite.course_claims import admin_code_digest
 
@@ -140,27 +141,31 @@ class CourseInvitationStore:
         return await self.for_code(code) is not None
 
     async def prepared_for_emails(self, emails):
-        """Prepared invitations requested from any of ``emails``, ignoring case.
+        """Prepared invitations requested from any of ``emails``.
 
+        Addresses are compared as Synapse stores verified ones
+        (``canonicalise_email``): SQL ``LOWER`` folds only ASCII, so a
+        requested ``JÖRG@schule.de`` would miss the stored ``jörg@schule.de``.
         Completed invitations have no address left to match, and revoked ones
         are excluded by status.
         """
         await self.ensure()
-        lowered = sorted({email.lower() for email in emails})
-        if not lowered:
+        wanted = {canonicalise_email(email) for email in emails}
+        if not wanted:
             return []
 
+        # ponytail: reads every prepared invitation on each sign-in; store a
+        # canonical address column if the table grows past a few thousand.
         def select(txn):
             txn.execute(
                 SELECT
-                + "WHERE status = 'prepared' AND LOWER(requested_email) IN ("
-                + ", ".join("?" for _ in lowered)
-                + ") ORDER BY created_at_ms, invitation_id",
-                lowered,
+                + "WHERE status = 'prepared' AND requested_email IS NOT NULL"
+                + " ORDER BY created_at_ms, invitation_id"
             )
             return [self.row(r) for r in txn.fetchall()]
 
-        return await self.db.runInteraction("pangea_invitation_for_emails", select)
+        rows = await self.db.runInteraction("pangea_invitation_for_emails", select)
+        return [r for r in rows if canonicalise_email(r["requested_email"]) in wanted]
 
     async def reserve_creation(self, invitation_id, user):
         await self.ensure()

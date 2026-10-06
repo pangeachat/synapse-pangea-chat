@@ -127,6 +127,19 @@ class TestClaimByEmail(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["invitation_id"] for row in found], [self.ident])
         self.assertEqual(await self.invitations.prepared_for_emails([]), [])
 
+    async def test_prepared_lookup_folds_case_beyond_ascii(self):
+        # Requested as typed; the verified address as Synapse stores it.
+        for key, requested, verified in (
+            ("umlaut", "JÖRG@schule.de", "jörg@schule.de"),
+            ("eszett", "Straße@schule.de", "strasse@schule.de"),
+        ):
+            with self.subTest(requested=requested):
+                ident, _ = await self.invitations.prepare(
+                    "@operator:x", key, SPEC, requested, key[:3] + "2abcd", 2
+                )
+                found = await self.invitations.prepared_for_emails([verified])
+                self.assertEqual([row["invitation_id"] for row in found], [ident])
+
     async def test_sign_in_claims_every_matching_invitation(self):
         second, _ = await self.invitations.prepare(
             "@operator:x", "request-2", SPEC, "teacher@school.example", "ghi3jkm", 2
@@ -186,6 +199,13 @@ class TestClaimByEmail(unittest.IsolatedAsyncioTestCase):
         await self.claimer.on_user_login(TEACHER, None, None)
         self.captured.assert_called_once()
         self.assertIsInstance(self.captured.call_args.args[0], RuntimeError)
+        # Failing after the reservation leaves a partial claim held for this
+        # account, which later sign-ins do not retry (only the link resumes it).
+        row = await self.invitations.get(self.ident)
+        self.assertEqual((row["status"], row["claimant"]), ("provisioning", TEACHER))
+        await self.claimer.on_user_login(TEACHER, None, None)
+        self.assertEqual(self.create_room.await_count, 1)
+        self.captured.assert_called_once()
 
     async def test_a_failed_lookup_is_reported_and_never_fails_the_sign_in(self):
         self.threepids.side_effect = RuntimeError("database down")
