@@ -160,6 +160,10 @@ _DELETE_CLAIM_SQL = """
     WHERE event_id = ? AND disposition = ? AND claim_id = ?
 """
 
+#: The table's DDL, for the Safety page's one-time backfill, which reads this
+#: table on an instance that may never have run Tier 2.
+CREATE_TABLE_SQL = _CREATE_TABLE_SQL
+
 #: Every statement above, for the drift test.
 STATEMENTS = (
     _CREATE_TABLE_SQL,
@@ -251,6 +255,11 @@ class DispositionStore:
         self._pending[event_id] = (room_id, category)
         metrics.TIER2_DISPOSITION_UNWRITTEN.set(len(self._pending))
         return await self._flush_pending(event_id)
+
+    async def flush_pending(self) -> None:
+        """Write the preserves that have not landed yet, before a redaction
+        decision does anything else. See `_flush_pending`."""
+        await self._flush_pending()
 
     async def _flush_pending(self, event_id: Optional[str] = None) -> bool:
         """Write the preserves that have not landed yet.

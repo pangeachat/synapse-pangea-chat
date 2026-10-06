@@ -518,8 +518,46 @@ REDACTION_SKIP_CAUSES = frozenset(
         # act on an unknown rather than carrying on - see
         # `moderation.disposition`.
         "disposition_unknown",
+        # The safety incident row could not be written, so nothing is
+        # enforced: a message is never removed without its record. See
+        # `moderation.incidents`.
+        "incident_unwritten",
     }
 )
+
+# Which write of a safety incident failed. Closed for the same reason as the
+# sets above.
+INCIDENT_WRITE_KINDS = frozenset({"block", "verdict", "outcome"})
+
+INCIDENT_WRITE_FAILED = _get_or_create(
+    Counter,
+    "pangea_safety_incident_write_failed_total",
+    "Safety incident writes that failed on the first try and were handed to "
+    "the in-process retry. A block is still refused and a verdict is not "
+    "enforced; what is at risk is the record on the Safety page.",
+    ["kind"],
+)
+
+INCIDENT_LOST = _get_or_create(
+    Counter,
+    "pangea_safety_incident_lost_total",
+    "Safety incidents that were not written after every retry, or whose "
+    "retry could not be scheduled. Each is an incident a course admin will "
+    "not see.",
+    ["kind"],
+)
+
+
+def record_incident_write_failed(kind: str) -> None:
+    if kind not in INCIDENT_WRITE_KINDS:
+        raise ValueError(f"unknown safety incident write kind {kind!r}")
+    INCIDENT_WRITE_FAILED.labels(kind=kind).inc()
+
+
+def record_incident_lost(kind: str) -> None:
+    if kind not in INCIDENT_WRITE_KINDS:
+        raise ValueError(f"unknown safety incident write kind {kind!r}")
+    INCIDENT_LOST.labels(kind=kind).inc()
 
 
 def record_drop(cause: str, count: int = 1) -> None:

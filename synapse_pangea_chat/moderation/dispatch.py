@@ -99,6 +99,11 @@ class ModerationJob:
     sender: str
     text: str
     enqueued_at: float
+    #: The sender's student courses as of queue time - a
+    #: `recorder.CourseSnapshot` - so a learner who leaves a course before
+    #: the verdict still lands on it. None when nothing was captured, and the
+    #: verdict then looks the courses up itself.
+    courses: Optional[Any] = None
 
 
 class Tier2Dispatcher:

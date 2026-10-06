@@ -2718,7 +2718,17 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
         )
         api, homeserver = self._pair()
         mod = self._module(api, homeserver)
-        homeserver.store.db_pool.error = RuntimeError("database is unhappy")
+
+        # The DISPOSITION table is what is unreadable, and only it. A
+        # database that is down altogether now stops the redaction one step
+        # earlier, at the Safety page's incident row (nothing is removed
+        # without its record - `test_safety_incidents_unit`), and would never
+        # reach the disposition read this test is about.
+        def _disposition_unreadable(sql: str, _args: Any) -> None:
+            if DISPOSITION_TABLE in sql:
+                raise RuntimeError("database is unhappy")
+
+        homeserver.store.db_pool.on_statement = _disposition_unreadable
         with patch(self.MODERATE, self._verdict("harassment")):
             await mod._check_and_redact(self._job())
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()

@@ -32,6 +32,7 @@ the org trust-and-safety doc it descends from.
 
 import inspect
 import re
+import uuid
 from functools import partial
 from html.parser import HTMLParser
 from typing import (
@@ -68,6 +69,7 @@ from synapse_pangea_chat.moderation.choreo_client import (
     install_proxy_log_guard,
 )
 from synapse_pangea_chat.moderation.compat import reraise_if_cancelled
+from synapse_pangea_chat.moderation.courses import StudentCourses
 from synapse_pangea_chat.moderation.dispatch import ModerationJob, Tier2Dispatcher
 from synapse_pangea_chat.moderation.disposition import (
     GRANTED,
@@ -80,6 +82,22 @@ from synapse_pangea_chat.moderation.exempt import (
     glob_match,
     validate_glob,
 )
+from synapse_pangea_chat.moderation.incidents import (
+    ACTION_BLOCKED,
+    ACTION_KEPT,
+    ACTION_PRESERVED,
+    ACTION_REDACTED,
+    OUTCOME_FAILED,
+    OUTCOME_PENDING,
+    OUTCOME_REMOVED,
+    OUTCOME_SKIPPED,
+    OUTCOME_UNKNOWN,
+    SOURCE_MODERATION,
+    Incident,
+    IncidentStore,
+    mod_incident_id,
+    unique,
+)
 from synapse_pangea_chat.moderation.log_safety import (
     error_site,
     new_digest_key,
@@ -88,6 +106,7 @@ from synapse_pangea_chat.moderation.log_safety import (
     sender_digest,
 )
 from synapse_pangea_chat.moderation.profanity import contains_profanity
+from synapse_pangea_chat.moderation.recorder import IncidentRecorder
 from synapse_pangea_chat.moderation.refusal import refusal_body
 from synapse_pangea_chat.moderation.refusal import (
     validate_messages as validate_refusal_messages,
@@ -515,6 +534,60 @@ class _Extracted(NamedTuple):
     incomplete: bool
 
 
+def extract_message_text(
+    event_type: Any, raw_content: Any, event_id: Any = None
+) -> "_Extracted":
+    """The displayed text of a message, and whether it is all of it.
+
+    `ChatModeration._extract_text` documents the rule. A function rather than
+    a method so the Safety page's report endpoint and its backfill snapshot a
+    message exactly as moderation reads one.
+    """
+    if event_type != MESSAGE_EVENT_TYPE:
+        return _Extracted(None, False)
+    # `Mapping`, not `dict`: event content is not guaranteed to be a plain
+    # dict. Synapse builds events through a Rust type whose `content` is a
+    # `JsonObject`, and a homeserver running with `use_frozen_dicts: true`
+    # hands modules `immutabledict` values. An `isinstance(..., dict)`
+    # test on either returns False, which would silently stop moderating
+    # the replacement text of every edit - a bypass that fails open and
+    # says nothing.
+    content = raw_content or {}
+    if not isinstance(content, Mapping):
+        # A content we cannot even index is a content we cannot read, and
+        # a client that renders it renders something. Reported as an
+        # unknown rather than as an empty message.
+        return _Extracted(None, True)
+
+    surfaces: List[Mapping[str, Any]] = [content]
+    new_content = content.get("m.new_content")
+    if _is_replacement(content) and isinstance(new_content, Mapping):
+        surfaces.append(new_content)
+
+    parts: List[str] = []
+    incomplete = False
+    for surface in surfaces:
+        try:
+            surface_parts, surface_incomplete = _surface_text(surface)
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # Type and site, never the message: a reader that failed on a
+            # message body routinely quotes that body back.
+            incomplete = True
+            logger.warning(
+                "moderation could not read a surface of %s at %s (%s); "
+                "the rest of the event is still checked",
+                event_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
+            continue
+        parts.extend(surface_parts)
+        incomplete = incomplete or surface_incomplete
+    text = "\n".join(parts).strip()
+    return _Extracted(text or None, incomplete)
+
+
 class ChatModeration:
     """Registers the enabled moderation tiers. Constructed only when at least
     one tier is enabled (see PangeaChat.__init__), mirroring the module's
@@ -571,6 +644,16 @@ class ChatModeration:
         # import so it runs once moderation is actually enabled, by which time
         # the deployment's logging config is in place.
         scrub_reachable_handlers(logger)
+
+        # The Safety page's record (pangeachat/admin-dash#105). Built on
+        # every instance with a tier enabled, not only the Tier-2 one: Tier 1
+        # refuses a send wherever it arrives, and records it there.
+        self._incidents = IncidentStore(api._hs)
+        self._recorder = IncidentRecorder(
+            api._hs,
+            self._incidents,
+            StudentCourses.from_homeserver(api._hs, self._is_exempt_sender),
+        )
 
         self._tier2_active = False
         self._dispatcher: Optional[Tier2Dispatcher] = None
@@ -732,49 +815,7 @@ class ChatModeration:
         result says so. The caller counts the shortfall and Tier 2 still gets
         the message - an unknown is escalated, never dropped quietly.
         """
-        if event.type != MESSAGE_EVENT_TYPE:
-            return _Extracted(None, False)
-        # `Mapping`, not `dict`: event content is not guaranteed to be a plain
-        # dict. Synapse builds events through a Rust type whose `content` is a
-        # `JsonObject`, and a homeserver running with `use_frozen_dicts: true`
-        # hands modules `immutabledict` values. An `isinstance(..., dict)`
-        # test on either returns False, which would silently stop moderating
-        # the replacement text of every edit - a bypass that fails open and
-        # says nothing.
-        content = event.content or {}
-        if not isinstance(content, Mapping):
-            # A content we cannot even index is a content we cannot read, and
-            # a client that renders it renders something. Reported as an
-            # unknown rather than as an empty message.
-            return _Extracted(None, True)
-
-        surfaces: List[Mapping[str, Any]] = [content]
-        new_content = content.get("m.new_content")
-        if _is_replacement(content) and isinstance(new_content, Mapping):
-            surfaces.append(new_content)
-
-        parts: List[str] = []
-        incomplete = False
-        for surface in surfaces:
-            try:
-                surface_parts, surface_incomplete = _surface_text(surface)
-            except Exception as exc:
-                reraise_if_cancelled(exc)
-                # Type and site, never the message: a reader that failed on a
-                # message body routinely quotes that body back.
-                incomplete = True
-                logger.warning(
-                    "moderation could not read a surface of %s at %s (%s); "
-                    "the rest of the event is still checked",
-                    event.event_id,
-                    error_site(exc),
-                    type(exc).__name__,
-                )
-                continue
-            parts.extend(surface_parts)
-            incomplete = incomplete or surface_incomplete
-        text = "\n".join(parts).strip()
-        return _Extracted(text or None, incomplete)
+        return extract_message_text(event.type, event.content, event.event_id)
 
     def _is_exempt_sender(self, sender: str) -> bool:
         # Whole-string, both ends. A prefix match here exempted any sender
@@ -836,6 +877,10 @@ class ChatModeration:
                     reason,
                     self._sender_digest(event.sender),
                 )
+                # Recorded BEFORE the refusal goes out, and the refusal does
+                # not depend on it: a block whose row could not be written is
+                # still a block, and the row is retried.
+                await self._record_block(event, reason, text)
                 # The rule identifier goes to the SENDER, who already knows
                 # what they wrote, and nowhere else. It is not the same
                 # disclosure as the log line above, which sits beside a room
@@ -844,6 +889,11 @@ class ChatModeration:
                 return Codes.FORBIDDEN, refusal_body(reason, self._refusal_messages)
             return NOT_SPAM
         except Exception as exc:
+            # A cancellation is not a moderation failure: the send it belongs
+            # to is being abandoned, and answering it NOT_SPAM would be an
+            # answer nobody is waiting for. This handler wraps an `await` now
+            # - the block's incident write - so the module-wide rule applies.
+            reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract — a moderation bug must never
             # block all sends; the failure is logged and Tier 2 still runs.
             #
@@ -863,6 +913,52 @@ class ChatModeration:
                 type(exc).__name__,
             )
             return NOT_SPAM
+
+    async def _record_block(self, event: EventBase, rule: str, text: str) -> None:
+        """Write the Safety page's row for a Tier 1 block.
+
+        Never raises into the refusal other than to let a cancellation past:
+        the handler around it fails OPEN, so an exception escaping here would
+        turn a block into an allowed send. A write that fails is retried by
+        the recorder; the refusal goes out either way.
+        """
+        try:
+            now_ms = self._incidents.now_ms()
+            incident = Incident(
+                incident_id=f"block:{uuid.uuid4()}",
+                source=SOURCE_MODERATION,
+                action=ACTION_BLOCKED,
+                outcome=None,
+                subject_id=event.sender,
+                reporter_id=None,
+                room_id=event.room_id,
+                event_id=None,
+                # Resolved by the recorder, at block time.
+                course_ids=None,
+                categories=(),
+                self_harm=False,
+                rule=rule,
+                top_score=None,
+                text=text,
+                reason=None,
+                created_ms=now_ms,
+                updated_ms=now_ms,
+            )
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok: the send is still refused. Counted as lost, because
+            # nothing was captured that a retry could write.
+            metrics.record_incident_lost("block")
+            logger.error(
+                "tier1 could not capture the safety incident for a block in %s "
+                "at %s (%s); the send is refused and the Safety page will not "
+                "show it",
+                event.room_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
+            return
+        await self._recorder.record_block(incident)
 
     # ------------------------------------------------------------------
     # Tier 2 — LLM moderation (redacts after persist)
@@ -929,6 +1025,11 @@ class ChatModeration:
                     sender=event.sender,
                     text=text,
                     enqueued_at=self._clock.time(),
+                    # The sender's courses, frozen NOW rather than at the
+                    # verdict, so a learner who leaves before it still lands
+                    # on their course's Safety page. The lookup starts on the
+                    # next reactor turn: this path does no I/O.
+                    courses=self._recorder.snapshot(event.sender),
                 )
             )
         except Exception as exc:
@@ -1173,6 +1274,10 @@ class ChatModeration:
             # That path is pangeachat/admin-dash#105, and it is the reason this
             # branch is a preserve rather than an escalate.
             await self._record_preserved(job, category)
+            # The Safety page's row, AFTER the protection: preserving must
+            # never wait on, or depend on, the incident write. A row that
+            # fails is retried; the message stays up either way.
+            await self._record_verdict(job, ACTION_PRESERVED, None, result)
             metrics.TIER2_SUPPRESSED.labels(category=category).inc()
             logger.info(
                 "tier2 flagged event %s in %s (category=%s); preserved, not redacted",
@@ -1201,6 +1306,9 @@ class ChatModeration:
             # NOT a preserve: nothing durable is written, so a later and more
             # severe verdict on the same event decides on its own merits.
             metrics.record_redaction_skip("below_threshold")
+            # Flagged and left up is still an incident: the course admin sees
+            # it as Low, and a later verdict on the same message merges in.
+            await self._record_verdict(job, ACTION_KEPT, None, result)
             driver = decision.driver
             logger.info(
                 "tier2 flagged event %s in %s (category=%s, score=%.3f, "
@@ -1217,10 +1325,41 @@ class ChatModeration:
         # taken and then abandoned at an await - a cancellation, a shutdown -
         # is a row that says `redacted` on a message that is still standing,
         # and nothing after it would ever take that message down.
-        if not await self._is_still_redactable(job):
+        #
+        # **Never enforce without a record.** The incident row is written
+        # first, marked `pending`, and a row that cannot be written is a
+        # redaction that is not sent: the message stays visible and the
+        # captured row is retried. Preserves the database refused earlier are
+        # flushed before it, so a disclosure's protection never queues behind
+        # this message's record.
+        if self._disposition is not None:
+            await self._disposition.flush_pending()
+        written, prior = await self._record_verdict(
+            job, ACTION_REDACTED, OUTCOME_PENDING, result
+        )
+        if not written:
+            metrics.record_redaction_skip("incident_unwritten")
+            logger.warning(
+                "tier2 will not redact %s in %s: its safety incident could not "
+                "be written, and nothing is removed without its record",
+                job.event_id,
+                job.room_id,
+            )
+            return
+        incident_id = mod_incident_id(job.event_id)
+        # What a redaction that is then NOT sent leaves behind: whatever an
+        # earlier attempt established, or `skipped` when there was none.
+        declined = prior if prior is not None else OUTCOME_SKIPPED
+        blocker = await self._redaction_blocker(job)
+        if blocker is not None:
+            self._recorder.settle_outcome(
+                incident_id,
+                OUTCOME_REMOVED if blocker == "already_redacted" else declined,
+            )
             return
         claim = await self._may_redact(job, category)
         if claim is None:
+            self._recorder.settle_outcome(incident_id, declined)
             return
         # Bound after the narrowing, because the release below runs inside a
         # closure and a captured Optional does not carry the narrowing with
@@ -1314,6 +1453,7 @@ class ChatModeration:
         # landed. The success metric is out here for the same reason - the
         # `try` holds the send and nothing else.
         metrics.TIER2_REDACTIONS.labels(category=category).inc()
+        self._recorder.settle_outcome(incident_id, OUTCOME_REMOVED)
         # The VISIBLE WINDOW, observed here and nowhere else: the send has
         # returned, so this is the first moment the message is provably no
         # longer readable, and `enqueued_at` was taken in `on_new_event`,
@@ -1537,6 +1677,16 @@ class ChatModeration:
         if disposition is None:
             return
         landed = await self._redaction_landed(job)
+        # The Safety page's outcome follows the same evidence the claim does:
+        # removed only when the re-read says so, failed only when it says the
+        # message is still there, and unknown otherwise.
+        if landed is True:
+            outcome = OUTCOME_REMOVED
+        elif landed is False:
+            outcome = OUTCOME_FAILED
+        else:
+            outcome = OUTCOME_UNKNOWN
+        self._recorder.settle_outcome(mod_incident_id(job.event_id), outcome)
         if landed is False:
             # The only branch with positive evidence: the event is there and
             # it is not redacted, so the send did not happen and the claim
@@ -1633,6 +1783,15 @@ class ChatModeration:
         further content is lost; the damage is noise in the DAG and a second
         notification.
         """
+        return await self._redaction_blocker(job) is None
+
+    async def _redaction_blocker(self, job: ModerationJob) -> Optional[str]:
+        """`_is_still_redactable`, saying WHICH skip cause stopped it.
+
+        None when the event may be redacted. The cause is what the Safety
+        page's outcome needs: a message somebody already took down is
+        `removed`, and the other two are a redaction that did not happen.
+        """
         try:
             store = self._api._hs.get_datastores().main
             existing = await store.get_event(job.event_id, allow_none=True)
@@ -1648,14 +1807,55 @@ class ChatModeration:
                 error_site(exc),
                 type(exc).__name__,
             )
-            return False
+            return "lookup_failed"
         if existing is None:
             metrics.record_redaction_skip("event_missing")
-            return False
+            return "event_missing"
         if existing.internal_metadata.is_redacted():
             metrics.record_redaction_skip("already_redacted")
-            return False
-        return True
+            return "already_redacted"
+        return None
+
+    async def _record_verdict(
+        self,
+        job: ModerationJob,
+        action: str,
+        outcome: Optional[str],
+        result: Mapping[str, Any],
+    ) -> Tuple[bool, Optional[str]]:
+        """Upsert the Safety page's row for this verdict.
+
+        Returns `(written, prior_outcome)`; see `IncidentRecorder`. The
+        courses are the ones captured when the message was queued; when that
+        lookup failed, the recorder looks them up now, and a lookup that
+        fails again is a row that is not written.
+        """
+        categories = result.get("categories")
+        raw: List[Any] = list(categories) if isinstance(categories, list) else []
+        courses = None
+        if job.courses is not None:
+            courses = await job.courses.get()
+        now_ms = self._incidents.now_ms()
+        incident = Incident(
+            incident_id=mod_incident_id(job.event_id),
+            source=SOURCE_MODERATION,
+            action=action,
+            outcome=outcome,
+            subject_id=job.sender,
+            reporter_id=None,
+            room_id=job.room_id,
+            event_id=job.event_id,
+            course_ids=courses,
+            categories=_incident_categories(raw),
+            self_harm=_should_preserve(raw),
+            rule=None,
+            top_score=_top_score(raw, result.get("category_scores")),
+            text=job.text,
+            reason=None,
+            created_ms=now_ms,
+            updated_ms=now_ms,
+        )
+        return await self._recorder.record_verdict(incident)
 
     async def shutdown(self) -> None:
         """Drain Tier 2. Registered with the homeserver by the dispatcher;
@@ -1909,3 +2109,41 @@ def _summarize_categories(categories: Iterable[Any]) -> str:
             return normalized
         fallback = UNKNOWN_CATEGORY
     return fallback or UNNAMED_CATEGORY
+
+
+def _incident_categories(categories: Iterable[Any]) -> Tuple[str, ...]:
+    """The tripped categories as the Safety page stores them.
+
+    Normalised onto the same vocabulary the log line and the redaction reason
+    use - a category is a free-form string from a service we do not run, and
+    the raw value never leaves this module - with one exception in the safe
+    direction: a name `_preserves` recognises as self-harm is stored as
+    `self_harm` even when the vocabulary does not know it, so the row cannot
+    say `other` beside `self_harm: true`.
+    """
+    return unique(
+        "self_harm" if _preserves(category) else _normalize_category(category)
+        for category in categories
+    )
+
+
+def _top_score(categories: Iterable[Any], scores: Any) -> Optional[float]:
+    """The highest provider score among the TRIPPED categories, or None.
+
+    Only a number in [0, 1] counts, by the same rule `severity` applies: a
+    value outside it is not a score the provider can send. A category that
+    was scored and not tripped says nothing about this incident.
+    """
+    if not isinstance(scores, Mapping):
+        return None
+    best: Optional[float] = None
+    for category in categories:
+        if not isinstance(category, str):
+            continue
+        value = scores.get(category)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not 0.0 <= float(value) <= 1.0:
+            continue
+        best = float(value) if best is None else max(best, float(value))
+    return best

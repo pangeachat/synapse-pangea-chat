@@ -292,6 +292,11 @@ class EventStoreDouble:
         #: re-read against the disposition claim.
         self.on_read: Optional[Callable[[], None]] = None
 
+    async def get_rooms_for_user(self, user_id: str) -> frozenset:
+        """No rooms: a sender who is a student nowhere. The Safety page's
+        course lookup reads this; a test about courses supplies its own."""
+        return frozenset()
+
     async def get_event(self, event_id: str, allow_none: bool = False) -> Any:
         self.reads.append(event_id)
         if self.on_read is not None:
