@@ -1,5 +1,8 @@
-You can also use the {{ app_name }} app:
-App Store: {{ app_store_url }}
+{% if claims_by_address %}No app yet? Install it, then sign in with this address or tap this link again.
+{% else %}You can also use the {{ app_name }} app:
+{% endif %}App Store: {{ app_store_url }}
 Google Play: {{ google_play_url }}
 
-If you install the app before you open your course, enter this code when it asks for a course code: {{ claim_code }}
+{% if claims_by_address %}Signing in with a different address? Enter this code when the app asks for a course code: {{ claim_code }}
+{% else %}If you install the app before you open your course, enter this code when it asks for a course code: {{ claim_code }}
+{% endif %}

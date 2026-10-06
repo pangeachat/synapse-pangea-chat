@@ -139,6 +139,29 @@ class CourseInvitationStore:
     async def code_in_use(self, code):
         return await self.for_code(code) is not None
 
+    async def prepared_for_emails(self, emails):
+        """Prepared invitations requested from any of ``emails``, ignoring case.
+
+        Completed invitations have no address left to match, and revoked ones
+        are excluded by status.
+        """
+        await self.ensure()
+        lowered = sorted({email.lower() for email in emails})
+        if not lowered:
+            return []
+
+        def select(txn):
+            txn.execute(
+                SELECT
+                + "WHERE status = 'prepared' AND LOWER(requested_email) IN ("
+                + ", ".join("?" for _ in lowered)
+                + ") ORDER BY created_at_ms, invitation_id",
+                lowered,
+            )
+            return [self.row(r) for r in txn.fetchall()]
+
+        return await self.db.runInteraction("pangea_invitation_for_emails", select)
+
     async def reserve_creation(self, invitation_id, user):
         await self.ensure()
 

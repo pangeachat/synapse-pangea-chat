@@ -228,6 +228,41 @@ class TestClaimEmailTemplates(unittest.TestCase):
                 self.assertIn("Spanish 1", out)
                 self.assertNotIn("class code", out.lower())
 
+    def test_only_a_prepared_invitation_says_signing_in_claims_it(self) -> None:
+        """A room-backed course is claimed only by its link, so its email must
+        not promise that signing in with the address claims it."""
+        env = self._env()
+        for name in ("course_ready.html", "course_ready.txt"):
+            for claims_by_address in (True, False):
+                with self.subTest(template=name, claims_by_address=claims_by_address):
+                    out = env.get_template(name).render(
+                        app_name="Pangea Chat",
+                        course_title="Spanish 1",
+                        course_description="",
+                        request_summary=None,
+                        claim_url="https://app.pangea.chat/adm1nab",
+                        claim_code="adm1nab",
+                        claims_by_address=claims_by_address,
+                    )
+                    words = " ".join(out.split())
+                    self.assertEqual(
+                        "sign in with this address" in words, claims_by_address
+                    )
+                    # Signing in claims the course, so the code is only for
+                    # a different address; without that, every app-first
+                    # teacher needs it.
+                    self.assertEqual(
+                        "Signing in with a different address?" in words,
+                        claims_by_address,
+                    )
+                    self.assertEqual(
+                        "If you install the app before you open your course" in words,
+                        not claims_by_address,
+                    )
+                    self.assertIn(
+                        "adm1nab", out.replace("https://app.pangea.chat/adm1nab", "")
+                    )
+
     def test_course_claimed_carries_class_link_and_claimer(self) -> None:
         env = self._env()
         for name in ("course_claimed.html", "course_claimed.txt"):

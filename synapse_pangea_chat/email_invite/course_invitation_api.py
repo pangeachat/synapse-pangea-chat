@@ -178,6 +178,7 @@ class CourseInvitationAPI(Resource):
                     request_summary=spec["request_summary"] or None,
                     claim_url=url,
                     claim_code=code,
+                    claims_by_address=True,
                 )
             else:
                 await self.mailer.send_course_reminder(

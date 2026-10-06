@@ -106,13 +106,18 @@ class CourseClaimMailer:
         request_summary: Optional[str],
         claim_url: str,
         claim_code: str,
+        claims_by_address: bool = False,
     ) -> None:
+        """``claims_by_address``: signing in with this address claims the
+        course (claim_by_email), so the email may say so. Only a prepared
+        invitation is matched; a room-backed course is claimed by its link."""
         template_vars = {
             "app_name": self._app_name,
             "course_title": course_title,
             "course_description": course_description,
             "request_summary": request_summary,
             **_claim_template_vars(claim_url, claim_code),
+            "claims_by_address": claims_by_address,
         }
         await self._send(
             email_address=email_address,
