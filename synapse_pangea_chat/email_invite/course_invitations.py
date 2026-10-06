@@ -154,8 +154,6 @@ class CourseInvitationStore:
         if not wanted:
             return []
 
-        # ponytail: reads every prepared invitation on each sign-in; store a
-        # canonical address column if the table grows past a few thousand.
         def select(txn):
             txn.execute(
                 SELECT
