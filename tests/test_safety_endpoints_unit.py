@@ -98,9 +98,14 @@ class FakeStore:
         self.db_pool = DbPoolDouble()
         self.events: Dict[str, FakeEvent] = {}
         self.memberships: Dict[Tuple[str, str], str] = {}
+        #: Original event id -> its latest applicable edit.
+        self.edits: Dict[str, Any] = {}
 
     async def get_event(self, event_id: str, allow_none: bool = False) -> Any:
         return self.events.get(event_id)
+
+    async def get_applicable_edits(self, event_ids: List[str]) -> Dict[str, Any]:
+        return {event_id: self.edits.get(event_id) for event_id in event_ids}
 
     async def get_local_current_membership_for_user_in_room(
         self, user_id: str, room_id: str
@@ -276,6 +281,26 @@ class TestReportSnapshot(ReportCase):
         assert row is not None
         self.assertIsNone(row.text)
         self.assertEqual(row.reason, "this is bullying")
+
+    async def test_an_edited_message_is_recorded_as_the_reporter_sees_it(
+        self,
+    ) -> None:
+        """The client reports the ORIGINAL event and renders its latest edit,
+        so the snapshot is the edit's `m.new_content` - not the original's
+        text, and not the `* ` fallback body."""
+        edit = FakeEvent(event_id="$edit", body="* you are worthless")
+        edit.content["m.new_content"] = {
+            "msgtype": "m.text",
+            "body": "you are worthless",
+        }
+        edit.content["m.relates_to"] = {"rel_type": "m.replace", "event_id": "$msg"}
+        self.hs.store.events["$msg"] = FakeEvent(body="hi")
+        self.hs.store.edits["$msg"] = edit
+        status, payload = await self._report()
+        self.assertEqual(status, 200)
+        row = await self.store.get(payload["incident_id"])
+        assert row is not None
+        self.assertEqual(row.text, "you are worthless")
 
     async def test_nul_in_the_reason_and_the_text(self) -> None:
         self.hs.store.events["$msg"] = FakeEvent(body="a\x00b")

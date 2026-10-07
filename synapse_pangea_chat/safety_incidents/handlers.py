@@ -23,7 +23,7 @@ Neither logs a word of a message or a reason.
 """
 
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from synapse.api.errors import AuthError
 from synapse.types import RoomID, UserID
@@ -136,7 +136,7 @@ class ReportHandler:
         subject_id = event.sender
         text: Optional[str] = None
         if not event.internal_metadata.is_redacted():
-            text = extract_message_text(event.type, event.content, event.event_id).text
+            text = await self._displayed_text(event)
         # At report time: there is no send-time snapshot for a message that
         # was never flagged.
         position = self._courses.position_now()
@@ -176,6 +176,32 @@ class ReportHandler:
                 "errcode": "M_UNKNOWN",
             }
         return 200, {"incident_id": incident_id}
+
+    async def _displayed_text(self, event: Any) -> Optional[str]:
+        """The text the reporter sees: the latest edit's `m.new_content` when
+        the message was edited, the event's own content otherwise.
+
+        A client reports the ORIGINAL event id and renders its latest edit,
+        so snapshotting the original would record what the message said
+        before it was changed. Synapse's own lookup applies the edit rules
+        (same sender, same type, same room), and a redacted edit is no longer
+        a relation, so the reporter is shown the revision before it - and so
+        is the snapshot.
+        """
+        edits = await self._hs.get_datastores().main.get_applicable_edits(
+            [event.event_id]
+        )
+        edit = edits.get(event.event_id)
+        if edit is not None:
+            edit_content = edit.content
+            new_content = (
+                edit_content.get("m.new_content")
+                if isinstance(edit_content, Mapping)
+                else None
+            )
+            if isinstance(new_content, Mapping):
+                return extract_message_text(edit.type, new_content, edit.event_id).text
+        return extract_message_text(event.type, event.content, event.event_id).text
 
 
 class ReadHandler:
