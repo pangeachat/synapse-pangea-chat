@@ -518,10 +518,6 @@ REDACTION_SKIP_CAUSES = frozenset(
         # act on an unknown rather than carrying on - see
         # `moderation.disposition`.
         "disposition_unknown",
-        # The safety incident row could not be written, so nothing is
-        # enforced: a message is never removed without its record. See
-        # `moderation.incidents`.
-        "incident_unwritten",
     }
 )
 
@@ -533,9 +529,16 @@ INCIDENT_WRITE_FAILED = _get_or_create(
     Counter,
     "pangea_safety_incident_write_failed_total",
     "Safety incident writes that failed on the first try and were handed to "
-    "the in-process retry. A block is still refused and a verdict is not "
-    "enforced; what is at risk is the record on the Safety page.",
+    "the in-process retry. A block is still refused and a redaction is still "
+    "sent; what is at risk is the record on the Safety page.",
     ["kind"],
+)
+
+INCIDENT_COURSES_UNRESOLVED = _get_or_create(
+    Counter,
+    "pangea_safety_incident_courses_unresolved_total",
+    "Safety incidents written with no courses because the course lookup "
+    "failed. The row is recorded, but no course's Safety page lists it.",
 )
 
 INCIDENT_LOST = _get_or_create(
@@ -558,6 +561,10 @@ def record_incident_lost(kind: str) -> None:
     if kind not in INCIDENT_WRITE_KINDS:
         raise ValueError(f"unknown safety incident write kind {kind!r}")
     INCIDENT_LOST.labels(kind=kind).inc()
+
+
+def record_incident_courses_unresolved() -> None:
+    INCIDENT_COURSES_UNRESOLVED.inc()
 
 
 def record_drop(cause: str, count: int = 1) -> None:

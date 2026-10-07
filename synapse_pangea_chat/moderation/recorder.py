@@ -2,24 +2,27 @@
 
 `IncidentStore` is the table; this is the policy around it.
 
-**A captured row is retried in-process, with backoff, up to five times.** A
-Tier 1 block has already refused the send and a Tier 2 verdict has already
-declined to redact, so what a failed write costs is the record, not the
-safety decision. The row - not the moderation job - is what is retried: the
-text, the sender and the verdict were captured when it happened, and a retry
-must not re-read any of them. The retry is in memory, so a restart before it
-lands loses that one row; five failures lose it too. Both are counted
+**Moderation never waits on the record.** A Tier 1 block is refused before
+its row is written, and a Tier 2 redaction is sent before its row is: the row
+records what happened, with its final outcome, in one write. What a failed
+write costs is the record, never the safety decision.
+
+**A captured row is retried in-process, with backoff, up to five times.** The
+row - not the moderation job - is what is retried: the text, the sender, the
+verdict and the outcome were captured when it happened, and a retry must not
+re-read any of them. The retry is in memory, so a restart before it lands
+loses that one row; five failures lose it too. Both are counted
 (`pangea_safety_incident_lost_total`) and logged at ERROR, with the incident
 id and never the text.
 
 **Courses resolve before the row is written, at the incident's position.**
-A row written with no courses reaches no Safety page while looking recorded,
-so a row's courses are resolved first and a failed lookup is a failed write.
 The lookup is anchored to the stream position captured when the incident
 happened (`Incident.as_of`), so resolving it late - on a retry, or at a Tier 2
 verdict seconds after the message was queued - answers the same question as
-resolving it at once. Once resolved, the courses are carried by the retry and
-never looked up again.
+resolving it at once. A lookup that fails does not stop the write: the row is
+written with no courses, counted
+(`pangea_safety_incident_courses_unresolved_total`) and logged, so the
+incident is on record even though no course's Safety page lists it yet.
 """
 
 from typing import Any, Awaitable, Callable, Optional, Tuple
@@ -92,14 +95,7 @@ class IncidentRecorder:
         position = incident.as_of
         if position is None:
             position = self.courses.position_now()
-        if incident.reporter_id is not None and incident.subject_id is not None:
-            courses = await self.courses.for_report(
-                incident.subject_id, incident.reporter_id, position
-            )
-        elif incident.subject_id is not None:
-            courses = await self.courses.for_user(incident.subject_id, position)
-        else:
-            courses = ()
+        courses = await self._courses_or_empty(incident, position)
         # Read with the courses and carried with them, so a retry does not
         # read it again. Best effort: None when it cannot be read.
         room_name = incident.room_name
@@ -110,6 +106,36 @@ class IncidentRecorder:
         return attr.evolve(
             incident, course_ids=courses, as_of=position, room_name=room_name
         )
+
+    async def _courses_or_empty(
+        self, incident: Incident, position: int
+    ) -> Tuple[str, ...]:
+        """The incident's courses, or none when the lookup fails - the row is
+        written either way, because an incident with no course is still an
+        incident."""
+        try:
+            if incident.reporter_id is not None and incident.subject_id is not None:
+                return tuple(
+                    await self.courses.for_report(
+                        incident.subject_id, incident.reporter_id, position
+                    )
+                )
+            if incident.subject_id is not None:
+                return tuple(await self.courses.for_user(incident.subject_id, position))
+            return ()
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok: the row is written with no courses; counted and
+            # logged by type and site.
+            metrics.record_incident_courses_unresolved()
+            logger.warning(
+                "safety incident %s course lookup failed at %s (%s); written "
+                "with no courses",
+                incident.incident_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
+            return ()
 
     # ------------------------------------------------------------------
     # Tier 1
@@ -133,22 +159,41 @@ class IncidentRecorder:
             return False
 
     def _retry_insert(self, kind: str, incident: Incident) -> None:
+        held = [incident]
+
         async def _attempt() -> None:
-            await self.store.insert(await self.resolve(incident))
+            held[0] = await self.resolve(held[0])
+            await self.store.insert(held[0])
 
         self.retry(kind, incident.incident_id, _attempt)
+
+    def record_block_in_background(self, incident: Incident) -> None:
+        """`record_block`, detached in a logging context of its own, so the
+        refusal never waits on the write and a write that outlives the
+        refused request never resumes that request's finished context."""
+        try:
+            run_as_background_process(
+                *background_process_args(
+                    self._hs, "pangea_safety_incident_block", self.record_block
+                ),
+                incident,
+            )
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok in that nothing else can be done from here; NOT
+            # silent - the row is counted lost and logged at ERROR.
+            _lost("block", incident.incident_id, exc)
 
     # ------------------------------------------------------------------
     # Tier 2
     # ------------------------------------------------------------------
 
     async def record_verdict(self, incident: Incident) -> Tuple[bool, Optional[str]]:
-        """Upsert a Tier 2 verdict BEFORE any enforcement.
+        """Upsert a Tier 2 verdict, AFTER whatever was enforced on it, with
+        its final outcome.
 
-        Returns `(written, prior_outcome)`. When `written` is False the
-        caller must not redact: the message stays visible, and the captured
-        row is retried WITHOUT the outcome it carried, because no attempt
-        will follow it.
+        Returns `(written, prior_outcome)`. A row that is not written is
+        retried as captured, outcome included; nothing waits on it.
         """
         captured = [incident]
         try:
@@ -157,47 +202,49 @@ class IncidentRecorder:
             return True, prior
         except Exception as exc:
             reraise_if_cancelled(exc, lambda: self.retry_verdict(captured[0]))
-            # silent-ok: nothing is enforced on this verdict; the row is
-            # retried, and the caller counts the redaction it did not send.
+            # silent-ok: the verdict was already enforced; the row is
+            # retried.
             metrics.record_incident_write_failed("verdict")
             _log_failure(incident.incident_id, exc)
             self.retry_verdict(captured[0])
             return False, None
 
     def retry_verdict(self, incident: Incident) -> None:
-        """Hand a captured verdict to the retry, as a row that records no
-        attempt: whoever calls this is not going to redact on it."""
-        captured = attr.evolve(incident, outcome=None, attempt_id=None)
+        """Hand a captured verdict to the retry, with the outcome it carries.
+        The write merges like any verdict: `removed` is final and `skipped`
+        fills an empty outcome only."""
+
+        self.retry("verdict", incident.incident_id, self._upsert_resolved(incident))
+
+    def record_verdict_in_background(self, incident: Incident) -> None:
+        """`record_verdict`, detached in a background process of its own:
+        for a redaction, whose row is written after the send and must never
+        hold anything up. A first try that fails is counted, logged and
+        retried exactly as it is inline."""
+        try:
+            run_as_background_process(
+                *background_process_args(
+                    self._hs, "pangea_safety_incident_verdict", self.record_verdict
+                ),
+                incident,
+            )
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok in that nothing else can be done from here; NOT
+            # silent - the row is counted lost and logged at ERROR.
+            _lost("verdict", incident.incident_id, exc)
+
+    def _upsert_resolved(self, incident: Incident) -> Callable[[], Awaitable[None]]:
+        """One retry's attempt. The resolved row is kept between tries, so a
+        later try never looks the courses up again - a lookup that failed
+        then would write the row with none."""
+        held = [incident]
 
         async def _attempt() -> None:
-            await self.store.upsert_verdict(await self.resolve(captured))
+            held[0] = await self.resolve(held[0])
+            await self.store.upsert_verdict(held[0])
 
-        self.retry("verdict", incident.incident_id, _attempt)
-
-    def settle_outcome(
-        self, incident_id: str, outcome: str, attempt_id: Optional[str]
-    ) -> None:
-        """Record how a redaction attempt ended, detached and retried.
-
-        Scoped to the attempt, so a result that lands late cannot overwrite
-        a later attempt's. Detached because the caller may be being cancelled
-        at the drain, and an outcome lost then leaves the row `pending` until
-        the next startup sweep - which is the backstop, not the plan.
-        """
-
-        async def _attempt() -> None:
-            await self.store.set_outcome(incident_id, outcome, attempt_id=attempt_id)
-
-        self.retry("outcome", incident_id, _attempt, immediately=True)
-
-    def abandon(self, incident_id: str, attempt_id: str) -> None:
-        """An attempt that will not send: put back what the row said before
-        it, detached and retried. See `IncidentStore.abandon_attempt`."""
-
-        async def _attempt() -> None:
-            await self.store.abandon_attempt(incident_id, attempt_id)
-
-        self.retry("outcome", incident_id, _attempt, immediately=True)
+        return _attempt
 
     # ------------------------------------------------------------------
     # The retry loop

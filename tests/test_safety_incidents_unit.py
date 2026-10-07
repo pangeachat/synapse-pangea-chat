@@ -5,8 +5,9 @@ Two principles are under test, and most tests here are one of them:
 - **Snapshot at the moment of the incident.** Sender, text and course are
   captured when it happens and never recomputed - so a learner who leaves a
   course before the verdict still lands on it.
-- **Never enforce without a record.** No redaction is sent unless the
-  incident row was written first.
+- **Moderation never waits on the record.** A block is refused and a
+  redaction is sent first; the row is written after, with the final outcome,
+  and a row that fails is retried.
 
 The store runs against a real SQLite database through Synapse's own
 parameter converter (`tests/moderation_doubles.py` says why), and Tier 1 and
@@ -29,6 +30,7 @@ from typing import (
 )
 from unittest.mock import AsyncMock, create_autospec, patch
 
+from synapse.logging.context import LoggingContext, current_context
 from synapse.module_api import ModuleApi
 from twisted.internet import defer
 
@@ -758,17 +760,59 @@ class TestTier1RecordsEveryBlock(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1, "the captured block was not retried")
         self.assertEqual(rows[0][6], PHONE_TEXT)
 
-    async def test_a_course_lookup_that_fails_is_retried_with_the_row(self) -> None:
+    async def test_the_refusal_does_not_wait_on_the_write(self) -> None:
+        """A write that never completes still lets the refusal out."""
+        module, _hs, _db = _tier1(_classroom())
+        never: "defer.Deferred[bool]" = defer.Deferred()
+
+        async def _hang(_incident: Any) -> bool:
+            return await never
+
+        with patch.object(module._recorder, "record_block", _hang):
+            result = await module.check_event_for_spam(
+                _event(PHONE_TEXT, sender=STUDENT)
+            )
+        tier1_refusal_code(result)
+        self.assertFalse(never.called)
+
+    async def test_the_detached_write_has_its_own_logging_context(self) -> None:
+        """The write outlives the refused request, so it must not run in -
+        and later resume - that request's logging context."""
+        module, _hs, _db = _tier1(_classroom())
+        seen: List[Any] = []
+
+        async def _record(_incident: Any) -> bool:
+            seen.append(current_context())
+            return True
+
+        with patch.object(module._recorder, "record_block", _record):
+            with LoggingContext(name="tier1-request", server_name="test") as request:
+                tier1_refusal_code(
+                    await module.check_event_for_spam(
+                        _event(PHONE_TEXT, sender=STUDENT)
+                    )
+                )
+        self.assertEqual(len(seen), 1)
+        self.assertIsNot(seen[0], request)
+
+    async def test_a_course_lookup_that_fails_still_writes_the_row(self) -> None:
+        """The lookup fails: the row is written at once, with no courses, and
+        counted - never held back waiting for a course."""
         world = _classroom()
-        module, homeserver, db_pool = _tier1(world)
+        module, _hs, db_pool = _tier1(world)
+        reader = MetricReader()
+        reader.snapshot("pangea_safety_incident_courses_unresolved_total")
         world.error = RuntimeError("state unreadable")
         tier1_refusal_code(
             await module.check_event_for_spam(_event(PHONE_TEXT, sender=STUDENT))
         )
-        self.assertEqual(_rows(db_pool), [], "a row was written with no courses")
-        world.error = None
-        homeserver.clock.advance(1.0)
-        self.assertEqual(_rows(db_pool)[0][3], f'["{COURSE_A}"]')
+        rows = _rows(db_pool)
+        self.assertEqual(len(rows), 1, "the row was held back")
+        self.assertEqual(rows[0][3], "[]")
+        self.assertEqual(rows[0][6], PHONE_TEXT)
+        self.assertEqual(
+            reader.delta("pangea_safety_incident_courses_unresolved_total"), 1.0
+        )
 
     async def test_five_failed_retries_lose_the_row_loudly(self) -> None:
         module, homeserver, db_pool = _tier1(_classroom())
@@ -824,6 +868,24 @@ def _job(
         enqueued_at=0.0,
         **extra,
     )
+
+
+def _refusing_incidents(db_pool: DbPoolDouble) -> Dict[str, bool]:
+    """Make the incident table refuse every statement until `["on"]` is
+    False; nothing else refuses."""
+    refuse = {"on": True}
+
+    def _refuse_incidents(sql: str, _args: Any) -> None:
+        if refuse["on"] and "pangea_safety_incidents" in sql:
+            raise RuntimeError("incident table refuses")
+
+    db_pool.on_statement = _refuse_incidents
+    return refuse
+
+
+def _run_the_retries(homeserver: Any) -> None:
+    for seconds in (1, 2, 4, 8, 16, 32):
+        homeserver.clock.advance(seconds)
 
 
 class Tier2Case(unittest.IsolatedAsyncioTestCase):
@@ -894,7 +956,9 @@ class TestTier2RecordsEveryVerdict(Tier2Case):
         self.assertTrue(row.self_harm)
         self.assertIn("self_harm", row.categories)
 
-    async def test_a_redaction_is_sent_only_after_its_row_exists(self) -> None:
+    async def test_a_redaction_is_sent_before_its_row_is_written(self) -> None:
+        """Moderation first: nothing is written before the send, and the row
+        lands after it, once, with the final outcome - never `pending`."""
         module, api, _hs, _db = self._module()
         seen: List[Optional[Incident]] = []
 
@@ -904,54 +968,58 @@ class TestTier2RecordsEveryVerdict(Tier2Case):
         cast(AsyncMock, api.create_and_send_event_into_room).side_effect = _send
         with patch(MODERATE_TEXT, _verdict("harassment")):
             await module._check_and_redact(_job())
-        self.assertEqual(len(seen), 1)
-        at_send = seen[0]
-        assert at_send is not None, "the redaction was sent before its row existed"
-        self.assertEqual(
-            (at_send.action, at_send.outcome), (ACTION_REDACTED, OUTCOME_PENDING)
-        )
+        self.assertEqual(seen, [None], "a row was written before the send")
         row = await self._row(module)
-        self.assertEqual(row.outcome, OUTCOME_REMOVED)
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_REMOVED))
 
-    async def test_no_redaction_without_a_written_row(self) -> None:
-        """The incident table refuses; nothing else does. The message must
-        stay up, the skip must be counted, and the captured row - with no
-        outcome, because nothing was attempted - must land on the retry."""
+    async def test_a_redaction_is_sent_when_its_row_is_not_written(self) -> None:
+        """The incident table refuses; nothing else does. The message is
+        still redacted, and the row lands on the retry with its outcome."""
         module, api, homeserver, db_pool = self._module()
-        refuse = {"on": True}
-
-        def _refuse_incidents(sql: str, _args: Any) -> None:
-            if refuse["on"] and "pangea_safety_incidents" in sql:
-                raise RuntimeError("incident table refuses")
-
-        db_pool.on_statement = _refuse_incidents
+        refuse = _refusing_incidents(db_pool)
         reader = MetricReader()
-        reader.snapshot(
-            "pangea_moderation_tier2_redaction_skipped_total",
-            cause="incident_unwritten",
-        )
+        reader.snapshot("pangea_safety_incident_write_failed_total", kind="verdict")
         with patch(MODERATE_TEXT, _verdict("harassment")):
             await module._check_and_redact(_job())
-        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
         self.assertEqual(
-            reader.delta(
-                "pangea_moderation_tier2_redaction_skipped_total",
-                cause="incident_unwritten",
-            ),
+            reader.delta("pangea_safety_incident_write_failed_total", kind="verdict"),
             1.0,
         )
         refuse["on"] = False
-        homeserver.clock.advance(1.0)
+        _run_the_retries(homeserver)
         row = await self._row(module)
-        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, None))
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_REMOVED))
 
-    async def test_a_course_lookup_failure_is_no_redaction_either(self) -> None:
+        module, api, homeserver, db_pool = self._module()
+        refuse = _refusing_incidents(db_pool)
+        cast(AsyncMock, api.create_and_send_event_into_room).side_effect = RuntimeError(
+            "send refused"
+        )
+        with patch(MODERATE_TEXT, _verdict("harassment")):
+            await module._check_and_redact(_job())
+        refuse["on"] = False
+        _run_the_retries(homeserver)
+        row = await self._row(module)
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_FAILED))
+
+    async def test_a_course_lookup_failure_still_redacts_and_records(self) -> None:
+        """The lookup fails: the message is redacted anyway, and the row is
+        written with no courses - counted, so the gap is visible."""
         world = _classroom()
         module, api, _hs, _db = self._module(world)
+        reader = MetricReader()
+        reader.snapshot("pangea_safety_incident_courses_unresolved_total")
         world.error = RuntimeError("state unreadable")
         with patch(MODERATE_TEXT, _verdict("harassment")):
             await module._check_and_redact(_job())
-        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
+        row = await self._row(module)
+        self.assertEqual(row.course_ids, ())
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_REMOVED))
+        self.assertEqual(
+            reader.delta("pangea_safety_incident_courses_unresolved_total"), 1.0
+        )
 
     async def test_a_repeat_verdict_merges(self) -> None:
         module, api, _hs, _db = self._module()
@@ -1095,21 +1163,30 @@ class TestCourseIsFrozenAtQueueTime(Tier2Case):
             await module._check_and_redact(job)
         self.assertEqual((await self._row(module)).course_ids, (COURSE_A,))
 
-    async def test_a_lookup_that_fails_is_retried_at_the_same_position(self) -> None:
+    async def test_a_retried_row_carries_the_courses_it_resolved(self) -> None:
+        """The courses resolve, the write fails, and the learner then moves
+        from A to B while every later lookup fails: the retry carries the
+        courses it already had, and never looks them up again."""
         world = _classroom()
-        module, api, homeserver, _db = self._module(world)
+        module, api, homeserver, db_pool = self._module(world)
         job = await self._queue(module, _sent_event(world, "you are awful"))
-        world.error = RuntimeError("state unreadable")
+        reader = MetricReader()
+        reader.snapshot("pangea_safety_incident_courses_unresolved_total")
+        refuse = _refusing_incidents(db_pool)
         with patch(MODERATE_TEXT, _verdict("harassment")):
             await module._check_and_redact(job)
-        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
-        world.error = None
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
+        refuse["on"] = False
         world.leave(STUDENT, COURSE_A)
         world.join(STUDENT, COURSE_B)
-        homeserver.clock.advance(1.0)
+        world.error = RuntimeError("state unreadable")
+        _run_the_retries(homeserver)
         row = await self._row(module)
         self.assertEqual(row.course_ids, (COURSE_A,))
-        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, None))
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_REMOVED))
+        self.assertEqual(
+            reader.delta("pangea_safety_incident_courses_unresolved_total"), 0.0
+        )
 
     async def test_on_new_event_reads_no_state(self) -> None:
         world = _classroom()
@@ -1156,21 +1233,22 @@ class TestACancellationDoesNotLoseTheFinding(Tier2Case):
         self.assertEqual(row.action, ACTION_PRESERVED)
         self.assertTrue(row.self_harm)
 
-    async def test_cancelled_while_flushing_before_a_redaction(self) -> None:
+    async def test_cancelled_at_the_claim_before_a_redaction(self) -> None:
+        """Cancelled at the claim, before anything is sent: the finding is
+        not lost, and the row says the redaction was decided and not sent."""
         module, api, homeserver, _db = self._module()
-        assert module._disposition is not None
 
-        async def _cancelled() -> None:
+        async def _cancelled(job: Any, category: str) -> None:
             raise defer.CancelledError()
 
-        with patch.object(module._disposition, "flush_pending", _cancelled):
+        with patch.object(module, "_may_redact", _cancelled):
             with patch(MODERATE_TEXT, _verdict("harassment")):
                 with self.assertRaises(defer.CancelledError):
                     await module._check_and_redact(_job())
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
         homeserver.clock.advance(1.0)
         row = await self._row(module)
-        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, None))
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_SKIPPED))
 
 
 class TestAnUnconfirmedScreenIsStillRecorded(Tier2Case):
@@ -1300,20 +1378,22 @@ class TestNoTextInLogs(Tier2Case):
 
 
 class TestRecorderRetry(unittest.IsolatedAsyncioTestCase):
-    async def test_a_verdict_retry_drops_the_outcome_it_carried(self) -> None:
+    async def test_a_verdict_retry_keeps_the_outcome_it_carried(self) -> None:
+        """A row is written after its enforcement, so the outcome it carries
+        is final, and the retry writes it as captured."""
         world = _classroom()
         store, homeserver = _store()
         recorder = IncidentRecorder(homeserver, store, world.courses())
         homeserver.store.db_pool.error = RuntimeError("down")
         written, _prior = await recorder.record_verdict(
-            _incident(action=ACTION_REDACTED, outcome=OUTCOME_PENDING, course_ids=None)
+            _incident(action=ACTION_REDACTED, outcome=OUTCOME_REMOVED, course_ids=None)
         )
         self.assertFalse(written)
         homeserver.store.db_pool.error = None
         homeserver.clock.advance(1.0)
         row = await store.get("mod:$e1")
         assert row is not None
-        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, None))
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_REMOVED))
         self.assertEqual(row.course_ids, (COURSE_A,))
 
 

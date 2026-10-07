@@ -12,8 +12,10 @@ Two principles, and every rule below follows from one of them:
   the courses the incident belongs to are captured once, when it happens, and
   never recomputed from Synapse. A learner leaving a course or a redaction
   being pruned cannot erase the evidence.
-- **Never enforce without a record.** Tier 2 writes its row before it redacts
-  anything, and when the write fails it does not redact.
+- **Moderation never waits on the record.** A block is refused and a
+  redaction is sent first; the row is written after, with the final outcome,
+  and retried if it fails. A row whose courses could not be looked up is
+  written with none rather than not at all.
 
 **Text and reasons are stored and never logged.** The table is read by course
 admins behind an authorisation check; a log line is read by anybody with log

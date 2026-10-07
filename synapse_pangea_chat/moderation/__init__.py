@@ -50,6 +50,7 @@ from typing import (
     Union,
 )
 
+import attr
 from synapse.api.errors import AuthError, Codes, SynapseError
 from synapse.events import EventBase
 from synapse.logging.context import run_in_background
@@ -88,14 +89,13 @@ from synapse_pangea_chat.moderation.incidents import (
     ACTION_PRESERVED,
     ACTION_REDACTED,
     OUTCOME_FAILED,
-    OUTCOME_PENDING,
     OUTCOME_REMOVED,
+    OUTCOME_SKIPPED,
     OUTCOME_UNKNOWN,
     SOURCE_MODERATION,
     Incident,
     IncidentStore,
     mod_incident_id,
-    new_attempt_id,
     unique,
 )
 from synapse_pangea_chat.moderation.log_safety import (
@@ -877,10 +877,11 @@ class ChatModeration:
                     reason,
                     self._sender_digest(event.sender),
                 )
-                # Recorded BEFORE the refusal goes out, and the refusal does
-                # not depend on it: a block whose row could not be written is
-                # still a block, and the row is retried.
-                await self._record_block(event, reason, text)
+                # Captured here, with this send's text and position, and
+                # written in the background: the refusal never waits on the
+                # row, and a block whose row could not be written is still a
+                # block - the row is retried.
+                self._record_block(event, reason, text)
                 # The rule identifier goes to the SENDER, who already knows
                 # what they wrote, and nowhere else. It is not the same
                 # disclosure as the log line above, which sits beside a room
@@ -891,8 +892,9 @@ class ChatModeration:
         except Exception as exc:
             # A cancellation is not a moderation failure: the send it belongs
             # to is being abandoned, and answering it NOT_SPAM would be an
-            # answer nobody is waiting for. This handler wraps an `await` now
-            # - the block's incident write - so the module-wide rule applies.
+            # answer nobody is waiting for. The handler awaits nothing today -
+            # the block's incident write is detached - but the module-wide
+            # rule still applies to it.
             reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract — a moderation bug must never
             # block all sends; the failure is logged and Tier 2 still runs.
@@ -914,13 +916,13 @@ class ChatModeration:
             )
             return NOT_SPAM
 
-    async def _record_block(self, event: EventBase, rule: str, text: str) -> None:
-        """Write the Safety page's row for a Tier 1 block.
+    def _record_block(self, event: EventBase, rule: str, text: str) -> None:
+        """Capture the Safety page's row for a Tier 1 block and hand its write
+        to the background, so the refusal never waits on it.
 
-        Never raises into the refusal other than to let a cancellation past:
-        the handler around it fails OPEN, so an exception escaping here would
-        turn a block into an allowed send. A write that fails is retried by
-        the recorder; the refusal goes out either way.
+        Never raises: the handler around it fails OPEN, so an exception
+        escaping here would turn a block into an allowed send. A write that
+        fails is retried by the recorder.
         """
         try:
             now_ms = self._incidents.now_ms()
@@ -959,7 +961,7 @@ class ChatModeration:
                 type(exc).__name__,
             )
             return
-        await self._recorder.record_block(incident)
+        self._recorder.record_block_in_background(incident)
 
     # ------------------------------------------------------------------
     # Tier 2 — LLM moderation (redacts after persist)
@@ -1290,19 +1292,15 @@ class ChatModeration:
         if captured is not None:
             self._recorder.retry_verdict(captured)
 
-    def _rescue_attempt(self, captured: Incident) -> None:
-        self._recorder.retry_verdict(captured)
-        if captured.attempt_id is not None:
-            self._recorder.abandon(captured.incident_id, captured.attempt_id)
-
-    def _skip_unrecorded(self, job: ModerationJob) -> None:
-        metrics.record_redaction_skip("incident_unwritten")
-        logger.warning(
-            "tier2 will not redact %s in %s: its safety incident could not be "
-            "written, and nothing is removed without its record",
-            job.event_id,
-            job.room_id,
-        )
+    def _record_attempt(self, captured: Optional[Incident], outcome: str) -> None:
+        """Write a redaction's row with the outcome its attempt reached,
+        detached: nothing waits on the record. `skipped` - decided and not
+        sent - fills an empty outcome only, so an earlier attempt's result
+        stands."""
+        if captured is not None:
+            self._recorder.record_verdict_in_background(
+                attr.evolve(captured, outcome=outcome)
+            )
 
     def _capture_verdict(
         self,
@@ -1310,18 +1308,14 @@ class ChatModeration:
         action: str,
         outcome: Optional[str],
         result: Mapping[str, Any],
-        *,
-        attempt_id: Optional[str] = None,
     ) -> Optional[Incident]:
         """`_verdict_incident`, never raising. A verdict the row cannot be
         built from - a field no rule anticipated - costs the record and is
         counted lost; it must never cost the decision around it, which is
-        the self-harm protection in one branch and the refusal to redact
-        without a record in another."""
+        the self-harm protection in one branch and the redaction in
+        another."""
         try:
-            return self._verdict_incident(
-                job, action, outcome, result, attempt_id=attempt_id
-            )
+            return self._verdict_incident(job, action, outcome, result)
         except Exception as exc:
             reraise_if_cancelled(exc)
             # silent-ok: counted lost and logged at ERROR; the caller treats
@@ -1468,52 +1462,38 @@ class ChatModeration:
         # is a row that says `redacted` on a message that is still standing,
         # and nothing after it would ever take that message down.
         #
-        # **Never enforce without a record.** The incident row is written
-        # first, marked `pending`, and a row that cannot be written is a
-        # redaction that is not sent: the message stays visible and the
-        # captured row is retried. Preserves the database refused earlier are
-        # flushed before it, so a disclosure's protection never queues behind
-        # this message's record.
-        attempt_id = new_attempt_id()
-        captured = self._capture_verdict(
-            job, ACTION_REDACTED, OUTCOME_PENDING, result, attempt_id=attempt_id
-        )
-        if captured is None:
-            self._skip_unrecorded(job)
-            return
-        incident_id = captured.incident_id
-        # From the incident write to the claim, nothing here may leave the
-        # attempt `pending` behind it. A cancellation - or any exception -
-        # hands the captured row to the retry (with no outcome, since nothing
-        # will be sent) and abandons this attempt, which puts back what the
-        # row said before it began. Both are no-ops when there is nothing to
-        # do: a row that was never written, or one another attempt owns.
+        # **Moderation never waits on the record.** Nothing is written before
+        # the send. The row is captured here and written once, after, with
+        # the outcome this attempt reached - so there is no `pending` row to
+        # strand and no second write to race it. A crash between the send and
+        # that write loses the row; the message is still gone. A row that
+        # cannot even be built is counted lost by `_capture_verdict`, and the
+        # redaction goes ahead. Preserves the database refused earlier are
+        # flushed by the claim, before anything is sent.
+        captured = self._capture_verdict(job, ACTION_REDACTED, None, result)
         try:
-            if self._disposition is not None:
-                await self._disposition.flush_pending()
-            written, _prior = await self._recorder.record_verdict(captured)
-            if not written:
-                self._skip_unrecorded(job)
-                return
             blocker = await self._redaction_blocker(job)
             if blocker is not None:
-                if blocker == "already_redacted":
-                    self._recorder.settle_outcome(
-                        incident_id, OUTCOME_REMOVED, attempt_id
-                    )
-                else:
-                    self._recorder.abandon(incident_id, attempt_id)
+                self._record_attempt(
+                    captured,
+                    (
+                        OUTCOME_REMOVED
+                        if blocker == "already_redacted"
+                        else OUTCOME_SKIPPED
+                    ),
+                )
                 return
             claim = await self._may_redact(job, category)
         except Exception as exc:
-            reraise_if_cancelled(exc, partial(self._rescue_attempt, captured))
-            self._rescue_attempt(captured)
+            reraise_if_cancelled(
+                exc, partial(self._record_attempt, captured, OUTCOME_SKIPPED)
+            )
+            self._record_attempt(captured, OUTCOME_SKIPPED)
             raise
         if claim is None:
-            # Declined: put back what an earlier attempt established - and
-            # its ownership, so that attempt's own late result still lands -
-            # or `skipped` when there was none.
-            self._recorder.abandon(incident_id, attempt_id)
+            # Declined. `skipped` fills an empty outcome only, so what an
+            # earlier attempt established stands.
+            self._record_attempt(captured, OUTCOME_SKIPPED)
             return
         # Bound after the narrowing, because the release below runs inside a
         # closure and a captured Optional does not carry the narrowing with
@@ -1590,9 +1570,9 @@ class ChatModeration:
             # silently.
             reraise_if_cancelled(
                 exc,
-                partial(self._settle_claim, job, claim_id, category, exc, attempt_id),
+                partial(self._settle_claim, job, claim_id, category, exc, captured),
             )
-            self._settle_claim(job, claim_id, category, exc, attempt_id)
+            self._settle_claim(job, claim_id, category, exc, captured)
             logger.warning(
                 "tier2 redaction raised for %s in %s at %s (%s); whether it "
                 "landed is being re-read",
@@ -1608,7 +1588,7 @@ class ChatModeration:
         # landed. The success metric is out here for the same reason - the
         # `try` holds the send and nothing else.
         metrics.TIER2_REDACTIONS.labels(category=category).inc()
-        self._recorder.settle_outcome(incident_id, OUTCOME_REMOVED, attempt_id)
+        self._record_attempt(captured, OUTCOME_REMOVED)
         # The VISIBLE WINDOW, observed here and nowhere else: the send has
         # returned, so this is the first moment the message is provably no
         # longer readable, and `enqueued_at` was taken in `on_new_event`,
@@ -1783,7 +1763,7 @@ class ChatModeration:
         claim_id: str,
         category: str,
         error: BaseException,
-        attempt_id: Optional[str] = None,
+        captured: Optional[Incident] = None,
     ) -> None:
         """Decide what to do with the claim after the send RAISED.
 
@@ -1818,6 +1798,8 @@ class ChatModeration:
         every frame's locals, message text included - alive with it.
         """
         if self._disposition is None or not claim_id:
+            # Nothing will re-read the send, so its row says so.
+            self._record_attempt(captured, OUTCOME_UNKNOWN)
             return
         run_in_background(
             self._settle_claim_now,
@@ -1825,7 +1807,7 @@ class ChatModeration:
             claim_id,
             category,
             _redaction_failure_cause(error),
-            attempt_id,
+            captured,
         )
 
     async def _settle_claim_now(
@@ -1834,7 +1816,7 @@ class ChatModeration:
         claim_id: str,
         category: str,
         cause: str,
-        attempt_id: Optional[str] = None,
+        captured: Optional[Incident] = None,
     ) -> None:
         """The detached half of `_settle_claim`. Never raises to its caller
         except on a cancellation of its own, which leaves the claim in place -
@@ -1852,9 +1834,7 @@ class ChatModeration:
             outcome = OUTCOME_FAILED
         else:
             outcome = OUTCOME_UNKNOWN
-        self._recorder.settle_outcome(
-            mod_incident_id(job.event_id), outcome, attempt_id
-        )
+        self._record_attempt(captured, outcome)
         if landed is False:
             # The only branch with positive evidence: the event is there and
             # it is not redacted, so the send did not happen and the claim
@@ -1990,8 +1970,6 @@ class ChatModeration:
         action: str,
         outcome: Optional[str],
         result: Mapping[str, Any],
-        *,
-        attempt_id: Optional[str] = None,
     ) -> Incident:
         """Capture the Safety page's row for this verdict, without I/O.
 
@@ -2021,7 +1999,6 @@ class ChatModeration:
             reason=None,
             created_ms=now_ms,
             updated_ms=now_ms,
-            attempt_id=attempt_id,
             as_of=job.position,
         )
 
