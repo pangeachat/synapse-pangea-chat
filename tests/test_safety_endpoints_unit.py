@@ -31,6 +31,7 @@ from synapse_pangea_chat.moderation.incidents import (
     OUTCOME_UNKNOWN,
     SOURCE_REPORT,
     IncidentStore,
+    new_attempt_id,
 )
 from synapse_pangea_chat.safety_incidents.handlers import (
     FORBIDDEN_READ,
@@ -497,96 +498,82 @@ class StartupCase(unittest.IsolatedAsyncioTestCase):
 
 
 class TestStartupSweep(StartupCase):
-    async def test_pending_rows_left_by_a_crash_are_settled(self) -> None:
-        boot_ms = self.hs.clock.time_msec()
+    async def _pending(self, name: str, attempt_id: Optional[str]) -> None:
         await self.store.insert(
             _incident(
-                incident_id="mod:$gone",
-                event_id="$gone",
+                incident_id=f"mod:${name}",
+                event_id=f"${name}",
+                action=ACTION_REDACTED,
                 outcome=OUTCOME_PENDING,
-                updated_ms=boot_ms - 10,
+                attempt_id=attempt_id,
             )
         )
+
+    async def _outcome_of(self, name: str) -> Optional[str]:
+        row = await self.store.get(f"mod:${name}")
+        assert row is not None
+        return row.outcome
+
+    async def test_pending_rows_left_by_another_process_are_settled(self) -> None:
+        await self._pending("gone", "crashed-process:1")
+        await self._pending("up", "crashed-process:2")
+        await self._pending("missing", None)
+        await self._pending("live", new_attempt_id())
         await self.store.insert(
             _incident(
-                incident_id="mod:$up",
-                event_id="$up",
-                outcome=OUTCOME_PENDING,
-                updated_ms=boot_ms - 10,
-            )
-        )
-        await self.store.insert(
-            _incident(
-                incident_id="mod:$missing",
-                event_id="$missing",
-                outcome=OUTCOME_PENDING,
-                updated_ms=boot_ms - 10,
-            )
-        )
-        await self.store.insert(
-            _incident(
-                incident_id="mod:$failed",
-                event_id="$failed",
-                outcome=OUTCOME_FAILED,
-                updated_ms=boot_ms - 10,
+                incident_id="mod:$failed", event_id="$failed", outcome=OUTCOME_FAILED
             )
         )
         self.hs.store.events["$gone"] = FakeEvent(event_id="$gone", redacted=True)
         self.hs.store.events["$up"] = FakeEvent(event_id="$up")
-        startup = self._startup()
-        await self.store.insert(
+        self.assertEqual(await self._startup().sweep(), 3)
+        self.assertEqual(await self._outcome_of("gone"), OUTCOME_REMOVED)
+        self.assertEqual(await self._outcome_of("up"), OUTCOME_UNKNOWN)
+        self.assertEqual(await self._outcome_of("missing"), OUTCOME_UNKNOWN)
+        self.assertEqual(
+            await self._outcome_of("live"),
+            OUTCOME_PENDING,
+            "the sweep settled an attempt this process is still running",
+        )
+        self.assertEqual(await self._outcome_of("failed"), OUTCOME_FAILED)
+
+    async def test_an_ordinary_update_does_not_hide_a_crashed_attempt(self) -> None:
+        """A preserve verdict after boot rewrites the row - action, categories,
+        `updated_ms` - without starting an attempt. The crashed attempt it
+        carries is still the one the sweep must settle."""
+        await self._pending("crashed", "crashed-process:1")
+        await self.store.upsert_verdict(
             _incident(
-                incident_id="mod:$new",
-                event_id="$new",
-                outcome=OUTCOME_PENDING,
-                updated_ms=boot_ms,
+                incident_id="mod:$crashed",
+                event_id="$crashed",
+                action=ACTION_PRESERVED,
+                categories=("self_harm",),
+                self_harm=True,
             )
         )
-        self.assertEqual(await startup.sweep(), 3)
-        outcomes = {}
-        for incident_id in (
-            "mod:$gone",
-            "mod:$up",
-            "mod:$missing",
-            "mod:$failed",
-            "mod:$new",
-        ):
-            row = await self.store.get(incident_id)
-            assert row is not None
-            outcomes[incident_id] = row.outcome
-        self.assertEqual(
-            outcomes,
-            {
-                "mod:$gone": OUTCOME_REMOVED,
-                "mod:$up": OUTCOME_UNKNOWN,
-                "mod:$missing": OUTCOME_UNKNOWN,
-                "mod:$failed": OUTCOME_FAILED,
-                "mod:$new": OUTCOME_PENDING,
-            },
-        )
+        self.assertEqual(await self._startup().sweep(), 1)
+        self.assertEqual(await self._outcome_of("crashed"), OUTCOME_UNKNOWN)
 
 
 class TestTheSweepNeverTouchesANewAttempt(StartupCase):
-    async def test_a_row_rewritten_after_boot_is_left_alone(self) -> None:
-        """The sweep reads its list, and a new attempt in this process sets a
-        row `pending` before the sweep reaches it. The settle is conditional
-        on the row still predating the boot, so the live attempt keeps it."""
-        boot_ms = self.hs.clock.time_msec()
-        startup = self._startup()
+    async def test_a_row_taken_over_after_it_was_read_is_left_alone(self) -> None:
+        """The sweep reads its list, and a new attempt in this process takes
+        the row over before the sweep reaches it. The settle is scoped to the
+        attempt the list named, so the live attempt keeps the row."""
         await self.store.insert(
             _incident(
                 incident_id="mod:$live",
                 event_id="$live",
                 outcome=OUTCOME_PENDING,
-                updated_ms=boot_ms + 5,
+                attempt_id=new_attempt_id(),
             )
         )
 
-        async def _stale_list(before_ms: int) -> List[Tuple[str, Optional[str]]]:
-            return [("mod:$live", "$live")]
+        async def _stale_list() -> List[Tuple[str, Optional[str], Optional[str]]]:
+            return [("mod:$live", "$live", "crashed-process:1")]
 
-        with patch.object(self.store, "pending_before", _stale_list):
-            self.assertEqual(await startup.sweep(), 0)
+        with patch.object(self.store, "pending", _stale_list):
+            self.assertEqual(await self._startup().sweep(), 0)
         row = await self.store.get("mod:$live")
         assert row is not None
         self.assertEqual(row.outcome, OUTCOME_PENDING)

@@ -28,8 +28,9 @@ already written is never overwritten.
 
 **The sweep** settles rows a crash left `pending`: a redaction attempt whose
 result was never recorded. It re-reads the event and records `removed` when
-it is redacted, `unknown` otherwise. Only rows last written before this boot
-are touched, so an attempt this process starts meanwhile is not.
+it is redacted, `unknown` otherwise. Only attempts another process started
+are touched - an attempt id carries the process that minted it - so an
+attempt this process starts meanwhile is not.
 """
 
 import json
@@ -52,6 +53,7 @@ from synapse_pangea_chat.moderation.incidents import (
     Incident,
     IncidentStore,
     mod_incident_id,
+    started_by_this_process,
 )
 from synapse_pangea_chat.moderation.log_safety import error_site, scrubbing_logger
 
@@ -88,7 +90,6 @@ class SafetyIncidentsStartup:
         self._hs = homeserver
         self._store = store
         self._courses = courses
-        self._booted_ms = int(homeserver.get_clock().time_msec())
 
     def schedule(self) -> None:
         """Run once, on the next reactor turn."""
@@ -134,18 +135,26 @@ class SafetyIncidentsStartup:
     # ------------------------------------------------------------------
 
     async def sweep(self) -> int:
-        """Settle every row left `pending` before this boot. Returns how many
-        were settled."""
+        """Settle every row whose `pending` attempt another process started.
+        Returns how many were settled.
+
+        An attempt this process started is live - its own result is on its
+        way - so it is left alone, and the settle is scoped to the attempt
+        the row named when it was read: a row a new attempt has taken over
+        since is not touched.
+        """
         settled = 0
-        for incident_id, event_id in await self._store.pending_before(self._booted_ms):
+        for incident_id, event_id, attempt_id in await self._store.pending():
+            if started_by_this_process(attempt_id):
+                continue
             outcome = OUTCOME_UNKNOWN
             if event_id is not None and await self._is_redacted(event_id) is True:
                 outcome = OUTCOME_REMOVED
             if await self._store.set_outcome(
                 incident_id,
                 outcome,
+                attempt_id=attempt_id,
                 only_if=OUTCOME_PENDING,
-                updated_before_ms=self._booted_ms,
             ):
                 settled += 1
         if settled:

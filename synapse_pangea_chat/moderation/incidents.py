@@ -39,6 +39,7 @@ serialisation error that `runInteraction` retries, and SQLite has one writer.
 """
 
 import json
+import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import attr
@@ -123,9 +124,15 @@ class Incident:
     reason: Optional[str]
     created_ms: int
     updated_ms: int
-    #: Which redaction attempt last set `outcome`. Internal: it is what stops
-    #: a delayed result from one attempt overwriting a later attempt's.
+    #: Which redaction attempt owns `outcome`. Internal: it is what stops a
+    #: delayed result from one attempt overwriting a later attempt's. Minted
+    #: by `new_attempt_id`, so it also says which process started it.
     attempt_id: Optional[str] = None
+    #: What the row said before the current attempt began, so an attempt that
+    #: is then not sent - declined, or abandoned at a cancellation - puts it
+    #: back, ownership included. Internal.
+    prior_outcome: Optional[str] = None
+    prior_attempt_id: Optional[str] = None
     #: The stream position the incident's courses are read at, when they are
     #: still to be resolved. In memory only; never stored.
     as_of: Optional[int] = attr.ib(default=None, eq=False)
@@ -155,6 +162,20 @@ class Incident:
             "created_ms": self.created_ms,
             "updated_ms": self.updated_ms,
         }
+
+
+#: This process's mark on the attempts it starts. The startup sweep settles a
+#: `pending` row only when another process started its attempt: an attempt
+#: this process started is live, and its own result is on its way.
+BOOT_TOKEN = uuid.uuid4().hex
+
+
+def new_attempt_id() -> str:
+    return f"{BOOT_TOKEN}:{uuid.uuid4().hex}"
+
+
+def started_by_this_process(attempt_id: Optional[str]) -> bool:
+    return attempt_id is not None and attempt_id.startswith(f"{BOOT_TOKEN}:")
 
 
 def merge_outcome(existing: Optional[str], new: Optional[str]) -> Optional[str]:
@@ -203,15 +224,18 @@ def merge_incident(existing: Incident, new: Incident) -> Incident:
         if category not in categories:
             categories.append(category)
     outcome = merge_outcome(existing.outcome, new.outcome)
-    attempt_id = existing.attempt_id
+    attempt = (existing.attempt_id, existing.prior_outcome, existing.prior_attempt_id)
     if new.outcome == OUTCOME_PENDING and outcome == OUTCOME_PENDING:
-        # A new attempt begins and owns the outcome from here on.
-        attempt_id = new.attempt_id
+        # A new attempt begins and owns the outcome from here on; what the row
+        # said before it is kept, to be put back if the attempt is not sent.
+        attempt = (new.attempt_id, existing.outcome, existing.attempt_id)
     return attr.evolve(
         existing,
         action=merge_action(existing.action, new.action),
         outcome=outcome,
-        attempt_id=attempt_id,
+        attempt_id=attempt[0],
+        prior_outcome=attempt[1],
+        prior_attempt_id=attempt[2],
         categories=tuple(categories),
         self_harm=existing.self_harm or new.self_harm,
         top_score=_max_score(existing.top_score, new.top_score),
@@ -256,7 +280,9 @@ _CREATE_INCIDENTS_SQL = """
         reason TEXT,
         created_ms BIGINT NOT NULL,
         updated_ms BIGINT NOT NULL,
-        attempt_id TEXT
+        attempt_id TEXT,
+        prior_outcome TEXT,
+        prior_attempt_id TEXT
     )
 """
 
@@ -283,7 +309,8 @@ _CREATE_OUTCOME_INDEX_SQL = """
 _SELECT_ONE_SQL = """
     SELECT incident_id, source, action, outcome, subject_id, reporter_id,
         room_id, event_id, course_ids, categories, self_harm, rule, top_score,
-        text, reason, created_ms, updated_ms, attempt_id
+        text, reason, created_ms, updated_ms, attempt_id, prior_outcome,
+        prior_attempt_id
     FROM pangea_safety_incidents
     WHERE incident_id = ?
 """
@@ -292,8 +319,9 @@ _INSERT_SQL = """
     INSERT INTO pangea_safety_incidents
         (incident_id, source, action, outcome, subject_id, reporter_id,
         room_id, event_id, course_ids, categories, self_harm, rule, top_score,
-        text, reason, created_ms, updated_ms, attempt_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        text, reason, created_ms, updated_ms, attempt_id, prior_outcome,
+        prior_attempt_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (incident_id) DO NOTHING
 """
 
@@ -306,7 +334,8 @@ _INSERT_COURSE_SQL = """
 _UPDATE_SQL = """
     UPDATE pangea_safety_incidents
     SET action = ?, outcome = ?, categories = ?, self_harm = ?, rule = ?,
-        top_score = ?, text = ?, updated_ms = ?, attempt_id = ?
+        top_score = ?, text = ?, updated_ms = ?, attempt_id = ?,
+        prior_outcome = ?, prior_attempt_id = ?
     WHERE incident_id = ?
 """
 
@@ -314,7 +343,7 @@ _SELECT_FOR_COURSE_SQL = """
     SELECT i.incident_id, i.source, i.action, i.outcome, i.subject_id,
         i.reporter_id, i.room_id, i.event_id, i.course_ids, i.categories,
         i.self_harm, i.rule, i.top_score, i.text, i.reason, i.created_ms,
-        i.updated_ms, i.attempt_id
+        i.updated_ms, i.attempt_id, i.prior_outcome, i.prior_attempt_id
     FROM pangea_safety_incidents AS i
     INNER JOIN pangea_safety_incident_courses AS c
         ON c.incident_id = i.incident_id
@@ -323,8 +352,8 @@ _SELECT_FOR_COURSE_SQL = """
 """
 
 _SELECT_PENDING_SQL = """
-    SELECT incident_id, event_id FROM pangea_safety_incidents
-    WHERE outcome = ? AND updated_ms < ?
+    SELECT incident_id, event_id, attempt_id FROM pangea_safety_incidents
+    WHERE outcome = ?
 """
 
 _SELECT_META_SQL = """
@@ -373,6 +402,8 @@ def _row_to_incident(row: Sequence[Any]) -> Incident:
         created_ms=int(row[15]),
         updated_ms=int(row[16]),
         attempt_id=row[17],
+        prior_outcome=row[18],
+        prior_attempt_id=row[19],
     )
 
 
@@ -396,6 +427,8 @@ def _insert_args(incident: Incident) -> Tuple[Any, ...]:
         incident.created_ms,
         incident.updated_ms,
         incident.attempt_id,
+        incident.prior_outcome,
+        incident.prior_attempt_id,
     )
 
 
@@ -487,14 +520,13 @@ class IncidentStore:
         *,
         attempt_id: Optional[str] = None,
         only_if: Optional[str] = None,
-        updated_before_ms: Optional[int] = None,
     ) -> bool:
         """Record how a redaction attempt ended.
 
-        `removed` is final and is never replaced. `only_if` and
-        `updated_before_ms` make it conditional, which is what the startup
-        sweep needs: it settles a row left `pending` by a crash, and must not
-        touch one a new attempt in this process has just set.
+        `removed` is final and is never replaced. `attempt_id` scopes the
+        write to the attempt that still owns the row, and `only_if` to an
+        outcome the row still has - which is what the startup sweep needs to
+        settle a crashed attempt without touching a live one.
 
         Returns whether the row changed.
         """
@@ -511,11 +543,6 @@ class IncidentStore:
                 # A later attempt owns the outcome now; this result is stale.
                 return False
             if only_if is not None and existing.outcome != only_if:
-                return False
-            if (
-                updated_before_ms is not None
-                and existing.updated_ms >= updated_before_ms
-            ):
                 return False
             if existing.outcome == OUTCOME_REMOVED or existing.outcome == outcome:
                 return False
@@ -557,14 +584,51 @@ class IncidentStore:
             "pangea_safety_incidents_for_course", _select
         )
 
-    async def pending_before(self, before_ms: int) -> List[Tuple[str, Optional[str]]]:
-        """`(incident_id, event_id)` of every row left `pending` before
-        `before_ms`."""
+    async def abandon_attempt(self, incident_id: str, attempt_id: str) -> bool:
+        """An attempt that will not send: put back what the row said before
+        it began - the earlier attempt's outcome AND its ownership, so that
+        attempt's own late result can still land - or `skipped` when there
+        was nothing. A no-op once another attempt owns the row, or once it
+        says `removed`. Returns whether the row changed."""
+        await self.ensure_table()
+        now_ms = self.now_ms()
+
+        def _abandon(txn: Any) -> bool:
+            txn.execute(_SELECT_ONE_SQL, (incident_id,))
+            row = txn.fetchone()
+            if row is None:
+                return False
+            existing = _row_to_incident(row)
+            if existing.attempt_id != attempt_id:
+                return False
+            if existing.outcome == OUTCOME_REMOVED:
+                return False
+            restored = attr.evolve(
+                existing,
+                outcome=(
+                    existing.prior_outcome
+                    if existing.prior_outcome is not None
+                    else OUTCOME_SKIPPED
+                ),
+                attempt_id=existing.prior_attempt_id,
+                prior_outcome=None,
+                prior_attempt_id=None,
+            )
+            _write_update(txn, restored, next_updated_ms(existing.updated_ms, now_ms))
+            return True
+
+        return await self._pool().runInteraction(
+            "pangea_safety_incidents_abandon_attempt", _abandon
+        )
+
+    async def pending(self) -> List[Tuple[str, Optional[str], Optional[str]]]:
+        """`(incident_id, event_id, attempt_id)` of every row left
+        `pending`."""
         await self.ensure_table()
 
-        def _select(txn: Any) -> List[Tuple[str, Optional[str]]]:
-            txn.execute(_SELECT_PENDING_SQL, (OUTCOME_PENDING, before_ms))
-            return [(row[0], row[1]) for row in txn.fetchall()]
+        def _select(txn: Any) -> List[Tuple[str, Optional[str], Optional[str]]]:
+            txn.execute(_SELECT_PENDING_SQL, (OUTCOME_PENDING,))
+            return [(row[0], row[1], row[2]) for row in txn.fetchall()]
 
         return await self._pool().runInteraction(
             "pangea_safety_incidents_pending", _select
@@ -608,7 +672,29 @@ def _execute_private(txn: Any, sql: str, args: Tuple[Any, ...]) -> None:
     the homeserver log of any deployment that turns SQL logging up. The
     parameter style is converted exactly as the wrapper converts it.
     """
-    txn.txn.execute(txn.database_engine.convert_param_style(sql), args)
+    engine = txn.database_engine
+    failure: Optional[BaseException] = None
+    try:
+        txn.txn.execute(engine.convert_param_style(sql), args)
+        return
+    except Exception as exc:
+        if engine.is_deadlock(exc) or isinstance(exc, engine.module.OperationalError):
+            # Synapse retries these, and needs the driver's own exception to
+            # do it. Neither carries a row: a serialisation failure names no
+            # values, and an operational error is about the connection.
+            raise
+        failure = exc
+    # Anything else is replaced by its type name, raised OUTSIDE the handler
+    # so the driver's exception is not attached as context. A constraint
+    # failure's message can quote the whole failing row ("Failing row
+    # contains ..."), and Synapse logs a failed transaction's exception
+    # message to `synapse.storage.txn`.
+    raise IncidentWriteError(type(failure).__name__)
+
+
+class IncidentWriteError(Exception):
+    """A write of an incident failed. Carries the driver's exception TYPE and
+    nothing else, because the driver's message can quote the row."""
 
 
 def _write_new(txn: Any, incident: Incident) -> None:
@@ -631,6 +717,8 @@ def _write_update(txn: Any, incident: Incident, updated_ms: int) -> None:
             nul_safe(incident.text),
             updated_ms,
             incident.attempt_id,
+            incident.prior_outcome,
+            incident.prior_attempt_id,
             incident.incident_id,
         ),
     )

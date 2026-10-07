@@ -90,12 +90,12 @@ from synapse_pangea_chat.moderation.incidents import (
     OUTCOME_FAILED,
     OUTCOME_PENDING,
     OUTCOME_REMOVED,
-    OUTCOME_SKIPPED,
     OUTCOME_UNKNOWN,
     SOURCE_MODERATION,
     Incident,
     IncidentStore,
     mod_incident_id,
+    new_attempt_id,
     unique,
 )
 from synapse_pangea_chat.moderation.log_safety import (
@@ -1117,7 +1117,8 @@ class ChatModeration:
             # is entirely latency, and it is reachable during a rolling choreo
             # upgrade where production load meets an endpoint answering 422.
             self._stop_batching()
-        for job, result in zip(jobs, verdicts.results, strict=True):
+        pairs = list(zip(jobs, verdicts.results, strict=True))
+        for index, (job, result) in enumerate(pairs):
             # Each job inside its own guard. Sharing one provider call is a
             # transport decision and must not widen a blast radius: before
             # batching every job was its own handler call, so a failure cost
@@ -1129,7 +1130,13 @@ class ChatModeration:
             try:
                 await self._decide_screened(job, result, verdicts.confirmed)
             except Exception as exc:
-                reraise_if_cancelled(exc)
+                # A cancellation ends the loop, and the jobs behind this one
+                # have answers in hand that would go with it: each flagged
+                # one is handed to the Safety page's retry, as flagged and
+                # left up - which is what happens to the message.
+                reraise_if_cancelled(
+                    exc, partial(self._rescue_unscreened, pairs[index + 1 :])
+                )
                 # silent-ok: fail-open by contract, and the loop has to
                 # survive for the jobs behind this one. Counted for this
                 # message alone - the dispatcher's own counter would count the
@@ -1162,7 +1169,15 @@ class ChatModeration:
             # A screen result, not a decision. Ask again about this one
             # message alone; `_check_and_redact` records its own matcher
             # agreement and its own check outcome from that answer.
-            await self._check_and_redact(job, count_truncation=False, screen=result)
+            #
+            # The screen's finding is captured before that `await`, so a
+            # cancellation while the confirmation is out does not lose it.
+            screened = self._capture_screen(job, result)
+            try:
+                await self._check_and_redact(job, count_truncation=False, screen=result)
+            except Exception as exc:
+                reraise_if_cancelled(exc, partial(self._retry_captured, screened))
+                raise
             return
         self._record_matcher_agreement(job, result)
 
@@ -1223,11 +1238,79 @@ class ChatModeration:
     async def _record_unconfirmed_screen(
         self, job: ModerationJob, screen: Mapping[str, Any]
     ) -> None:
+        captured = self._capture_screen(job, screen)
+        if captured is not None:
+            await self._recorder.record_verdict(captured)
+
+    def _capture_screen(
+        self, job: ModerationJob, screen: Mapping[str, Any]
+    ) -> Optional[Incident]:
+        """A screen's finding as a flagged-and-left-up row, or None when the
+        screen named no usable category - which is no finding at all."""
         if not _usable_categories(screen.get("categories")):
-            return
-        await self._recorder.record_verdict(
-            self._verdict_incident(job, ACTION_KEPT, None, screen)
+            return None
+        return self._capture_verdict(job, ACTION_KEPT, None, screen)
+
+    def _rescue_unscreened(
+        self, pairs: Sequence[Tuple[ModerationJob, Optional[Dict[str, Any]]]]
+    ) -> None:
+        """Hand every flagged answer a cancelled batch did not reach to the
+        retry. Nothing was enforced on any of them, so each is recorded as
+        flagged and left up."""
+        for job, result in pairs:
+            if result is not None and result.get("flagged"):
+                self._retry_captured(self._capture_screen(job, result))
+
+    def _retry_captured(self, captured: Optional[Incident]) -> None:
+        if captured is not None:
+            self._recorder.retry_verdict(captured)
+
+    def _rescue_attempt(self, captured: Incident) -> None:
+        self._recorder.retry_verdict(captured)
+        if captured.attempt_id is not None:
+            self._recorder.abandon(captured.incident_id, captured.attempt_id)
+
+    def _skip_unrecorded(self, job: ModerationJob) -> None:
+        metrics.record_redaction_skip("incident_unwritten")
+        logger.warning(
+            "tier2 will not redact %s in %s: its safety incident could not be "
+            "written, and nothing is removed without its record",
+            job.event_id,
+            job.room_id,
         )
+
+    def _capture_verdict(
+        self,
+        job: ModerationJob,
+        action: str,
+        outcome: Optional[str],
+        result: Mapping[str, Any],
+        *,
+        attempt_id: Optional[str] = None,
+    ) -> Optional[Incident]:
+        """`_verdict_incident`, never raising. A verdict the row cannot be
+        built from - a field no rule anticipated - costs the record and is
+        counted lost; it must never cost the decision around it, which is
+        the self-harm protection in one branch and the refusal to redact
+        without a record in another."""
+        try:
+            return self._verdict_incident(
+                job, action, outcome, result, attempt_id=attempt_id
+            )
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok: counted lost and logged at ERROR; the caller treats
+            # None as a row that was not written.
+            metrics.record_incident_lost("verdict")
+            logger.error(
+                "tier2 could not capture the safety incident for %s in %s at "
+                "%s (%s)",
+                job.event_id,
+                job.room_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
+            return None
 
     async def _decide(
         self, job: ModerationJob, result: Optional[Dict[str, Any]]
@@ -1300,15 +1383,16 @@ class ChatModeration:
             # protection: preserving must never wait on, or depend on, the
             # incident write, and a cancellation at the protection's `await`
             # must not lose the finding - the captured row goes to the retry.
-            captured = self._verdict_incident(job, ACTION_PRESERVED, None, result)
+            # A row that cannot even be captured costs the record, never the
+            # protection: the preserve below runs either way.
+            captured = self._capture_verdict(job, ACTION_PRESERVED, None, result)
             try:
                 await self._record_preserved(job, category)
             except Exception as exc:
-                reraise_if_cancelled(
-                    exc, partial(self._recorder.retry_verdict, captured)
-                )
+                reraise_if_cancelled(exc, partial(self._retry_captured, captured))
                 raise
-            await self._recorder.record_verdict(captured)
+            if captured is not None:
+                await self._recorder.record_verdict(captured)
             metrics.TIER2_SUPPRESSED.labels(category=category).inc()
             logger.info(
                 "tier2 flagged event %s in %s (category=%s); preserved, not redacted",
@@ -1339,9 +1423,9 @@ class ChatModeration:
             metrics.record_redaction_skip("below_threshold")
             # Flagged and left up is still an incident: the course admin sees
             # it as Low, and a later verdict on the same message merges in.
-            await self._recorder.record_verdict(
-                self._verdict_incident(job, ACTION_KEPT, None, result)
-            )
+            kept = self._capture_verdict(job, ACTION_KEPT, None, result)
+            if kept is not None:
+                await self._recorder.record_verdict(kept)
             driver = decision.driver
             logger.info(
                 "tier2 flagged event %s in %s (category=%s, score=%.3f, "
@@ -1365,46 +1449,46 @@ class ChatModeration:
         # captured row is retried. Preserves the database refused earlier are
         # flushed before it, so a disclosure's protection never queues behind
         # this message's record.
-        attempt_id = uuid.uuid4().hex
-        captured = self._verdict_incident(
+        attempt_id = new_attempt_id()
+        captured = self._capture_verdict(
             job, ACTION_REDACTED, OUTCOME_PENDING, result, attempt_id=attempt_id
         )
-        if self._disposition is not None:
-            try:
+        if captured is None:
+            self._skip_unrecorded(job)
+            return
+        incident_id = captured.incident_id
+        # From the incident write to the claim, nothing here may leave the
+        # attempt `pending` behind it. A cancellation - or any exception -
+        # hands the captured row to the retry (with no outcome, since nothing
+        # will be sent) and abandons this attempt, which puts back what the
+        # row said before it began. Both are no-ops when there is nothing to
+        # do: a row that was never written, or one another attempt owns.
+        try:
+            if self._disposition is not None:
                 await self._disposition.flush_pending()
-            except Exception as exc:
-                # Not a fail-open handler: `flush_pending` raises nothing but
-                # a cancellation, and the captured finding is handed to the
-                # retry on its way past rather than lost with it.
-                reraise_if_cancelled(
-                    exc, partial(self._recorder.retry_verdict, captured)
-                )
-                raise
-        written, prior = await self._recorder.record_verdict(captured)
-        if not written:
-            metrics.record_redaction_skip("incident_unwritten")
-            logger.warning(
-                "tier2 will not redact %s in %s: its safety incident could not "
-                "be written, and nothing is removed without its record",
-                job.event_id,
-                job.room_id,
-            )
-            return
-        incident_id = mod_incident_id(job.event_id)
-        # What a redaction that is then NOT sent leaves behind: whatever an
-        # earlier attempt established, or `skipped` when there was none.
-        declined = prior if prior is not None else OUTCOME_SKIPPED
-        blocker = await self._redaction_blocker(job)
-        if blocker is not None:
-            self._recorder.settle_outcome(
-                incident_id,
-                OUTCOME_REMOVED if blocker == "already_redacted" else declined,
-                attempt_id,
-            )
-            return
-        claim = await self._may_redact(job, category)
+            written, _prior = await self._recorder.record_verdict(captured)
+            if not written:
+                self._skip_unrecorded(job)
+                return
+            blocker = await self._redaction_blocker(job)
+            if blocker is not None:
+                if blocker == "already_redacted":
+                    self._recorder.settle_outcome(
+                        incident_id, OUTCOME_REMOVED, attempt_id
+                    )
+                else:
+                    self._recorder.abandon(incident_id, attempt_id)
+                return
+            claim = await self._may_redact(job, category)
+        except Exception as exc:
+            reraise_if_cancelled(exc, partial(self._rescue_attempt, captured))
+            self._rescue_attempt(captured)
+            raise
         if claim is None:
-            self._recorder.settle_outcome(incident_id, declined, attempt_id)
+            # Declined: put back what an earlier attempt established - and
+            # its ownership, so that attempt's own late result still lands -
+            # or `skipped` when there was none.
+            self._recorder.abandon(incident_id, attempt_id)
             return
         # Bound after the narrowing, because the release below runs inside a
         # closure and a captured Optional does not carry the narrowing with
@@ -2202,9 +2286,14 @@ def _top_score(categories: Iterable[Any], scores: Any) -> Optional[float]:
         value = scores.get(category)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             continue
-        if not 0.0 <= float(value) <= 1.0:
+        try:
+            number = float(value)
+        except (OverflowError, ValueError):
+            # An integer too large for a float is not a score either.
             continue
-        best = float(value) if best is None else max(best, float(value))
+        if not 0.0 <= number <= 1.0:
+            continue
+        best = number if best is None else max(best, number)
     return best
 
 

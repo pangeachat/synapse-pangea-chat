@@ -188,6 +188,19 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
                 "event_id"
             ]
 
+            # --- A browser's preflight is answered, with CORS, by Synapse ---
+            for url in (_REPORT, _INCIDENTS):
+                preflight = requests.options(
+                    url,
+                    headers={
+                        "Origin": "https://app.pangea.chat",
+                        "Access-Control-Request-Method": "POST",
+                        "Access-Control-Request-Headers": "authorization,content-type",
+                    },
+                )
+                self.assertEqual(preflight.status_code, 204, preflight.text)
+                self.assertIn("Access-Control-Allow-Origin", preflight.headers)
+
             # --- The report endpoint ---
             report_id = str(uuid.uuid4())
             resp = self._report(teacher, chat, event_id, report_id, "unkind\x00!")

@@ -20,13 +20,10 @@ The rules over a room's state are pure functions (`is_student_in`,
 around them only reads state.
 """
 
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Tuple
 
 from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
-from synapse_pangea_chat.course_member_emails.members import (
-    COURSE_ADMIN_POWER_LEVEL,
-    effective_power_levels,
-)
+from synapse_pangea_chat.course_member_emails.members import COURSE_ADMIN_POWER_LEVEL
 
 COURSE_PLAN_EVENT_TYPE = "pangea.course_plan"
 CREATE_EVENT_TYPE = "m.room.create"
@@ -53,28 +50,27 @@ def is_course(state: StateMap) -> bool:
 
 
 def power_level(state: StateMap, user_id: str) -> int:
-    """`user_id`'s power level as the room enforces it, creators included."""
-    create_event = state.get((CREATE_EVENT_TYPE, ""))
-    creators: Set[str] = set()
-    if create_event is not None and getattr(
-        getattr(create_event, "room_version", None),
-        "msc4289_creator_power_enabled",
-        False,
-    ):
-        additional = create_event.content.get("additional_creators", [])
-        if isinstance(additional, list):
-            creators.update(c for c in additional if isinstance(c, str))
-        creators.add(create_event.sender)
-    power_event = state.get((POWER_LEVELS_EVENT_TYPE, ""))
-    if power_event is None and create_event is not None:
-        # With no power-levels event, the room's creator holds 100 in every
-        # room version (Matrix spec, `m.room.power_levels`), not only those
-        # that give creators unlimited power.
-        creators.add(create_event.sender)
-    levels = effective_power_levels(
-        [user_id], power_event.content if power_event is not None else None, creators
-    )
-    return levels[user_id]
+    """`user_id`'s power level exactly as the room enforces it.
+
+    Synapse's own `event_auth.get_user_power_level`, not a re-implementation:
+    which user counts as a room's creator, and what a creator holds, differ
+    by room version - the create event's `sender` or its `content.creator`,
+    100 or unlimited - and a copy of that rule was wrong in both directions,
+    granting a course admin's access to a power-0 member of an older room and
+    reading its real creator as a student. A state with no create event is
+    no room the rule can be applied to, and reads as level 0, which grants
+    nothing on the read endpoint.
+    """
+    from synapse.event_auth import get_user_power_level
+
+    if state.get((CREATE_EVENT_TYPE, "")) is None:
+        return 0
+    auth_events = {
+        key: state[key]
+        for key in ((CREATE_EVENT_TYPE, ""), (POWER_LEVELS_EVENT_TYPE, ""))
+        if key in state
+    }
+    return int(get_user_power_level(user_id, auth_events))
 
 
 def is_joined(state: StateMap, user_id: str) -> bool:
@@ -133,9 +129,10 @@ class StudentCourses:
     the same question.
 
     The candidates are the rooms the user has ever joined that carry a course
-    plan NOW. A course plan is set when a course space is created and never
-    removed, so the current-state filter only saves reading every DM and
-    activity room's history.
+    plan now, plus any room this server no longer holds current state for -
+    the state at the position decides those. A course plan is set when a
+    course space is created and never removed, so the current-state filter
+    only saves reading every DM and activity room's history.
     """
 
     def __init__(
@@ -208,8 +205,17 @@ def _is_course_now(homeserver: Any) -> Callable[[str], Awaitable[bool]]:
 
         controller = homeserver.get_storage_controllers().state
         ids = await controller.get_current_state_ids(
-            room_id, StateFilter.from_types([(COURSE_PLAN_EVENT_TYPE, "")])
+            room_id,
+            StateFilter.from_types(
+                [(COURSE_PLAN_EVENT_TYPE, ""), (CREATE_EVENT_TYPE, "")]
+            ),
         )
+        if (CREATE_EVENT_TYPE, "") not in ids:
+            # This server holds no current state for the room - every local
+            # member has left, and Synapse drops current state then - so it
+            # cannot say the room is not a course. It stays a candidate, and
+            # the state AT the position decides.
+            return True
         return (COURSE_PLAN_EVENT_TYPE, "") in ids
 
     return _check

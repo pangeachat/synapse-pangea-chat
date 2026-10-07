@@ -101,7 +101,9 @@ def _state_event(content: Mapping[str, Any], sender: str = TEACHER) -> Any:
     return SimpleNamespace(
         content=dict(content),
         sender=sender,
-        room_version=SimpleNamespace(msc4289_creator_power_enabled=False),
+        room_version=SimpleNamespace(
+            msc4289_creator_power_enabled=False, implicit_room_creator=True
+        ),
     )
 
 
@@ -500,22 +502,17 @@ class TestIncidentStore(unittest.IsolatedAsyncioTestCase):
 
     async def test_set_outcome_can_be_conditional(self) -> None:
         store, homeserver = _store()
-        await store.insert(_incident(outcome=OUTCOME_PENDING, updated_ms=5000))
+        await store.insert(_incident(outcome=OUTCOME_PENDING, attempt_id="a"))
         self.assertFalse(
-            await store.set_outcome(
-                "mod:$e1",
-                OUTCOME_UNKNOWN,
-                only_if=OUTCOME_PENDING,
-                updated_before_ms=5000,
-            ),
-            "a row updated at or after the cutoff was settled",
+            await store.set_outcome("mod:$e1", OUTCOME_UNKNOWN, attempt_id="b"),
+            "a result from an attempt that does not own the row was written",
+        )
+        self.assertFalse(
+            await store.set_outcome("mod:$e1", OUTCOME_UNKNOWN, only_if=OUTCOME_FAILED)
         )
         self.assertTrue(
             await store.set_outcome(
-                "mod:$e1",
-                OUTCOME_UNKNOWN,
-                only_if=OUTCOME_PENDING,
-                updated_before_ms=5001,
+                "mod:$e1", OUTCOME_UNKNOWN, attempt_id="a", only_if=OUTCOME_PENDING
             )
         )
         self.assertFalse(
@@ -626,7 +623,9 @@ class TestStudentCourses(unittest.IsolatedAsyncioTestCase):
         create = SimpleNamespace(
             content={"type": "m.space"},
             sender=TEACHER,
-            room_version=SimpleNamespace(msc4289_creator_power_enabled=False),
+            room_version=SimpleNamespace(
+                msc4289_creator_power_enabled=False, implicit_room_creator=True
+            ),
         )
         state = {
             (CREATE_EVENT_TYPE, ""): create,
@@ -1344,3 +1343,230 @@ class TestNoTextInSynapsesSqlLog(unittest.IsolatedAsyncioTestCase):
         for record in capture.records:
             self.assertNotIn(self.SECRET_TEXT, record.getMessage())
             self.assertNotIn(self.SECRET_REASON, record.getMessage())
+
+
+class TestRoundTwoFindings(Tier2Case):
+    """Each test here is a defect a cross-model review reproduced."""
+
+    async def test_an_absurd_score_never_costs_the_self_harm_protection(self) -> None:
+        module, api, _hs, _db = self._module()
+        with patch(
+            MODERATE_TEXT,
+            _verdict("self-harm/intent", scores={"self-harm/intent": 10**400}),
+        ):
+            await module._check_and_redact(_job())
+        with patch(MODERATE_TEXT, _verdict("harassment")):
+            await module._check_and_redact(_job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        row = await self._row(module)
+        self.assertEqual(row.action, ACTION_PRESERVED)
+        self.assertIsNone(row.top_score)
+
+    async def test_a_declined_repeat_gives_ownership_back(self) -> None:
+        """Attempt A's send raised and its result is still on its way; a
+        second verdict starts attempt B, whose claim is declined. B must put
+        back A's outcome AND A's ownership, or A's result can never land."""
+        store, _hs = _store()
+        await store.upsert_verdict(
+            _incident(action=ACTION_REDACTED, outcome=OUTCOME_PENDING, attempt_id="a")
+        )
+        await store.upsert_verdict(
+            _incident(action=ACTION_REDACTED, outcome=OUTCOME_PENDING, attempt_id="b")
+        )
+        self.assertTrue(await store.abandon_attempt("mod:$e1", "b"))
+        self.assertTrue(
+            await store.set_outcome("mod:$e1", OUTCOME_UNKNOWN, attempt_id="a"),
+            "attempt a's result could not land after b declined",
+        )
+        row = await store.get("mod:$e1")
+        assert row is not None
+        self.assertEqual(row.outcome, OUTCOME_UNKNOWN)
+
+    async def test_abandoning_a_first_attempt_is_skipped_and_removed_is_final(
+        self,
+    ) -> None:
+        store, _hs = _store()
+        await store.upsert_verdict(
+            _incident(action=ACTION_REDACTED, outcome=OUTCOME_PENDING, attempt_id="a")
+        )
+        self.assertTrue(await store.abandon_attempt("mod:$e1", "a"))
+        row = await store.get("mod:$e1")
+        assert row is not None
+        self.assertEqual(row.outcome, OUTCOME_SKIPPED)
+        await store.insert(
+            _incident(incident_id="mod:$gone", outcome=OUTCOME_REMOVED, attempt_id="x")
+        )
+        self.assertFalse(await store.abandon_attempt("mod:$gone", "x"))
+
+    async def test_cancelled_after_the_pending_row_committed(self) -> None:
+        """The upsert commits, then the coroutine is cancelled at the re-read.
+        Nothing will be sent, so the row must not stay `pending`."""
+        module, api, homeserver, _db = self._module()
+
+        async def _cancelled(job: Any) -> None:
+            raise defer.CancelledError()
+
+        with patch.object(module, "_redaction_blocker", _cancelled):
+            with patch(MODERATE_TEXT, _verdict("harassment")):
+                with self.assertRaises(defer.CancelledError):
+                    await module._check_and_redact(_job())
+        homeserver.clock.advance(1.0)
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        row = await self._row(module)
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_SKIPPED))
+
+    async def test_a_declined_claim_restores_an_earlier_failure(self) -> None:
+        module, api, _hs, _db = self._module()
+        cast(AsyncMock, api.create_and_send_event_into_room).side_effect = RuntimeError(
+            "send refused"
+        )
+        with patch(MODERATE_TEXT, _verdict("harassment")):
+            await module._check_and_redact(_job())
+        assert module._dispatcher is not None
+        with patch.object(
+            type(module._dispatcher),
+            "actions_permitted",
+            new_callable=lambda: property(lambda _self: False),
+        ):
+            with patch(MODERATE_TEXT, _verdict("harassment")):
+                await module._check_and_redact(_job())
+        row = await self._row(module)
+        self.assertEqual(row.outcome, OUTCOME_FAILED)
+
+    async def test_a_cancelled_confirmation_keeps_the_screen(self) -> None:
+        module, _api, homeserver, _db = self._module()
+        assert module._checker is not None
+        screen = {
+            "flagged": True,
+            "categories": ["self-harm/intent"],
+            "evaluated": True,
+        }
+
+        async def _cancelled(text: str) -> Any:
+            raise defer.CancelledError()
+
+        with patch.object(module._checker, "check", _cancelled):
+            with self.assertRaises(defer.CancelledError):
+                await module._decide_screened(_job(), screen, False)
+        homeserver.clock.advance(1.0)
+        row = await self._row(module)
+        self.assertEqual(row.action, ACTION_KEPT)
+        self.assertTrue(row.self_harm)
+
+    async def test_a_cancelled_batch_hands_on_the_answers_it_did_not_reach(
+        self,
+    ) -> None:
+        module, _api, homeserver, _db = self._module()
+        jobs = (_job("$e1"), _job("$e2"), _job("$e3"))
+        results = [
+            {"flagged": True, "categories": ["harassment"], "evaluated": True},
+            {"flagged": True, "categories": ["self-harm/intent"], "evaluated": True},
+            {"flagged": False, "categories": [], "evaluated": True},
+        ]
+        assert module._checker is not None
+        batch = SimpleNamespace(results=results, confirmed=True)
+
+        async def _check_batch(texts: Any) -> Any:
+            return batch
+
+        async def _decide(job: Any, result: Any) -> None:
+            raise defer.CancelledError()
+
+        with patch.object(module._checker, "check_batch", _check_batch):
+            with patch.object(module, "_decide", _decide):
+                with self.assertRaises(defer.CancelledError):
+                    await module._screen_batch(jobs)
+        homeserver.clock.advance(1.0)
+        second = await self._row(module, "$e2")
+        self.assertEqual(second.action, ACTION_KEPT)
+        self.assertTrue(second.self_harm)
+        self.assertIsNone(await module._incidents.get("mod:$e3"))
+
+
+class TestCreatorsByRoomVersion(unittest.TestCase):
+    def test_an_explicit_creator_is_the_creator(self) -> None:
+        """Before MSC4289 a room's creator is `content.creator`, which need
+        not be the create event's sender. Synapse's rule decides."""
+        create = SimpleNamespace(
+            content={"creator": TEACHER, "type": "m.space"},
+            sender=STUDENT,
+            room_version=SimpleNamespace(
+                msc4289_creator_power_enabled=False, implicit_room_creator=False
+            ),
+        )
+        state = {
+            (CREATE_EVENT_TYPE, ""): create,
+            (COURSE_PLAN_EVENT_TYPE, ""): _state_event({"uuid": "plan"}),
+            (MEMBER_EVENT_TYPE, TEACHER): _state_event({"membership": "join"}),
+            (MEMBER_EVENT_TYPE, STUDENT): _state_event({"membership": "join"}),
+        }
+        self.assertTrue(is_course_admin_in(state, TEACHER))
+        self.assertFalse(is_course_admin_in(state, STUDENT))
+        self.assertTrue(is_student_in(state, STUDENT))
+
+
+class TestAFailedWriteNeverCarriesTheRow(unittest.IsolatedAsyncioTestCase):
+    SECRET = "wombat-text-7731"
+
+    async def test_the_drivers_message_is_replaced_by_its_type(self) -> None:
+        import sqlite3
+
+        store, homeserver = _store()
+        db_pool = homeserver.store.db_pool
+
+        def _refuse(sql: str, args: Any) -> None:
+            if sql.lstrip().startswith("INSERT INTO pangea_safety_incidents"):
+                raise sqlite3.IntegrityError(f"Failing row contains ({self.SECRET})")
+
+        db_pool.on_statement = _refuse
+        with self.assertRaises(Exception) as caught:
+            await store.insert(_incident(text=self.SECRET))
+        error = caught.exception
+        self.assertNotIn(self.SECRET, str(error))
+        self.assertNotIn(self.SECRET, repr(error))
+        self.assertIsNone(error.__context__)
+        self.assertIsNone(error.__cause__)
+        self.assertIn("IntegrityError", str(error))
+
+    async def test_a_retryable_failure_is_passed_through_for_synapse(self) -> None:
+        import sqlite3
+
+        store, homeserver = _store()
+
+        def _locked(sql: str, args: Any) -> None:
+            if sql.lstrip().startswith("INSERT INTO pangea_safety_incidents"):
+                raise sqlite3.OperationalError("database is locked")
+
+        homeserver.store.db_pool.on_statement = _locked
+        with self.assertRaises(sqlite3.OperationalError):
+            await store.insert(_incident())
+
+
+class TestCandidatesWithoutCurrentState(unittest.IsolatedAsyncioTestCase):
+    async def test_a_room_with_no_current_state_stays_a_candidate(self) -> None:
+        """Synapse drops a room's current state when its last local member
+        leaves. That says nothing about whether the room was a course at the
+        incident's position, so it must not exclude it."""
+        from synapse_pangea_chat.moderation import courses as courses_module
+
+        answers: Dict[str, Dict[Any, str]] = {
+            "!gone:example.org": {},
+            "!course:example.org": {
+                (CREATE_EVENT_TYPE, ""): "$c",
+                (COURSE_PLAN_EVENT_TYPE, ""): "$p",
+            },
+            "!chat:example.org": {(CREATE_EVENT_TYPE, ""): "$c"},
+        }
+
+        async def _current(room_id: str, state_filter: Any) -> Dict[Any, str]:
+            return answers[room_id]
+
+        homeserver = SimpleNamespace(
+            get_storage_controllers=lambda: SimpleNamespace(
+                state=SimpleNamespace(get_current_state_ids=_current)
+            )
+        )
+        check = courses_module._is_course_now(homeserver)
+        self.assertTrue(await check("!gone:example.org"))
+        self.assertTrue(await check("!course:example.org"))
+        self.assertFalse(await check("!chat:example.org"))

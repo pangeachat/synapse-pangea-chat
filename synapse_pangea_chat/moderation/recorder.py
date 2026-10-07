@@ -178,6 +178,15 @@ class IncidentRecorder:
 
         self.retry("outcome", incident_id, _attempt, immediately=True)
 
+    def abandon(self, incident_id: str, attempt_id: str) -> None:
+        """An attempt that will not send: put back what the row said before
+        it, detached and retried. See `IncidentStore.abandon_attempt`."""
+
+        async def _attempt() -> None:
+            await self.store.abandon_attempt(incident_id, attempt_id)
+
+        self.retry("outcome", incident_id, _attempt, immediately=True)
+
     # ------------------------------------------------------------------
     # The retry loop
     # ------------------------------------------------------------------
