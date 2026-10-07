@@ -1,6 +1,6 @@
 ---
 applyTo: "synapse_pangea_chat/moderation/**,synapse_pangea_chat/safety_incidents/**,tests/*moderation*,tests/*safety*"
-description: "Server-side chat moderation rollout — the two-tier design's wiring decisions: package choices, self-redaction disposition, fail-open contract, and what this module deliberately skips, and the Safety page's incident record and endpoints."
+description: "Server-side chat moderation rollout — the two-tier design's wiring decisions: package choices, self-redaction disposition, fail-open contract, what this module deliberately skips, and the Safety page's incident record and endpoints."
 ---
 
 # Server-Side Chat Moderation
