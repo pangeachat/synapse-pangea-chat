@@ -30,6 +30,7 @@ from typing import (
 from unittest.mock import AsyncMock, create_autospec, patch
 
 from synapse.module_api import ModuleApi
+from twisted.internet import defer
 
 from synapse_pangea_chat.moderation import ChatModeration
 from synapse_pangea_chat.moderation.choreo_client import moderate_text
@@ -75,6 +76,7 @@ from .moderation_doubles import (
 )
 from .test_moderation_unit import (
     MODERATE_TEXT,
+    FakeEvent,
     _config,
     _event,
     _module_api,
@@ -104,36 +106,74 @@ def _state_event(content: Mapping[str, Any], sender: str = TEACHER) -> Any:
 
 
 class CourseWorld:
-    """Rooms, their course plans and power levels, and who is joined where.
+    """Rooms, their course plans and power levels, and a TIMELINE of who
+    joined and left where - so a test can ask what was true at a position.
 
-    Mutable on purpose: "the learner leaves before the verdict" is a test
-    that changes the world between the queue and the verdict.
+    Every change takes the next stream position. "The learner leaves before
+    the verdict" is a test that changes the world after the incident's
+    position; the course rule must still answer as of that position.
     """
 
     def __init__(self) -> None:
         self.plans: Dict[str, bool] = {}
         self.levels: Dict[str, Dict[str, int]] = {}
-        self.joined: Dict[str, Set[str]] = {}
+        self.created: Dict[str, int] = {}
+        self.timeline: List[Tuple[int, str, str, bool]] = []
+        self.position = 0
         self.reads: List[Tuple[str, str]] = []
         self.error: Optional[Exception] = None
+
+    def _tick(self) -> int:
+        self.position += 1
+        return self.position
 
     def room(self, room_id: str, *, course: bool, **levels: int) -> None:
         self.plans[room_id] = course
         self.levels[room_id] = {f"@{k}:example.org": v for k, v in levels.items()}
+        self.created.setdefault(room_id, self._tick())
 
     def join(self, user_id: str, room_id: str) -> None:
-        self.joined.setdefault(user_id, set()).add(room_id)
+        self.timeline.append((self._tick(), user_id, room_id, True))
 
     def leave(self, user_id: str, room_id: str) -> None:
-        self.joined.get(user_id, set()).discard(room_id)
+        self.timeline.append((self._tick(), user_id, room_id, False))
 
-    async def rooms_for_user(self, user_id: str) -> frozenset:
+    def joined_at(self, user_id: str, room_id: str, position: int) -> bool:
+        joined = False
+        for at, user, room, is_join in self.timeline:
+            if at <= position and user == user_id and room == room_id:
+                joined = is_join
+        return joined
+
+    @property
+    def joined(self) -> Dict[str, Set[str]]:
+        """Who is joined where NOW."""
+        result: Dict[str, Set[str]] = {}
+        for _at, user, room, _join in self.timeline:
+            if self.joined_at(user, room, self.position):
+                result.setdefault(user, set()).add(room)
+        return result
+
+    async def rooms_ever_joined(self, user_id: str) -> Set[str]:
         if self.error is not None:
             raise self.error
-        return frozenset(self.joined.get(user_id, set()))
+        return {
+            room
+            for _at, user, room, is_join in self.timeline
+            if user == user_id and is_join
+        }
 
-    async def read_state(self, room_id: str, user_id: str) -> Dict[Any, Any]:
+    async def is_course_now(self, room_id: str) -> bool:
+        return bool(self.plans.get(room_id))
+
+    async def state_at(
+        self, room_id: str, user_id: str, position: int
+    ) -> Dict[Any, Any]:
         self.reads.append((room_id, user_id))
+        if self.error is not None:
+            raise self.error
+        if self.created.get(room_id, 10**9) > position:
+            return {}
         state: Dict[Any, Any] = {
             (CREATE_EVENT_TYPE, ""): _state_event({"type": "m.space"}),
             (POWER_LEVELS_EVENT_TYPE, ""): _state_event(
@@ -142,18 +182,24 @@ class CourseWorld:
         }
         if self.plans.get(room_id):
             state[(COURSE_PLAN_EVENT_TYPE, "")] = _state_event({"uuid": "plan"})
-        if room_id in self.joined.get(user_id, set()):
+        if self.joined_at(user_id, room_id, position):
             state[(MEMBER_EVENT_TYPE, user_id)] = _state_event(
                 {"membership": "join"}, sender=user_id
             )
         return state
 
+    async def read_state(self, room_id: str, user_id: str) -> Dict[Any, Any]:
+        """Current state, for the read endpoint's admin check."""
+        return await self.state_at(room_id, user_id, self.position)
+
     def courses(
         self, is_exempt: Callable[[str], bool] = lambda _user: False
     ) -> StudentCourses:
         return StudentCourses(
-            rooms_for_user=self.rooms_for_user,
-            read_state=self.read_state,
+            rooms_ever_joined=self.rooms_ever_joined,
+            is_course_now=self.is_course_now,
+            state_at=self.state_at,
+            current_position=lambda: self.position,
             is_exempt=is_exempt,
         )
 
@@ -486,23 +532,25 @@ class TestStudentCourses(unittest.IsolatedAsyncioTestCase):
     async def test_a_student_course_is_a_joined_course_below_100(self) -> None:
         world = _classroom()
         courses = world.courses()
-        self.assertEqual(await courses.for_user(STUDENT), (COURSE_A,))
+        self.assertEqual(await courses.for_user(STUDENT, world.position), (COURSE_A,))
         self.assertEqual(
-            await courses.for_user(TEACHER), (), "a course admin is nobody's student"
+            await courses.for_user(TEACHER, world.position),
+            (),
+            "a course admin is nobody's student",
         )
 
     async def test_a_room_without_a_course_plan_is_not_a_course(self) -> None:
         world = _classroom()
         world.room(ROOM, course=False)
-        self.assertNotIn(ROOM, await world.courses().for_user(STUDENT))
+        self.assertNotIn(ROOM, await world.courses().for_user(STUDENT, world.position))
 
     async def test_exempt_users_and_bots_are_nobodys_students(self) -> None:
         world = _classroom()
         bot = "@bot:example.org"
         world.join(bot, COURSE_A)
         exempt = world.courses(is_exempt=lambda user: user == STUDENT)
-        self.assertEqual(await exempt.for_user(STUDENT), ())
-        self.assertEqual(await world.courses().for_user(bot), ())
+        self.assertEqual(await exempt.for_user(STUDENT, world.position), ())
+        self.assertEqual(await world.courses().for_user(bot, world.position), ())
 
     async def test_a_read_that_fails_is_an_error_and_not_a_student_nowhere(
         self,
@@ -510,7 +558,7 @@ class TestStudentCourses(unittest.IsolatedAsyncioTestCase):
         world = _classroom()
         world.error = RuntimeError("store down")
         with self.assertRaises(RuntimeError):
-            await world.courses().for_user(STUDENT)
+            await world.courses().for_user(STUDENT, world.position)
 
     async def test_a_teachers_report_reaches_only_the_learners_course(self) -> None:
         """The teacher teaches A and B; the learner is in A. A report the
@@ -518,7 +566,8 @@ class TestStudentCourses(unittest.IsolatedAsyncioTestCase):
         no business seeing a message from a learner who is not theirs."""
         world = _classroom()
         self.assertEqual(
-            await world.courses().for_report(STUDENT, TEACHER), (COURSE_A,)
+            await world.courses().for_report(STUDENT, TEACHER, world.position),
+            (COURSE_A,),
         )
 
     async def test_a_reporters_own_student_courses_are_not_added(self) -> None:
@@ -529,9 +578,12 @@ class TestStudentCourses(unittest.IsolatedAsyncioTestCase):
         course_c = "!course-c:example.org"
         world.room(course_c, course=True, someone=100)
         world.join(TEACHER, course_c)
-        self.assertEqual(await world.courses().for_user(TEACHER), (course_c,))
         self.assertEqual(
-            await world.courses().for_report(STUDENT, TEACHER), (COURSE_A,)
+            await world.courses().for_user(TEACHER, world.position), (course_c,)
+        )
+        self.assertEqual(
+            await world.courses().for_report(STUDENT, TEACHER, world.position),
+            (COURSE_A,),
         )
 
     async def test_a_report_about_an_outsider_goes_to_the_reporters_courses(
@@ -540,12 +592,51 @@ class TestStudentCourses(unittest.IsolatedAsyncioTestCase):
         world = _classroom()
         world.join(OUTSIDER, ROOM)
         self.assertEqual(
-            await world.courses().for_report(OUTSIDER, STUDENT), (COURSE_A,)
+            await world.courses().for_report(OUTSIDER, STUDENT, world.position),
+            (COURSE_A,),
         )
 
     async def test_nobodys_report_reaches_no_course(self) -> None:
         world = _classroom()
-        self.assertEqual(await world.courses().for_report(OUTSIDER, TEACHER), ())
+        self.assertEqual(
+            await world.courses().for_report(OUTSIDER, TEACHER, world.position), ()
+        )
+
+    async def test_courses_are_read_as_of_the_position_not_now(self) -> None:
+        """The learner was in A at the incident, then left A and joined B as
+        a learner. Asked at the incident's position, the answer is A - and
+        only A - however late the question is asked."""
+        world = _classroom()
+        at_incident = world.position
+        world.leave(STUDENT, COURSE_A)
+        course_c = "!course-c:example.org"
+        world.room(course_c, course=True, teacher=100)
+        world.join(STUDENT, COURSE_B)
+        world.join(STUDENT, course_c)
+        courses = world.courses()
+        self.assertEqual(await courses.for_user(STUDENT, at_incident), (COURSE_A,))
+        self.assertEqual(
+            await courses.for_user(STUDENT, world.position), (COURSE_B, course_c)
+        )
+
+    async def test_a_creator_with_no_power_levels_event_is_an_admin(self) -> None:
+        """No `m.room.power_levels` in the room: the spec gives the creator
+        100 in every room version, so the creator is a course admin, not a
+        student - in a v11 room as much as in a v12 one."""
+        create = SimpleNamespace(
+            content={"type": "m.space"},
+            sender=TEACHER,
+            room_version=SimpleNamespace(msc4289_creator_power_enabled=False),
+        )
+        state = {
+            (CREATE_EVENT_TYPE, ""): create,
+            (COURSE_PLAN_EVENT_TYPE, ""): _state_event({"uuid": "plan"}),
+            (MEMBER_EVENT_TYPE, TEACHER): _state_event({"membership": "join"}),
+            (MEMBER_EVENT_TYPE, STUDENT): _state_event({"membership": "join"}),
+        }
+        self.assertTrue(is_course_admin_in(state, TEACHER))
+        self.assertFalse(is_student_in(state, TEACHER))
+        self.assertTrue(is_student_in(state, STUDENT))
 
     async def test_admin_and_student_predicates(self) -> None:
         world = _classroom()
@@ -907,71 +998,213 @@ class TestTier2RecordsEveryVerdict(Tier2Case):
         self.assertEqual((await self._row(module)).outcome, OUTCOME_FAILED)
 
 
+def _accepting(queued: List[ModerationJob]) -> Callable[[ModerationJob], bool]:
+    """`Tier2Dispatcher.enqueue`, accepting every job into `queued`."""
+
+    def _enqueue(job: ModerationJob) -> bool:
+        queued.append(job)
+        return True
+
+    return _enqueue
+
+
+def _sent_event(world: CourseWorld, body: str, event_id: str = "$e1") -> Any:
+    """A message as `on_new_event` sees it: persisted, with its stream
+    position set - the next one in the world's timeline."""
+    event = FakeEvent(body, sender=STUDENT, event_id=event_id)
+    world.position += 1
+    event.internal_metadata = SimpleNamespace(stream_ordering=world.position)
+    return event
+
+
 class TestCourseIsFrozenAtQueueTime(Tier2Case):
+    async def _queue(self, module: ChatModeration, event: Any) -> ModerationJob:
+        assert module._dispatcher is not None
+        queued: List[ModerationJob] = []
+        with patch.object(
+            module._dispatcher,
+            "enqueue",
+            side_effect=_accepting(queued),
+        ):
+            await module.on_new_event(event, {})
+        self.assertEqual(len(queued), 1)
+        return queued[0]
+
     async def test_a_learner_who_leaves_before_the_verdict_lands_on_the_course(
         self,
     ) -> None:
         world = _classroom()
-        module, api, homeserver, _db = self._module(world)
-        assert module._dispatcher is not None
-        queued: List[ModerationJob] = []
-        with patch.object(
-            module._dispatcher,
-            "enqueue",
-            side_effect=lambda job: queued.append(job) or True,
-        ):
-            await module.on_new_event(
-                _event("you are awful", sender=STUDENT, event_id="$e1"), {}
-            )
-        self.assertEqual(len(queued), 1)
-        self.assertIsNotNone(queued[0].courses, "no course snapshot rode on the job")
-        homeserver.clock.run_pending()
+        module, _api, _hs, _db = self._module(world)
+        job = await self._queue(module, _sent_event(world, "you are awful"))
+        self.assertEqual(job.position, world.position)
         world.leave(STUDENT, COURSE_A)
         with patch(MODERATE_TEXT, _verdict("harassment")):
-            await module._check_and_redact(queued[0])
-        row = await self._row(module)
+            await module._check_and_redact(job)
         self.assertEqual(
-            row.course_ids,
+            (await self._row(module)).course_ids,
             (COURSE_A,),
             "the course was read at verdict time, after the learner had left",
         )
 
-    async def test_on_new_event_does_no_course_reads_inline(self) -> None:
+    async def test_leaving_and_joining_another_course_before_the_read(self) -> None:
+        """The window a lookup scheduled for later cannot close: the learner
+        leaves A and joins B between the queue and ANY read. The answer must
+        still be A, and only A."""
         world = _classroom()
-        module, _api, homeserver, _db = self._module(world)
-        assert module._dispatcher is not None
-        with patch.object(module._dispatcher, "enqueue", side_effect=lambda job: True):
-            await module.on_new_event(_event("hello", sender=STUDENT), {})
-        self.assertEqual(world.reads, [], "the notifier's inline path read state")
-        homeserver.clock.run_pending()
-        self.assertNotEqual(world.reads, [])
-
-    async def test_a_refused_job_does_not_look_its_courses_up(self) -> None:
-        world = _classroom()
-        module, _api, homeserver, _db = self._module(world)
-        assert module._dispatcher is not None
-        with patch.object(module._dispatcher, "enqueue", return_value=False):
-            await module.on_new_event(_event("hello", sender=STUDENT), {})
-        homeserver.clock.run_pending()
-        self.assertEqual(world.reads, [], "a refused job still read state")
-
-    async def test_a_failed_snapshot_is_looked_up_at_the_verdict(self) -> None:
-        world = _classroom()
-        module, _api, homeserver, _db = self._module(world)
-        assert module._dispatcher is not None
-        queued: List[ModerationJob] = []
-        with patch.object(
-            module._dispatcher,
-            "enqueue",
-            side_effect=lambda job: queued.append(job) or True,
-        ):
-            await module.on_new_event(_event("you are awful", sender=STUDENT), {})
-        world.error = RuntimeError("down at queue time")
-        homeserver.clock.run_pending()
-        world.error = None
+        module, _api, _hs, _db = self._module(world)
+        job = await self._queue(module, _sent_event(world, "you are awful"))
+        world.leave(STUDENT, COURSE_A)
+        world.join(STUDENT, COURSE_B)
         with patch(MODERATE_TEXT, _verdict("harassment")):
-            await module._check_and_redact(queued[0])
-        self.assertEqual((await self._row(module, "$evt1")).course_ids, (COURSE_A,))
+            await module._check_and_redact(job)
+        self.assertEqual((await self._row(module)).course_ids, (COURSE_A,))
+
+    async def test_a_lookup_that_fails_is_retried_at_the_same_position(self) -> None:
+        world = _classroom()
+        module, api, homeserver, _db = self._module(world)
+        job = await self._queue(module, _sent_event(world, "you are awful"))
+        world.error = RuntimeError("state unreadable")
+        with patch(MODERATE_TEXT, _verdict("harassment")):
+            await module._check_and_redact(job)
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        world.error = None
+        world.leave(STUDENT, COURSE_A)
+        world.join(STUDENT, COURSE_B)
+        homeserver.clock.advance(1.0)
+        row = await self._row(module)
+        self.assertEqual(row.course_ids, (COURSE_A,))
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, None))
+
+    async def test_on_new_event_reads_no_state(self) -> None:
+        world = _classroom()
+        module, _api, homeserver, _db = self._module(world)
+        await self._queue(module, _sent_event(world, "hello"))
+        homeserver.clock.run_pending()
+        self.assertEqual(world.reads, [], "queueing a message read state")
+
+
+class TestABlockKeepsTheCoursesItResolved(unittest.IsolatedAsyncioTestCase):
+    async def test_a_retry_writes_the_courses_of_the_block(self) -> None:
+        world = _classroom()
+        module, homeserver, db_pool = _tier1(world)
+        refuse = {"on": True}
+
+        def _refuse_incidents(sql: str, _args: Any) -> None:
+            if refuse["on"] and sql.lstrip().startswith("INSERT INTO pangea_safety"):
+                raise RuntimeError("insert refused")
+
+        db_pool.on_statement = _refuse_incidents
+        tier1_refusal_code(
+            await module.check_event_for_spam(_event(PHONE_TEXT, sender=STUDENT))
+        )
+        world.leave(STUDENT, COURSE_A)
+        world.join(STUDENT, COURSE_B)
+        refuse["on"] = False
+        homeserver.clock.advance(1.0)
+        self.assertEqual(_rows(db_pool)[0][3], f'["{COURSE_A}"]')
+
+
+class TestACancellationDoesNotLoseTheFinding(Tier2Case):
+    async def test_cancelled_while_preserving(self) -> None:
+        module, _api, homeserver, _db = self._module()
+
+        async def _cancelled(job: Any, category: str) -> None:
+            raise defer.CancelledError()
+
+        with patch.object(module, "_record_preserved", _cancelled):
+            with patch(MODERATE_TEXT, _verdict("self-harm/intent")):
+                with self.assertRaises(defer.CancelledError):
+                    await module._check_and_redact(_job())
+        homeserver.clock.advance(1.0)
+        row = await self._row(module)
+        self.assertEqual(row.action, ACTION_PRESERVED)
+        self.assertTrue(row.self_harm)
+
+    async def test_cancelled_while_flushing_before_a_redaction(self) -> None:
+        module, api, homeserver, _db = self._module()
+        assert module._disposition is not None
+
+        async def _cancelled() -> None:
+            raise defer.CancelledError()
+
+        with patch.object(module._disposition, "flush_pending", _cancelled):
+            with patch(MODERATE_TEXT, _verdict("harassment")):
+                with self.assertRaises(defer.CancelledError):
+                    await module._check_and_redact(_job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        homeserver.clock.advance(1.0)
+        row = await self._row(module)
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, None))
+
+
+class TestAnUnconfirmedScreenIsStillRecorded(Tier2Case):
+    async def _screened(self, module: ChatModeration, confirmation: Any) -> None:
+        assert module._checker is not None
+        screen = {
+            "flagged": True,
+            "categories": ["self-harm/intent"],
+            "evaluated": True,
+        }
+        with patch.object(
+            module._checker, "check", AsyncMock(return_value=confirmation)
+        ):
+            await module._decide_screened(_job(), screen, False)
+
+    async def test_no_confirmation_records_the_screen_as_left_up(self) -> None:
+        module, api, _hs, _db = self._module()
+        await self._screened(module, None)
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        row = await self._row(module)
+        self.assertEqual((row.action, row.outcome), (ACTION_KEPT, None))
+        self.assertTrue(row.self_harm)
+
+    async def test_a_clean_confirmation_is_the_verdict(self) -> None:
+        module, _api, _hs, _db = self._module()
+        await self._screened(
+            module, {"flagged": False, "categories": [], "evaluated": True}
+        )
+        self.assertIsNone(await module._incidents.get("mod:$e1"))
+
+
+class TestAttemptsDoNotOverwriteEachOther(unittest.IsolatedAsyncioTestCase):
+    async def test_a_stale_result_cannot_replace_a_later_attempts(self) -> None:
+        store, _hs = _store()
+        await store.upsert_verdict(
+            _incident(action=ACTION_REDACTED, outcome=OUTCOME_PENDING, attempt_id="a")
+        )
+        await store.upsert_verdict(
+            _incident(action=ACTION_REDACTED, outcome=OUTCOME_PENDING, attempt_id="b")
+        )
+        self.assertTrue(
+            await store.set_outcome("mod:$e1", OUTCOME_UNKNOWN, attempt_id="b")
+        )
+        self.assertFalse(
+            await store.set_outcome("mod:$e1", OUTCOME_FAILED, attempt_id="a"),
+            "attempt a's late result overwrote attempt b's",
+        )
+        row = await store.get("mod:$e1")
+        assert row is not None
+        self.assertEqual(row.outcome, OUTCOME_UNKNOWN)
+
+    async def test_a_new_attempt_moves_updated_ms_even_when_still_pending(self) -> None:
+        store, _hs = _store()
+        await store.insert(
+            _incident(
+                action=ACTION_REDACTED,
+                outcome=OUTCOME_PENDING,
+                attempt_id="crashed",
+                updated_ms=1,
+            )
+        )
+        await store.upsert_verdict(
+            _incident(
+                action=ACTION_REDACTED, outcome=OUTCOME_PENDING, attempt_id="live"
+            )
+        )
+        row = await store.get("mod:$e1")
+        assert row is not None
+        self.assertEqual(row.attempt_id, "live")
+        self.assertGreater(row.updated_ms, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1046,3 +1279,68 @@ class TestRecorderRetry(unittest.IsolatedAsyncioTestCase):
         assert row is not None
         self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, None))
         self.assertEqual(row.course_ids, (COURSE_A,))
+
+
+class _RealLoggingPool(DbPoolDouble):
+    """`db_pool` over SQLite with Synapse's REAL `LoggingTransaction`, which
+    logs every statement's arguments to `synapse.storage.SQL` at DEBUG. The
+    double the other tests use does not log, so it cannot see this channel."""
+
+    async def runInteraction(
+        self, desc: str, func: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        from synapse.storage.database import LoggingTransaction
+
+        txn = LoggingTransaction(
+            txn=self.connection.cursor(),
+            name=desc,
+            server_name="example.org",
+            database_engine=sqlite_engine(),
+        )
+        result = func(txn, *args, **kwargs)
+        self.connection.commit()
+        return result
+
+
+class TestNoTextInSynapsesSqlLog(unittest.IsolatedAsyncioTestCase):
+    SECRET_TEXT = "quokka-text-5511"
+    SECRET_REASON = "quokka-reason-5522"
+
+    async def test_text_and_reason_never_reach_the_sql_debug_log(self) -> None:
+        pool = _RealLoggingPool()
+        self.addCleanup(pool.connection.close)
+        store_double = EventStoreDouble()
+        homeserver = HomeServerDouble(store_double)
+        store_double.db_pool = pool
+        store = IncidentStore(homeserver)
+        capture = _Capture()
+        sql_logger = logging.getLogger("synapse.storage.SQL")
+        sql_logger.addHandler(capture)
+        old = sql_logger.level
+        sql_logger.setLevel(logging.DEBUG)
+        self.addCleanup(sql_logger.removeHandler, capture)
+        self.addCleanup(sql_logger.setLevel, old)
+
+        await store.insert(
+            _incident(
+                incident_id="report:r",
+                text=self.SECRET_TEXT,
+                reason=self.SECRET_REASON,
+            )
+        )
+        await store.upsert_verdict(_incident(text=self.SECRET_TEXT))
+        await store.upsert_verdict(
+            _incident(text=self.SECRET_TEXT, action=ACTION_PRESERVED, self_harm=True)
+        )
+        await store.set_outcome("mod:$e1", OUTCOME_UNKNOWN)
+        row = await store.get("report:r")
+        assert row is not None
+        self.assertEqual((row.text, row.reason), (self.SECRET_TEXT, self.SECRET_REASON))
+
+        self.assertTrue(
+            any("[SQL values]" in r.getMessage() for r in capture.records),
+            "the SQL debug log captured nothing, so the check is not live",
+        )
+        for record in capture.records:
+            self.assertNotIn(self.SECRET_TEXT, record.getMessage())
+            self.assertNotIn(self.SECRET_REASON, record.getMessage())

@@ -6,16 +6,18 @@ A user's **student courses** are the course spaces - rooms carrying a
 student courses, captured when it happens:
 
 - Tier 1: at block time.
-- Tier 2: when the message is queued, and carried on the job, so a learner
-  who leaves before the verdict still lands on their course.
+- Tier 2: at the message's own stream position, carried on the job from the
+  moment it is queued, so a learner who leaves before the verdict still lands
+  on their course.
 - Report: at report time. The subject's student courses, or, only when the
   subject is a student nowhere, the reporter's.
 
 A **course admin** of a space is a member currently joined at power level 100
 or above; only they may read its incidents.
 
-The rule over a room's state is a pure function, `student_level`, so it is
-tested without a homeserver; the class around it only reads state.
+The rules over a room's state are pure functions (`is_student_in`,
+`is_course_admin_in`), so they are tested without a homeserver; the class
+around them only reads state.
 """
 
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Set, Tuple
@@ -64,6 +66,11 @@ def power_level(state: StateMap, user_id: str) -> int:
             creators.update(c for c in additional if isinstance(c, str))
         creators.add(create_event.sender)
     power_event = state.get((POWER_LEVELS_EVENT_TYPE, ""))
+    if power_event is None and create_event is not None:
+        # With no power-levels event, the room's creator holds 100 in every
+        # room version (Matrix spec, `m.room.power_levels`), not only those
+        # that give creators unlimited power.
+        creators.add(create_event.sender)
     levels = effective_power_levels(
         [user_id], power_event.content if power_event is not None else None, creators
     )
@@ -105,18 +112,45 @@ def state_keys_for(user_id: str) -> List[Tuple[str, str]]:
     ]
 
 
+#: Reads `(room_id, user_id, position)` -> the course keys and that user's
+#: membership in the room's state AFTER its last event at or before
+#: `position`. `{}` when the room had no events yet at that position.
+StateAtPosition = Callable[[str, str, int], Awaitable[StateMap]]
+
+
 class StudentCourses:
-    """Resolves a user's student courses from current state."""
+    """Resolves a user's student courses AS OF a stream position.
+
+    **Anchored to a position, not to the moment the lookup runs.** The rule
+    is "the courses the sender was a student of when the incident happened",
+    and a lookup that read current state would answer "when the lookup ran"
+    instead: a learner who left course A and joined course B between the
+    incident and the read would land on B. So every caller captures a
+    position at the moment of the incident - the message's own stream
+    ordering for Tier 2, the current maximum for a block or a report - and
+    the state read is the state of each course space after its last event at
+    or before that position. A lookup that fails and is retried later answers
+    the same question.
+
+    The candidates are the rooms the user has ever joined that carry a course
+    plan NOW. A course plan is set when a course space is created and never
+    removed, so the current-state filter only saves reading every DM and
+    activity room's history.
+    """
 
     def __init__(
         self,
         *,
-        rooms_for_user: Callable[[str], Awaitable[Iterable[str]]],
-        read_state: StateReader,
+        rooms_ever_joined: Callable[[str], Awaitable[Iterable[str]]],
+        is_course_now: Callable[[str], Awaitable[bool]],
+        state_at: StateAtPosition,
+        current_position: Callable[[], int],
         is_exempt: Callable[[str], bool],
     ) -> None:
-        self._rooms_for_user = rooms_for_user
-        self._read_state = read_state
+        self._rooms_ever_joined = rooms_ever_joined
+        self._is_course_now = is_course_now
+        self._state_at = state_at
+        self._current_position = current_position
         self._is_exempt = is_exempt
 
     @classmethod
@@ -125,8 +159,10 @@ class StudentCourses:
     ) -> "StudentCourses":
         store = homeserver.get_datastores().main
         return cls(
-            rooms_for_user=store.get_rooms_for_user,
-            read_state=current_state_reader(homeserver),
+            rooms_ever_joined=store.get_rooms_user_has_been_in,
+            is_course_now=_is_course_now(homeserver),
+            state_at=_state_at_position(homeserver),
+            current_position=store.get_room_max_stream_ordering,
             is_exempt=is_exempt,
         )
 
@@ -134,28 +170,67 @@ class StudentCourses:
         """Exempt senders and bots are nobody's students."""
         return self._is_exempt(user_id) or is_probable_bot_user_id(user_id)
 
-    async def for_user(self, user_id: str) -> Tuple[str, ...]:
-        """The user's student courses now, sorted. Raises when they cannot be
-        read: an empty answer means "a student nowhere", and must never be
-        what a failed read looks like."""
+    def position_now(self) -> int:
+        """The position to anchor an incident happening now."""
+        return int(self._current_position())
+
+    async def for_user(self, user_id: str, position: int) -> Tuple[str, ...]:
+        """The user's student courses at `position`, sorted. Raises when they
+        cannot be read: an empty answer means "a student nowhere", and must
+        never be what a failed read looks like."""
         if self.excluded(user_id):
             return ()
-        rooms = await self._rooms_for_user(user_id)
+        rooms = await self._rooms_ever_joined(user_id)
         courses = []
         for room_id in sorted(rooms):
-            state = await self._read_state(room_id, user_id)
+            if not await self._is_course_now(room_id):
+                continue
+            state = await self._state_at(room_id, user_id, position)
             if is_student_in(state, user_id):
                 courses.append(room_id)
         return tuple(courses)
 
-    async def for_report(self, subject_id: str, reporter_id: str) -> Tuple[str, ...]:
+    async def for_report(
+        self, subject_id: str, reporter_id: str, position: int
+    ) -> Tuple[str, ...]:
         """The subject's student courses; the reporter's only when the
         subject is a student nowhere. So a report about a course's learner
         reaches that course and none of the reporter's others."""
-        subject_courses = await self.for_user(subject_id)
+        subject_courses = await self.for_user(subject_id, position)
         if subject_courses:
             return subject_courses
-        return await self.for_user(reporter_id)
+        return await self.for_user(reporter_id, position)
+
+
+def _is_course_now(homeserver: Any) -> Callable[[str], Awaitable[bool]]:
+    async def _check(room_id: str) -> bool:
+        from synapse.types.state import StateFilter
+
+        controller = homeserver.get_storage_controllers().state
+        ids = await controller.get_current_state_ids(
+            room_id, StateFilter.from_types([(COURSE_PLAN_EVENT_TYPE, "")])
+        )
+        return (COURSE_PLAN_EVENT_TYPE, "") in ids
+
+    return _check
+
+
+def _state_at_position(homeserver: Any) -> StateAtPosition:
+    after_event = state_after_event_reader(homeserver)
+
+    async def _read(room_id: str, user_id: str, position: int) -> StateMap:
+        from synapse.types import RoomStreamToken
+
+        store = homeserver.get_datastores().main
+        last = await store.get_last_event_id_in_room_before_stream_ordering(
+            room_id, RoomStreamToken(stream=position)
+        )
+        if last is None:
+            # The room had no events yet: nobody was a member of it.
+            return {}
+        return await after_event(last, user_id)
+
+    return _read
 
 
 def current_state_reader(homeserver: Any) -> StateReader:

@@ -123,6 +123,12 @@ class Incident:
     reason: Optional[str]
     created_ms: int
     updated_ms: int
+    #: Which redaction attempt last set `outcome`. Internal: it is what stops
+    #: a delayed result from one attempt overwriting a later attempt's.
+    attempt_id: Optional[str] = None
+    #: The stream position the incident's courses are read at, when they are
+    #: still to be resolved. In memory only; never stored.
+    as_of: Optional[int] = attr.ib(default=None, eq=False)
 
     def to_json(self) -> Dict[str, Any]:
         """The wire shape of the read endpoint's `Incident`.
@@ -196,10 +202,16 @@ def merge_incident(existing: Incident, new: Incident) -> Incident:
     for category in new.categories:
         if category not in categories:
             categories.append(category)
+    outcome = merge_outcome(existing.outcome, new.outcome)
+    attempt_id = existing.attempt_id
+    if new.outcome == OUTCOME_PENDING and outcome == OUTCOME_PENDING:
+        # A new attempt begins and owns the outcome from here on.
+        attempt_id = new.attempt_id
     return attr.evolve(
         existing,
         action=merge_action(existing.action, new.action),
-        outcome=merge_outcome(existing.outcome, new.outcome),
+        outcome=outcome,
+        attempt_id=attempt_id,
         categories=tuple(categories),
         self_harm=existing.self_harm or new.self_harm,
         top_score=_max_score(existing.top_score, new.top_score),
@@ -243,7 +255,8 @@ _CREATE_INCIDENTS_SQL = """
         text TEXT,
         reason TEXT,
         created_ms BIGINT NOT NULL,
-        updated_ms BIGINT NOT NULL
+        updated_ms BIGINT NOT NULL,
+        attempt_id TEXT
     )
 """
 
@@ -267,16 +280,10 @@ _CREATE_OUTCOME_INDEX_SQL = """
     ON pangea_safety_incidents (outcome)
 """
 
-_COLUMNS = (
-    "incident_id, source, action, outcome, subject_id, reporter_id, room_id, "
-    "event_id, course_ids, categories, self_harm, rule, top_score, text, "
-    "reason, created_ms, updated_ms"
-)
-
 _SELECT_ONE_SQL = """
     SELECT incident_id, source, action, outcome, subject_id, reporter_id,
         room_id, event_id, course_ids, categories, self_harm, rule, top_score,
-        text, reason, created_ms, updated_ms
+        text, reason, created_ms, updated_ms, attempt_id
     FROM pangea_safety_incidents
     WHERE incident_id = ?
 """
@@ -285,8 +292,8 @@ _INSERT_SQL = """
     INSERT INTO pangea_safety_incidents
         (incident_id, source, action, outcome, subject_id, reporter_id,
         room_id, event_id, course_ids, categories, self_harm, rule, top_score,
-        text, reason, created_ms, updated_ms)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        text, reason, created_ms, updated_ms, attempt_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (incident_id) DO NOTHING
 """
 
@@ -299,7 +306,7 @@ _INSERT_COURSE_SQL = """
 _UPDATE_SQL = """
     UPDATE pangea_safety_incidents
     SET action = ?, outcome = ?, categories = ?, self_harm = ?, rule = ?,
-        top_score = ?, text = ?, updated_ms = ?
+        top_score = ?, text = ?, updated_ms = ?, attempt_id = ?
     WHERE incident_id = ?
 """
 
@@ -307,7 +314,7 @@ _SELECT_FOR_COURSE_SQL = """
     SELECT i.incident_id, i.source, i.action, i.outcome, i.subject_id,
         i.reporter_id, i.room_id, i.event_id, i.course_ids, i.categories,
         i.self_harm, i.rule, i.top_score, i.text, i.reason, i.created_ms,
-        i.updated_ms
+        i.updated_ms, i.attempt_id
     FROM pangea_safety_incidents AS i
     INNER JOIN pangea_safety_incident_courses AS c
         ON c.incident_id = i.incident_id
@@ -365,6 +372,7 @@ def _row_to_incident(row: Sequence[Any]) -> Incident:
         reason=row[14],
         created_ms=int(row[15]),
         updated_ms=int(row[16]),
+        attempt_id=row[17],
     )
 
 
@@ -387,6 +395,7 @@ def _insert_args(incident: Incident) -> Tuple[Any, ...]:
         nul_safe(incident.reason),
         incident.created_ms,
         incident.updated_ms,
+        incident.attempt_id,
     )
 
 
@@ -476,6 +485,7 @@ class IncidentStore:
         incident_id: str,
         outcome: str,
         *,
+        attempt_id: Optional[str] = None,
         only_if: Optional[str] = None,
         updated_before_ms: Optional[int] = None,
     ) -> bool:
@@ -497,6 +507,9 @@ class IncidentStore:
             if row is None:
                 return False
             existing = _row_to_incident(row)
+            if attempt_id is not None and existing.attempt_id != attempt_id:
+                # A later attempt owns the outcome now; this result is stale.
+                return False
             if only_if is not None and existing.outcome != only_if:
                 return False
             if (
@@ -586,14 +599,27 @@ def _require_courses(incident: Incident) -> None:
         raise ValueError("an incident is never written before its courses")
 
 
+def _execute_private(txn: Any, sql: str, args: Tuple[Any, ...]) -> None:
+    """Run a statement whose arguments carry message text or a reason.
+
+    Below Synapse's `LoggingTransaction`, on the cursor it wraps: that
+    wrapper logs every statement's arguments to `synapse.storage.SQL` at
+    DEBUG, which would put a learner's message and a reporter's reason into
+    the homeserver log of any deployment that turns SQL logging up. The
+    parameter style is converted exactly as the wrapper converts it.
+    """
+    txn.txn.execute(txn.database_engine.convert_param_style(sql), args)
+
+
 def _write_new(txn: Any, incident: Incident) -> None:
-    txn.execute(_INSERT_SQL, _insert_args(incident))
+    _execute_private(txn, _INSERT_SQL, _insert_args(incident))
     for course_id in incident.course_ids or ():
         txn.execute(_INSERT_COURSE_SQL, (course_id, incident.incident_id))
 
 
 def _write_update(txn: Any, incident: Incident, updated_ms: int) -> None:
-    txn.execute(
+    _execute_private(
+        txn,
         _UPDATE_SQL,
         (
             incident.action,
@@ -604,6 +630,7 @@ def _write_update(txn: Any, incident: Incident, updated_ms: int) -> None:
             incident.top_score,
             nul_safe(incident.text),
             updated_ms,
+            incident.attempt_id,
             incident.incident_id,
         ),
     )

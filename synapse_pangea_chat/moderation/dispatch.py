@@ -99,11 +99,11 @@ class ModerationJob:
     sender: str
     text: str
     enqueued_at: float
-    #: The sender's student courses as of queue time - a
-    #: `recorder.CourseSnapshot` - so a learner who leaves a course before
-    #: the verdict still lands on it. None when nothing was captured, and the
-    #: verdict then looks the courses up itself.
-    courses: Optional[Any] = None
+    #: The message's stream position, captured when it was queued. The
+    #: Safety page reads the sender's courses AS OF this position, so a
+    #: learner who leaves a course before the verdict still lands on it.
+    #: None when the event carried none; the verdict then anchors to now.
+    position: Optional[int] = None
 
 
 class Tier2Dispatcher:

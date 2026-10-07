@@ -12,16 +12,14 @@ lands loses that one row; five failures lose it too. Both are counted
 (`pangea_safety_incident_lost_total`) and logged at ERROR, with the incident
 id and never the text.
 
-**Courses resolve before the row is written.** A row written with no courses
-reaches no Safety page while looking recorded, so a row whose lookup failed
-is retried WITH its lookup, as late as the retry runs. That is the one field a
-retry computes rather than carries, and it is the closest the module can get
-to the moment of the incident once the moment itself could not be read.
-
-`CourseSnapshot` is the Tier 2 half of "frozen at queue time": the lookup is
-started when `on_new_event` queues the message - in a background process on
-the next reactor turn, so the notifier's inline path still does no I/O - and
-the verdict, seconds later, reads whatever it found.
+**Courses resolve before the row is written, at the incident's position.**
+A row written with no courses reaches no Safety page while looking recorded,
+so a row's courses are resolved first and a failed lookup is a failed write.
+The lookup is anchored to the stream position captured when the incident
+happened (`Incident.as_of`), so resolving it late - on a retry, or at a Tier 2
+verdict seconds after the message was queued - answers the same question as
+resolving it at once. Once resolved, the courses are carried by the retry and
+never looked up again.
 """
 
 from typing import Any, Awaitable, Callable, Optional, Tuple
@@ -29,7 +27,6 @@ from typing import Any, Awaitable, Callable, Optional, Tuple
 import attr
 from synapse.logging.context import PreserveLoggingContext, make_deferred_yieldable
 from synapse.metrics.background_process_metrics import run_as_background_process
-from synapse.util.async_helpers import ObservableDeferred
 from twisted.internet import defer
 
 from synapse_pangea_chat.moderation import metrics
@@ -51,76 +48,6 @@ RETRY_ATTEMPTS = 5
 RETRY_FIRST_DELAY_SECONDS = 1.0
 
 
-class CourseSnapshot:
-    """A user's student courses, looked up once, from queue time."""
-
-    def __init__(self, homeserver: Any, courses: StudentCourses, user_id: str) -> None:
-        self._hs = homeserver
-        self._courses = courses
-        self._user_id = user_id
-        self._observable: Optional[ObservableDeferred] = None
-        self._result: Optional[Tuple[str, ...]] = None
-        self._done = False
-        #: The scheduled start, so a refused job can cancel it.
-        self.timer: Optional[Any] = None
-
-    def discard(self) -> None:
-        """Cancel a lookup that has not started. For a job the queue refused."""
-        timer = self.timer
-        try:
-            if timer is not None and timer.active():
-                timer.cancel()
-        except Exception:
-            # silent-ok: a timer that cannot be cancelled runs one lookup
-            # nobody reads, which costs a read and nothing else.
-            pass
-
-    def start(self) -> None:
-        """Begin the lookup. Idempotent, and never raises: a failure is a
-        lookup the verdict redoes, not a message that goes unmoderated."""
-        if self._observable is not None:
-            return
-        try:
-            deferred = run_as_background_process(
-                *background_process_args(
-                    self._hs, "pangea_safety_course_snapshot", self._resolve
-                )
-            )
-            self._observable = ObservableDeferred(deferred, consumeErrors=True)
-        except Exception as exc:
-            reraise_if_cancelled(exc)
-            # silent-ok: `get` answers None, and the verdict looks the courses
-            # up itself. Logged by type and site only.
-            self._done = True
-            logger.warning(
-                "safety course snapshot could not start at %s (%s)",
-                error_site(exc),
-                type(exc).__name__,
-            )
-
-    async def _resolve(self) -> None:
-        try:
-            self._result = await self._courses.for_user(self._user_id)
-        except Exception as exc:
-            reraise_if_cancelled(exc)
-            # silent-ok: None from `get` sends the verdict to look again.
-            logger.warning(
-                "safety course snapshot failed at %s (%s); the verdict will "
-                "look the courses up itself",
-                error_site(exc),
-                type(exc).__name__,
-            )
-        finally:
-            self._done = True
-
-    async def get(self) -> Optional[Tuple[str, ...]]:
-        """The courses as of queue time, or None when the lookup failed."""
-        self.start()
-        if not self._done and self._observable is not None:
-            await make_deferred_yieldable(self._observable.observe())
-        return self._result
-
-
 class IncidentRecorder:
     """Writes incidents, and retries the ones the database refused."""
 
@@ -139,30 +66,38 @@ class IncidentRecorder:
         self._attempts = attempts
         self._first_delay = first_delay_seconds
 
-    def snapshot(self, user_id: str) -> CourseSnapshot:
-        snapshot = CourseSnapshot(self._hs, self.courses, user_id)
+    def position_now(self) -> Optional[int]:
+        """The position to anchor an incident happening now, or None when it
+        cannot be read - the row is then anchored when it is written."""
         try:
-            snapshot.timer = self._hs.get_clock().call_later(
-                _SecondsInterval(0), snapshot.start
+            return self.courses.position_now()
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok: `resolve` reads the position itself when the row is
+            # written; logged by type and site.
+            logger.warning(
+                "safety incident position unreadable at %s (%s)",
+                error_site(exc),
+                type(exc).__name__,
             )
-        except Exception:
-            # silent-ok: a clock that refuses a call is shutting down; `get`
-            # starts the lookup itself when the verdict asks for it.
-            pass
-        return snapshot
+            return None
 
-    async def _with_courses(self, incident: Incident) -> Incident:
+    async def resolve(self, incident: Incident) -> Incident:
+        """The incident with its courses, read at its own position."""
         if incident.course_ids is not None:
             return incident
+        position = incident.as_of
+        if position is None:
+            position = self.courses.position_now()
         if incident.reporter_id is not None and incident.subject_id is not None:
             courses = await self.courses.for_report(
-                incident.subject_id, incident.reporter_id
+                incident.subject_id, incident.reporter_id, position
             )
         elif incident.subject_id is not None:
-            courses = await self.courses.for_user(incident.subject_id)
+            courses = await self.courses.for_user(incident.subject_id, position)
         else:
             courses = ()
-        return attr.evolve(incident, course_ids=courses)
+        return attr.evolve(incident, course_ids=courses, as_of=position)
 
     # ------------------------------------------------------------------
     # Tier 1
@@ -172,20 +107,22 @@ class IncidentRecorder:
         """Write a Tier 1 block. Returns whether it landed; never raises
         except to let a cancellation past, and schedules the retry either
         way, because the send is refused whatever happens here."""
+        captured = [incident]
         try:
-            await self.store.insert(await self._with_courses(incident))
+            captured[0] = await self.resolve(incident)
+            await self.store.insert(captured[0])
             return True
         except Exception as exc:
-            reraise_if_cancelled(exc, lambda: self._retry_insert("block", incident))
+            reraise_if_cancelled(exc, lambda: self._retry_insert("block", captured[0]))
             # silent-ok: the send is still refused; the row is retried.
             metrics.record_incident_write_failed("block")
-            _log_failure("written", incident.incident_id, exc)
-            self._retry_insert("block", incident)
+            _log_failure(incident.incident_id, exc)
+            self._retry_insert("block", captured[0])
             return False
 
     def _retry_insert(self, kind: str, incident: Incident) -> None:
         async def _attempt() -> None:
-            await self.store.insert(await self._with_courses(incident))
+            await self.store.insert(await self.resolve(incident))
 
         self.retry(kind, incident.incident_id, _attempt)
 
@@ -201,39 +138,43 @@ class IncidentRecorder:
         row is retried WITHOUT the outcome it carried, because no attempt
         will follow it.
         """
+        captured = [incident]
         try:
-            resolved = await self._with_courses(incident)
-            prior = await self.store.upsert_verdict(resolved)
+            captured[0] = await self.resolve(incident)
+            prior = await self.store.upsert_verdict(captured[0])
             return True, prior
         except Exception as exc:
-            reraise_if_cancelled(exc, lambda: self._retry_verdict(incident))
+            reraise_if_cancelled(exc, lambda: self.retry_verdict(captured[0]))
             # silent-ok: nothing is enforced on this verdict; the row is
             # retried, and the caller counts the redaction it did not send.
             metrics.record_incident_write_failed("verdict")
-            _log_failure("written", incident.incident_id, exc)
-            self._retry_verdict(incident)
+            _log_failure(incident.incident_id, exc)
+            self.retry_verdict(captured[0])
             return False, None
 
-    def _retry_verdict(self, incident: Incident) -> None:
-        # The captured row WITHOUT its outcome: the verdict that carried it
-        # declined to redact, so no attempt follows this row.
-        captured = attr.evolve(incident, outcome=None)
+    def retry_verdict(self, incident: Incident) -> None:
+        """Hand a captured verdict to the retry, as a row that records no
+        attempt: whoever calls this is not going to redact on it."""
+        captured = attr.evolve(incident, outcome=None, attempt_id=None)
 
         async def _attempt() -> None:
-            await self.store.upsert_verdict(await self._with_courses(captured))
+            await self.store.upsert_verdict(await self.resolve(captured))
 
         self.retry("verdict", incident.incident_id, _attempt)
 
-    def settle_outcome(self, incident_id: str, outcome: str) -> None:
+    def settle_outcome(
+        self, incident_id: str, outcome: str, attempt_id: Optional[str]
+    ) -> None:
         """Record how a redaction attempt ended, detached and retried.
 
-        Detached because the caller may be being cancelled at the drain, and
-        an outcome lost then leaves the row `pending` until the next startup
-        sweep - which is the backstop, not the plan.
+        Scoped to the attempt, so a result that lands late cannot overwrite
+        a later attempt's. Detached because the caller may be being cancelled
+        at the drain, and an outcome lost then leaves the row `pending` until
+        the next startup sweep - which is the backstop, not the plan.
         """
 
         async def _attempt() -> None:
-            await self.store.set_outcome(incident_id, outcome)
+            await self.store.set_outcome(incident_id, outcome, attempt_id=attempt_id)
 
         self.retry("outcome", incident_id, _attempt, immediately=True)
 
@@ -316,11 +257,10 @@ class IncidentRecorder:
         return True
 
 
-def _log_failure(what: str, incident_id: str, exc: BaseException) -> None:
+def _log_failure(incident_id: str, exc: BaseException) -> None:
     logger.warning(
-        "safety incident %s could not be %s at %s (%s); it will be retried",
+        "safety incident %s could not be written at %s (%s); it will be retried",
         incident_id,
-        what,
         error_site(exc),
         type(exc).__name__,
     )

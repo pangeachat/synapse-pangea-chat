@@ -933,7 +933,7 @@ class ChatModeration:
                 reporter_id=None,
                 room_id=event.room_id,
                 event_id=None,
-                # Resolved by the recorder, at block time.
+                # Resolved by the recorder, as of this position.
                 course_ids=None,
                 categories=(),
                 self_harm=False,
@@ -943,6 +943,7 @@ class ChatModeration:
                 reason=None,
                 created_ms=now_ms,
                 updated_ms=now_ms,
+                as_of=self._recorder.position_now(),
             )
         except Exception as exc:
             reraise_if_cancelled(exc)
@@ -1018,27 +1019,20 @@ class ChatModeration:
                 # a visible product regression, so the exemption has to win
                 # over the room's inclusion.
                 return
-            # The sender's courses, frozen NOW rather than at the verdict, so
-            # a learner who leaves before it still lands on their course's
-            # Safety page. The lookup is scheduled for the next reactor turn -
-            # this path does no I/O - and BEFORE the job is queued, so it is
-            # always ahead of the worker that will read it.
-            courses = self._recorder.snapshot(event.sender)
-            accepted = self._dispatcher.enqueue(
+            self._dispatcher.enqueue(
                 ModerationJob(
                     event_id=event.event_id,
                     room_id=event.room_id,
                     sender=event.sender,
                     text=text,
                     enqueued_at=self._clock.time(),
-                    courses=courses,
+                    # Where the message sits in the stream. The Safety page
+                    # reads the sender's courses as of HERE, not as of the
+                    # verdict, so a learner who leaves before it still lands
+                    # on their course - and no state is read on this path.
+                    position=_stream_position(event),
                 )
             )
-            if not accepted:
-                # Refused and already counted by the dispatcher; a lookup for
-                # a message nobody will check is load an overloaded queue
-                # does not need.
-                courses.discard()
         except Exception as exc:
             reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract; observe-only hook, so the
@@ -1168,7 +1162,7 @@ class ChatModeration:
             # A screen result, not a decision. Ask again about this one
             # message alone; `_check_and_redact` records its own matcher
             # agreement and its own check outcome from that answer.
-            await self._check_and_redact(job, count_truncation=False)
+            await self._check_and_redact(job, count_truncation=False, screen=result)
             return
         self._record_matcher_agreement(job, result)
 
@@ -1193,7 +1187,11 @@ class ChatModeration:
             metrics.TIER2_TRUNCATED.inc()
 
     async def _check_and_redact(
-        self, job: ModerationJob, *, count_truncation: bool = True
+        self,
+        job: ModerationJob,
+        *,
+        count_truncation: bool = True,
+        screen: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Ask about one message, then act on the answer.
 
@@ -1212,7 +1210,24 @@ class ChatModeration:
             # counting it again would report every long flagged message twice.
             self._count_truncation(job)
         result = await self._checker.check(job.text)
+        if result is None and screen is not None:
+            # The batch screen flagged this message and the confirmation
+            # produced no verdict at all. Nothing is enforced on a screen -
+            # that rule stands - but the finding is not dropped either: it is
+            # recorded as flagged and left up, which is exactly what happened
+            # to the message. A confirmation that answers CLEAN is a verdict,
+            # and governs.
+            await self._record_unconfirmed_screen(job, screen)
         await self._decide(job, result)
+
+    async def _record_unconfirmed_screen(
+        self, job: ModerationJob, screen: Mapping[str, Any]
+    ) -> None:
+        if not _usable_categories(screen.get("categories")):
+            return
+        await self._recorder.record_verdict(
+            self._verdict_incident(job, ACTION_KEPT, None, screen)
+        )
 
     async def _decide(
         self, job: ModerationJob, result: Optional[Dict[str, Any]]
@@ -1280,11 +1295,20 @@ class ChatModeration:
             # contact, so a preserved flag reaches the logs and stops there.
             # That path is pangeachat/admin-dash#105, and it is the reason this
             # branch is a preserve rather than an escalate.
-            await self._record_preserved(job, category)
-            # The Safety page's row, AFTER the protection: preserving must
-            # never wait on, or depend on, the incident write. A row that
-            # fails is retried; the message stays up either way.
-            await self._record_verdict(job, ACTION_PRESERVED, None, result)
+            #
+            # The Safety page's row is CAPTURED first and written after the
+            # protection: preserving must never wait on, or depend on, the
+            # incident write, and a cancellation at the protection's `await`
+            # must not lose the finding - the captured row goes to the retry.
+            captured = self._verdict_incident(job, ACTION_PRESERVED, None, result)
+            try:
+                await self._record_preserved(job, category)
+            except Exception as exc:
+                reraise_if_cancelled(
+                    exc, partial(self._recorder.retry_verdict, captured)
+                )
+                raise
+            await self._recorder.record_verdict(captured)
             metrics.TIER2_SUPPRESSED.labels(category=category).inc()
             logger.info(
                 "tier2 flagged event %s in %s (category=%s); preserved, not redacted",
@@ -1315,7 +1339,9 @@ class ChatModeration:
             metrics.record_redaction_skip("below_threshold")
             # Flagged and left up is still an incident: the course admin sees
             # it as Low, and a later verdict on the same message merges in.
-            await self._record_verdict(job, ACTION_KEPT, None, result)
+            await self._recorder.record_verdict(
+                self._verdict_incident(job, ACTION_KEPT, None, result)
+            )
             driver = decision.driver
             logger.info(
                 "tier2 flagged event %s in %s (category=%s, score=%.3f, "
@@ -1339,11 +1365,22 @@ class ChatModeration:
         # captured row is retried. Preserves the database refused earlier are
         # flushed before it, so a disclosure's protection never queues behind
         # this message's record.
-        if self._disposition is not None:
-            await self._disposition.flush_pending()
-        written, prior = await self._record_verdict(
-            job, ACTION_REDACTED, OUTCOME_PENDING, result
+        attempt_id = uuid.uuid4().hex
+        captured = self._verdict_incident(
+            job, ACTION_REDACTED, OUTCOME_PENDING, result, attempt_id=attempt_id
         )
+        if self._disposition is not None:
+            try:
+                await self._disposition.flush_pending()
+            except Exception as exc:
+                # Not a fail-open handler: `flush_pending` raises nothing but
+                # a cancellation, and the captured finding is handed to the
+                # retry on its way past rather than lost with it.
+                reraise_if_cancelled(
+                    exc, partial(self._recorder.retry_verdict, captured)
+                )
+                raise
+        written, prior = await self._recorder.record_verdict(captured)
         if not written:
             metrics.record_redaction_skip("incident_unwritten")
             logger.warning(
@@ -1362,11 +1399,12 @@ class ChatModeration:
             self._recorder.settle_outcome(
                 incident_id,
                 OUTCOME_REMOVED if blocker == "already_redacted" else declined,
+                attempt_id,
             )
             return
         claim = await self._may_redact(job, category)
         if claim is None:
-            self._recorder.settle_outcome(incident_id, declined)
+            self._recorder.settle_outcome(incident_id, declined, attempt_id)
             return
         # Bound after the narrowing, because the release below runs inside a
         # closure and a captured Optional does not carry the narrowing with
@@ -1442,9 +1480,10 @@ class ChatModeration:
             # it is the kind of working-by-accident the next edit breaks
             # silently.
             reraise_if_cancelled(
-                exc, partial(self._settle_claim, job, claim_id, category, exc)
+                exc,
+                partial(self._settle_claim, job, claim_id, category, exc, attempt_id),
             )
-            self._settle_claim(job, claim_id, category, exc)
+            self._settle_claim(job, claim_id, category, exc, attempt_id)
             logger.warning(
                 "tier2 redaction raised for %s in %s at %s (%s); whether it "
                 "landed is being re-read",
@@ -1460,7 +1499,7 @@ class ChatModeration:
         # landed. The success metric is out here for the same reason - the
         # `try` holds the send and nothing else.
         metrics.TIER2_REDACTIONS.labels(category=category).inc()
-        self._recorder.settle_outcome(incident_id, OUTCOME_REMOVED)
+        self._recorder.settle_outcome(incident_id, OUTCOME_REMOVED, attempt_id)
         # The VISIBLE WINDOW, observed here and nowhere else: the send has
         # returned, so this is the first moment the message is provably no
         # longer readable, and `enqueued_at` was taken in `on_new_event`,
@@ -1630,7 +1669,12 @@ class ChatModeration:
         )
 
     def _settle_claim(
-        self, job: ModerationJob, claim_id: str, category: str, error: BaseException
+        self,
+        job: ModerationJob,
+        claim_id: str,
+        category: str,
+        error: BaseException,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """Decide what to do with the claim after the send RAISED.
 
@@ -1672,10 +1716,16 @@ class ChatModeration:
             claim_id,
             category,
             _redaction_failure_cause(error),
+            attempt_id,
         )
 
     async def _settle_claim_now(
-        self, job: ModerationJob, claim_id: str, category: str, cause: str
+        self,
+        job: ModerationJob,
+        claim_id: str,
+        category: str,
+        cause: str,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """The detached half of `_settle_claim`. Never raises to its caller
         except on a cancellation of its own, which leaves the claim in place -
@@ -1693,7 +1743,9 @@ class ChatModeration:
             outcome = OUTCOME_FAILED
         else:
             outcome = OUTCOME_UNKNOWN
-        self._recorder.settle_outcome(mod_incident_id(job.event_id), outcome)
+        self._recorder.settle_outcome(
+            mod_incident_id(job.event_id), outcome, attempt_id
+        )
         if landed is False:
             # The only branch with positive evidence: the event is there and
             # it is not redacted, so the send did not happen and the claim
@@ -1823,27 +1875,26 @@ class ChatModeration:
             return "already_redacted"
         return None
 
-    async def _record_verdict(
+    def _verdict_incident(
         self,
         job: ModerationJob,
         action: str,
         outcome: Optional[str],
         result: Mapping[str, Any],
-    ) -> Tuple[bool, Optional[str]]:
-        """Upsert the Safety page's row for this verdict.
+        *,
+        attempt_id: Optional[str] = None,
+    ) -> Incident:
+        """Capture the Safety page's row for this verdict, without I/O.
 
-        Returns `(written, prior_outcome)`; see `IncidentRecorder`. The
-        courses are the ones captured when the message was queued; when that
-        lookup failed, the recorder looks them up now, and a lookup that
-        fails again is a row that is not written.
+        Synchronous on purpose: everything the row needs is already in hand,
+        so it exists before the first `await` that could be cancelled. The
+        courses are resolved when it is written, as of the position the
+        message was queued at.
         """
         categories = result.get("categories")
         raw: List[Any] = list(categories) if isinstance(categories, list) else []
-        courses = None
-        if job.courses is not None:
-            courses = await job.courses.get()
         now_ms = self._incidents.now_ms()
-        incident = Incident(
+        return Incident(
             incident_id=mod_incident_id(job.event_id),
             source=SOURCE_MODERATION,
             action=action,
@@ -1852,7 +1903,7 @@ class ChatModeration:
             reporter_id=None,
             room_id=job.room_id,
             event_id=job.event_id,
-            course_ids=courses,
+            course_ids=None,
             categories=_incident_categories(raw),
             self_harm=_should_preserve(raw),
             rule=None,
@@ -1861,8 +1912,9 @@ class ChatModeration:
             reason=None,
             created_ms=now_ms,
             updated_ms=now_ms,
+            attempt_id=attempt_id,
+            as_of=job.position,
         )
-        return await self._recorder.record_verdict(incident)
 
     async def shutdown(self) -> None:
         """Drain Tier 2. Registered with the homeserver by the dispatcher;
@@ -2154,3 +2206,13 @@ def _top_score(categories: Iterable[Any], scores: Any) -> Optional[float]:
             continue
         best = float(value) if best is None else max(best, float(value))
     return best
+
+
+def _stream_position(event: EventBase) -> Optional[int]:
+    """The event's stream ordering, which Synapse has set by the time
+    `on_new_event` sees it. None when it is absent or not a number."""
+    metadata = getattr(event, "internal_metadata", None)
+    position = getattr(metadata, "stream_ordering", None)
+    if isinstance(position, bool) or not isinstance(position, int):
+        return None
+    return position

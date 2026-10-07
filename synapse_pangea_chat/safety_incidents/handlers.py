@@ -131,7 +131,11 @@ class ReportHandler:
         text: Optional[str] = None
         if not event.internal_metadata.is_redacted():
             text = extract_message_text(event.type, event.content, event.event_id).text
-        courses = await self._courses.for_report(subject_id, reporter_id)
+        # At report time: there is no send-time snapshot for a message that
+        # was never flagged.
+        courses = await self._courses.for_report(
+            subject_id, reporter_id, self._courses.position_now()
+        )
         now_ms = self._store.now_ms()
         incident_id = report_incident_id(report_id)
         written = await self._store.insert(

@@ -20,11 +20,6 @@ from synapse.http.site import SynapseRequest
 from synapse.types import UserID
 
 from synapse_pangea_chat import PangeaChat
-from synapse_pangea_chat.moderation.courses import (
-    COURSE_PLAN_EVENT_TYPE,
-    MEMBER_EVENT_TYPE,
-    POWER_LEVELS_EVENT_TYPE,
-)
 from synapse_pangea_chat.moderation.disposition import CREATE_TABLE_SQL
 from synapse_pangea_chat.moderation.incidents import (
     ACTION_PRESERVED,
@@ -62,7 +57,6 @@ from .test_safety_incidents_unit import (
     _classroom,
     _incident,
     _rows,
-    _state_event,
 )
 
 OTHER_ROOM = "!elsewhere:example.org"
@@ -497,15 +491,9 @@ class StartupCase(unittest.IsolatedAsyncioTestCase):
         self.hs = FakeHomeServer()
         self.world = _classroom()
         self.store = IncidentStore(self.hs)
-        self.states: Dict[Tuple[str, str], Dict[Any, Any]] = {}
-
-    async def _state_after(self, event_id: str, user_id: str) -> Dict[Any, Any]:
-        return self.states.get((event_id, user_id), {})
 
     def _startup(self) -> SafetyIncidentsStartup:
-        return SafetyIncidentsStartup(
-            self.hs, self.store, self.world.courses(), state_after=self._state_after
-        )
+        return SafetyIncidentsStartup(self.hs, self.store, self.world.courses())
 
 
 class TestStartupSweep(StartupCase):
@@ -608,7 +596,6 @@ _SYNAPSE_TABLES = (
     "CREATE TABLE events (event_id TEXT, room_id TEXT, sender TEXT, type TEXT, "
     "stream_ordering BIGINT, outlier BOOLEAN)",
     "CREATE TABLE event_json (event_id TEXT, json TEXT)",
-    "CREATE TABLE room_memberships (user_id TEXT, room_id TEXT, membership TEXT)",
 )
 
 
@@ -641,11 +628,6 @@ class TestBackfill(StartupCase):
             )
         connection.commit()
 
-    def _membership(self, user_id: str, room_id: str) -> None:
-        self.hs.store.db_pool.connection.execute(
-            "INSERT INTO room_memberships VALUES (?, ?, 'join')", (user_id, room_id)
-        )
-
     def _decision(self, event_id: str, disposition: str, category: str) -> None:
         self.hs.store.db_pool.connection.execute(
             "INSERT INTO pangea_moderation_disposition VALUES (?, ?, ?, ?, ?, ?)",
@@ -653,31 +635,17 @@ class TestBackfill(StartupCase):
         )
         self.hs.store.db_pool.connection.commit()
 
-    def _course_state(
-        self, event_id: str, user_id: str, *, joined: bool, level: int = 0
-    ) -> None:
-        state: Dict[Any, Any] = {
-            (COURSE_PLAN_EVENT_TYPE, ""): _state_event({"uuid": "plan"}),
-            (POWER_LEVELS_EVENT_TYPE, ""): _state_event({"users": {user_id: level}}),
-        }
-        if joined:
-            state[(MEMBER_EVENT_TYPE, user_id)] = _state_event({"membership": "join"})
-        self.states[(event_id, user_id)] = state
-
     async def test_the_legacy_decisions_are_copied_with_the_courses_of_their_time(
         self,
     ) -> None:
         """The learner was in course A when the message was sent and has left
         since; they joined course B after it. The row belongs to A only."""
-        self._membership(STUDENT, COURSE_A)
-        self._membership(STUDENT, COURSE_B)
-        self._event("$a-join", COURSE_A, 10)
-        self._event("$a-leave", COURSE_A, 20)
-        self._event("$b-join", COURSE_B, 30)
-        self._course_state("$a-join", STUDENT, joined=True)
-        self._course_state("$a-leave", STUDENT, joined=False)
-        self._course_state("$b-join", STUDENT, joined=True)
-        self._event("$msg", ROOM, 15, content={"msgtype": "m.text", "body": "awful"})
+        sent_at = self.world.position
+        self.world.leave(STUDENT, COURSE_A)
+        self.world.join(STUDENT, COURSE_B)
+        self._event(
+            "$msg", ROOM, sent_at, content={"msgtype": "m.text", "body": "awful"}
+        )
         self._decision("$msg", "redacted", "harassment")
         self.hs.store.events["$msg"] = FakeEvent(event_id="$msg", redacted=True)
 
@@ -739,17 +707,10 @@ class TestBackfill(StartupCase):
         self._event("$ok", ROOM, 5, content={"msgtype": "m.text", "body": "x"})
         self._decision("$ok", "redacted", "hate")
         self._decision("$bad", "redacted", "hate")
-        self._membership(STUDENT, COURSE_A)
-        self._event("$a", COURSE_A, 1)
         self._event("$bad", ROOM, 6, content={"msgtype": "m.text", "body": "y"})
-
-        async def _broken(event_id: str, user_id: str) -> Dict[Any, Any]:
-            raise RuntimeError("no state group")
-
-        startup = SafetyIncidentsStartup(
-            self.hs, self.store, self.world.courses(), state_after=_broken
-        )
-        await startup.backfill()
+        self.world.error = RuntimeError("no state group")
+        await self._startup().backfill()
+        self.world.error = None
         self.assertFalse(await self.store.is_done("disposition_backfill"))
         healed = self._startup()
         await healed.backfill()

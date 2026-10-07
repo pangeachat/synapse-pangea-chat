@@ -18,10 +18,10 @@ already written is never overwritten.
   redacted event keeps its original JSON until Synapse's retention prunes it;
   after that the content is empty and `text` is NULL.
 - `course_ids` is the course spaces where, AT THE INCIDENT EVENT'S position,
-  the sender was joined below power level 100 - read from Synapse's state
-  after the last event of each space at or before that position, not from
-  current state. A learner who has since left still lands on the course they
-  were in. This rule is used only here.
+  the sender was joined below power level 100 - `StudentCourses.for_user` at
+  the event's own stream ordering, which reads each space's state after its
+  last event at or before that position, never current state. A learner who
+  has since left still lands on the course they were in.
 - `outcome` is `removed` when the event is redacted now, `unknown` for a
   legacy redaction whose event is still standing (a claim that was kept or
   stranded), and empty otherwise.
@@ -33,19 +33,14 @@ are touched, so an attempt this process starts meanwhile is not.
 """
 
 import json
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from synapse_pangea_chat.moderation.compat import (
     _SecondsInterval,
     background_process_args,
     reraise_if_cancelled,
 )
-from synapse_pangea_chat.moderation.courses import (
-    StateMap,
-    StudentCourses,
-    is_student_in,
-    state_after_event_reader,
-)
+from synapse_pangea_chat.moderation.courses import StudentCourses
 from synapse_pangea_chat.moderation.disposition import CREATE_TABLE_SQL
 from synapse_pangea_chat.moderation.incidents import (
     ACTION_PRESERVED,
@@ -79,26 +74,8 @@ _SELECT_EVENT_SQL = """
     WHERE e.event_id = ?
 """
 
-_SELECT_CANDIDATE_ROOMS_SQL = """
-    SELECT DISTINCT room_id FROM room_memberships WHERE user_id = ?
-"""
-
-_SELECT_LAST_EVENT_AT_SQL = """
-    SELECT event_id FROM events
-    WHERE room_id = ? AND stream_ordering <= ? AND outlier = ?
-    ORDER BY stream_ordering DESC
-    LIMIT 1
-"""
-
 #: For the drift test.
-STATEMENTS = (
-    _SELECT_DISPOSITIONS_SQL,
-    _SELECT_EVENT_SQL,
-    _SELECT_CANDIDATE_ROOMS_SQL,
-    _SELECT_LAST_EVENT_AT_SQL,
-)
-
-StateAfter = Callable[[str, str], Awaitable[StateMap]]
+STATEMENTS = (_SELECT_DISPOSITIONS_SQL, _SELECT_EVENT_SQL)
 
 
 class SafetyIncidentsStartup:
@@ -107,13 +84,10 @@ class SafetyIncidentsStartup:
         homeserver: Any,
         store: IncidentStore,
         courses: StudentCourses,
-        *,
-        state_after: Optional[StateAfter] = None,
     ) -> None:
         self._hs = homeserver
         self._store = store
         self._courses = courses
-        self._state_after = state_after or state_after_event_reader(homeserver)
         self._booted_ms = int(homeserver.get_clock().time_msec())
 
     def schedule(self) -> None:
@@ -269,7 +243,9 @@ class SafetyIncidentsStartup:
                 parsed = json.loads(raw_json)
                 content = parsed.get("content") if isinstance(parsed, dict) else None
                 text = extract_message_text(event_type, content, event_id).text
-            courses = await self._courses_at(sender, int(stream_ordering))
+            # The same position-anchored rule every live incident uses, at the
+            # incident event's own position rather than now.
+            courses = await self._courses.for_user(sender, int(stream_ordering))
         redacted = await self._is_redacted(event_id)
         preserved = disposition == ACTION_PRESERVED
         if redacted is True:
@@ -300,33 +276,3 @@ class SafetyIncidentsStartup:
             created_ms=decided_at_ms,
             updated_ms=max(now_ms, decided_at_ms),
         )
-
-    async def _courses_at(self, user_id: str, position: int) -> Tuple[str, ...]:
-        """The user's student courses at a stream position, from the state of
-        each space after its last event at or before that position."""
-        if self._courses.excluded(user_id):
-            return ()
-        pool = self._hs.get_datastores().main.db_pool
-
-        def _candidates(txn: Any) -> List[Tuple[str, Optional[str]]]:
-            txn.execute(_SELECT_CANDIDATE_ROOMS_SQL, (user_id,))
-            rooms = sorted(row[0] for row in txn.fetchall())
-            result: List[Tuple[str, Optional[str]]] = []
-            for room_id in rooms:
-                txn.execute(_SELECT_LAST_EVENT_AT_SQL, (room_id, position, False))
-                last = txn.fetchone()
-                result.append((room_id, None if last is None else last[0]))
-            return result
-
-        candidates = await pool.runInteraction(
-            "pangea_safety_backfill_candidates", _candidates
-        )
-        courses: List[str] = []
-        for room_id, last_event_id in candidates:
-            if last_event_id is None:
-                # The room did not exist yet at that position.
-                continue
-            state = await self._state_after(last_event_id, user_id)
-            if is_student_in(state, user_id):
-                courses.append(room_id)
-        return tuple(courses)
