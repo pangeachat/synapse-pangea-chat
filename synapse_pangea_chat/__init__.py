@@ -60,6 +60,7 @@ from synapse_pangea_chat.room_preview import (
     RoomPreview,
     invalidate_room_cache,
 )
+from synapse_pangea_chat.set_course_plan import SetCoursePlan
 from synapse_pangea_chat.user_activity import (
     CourseActivities,
     UserActivity,
@@ -438,6 +439,13 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/find_user_by_email",
             resource=self.find_user_by_email_resource,
+        )
+
+        # --- Set Course Plan ---
+        self.set_course_plan_resource = SetCoursePlan(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/set_course_plan",
+            resource=self.set_course_plan_resource,
         )
 
         # --- Course Member Emails ---
