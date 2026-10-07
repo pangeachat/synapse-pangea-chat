@@ -527,6 +527,7 @@ class PangeaChat:
         self.deliver_notice_resource = DeliverNotice(
             api, config, self.direct_push_resource
         )
+        self.deliver_notice_resource.schedule.start()
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/deliver_notice",
             resource=self.deliver_notice_resource,

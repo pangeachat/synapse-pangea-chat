@@ -35,6 +35,14 @@ The former `deliver_nudge` and `prepare_nudge` URLs remain compatibility aliases
 
 Notice emails use the standard [Pangea Brand template](../../../admin/email-marketing/templates/base.html), including its logo, header, gold accents, NSF badge, and company footer. The message body and call to action occupy its content area; the footer shows a simple “Unsubscribe” link, which retains its category-specific destination.
 
+Course/activity images use email-accessible HTTPS URLs within the brand template, with alternative text and a useful plaintext version.
+
+## Scheduled delivery
+
+An optional `scheduled_at` defers the entire notice, including its in-app event, push, and email. Scheduled requests provide notice content instead of an existing event ID. Existing immediate requests remain supported.
+
+Schedules survive restarts and are deduplicated by run/person. At send time, recheck permissions, membership, preferences, and availability, then use the existing delivery service and Notification_Log. Uncertain delivery outcomes require reconciliation rather than automatic resending.
+
 ## The refusal store
 
 Refusal state is one global account-data event per user, `pangea.communication_preferences`: the refused categories, an `all_off` flag, when it changed, and which surface changed it (`unsubscribe_link` or `app`). It is the store the in-app preference screen reads and writes and the store this module reads before every send, so the two surfaces cannot disagree. Rules the store enforces:

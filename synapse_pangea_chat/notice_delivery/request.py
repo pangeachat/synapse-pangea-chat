@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -106,7 +107,7 @@ class NoticeRequest:
     user_id: str
     category: str
     variant: str
-    notice_event_id: str
+    notice_event_id: Optional[str]
     notice_room_id: str
     method: str
     push: Optional[PushContent]
@@ -118,12 +119,30 @@ class NoticeRequest:
         user = string(data, "user_id")
         category = string(data, "category")
         variant = string(data, "variant")
-        event = string(data, "notice_event_id")
+        scheduled = "scheduled_at" in data
+        event = None if scheduled else string(data, "notice_event_id")
+        if scheduled:
+            if "notice_event_id" in data:
+                raise ValueError("Scheduled notices must not already have an event")
+            stamp = datetime.fromisoformat(
+                string(data, "scheduled_at").replace("Z", "+00:00")
+            )
+            if stamp.tzinfo is None:
+                raise ValueError("scheduled_at requires a timezone")
+            sender = string(data, "sender_id")
+            if not sender.startswith("@") or ":" not in sender:
+                raise ValueError("Invalid sender_id")
+            content = data.get("notice_content")
+            if not isinstance(content, dict) or not content:
+                raise ValueError("Scheduled notices require notice_content")
+            # Matrix events have a 64 KiB limit including the event envelope.
+            if len(json.dumps(content).encode()) > 48_000:
+                raise ValueError("notice_content is too large")
         room = string(data, "notice_room_id")
         if (
             not user.startswith("@")
             or ":" not in user
-            or not event.startswith("$")
+            or (event is not None and not event.startswith("$"))
             or not room.startswith("!")
         ):
             raise ValueError("Invalid Matrix user, notice event or room id")
@@ -177,4 +196,7 @@ class NoticeRequest:
 
 
 def is_structured(data: Dict[str, Any]) -> bool:
-    return any(key in data for key in ("push", "email", "delivery_method", "log"))
+    return any(
+        key in data
+        for key in ("push", "email", "delivery_method", "log", "scheduled_at")
+    )

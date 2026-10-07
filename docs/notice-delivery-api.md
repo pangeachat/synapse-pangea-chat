@@ -2,6 +2,8 @@
 
 Design: [notice delivery](../.github/instructions/notice-delivery.instructions.md). All calls require a server-admin Matrix bearer token. Internal module callers use `DeliverNotice.deliver` with the same payload and validation.
 
+For immediate delivery (see [Scheduled notices](#scheduled-notices) for deferred creation):
+
 1. Call `POST /_synapse/client/pangea/v1/prepare_notice` with `{"user_id":"@learner:example.org"}` before recording a notice, to suppress Synapse's duplicate push/email pipeline.
 2. Record a `p.room.notice` from the admin bot into its DM with the recipient. The recipient must be joined.
 3. Call `POST /_synapse/client/pangea/v1/deliver_notice` with the following shape. Keep the same run/person and notice references on every retry.
@@ -58,3 +60,19 @@ Run from this checkout with its absolute path in `PYTHONPATH`, so spawned Synaps
 For the real CMS boundary, run `pnpm exec tsx <synapse-checkout>/tests/fixtures/notice_log_cms.mts /tmp/notice-cms.json` from the sibling CMS checkout, whose `.env` must point to local Postgres. Then run `NOTICE_CMS_FIXTURE=/tmp/notice-cms.json python -m unittest tests.integration.notice_delivery_cms` from this checkout. The fixture uses actual CMS REST handlers, authentication, collection hooks, and uniqueness constraints. Stop it with SIGTERM to remove its test rows and temporary service user. It does not replace or restart a running CMS.
 
 After staging deployment, `python -m unittest tests.staging_tests.notice_delivery` exercises the live structured endpoint and CMS log. Supply `SYNAPSE_AUTH_TOKEN` (server admin), `NOTICE_TEST_USER_ID` (an explicitly authorized internal staging recipient), and `NOTICE_CMS_API_KEY` through the environment. This sends one email, records three notices, and attempts one push; it does not establish physical-device receipt. Read the emitted channel and log IDs, and verify the received email's signed links separately. End the temporary admin session afterward.
+
+## Scheduled notices
+
+Add `scheduled_at` (ISO 8601 with a timezone, for example `2026-10-15T14:00:00Z`) to the structured request. Omit `notice_event_id`; supply `sender_id` (a local server admin joined to the DM) and `notice_content` (the exact `p.room.notice` content the client expects). Keep `notice_room_id`, recipient, category/variant, channel content, and `log` as usual. Do not post the Matrix notice yourself or call `prepare_notice` for this request: the service handles suppression and event creation when due.
+
+The endpoint returns HTTP 202 with `schedule_id`, `scheduled_at_ms`, `status`, `result`, and `duplicate`. Repeating the same request returns the same schedule; changing its content or time while reusing the run/person returns 409. Query `GET /_synapse/client/pangea/v1/deliver_notice?schedule_id=…` with a server-admin token for status and the eventual delivery result, including `notification_log_id` and `notice_event_id`.
+
+Queued requests are stored in the Synapse database. Polling checks due work every five seconds; scheduling is a not-before time, not an exact wall-clock guarantee. A time already in the past becomes due on the next poll. No event, push, email, or delivery log is created at submission. When due, the service reserves Notification_Log before creating the notice and uses the usual delivery path. Refusals or lost eligibility produce no notice. Successful completion removes queued message content, retaining the request fingerprint and safe result for deduplication. Existing immediate requests keep their current behavior.
+
+`queued` means no send has started. `complete` includes delivery and definite no-send outcomes; inspect `result.channel` and `result.reason`. `pending_reconciliation` means execution has claimed the job and may be in progress or interrupted; inspect its result/log and server evidence before any resend. The worker never automatically reclaims it, so an SMTP acknowledgement or event-creation result lost during a restart cannot cause duplicate delivery. A queued job survives a restart. There is no recurring schedule or reschedule/cancel API in this version.
+
+## Course/activity images
+
+Images are ordinary HTML in `email.html`; Synapse preserves them while substituting signed link/footer slots. Use public HTTPS assets, descriptive `alt` text, and responsive inline styles. Do not use `mxc://` or authenticated media endpoints, which email clients cannot fetch. The service does not download or proxy images.
+
+The bundled `notice_email.html` brand template accepts an optional `images` list when the caller renders it, with `url` and `alt` for each course/activity image. This is a template rendering argument, not an extra API field. Pass `{{cta_url}}`, `{{unsubscribe_url}}`, `{{receiving_reason}}`, and `{{postal_address}}` through that render unchanged for Synapse to fill. Include the activity/course name and action in `email.text` so blocked images and plaintext readers still receive useful content.
