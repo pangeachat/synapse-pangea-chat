@@ -123,7 +123,7 @@ class FakePusher:
         self.max_stream_ordering = 10
         self.backoff_delay = 1
         self.failing_since = None
-        self.timed_call = None
+        self.timed_call: FakeDelayedCall | None = None
         self.clock = FakeClock()
         self.hs = FakeHomeServer(active=active)
         self._pusherpool = MagicMock()

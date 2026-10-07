@@ -83,7 +83,7 @@ modules:
         enabled: false
         delay_ms: 60000
         max_delay_ms: 600000
-        require_synapse_version: "1.124.0"
+        require_synapse_version: "1.159.0"
 ```
 
 All config keys are optional and have sensible defaults. The `limit_user_directory` spam checker is only activated when `limit_user_directory_public_attribute_search_path` is set.
@@ -311,7 +311,7 @@ Requester must be a Synapse server admin. The endpoint accepts exactly two disti
 
 Optionally delays normal Matrix HTTP push notifications while the target user is actively using Synapse. This is disabled by default because it monkey-patches Synapse's private `HttpPusher` internals and must be re-audited for every Synapse version upgrade.
 
-When enabled, normal HTTP pushers reschedule unread notifications for users whose Synapse presence `state` is `online` at the configured delay interval. If the event is read before the next check, Synapse's unread push-action query drops it and no notification is sent. If the user becomes offline/unavailable or the event reaches `max_delay_ms` age, the pusher sends normally; stale `currently_active=true` does not keep delaying an offline user. DirectPush, email pushers, and badge-only receipt updates are unchanged.
+When enabled, normal HTTP pushers reschedule unread notifications for users whose Synapse presence `state` is `online` at the configured delay interval. If the event is read before the next check, Synapse's unread push-action query drops it and no notification is sent. If the user becomes offline/unavailable or the event reaches `max_delay_ms` age, the pusher sends normally; stale `currently_active=true` does not keep delaying an offline user. Call rings (`org.matrix.msc4075.rtc.notification`) are never delayed, and a ring queued behind a delayed notification sends it early, in order, along with the ring. DirectPush, email pushers, and badge-only receipt updates are unchanged.
 
 ### Config
 
@@ -320,7 +320,7 @@ When enabled, normal HTTP pushers reschedule unread notifications for users whos
 | `delayed_push.enabled`                   | bool | `false` | Enables the HttpPusher monkey patch |
 | `delayed_push.delay_ms`                  | int  | `60000` | Recheck interval while the user remains active |
 | `delayed_push.max_delay_ms`              | int  | `600000` | Maximum event age before sending even if still active |
-| `delayed_push.require_synapse_version`   | str  | `1.124.0` | Exact audited Synapse version required when enabled |
+| `delayed_push.require_synapse_version`   | str  | `1.159.0` | Exact audited Synapse version required when enabled |
 
 ---
 
