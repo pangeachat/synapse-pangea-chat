@@ -340,6 +340,8 @@ class TestNoticeDeliveryCMS(BaseSynapseE2ETest):
             while time.monotonic() < deadline:
                 try:
                     response = requests.get(status_url, headers=headers, timeout=2)
+                # silent-ok: connection refusal is expected during restart;
+                # the bounded poll fails its final assertion if startup fails.
                 except requests.ConnectionError:
                     time.sleep(0.2)
                     continue

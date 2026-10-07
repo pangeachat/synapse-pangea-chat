@@ -271,6 +271,8 @@ class DeliverNotice(Resource):
         if req is not None and req.notice_event_id is None:
             try:
                 await self._validate_scheduled_target(body, req)
+            # silent-ok: expected eligibility changes become a recorded no-send
+            # result in Notification_Log below, not an unreported failure.
             except ValueError:
                 result = {
                     "user_id": req.user_id,
