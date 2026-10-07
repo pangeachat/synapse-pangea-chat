@@ -125,7 +125,12 @@ class Incident:
     updated_ms: int
 
     def to_json(self) -> Dict[str, Any]:
-        """The wire shape of the read endpoint's `Incident`."""
+        """The wire shape of the read endpoint's `Incident`.
+
+        `course_ids` is deliberately absent: it names every course the
+        subject belongs to, and a course admin reading one course's page has
+        no business learning which others a learner is in.
+        """
         return {
             "incident_id": self.incident_id,
             "source": self.source,
@@ -135,7 +140,6 @@ class Incident:
             "reporter_id": self.reporter_id,
             "room_id": self.room_id,
             "event_id": self.event_id,
-            "course_ids": list(self.course_ids or ()),
             "categories": list(self.categories),
             "self_harm": self.self_harm,
             "rule": self.rule,
