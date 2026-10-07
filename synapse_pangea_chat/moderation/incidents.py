@@ -540,15 +540,32 @@ class IncidentStore:
                 return False
             existing = _row_to_incident(row)
             if attempt_id is not None and existing.attempt_id != attempt_id:
+                if (
+                    existing.prior_attempt_id == attempt_id
+                    and existing.prior_outcome != OUTCOME_REMOVED
+                ):
+                    # The owner a provisional attempt suspended: its result
+                    # is what that attempt puts back if it is abandoned, so it
+                    # is kept there rather than lost.
+                    _write_update(
+                        txn,
+                        attr.evolve(existing, prior_outcome=outcome),
+                        next_updated_ms(existing.updated_ms, now_ms),
+                    )
+                    return True
                 # A later attempt owns the outcome now; this result is stale.
                 return False
             if only_if is not None and existing.outcome != only_if:
                 return False
             if existing.outcome == OUTCOME_REMOVED or existing.outcome == outcome:
                 return False
+            # The attempt has a result, so there is nothing left to put back:
+            # the suspended owner's record goes, and its late result is stale.
             _write_update(
                 txn,
-                attr.evolve(existing, outcome=outcome),
+                attr.evolve(
+                    existing, outcome=outcome, prior_outcome=None, prior_attempt_id=None
+                ),
                 next_updated_ms(existing.updated_ms, now_ms),
             )
             return True

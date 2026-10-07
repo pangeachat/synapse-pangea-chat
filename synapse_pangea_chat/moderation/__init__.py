@@ -1135,7 +1135,12 @@ class ChatModeration:
                 # one is handed to the Safety page's retry, as flagged and
                 # left up - which is what happens to the message.
                 reraise_if_cancelled(
-                    exc, partial(self._rescue_unscreened, pairs[index + 1 :])
+                    exc,
+                    partial(
+                        self._rescue_unscreened,
+                        pairs[index + 1 :],
+                        verdicts.confirmed,
+                    ),
                 )
                 # silent-ok: fail-open by contract, and the loop has to
                 # survive for the jobs behind this one. Counted for this
@@ -1252,14 +1257,34 @@ class ChatModeration:
         return self._capture_verdict(job, ACTION_KEPT, None, screen)
 
     def _rescue_unscreened(
-        self, pairs: Sequence[Tuple[ModerationJob, Optional[Dict[str, Any]]]]
+        self,
+        pairs: Sequence[Tuple[ModerationJob, Optional[Dict[str, Any]]]],
+        confirmed: bool,
     ) -> None:
         """Hand every flagged answer a cancelled batch did not reach to the
         retry. Nothing was enforced on any of them, so each is recorded as
-        flagged and left up."""
+        flagged and left up - except a CONFIRMED self-harm verdict, which is
+        a verdict about that message alone and gets what it would have got:
+        the durable preserve, started here so it is protected in memory at
+        once, and a `preserved` row. A screen is never acted on, so a
+        screened self-harm flag is recorded and not preserved."""
         for job, result in pairs:
-            if result is not None and result.get("flagged"):
-                self._retry_captured(self._capture_screen(job, result))
+            if result is None or not result.get("flagged"):
+                continue
+            categories = result.get("categories")
+            if (
+                confirmed
+                and _usable_categories(categories)
+                and _should_preserve(categories)
+            ):
+                run_in_background(
+                    self._record_preserved, job, _summarize_categories(categories)
+                )
+                self._retry_captured(
+                    self._capture_verdict(job, ACTION_PRESERVED, None, result)
+                )
+                continue
+            self._retry_captured(self._capture_screen(job, result))
 
     def _retry_captured(self, captured: Optional[Incident]) -> None:
         if captured is not None:

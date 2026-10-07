@@ -1478,9 +1478,41 @@ class TestRoundTwoFindings(Tier2Case):
                     await module._screen_batch(jobs)
         homeserver.clock.advance(1.0)
         second = await self._row(module, "$e2")
-        self.assertEqual(second.action, ACTION_KEPT)
+        # Confirmed: a verdict about that message alone, so it is preserved.
+        # A screened one is recorded and not acted on - see the next test.
+        self.assertEqual(second.action, ACTION_PRESERVED)
         self.assertTrue(second.self_harm)
         self.assertIsNone(await module._incidents.get("mod:$e3"))
+
+    async def test_a_cancelled_screen_records_and_does_not_preserve(self) -> None:
+        module, api, homeserver, _db = self._module()
+        jobs = (_job("$e1"), _job("$e2"))
+        results = [
+            {"flagged": True, "categories": ["harassment"], "evaluated": True},
+            {"flagged": True, "categories": ["self-harm/intent"], "evaluated": True},
+        ]
+        assert module._checker is not None
+        batch = SimpleNamespace(results=results, confirmed=False)
+
+        async def _check_batch(texts: Any) -> Any:
+            return batch
+
+        async def _check(text: str) -> Any:
+            raise defer.CancelledError()
+
+        with patch.object(module._checker, "check_batch", _check_batch):
+            with patch.object(module._checker, "check", _check):
+                with self.assertRaises(defer.CancelledError):
+                    await module._screen_batch(jobs)
+        homeserver.clock.advance(1.0)
+        second = await self._row(module, "$e2")
+        self.assertEqual(second.action, ACTION_KEPT)
+        self.assertTrue(second.self_harm)
+        assert module._disposition is not None
+        self.assertFalse(
+            await module._disposition.is_preserved("$e2"),
+            "a screen was acted on",
+        )
 
 
 class TestCreatorsByRoomVersion(unittest.TestCase):
@@ -1570,3 +1602,114 @@ class TestCandidatesWithoutCurrentState(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await check("!gone:example.org"))
         self.assertTrue(await check("!course:example.org"))
         self.assertFalse(await check("!chat:example.org"))
+
+
+class TestRoundThreeFindings(Tier2Case):
+    async def test_a_rescued_confirmed_self_harm_verdict_is_still_protected(
+        self,
+    ) -> None:
+        module, api, homeserver, _db = self._module()
+        jobs = (_job("$e1"), _job("$e2"))
+        results = [
+            {"flagged": True, "categories": ["harassment"], "evaluated": True},
+            {"flagged": True, "categories": ["self-harm/intent"], "evaluated": True},
+        ]
+        assert module._checker is not None
+        batch = SimpleNamespace(results=results, confirmed=True)
+
+        async def _check_batch(texts: Any) -> Any:
+            return batch
+
+        async def _decide(job: Any, result: Any) -> None:
+            raise defer.CancelledError()
+
+        with patch.object(module._checker, "check_batch", _check_batch):
+            with patch.object(module, "_decide", _decide):
+                with self.assertRaises(defer.CancelledError):
+                    await module._screen_batch(jobs)
+        homeserver.clock.advance(1.0)
+        with patch(MODERATE_TEXT, _verdict("harassment")):
+            await module._check_and_redact(_job("$e2"))
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        row = await self._row(module, "$e2")
+        self.assertEqual(row.action, ACTION_PRESERVED)
+        self.assertTrue(row.self_harm)
+
+    async def test_an_absurd_score_on_a_redaction_still_records_it(self) -> None:
+        """An integer too large for a float is an unreadable score, and an
+        unreadable score redacts - with its row, like any other."""
+        module, api, _hs, _db = self._module()
+        with patch(
+            MODERATE_TEXT, _verdict("harassment", scores={"harassment": 10**400})
+        ):
+            await module._check_and_redact(_job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
+        row = await self._row(module)
+        self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_REMOVED))
+        self.assertIsNone(row.top_score)
+
+    async def test_a_suspended_owners_result_survives_the_abandon(self) -> None:
+        """Attempt A's result lands while attempt B is provisional, and B is
+        then abandoned. B must put back A's RESULT, not A's stale pending."""
+        store, _hs = _store()
+        await store.upsert_verdict(
+            _incident(action=ACTION_REDACTED, outcome=OUTCOME_PENDING, attempt_id="a")
+        )
+        await store.upsert_verdict(
+            _incident(action=ACTION_REDACTED, outcome=OUTCOME_PENDING, attempt_id="b")
+        )
+        self.assertTrue(
+            await store.set_outcome("mod:$e1", OUTCOME_REMOVED, attempt_id="a")
+        )
+        self.assertTrue(await store.abandon_attempt("mod:$e1", "b"))
+        row = await store.get("mod:$e1")
+        assert row is not None
+        self.assertEqual((row.outcome, row.attempt_id), (OUTCOME_REMOVED, "a"))
+
+
+class TestHistoricalStateIsReadAsSent(unittest.IsolatedAsyncioTestCase):
+    async def _behaviour(self, historical: bool) -> Any:
+        from synapse.storage.databases.main.events_worker import EventRedactBehaviour
+
+        from synapse_pangea_chat.moderation import courses as courses_module
+
+        seen: List[Any] = []
+        ids = {
+            (COURSE_PLAN_EVENT_TYPE, ""): "$plan",
+            (CREATE_EVENT_TYPE, ""): "$create",
+        }
+
+        async def _ids(_target: str, _filter: Any) -> Dict[Any, str]:
+            return ids
+
+        async def _get_events(
+            event_ids: List[str], redact_behaviour: Any = EventRedactBehaviour.redact
+        ) -> Dict[str, Any]:
+            seen.append(redact_behaviour)
+            return {}
+
+        homeserver = SimpleNamespace(
+            get_storage_controllers=lambda: SimpleNamespace(
+                state=SimpleNamespace(
+                    get_state_ids_for_event=_ids, get_current_state_ids=_ids
+                )
+            ),
+            get_datastores=lambda: SimpleNamespace(
+                main=SimpleNamespace(get_events=_get_events)
+            ),
+        )
+        if historical:
+            await courses_module.state_after_event_reader(homeserver)("$e", STUDENT)
+        else:
+            await courses_module.current_state_reader(homeserver)("!r", STUDENT)
+        return seen[0]
+
+    async def test_a_later_redaction_does_not_rewrite_the_past(self) -> None:
+        from synapse.storage.databases.main.events_worker import EventRedactBehaviour
+
+        self.assertEqual(await self._behaviour(True), EventRedactBehaviour.as_is)
+        self.assertEqual(
+            await self._behaviour(False),
+            EventRedactBehaviour.redact,
+            "the read endpoint's gate must see the room as it is now",
+        )

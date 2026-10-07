@@ -271,14 +271,31 @@ def state_after_event_reader(
         )
         if (COURSE_PLAN_EVENT_TYPE, "") not in ids:
             return {}
-        return await _load(homeserver, ids)
+        return await _load(homeserver, ids, as_sent=True)
 
     return _read
 
 
-async def _load(homeserver: Any, ids: Mapping[Tuple[str, str], str]) -> StateMap:
+async def _load(
+    homeserver: Any, ids: Mapping[Tuple[str, str], str], *, as_sent: bool = False
+) -> StateMap:
+    """The state events behind `ids`.
+
+    `as_sent` reads them as they were when sent, not as a later redaction
+    left them. A historical lookup needs that: a course plan redacted after
+    the incident - replaced by a new one, say - was in force at the
+    incident's position, and pruned to an empty content it would read as no
+    course at all, moving the incident off the course it belonged to.
+    """
+    from synapse.storage.databases.main.events_worker import EventRedactBehaviour
+
     store = homeserver.get_datastores().main
-    events = await store.get_events(list(ids.values()))
+    events = await store.get_events(
+        list(ids.values()),
+        redact_behaviour=(
+            EventRedactBehaviour.as_is if as_sent else EventRedactBehaviour.redact
+        ),
+    )
     result: Dict[Tuple[str, str], Any] = {}
     for key, event_id in ids.items():
         event = events.get(event_id)
