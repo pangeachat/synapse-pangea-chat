@@ -38,6 +38,7 @@ from synapse_pangea_chat.moderation.compat import (
 from synapse_pangea_chat.moderation.courses import StudentCourses
 from synapse_pangea_chat.moderation.incidents import Incident, IncidentStore
 from synapse_pangea_chat.moderation.log_safety import error_site, scrubbing_logger
+from synapse_pangea_chat.moderation.room_names import RoomNames
 
 logger = scrubbing_logger("synapse.modules.synapse_pangea_chat.moderation.recorder")
 
@@ -57,12 +58,14 @@ class IncidentRecorder:
         store: IncidentStore,
         courses: StudentCourses,
         *,
+        room_names: Optional[RoomNames] = None,
         attempts: int = RETRY_ATTEMPTS,
         first_delay_seconds: float = RETRY_FIRST_DELAY_SECONDS,
     ) -> None:
         self._hs = homeserver
         self.store = store
         self.courses = courses
+        self.room_names = room_names or RoomNames.from_homeserver(homeserver)
         self._attempts = attempts
         self._first_delay = first_delay_seconds
 
@@ -97,7 +100,16 @@ class IncidentRecorder:
             courses = await self.courses.for_user(incident.subject_id, position)
         else:
             courses = ()
-        return attr.evolve(incident, course_ids=courses, as_of=position)
+        # Read with the courses and carried with them, so a retry does not
+        # read it again. Best effort: None when it cannot be read.
+        room_name = incident.room_name
+        if room_name is None:
+            room_name = await self.room_names.label(
+                incident.room_id, incident.subject_id, position
+            )
+        return attr.evolve(
+            incident, course_ids=courses, as_of=position, room_name=room_name
+        )
 
     # ------------------------------------------------------------------
     # Tier 1

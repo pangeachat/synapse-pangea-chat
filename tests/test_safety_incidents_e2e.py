@@ -165,6 +165,7 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
             self._join(course, learner)
             chat = self._create_room(
                 teacher,
+                name="Week 3 chat",
                 preset="private_chat",
                 initial_state=[
                     {
@@ -245,6 +246,7 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
             self.assertEqual(reported["text"], "you are rudely unkind")
             self.assertEqual(reported["reason"], "unkind␀!")
             self.assertEqual(reported["action"], "reported")
+            self.assertEqual(reported["room_name"], "Week 3 chat")
             self.assertNotIn("course_ids", reported)
             block = self._wait_for_incident(
                 teacher, course, lambda i: i["action"] == "blocked"

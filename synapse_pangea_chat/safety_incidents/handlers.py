@@ -41,6 +41,7 @@ from synapse_pangea_chat.moderation.incidents import (
     IncidentStore,
     report_incident_id,
 )
+from synapse_pangea_chat.moderation.room_names import RoomNames
 
 JOIN = "join"
 
@@ -77,11 +78,16 @@ def _valid_event_id(value: Any) -> bool:
 
 class ReportHandler:
     def __init__(
-        self, homeserver: Any, store: IncidentStore, courses: StudentCourses
+        self,
+        homeserver: Any,
+        store: IncidentStore,
+        courses: StudentCourses,
+        room_names: Optional[RoomNames] = None,
     ) -> None:
         self._hs = homeserver
         self._store = store
         self._courses = courses
+        self._room_names = room_names or RoomNames.from_homeserver(homeserver)
 
     async def report(self, reporter: UserID, body: Any) -> Response:
         if not isinstance(body, dict):
@@ -133,9 +139,9 @@ class ReportHandler:
             text = extract_message_text(event.type, event.content, event.event_id).text
         # At report time: there is no send-time snapshot for a message that
         # was never flagged.
-        courses = await self._courses.for_report(
-            subject_id, reporter_id, self._courses.position_now()
-        )
+        position = self._courses.position_now()
+        courses = await self._courses.for_report(subject_id, reporter_id, position)
+        room_name = await self._room_names.label(room_id, subject_id, position)
         now_ms = self._store.now_ms()
         incident_id = report_incident_id(report_id)
         written = await self._store.insert(
@@ -148,6 +154,7 @@ class ReportHandler:
                 reporter_id=reporter_id,
                 room_id=room_id,
                 event_id=event_id,
+                room_name=room_name,
                 course_ids=courses,
                 categories=(),
                 self_harm=False,

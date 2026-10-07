@@ -124,6 +124,9 @@ class Incident:
     reason: Optional[str]
     created_ms: int
     updated_ms: int
+    #: The room's readable name when the incident happened; see
+    #: `moderation.room_names`. Same U+0000 rule as `text`.
+    room_name: Optional[str] = None
     #: Which redaction attempt owns `outcome`. Internal: it is what stops a
     #: delayed result from one attempt overwriting a later attempt's. Minted
     #: by `new_attempt_id`, so it also says which process started it.
@@ -152,6 +155,7 @@ class Incident:
             "subject_id": self.subject_id,
             "reporter_id": self.reporter_id,
             "room_id": self.room_id,
+            "room_name": self.room_name,
             "event_id": self.event_id,
             "categories": list(self.categories),
             "self_harm": self.self_harm,
@@ -241,6 +245,9 @@ def merge_incident(existing: Incident, new: Incident) -> Incident:
         top_score=_max_score(existing.top_score, new.top_score),
         text=existing.text if existing.text is not None else new.text,
         rule=existing.rule if existing.rule is not None else new.rule,
+        room_name=(
+            existing.room_name if existing.room_name is not None else new.room_name
+        ),
     )
 
 
@@ -282,7 +289,8 @@ _CREATE_INCIDENTS_SQL = """
         updated_ms BIGINT NOT NULL,
         attempt_id TEXT,
         prior_outcome TEXT,
-        prior_attempt_id TEXT
+        prior_attempt_id TEXT,
+        room_name TEXT
     )
 """
 
@@ -310,7 +318,7 @@ _SELECT_ONE_SQL = """
     SELECT incident_id, source, action, outcome, subject_id, reporter_id,
         room_id, event_id, course_ids, categories, self_harm, rule, top_score,
         text, reason, created_ms, updated_ms, attempt_id, prior_outcome,
-        prior_attempt_id
+        prior_attempt_id, room_name
     FROM pangea_safety_incidents
     WHERE incident_id = ?
 """
@@ -320,8 +328,8 @@ _INSERT_SQL = """
         (incident_id, source, action, outcome, subject_id, reporter_id,
         room_id, event_id, course_ids, categories, self_harm, rule, top_score,
         text, reason, created_ms, updated_ms, attempt_id, prior_outcome,
-        prior_attempt_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        prior_attempt_id, room_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (incident_id) DO NOTHING
 """
 
@@ -335,7 +343,7 @@ _UPDATE_SQL = """
     UPDATE pangea_safety_incidents
     SET action = ?, outcome = ?, categories = ?, self_harm = ?, rule = ?,
         top_score = ?, text = ?, updated_ms = ?, attempt_id = ?,
-        prior_outcome = ?, prior_attempt_id = ?
+        prior_outcome = ?, prior_attempt_id = ?, room_name = ?
     WHERE incident_id = ?
 """
 
@@ -343,7 +351,8 @@ _SELECT_FOR_COURSE_SQL = """
     SELECT i.incident_id, i.source, i.action, i.outcome, i.subject_id,
         i.reporter_id, i.room_id, i.event_id, i.course_ids, i.categories,
         i.self_harm, i.rule, i.top_score, i.text, i.reason, i.created_ms,
-        i.updated_ms, i.attempt_id, i.prior_outcome, i.prior_attempt_id
+        i.updated_ms, i.attempt_id, i.prior_outcome, i.prior_attempt_id,
+        i.room_name
     FROM pangea_safety_incidents AS i
     INNER JOIN pangea_safety_incident_courses AS c
         ON c.incident_id = i.incident_id
@@ -404,6 +413,7 @@ def _row_to_incident(row: Sequence[Any]) -> Incident:
         attempt_id=row[17],
         prior_outcome=row[18],
         prior_attempt_id=row[19],
+        room_name=row[20],
     )
 
 
@@ -429,6 +439,7 @@ def _insert_args(incident: Incident) -> Tuple[Any, ...]:
         incident.attempt_id,
         incident.prior_outcome,
         incident.prior_attempt_id,
+        nul_safe(incident.room_name),
     )
 
 
@@ -736,6 +747,7 @@ def _write_update(txn: Any, incident: Incident, updated_ms: int) -> None:
             incident.attempt_id,
             incident.prior_outcome,
             incident.prior_attempt_id,
+            nul_safe(incident.room_name),
             incident.incident_id,
         ),
     )

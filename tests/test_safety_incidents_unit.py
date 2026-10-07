@@ -65,6 +65,11 @@ from synapse_pangea_chat.moderation.incidents import (
     next_updated_ms,
 )
 from synapse_pangea_chat.moderation.recorder import IncidentRecorder
+from synapse_pangea_chat.moderation.room_names import (
+    NAME_EVENT_TYPE,
+    RoomNames,
+    label_from_state,
+)
 
 from .moderation_doubles import (
     DbPoolDouble,
@@ -124,6 +129,9 @@ class CourseWorld:
         self.position = 0
         self.reads: List[Tuple[str, str]] = []
         self.error: Optional[Exception] = None
+        self.names: List[Tuple[int, str, str]] = []
+        self.display_names: Dict[str, str] = {}
+        self.name_error: Optional[Exception] = None
 
     def _tick(self) -> int:
         self.position += 1
@@ -189,6 +197,32 @@ class CourseWorld:
                 {"membership": "join"}, sender=user_id
             )
         return state
+
+    def rename(self, room_id: str, name: str) -> None:
+        self.names.append((self._tick(), room_id, name))
+
+    async def name_state(self, room_id: str, position: int) -> Dict[Any, Any]:
+        """The room's name and joined members at `position`, as
+        `moderation.room_names` reads them."""
+        if self.name_error is not None:
+            raise self.name_error
+        state: Dict[Any, Any] = {}
+        for at, room, name in self.names:
+            if at <= position and room == room_id:
+                state[(NAME_EVENT_TYPE, "")] = _state_event({"name": name})
+        users = {user for _at, user, room, _join in self.timeline if room == room_id}
+        for user in users:
+            if self.joined_at(user, room_id, position):
+                content: Dict[str, Any] = {"membership": "join"}
+                if user in self.display_names:
+                    content["displayname"] = self.display_names[user]
+                state[(MEMBER_EVENT_TYPE, user)] = _state_event(content, sender=user)
+        return state
+
+    def room_names(self) -> RoomNames:
+        return RoomNames(
+            read_state=self.name_state, current_position=lambda: self.position
+        )
 
     async def read_state(self, room_id: str, user_id: str) -> Dict[Any, Any]:
         """Current state, for the read endpoint's admin check."""
@@ -665,6 +699,7 @@ def _tier1(world: CourseWorld) -> Tuple[ChatModeration, HomeServerDouble, DbPool
     homeserver = HomeServerDouble()
     module = ChatModeration(_module_api(homeserver), _config())
     module._recorder.courses = world.courses()
+    module._recorder.room_names = world.room_names()
     return module, homeserver, homeserver.store.db_pool
 
 
@@ -800,8 +835,22 @@ class Tier2Case(unittest.IsolatedAsyncioTestCase):
         homeserver = HomeServerDouble(store)
         api = _module_api(homeserver)
         module = _tier2_module(self, api, _tier2_config())
-        module._recorder.courses = (world or _classroom()).courses()
+        world = world or _classroom()
+        module._recorder.courses = world.courses()
+        module._recorder.room_names = world.room_names()
         return module, api, homeserver, homeserver.store.db_pool
+
+    async def _queue(self, module: ChatModeration, event: Any) -> ModerationJob:
+        assert module._dispatcher is not None
+        queued: List[ModerationJob] = []
+        with patch.object(
+            module._dispatcher,
+            "enqueue",
+            side_effect=_accepting(queued),
+        ):
+            await module.on_new_event(event, {})
+        self.assertEqual(len(queued), 1)
+        return queued[0]
 
     async def _row(self, module: ChatModeration, event_id: str = "$e1") -> Incident:
         row = await module._incidents.get(f"mod:{event_id}")
@@ -1017,18 +1066,6 @@ def _sent_event(world: CourseWorld, body: str, event_id: str = "$e1") -> Any:
 
 
 class TestCourseIsFrozenAtQueueTime(Tier2Case):
-    async def _queue(self, module: ChatModeration, event: Any) -> ModerationJob:
-        assert module._dispatcher is not None
-        queued: List[ModerationJob] = []
-        with patch.object(
-            module._dispatcher,
-            "enqueue",
-            side_effect=_accepting(queued),
-        ):
-            await module.on_new_event(event, {})
-        self.assertEqual(len(queued), 1)
-        return queued[0]
-
     async def test_a_learner_who_leaves_before_the_verdict_lands_on_the_course(
         self,
     ) -> None:
@@ -1713,3 +1750,107 @@ class TestHistoricalStateIsReadAsSent(unittest.IsolatedAsyncioTestCase):
             EventRedactBehaviour.redact,
             "the read endpoint's gate must see the room as it is now",
         )
+
+
+class TestRoomNames(unittest.IsolatedAsyncioTestCase):
+    def _state(self, name: Optional[str], *members: Tuple[str, Optional[str]]) -> Any:
+        state: Dict[Any, Any] = {}
+        if name is not None:
+            state[(NAME_EVENT_TYPE, "")] = _state_event({"name": name})
+        for user, display in members:
+            content: Dict[str, Any] = {"membership": "join"}
+            if display is not None:
+                content["displayname"] = display
+            state[(MEMBER_EVENT_TYPE, user)] = _state_event(content)
+        return state
+
+    def test_the_label_rule(self) -> None:
+        self.assertEqual(
+            label_from_state(self._state("Week 3 chat"), STUDENT), "Week 3 chat"
+        )
+        self.assertEqual(
+            label_from_state(
+                self._state(None, (STUDENT, "Lea"), (TEACHER, "Ms Ortiz")), STUDENT
+            ),
+            "Direct chat with Ms Ortiz",
+        )
+        self.assertEqual(
+            label_from_state(
+                self._state("  ", (STUDENT, None), (TEACHER, None)), STUDENT
+            ),
+            f"Direct chat with {TEACHER}",
+        )
+        self.assertIsNone(
+            label_from_state(
+                self._state(None, (STUDENT, None), (TEACHER, None), (OUTSIDER, None)),
+                STUDENT,
+            ),
+            "a group with no name is not a direct chat",
+        )
+        self.assertIsNone(
+            label_from_state(
+                self._state(None, (TEACHER, None), (OUTSIDER, None)), STUDENT
+            ),
+            "a chat the subject is not in is nobody's direct chat with them",
+        )
+
+    async def test_a_verdict_carries_the_name_the_room_had_when_queued(self) -> None:
+        world = _classroom()
+        world.rename(ROOM, "Before")
+        names = world.room_names()
+        at = world.position
+        world.rename(ROOM, "After")
+        self.assertEqual(await names.label(ROOM, STUDENT, at), "Before")
+        self.assertEqual(await names.label(ROOM, STUDENT, None), "After")
+
+    async def test_an_unreadable_name_is_none_and_never_a_failure(self) -> None:
+        world = _classroom()
+        world.name_error = RuntimeError("state unreadable")
+        self.assertIsNone(await world.room_names().label(ROOM, STUDENT, None))
+
+
+class TestIncidentsCarryTheRoomName(Tier2Case):
+    async def test_tier2_snapshots_the_name_at_the_messages_position(self) -> None:
+        world = _classroom()
+        world.rename(ROOM, "Debate club")
+        module, _api, _hs, _db = self._module(world)
+        job = await self._queue(module, _sent_event(world, "you are awful"))
+        world.rename(ROOM, "Renamed later")
+        with patch(MODERATE_TEXT, _verdict("harassment")):
+            await module._check_and_redact(job)
+        row = await self._row(module)
+        self.assertEqual(row.room_name, "Debate club")
+        self.assertEqual(row.to_json()["room_name"], "Debate club")
+
+    async def test_a_block_carries_the_name_and_nul_is_replaced(self) -> None:
+        world = _classroom()
+        world.rename(ROOM, "Lab\x00 room")
+        module, _hs, db_pool = _tier1(world)
+        tier1_refusal_code(
+            await module.check_event_for_spam(_event(PHONE_TEXT, sender=STUDENT))
+        )
+        name = db_pool.connection.execute(
+            "SELECT room_name FROM pangea_safety_incidents"
+        ).fetchone()[0]
+        self.assertEqual(name, "Lab\u2400 room")
+
+    async def test_a_name_that_cannot_be_read_does_not_cost_the_redaction(
+        self,
+    ) -> None:
+        world = _classroom()
+        world.name_error = RuntimeError("state unreadable")
+        module, api, _hs, _db = self._module(world)
+        with patch(MODERATE_TEXT, _verdict("harassment")):
+            await module._check_and_redact(_job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_awaited_once()
+        row = await self._row(module)
+        self.assertIsNone(row.room_name)
+        self.assertEqual(row.course_ids, (COURSE_A,))
+
+    async def test_a_repeat_verdict_keeps_the_first_name(self) -> None:
+        merged = merge_incident(
+            _incident(room_name="First"), _incident(room_name="Second")
+        )
+        self.assertEqual(merged.room_name, "First")
+        filled = merge_incident(_incident(room_name=None), _incident(room_name="Late"))
+        self.assertEqual(filled.room_name, "Late")

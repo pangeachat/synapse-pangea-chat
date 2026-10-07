@@ -164,7 +164,10 @@ class ReportCase(unittest.IsolatedAsyncioTestCase):
         self.hs = FakeHomeServer()
         self.world = _classroom()
         self.store = IncidentStore(self.hs)
-        self.handler = ReportHandler(self.hs, self.store, self.world.courses())
+        self.world.rename(ROOM, "Week 3 chat")
+        self.handler = ReportHandler(
+            self.hs, self.store, self.world.courses(), self.world.room_names()
+        )
         self.hs.store.events["$msg"] = FakeEvent()
         self.hs.store.events["$other"] = FakeEvent(
             event_id="$other", room_id=OTHER_ROOM
@@ -241,6 +244,7 @@ class TestReportSnapshot(ReportCase):
         self.assertEqual((row.room_id, row.event_id), (ROOM, "$msg"))
         self.assertEqual(row.text, "you are awful")
         self.assertEqual(row.reason, "this is bullying")
+        self.assertEqual(row.room_name, "Week 3 chat")
         self.assertEqual(
             row.course_ids,
             (COURSE_A,),
@@ -336,6 +340,7 @@ class TestReadIsCourseAdminsOnly(unittest.IsolatedAsyncioTestCase):
                 "subject_id",
                 "reporter_id",
                 "room_id",
+                "room_name",
                 "event_id",
                 "categories",
                 "self_harm",
@@ -494,7 +499,9 @@ class StartupCase(unittest.IsolatedAsyncioTestCase):
         self.store = IncidentStore(self.hs)
 
     def _startup(self) -> SafetyIncidentsStartup:
-        return SafetyIncidentsStartup(self.hs, self.store, self.world.courses())
+        return SafetyIncidentsStartup(
+            self.hs, self.store, self.world.courses(), self.world.room_names()
+        )
 
 
 class TestStartupSweep(StartupCase):
@@ -627,7 +634,9 @@ class TestBackfill(StartupCase):
     ) -> None:
         """The learner was in course A when the message was sent and has left
         since; they joined course B after it. The row belongs to A only."""
+        self.world.rename(ROOM, "Then")
         sent_at = self.world.position
+        self.world.rename(ROOM, "Now")
         self.world.leave(STUDENT, COURSE_A)
         self.world.join(STUDENT, COURSE_B)
         self._event(
@@ -640,6 +649,7 @@ class TestBackfill(StartupCase):
         row = await self.store.get("mod:$msg")
         assert row is not None
         self.assertEqual(row.course_ids, (COURSE_A,))
+        self.assertEqual(row.room_name, "Then", "the backfill read today's name")
         self.assertEqual(row.action, ACTION_REDACTED)
         self.assertEqual(row.outcome, OUTCOME_REMOVED)
         self.assertEqual(row.text, "awful", "the unpruned JSON was not read")

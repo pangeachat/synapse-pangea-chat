@@ -56,6 +56,7 @@ from synapse_pangea_chat.moderation.incidents import (
     started_by_this_process,
 )
 from synapse_pangea_chat.moderation.log_safety import error_site, scrubbing_logger
+from synapse_pangea_chat.moderation.room_names import RoomNames
 
 logger = scrubbing_logger(
     "synapse.modules.synapse_pangea_chat.moderation.safety_startup"
@@ -86,10 +87,12 @@ class SafetyIncidentsStartup:
         homeserver: Any,
         store: IncidentStore,
         courses: StudentCourses,
+        room_names: Optional[RoomNames] = None,
     ) -> None:
         self._hs = homeserver
         self._store = store
         self._courses = courses
+        self._room_names = room_names or RoomNames.from_homeserver(homeserver)
 
     def schedule(self) -> None:
         """Run once, on the next reactor turn."""
@@ -245,6 +248,7 @@ class SafetyIncidentsStartup:
         subject_id: Optional[str] = None
         text: Optional[str] = None
         courses: Tuple[str, ...] = ()
+        room_name: Optional[str] = None
         if row is not None:
             sender, stream_ordering, event_type, raw_json = row
             subject_id = sender
@@ -255,6 +259,10 @@ class SafetyIncidentsStartup:
             # The same position-anchored rule every live incident uses, at the
             # incident event's own position rather than now.
             courses = await self._courses.for_user(sender, int(stream_ordering))
+            # The room's name as it was at the incident event, too.
+            room_name = await self._room_names.label(
+                room_id, sender, int(stream_ordering)
+            )
         redacted = await self._is_redacted(event_id)
         preserved = disposition == ACTION_PRESERVED
         if redacted is True:
@@ -273,6 +281,7 @@ class SafetyIncidentsStartup:
             reporter_id=None,
             room_id=room_id,
             event_id=event_id,
+            room_name=room_name,
             course_ids=courses,
             categories=(category,),
             # Preservation only ever happened for self-harm; the stored
