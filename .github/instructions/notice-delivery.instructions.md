@@ -64,11 +64,11 @@ The confirmation, success, and expired-link pages share a branded, responsive la
 
 `GET /_synapse/client/pangea/v1/n?t=<token>` — unauthenticated, rate-limited per client address.
 
-The email's call-to-action goes through this redirect. It writes the same first-party `p.room.notice.opened` event into the DM that the client writes on a push tap — sender is the person, content names the notice and the variant — so an email click feeds cooldown and backoff exactly like a tap, then redirects to the app: the shareable activity link (`/:activityId`, with `?roomid=` when a session exists) or the World map. The record never blocks the redirect: an expired link or a failed write logs a warning and the person still lands in the app.
+The email's call-to-action goes through this redirect. It writes the same first-party `p.room.notice.opened` event into the DM that the client writes on a push tap — sender is the person, content names the notice and the variant — so an email click feeds cooldown and backoff exactly like a tap. Tracked notice links may target a caller-supplied path within the configured app, including course pages and course join links; external destinations are rejected. Existing activity/session targets remain supported, and a notice without a destination opens the World map. A caller-supplied path takes precedence over those legacy targets and is signed with the notice so it cannot be changed after delivery. This affects the email destination; callers still supply the corresponding in-app notice and push routing metadata. The record never blocks the redirect: an expired link lands at the app root, and a failed write logs a warning while preserving a valid destination.
 
 ## Signed links
 
-Both links are HMAC-signed tokens naming the person, the action, and an expiry (`notice_token_ttl_days`, default 90 — past CAN-SPAM's 30 and CASL's 60). The key is `notice_token_secret`, falling back to the homeserver's macaroon secret so no new secret is required to turn email on. Payloads carry ids only, never addresses or bodies. A click token cannot be used to unsubscribe and vice versa.
+Both links are HMAC-signed tokens naming the person, the action, and an expiry (`notice_token_ttl_days`, default 90 — past CAN-SPAM's 30 and CASL's 60). The key is `notice_token_secret`, falling back to the homeserver's macaroon secret so no new secret is required to turn email on. Payloads carry identifiers and the optional app destination, never email addresses or message bodies; destinations must not contain credentials or personal data. A click token cannot be used to unsubscribe and vice versa.
 
 ## Keeping Synapse's own pipeline off bot notices
 
