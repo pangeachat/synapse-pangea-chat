@@ -6,11 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import synapse
+from synapse.push.httppusher import HttpPusher
 
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.delayed_push.delayed_push import (
     AUDITED_SYNAPSE_VERSION,
-    _pangea_delayed_push_start_processing,
+    CALL_RING_EVENT_TYPE,
     _pangea_delayed_push_unsafe_process,
     configure_delayed_push,
     reset_delayed_push_patch_for_tests,
@@ -109,6 +110,8 @@ class FakeHomeServer:
 
 
 class FakePusher:
+    MAX_BACKOFF_SEC = HttpPusher.MAX_BACKOFF_SEC
+
     def __init__(self, *, active: bool = True, event_age_ms: int = 1_000):
         self.user_id = "@alice:example.test"
         self.app_id = "app"
@@ -133,24 +136,52 @@ class FakePusher:
             update_pusher_last_stream_ordering_and_success=AsyncMock(return_value=True),
             update_pusher_failing_since=AsyncMock(),
             update_pusher_last_stream_ordering=AsyncMock(),
+            # The queued-ring lookup: the newest ring's stream ordering, or None.
+            db_pool=SimpleNamespace(runInteraction=AsyncMock(return_value=None)),
         )
-        self.push_action = SimpleNamespace(
-            event_id="$event",
-            stream_ordering=5,
-            actions=["notify"],
+        self.events: dict[str, SimpleNamespace] = {}
+        self.push_action = self.add_action(
+            "$event", stream_ordering=5, event_age_ms=event_age_ms
         )
-        self.event = SimpleNamespace(
-            event_id="$event",
-            room_id="!room:example.test",
-            origin_server_ts=self.clock.time_msec() - event_age_ms,
-        )
+        self.event = self.events["$event"]
         self.store.get_unread_push_actions_for_user_in_range_for_http.return_value = [
             self.push_action
         ]
-        self.store.get_event.return_value = self.event
+        self.store.get_event.side_effect = lambda event_id, allow_none: self.events.get(
+            event_id
+        )
         self._pangea_delayed_push_config = PangeaChat.parse_config(
             _base_config(enabled=True, delay_ms=60_000, max_delay_ms=600_000)
         )
+
+    def add_action(
+        self,
+        event_id: str,
+        *,
+        stream_ordering: int,
+        event_type: str = "m.room.message",
+        event_age_ms: int = 1_000,
+    ) -> SimpleNamespace:
+        self.events[event_id] = SimpleNamespace(
+            event_id=event_id,
+            type=event_type,
+            room_id="!room:example.test",
+            origin_server_ts=self.clock.time_msec() - event_age_ms,
+        )
+        return SimpleNamespace(
+            event_id=event_id,
+            stream_ordering=stream_ordering,
+            actions=["notify"],
+        )
+
+    def hold(self, push_action: SimpleNamespace) -> FakeDelayedCall:
+        """Puts the pusher in the state a deferral of push_action leaves it in."""
+        hold_timer = FakeDelayedCall(60, self.on_timer)
+        self.timed_call = hold_timer
+        self._pangea_delayed_push_event_id = push_action.event_id
+        self._pangea_delayed_push_stream_ordering = push_action.stream_ordering
+        self._pangea_delayed_push_until_ms = self.clock.time_msec() + 60_000
+        return hold_timer
 
 
 class TestDelayedPushConfig(unittest.TestCase):
@@ -244,8 +275,6 @@ class TestDelayedPushPatch(unittest.TestCase):
             "1.159.0",
         ):
             configure_delayed_push(config)
-
-        from synapse.push.httppusher import HttpPusher
 
         self.assertTrue(HttpPusher._pangea_delayed_push_patched)
         self.assertIs(HttpPusher._pangea_delayed_push_config, config)
@@ -395,31 +424,154 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
         pusher.store.update_pusher_last_stream_ordering_and_success.assert_not_awaited()
         self.assertFalse(hasattr(pusher, "_pangea_delayed_push_event_id"))
 
+    async def _process(self, pusher: FakePusher) -> None:
+        with patch(
+            "synapse_pangea_chat.delayed_push.delayed_push.httppusher.opentracing.start_active_span",
+            return_value=nullcontext(),
+        ):
+            await _pangea_delayed_push_unsafe_process(pusher)
 
-class TestDelayedPushStartProcessing(unittest.TestCase):
-    def test_start_processing_ignores_early_wake_until_delay_expires(self):
-        class FakeStartPusher:
-            _pangea_delayed_push_config = PangeaChat.parse_config(
-                _base_config(enabled=True)
-            )
+    def _sent_event_ids(self, pusher: FakePusher) -> list[str]:
+        return [call.args[0].event_id for call in pusher._process_one.await_args_list]
 
-            def __init__(self):
-                self.clock = FakeClock(now_ms=1_000)
-                self.name = "pusher"
-                self.started = False
-                self._pangea_delayed_push_until_ms = 2_000
-
-            def original_start(self):
-                self.started = True
-
-        FakeStartPusher._pangea_delayed_push_original_start_processing = (
-            FakeStartPusher.original_start
+    async def test_ring_sends_immediately_for_online_user(self):
+        pusher = FakePusher(active=True)
+        ring = pusher.add_action(
+            "$ring", stream_ordering=5, event_type=CALL_RING_EVENT_TYPE
         )
-        pusher = FakeStartPusher()
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.return_value = [
+            ring
+        ]
 
-        _pangea_delayed_push_start_processing(pusher)
-        self.assertFalse(pusher.started)
+        await self._process(pusher)
 
-        pusher.clock.now_ms = 2_000
-        _pangea_delayed_push_start_processing(pusher)
-        self.assertTrue(pusher.started)
+        self.assertEqual(self._sent_event_ids(pusher), ["$ring"])
+        self.assertEqual(pusher.last_stream_ordering, 5)
+        self.assertEqual(pusher.hs.clock.calls, [])
+
+    async def test_ring_queued_behind_a_message_sends_both_in_order(self):
+        pusher = FakePusher(active=True)
+        ring = pusher.add_action(
+            "$ring", stream_ordering=7, event_type=CALL_RING_EVENT_TYPE
+        )
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.return_value = [
+            pusher.push_action,
+            ring,
+        ]
+        pusher.store.db_pool.runInteraction.return_value = 7
+
+        await self._process(pusher)
+
+        self.assertEqual(self._sent_event_ids(pusher), ["$event", "$ring"])
+        self.assertEqual(pusher.last_stream_ordering, 7)
+        self.assertEqual(pusher.hs.clock.calls, [])
+
+    async def test_message_after_the_ring_is_still_held(self):
+        pusher = FakePusher(active=True)
+        ring = pusher.add_action(
+            "$ring", stream_ordering=7, event_type=CALL_RING_EVENT_TYPE
+        )
+        later = pusher.add_action("$later", stream_ordering=9)
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.return_value = [
+            pusher.push_action,
+            ring,
+            later,
+        ]
+        # The lookup that finds the ring, then the one past it that finds none.
+        pusher.store.db_pool.runInteraction.side_effect = [7, None]
+
+        await self._process(pusher)
+
+        self.assertEqual(self._sent_event_ids(pusher), ["$event", "$ring"])
+        self.assertEqual(pusher.last_stream_ordering, 7)
+        self.assertEqual(pusher._pangea_delayed_push_event_id, "$later")
+        self.assertEqual(len(pusher.hs.clock.calls), 1)
+
+    async def test_wake_during_a_hold_without_a_ring_keeps_the_hold(self):
+        pusher = FakePusher(active=True)
+        hold_timer = pusher.hold(pusher.push_action)
+
+        await self._process(pusher)
+
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.assert_not_awaited()
+        pusher._process_one.assert_not_awaited()
+        self.assertFalse(hold_timer.cancelled)
+        self.assertEqual(pusher._pangea_delayed_push_event_id, "$event")
+
+    async def test_ring_arriving_during_a_hold_releases_it(self):
+        pusher = FakePusher(active=True)
+        hold_timer = pusher.hold(pusher.push_action)
+        ring = pusher.add_action(
+            "$ring", stream_ordering=7, event_type=CALL_RING_EVENT_TYPE
+        )
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.return_value = [
+            pusher.push_action,
+            ring,
+        ]
+        pusher.store.db_pool.runInteraction.return_value = 7
+
+        with patch(
+            "synapse_pangea_chat.delayed_push.delayed_push.logger.info"
+        ) as log_info:
+            await self._process(pusher)
+
+        self.assertTrue(hold_timer.cancelled)
+        self.assertEqual(self._sent_event_ids(pusher), ["$event", "$ring"])
+        self.assertEqual(pusher.last_stream_ordering, 7)
+        self.assertFalse(hasattr(pusher, "_pangea_delayed_push_event_id"))
+        self.assertEqual(pusher.hs.clock.calls, [])
+        # Releasing the hold is not reading the held event.
+        logged = [call.args[0] for call in log_info.call_args_list]
+        self.assertFalse(any("suppressing" in message for message in logged))
+
+    async def test_ring_beyond_one_fetch_is_still_reached(self):
+        # Synapse returns 20 push actions per fetch; a hold can queue more.
+        pusher = FakePusher(active=True)
+        ring = pusher.add_action(
+            "$ring", stream_ordering=9, event_type=CALL_RING_EVENT_TYPE
+        )
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.side_effect = [
+            [pusher.push_action],
+            [ring],
+        ]
+        pusher.store.db_pool.runInteraction.return_value = 9
+
+        await self._process(pusher)
+
+        self.assertEqual(self._sent_event_ids(pusher), ["$event", "$ring"])
+        self.assertEqual(pusher.last_stream_ordering, 9)
+        self.assertEqual(
+            pusher.store.get_unread_push_actions_for_user_in_range_for_http.await_count,
+            2,
+        )
+
+    async def test_failed_push_ahead_of_a_ring_backs_off_instead_of_refetching(self):
+        pusher = FakePusher(active=True)
+        pusher.store.db_pool.runInteraction.return_value = 9
+        pusher._process_one.return_value = False
+
+        await self._process(pusher)
+
+        self.assertEqual(
+            pusher.store.get_unread_push_actions_for_user_in_range_for_http.await_count,
+            1,
+        )
+        self.assertEqual(pusher.last_stream_ordering, 1)
+        self.assertEqual(len(pusher.hs.clock.calls), 1)
+        self.assertEqual(pusher.hs.clock.calls[0].delay_seconds, 1)
+
+    async def test_ring_lookup_failure_during_a_hold_sends_normally(self):
+        pusher = FakePusher(active=True)
+        hold_timer = pusher.hold(pusher.push_action)
+        pusher.store.db_pool.runInteraction.side_effect = RuntimeError("db down")
+
+        with patch(
+            "synapse_pangea_chat.delayed_push.delayed_push.logger.exception"
+        ) as log_exception:
+            await self._process(pusher)
+
+        self.assertTrue(hold_timer.cancelled)
+        self.assertEqual(self._sent_event_ids(pusher), ["$event"])
+        self.assertEqual(pusher.last_stream_ordering, 5)
+        # Once for the hold, once for the held event's own decision.
+        self.assertEqual(log_exception.call_count, 2)

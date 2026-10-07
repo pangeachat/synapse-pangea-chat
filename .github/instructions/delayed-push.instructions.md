@@ -13,14 +13,15 @@ Delayed push is an optional Synapse-module-only policy for normal Matrix HTTP pu
 - Uses Synapse's per-user presence `state == "online"` as the only active-user signal. Unavailable, offline even with stale `currently_active == true`, disabled presence, or presence lookup failure all send normally.
 - Read wins over every other state: if Synapse no longer returns a deferred event as unread, no notification is sent.
 - Unread events for online users defer at the configured interval until the user becomes offline/unavailable or the event reaches the configured max age.
+- Call rings (`org.matrix.msc4075.rtc.notification`) never defer. A ring lasts 30 seconds, which is shorter than one delay interval, so a held ring reaches the phone already dead.
 - The max delay clock is measured from the event origin timestamp, not from first deferral.
-- Deferral intentionally keeps the pusher cursor unchanged and accepts head-of-line blocking for that user's HTTP pusher/device. Other users and non-HTTP push paths are not blocked.
+- Deferral intentionally keeps the pusher cursor unchanged and accepts head-of-line blocking for that user's HTTP pusher/device, with one exception: a ring queued behind a held event releases the hold, and everything ahead of the ring sends with it, in order. Sending the ring around the held events would need a second record of what was sent, kept in memory beyond the cursor; a Synapse restart or a phone re-registering its pusher loses it and re-sends a stale ring. Other users and non-HTTP push paths are not blocked.
 - Fail open: delayed-push decision errors log and send normally.
 
 ## Synapse private API requirement
 
-This feature monkey-patches Synapse's private `HttpPusher` processing path. Keep it disabled by default and require an exact audited Synapse version when enabling it. Every Synapse upgrade must audit `synapse.push.httppusher.HttpPusher._unsafe_process`, `_start_processing`, pusher cursor advancement, and presence `state` semantics before widening the allowed version.
+This feature monkey-patches Synapse's private `HttpPusher` processing path. Keep it disabled by default and require an exact audited Synapse version when enabling it. Every Synapse upgrade must audit `synapse.push.httppusher.HttpPusher._unsafe_process`, `_start_processing`, pusher cursor advancement, presence `state` semantics, and the `event_push_actions` and `events` columns the queued-ring lookup reads before widening the allowed version.
 
 ## Rollout
 
-Enable explicitly per environment. Test local/staging before production, and keep logs available for deferred, sent-because-inactive, sent-because-max-age, suppressed-read, and fail-open decisions.
+Enable explicitly per environment. Test local/staging before production, and keep logs available for deferred, sent-because-inactive, sent-because-max-age, sent-for-ring, suppressed-read, and fail-open decisions.
