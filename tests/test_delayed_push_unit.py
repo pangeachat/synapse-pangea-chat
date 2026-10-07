@@ -579,6 +579,96 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
         # Once for the hold, once for the held event's own decision.
         self.assertEqual(log_exception.call_count, 2)
 
+    def _answer_db_reads(
+        self,
+        pusher: FakePusher,
+        *,
+        queued_ring: int | None = None,
+        read_page_ends: list[int | None] | None = None,
+    ) -> None:
+        page_ends = list(read_page_ends or [])
+
+        def run_interaction(desc, _txn_func):
+            if desc == "pangea_delayed_push_newest_queued_ring":
+                return queued_ring
+            if desc == "pangea_delayed_push_read_page_end":
+                return page_ends.pop(0)
+            raise AssertionError(f"unexpected database read {desc}")
+
+        pusher.store.db_pool.runInteraction.side_effect = run_interaction
+
+    def _fetch_ranges(self, pusher: FakePusher) -> list[tuple[int, int]]:
+        fetch = pusher.store.get_unread_push_actions_for_user_in_range_for_http
+        return [call.args[1:3] for call in fetch.await_args_list]
+
+    async def test_fetch_reads_past_a_page_of_read_rows(self):
+        # Synapse limits its fetch before dropping read rows, and keeps read
+        # mentions, so 20 of them ahead of the cursor make every fetch empty.
+        pusher = FakePusher(active=False)
+        later = pusher.add_action("$later", stream_ordering=30)
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.side_effect = [
+            [],
+            [],
+            [later],
+        ]
+        self._answer_db_reads(pusher, read_page_ends=[25])
+
+        await self._process(pusher)
+
+        self.assertEqual(self._fetch_ranges(pusher), [(1, 10), (1, 25), (25, 10)])
+        self.assertEqual(self._sent_event_ids(pusher), ["$later"])
+        self.assertEqual(pusher.last_stream_ordering, 30)
+
+    async def test_fetch_stops_when_the_read_page_was_not_full(self):
+        pusher = FakePusher(active=False)
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.return_value = (
+            []
+        )
+        self._answer_db_reads(pusher, read_page_ends=[None])
+
+        await self._process(pusher)
+
+        self.assertEqual(self._fetch_ranges(pusher), [(1, 10)])
+        pusher._process_one.assert_not_awaited()
+        self.assertEqual(pusher.last_stream_ordering, 1)
+
+    async def test_read_page_recheck_sends_a_row_the_first_fetch_missed(self):
+        # A read row deleted between the fetch and the page read moves the
+        # page past rows the fetch never saw.
+        pusher = FakePusher(active=False)
+        missed = pusher.add_action("$missed", stream_ordering=24)
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.side_effect = [
+            [],
+            [missed],
+        ]
+        self._answer_db_reads(pusher, read_page_ends=[25])
+
+        await self._process(pusher)
+
+        self.assertEqual(self._fetch_ranges(pusher), [(1, 10), (1, 25)])
+        self.assertEqual(self._sent_event_ids(pusher), ["$missed"])
+
+    async def test_ring_behind_read_mentions_still_sends(self):
+        # The held message, then 20 mentions read on web, then the ring.
+        pusher = FakePusher(active=True)
+        pusher.hold(pusher.push_action)
+        ring = pusher.add_action(
+            "$ring", stream_ordering=50, event_type=CALL_RING_EVENT_TYPE
+        )
+        pusher.max_stream_ordering = 50
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.side_effect = [
+            [pusher.push_action],
+            [],
+            [],
+            [ring],
+        ]
+        self._answer_db_reads(pusher, queued_ring=50, read_page_ends=[25])
+
+        await self._process(pusher)
+
+        self.assertEqual(self._sent_event_ids(pusher), ["$event", "$ring"])
+        self.assertEqual(pusher.last_stream_ordering, 50)
+
     async def test_ring_lookups_start_after_the_event_being_decided(self):
         # Rows between the cursor and that event were already read, so a ring
         # among them must not release anything.

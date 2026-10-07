@@ -12,6 +12,7 @@ Delayed push is an optional Synapse-module-only policy for normal Matrix HTTP pu
 - Applies only to normal Synapse `HttpPusher` notifications. DirectPush, email pushers, and badge-only receipt updates remain unchanged.
 - Uses Synapse's per-user presence `state == "online"` as the only active-user signal. Unavailable, offline even with stale `currently_active == true`, disabled presence, or presence lookup failure all send normally.
 - Read wins over every other state: if Synapse no longer returns a deferred event as unread, no notification is sent.
+- Already-read rows never stop the pusher: when every row in one of Synapse's fetches was already read, the pusher keeps reading past them. The pusher cursor still moves only when a notification is sent.
 - Unread events for online users defer at the configured interval until the user becomes offline/unavailable or the event reaches the configured max age.
 - Call rings (`org.matrix.msc4075.rtc.notification`) never defer. A ring lasts 30 seconds, which is shorter than one delay interval, so a held ring reaches the phone already dead.
 - The max delay clock is measured from the event origin timestamp, not from first deferral.
@@ -20,7 +21,7 @@ Delayed push is an optional Synapse-module-only policy for normal Matrix HTTP pu
 
 ## Synapse private API requirement
 
-This feature monkey-patches Synapse's private `HttpPusher` processing path. Keep it disabled by default and require an exact audited Synapse version when enabling it. Every Synapse upgrade must audit `synapse.push.httppusher.HttpPusher._unsafe_process`, `_start_processing`, pusher cursor advancement, presence `state` semantics, and the `event_push_actions` and `events` columns the queued-ring lookup reads before widening the allowed version.
+This feature monkey-patches Synapse's private `HttpPusher` processing path. Keep it disabled by default and require an exact audited Synapse version when enabling it. Every Synapse upgrade must audit `synapse.push.httppusher.HttpPusher._unsafe_process`, `_start_processing`, pusher cursor advancement, presence `state` semantics, and the `event_push_actions` and `events` columns the module reads directly (the queued-ring lookup and the fetch past already-read rows) before widening the allowed version.
 
 ## Rollout
 

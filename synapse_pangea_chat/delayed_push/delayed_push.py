@@ -23,6 +23,11 @@ internals it was not audited for."""
 CALL_RING_EVENT_TYPE = "org.matrix.msc4075.rtc.notification"
 """The call ring (MSC4075), the client's PangeaEventTypes.callNotification."""
 
+PUSH_ACTION_FETCH_LIMIT = 20
+"""Rows per unread push-action fetch: upstream's default, passed explicitly so
+the read-row page below can never reach past what the fetch covered and skip
+an unread row."""
+
 
 _ORIGINAL_UNSAFE_PROCESS_ATTR = "_pangea_delayed_push_original_unsafe_process"
 _ORIGINAL_START_PROCESSING_ATTR = "_pangea_delayed_push_original_start_processing"
@@ -183,11 +188,7 @@ async def _pangea_delayed_push_unsafe_process(self: Any) -> None:
             return
 
     while True:
-        unprocessed = (
-            await self.store.get_unread_push_actions_for_user_in_range_for_http(
-                self.user_id, self.last_stream_ordering, self.max_stream_ordering
-            )
-        )
+        unprocessed = await _fetch_unread_push_actions(self)
         _log_deferred_event_if_no_longer_unread(self, unprocessed)
 
         logger.info(
@@ -305,6 +306,94 @@ async def _pangea_delayed_push_unsafe_process(self: Any) -> None:
             or queued_ring_stream_ordering <= self.last_stream_ordering
         ):
             return
+
+
+async def _fetch_unread_push_actions(self: Any) -> list[Any]:
+    """Synapse's unread push-action fetch, continued past fetches whose every
+    row was already read.
+
+    Synapse applies its row limit before it drops read rows, and keeps read
+    mentions in the table, so a hold that lets 20 read mentions queue ahead of
+    the cursor would otherwise get an empty fetch on every pass and never push
+    to this device again. The cursor still moves only when a push is sent.
+    """
+    fetch_after = self.last_stream_ordering
+    while True:
+        unprocessed = await _fetch_unread_push_actions_in_range(
+            self, fetch_after, self.max_stream_ordering
+        )
+        if unprocessed:
+            return unprocessed
+
+        read_page_end = await _end_of_full_push_action_page(self, fetch_after)
+        if read_page_end is None:
+            return []
+        # Synapse deletes read rows on its own schedule, and a deletion between
+        # the two reads moves this page past rows the fetch never saw. Check
+        # exactly this page before skipping it.
+        unprocessed = await _fetch_unread_push_actions_in_range(
+            self, fetch_after, read_page_end
+        )
+        if unprocessed:
+            return unprocessed
+        logger.info(
+            "Pangea delayed push reading past %s already-read push actions for "
+            "%s, through stream_ordering %s",
+            PUSH_ACTION_FETCH_LIMIT,
+            self.name,
+            read_page_end,
+        )
+        fetch_after = read_page_end
+
+
+async def _fetch_unread_push_actions_in_range(
+    self: Any, after_stream_ordering: int, through_stream_ordering: int
+) -> list[Any]:
+    return await self.store.get_unread_push_actions_for_user_in_range_for_http(
+        self.user_id,
+        after_stream_ordering,
+        through_stream_ordering,
+        limit=PUSH_ACTION_FETCH_LIMIT,
+    )
+
+
+async def _end_of_full_push_action_page(
+    self: Any, after_stream_ordering: int
+) -> int | None:
+    """The last stream ordering among the first PUSH_ACTION_FETCH_LIMIT push
+    actions after ``after_stream_ordering``, the rows Synapse's fetch reads, or
+    None when there are fewer, so nothing lies beyond them."""
+
+    def page_end_txn(txn: LoggingTransaction) -> int | None:
+        txn.execute(
+            """
+            SELECT COUNT(*), MAX(page.stream_ordering)
+            FROM (
+                SELECT ep.stream_ordering
+                FROM event_push_actions AS ep
+                WHERE ep.user_id = ?
+                    AND ep.stream_ordering > ?
+                    AND ep.stream_ordering <= ?
+                    AND ep.notif = 1
+                ORDER BY ep.stream_ordering ASC
+                LIMIT ?
+            ) AS page
+            """,
+            (
+                self.user_id,
+                after_stream_ordering,
+                self.max_stream_ordering,
+                PUSH_ACTION_FETCH_LIMIT,
+            ),
+        )
+        row = txn.fetchone()
+        if row is None or row[0] < PUSH_ACTION_FETCH_LIMIT:
+            return None
+        return row[1]
+
+    return await self.store.db_pool.runInteraction(
+        "pangea_delayed_push_read_page_end", page_end_txn
+    )
 
 
 async def _should_defer_push_action(self: Any, push_action: Any) -> bool:
