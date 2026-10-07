@@ -1018,20 +1018,27 @@ class ChatModeration:
                 # a visible product regression, so the exemption has to win
                 # over the room's inclusion.
                 return
-            self._dispatcher.enqueue(
+            # The sender's courses, frozen NOW rather than at the verdict, so
+            # a learner who leaves before it still lands on their course's
+            # Safety page. The lookup is scheduled for the next reactor turn -
+            # this path does no I/O - and BEFORE the job is queued, so it is
+            # always ahead of the worker that will read it.
+            courses = self._recorder.snapshot(event.sender)
+            accepted = self._dispatcher.enqueue(
                 ModerationJob(
                     event_id=event.event_id,
                     room_id=event.room_id,
                     sender=event.sender,
                     text=text,
                     enqueued_at=self._clock.time(),
-                    # The sender's courses, frozen NOW rather than at the
-                    # verdict, so a learner who leaves before it still lands
-                    # on their course's Safety page. The lookup starts on the
-                    # next reactor turn: this path does no I/O.
-                    courses=self._recorder.snapshot(event.sender),
+                    courses=courses,
                 )
             )
+            if not accepted:
+                # Refused and already counted by the dispatcher; a lookup for
+                # a message nobody will check is load an overloaded queue
+                # does not need.
+                courses.discard()
         except Exception as exc:
             reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract; observe-only hook, so the

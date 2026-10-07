@@ -61,6 +61,19 @@ class CourseSnapshot:
         self._observable: Optional[ObservableDeferred] = None
         self._result: Optional[Tuple[str, ...]] = None
         self._done = False
+        #: The scheduled start, so a refused job can cancel it.
+        self.timer: Optional[Any] = None
+
+    def discard(self) -> None:
+        """Cancel a lookup that has not started. For a job the queue refused."""
+        timer = self.timer
+        try:
+            if timer is not None and timer.active():
+                timer.cancel()
+        except Exception:
+            # silent-ok: a timer that cannot be cancelled runs one lookup
+            # nobody reads, which costs a read and nothing else.
+            pass
 
     def start(self) -> None:
         """Begin the lookup. Idempotent, and never raises: a failure is a
@@ -129,7 +142,9 @@ class IncidentRecorder:
     def snapshot(self, user_id: str) -> CourseSnapshot:
         snapshot = CourseSnapshot(self._hs, self.courses, user_id)
         try:
-            self._hs.get_clock().call_later(_SecondsInterval(0), snapshot.start)
+            snapshot.timer = self._hs.get_clock().call_later(
+                _SecondsInterval(0), snapshot.start
+            )
         except Exception:
             # silent-ok: a clock that refuses a call is shutting down; `get`
             # starts the lookup itself when the verdict asks for it.

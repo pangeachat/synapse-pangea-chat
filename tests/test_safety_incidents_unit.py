@@ -915,7 +915,11 @@ class TestCourseIsFrozenAtQueueTime(Tier2Case):
         module, api, homeserver, _db = self._module(world)
         assert module._dispatcher is not None
         queued: List[ModerationJob] = []
-        with patch.object(module._dispatcher, "enqueue", side_effect=queued.append):
+        with patch.object(
+            module._dispatcher,
+            "enqueue",
+            side_effect=lambda job: queued.append(job) or True,
+        ):
             await module.on_new_event(
                 _event("you are awful", sender=STUDENT, event_id="$e1"), {}
             )
@@ -942,12 +946,25 @@ class TestCourseIsFrozenAtQueueTime(Tier2Case):
         homeserver.clock.run_pending()
         self.assertNotEqual(world.reads, [])
 
+    async def test_a_refused_job_does_not_look_its_courses_up(self) -> None:
+        world = _classroom()
+        module, _api, homeserver, _db = self._module(world)
+        assert module._dispatcher is not None
+        with patch.object(module._dispatcher, "enqueue", return_value=False):
+            await module.on_new_event(_event("hello", sender=STUDENT), {})
+        homeserver.clock.run_pending()
+        self.assertEqual(world.reads, [], "a refused job still read state")
+
     async def test_a_failed_snapshot_is_looked_up_at_the_verdict(self) -> None:
         world = _classroom()
         module, _api, homeserver, _db = self._module(world)
         assert module._dispatcher is not None
         queued: List[ModerationJob] = []
-        with patch.object(module._dispatcher, "enqueue", side_effect=queued.append):
+        with patch.object(
+            module._dispatcher,
+            "enqueue",
+            side_effect=lambda job: queued.append(job) or True,
+        ):
             await module.on_new_event(_event("you are awful", sender=STUDENT), {})
         world.error = RuntimeError("down at queue time")
         homeserver.clock.run_pending()
