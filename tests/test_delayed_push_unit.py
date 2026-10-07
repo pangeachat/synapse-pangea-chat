@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import synapse
@@ -12,6 +14,7 @@ from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.delayed_push.delayed_push import (
     AUDITED_SYNAPSE_VERSION,
     CALL_RING_EVENT_TYPE,
+    _pangea_delayed_push_start_processing,
     _pangea_delayed_push_unsafe_process,
     configure_delayed_push,
     reset_delayed_push_patch_for_tests,
@@ -575,3 +578,123 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pusher.last_stream_ordering, 5)
         # Once for the hold, once for the held event's own decision.
         self.assertEqual(log_exception.call_count, 2)
+
+    async def test_ring_lookups_start_after_the_event_being_decided(self):
+        # Rows between the cursor and that event were already read, so a ring
+        # among them must not release anything.
+        txn = MagicMock()
+        txn.fetchone.return_value = (None,)
+
+        for held in (False, True):
+            with self.subTest(held=held):
+                txn.execute.reset_mock()
+                pusher = FakePusher(active=True)
+                pusher.store.db_pool.runInteraction.side_effect = (
+                    lambda _desc, txn_func: txn_func(txn)
+                )
+                if held:
+                    pusher.hold(pusher.push_action)
+
+                await self._process(pusher)
+
+                self.assertGreater(
+                    pusher.push_action.stream_ordering, pusher.last_stream_ordering
+                )
+                for call in txn.execute.call_args_list:
+                    _, (_, after_stream_ordering, _, _) = call.args
+                    self.assertEqual(
+                        after_stream_ordering, pusher.push_action.stream_ordering
+                    )
+                self.assertTrue(txn.execute.called)
+
+
+@unittest.skipUnless(
+    synapse.__version__.split(" ")[0] == AUDITED_SYNAPSE_VERSION,
+    "drives Synapse's own HttpPusher scheduling, which the patch mirrors only on "
+    f"{AUDITED_SYNAPSE_VERSION}",
+)
+class TestDelayedPushScheduling(unittest.IsolatedAsyncioTestCase):
+    """The patch through Synapse's real _process and on_timer, where a wake can
+    be dropped before the patched body ever runs."""
+
+    def _wire_synapse_scheduling(self, pusher: Any) -> list[asyncio.Task]:
+        tasks: list[asyncio.Task] = []
+        pusher._is_processing = False
+
+        def run_as_background_process(_name, func, *args):
+            tasks.append(asyncio.ensure_future(func(*args)))
+
+        pusher.hs.run_as_background_process = run_as_background_process
+        pusher._unsafe_process = lambda: _pangea_delayed_push_unsafe_process(pusher)
+        pusher._process = lambda: HttpPusher._process(pusher)
+        pusher._start_processing = lambda: _pangea_delayed_push_start_processing(pusher)
+        pusher.on_timer = lambda: HttpPusher.on_timer(pusher)
+        # Where configure_delayed_push keeps the original the patch falls back to.
+        self.enterContext(
+            patch.object(
+                FakePusher,
+                "_pangea_delayed_push_original_start_processing",
+                HttpPusher._start_processing,
+                create=True,
+            )
+        )
+        return tasks
+
+    async def test_ring_wakes_a_held_pusher_that_had_a_failed_push(self):
+        # failing_since stays set until a push succeeds, and the hold keeps its
+        # timer where Synapse looks for a failed push's retry timer.
+        pusher = FakePusher(active=True)
+        tasks = self._wire_synapse_scheduling(pusher)
+        pusher.hold(pusher.push_action)
+        pusher.failing_since = pusher.clock.time_msec() - 5_000
+        ring = pusher.add_action(
+            "$ring", stream_ordering=7, event_type=CALL_RING_EVENT_TYPE
+        )
+        pusher.store.get_unread_push_actions_for_user_in_range_for_http.return_value = [
+            pusher.push_action,
+            ring,
+        ]
+        pusher.store.db_pool.runInteraction.return_value = 7
+
+        with patch(
+            "synapse_pangea_chat.delayed_push.delayed_push.httppusher.opentracing.start_active_span",
+            return_value=nullcontext(),
+        ):
+            pusher._start_processing()
+            await asyncio.gather(*tasks)
+
+        self.assertEqual(
+            [call.args[0].event_id for call in pusher._process_one.await_args_list],
+            ["$event", "$ring"],
+        )
+
+    async def test_hold_expiring_during_a_ring_lookup_still_sends(self):
+        # The user closed the web tab; a message wakes the pusher just before
+        # the hold ends, and the hold timer fires while that wake's lookup runs.
+        pusher = FakePusher(active=False)
+        tasks = self._wire_synapse_scheduling(pusher)
+        hold_timer = pusher.hold(pusher.push_action)
+        lookup_may_finish = asyncio.Event()
+
+        async def slow_ring_lookup(*_args):
+            await lookup_may_finish.wait()
+            return None
+
+        pusher.store.db_pool.runInteraction.side_effect = slow_ring_lookup
+
+        with patch(
+            "synapse_pangea_chat.delayed_push.delayed_push.httppusher.opentracing.start_active_span",
+            return_value=nullcontext(),
+        ):
+            pusher.clock.now_ms = pusher._pangea_delayed_push_until_ms - 1
+            pusher._start_processing()
+            await asyncio.sleep(0)
+            pusher.clock.now_ms += 5
+            hold_timer.cancelled = True
+            pusher.on_timer()
+            lookup_may_finish.set()
+            await asyncio.gather(*tasks)
+
+        self.assertEqual(len(tasks), 1)
+        pusher._process_one.assert_awaited_once_with(pusher.push_action)
+        self.assertEqual(pusher.last_stream_ordering, 5)

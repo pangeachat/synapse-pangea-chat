@@ -25,6 +25,7 @@ CALL_RING_EVENT_TYPE = "org.matrix.msc4075.rtc.notification"
 
 
 _ORIGINAL_UNSAFE_PROCESS_ATTR = "_pangea_delayed_push_original_unsafe_process"
+_ORIGINAL_START_PROCESSING_ATTR = "_pangea_delayed_push_original_start_processing"
 _PATCHED_ATTR = "_pangea_delayed_push_patched"
 _CONFIG_ATTR = "_pangea_delayed_push_config"
 
@@ -66,10 +67,13 @@ def reset_delayed_push_patch_for_tests() -> None:
         return
 
     original_unsafe_process = getattr(HttpPusher, _ORIGINAL_UNSAFE_PROCESS_ATTR)
+    original_start_processing = getattr(HttpPusher, _ORIGINAL_START_PROCESSING_ATTR)
     HttpPusher._unsafe_process = original_unsafe_process  # type: ignore[method-assign]
+    HttpPusher._start_processing = original_start_processing  # type: ignore[method-assign]
 
     for attr_name in (
         _ORIGINAL_UNSAFE_PROCESS_ATTR,
+        _ORIGINAL_START_PROCESSING_ATTR,
         _PATCHED_ATTR,
         _CONFIG_ATTR,
     ):
@@ -100,7 +104,11 @@ def _require_audited_synapse_version(required_version: str) -> None:
 def _install_delayed_push_patch(config: DelayedPushConfigProtocol) -> None:
     if not getattr(HttpPusher, _PATCHED_ATTR, False):
         setattr(HttpPusher, _ORIGINAL_UNSAFE_PROCESS_ATTR, HttpPusher._unsafe_process)
+        setattr(
+            HttpPusher, _ORIGINAL_START_PROCESSING_ATTR, HttpPusher._start_processing
+        )
         HttpPusher._unsafe_process = _pangea_delayed_push_unsafe_process  # type: ignore[method-assign]
+        HttpPusher._start_processing = _pangea_delayed_push_start_processing  # type: ignore[method-assign]
         setattr(HttpPusher, _PATCHED_ATTR, True)
 
     setattr(HttpPusher, _CONFIG_ATTR, config)
@@ -128,6 +136,26 @@ def _delayed_push_pending(self: Any, config: DelayedPushConfigProtocol | None) -
     return delayed_until_ms > self.clock.time_msec()
 
 
+def _pangea_delayed_push_start_processing(self: Any) -> None:
+    """HttpPusher._start_processing that still wakes a held pusher after a
+    failed push.
+
+    Upstream drops a wake while a failed push's retry timer is active, and a
+    hold keeps its timer in that same ``timed_call`` slot, so upstream would
+    take the hold for a retry and drop the wake a ring arrives on. A wake
+    during a hold sends nothing unless it finds a ring, so it cannot hammer a
+    failing gateway.
+    """
+    if not self._is_processing and _delayed_push_pending(
+        self, _get_delayed_push_config(self)
+    ):
+        self.hs.run_as_background_process("httppush.process", self._process)
+        return
+
+    original_start_processing = getattr(type(self), _ORIGINAL_START_PROCESSING_ATTR)
+    original_start_processing(self)
+
+
 async def _pangea_delayed_push_unsafe_process(self: Any) -> None:
     """HttpPusher._unsafe_process with Pangea active-user deferral.
 
@@ -147,10 +175,12 @@ async def _pangea_delayed_push_unsafe_process(self: Any) -> None:
     config = _get_delayed_push_config(self)
     # Every new notification wakes the pusher, held or not; a held pusher
     # resumes early only for a ring.
-    if _delayed_push_pending(self, config) and not await _release_hold_for_queued_ring(
-        self
-    ):
-        return
+    if _delayed_push_pending(self, config):
+        released = await _release_hold_for_queued_ring(self)
+        # A hold timer that fired during the lookup found this pusher busy and
+        # was dropped, so an expired hold is processed now or never.
+        if not released and _delayed_push_pending(self, config):
+            return
 
     while True:
         unprocessed = (
@@ -330,7 +360,9 @@ async def _should_defer_push_action(self: Any, push_action: Any) -> bool:
         _clear_delayed_push_state(self)
         return False
 
-    queued_ring_stream_ordering = await _find_queued_ring(self)
+    queued_ring_stream_ordering = await _find_queued_ring(
+        self, after_stream_ordering=push_action.stream_ordering
+    )
     if queued_ring_stream_ordering is not None:
         _log_sent_ahead_of_ring(self, push_action, queued_ring_stream_ordering)
         _clear_delayed_push_state(self)
@@ -364,9 +396,13 @@ def _queued_ring_stream_ordering(self: Any) -> int | None:
     return getattr(self, "_pangea_delayed_push_queued_ring_stream_ordering", None)
 
 
-async def _find_queued_ring(self: Any) -> int | None:
-    """The stream ordering of the newest ring queued for this pusher, if any,
-    remembered until the cursor passes it.
+async def _find_queued_ring(self: Any, after_stream_ordering: int) -> int | None:
+    """The stream ordering of the newest ring queued for this pusher after
+    ``after_stream_ordering``, if any, remembered until the cursor passes it.
+
+    Bounded by the event being decided rather than the cursor: Synapse returns
+    no unread push action between the two, so a ring there was already read on
+    another device.
 
     Reads Synapse's tables directly: its own push-action query carries no event
     type and returns 20 rows at a time, fewer than a hold can queue in front of
@@ -387,7 +423,7 @@ async def _find_queued_ring(self: Any) -> int | None:
             """,
             (
                 self.user_id,
-                self.last_stream_ordering,
+                after_stream_ordering,
                 self.max_stream_ordering,
                 CALL_RING_EVENT_TYPE,
             ),
@@ -412,7 +448,9 @@ async def _release_hold_for_queued_ring(self: Any) -> bool:
     normally rather than staying held without the ring check.
     """
     try:
-        queued_ring_stream_ordering = await _find_queued_ring(self)
+        queued_ring_stream_ordering = await _find_queued_ring(
+            self, after_stream_ordering=self._pangea_delayed_push_stream_ordering
+        )
     except Exception:
         logger.exception(
             "Pangea delayed push could not look for a queued ring for user %s; "
