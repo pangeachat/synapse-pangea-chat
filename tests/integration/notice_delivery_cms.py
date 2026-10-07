@@ -8,9 +8,12 @@ import copy
 import json
 import os
 import socket
+import subprocess
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -248,6 +251,166 @@ class TestNoticeDeliveryCMS(BaseSynapseE2ETest):
             print(
                 f"100 local in-app decisions and CMS records, concurrency 5: {time.monotonic() - begin:.2f}s"
             )
+
+            # Refill the configured admin burst after the bounded batch above.
+            time.sleep(2)
+            scheduled = request_body("email-only")
+            del scheduled["notice_event_id"]
+            scheduled.update(
+                user_id=uid,
+                notice_room_id=room,
+                sender_id="@admin:my.domain.name",
+                notice_content={
+                    "body": "Scheduled activity",
+                    "check_in_type": "do_activity",
+                },
+                scheduled_at=datetime.fromtimestamp(
+                    time.time() + 20, timezone.utc
+                ).isoformat(),
+            )
+            scheduled["log"]["run"]["run_id"] = (
+                "notice-228-integration-scheduled-" + uuid.uuid4().hex
+            )
+            image_url = "https://content.pangea.chat/media/example-activity.jpg"
+            scheduled["email"]["html"] = env.get_template("notice_email.html").render(
+                title="Scheduled activity",
+                body="A course and activity for you",
+                images=[{"url": image_url, "alt": "Activity cover"}],
+                cta_label="Open activity",
+                cta_url="{{cta_url}}",
+                unsubscribe_url="{{unsubscribe_url}}",
+                postal_address="{{postal_address}}",
+                receiving_reason="{{receiving_reason}}",
+            )
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                accepted = list(
+                    pool.map(
+                        lambda _: requests.post(
+                            url, headers=headers, json=scheduled, timeout=20
+                        ),
+                        range(5),
+                    )
+                )
+            self.assertTrue(
+                all(r.status_code == 202 for r in accepted), [r.text for r in accepted]
+            )
+            self.assertEqual(len({r.json()["schedule_id"] for r in accepted}), 1)
+            schedule_id = accepted[0].json()["schedule_id"]
+
+            def notice_events():
+                response = requests.get(
+                    f"{self.server_url}/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=100",
+                    headers=headers,
+                    timeout=20,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                return [
+                    e for e in response.json()["chunk"] if e["type"] == "p.room.notice"
+                ]
+
+            self.assertEqual(len(notice_events()), 1)
+            self.assertEqual(len(smtp.received_emails), 1)
+            status_url = url + "?schedule_id=" + schedule_id
+            self.assertEqual(
+                requests.get(
+                    status_url,
+                    headers={"Authorization": f"Bearer {alice_token}"},
+                    timeout=20,
+                ).status_code,
+                403,
+            )
+
+            # Restart the actual Synapse process with the same PostgreSQL DB.
+            args = process.args
+            process.terminate()
+            process.wait(timeout=20)
+            stdout.join(timeout=5)
+            stderr.join(timeout=5)
+            restart_log = tempfile.TemporaryFile(mode="w+")
+            self.addCleanup(restart_log.close)
+            process = subprocess.Popen(
+                args,
+                cwd=directory,
+                stdout=restart_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            deadline = time.monotonic() + 40
+            final = None
+            while time.monotonic() < deadline:
+                try:
+                    response = requests.get(status_url, headers=headers, timeout=2)
+                except requests.ConnectionError:
+                    time.sleep(0.2)
+                    continue
+                self.assertEqual(response.status_code, 200, response.text)
+                final = response.json()
+                if final["status"] == "complete":
+                    break
+                time.sleep(0.2)
+            self.assertIsNotNone(final)
+            self.assertEqual(final["status"], "complete", final)
+            self.assertEqual(final["result"]["channel"], "email", final)
+            self.assertEqual(final["result"]["log_status"], "complete", final)
+            self.assertEqual(len(notice_events()), 2)
+            self.assertEqual(len(smtp.received_emails), 2)
+            delivered_event = next(
+                e
+                for e in notice_events()
+                if e["event_id"] == final["result"]["notice_event_id"]
+            )
+            self.assertGreaterEqual(
+                delivered_event["origin_server_ts"],
+                accepted[0].json()["scheduled_at_ms"],
+            )
+            self.assertEqual(
+                delivered_event["content"]["pangea.schedule_id"], schedule_id
+            )
+            persisted = requests.get(
+                f'{cms["url"]}/api/notification-log/{final["result"]["notification_log_id"]}',
+                headers=cms_headers,
+                timeout=20,
+            )
+            self.assertEqual(persisted.status_code, 200, persisted.text)
+            self.assertEqual(
+                persisted.json()["decision"]["notice_event_id"],
+                final["result"]["notice_event_id"],
+            )
+            message = BytesParser(policy=policy.default).parsebytes(
+                smtp.received_emails[1]["data"].removesuffix(".\r\n").encode()
+            )
+            html = message.get_body(preferencelist=("html",)).get_content()
+            self.assertIn(image_url, html)
+            self.assertIn('alt="Activity cover"', html)
+            self.assertIn("NSF.png", html)
+            links = Links()
+            links.feed(html)
+            scheduled_cta = next(link for link in links.urls if "/pangea/v1/n?" in link)
+            clicked = requests.get(scheduled_cta, allow_redirects=False, timeout=20)
+            self.assertEqual(clicked.status_code, 302)
+            self.assertTrue(clicked.headers["Location"].endswith("/app/activity-1"))
+            opened = requests.get(
+                f"{self.server_url}/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=100",
+                headers=headers,
+                timeout=20,
+            ).json()["chunk"]
+            self.assertTrue(
+                any(
+                    e["type"] == "p.room.notice.opened"
+                    and e["content"]["notification_event_id"]
+                    == final["result"]["notice_event_id"]
+                    for e in opened
+                )
+            )
+            self.assertIn(
+                "Open http://",
+                message.get_body(preferencelist=("plain",)).get_content(),
+            )
+            retry = requests.post(url, headers=headers, json=scheduled, timeout=20)
+            self.assertEqual(retry.status_code, 202, retry.text)
+            self.assertTrue(retry.json()["duplicate"])
+            self.assertEqual(len(notice_events()), 2)
+            self.assertEqual(len(smtp.received_emails), 2)
         finally:
             self.stop_synapse(
                 server_process=process,

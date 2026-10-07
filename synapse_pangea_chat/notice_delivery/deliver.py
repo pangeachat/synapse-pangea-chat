@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Dict, Optional, cast
 
 from synapse.api.constants import PresenceState
@@ -52,6 +53,7 @@ from synapse_pangea_chat.notice_delivery.request import (
     NoticeRequest,
     is_structured,
 )
+from synapse_pangea_chat.notice_delivery.schedule import NoticeSchedule
 from synapse_pangea_chat.notice_delivery.tokens import MILLISECONDS_PER_DAY, sign_token
 
 if TYPE_CHECKING:
@@ -93,6 +95,7 @@ class DeliverNotice(Resource):
             config.notice_admin_requests_per_minute, config.notice_admin_burst
         )
         self._delivery_log = DeliveryLog(api, config)
+        self.schedule = NoticeSchedule(api, self._deliver_scheduled)
         self._send_email_handler = self._hs.get_send_email_handler()
         self._app_name = self._hs.config.email.email_app_name
         [self._email_html, self._email_text] = api.read_templates(
@@ -101,6 +104,10 @@ class DeliverNotice(Resource):
         )
 
     def render_POST(self, request: SynapseRequest):
+        run_in_background(self._async_render_POST, request)
+        return server.NOT_DONE_YET
+
+    def render_GET(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
         return server.NOT_DONE_YET
 
@@ -119,6 +126,15 @@ class DeliverNotice(Resource):
                 )
                 return
 
+            if request.method == b"GET":
+                args = cast(Dict[bytes, list[bytes]], request.args)
+                values = args.get(b"schedule_id", [])
+                if len(values) != 1:
+                    raise ValueError("schedule_id is required")
+                response = await self.schedule.get(values[0].decode("utf-8"))
+                respond_with_json(request, 200, response, send_cors=True)
+                return
+
             body = self._parse_body(request)
             if body is None:
                 respond_with_json(
@@ -130,8 +146,13 @@ class DeliverNotice(Resource):
                 respond_with_json(request, 400, {"error": error}, send_cors=True)
                 return
 
-            response = await self.deliver(body)
-            respond_with_json(request, 200, response, send_cors=True)
+            response = await self.deliver(body, requested_by=requester_id)
+            respond_with_json(
+                request,
+                202 if "schedule_id" in response else 200,
+                response,
+                send_cors=True,
+            )
         except ValueError as error:
             respond_with_json(request, 400, {"error": str(error)}, send_cors=True)
         except DeliveryConflict as error:
@@ -189,15 +210,55 @@ class DeliverNotice(Resource):
             return "content must be an object"
         return None
 
-    async def deliver(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    async def deliver(
+        self, body: Dict[str, Any], *, requested_by: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Shared entry point for HTTP operators and trusted internal flows."""
         error = self._validate(body)
         if error:
             raise ValueError(error)
+        if "scheduled_at" in body:
+            body = {**body, "_requested_by": requested_by or body["sender_id"]}
+            req = NoticeRequest.parse(body)
+            await self._validate_scheduled_target(body, req)
+            return await self.schedule.enqueue(body)
+        return await self._deliver_now(body)
+
+    async def _deliver_scheduled(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        # Revalidate persisted content and eligibility; never run through enqueue.
+        NoticeRequest.parse(body)
+        return await self._deliver_now(body)
+
+    async def _validate_scheduled_target(
+        self, body: Dict[str, Any], req: NoticeRequest
+    ) -> None:
+        sender = body["sender_id"]
+        for admin in {sender, body.get("_requested_by", sender)}:
+            if not self._api.is_mine(admin) or not await self._api.is_user_admin(admin):
+                raise ValueError(
+                    "Sender and requesting operator must be local server admins"
+                )
+        for user in (sender, req.user_id):
+            (
+                membership,
+                _,
+            ) = await self._store.get_local_current_membership_for_user_in_room(
+                user, req.notice_room_id
+            )
+            if membership != "join":
+                raise ValueError(
+                    "Sender and recipient must be joined local room members"
+                )
+        if not self._config.notice_suppress_notice_push_rules:
+            raise ValueError("Scheduled delivery requires native notice suppression")
+
+    async def _deliver_now(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        body = dict(body)
         req = NoticeRequest.parse(body) if is_structured(body) else None
         record_id = None
         if req is not None:
-            await self._validate_notice(req)
+            if req.notice_event_id is not None:
+                await self._validate_notice(req)
             record_id, previous = await self._delivery_log.reserve(req)
             if previous is not None:
                 return {
@@ -206,11 +267,35 @@ class DeliverNotice(Resource):
                     "log_status": "complete",
                     "duplicate": True,
                 }
-        result = await self._deliver_once(body, req)
+        result: Dict[str, Any]
+        if req is not None and req.notice_event_id is None:
+            try:
+                await self._validate_scheduled_target(body, req)
+            except ValueError:
+                result = {
+                    "user_id": req.user_id,
+                    "category": req.category,
+                    "channel": CHANNEL_NONE,
+                    "reason": "scheduled_target_ineligible",
+                    "push": None,
+                    "email": None,
+                    "push_rule_installed": False,
+                }
+            else:
+                result = await self._deliver_once(body, req)
+            req = replace(req, notice_event_id=body.get("notice_event_id"))
+            result["notice_event_id"] = req.notice_event_id
+            result["notice_room_id"] = req.notice_room_id
+        else:
+            result = await self._deliver_once(body, req)
         if req is not None and record_id is not None:
             result.update(
                 notification_log_id=record_id, log_status="complete", duplicate=False
             )
+            if "scheduled_at" in body and (result.get("reason") or "").endswith(
+                "send_failed"
+            ):
+                result["log_status"] = "pending_reconciliation"
             try:
                 await self._delivery_log.finish(record_id, req, result)
             except Exception:
@@ -224,6 +309,7 @@ class DeliverNotice(Resource):
         return result
 
     async def _validate_notice(self, req: NoticeRequest) -> None:
+        assert req.notice_event_id is not None
         event = await self._store.get_event(req.notice_event_id, allow_none=True)
         if (
             event is None
@@ -275,6 +361,24 @@ class DeliverNotice(Resource):
             result["push_rule_installed"] = await ensure_bot_notice_push_rule(
                 self._api, user_id
             )
+
+        if req is not None and req.notice_event_id is None:
+            event = await self._api.create_and_send_event_into_room(
+                {
+                    "type": BOT_NOTICE_EVENT_TYPE,
+                    "sender": body["sender_id"],
+                    "room_id": req.notice_room_id,
+                    "content": {
+                        **body["notice_content"],
+                        **(
+                            {"pangea.schedule_id": body["_schedule_id"]}
+                            if "_schedule_id" in body
+                            else {}
+                        ),
+                    },
+                }
+            )
+            body["notice_event_id"] = event.event_id
 
         method = (
             req.method

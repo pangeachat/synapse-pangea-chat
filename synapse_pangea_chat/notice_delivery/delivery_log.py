@@ -154,7 +154,7 @@ class DeliveryLog:
             outcome="send" if sent else "skip",
             channel=result["channel"] if sent else "none",
             no_send_reason=None if sent else result["reason"],
-            delivery={"status": "complete", "response": safe},
+            delivery={"status": result.get("log_status", "complete"), "response": safe},
         )
         status, _ = await self._request(
             "PATCH", "/" + quote(record_id, safe=""), {"decision": decision}
