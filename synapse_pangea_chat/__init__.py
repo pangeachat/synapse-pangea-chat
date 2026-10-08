@@ -60,6 +60,7 @@ from synapse_pangea_chat.room_preview import (
     RoomPreview,
     invalidate_room_cache,
 )
+from synapse_pangea_chat.safety_incidents import register_safety_incidents
 from synapse_pangea_chat.user_activity import (
     CourseActivities,
     UserActivity,
@@ -448,6 +449,11 @@ class PangeaChat:
                 path="/_synapse/client/pangea/v1/course_member_emails",
                 resource=self.course_member_emails_resource,
             )
+
+        # --- Safety page: reports and the incident read ---
+        # Always registered: a report is recorded whether or not moderation is
+        # on, and the read is how a course admin sees both.
+        register_safety_incidents(api, config)
 
         # --- User Activity ---
         self.user_activity_resource = UserActivity(api, config)
@@ -899,6 +905,19 @@ class PangeaChat:
                 "course_member_emails_burst_duration_seconds must be an integer >= 1"
             )
 
+        # --- safety incidents config ---
+        safety_limits: Dict[str, int] = {}
+        for key, default in (
+            ("safety_report_requests_per_burst", 30),
+            ("safety_report_burst_duration_seconds", 60),
+            ("safety_incidents_requests_per_burst", 60),
+            ("safety_incidents_burst_duration_seconds", 60),
+        ):
+            value = config.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{key} must be an integer >= 1")
+            safety_limits[key] = value
+
         # --- register_email config ---
         register_email_requests_per_burst = config.get(
             "register_email_requests_per_burst", 5
@@ -1328,6 +1347,18 @@ class PangeaChat:
             course_member_emails_enabled=course_member_emails_enabled,
             course_member_emails_requests_per_burst=course_member_emails_requests_per_burst,
             course_member_emails_burst_duration_seconds=course_member_emails_burst_duration_seconds,
+            safety_report_requests_per_burst=safety_limits[
+                "safety_report_requests_per_burst"
+            ],
+            safety_report_burst_duration_seconds=safety_limits[
+                "safety_report_burst_duration_seconds"
+            ],
+            safety_incidents_requests_per_burst=safety_limits[
+                "safety_incidents_requests_per_burst"
+            ],
+            safety_incidents_burst_duration_seconds=safety_limits[
+                "safety_incidents_burst_duration_seconds"
+            ],
             register_email_requests_per_burst=register_email_requests_per_burst,
             register_email_burst_duration_seconds=register_email_burst_duration_seconds,
             email_policy_enabled=email_policy_enabled,

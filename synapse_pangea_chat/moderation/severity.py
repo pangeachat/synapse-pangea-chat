@@ -240,9 +240,16 @@ def _readable_score(scores: Any, wire_name: str) -> Optional[float]:
     score = scores.get(wire_name)
     if isinstance(score, bool) or not isinstance(score, (int, float)):
         return None
-    if not math.isfinite(score) or not 0.0 <= float(score) <= 1.0:
+    try:
+        number = float(score)
+    except OverflowError:
+        # An integer too large for a float is a number we cannot interpret,
+        # like any other out-of-range value - not an exception that takes
+        # the whole verdict, and its record, down with it.
         return None
-    return float(score)
+    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+        return None
+    return number
 
 
 def decide(

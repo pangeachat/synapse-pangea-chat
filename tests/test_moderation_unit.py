@@ -2672,6 +2672,31 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(preserved[0], 20, "the backlog did not land")
 
+    async def test_a_remembered_preserve_still_flushes_the_backlog(self) -> None:
+        """A disclosure's preserve fails to land; the database recovers; the
+        next verdict is on that SAME event, which this process remembers is
+        preserved. The claim must still write the backlog - otherwise the
+        protection lives only in memory, and a restart loses it."""
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        db_pool.error = RuntimeError("database is unhappy")
+        with patch(self.MODERATE, self._verdict("self-harm/intent")):
+            await mod._check_and_redact(self._job("$e1"))
+        db_pool.error = None
+        with patch(self.MODERATE, self._verdict("harassment")):
+            await mod._check_and_redact(self._job("$e1"))
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        table = db_pool.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = ?", (DISPOSITION_TABLE,)
+        ).fetchone()
+        self.assertIsNotNone(table, "the remembered preserve never landed")
+        preserved = db_pool.connection.execute(
+            f"SELECT count(*) FROM {DISPOSITION_TABLE} "
+            f"WHERE disposition = 'preserved'"
+        ).fetchone()
+        self.assertEqual(preserved[0], 1, "the remembered preserve never landed")
+
     async def test_a_claim_is_taken_with_no_await_before_the_send(self) -> None:
         """A claim taken and then abandoned at an `await` is a row saying
         `redacted` on a message that is still standing, which nothing would
@@ -2718,7 +2743,17 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
         )
         api, homeserver = self._pair()
         mod = self._module(api, homeserver)
-        homeserver.store.db_pool.error = RuntimeError("database is unhappy")
+
+        # The DISPOSITION table is what is unreadable, and only it. A
+        # database that is down altogether now stops the redaction one step
+        # earlier, at the Safety page's incident row (nothing is removed
+        # without its record - `test_safety_incidents_unit`), and would never
+        # reach the disposition read this test is about.
+        def _disposition_unreadable(sql: str, _args: Any) -> None:
+            if DISPOSITION_TABLE in sql:
+                raise RuntimeError("database is unhappy")
+
+        homeserver.store.db_pool.on_statement = _disposition_unreadable
         with patch(self.MODERATE, self._verdict("harassment")):
             await mod._check_and_redact(self._job())
         cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
