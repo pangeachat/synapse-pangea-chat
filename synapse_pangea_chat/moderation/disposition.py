@@ -160,6 +160,10 @@ _DELETE_CLAIM_SQL = """
     WHERE event_id = ? AND disposition = ? AND claim_id = ?
 """
 
+#: The table's DDL, for the Safety page's one-time backfill, which reads this
+#: table on an instance that may never have run Tier 2.
+CREATE_TABLE_SQL = _CREATE_TABLE_SQL
+
 #: Every statement above, for the drift test.
 STATEMENTS = (
     _CREATE_TABLE_SQL,
@@ -251,6 +255,11 @@ class DispositionStore:
         self._pending[event_id] = (room_id, category)
         metrics.TIER2_DISPOSITION_UNWRITTEN.set(len(self._pending))
         return await self._flush_pending(event_id)
+
+    async def flush_pending(self) -> None:
+        """Write the preserves that have not landed yet, before a redaction
+        decision does anything else. See `_flush_pending`."""
+        await self._flush_pending()
 
     async def _flush_pending(self, event_id: Optional[str] = None) -> bool:
         """Write the preserves that have not landed yet.
@@ -377,13 +386,16 @@ class DispositionStore:
         so two instances both configured to run background tasks used to send
         two redactions for one message.
         """
-        if event_id in self._remembered:
-            return (PRESERVED, "")
         # Preserves the database refused earlier are written FIRST, so a
         # database that was briefly unavailable cannot leave a disclosure
         # unprotected once it comes back: the row exists before this claim
-        # asks for it, and the claim then loses to it.
+        # asks for it, and the claim then loses to it. Before the remembered
+        # check too: the backlog is OTHER events' protection, and a claim on
+        # an event this process already knows is preserved is still a chance
+        # to write it before a restart loses it.
         await self._flush_pending()
+        if event_id in self._remembered:
+            return (PRESERVED, "")
         # **Scoped to THIS event, and not to the backlog.** A preserve of this
         # event that has not landed is still a preserve, and this is where it
         # is protected - `_remembered` is an LRU and evicts, this does not.

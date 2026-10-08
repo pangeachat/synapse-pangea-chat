@@ -223,6 +223,20 @@ class _TransactionDouble:
         # the real transaction calls.
         self._cursor.execute(sqlite_engine().convert_param_style(sql), tuple(args))
 
+    @property
+    def database_engine(self) -> Any:
+        """`LoggingTransaction.database_engine`: the real SQLite engine."""
+        return sqlite_engine()
+
+    @property
+    def txn(self) -> "_RawCursorDouble":
+        """`LoggingTransaction.txn`, the cursor underneath the logging
+        wrapper. A statement run here has had its parameters converted by the
+        caller, as Synapse's own wrapper would have done, and still passes the
+        statement hook - a test that refuses a row must refuse it whichever
+        way it is written."""
+        return _RawCursorDouble(self._cursor, self._on_statement)
+
     def fetchone(self) -> Any:
         return self._cursor.fetchone()
 
@@ -232,6 +246,21 @@ class _TransactionDouble:
     @property
     def rowcount(self) -> int:
         return self._cursor.rowcount
+
+
+class _RawCursorDouble:
+    def __init__(
+        self,
+        cursor: "sqlite3.Cursor",
+        on_statement: Optional[Callable[[str, Any], None]],
+    ) -> None:
+        self._cursor = cursor
+        self._on_statement = on_statement
+
+    def execute(self, sql: str, args: Any = ()) -> None:
+        if self._on_statement is not None:
+            self._on_statement(sql, tuple(args))
+        self._cursor.execute(sql, tuple(args))
 
 
 class DbPoolDouble:
@@ -291,6 +320,14 @@ class EventStoreDouble:
         #: Called on every read, so a test can assert the ORDER of the
         #: re-read against the disposition claim.
         self.on_read: Optional[Callable[[], None]] = None
+
+    async def get_rooms_user_has_been_in(self, user_id: str) -> set:
+        """No rooms: a sender who is a student nowhere. The Safety page's
+        course lookup reads this; a test about courses supplies its own."""
+        return set()
+
+    def get_room_max_stream_ordering(self) -> int:
+        return 0
 
     async def get_event(self, event_id: str, allow_none: bool = False) -> Any:
         self.reads.append(event_id)

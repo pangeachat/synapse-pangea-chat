@@ -110,6 +110,13 @@ class PangeaChatConfig:
     course_member_emails_requests_per_burst: int = 20
     course_member_emails_burst_duration_seconds: int = 60
 
+    # --- safety incidents config ---
+    # Per-caller limits on the Safety page's report and read endpoints.
+    safety_report_requests_per_burst: int = 30
+    safety_report_burst_duration_seconds: int = 60
+    safety_incidents_requests_per_burst: int = 60
+    safety_incidents_burst_duration_seconds: int = 60
+
     # --- invite_by_email config ---
     invite_by_email_requests_per_burst: int = 5
     invite_by_email_burst_duration_seconds: int = 60
