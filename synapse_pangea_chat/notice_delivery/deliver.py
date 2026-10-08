@@ -46,6 +46,7 @@ from synapse_pangea_chat.notice_delivery.delivery_log import (
     DeliveryLog,
     DeliveryLogError,
 )
+from synapse_pangea_chat.notice_delivery.eligibility import NoticeEligibility
 from synapse_pangea_chat.notice_delivery.push_rule import ensure_bot_notice_push_rule
 from synapse_pangea_chat.notice_delivery.rate_limit import AdminRateLimiter
 from synapse_pangea_chat.notice_delivery.request import (
@@ -111,6 +112,10 @@ class DeliverNotice(Resource):
         run_in_background(self._async_render_POST, request)
         return server.NOT_DONE_YET
 
+    def render_DELETE(self, request: SynapseRequest):
+        run_in_background(self._async_render_POST, request)
+        return server.NOT_DONE_YET
+
     async def _async_render_POST(self, request: SynapseRequest) -> None:
         try:
             requester = await self._auth.get_user_by_req(request)
@@ -126,12 +131,17 @@ class DeliverNotice(Resource):
                 )
                 return
 
-            if request.method == b"GET":
+            if request.method in (b"GET", b"DELETE"):
                 args = cast(Dict[bytes, list[bytes]], request.args)
                 values = args.get(b"schedule_id", [])
                 if len(values) != 1:
                     raise ValueError("schedule_id is required")
-                response = await self.schedule.get(values[0].decode("utf-8"))
+                operation = (
+                    self.schedule.cancel
+                    if request.method == b"DELETE"
+                    else self.schedule.get
+                )
+                response = await operation(values[0].decode("utf-8"))
                 respond_with_json(request, 200, response, send_cors=True)
                 return
 
@@ -284,7 +294,22 @@ class DeliverNotice(Resource):
                     "push_rule_installed": False,
                 }
             else:
-                result = await self._deliver_once(body, req)
+                assert record_id is not None  # Structured delivery reserved above.
+                reason = await NoticeEligibility(self._api, self._delivery_log).check(
+                    body, req, record_id
+                )
+                if reason:
+                    result = {
+                        "user_id": req.user_id,
+                        "category": req.category,
+                        "channel": CHANNEL_NONE,
+                        "reason": reason,
+                        "push": None,
+                        "email": None,
+                        "push_rule_installed": False,
+                    }
+                else:
+                    result = await self._deliver_once(body, req)
             req = replace(req, notice_event_id=body.get("notice_event_id"))
             result["notice_event_id"] = req.notice_event_id
             result["notice_room_id"] = req.notice_room_id
