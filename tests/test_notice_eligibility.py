@@ -41,6 +41,18 @@ class TestEligibility(unittest.IsolatedAsyncioTestCase):
                 await gate.check(body, req, "42"), "eligibility_unavailable"
             )
 
+    async def test_inactive_recipient_uses_one_indexed_activity_read(self):
+        gate, body, req, api = self.setup_gate({"recipient_not_returned": True})
+        api._hs.get_presence_handler.return_value.current_state_for_user.return_value = SimpleNamespace(
+            last_active_ts=0
+        )
+        self.assertIsNone(await gate.check(body, req, "42"))
+        gate._query.assert_awaited_once()
+        self.assertIn(
+            "FROM user_ips WHERE user_id = ? AND last_seen > ? LIMIT 1",
+            gate._query.await_args.args[0],
+        )
+
     async def test_room_cap_stops_before_state_query(self):
         gate, body, req, _ = self.setup_gate({"activity_not_started": True})
         gate._query.return_value = [(f"!{i}:test",) for i in range(257)]

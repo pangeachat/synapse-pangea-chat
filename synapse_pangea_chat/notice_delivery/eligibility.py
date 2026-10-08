@@ -86,13 +86,6 @@ class NoticeEligibility:
                 )
                 if rows:
                     return "recipient_returned"
-                rows = await self._query(
-                    "SELECT 1 FROM events WHERE sender = ? AND type = 'm.room.message' "
-                    "AND origin_server_ts > ? LIMIT 1",
-                    (req.user_id, decided),
-                )
-                if rows:
-                    return "recipient_returned"
             spacing = conditions.get("min_contact_spacing_ms", 0)
             if spacing:
                 since = datetime.fromtimestamp(

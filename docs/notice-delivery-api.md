@@ -79,7 +79,7 @@ Add an `eligibility` object to a scheduled request. Unknown keys and invalid typ
 
 | Field | Type | Evidence checked when due |
 | --- | --- | --- |
-| `recipient_not_returned` | Boolean | Presence activity, persisted client activity, and messages since `log.run.decided_at`. These are server-observed activity signals, not email opens. |
+| `recipient_not_returned` | Boolean | Presence activity and indexed persisted client activity since `log.run.decided_at`. These are server-observed activity signals, not email opens. Synapse batches persisted client activity, so this is not an instantaneous activity fence. |
 | `min_contact_spacing_ms` | Integer, 0–30 days | Other send decisions for this recipient and funnel in Notification_Log, using their reservation creation time. Pending send reservations count conservatively; the current reservation is excluded. |
 | `activity_not_started` | Boolean | Requires `activity_id`. Current role assignments and the recipient-owned saved activity list, including previously left sessions. A claimed role counts as starting. |
 | `session_available` | Boolean | Requires `session_room_id`. Membership/access, replacement-room state, assigned roles, completion and capacity from the embedded or CMS-resolved activity plan. A pinned plan is read at its pinned version. |
@@ -90,7 +90,7 @@ The room evidence read is capped at 256 membership rooms and 256 saved sessions;
 
 ### Local load verification
 
-Start the existing local CMS fixture, then run `NOTICE_CMS_FIXTURE=/tmp/notice-cms.json python -m unittest tests.integration.notice_schedule_load` with the normal local Synapse test environment. The runner creates an isolated homeserver/database and 32 synthetic recipients, runs the Locust scenario in `tests/load_notice_schedule.py` at 100/500/1,000 scheduled requests, cancels one fifth, exercises due-time activity/contact reads, and keeps foreground `/sync` traffic active. Only in-app delivery is used. It checks terminal outcomes and reports maximum delivery lateness plus Locust CSV paths. The runner rejects non-local CMS and the scenario rejects non-local Synapse. Local results do not establish deployed staging/production headroom.
+Start the existing local CMS fixture, then run `NOTICE_CMS_FIXTURE=/tmp/notice-cms.json python -m unittest tests.integration.notice_schedule_load` with the normal local Synapse test environment. The runner creates an isolated homeserver/database and 32 synthetic recipients, runs the Locust scenario in `tests/load_notice_schedule.py` at 100/500/1,000 scheduled requests, cancels one fifth, exercises due-time activity/contact reads, and keeps foreground `/sync` traffic active. Only in-app delivery is used. It requires zero HTTP failures, correct terminal outcomes, foreground sync p95 below 250 ms and maximum below two seconds; these are local regression budgets. It reports maximum delivery lateness, Synapse-process peak RSS and Locust CSV paths. The runner rejects non-local CMS and the scenario rejects non-local Synapse. Local results do not establish deployed staging/production headroom.
 
 ## Course/activity images
 

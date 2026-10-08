@@ -102,6 +102,7 @@ class TestNoticeScheduleLoad(BaseSynapseE2ETest):
                     sender_id="@loadadmin:my.domain.name",
                     notice_content={"body": "Local load fixture"},
                     eligibility={
+                        "recipient_not_returned": True,
                         "activity_not_started": True,
                         "min_contact_spacing_ms": 1,
                     },

@@ -279,37 +279,30 @@ class DeliverNotice(Resource):
                 }
         result: Dict[str, Any]
         if req is not None and req.notice_event_id is None:
+            reason: Optional[str]
             try:
                 await self._validate_scheduled_target(body, req)
             # silent-ok: expected eligibility changes become a recorded no-send
             # result in Notification_Log below, not an unreported failure.
             except ValueError:
-                result = {
-                    "user_id": req.user_id,
-                    "category": req.category,
-                    "channel": CHANNEL_NONE,
-                    "reason": "scheduled_target_ineligible",
-                    "push": None,
-                    "email": None,
-                    "push_rule_installed": False,
-                }
+                reason = "scheduled_target_ineligible"
             else:
                 assert record_id is not None  # Structured delivery reserved above.
                 reason = await NoticeEligibility(self._api, self._delivery_log).check(
                     body, req, record_id
                 )
-                if reason:
-                    result = {
-                        "user_id": req.user_id,
-                        "category": req.category,
-                        "channel": CHANNEL_NONE,
-                        "reason": reason,
-                        "push": None,
-                        "email": None,
-                        "push_rule_installed": False,
-                    }
-                else:
-                    result = await self._deliver_once(body, req)
+            if reason:
+                result = {
+                    "user_id": req.user_id,
+                    "category": req.category,
+                    "channel": CHANNEL_NONE,
+                    "reason": reason,
+                    "push": None,
+                    "email": None,
+                    "push_rule_installed": False,
+                }
+            else:
+                result = await self._deliver_once(body, req)
             req = replace(req, notice_event_id=body.get("notice_event_id"))
             result["notice_event_id"] = req.notice_event_id
             result["notice_room_id"] = req.notice_room_id

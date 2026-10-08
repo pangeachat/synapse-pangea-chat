@@ -50,6 +50,7 @@ class TestNoticeDeliveryCMS(BaseSynapseE2ETest):
                 "app_base_url": "http://127.0.0.1/app",
             },
             synapse_config_overrides={
+                "rc_presence": {"per_user": {"per_second": 10, "burst_count": 10}},
                 "public_baseurl": self.server_url,
                 "listeners": [
                     {
@@ -416,9 +417,15 @@ class TestNoticeDeliveryCMS(BaseSynapseE2ETest):
 
             # Change eligibility after enqueue against real account data and
             # room membership, rather than only mocking the final read.
-            def scheduled_case(name, change, expected_channel, expected_reason=None):
+            def scheduled_case(
+                name,
+                change,
+                expected_channel,
+                expected_reason=None,
+                method="use-available",
+            ):
                 payload = copy.deepcopy(scheduled)
-                payload["delivery_method"] = "use-available"
+                payload["delivery_method"] = method
                 payload["log"]["run"]["run_id"] = (
                     "notice-228-integration-" + name + "-" + uuid.uuid4().hex
                 )
@@ -533,6 +540,69 @@ class TestNoticeDeliveryCMS(BaseSynapseE2ETest):
                 {"activity_id": "activity-1", "roles": [{"role_id": "one"}]},
             )
             put_state("pangea.activity_roles", {"roles": {}})
+            # Use a real canonical plan in the seeded local CMS. Verify both
+            # reference forms through the real REST boundary, not a mock.
+            page = 1
+            plan_doc = None
+            while plan_doc is None:
+                plans = requests.get(
+                    cms["url"] + "/api/activities-v2",
+                    headers=cms_headers,
+                    params={
+                        "where[req.source_request_hash][exists]": "false",
+                        "limit": 20,
+                        "page": page,
+                        "depth": 0,
+                    },
+                    timeout=20,
+                )
+                self.assertEqual(plans.status_code, 200, plans.text)
+                plan_doc = next(
+                    (
+                        d
+                        for d in plans.json()["docs"]
+                        if d.get("res", {}).get("plan", {}).get("roles")
+                    ),
+                    None,
+                )
+                if plan_doc is not None or not plans.json()["hasNextPage"]:
+                    break
+                page += 1
+            self.assertIsNotNone(
+                plan_doc, "Seed local CMS with a role-bearing canonical activity"
+            )
+            plan_id = plan_doc["res"]["plan"]["activity_id"]
+            versions = requests.get(
+                cms["url"] + "/api/activities-v2/versions",
+                headers=cms_headers,
+                params={
+                    "where[parent][equals]": plan_doc["id"],
+                    "limit": 1,
+                    "depth": 0,
+                },
+                timeout=20,
+            )
+            self.assertEqual(versions.status_code, 200, versions.text)
+            self.assertTrue(versions.json()["docs"])
+            scheduled["activity_id"] = plan_id
+            for reference in (
+                {"activity_id": plan_id},
+                {
+                    "activity_id": plan_id,
+                    "version_id": versions.json()["docs"][0]["id"],
+                },
+            ):
+                scheduled_case(
+                    "cms-plan-reference",
+                    lambda: put_state("pangea.activity_plan", reference),
+                    "in_app",
+                    method="in-app-only",
+                )
+            scheduled["activity_id"] = "activity-1"
+            put_state(
+                "pangea.activity_plan",
+                {"activity_id": "activity-1", "roles": [{"role_id": "one"}]},
+            )
             del scheduled["session_room_id"]
             saved_room = requests.post(
                 f"{self.server_url}/_matrix/client/v3/createRoom",
