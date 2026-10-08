@@ -386,13 +386,16 @@ class DispositionStore:
         so two instances both configured to run background tasks used to send
         two redactions for one message.
         """
-        if event_id in self._remembered:
-            return (PRESERVED, "")
         # Preserves the database refused earlier are written FIRST, so a
         # database that was briefly unavailable cannot leave a disclosure
         # unprotected once it comes back: the row exists before this claim
-        # asks for it, and the claim then loses to it.
+        # asks for it, and the claim then loses to it. Before the remembered
+        # check too: the backlog is OTHER events' protection, and a claim on
+        # an event this process already knows is preserved is still a chance
+        # to write it before a restart loses it.
         await self._flush_pending()
+        if event_id in self._remembered:
+            return (PRESERVED, "")
         # **Scoped to THIS event, and not to the backlog.** A preserve of this
         # event that has not landed is still a preserve, and this is where it
         # is protected - `_remembered` is an LRU and evicts, this does not.
