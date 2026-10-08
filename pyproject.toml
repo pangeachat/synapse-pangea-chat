@@ -24,6 +24,7 @@ dev = [
   "psycopg2",
   "requests",
   "testing.postgresql",
+  "locust == 2.42.0",
   # For the Tier 1 collision gate (tests/test_moderation_tier1_terms.py) only.
   # NEVER a runtime dependency: it carries ~324 MB of frequency data with the
   # [cjk] extra, which is what supplies the Japanese, Korean and Chinese
