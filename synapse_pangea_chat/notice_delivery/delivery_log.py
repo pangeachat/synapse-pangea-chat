@@ -39,11 +39,22 @@ class DeliveryLog:
         )
 
     async def _request(
-        self, method: str, suffix: str = "", body: Optional[Dict[str, Any]] = None
+        self,
+        method: str,
+        suffix: str = "",
+        body: Optional[Dict[str, Any]] = None,
+        *,
+        collection: str = "notification-log",
     ):
+        if collection not in {
+            "notification-log",
+            "activities-v2",
+            "activities-v2/versions",
+        }:
+            raise ValueError("Unsupported notice CMS collection")
         response = await self._http.request(
             method,
-            self._url + suffix,
+            self._url.removesuffix("notification-log") + collection + suffix,
             data=json.dumps(body).encode() if body is not None else None,
             headers=self._headers,
         )

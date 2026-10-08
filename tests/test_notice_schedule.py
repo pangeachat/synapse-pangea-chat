@@ -1,5 +1,6 @@
 """Scheduling timing, durable claims, and whole-notice side effects."""
 
+import asyncio
 import copy
 import sqlite3
 import unittest
@@ -66,6 +67,49 @@ class TestSchedule(unittest.IsolatedAsyncioTestCase):
                 "SELECT payload FROM pangea_notice_schedule"
             ).fetchone()[0]
         )
+
+    async def test_cancel_survives_restart_and_enqueue_retry(self):
+        body = scheduled_body()
+        accepted = await self.queue.enqueue(body)
+        cancelled = await self.queue.cancel(accepted["schedule_id"])
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(await self.queue.cancel(accepted["schedule_id"]), cancelled)
+        restarted = NoticeSchedule(self.api, self.execute)
+        self.api._hs.get_clock.return_value.time_msec.return_value = NOW_MS + 60000
+        await restarted.run_due()
+        self.execute.assert_not_awaited()
+        replay = await restarted.enqueue(body)
+        self.assertTrue(replay["duplicate"])
+        self.assertEqual(replay["status"], "cancelled")
+
+    async def test_claim_wins_cancellation_cannot_report_success(self):
+        accepted = await self.queue.enqueue(scheduled_body())
+        self.api._hs.get_clock.return_value.time_msec.return_value = NOW_MS + 60000
+        await self.pool.runInteraction("claim", self.queue._claim)
+        with self.assertRaises(DeliveryConflict):
+            await self.queue.cancel(accepted["schedule_id"])
+
+    async def test_slow_delivery_does_not_start_another_drain(self):
+        await self.queue.enqueue(scheduled_body())
+        body = scheduled_body()
+        body["log"]["run"]["run_id"] += "-second"
+        await self.queue.enqueue(body)
+        self.api._hs.get_clock.return_value.time_msec.return_value = NOW_MS + 60000
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def slow(_):
+            entered.set()
+            await release.wait()
+            return {"channel": "email"}
+
+        self.execute.side_effect = slow
+        first = asyncio.create_task(self.queue.run_due())
+        await entered.wait()
+        await self.queue.run_due()
+        self.assertEqual(self.execute.await_count, 1)
+        release.set()
+        await first
+        self.assertEqual(self.execute.await_count, 2)
 
     async def test_retry_is_deduplicated_and_changed_content_conflicts(self):
         body = scheduled_body()

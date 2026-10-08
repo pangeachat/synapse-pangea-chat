@@ -43,6 +43,12 @@ An optional `scheduled_at` defers the entire notice, including its in-app event,
 
 Schedules survive restarts and are deduplicated by run/person. At send time, recheck permissions, membership, preferences, and availability, then use the existing delivery service and Notification_Log. Uncertain delivery outcomes require reconciliation rather than automatic resending.
 
+Scheduled notices may include optional eligibility conditions, checked against current server data immediately before delivery. Conditions can suppress delivery when the recipient has returned since the decision, another qualifying contact violates the caller’s minimum spacing, the target activity has been started or completed, or the target session is full or inaccessible.
+
+Failed or unavailable checks send nothing and record a reason in Notification_Log. Requests without these conditions retain existing behavior.
+
+Server admins may cancel queued notices atomically. Cancellation succeeds only before the worker claims the notice, is idempotent, and prevents any notice event, push, or email. Claimed or uncertain deliveries cannot be reported as cancelled. Cancelled decisions remain deduplicated.
+
 ## The refusal store
 
 Refusal state is one global account-data event per user, `pangea.communication_preferences`: the refused categories, an `all_off` flag, when it changed, and which surface changed it (`unsubscribe_link` or `app`). It is the store the in-app preference screen reads and writes and the store this module reads before every send, so the two surfaces cannot disagree. Rules the store enforces:

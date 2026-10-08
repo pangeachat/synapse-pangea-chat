@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from synapse_pangea_chat.notice_delivery.categories import DELIVERABLE_CATEGORIES
+from synapse_pangea_chat.notice_delivery.eligibility import validate_eligibility
 
 EMAIL_ONLY = frozenset({"teacher_setup", "weekly_class_report", "campaigns"})
 METHODS = frozenset({"use-available", "email-only", "push-only", "in-app-only"})
@@ -116,6 +117,7 @@ class NoticeRequest:
 
     @classmethod
     def parse(cls, data: Dict[str, Any]) -> NoticeRequest:
+        validate_eligibility(data)
         user = string(data, "user_id")
         category = string(data, "category")
         variant = string(data, "variant")
@@ -198,5 +200,12 @@ class NoticeRequest:
 def is_structured(data: Dict[str, Any]) -> bool:
     return any(
         key in data
-        for key in ("push", "email", "delivery_method", "log", "scheduled_at")
+        for key in (
+            "push",
+            "email",
+            "delivery_method",
+            "log",
+            "scheduled_at",
+            "eligibility",
+        )
     )

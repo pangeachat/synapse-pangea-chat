@@ -32,6 +32,7 @@ class NoticeSchedule:
         self._clock = api._hs.get_clock()
         self._execute = execute
         self._ready = False
+        self._running = False
 
     def start(self) -> None:
         self._clock.looping_call(
@@ -130,6 +131,11 @@ class NoticeSchedule:
         return await self._db.runInteraction("notice_schedule_read", read)
 
     async def run_due(self) -> None:
+        # The timer starts background processes; it does not await the previous
+        # tick. Slow CMS/SMTP responses must not grow concurrent drain loops.
+        if self._running:
+            return
+        self._running = True
         try:
             await self._ensure_table()
             # Claim one at a time: a crash does not strand an unstarted batch.
@@ -164,6 +170,31 @@ class NoticeSchedule:
                     )
         except Exception:
             logger.exception("Notice schedule polling failed")
+        finally:
+            self._running = False
+
+    async def cancel(self, schedule_id: str) -> Dict[str, Any]:
+        """Compete with _claim in SQL; never promise to retract a claimed send."""
+        await self._ensure_table()
+
+        def cancel(txn):
+            txn.execute(
+                f"UPDATE {TABLE} SET status = 'cancelled', payload = NULL "
+                "WHERE schedule_id = ? AND status = 'queued'",
+                (schedule_id,),
+            )
+            txn.execute(
+                f"SELECT schedule_id, fingerprint, scheduled_at_ms, status, result FROM {TABLE} WHERE schedule_id = ?",
+                (schedule_id,),
+            )
+            row = txn.fetchone()
+            if row is None:
+                raise ValueError("Unknown schedule_id")
+            if row[3] != "cancelled":
+                raise DeliveryConflict("Notice already claimed; cannot cancel delivery")
+            return self._response(row)
+
+        return await self._db.runInteraction("notice_schedule_cancel", cancel)
 
     def _claim(self, txn):
         txn.execute(

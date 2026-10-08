@@ -69,7 +69,28 @@ The endpoint returns HTTP 202 with `schedule_id`, `scheduled_at_ms`, `status`, `
 
 Queued requests are stored in the Synapse database. Polling checks due work every five seconds; scheduling is a not-before time, not an exact wall-clock guarantee. A time already in the past becomes due on the next poll. No event, push, email, or delivery log is created at submission. When due, the service reserves Notification_Log before creating the notice and uses the usual delivery path. Refusals or lost eligibility produce no notice. Successful completion removes queued message content, retaining the request fingerprint and safe result for deduplication. Existing immediate requests keep their current behavior.
 
-`queued` means no send has started. `complete` includes delivery and definite no-send outcomes; inspect `result.channel` and `result.reason`. `pending_reconciliation` means execution has claimed the job and may be in progress or interrupted; inspect its result/log and server evidence before any resend. The worker never automatically reclaims it, so an SMTP acknowledgement or event-creation result lost during a restart cannot cause duplicate delivery. A queued job survives a restart. There is no recurring schedule or reschedule/cancel API in this version.
+`queued` means no send has started. `complete` includes delivery and definite no-send outcomes; inspect `result.channel` and `result.reason`. `pending_reconciliation` means execution has claimed the job and may be in progress or interrupted; inspect its result/log and server evidence before any resend. The worker never automatically reclaims it, so an SMTP acknowledgement or event-creation result lost during a restart cannot cause duplicate delivery. A queued job survives a restart. There is no recurring schedule or reschedule API.
+
+Cancel with `DELETE /_synapse/client/pangea/v1/deliver_notice?schedule_id=…`, using a server-admin token. HTTP 200 with `status: cancelled` confirms that execution cannot start. Repeating cancellation returns the same status. HTTP 409 means the worker already claimed the job (or it completed); delivery cannot be recalled. Retrying the original enqueue request still returns the cancelled schedule, without resurrecting it.
+
+### Optional eligibility conditions
+
+Add an `eligibility` object to a scheduled request. Unknown keys and invalid types are rejected before enqueue. All supplied conditions must pass; omitted conditions are not evaluated.
+
+| Field | Type | Evidence checked when due |
+| --- | --- | --- |
+| `recipient_not_returned` | Boolean | Presence activity and indexed persisted client activity since `log.run.decided_at`. These are server-observed activity signals, not email opens. Synapse batches persisted client activity, so this is not an instantaneous activity fence. |
+| `min_contact_spacing_ms` | Integer, 0–30 days | Other send decisions for this recipient and funnel in Notification_Log, using their reservation creation time. Pending send reservations count conservatively; the current reservation is excluded. |
+| `activity_not_started` | Boolean | Requires `activity_id`. Current role assignments and the recipient-owned saved activity list, including previously left sessions. A claimed role counts as starting. |
+| `session_available` | Boolean | Requires `session_room_id`. Membership/access, replacement-room state, assigned roles, completion and capacity from the embedded or CMS-resolved activity plan. A pinned plan is read at its pinned version. |
+
+Suppression returns `channel: none`, a reason such as `recipient_returned`, `contact_spacing`, `activity_already_started`, `activity_already_completed`, `session_full`, `session_ended`, or `session_inaccessible`, and the Notification_Log ID. Failed or malformed evidence returns `eligibility_unavailable`; exceeding the bounded room evidence returns `eligibility_evidence_limit`. These are terminal skips, not delayed retries.
+
+The room evidence read is capped at 256 membership rooms and 256 saved sessions; role/access-rule reads are capped at 32 entries. PostgreSQL eligibility queries have a 250 ms statement timeout. The scheduler allows only one active drain per process, including when a delivery takes longer than the five-second polling interval. Inspect skips and measured queue lag before increasing traffic; these limits are not a production capacity claim.
+
+### Local load verification
+
+Start the existing local CMS fixture, then run `NOTICE_CMS_FIXTURE=/tmp/notice-cms.json python -m unittest tests.integration.notice_schedule_load` with the normal local Synapse test environment. The runner creates an isolated homeserver/database and 32 synthetic recipients, runs the Locust scenario in `tests/load_notice_schedule.py` at 100/500/1,000 scheduled requests, cancels one fifth, exercises due-time activity/contact reads, and keeps foreground `/sync` traffic active. Only in-app delivery is used. It requires zero HTTP failures, correct terminal outcomes, foreground sync p95 below 250 ms and maximum below two seconds; these are local regression budgets. It reports maximum delivery lateness, Synapse-process peak RSS and Locust CSV paths. The runner rejects non-local CMS and the scenario rejects non-local Synapse. Local results do not establish deployed staging/production headroom.
 
 ## Course/activity images
 
