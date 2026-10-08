@@ -16,14 +16,19 @@ from locust import HttpUser, between, task
 from locust.exception import StopUser
 
 fixture = json.loads(Path(os.environ["NOTICE_LOAD_FIXTURE"]).read_text())
-if urlparse(fixture["url"]).hostname not in {"127.0.0.1", "localhost"}:
+staging = (
+    fixture["url"] == "https://matrix.staging.pangea.chat"
+    and os.environ.get("NOTICE_LOAD_ALLOW_STAGING") == "1"
+    and fixture["count"] <= 100
+)
+if not staging and urlparse(fixture["url"]).hostname not in {"127.0.0.1", "localhost"}:
     raise ValueError("This load scenario requires an isolated local homeserver")
 counter = itertools.count()
 
 
 class ScheduledNoticeUser(HttpUser):
     host = fixture["url"]
-    wait_time = between(0.05, 0.1)
+    wait_time = between(0.8, 1.2) if staging else between(0.05, 0.1)
 
     def on_start(self):
         self.client.headers["Authorization"] = "Bearer " + fixture["token"]
@@ -43,6 +48,11 @@ class ScheduledNoticeUser(HttpUser):
                 response.failure("enqueue status " + str(response.status_code))
                 return
             schedule_id = response.json()["schedule_id"]
+        if fixture.get("receipts"):
+            with open(fixture["receipts"], "a") as receipt:
+                receipt.write(
+                    json.dumps({"index": index, "schedule_id": schedule_id}) + "\n"
+                )
         status_path = path + "?schedule_id=" + schedule_id
         if index % 5 == 0:
             with self.client.delete(
@@ -60,7 +70,7 @@ class ScheduledNoticeUser(HttpUser):
 class ForegroundUser(HttpUser):
     host = fixture["url"]
     fixed_count = 1
-    wait_time = between(0.1, 0.2)
+    wait_time = between(0.5, 0.7) if staging else between(0.1, 0.2)
 
     def on_start(self):
         self.client.headers["Authorization"] = "Bearer " + fixture["token"]

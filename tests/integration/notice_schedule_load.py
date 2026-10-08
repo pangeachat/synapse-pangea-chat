@@ -69,6 +69,11 @@ class TestNoticeScheduleLoad(BaseSynapseE2ETest):
             )
             _, token = await self.login_user("loadadmin", "pw")
             headers = {"Authorization": "Bearer " + token}
+            if os.environ.get("NOTICE_HTTP_PROBE_ONLY") == "1":
+                from tests.staging_tests.notice_schedule import run_probe
+
+                run_probe(self.server_url, token, cms["url"], cms["api_key"])
+                return
             bodies = []
             for index in range(32):
                 uid = f"@notice_load_{index}:my.domain.name"

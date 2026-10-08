@@ -38,3 +38,9 @@ After removing the unindexed global message-history fallback, the final 1,000-no
 The repository-wide unit/integration suite passed: 1,261 tests in 1,542 seconds. The focused notice suite passed 45 tests after the final optimization. The real CMS/Synapse/captured-SMTP integration passed in 142 seconds, including both canonical and pinned CMS plan reads, full/unknown sessions, saved completion after role removal, returned/contact suppression, admin-only idempotent cancellation and the existing restart/email/click checks. Ruff, Black and full-module mypy checks passed (147 source files).
 
 Smoke/eval involving paid providers are not applicable: this feature changes scheduling and internal eligibility reads, not a paid model/provider integration. Deployed verification requires the new branch to be approved and deployed first; no staging or production claim is made by these local runs.
+
+## Bounded staging probe
+
+`python -m tests.staging_tests.notice_schedule` runs a 100-job Locust probe with three enqueue users and one foreground sync user. Staging requires `NOTICE_LOAD_ALLOW_STAGING=1`, the existing staging bot token, and a CMS admin session for cleanup; it rejects production and sends only to the bot itself in a temporary private room. The queue retains terminal deduplication receipts; the probe removes its room and CMS rows. It verifies 80 in-app deliveries, 20 cancellations, no early events, return/contact suppression and complete log outcomes. `NOTICE_HTTP_PROBE_ONLY=1` selects this same probe in the isolated local runner.
+
+The local rehearsal passed in 179 seconds, with zero Locust HTTP failures, sync p95 13 ms and maximum 101 ms. Black, Ruff and mypy passed across 237 source files. The earlier CI dependency failure was corrected by including the pinned Locust version in development dependencies.
