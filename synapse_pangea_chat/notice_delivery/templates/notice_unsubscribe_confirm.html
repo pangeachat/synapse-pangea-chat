@@ -2,7 +2,7 @@
 {% block content %}
         <h1>Email preferences</h1>
         <form method="post">
-          <input type="hidden" name="t" value="{{ token }}" />
+          {% if token %}<input type="hidden" name="t" value="{{ token }}" />{% endif %}
           <input type="hidden" name="scope" value="preferences" />
           <label class="toggle-row master">
             <span class="toggle-copy">Reminders and offers</span>
@@ -17,7 +17,8 @@
             {% endfor %}
           </div>
           <div class="other-messages">
-            <label class="toggle-row"><span class="toggle-copy">Missed-message emails<small>Managed separately</small></span><input class="switch" type="checkbox" role="switch" disabled /></label>
+            <input type="hidden" name="missed_message_shown" value="yes" />
+            <label class="toggle-row"><span class="toggle-copy">Missed-message emails{% if not missed_message_enabled %}<small>Unsubscribed</small>{% endif %}</span><input class="switch" type="checkbox" role="switch" name="missed_message_enabled" value="yes" {% if missed_message_enabled %}checked{% else %}disabled{% endif %} /></label>
             <label class="toggle-row"><span class="toggle-copy">Course invitations<small>Managed separately</small></span><input class="switch" type="checkbox" role="switch" disabled /></label>
             <label class="toggle-row"><span class="toggle-copy">Account emails<small>Always on</small></span><input class="switch" type="checkbox" role="switch" checked disabled /></label>
           </div>

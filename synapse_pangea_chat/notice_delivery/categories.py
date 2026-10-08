@@ -15,8 +15,9 @@ import attr
 COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE = "pangea.communication_preferences"
 PREFERENCES_VERSION = 1
 
+MISSED_MESSAGE_CATEGORY = "missed_message"
 EVENT_CATEGORIES: FrozenSet[str] = frozenset(
-    {"credential", "missed_message", "course_invite"}
+    {"credential", MISSED_MESSAGE_CATEGORY, "course_invite"}
 )
 NUDGE_CATEGORIES: FrozenSet[str] = frozenset(
     {
