@@ -249,6 +249,16 @@ class LaunchValidationTests(unittest.TestCase):
         token = self.double.sign(self._claims(**{LTI + "roles": _DROP}))
         self.assertRejected(token, "bad_roles")
 
+    def test_missing_context(self):
+        """course_navigation is course-scoped: a launch with no course context
+        cannot be linked or connected, so it is refused."""
+        token = self.double.sign(self._claims(**{LTI + "context": _DROP}))
+        self.assertRejected(token, "bad_context")
+
+    def test_context_without_id(self):
+        token = self.double.sign(self._claims(**{LTI + "context": {"title": "x"}}))
+        self.assertRejected(token, "bad_context")
+
     def test_missing_sub(self):
         token = self.double.sign(self._claims(sub=_DROP))
         self.assertRejected(token, "missing_claim")
@@ -758,6 +768,20 @@ class OpenIdConfigurationCheckTests(unittest.TestCase):
             doc = self._doc(**{field: "http://canvas.school.example/x"})
             with self.assertRaises(RegistrationRejected, msg=field):
                 check_openid_configuration(self.URL, doc)
+
+    def test_registration_endpoint_must_be_on_the_configuration_host(self):
+        """The registration token is a bearer credential: it is only ever sent
+        to the host the OpenID configuration was fetched from."""
+        for endpoint in (
+            "https://evil.example/register",
+            "https://canvas.school.example.evil.example/register",
+            "https://canvas.school.example:8443/register",
+        ):
+            self.assertRejected(
+                self.URL,
+                self._doc(registration_endpoint=endpoint),
+                "registration_endpoint_host_mismatch",
+            )
 
     def test_rs256_must_be_supported(self):
         self.assertRejected(

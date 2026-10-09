@@ -150,7 +150,43 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         self.assertIn("configuration_status_302", redirected.text)
         self.assertEqual(server.registrations, [])
 
-        # Dynamic Registration lands the platform as pending.
+        # The registration token only ever goes to the configuration's own
+        # host: a registration_endpoint elsewhere (here the same server under
+        # another host name, so a sent token WOULD arrive) is refused unsent.
+        server.registration_endpoint_override = (
+            f"https://127.0.0.1:{server.port}/register"
+        )
+        cross_host = requests.get(
+            BASE + "/register",
+            params={
+                "openid_configuration": server.base_url
+                + "/.well-known/openid-configuration",
+                "registration_token": server.registration_token,
+            },
+            timeout=30,
+        )
+        server.registration_endpoint_override = None
+        self.assertEqual(cross_host.status_code, 400, cross_host.text)
+        self.assertIn("registration_endpoint_host_mismatch", cross_host.text)
+        self.assertEqual(server.tokens_seen, [])
+
+        # Dynamic Registration by POST (form body) lands a platform as pending.
+        server.client_id_override = "pangea-client-post"
+        posted = requests.post(
+            BASE + "/register",
+            data={
+                "openid_configuration": server.base_url
+                + "/.well-known/openid-configuration",
+                "registration_token": server.registration_token,
+            },
+            timeout=30,
+        )
+        server.client_id_override = None
+        self.assertEqual(posted.status_code, 200, posted.text)
+        self.assertIn("org.imsglobal.lti.close", posted.text)
+        self.assertEqual(len(server.registrations), 1)
+
+        # Dynamic Registration by GET lands the platform as pending.
         registered = requests.get(
             BASE + "/register",
             params={
@@ -162,7 +198,9 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         )
         self.assertEqual(registered.status_code, 200, registered.text)
         self.assertIn("org.imsglobal.lti.close", registered.text)
-        [sent] = server.registrations
+        self.assertEqual(len(server.registrations), 2)
+        sent = server.registrations[1]
+        self.assertEqual(server.registrations[0], sent)
         self.assertEqual(sent["initiate_login_uri"], BASE + "/login")
         self.assertEqual(sent["redirect_uris"], [LAUNCH_URL])
         self.assertEqual(sent["jwks_uri"], BASE + "/jwks")
@@ -181,7 +219,7 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         )
         server.issuer_override = None
         self.assertEqual(mismatched.status_code, 400, mismatched.text)
-        self.assertEqual(len(server.registrations), 1)
+        self.assertEqual(len(server.registrations), 2)
 
         await self.register_user(config_path, synapse_dir, "operator", "pw-op", True)
         await self.register_user(config_path, synapse_dir, "teacher", "pw-t", False)
@@ -190,7 +228,10 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
 
         listed = self._get_platforms(admin_token)
         self.assertEqual(listed.status_code, 200, listed.text)
-        [row] = listed.json()["platforms"]
+        rows = {r["client_id"]: r for r in listed.json()["platforms"]}
+        self.assertEqual(set(rows), {"pangea-client-post", double.client_id})
+        self.assertEqual(rows["pangea-client-post"]["state"], "pending")
+        row = rows[double.client_id]
         self.assertEqual(row["state"], "pending")
         self.assertEqual(row["issuer"], server.base_url)
         self.assertEqual(row["client_id"], double.client_id)
@@ -216,6 +257,21 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         self.assertEqual(approved.status_code, 200, approved.text)
         self.assertEqual(approved.json()["state"], "approved")
         self.assertEqual(self._approve(platform_id, admin_token).status_code, 200)
+        # Approval takes no body: deployments come only from registration.
+        with_body = requests.post(
+            f"{BASE}/platforms/{platform_id}/approve",
+            json={"deployment_ids": ["dep-x"]},
+            headers=self._headers(admin_token),
+            timeout=10,
+        )
+        self.assertEqual(with_body.status_code, 200, with_body.text)
+        rows = {
+            r["client_id"]: r
+            for r in self._get_platforms(admin_token).json()["platforms"]
+        }
+        self.assertEqual(
+            rows[double.client_id]["deployment_ids"], [double.deployment_id]
+        )
 
         # `approved platform launch accepted`.
         state, nonce, cookie = self._login_ok(server)

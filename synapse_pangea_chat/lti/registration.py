@@ -156,6 +156,10 @@ def check_openid_configuration(config_url: str, doc: Any) -> PlatformConfigurati
         fields[name] = value
     if host_of(fields["issuer"]) != host_of(config_url):
         raise RegistrationRejected("issuer_host_mismatch")
+    # The registration token is a bearer credential: it only goes back to the
+    # host that served the configuration, never to a host the document names.
+    if host_of(fields["registration_endpoint"]) != host_of(config_url):
+        raise RegistrationRejected("registration_endpoint_host_mismatch")
     algorithms = doc.get("id_token_signing_alg_values_supported")
     if not isinstance(algorithms, list) or "RS256" not in algorithms:
         raise RegistrationRejected("rs256_unsupported")

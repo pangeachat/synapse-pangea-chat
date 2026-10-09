@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlencode, urlsplit
 
 from synapse.api.errors import (
@@ -55,14 +55,12 @@ from synapse_pangea_chat.lti.validation import (
     verify_launch,
 )
 from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
-from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.lti")
 
 STATE_TTL_MS = 10 * 60 * 1000
 COOKIE_PREFIX = "pangea_lti_state_"
 MAX_ARG_LENGTH = 4096
-MAX_DEPLOYMENTS_PER_APPROVAL = 50
 
 LaunchHandler = Callable[[SynapseRequest, Launch], Awaitable[None]]
 
@@ -389,7 +387,8 @@ def _redact_registration_token(request: SynapseRequest) -> None:
 
 
 class LtiRegister(_Async):
-    """Dynamic Registration: the platform opens this URL in its admin UI."""
+    """Dynamic Registration: the platform opens this URL in its admin UI
+    (GET with query parameters, or POST with the same as a form body)."""
 
     def __init__(
         self,
@@ -407,6 +406,10 @@ class LtiRegister(_Async):
         self._rate_limiter = rate_limiter
 
     def render_GET(self, request: SynapseRequest):
+        return self._run(self._handle, request)
+
+    def render_POST(self, request: SynapseRequest):
+        # The same parameters as a form body; Twisted parses them into args.
         return self._run(self._handle, request)
 
     async def _handle(self, request: SynapseRequest) -> None:
@@ -477,8 +480,8 @@ class LtiRegister(_Async):
 
 class LtiPlatformsAdmin(_Async):
     """`GET platforms` lists registrations; `POST platforms/<id>/approve`
-    approves one (and adds any `deployment_ids` in the body). Server admins
-    only."""
+    approves one (no body: its deployments come from its registration).
+    Server admins only."""
 
     def __init__(self, api: ModuleApi, store: LtiStore):
         super().__init__()
@@ -541,41 +544,18 @@ class LtiPlatformsAdmin(_Async):
             respond_with_json(request, 404, {"errcode": "M_NOT_FOUND"}, send_cors=True)
             return
         platform_id = segments[0]
-        body: Any = await extract_body_json(request)
-        if body is None:
-            body = {}
-        deployment_ids = (
-            body.get("deployment_ids", []) if isinstance(body, dict) else None
-        )
-        if (
-            not isinstance(deployment_ids, list)
-            or len(deployment_ids) > MAX_DEPLOYMENTS_PER_APPROVAL
-            or not all(isinstance(d, str) and 0 < len(d) <= 255 for d in deployment_ids)
-        ):
-            respond_with_json(
-                request,
-                400,
-                {
-                    "errcode": "M_INVALID_PARAM",
-                    "error": "deployment_ids must be a list of short strings",
-                },
-                send_cors=True,
-            )
-            return
         found = await self._store.approve(
             platform_id,
             operator=operator,
-            deployment_ids=deployment_ids,
             now_ms=self._clock.time_msec(),
         )
         if not found:
             respond_with_json(request, 404, {"errcode": "M_NOT_FOUND"}, send_cors=True)
             return
         logger.info(
-            "LTI platform approved: platform=%s operator=%s deployments_added=%d",
+            "LTI platform approved: platform=%s operator=%s",
             platform_id,
             operator,
-            len(deployment_ids),
         )
         respond_with_json(
             request,

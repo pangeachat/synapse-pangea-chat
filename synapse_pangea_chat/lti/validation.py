@@ -12,7 +12,7 @@ name its key. `verify_launch` then checks, with the platform's key:
 - the platform is approved, the deployment id is one it registered;
 - message type `LtiResourceLinkRequest`, version `1.3.0`, the target link is
   this tool's launch URL, and the resource link, roles and `sub` claims are
-  well formed.
+  well formed, and the launch carries a course context id.
 
 Every rejection is a `LaunchRejected` carrying a reason code. Nothing here logs,
 and no message carries a claim value, so neither the token nor the student's
@@ -74,7 +74,7 @@ class Launch:
     issuer: str
     sub: str
     deployment_id: str
-    context_id: str | None
+    context_id: str
     roles: Tuple[str, ...]
     path: str
     # The full verified claim set, for the steps after the launch (link,
@@ -214,12 +214,14 @@ def verify_launch(
     if not isinstance(sub, str) or not _short_string(sub):
         raise LaunchRejected("bad_sub")
 
-    context_id = None
+    # The only placement is course_navigation, which is course-scoped: every
+    # later step (link, connect, claim) is keyed by the Canvas course.
     context = claims.get(CLAIM_CONTEXT)
-    if context is not None:
-        if not isinstance(context, dict) or not _short_string(context.get("id")):
-            raise LaunchRejected("bad_context")
-        context_id = context["id"]
+    if not isinstance(context, dict):
+        raise LaunchRejected("bad_context")
+    context_id = context.get("id")
+    if not isinstance(context_id, str) or not _short_string(context_id):
+        raise LaunchRejected("bad_context")
 
     return Launch(
         platform_id=platform.platform_id,

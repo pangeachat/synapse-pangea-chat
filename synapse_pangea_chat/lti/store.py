@@ -13,7 +13,7 @@ The tool's own key is NOT stored here: it comes only from module config.
 from __future__ import annotations
 
 import secrets
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import attr
 
@@ -206,21 +206,10 @@ class LtiStore:
 
         return await self._db.runInteraction("lti_list_platforms", select)
 
-    async def approve(
-        self,
-        platform_id: str,
-        *,
-        operator: str,
-        deployment_ids: Iterable[str],
-        now_ms: int,
-    ) -> bool:
-        """Approve a platform and add deployment ids. False if it is unknown.
-
-        Idempotent: approving again keeps the first approval's time and
-        operator and only adds deployments.
-        """
+    async def approve(self, platform_id: str, *, operator: str, now_ms: int) -> bool:
+        """Approve a platform. False if it is unknown. Idempotent: approving
+        again keeps the first approval's time and operator."""
         await self.ensure()
-        wanted = sorted(set(deployment_ids))
 
         def update(txn: Any) -> bool:
             txn.execute(
@@ -235,12 +224,6 @@ class LtiStore:
                     """UPDATE lti_platform SET state = 'approved',
                     approved_at_ms = ?, approved_by = ? WHERE platform_id = ?""",
                     (now_ms, operator, platform_id),
-                )
-            for deployment_id in wanted:
-                txn.execute(
-                    """INSERT INTO lti_deployment (platform_id, deployment_id)
-                    VALUES (?, ?) ON CONFLICT DO NOTHING""",
-                    (platform_id, deployment_id),
                 )
             return True
 

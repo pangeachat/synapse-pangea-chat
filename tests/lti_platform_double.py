@@ -211,6 +211,10 @@ class HttpsPlatformServer:
         self.registrations: List[Dict[str, Any]] = []
         self.jwks_requests = 0
         self.issuer_override: Optional[str] = None
+        self.registration_endpoint_override: Optional[str] = None
+        self.client_id_override: Optional[str] = None
+        # Every Authorization header the registration endpoint received.
+        self.tokens_seen: List[str] = []
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -249,6 +253,7 @@ class HttpsPlatformServer:
                     self._json(404, {})
                     return
                 expected = f"Bearer {server.registration_token}"
+                server.tokens_seen.append(self.headers.get("Authorization") or "")
                 if self.headers.get("Authorization") != expected:
                     self._json(401, {})
                     return
@@ -258,7 +263,8 @@ class HttpsPlatformServer:
                 self._json(
                     200,
                     {
-                        "client_id": server.platform.client_id,
+                        "client_id": server.client_id_override
+                        or server.platform.client_id,
                         "https://purl.imsglobal.org/spec/lti-tool-configuration": {
                             "deployment_id": server.platform.deployment_id
                         },
@@ -280,7 +286,8 @@ class HttpsPlatformServer:
             "authorization_endpoint": self.base_url + "/authorize",
             "token_endpoint": self.base_url + "/token",
             "jwks_uri": self.base_url + "/jwks",
-            "registration_endpoint": self.base_url + "/register",
+            "registration_endpoint": self.registration_endpoint_override
+            or self.base_url + "/register",
             "id_token_signing_alg_values_supported": ["RS256"],
             "https://purl.imsglobal.org/spec/lti-platform-configuration": {
                 "product_family_code": "canvas",
