@@ -361,7 +361,11 @@ class _Base(unittest.IsolatedAsyncioTestCase):
         await self.c.links.ensure()
 
     async def written(self) -> Tuple[Any, ...]:
-        """Everything a link or connect step could write."""
+        """Every link, claim, confirmation, managed record, external id and
+        login token a link or connect step could write. The ticket's own
+        consumption is left out on purpose: C5.1 consumes it on every
+        request that passes body validation, whatever the outcome after
+        that, and the tests assert it explicitly (a later use gets 410)."""
         rows = await self.c.h.store.list_room(ROOM) + await self.c.h.store.list_room(
             OTHER_ROOM
         )
@@ -1630,6 +1634,10 @@ class TestNoLoginTokenForServerAdmins(_Base):
         self.assertEqual(status, 401, body)
         self.assertEqual(await self.written(), before)
         self.assertEqual(self.c.login_tokens.issued, [])
+        # The ticket itself is consumed (C5.1): it cannot be retried with a
+        # token either; a relaunch issues a new one.
+        status, body = await self.c.learner_l1(STUDENT, ticket)
+        self.assertEqual(status, 410, body)
         # Signing in themself, the admin still confirms and claims normally.
         ticket = await self.c.links.issue_ticket(
             KIND_LEARNER,
