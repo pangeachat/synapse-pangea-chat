@@ -189,7 +189,11 @@ def verify_launch(
         raise LaunchRejected("bad_message_type")
 
     deployment_id = claims.get(CLAIM_DEPLOYMENT_ID)
-    if not _short_string(deployment_id) or deployment_id not in known_deployments:
+    if (
+        not isinstance(deployment_id, str)
+        or not _short_string(deployment_id)
+        or deployment_id not in known_deployments
+    ):
         raise LaunchRejected("unknown_deployment", status=403)
 
     if claims.get(CLAIM_TARGET_LINK_URI) != launch_url:
@@ -206,7 +210,7 @@ def verify_launch(
         raise LaunchRejected("bad_roles")
 
     sub = claims["sub"]
-    if not _short_string(sub):
+    if not isinstance(sub, str) or not _short_string(sub):
         raise LaunchRejected("bad_sub")
 
     context_id = None

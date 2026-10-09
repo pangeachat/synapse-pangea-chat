@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from io import BytesIO
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
@@ -26,6 +27,11 @@ logger = logging.getLogger("synapse.module.synapse_pangea_chat.lti.http")
 MAX_BODY_BYTES = 256 * 1024
 BODY_TIMEOUT_SECONDS = 15
 MAX_URL_LENGTH = 2048
+_NETLOC = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*"
+    r"|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$"
+)
 
 
 class UpstreamError(Exception):
@@ -39,8 +45,9 @@ class UpstreamError(Exception):
 def https_url(value: Any) -> Optional[str]:
     """`value` if it is a plain absolute https URL, else None.
 
-    Plain means: ASCII, no whitespace or control characters, a host, no
-    userinfo and no fragment.
+    Plain means: ASCII, no whitespace or control characters, a host that is a
+    DNS name or IP literal (so no userinfo), an optional numeric port and no
+    fragment.
     """
     if not isinstance(value, str) or not value or len(value) > MAX_URL_LENGTH:
         return None
@@ -53,7 +60,9 @@ def https_url(value: Any) -> Optional[str]:
         return None
     if parts.scheme != "https" or not parts.hostname:
         return None
-    if "@" in parts.netloc or parts.fragment:
+    if parts.fragment or not _NETLOC.match(parts.netloc):
+        # Also excludes userinfo: a host is a DNS name or IP literal, nothing
+        # else, because it is sent upstream and echoed into a CSP header.
         return None
     return value
 

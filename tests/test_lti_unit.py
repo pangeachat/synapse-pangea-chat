@@ -695,6 +695,17 @@ class OpenIdConfigurationCheckTests(unittest.TestCase):
             "bad_configuration_url",
         )
 
+    def test_configuration_url_host_must_be_a_plain_name(self):
+        """The host feeds the registration page's CSP header and the outbound
+        request, so anything but a DNS name or IP literal is refused."""
+        for url in (
+            "https://canvas.school.example;script-src */openid",
+            "https://canvas.school.example,evil.example/openid",
+            "https://canvas_school!.example/openid",
+            "https://canvas.school.example:/openid",
+        ):
+            self.assertRejected(url, self._doc(), "bad_configuration_url")
+
     def test_endpoints_must_be_https(self):
         for field in (
             "issuer",

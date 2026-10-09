@@ -502,7 +502,7 @@ class LtiPlatformsAdmin(_Async):
         return user_id
 
     def _segments(self, request: SynapseRequest) -> List[str]:
-        return [s.decode("utf-8", "replace") for s in request.postpath if s]
+        return [s.decode("utf-8", "replace") for s in (request.postpath or []) if s]
 
     async def _list(self, request: SynapseRequest) -> None:
         if await self._admin(request) is None:
