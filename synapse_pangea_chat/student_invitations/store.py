@@ -114,6 +114,9 @@ _ACK_SELECT = (
 CanvasIdentity = Tuple[str, str, str]
 
 SOURCE_CANVAS = "canvas"
+# A concurrent import can beat this one to a row once per learner it shares;
+# each retry re-reads, so a few attempts always converge.
+IMPORT_ATTEMPTS = 3
 
 # Claim outcomes (claim_txn and StudentClaims.claim).
 CLAIMED = "claimed"
@@ -437,9 +440,11 @@ class StudentInvitationStore:
            to another Canvas user -> unchanged, reported in ``conflicts``;
         3. else a new ``invited`` row, ``source=canvas`` (``imported``).
 
-        Concurrent imports converge through the unique indexes: a conflicting
-        insert either does nothing or aborts, and Synapse retries the whole
-        transaction against the new state.
+        Concurrent imports converge through the unique indexes: an insert or
+        attach that a concurrent import beat fails on the index (Postgres
+        reports a plain unique violation, which Synapse does not retry), and
+        the whole transaction is run again on the new state, where step 1 or
+        2 now finds that row.
         """
         await self.ensure()
 
@@ -498,9 +503,15 @@ class StudentInvitationStore:
                 counts["imported"] += 1
             return {**counts, "conflicts": conflicts}
 
-        return await self.db.runInteraction(
-            "pangea_student_invitation_import_canvas", write
-        )
+        for attempt in range(IMPORT_ATTEMPTS):
+            try:
+                return await self.db.runInteraction(
+                    "pangea_student_invitation_import_canvas", write
+                )
+            except Exception as error:
+                if not is_integrity_error(error) or attempt + 1 == IMPORT_ATTEMPTS:
+                    raise
+        raise RuntimeError("unreachable")
 
     async def reserve_send(
         self, room_id: str, invitation_id: str, expected: int, now_ms: int

@@ -235,6 +235,9 @@ class LtiLinkStore:
             rows = txn.fetchall()
             if rows:
                 return SAME if list(rows) == [(sub, user_id)] else CONFLICT
+            # A concurrent link committed after this transaction's snapshot
+            # makes this insert fail serialization (Synapse's repeatable read),
+            # and Synapse's retry then reads it above: `same` or `conflict`.
             txn.execute(
                 "INSERT INTO lti_user_link (issuer, sub, user_id, linked_at_ms)"
                 " VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
@@ -283,6 +286,8 @@ class LtiLinkStore:
             if rows:
                 pair = (room_id, ticket.issuer, ticket.deployment_id, ticket.context_id)
                 return SAME if list(rows) == [pair] else CONFLICT
+            # As in link_user: a concurrent link of the same pair makes this
+            # insert fail serialization, and the retry reads it above.
             txn.execute(
                 "INSERT INTO lti_course_link (room_id, platform_id, issuer,"
                 " deployment_id, context_id, nrps_url, linked_by, linked_at_ms)"

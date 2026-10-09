@@ -863,6 +863,39 @@ class TestImport(_Base):
             {"sub-short", "sub-active"},
         )
 
+    async def test_concurrent_import_converges_instead_of_failing(self):
+        """Another import commits the same learner between this import's read
+        and its insert: the unique index refuses the insert, and the import
+        re-reads and reports the row instead of failing."""
+        await self.c.connected()
+        self.c.serve([_member(SUB, "race@school.example")])
+        pool = self.c.h.main.db_pool
+        fired: List[bool] = []
+
+        def concurrent_import(sql: str, args: Any) -> None:
+            if fired or "lti_issuer, lti_context_id, lti_user_id)" not in sql:
+                return
+            fired.append(True)
+            pool.connection.execute(
+                "INSERT INTO pangea_student_invitation (id, course_room_id,"
+                " email_key, email, state, source, invited_by, send_count,"
+                " created_at_ms, lti_issuer, lti_context_id, lti_user_id)"
+                " VALUES ('raced', ?, 'race@school.example', 'race@school.example',"
+                " 'invited', 'canvas', ?, 0, 1, ?, ?, ?)",
+                (ROOM, OTHER, ISSUER, CONTEXT, SUB),
+            )
+            pool.connection.commit()
+
+        pool.on_statement = concurrent_import
+        try:
+            status, body = await self.c.import_()
+        finally:
+            pool.on_statement = None
+        self.assertEqual(fired, [True])
+        self.assertEqual(status, 200, body)
+        self.assertEqual((body["imported"], body["unchanged"]), (0, 1), body)
+        self.assertEqual([r["id"] for r in await self.c.rows()], ["raced"])
+
     async def test_import_sends_no_email(self):
         await self.c.connected()
         self.c.serve([_member(SUB, "a@school.example")])
