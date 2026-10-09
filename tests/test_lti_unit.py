@@ -27,8 +27,8 @@ from synapse_pangea_chat.lti.platform_jwks import PlatformKeyCache
 from synapse_pangea_chat.lti.registration import (
     NRPS_SCOPE,
     RegistrationRejected,
-    canvas_static_config,
     check_openid_configuration,
+    registered_client,
     registration_request,
     tool_urls,
 )
@@ -819,9 +819,9 @@ class OpenIdConfigurationCheckTests(unittest.TestCase):
 
 
 class RegistrationArtifactTests(unittest.TestCase):
-    """`dynamic registration response and the static JSON config both declare
-    course_navigation, a new-window launch, NRPS contextmembership.readonly and
-    privacy_level public`."""
+    """`dynamic registration response ... declares course_navigation, a
+    new-window launch, NRPS contextmembership.readonly and privacy_level
+    public` (v1 installs by Dynamic Registration only; no static JSON)."""
 
     def test_dynamic_registration_request(self):
         body = registration_request(URLS)
@@ -851,19 +851,23 @@ class RegistrationArtifactTests(unittest.TestCase):
             message["https://canvas.instructure.com/lti/display_type"], "new_window"
         )
 
-    def test_static_canvas_json_config(self):
-        config = canvas_static_config(URLS)
-        self.assertEqual(config["oidc_initiation_url"], URLS.login)
-        self.assertEqual(config["target_link_uri"], URLS.launch)
-        self.assertEqual(config["public_jwk_url"], URLS.jwks)
-        self.assertEqual(config["scopes"], [NRPS_SCOPE])
-        [extension] = config["extensions"]
-        self.assertEqual(extension["privacy_level"], "public")
-        [placement] = extension["settings"]["placements"]
-        self.assertEqual(placement["placement"], "course_navigation")
-        self.assertEqual(placement["message_type"], "LtiResourceLinkRequest")
-        self.assertEqual(placement["target_link_uri"], URLS.launch)
-        self.assertEqual(placement["windowTarget"], "_blank")
+    def test_registration_response_must_carry_a_deployment_id(self):
+        """Approval adds no deployments, so without one the platform could
+        never launch: such a registration is refused."""
+        tool = "https://purl.imsglobal.org/spec/lti-tool-configuration"
+        for response in (
+            {"client_id": "c"},
+            {"client_id": "c", tool: {}},
+            {"client_id": "c", tool: {"deployment_id": ""}},
+            {"client_id": "c", tool: {"deployment_id": 7}},
+        ):
+            with self.assertRaises(RegistrationRejected) as caught:
+                registered_client(response)
+            self.assertEqual(caught.exception.code, "missing_deployment_id")
+        self.assertEqual(
+            registered_client({"client_id": "c", tool: {"deployment_id": "d"}}),
+            ("c", "d"),
+        )
 
     def test_urls_hang_off_public_baseurl(self):
         urls = tool_urls("https://matrix.pangea.example")

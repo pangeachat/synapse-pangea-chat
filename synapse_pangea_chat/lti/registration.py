@@ -1,14 +1,17 @@
-"""LTI Dynamic Registration and the static (Canvas JSON) tool configuration.
+"""LTI Dynamic Registration, the only way a platform installs the tool in v1.
 
 Dynamic Registration (1EdTech LTI Dynamic Registration 1.0): the platform
 opens `/lti/register?openid_configuration=<url>&registration_token=<t>`; the
 tool fetches that OpenID configuration, checks that the configuration's
 `issuer` is on the same host as the URL it was fetched from (so a document
-hosted anywhere cannot claim to be some other platform), posts its client
-registration to the platform's `registration_endpoint`, and records the
-platform as pending. Only an operator's approval lets it launch.
+hosted anywhere cannot claim to be some other platform) and that its
+`registration_endpoint` is on that host too (the registration token is never
+sent elsewhere), posts its client registration there, and records the
+platform as pending with the deployment id the platform returns (a response
+without one is refused: nothing else adds deployments). Only an operator's
+approval lets it launch.
 
-Both artifacts declare the same thing: the `course_navigation` placement,
+The registration declares the `course_navigation` placement,
 opened in a new window (the app's own sign-in storage does not work in an
 iframe), the NRPS `contextmembership.readonly` scope, and Canvas
 `privacy_level: public` (names and emails).
@@ -48,7 +51,6 @@ class ToolUrls:
     launch: str
     jwks: str
     register: str
-    config: str
     domain: str
 
 
@@ -60,7 +62,6 @@ def tool_urls(public_baseurl: str) -> ToolUrls:
         launch=prefix + "launch",
         jwks=prefix + "jwks",
         register=prefix + "register",
-        config=prefix + "config",
         domain=urlsplit(base).netloc,
     )
 
@@ -92,37 +93,6 @@ def registration_request(urls: ToolUrls) -> Dict[str, Any]:
             ],
             CANVAS_PRIVACY_LEVEL: "public",
         },
-    }
-
-
-def canvas_static_config(urls: ToolUrls) -> Dict[str, Any]:
-    """The Canvas developer-key JSON, for a manual install."""
-    return {
-        "title": TOOL_NAME,
-        "description": "Language learning chat for your course.",
-        "oidc_initiation_url": urls.login,
-        "target_link_uri": urls.launch,
-        "public_jwk_url": urls.jwks,
-        "scopes": [NRPS_SCOPE],
-        "extensions": [
-            {
-                "platform": "canvas.instructure.com",
-                "domain": urls.domain,
-                "privacy_level": "public",
-                "settings": {
-                    "placements": [
-                        {
-                            "placement": PLACEMENT,
-                            "message_type": MESSAGE_TYPE,
-                            "target_link_uri": urls.launch,
-                            "text": TOOL_NAME,
-                            "windowTarget": "_blank",
-                        }
-                    ]
-                },
-            }
-        ],
-        "custom_fields": {},
     }
 
 
@@ -178,18 +148,19 @@ def check_openid_configuration(config_url: str, doc: Any) -> PlatformConfigurati
     )
 
 
-def registered_client(response: Any) -> tuple[str, Optional[str]]:
-    """(client_id, deployment_id or None) from the platform's registration
-    response."""
+def registered_client(response: Any) -> tuple[str, str]:
+    """(client_id, deployment_id) from the platform's registration response.
+
+    The deployment id is required: approval adds none, so a platform
+    registered without one could never launch.
+    """
     if not isinstance(response, dict):
         raise RegistrationRejected("bad_registration_response")
     client_id = response.get("client_id")
     if not isinstance(client_id, str) or not 0 < len(client_id) <= 255:
         raise RegistrationRejected("bad_registration_response")
-    deployment_id = None
     tool = response.get(TOOL_CONFIGURATION)
-    if isinstance(tool, dict):
-        value = tool.get("deployment_id")
-        if isinstance(value, str) and 0 < len(value) <= 255:
-            deployment_id = value
+    deployment_id = tool.get("deployment_id") if isinstance(tool, dict) else None
+    if not isinstance(deployment_id, str) or not 0 < len(deployment_id) <= 255:
+        raise RegistrationRejected("missing_deployment_id")
     return client_id, deployment_id

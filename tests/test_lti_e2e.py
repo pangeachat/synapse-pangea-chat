@@ -131,12 +131,9 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         self.assertEqual(set(published), {"kty", "kid", "alg", "use", "n", "e"})
         self.assertEqual(published["n"], public_jwk(TOOL_KEY, "x")["n"])
 
-        static = requests.get(BASE + "/config", timeout=10)
-        self.assertEqual(static.status_code, 200)
-        self.assertEqual(
-            static.json()["extensions"][0]["settings"]["placements"][0]["placement"],
-            "course_navigation",
-        )
+        # v1 installs by Dynamic Registration only: there is no static
+        # JSON config to install from.
+        self.assertEqual(requests.get(BASE + "/config", timeout=10).status_code, 404)
 
         # Redirects are never followed: the issuer-host check is against the
         # URL the document was fetched from, so a redirect would let any
@@ -189,6 +186,24 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         self.assertIn("org.imsglobal.lti.close", posted.text)
         self.assertEqual(len(server.registrations), 1)
 
+        # A registration response without a deployment id is refused and
+        # stores nothing: such a platform could never launch.
+        server.omit_deployment_id = True
+        server.client_id_override = "pangea-client-no-deployment"
+        no_deployment = requests.get(
+            BASE + "/register",
+            params={
+                "openid_configuration": server.base_url
+                + "/.well-known/openid-configuration",
+                "registration_token": server.registration_token,
+            },
+            timeout=30,
+        )
+        server.omit_deployment_id = False
+        server.client_id_override = None
+        self.assertEqual(no_deployment.status_code, 400, no_deployment.text)
+        self.assertIn("missing_deployment_id", no_deployment.text)
+
         # Dynamic Registration by GET lands the platform as pending.
         registered = requests.get(
             BASE + "/register",
@@ -201,8 +216,8 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         )
         self.assertEqual(registered.status_code, 200, registered.text)
         self.assertIn("org.imsglobal.lti.close", registered.text)
-        self.assertEqual(len(server.registrations), 2)
-        sent = server.registrations[1]
+        self.assertEqual(len(server.registrations), 3)
+        sent = server.registrations[2]
         self.assertEqual(server.registrations[0], sent)
         self.assertEqual(sent["initiate_login_uri"], BASE + "/login")
         self.assertEqual(sent["redirect_uris"], [LAUNCH_URL])
@@ -222,11 +237,11 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         )
         server.issuer_override = None
         self.assertEqual(mismatched.status_code, 400, mismatched.text)
-        self.assertEqual(len(server.registrations), 2)
+        self.assertEqual(len(server.registrations), 3)
 
         await self.register_user(config_path, synapse_dir, "operator", "pw-op", True)
         await self.register_user(config_path, synapse_dir, "teacher", "pw-t", False)
-        _, admin_token = await self.login_user("operator", "pw-op")
+        operator_id, admin_token = await self.login_user("operator", "pw-op")
         _, user_token = await self.login_user("teacher", "pw-t")
 
         listed = self._get_platforms(admin_token)
@@ -375,6 +390,24 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         # logs` (INV-8).
         logs = self._logs()
         self.assertIn("LTI platform approved", logs)
+        # The module's own INFO+ lines never name the approving operator.
+        # (Synapse's access log shows the authenticated requester on every
+        # authenticated request; that line is Synapse's, not the module's.)
+        module_info = [
+            line
+            for line in logs.splitlines()
+            if "synapse.module.synapse_pangea_chat" in line
+            and " - DEBUG - " not in line
+        ]
+        self.assertTrue(any("LTI platform approved" in line for line in module_info))
+        self.assertFalse(
+            [
+                line
+                for line in module_info
+                if operator_id in line or "operator" in line.lower()
+            ],
+            "\n".join(module_info),
+        )
         # The registration token arrives in the query string (the Dynamic
         # Registration spec puts it there). Synapse's INFO access log records
         # the URI when the request finishes, so it must be redacted by then.

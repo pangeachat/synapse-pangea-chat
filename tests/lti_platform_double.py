@@ -213,6 +213,7 @@ class HttpsPlatformServer:
         self.issuer_override: Optional[str] = None
         self.registration_endpoint_override: Optional[str] = None
         self.client_id_override: Optional[str] = None
+        self.omit_deployment_id = False
         # Every Authorization header the registration endpoint received.
         self.tokens_seen: List[str] = []
         server = self
@@ -265,9 +266,11 @@ class HttpsPlatformServer:
                     {
                         "client_id": server.client_id_override
                         or server.platform.client_id,
-                        "https://purl.imsglobal.org/spec/lti-tool-configuration": {
-                            "deployment_id": server.platform.deployment_id
-                        },
+                        "https://purl.imsglobal.org/spec/lti-tool-configuration": (
+                            {}
+                            if server.omit_deployment_id
+                            else {"deployment_id": server.platform.deployment_id}
+                        ),
                     },
                 )
 

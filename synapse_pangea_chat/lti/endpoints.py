@@ -1,8 +1,8 @@
 """The LTI tool's web resources.
 
 Public (platform- and browser-facing): `login` (OIDC third-party login
-initiation), `launch` (the id_token POST), `jwks`, `config` (static Canvas
-JSON) and `register` (Dynamic Registration). Server-admin only: `platforms`
+initiation), `launch` (the id_token POST), `jwks` and `register` (Dynamic
+Registration, the only install path in v1). Server-admin only: `platforms`
 (list) and `platforms/<id>/approve`.
 
 Login binds a fresh state and nonce to the platform server-side and to the
@@ -43,7 +43,6 @@ from synapse_pangea_chat.lti.registration import (
     PATH_PREFIX,
     RegistrationRejected,
     ToolUrls,
-    canvas_static_config,
     check_openid_configuration,
     registered_client,
     registration_request,
@@ -356,20 +355,6 @@ class LtiJwks(_Async):
         respond_with_json(request, 200, self._settings.public_jwks(), send_cors=True)
 
 
-class LtiStaticConfig(_Async):
-    def __init__(self, urls: ToolUrls):
-        super().__init__()
-        self._urls = urls
-
-    def render_GET(self, request: SynapseRequest):
-        return self._run(self._handle, request)
-
-    async def _handle(self, request: SynapseRequest) -> None:
-        respond_with_json(
-            request, 200, canvas_static_config(self._urls), send_cors=True
-        )
-
-
 _CLOSE_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Pangea Chat</title></head>
 <body><p>{message}</p>
@@ -584,9 +569,9 @@ class LtiPlatformsAdmin(_Async):
             respond_with_json(request, 404, {"errcode": "M_NOT_FOUND"}, send_cors=True)
             return
         logger.info(
-            "LTI platform approved: platform=%s operator=%s",
+            # Who approved is recorded on the row (approved_by), not logged.
+            "LTI platform approved: platform=%s",
             platform_id,
-            operator,
         )
         respond_with_json(
             request,
@@ -623,7 +608,6 @@ def registration_resources(
             on_launch,
         ),
         "jwks": LtiJwks(settings),
-        "config": LtiStaticConfig(urls),
         "register": LtiRegister(
             api,
             store,

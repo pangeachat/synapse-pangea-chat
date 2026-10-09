@@ -104,7 +104,7 @@ class LtiStore:
         token_url: str,
         jwks_uri: str,
         product_family: Optional[str],
-        deployment_id: Optional[str],
+        deployment_id: str,
         now_ms: int,
     ) -> str:
         """Record a newly registered platform as pending; returns its id."""
@@ -134,11 +134,10 @@ class LtiStore:
                     now_ms,
                 ),
             )
-            if deployment_id is not None:
-                txn.execute(
-                    "INSERT INTO lti_deployment (platform_id, deployment_id) VALUES (?, ?)",
-                    (platform_id, deployment_id),
-                )
+            txn.execute(
+                "INSERT INTO lti_deployment (platform_id, deployment_id) VALUES (?, ?)",
+                (platform_id, deployment_id),
+            )
             return platform_id
 
         return await self._db.runInteraction("lti_create_platform", insert)
