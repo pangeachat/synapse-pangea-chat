@@ -9,7 +9,6 @@ test_lti_e2e.py.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -18,6 +17,8 @@ from typing import Any, Dict, List, Optional
 from unittest import mock
 
 from cryptography.hazmat.primitives import serialization
+from twisted.internet import defer
+from twisted.python.failure import Failure
 
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.lti import keys as lti_keys
@@ -330,6 +331,7 @@ class RolePathTests(unittest.TestCase):
             [INSTRUCTOR],
             ["http://purl.imsglobal.org/vocab/lis/v2/membership#Administrator"],
             ["http://purl.imsglobal.org/vocab/lis/v2/institution/person#Administrator"],
+            ["http://purl.imsglobal.org/vocab/lis/v2/system/person#Administrator"],
             [LEARNER, INSTRUCTOR],
         ):
             self.assertEqual(role_path(roles), "instructor", roles)
@@ -564,8 +566,13 @@ class PlatformKeyCacheTests(unittest.TestCase):
         self.document: Any = self.double.jwks()
         self.clock = _Clock()
 
+        # When set, a fetch waits on this Deferred: the network is "slow".
+        self.gate: Optional[defer.Deferred] = None
+
         async def fetch(url: str) -> Any:
             self.fetches.append(url)
+            if self.gate is not None:
+                await self.gate
             if isinstance(self.document, Exception):
                 raise self.document
             return self.document
@@ -574,8 +581,42 @@ class PlatformKeyCacheTests(unittest.TestCase):
             fetch, self.clock, max_age_seconds=3600, min_refetch_seconds=60
         )
 
+    def start(self, kid: str) -> List[Any]:
+        """Start a lookup; the returned list receives its result."""
+        out: List[Any] = []
+        d = defer.ensureDeferred(self.cache.get_key("https://p/jwks", kid))
+        d.addBoth(out.append)
+        return out
+
     def get(self, kid: str):
-        return asyncio.run(self.cache.get_key("https://p/jwks", kid))
+        out = self.start(kid)
+        self.assertEqual(len(out), 1, "lookup did not complete")
+        if isinstance(out[0], Failure):
+            out[0].raiseException()
+        return out[0]
+
+    def test_concurrent_cold_lookups_share_one_fetch(self):
+        """A classroom launching at once on a cold cache: every launch waits
+        for the one fetch in flight and gets the key, none is refused."""
+        self.gate = defer.Deferred()
+        waiting = [self.start("k1") for _ in range(5)]
+        self.assertEqual(len(self.fetches), 1)
+        self.assertTrue(all(out == [] for out in waiting))
+        self.gate.callback(None)
+        for out in waiting:
+            self.assertEqual(len(out), 1)
+            self.assertNotIsInstance(out[0], Failure)
+            self.assertIsNotNone(out[0])
+
+    def test_concurrent_lookups_on_expired_cache_share_one_fetch(self):
+        self.get("k1")
+        self.clock.now += 3601
+        self.gate = defer.Deferred()
+        waiting = [self.start("k1") for _ in range(3)]
+        self.assertEqual(len(self.fetches), 2)
+        self.gate.callback(None)
+        for out in waiting:
+            self.assertIsNotNone(out[0])
 
     def test_cached_by_kid(self):
         self.assertIsNotNone(self.get("k1"))

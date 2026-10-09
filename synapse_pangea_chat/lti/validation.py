@@ -54,6 +54,7 @@ CONNECT_ROLES = frozenset(
         "http://purl.imsglobal.org/vocab/lis/v2/membership#Instructor",
         "http://purl.imsglobal.org/vocab/lis/v2/membership#Administrator",
         "http://purl.imsglobal.org/vocab/lis/v2/institution/person#Administrator",
+        "http://purl.imsglobal.org/vocab/lis/v2/system/person#Administrator",
     }
 )
 PATH_INSTRUCTOR = "instructor"

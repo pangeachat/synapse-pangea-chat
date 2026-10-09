@@ -4,7 +4,8 @@ A launch names its key by `kid`. A kid the cache does not hold triggers one
 refetch (a platform may have rotated), but at most once per
 `min_refetch_seconds` per JWKS URL, so a stream of launches naming a made-up
 kid cannot turn the tool into a request amplifier against the platform. A
-failed fetch counts as an attempt for the same reason.
+failed fetch counts as an attempt for the same reason. Lookups that arrive
+while a fetch is in flight wait for that fetch instead of starting another.
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 import attr
 import jwt
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+from synapse.logging.context import make_deferred_yieldable, run_in_background
+from synapse.util.async_helpers import ObservableDeferred
 
 from synapse_pangea_chat.lti.keys import MIN_RSA_BITS, SIGNING_ALGORITHM
 
@@ -72,8 +75,16 @@ class PlatformKeyCache:
         self._max_age = max_age_seconds
         self._min_refetch = min_refetch_seconds
         self._entries: Dict[str, _Entry] = {}
+        self._inflight: Dict[str, ObservableDeferred] = {}
 
     async def get_key(self, jwks_uri: str, kid: str) -> Optional[jwt.PyJWK]:
+        inflight = self._inflight.get(jwks_uri)
+        if inflight is not None:
+            # A fetch is already on its way: wait for it rather than treating
+            # it as a recent attempt, so launches arriving together on a cold
+            # or expired cache all get its answer.
+            await make_deferred_yieldable(inflight.observe())
+            return self._lookup(jwks_uri, kid)
         now = self._clock()
         entry = self._entries.get(jwks_uri)
         fresh = entry is not None and now - entry.fetched_at < self._max_age
@@ -82,14 +93,27 @@ class PlatformKeyCache:
         if entry is not None and now - entry.attempted_at < self._min_refetch:
             # Recently fetched (or tried): answer from what we have.
             return entry.keys.get(kid) if fresh else None
-        await self._refresh(jwks_uri, now, entry)
-        refreshed = self._entries.get(jwks_uri)
-        return refreshed.keys.get(kid) if refreshed is not None else None
 
-    async def _refresh(
-        self, jwks_uri: str, now: float, entry: Optional[_Entry]
-    ) -> None:
-        # Mark the attempt before awaiting, so concurrent misses share it.
+        refresh = run_in_background(self._refresh, jwks_uri, now)
+        shared = ObservableDeferred(refresh, consumeErrors=True)
+        self._inflight[jwks_uri] = shared
+        try:
+            await make_deferred_yieldable(shared.observe())
+        finally:
+            if self._inflight.get(jwks_uri) is shared:
+                del self._inflight[jwks_uri]
+        return self._lookup(jwks_uri, kid)
+
+    def _lookup(self, jwks_uri: str, kid: str) -> Optional[jwt.PyJWK]:
+        entry = self._entries.get(jwks_uri)
+        if entry is None or self._clock() - entry.fetched_at >= self._max_age:
+            return None
+        return entry.keys.get(kid)
+
+    async def _refresh(self, jwks_uri: str, now: float) -> None:
+        """Fetch and store the key set. Never raises: a failure is logged and
+        counted as an attempt, so the refetch limit also covers failures."""
+        entry = self._entries.get(jwks_uri)
         if entry is None:
             entry = _Entry(keys={}, fetched_at=float("-inf"), attempted_at=now)
             self._entries[jwks_uri] = entry

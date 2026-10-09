@@ -8,6 +8,7 @@ module's real HTTP client, store and resources.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -23,6 +24,7 @@ from .lti_platform_double import (
     private_pem,
     public_jwk,
 )
+from .test_logcontext_e2e import LEAK_MARKERS
 
 BASE = "http://localhost:8008/_synapse/client/pangea/v1/lti"
 LAUNCH_URL = BASE + "/launch"
@@ -290,6 +292,16 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         )
         self._launch(rogue, state, cookie)
         self.assertLessEqual(server.jwks_requests - before, 1)
+
+        # The resources, the store and the shared JWKS fetch hand their
+        # logcontext back correctly (the same markers as test_logcontext_e2e).
+        await asyncio.sleep(2)
+        leaked = [
+            line
+            for line in self.server_stdout_lines + self.server_stderr_lines
+            if any(marker in line for marker in LEAK_MARKERS)
+        ]
+        self.assertEqual(leaked, [], "\n".join(leaked))
 
         # `approval logged without keys or emails` and `no key or email in
         # logs` (INV-8).
