@@ -641,6 +641,19 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             made["invitation_id"],
         )
 
+        # Power levels: a claimant who becomes a course admin is no longer
+        # managed; stepping back down records it again (C2.5).
+        self.set_power(room, "late", 100)
+        self.assertIsNone(self.managed(self.users["late"], room))
+        url = self.state_url(room, "m.room.power_levels")
+        content = self.ok("GET", url, self.tokens["late"])
+        content["users"][self.users["late"]] = 0
+        self.ok("PUT", url, self.tokens["late"], body=content)
+        self.assertEqual(
+            self.managed(self.users["late"], room),
+            (self.users["late"], room, self.users["teacher"]),
+        )
+
         # Revoke releases the managed record and keeps the membership.
         revoked = self.ok(
             "POST",

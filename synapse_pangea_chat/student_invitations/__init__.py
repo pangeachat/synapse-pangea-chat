@@ -169,6 +169,6 @@ def register_student_invitations(api: ModuleApi, config: Any) -> StudentInvitati
             ),
         )
     api.register_third_party_rules_callbacks(
-        on_new_event=MembershipRelease(store).on_new_event
+        on_new_event=MembershipRelease(store, claims).on_new_event
     )
     return StudentInvitations(store, claims, mailer, handlers)

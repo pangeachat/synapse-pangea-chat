@@ -12,6 +12,9 @@ The same two moments claim a student invitation the account has already
 confirmed but could not claim then, because the invited address was not yet
 verified on it (``student_invitations.claim``). An invitation the account has
 not confirmed is never claimed here: the student sees it in the app instead.
+Each sign-in also re-applies the managed-record rule to the account's joined
+invitations (managed exactly while not a course admin there), repairing a
+missed power-level event.
 """
 
 from __future__ import annotations
@@ -70,6 +73,7 @@ class ClaimByEmail:
     ) -> None:
         await self.claim_for(user_id)
         await self._claim_student_invitations(user_id)
+        await self._repair_managed_records(user_id)
 
     async def on_add_user_third_party_identifier(
         self, user_id: str, medium: str, address: str
@@ -77,6 +81,23 @@ class ClaimByEmail:
         if medium == EMAIL_MEDIUM:
             await self.claim_for(user_id)
             await self._claim_student_invitations(user_id)
+
+    async def _repair_managed_records(self, user_id: str) -> None:
+        if self._student_claims is None:
+            return
+        # repair_managed_for reports its own failures; this guard is for
+        # anything it did not foresee, since nothing may fail the sign-in.
+        try:
+            await self._student_claims.repair_managed_for(user_id)
+        except Exception as e:
+            logger.error(
+                "Managed record repair failed for %s: %s", user_id, type(e).__name__
+            )
+            if sentry_sdk is not None:
+                sentry_sdk.capture_message(
+                    f"managed record repair failed for {user_id}: {type(e).__name__}",
+                    level="error",
+                )
 
     async def _claim_student_invitations(self, user_id: str) -> None:
         if self._student_claims is None:

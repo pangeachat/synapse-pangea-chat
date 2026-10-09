@@ -475,6 +475,46 @@ class StudentInvitationStore:
 
         return await self.db.runInteraction("pangea_student_invitation_left", write)
 
+    async def set_managed(
+        self, invitation_id: str, user_id: str, managed: bool, now_ms: int
+    ) -> str:
+        """Apply the managed-record rule (C2.5) to one joined invitation:
+        ``managed`` inserts the record from the claimant's confirmation,
+        otherwise it is deleted. Idempotent. Returns "inserted", "deleted",
+        "unchanged", "not_joined" or "no_ack"."""
+        await self.ensure()
+
+        def write(txn: Any) -> str:
+            _lock(txn, invitation_id)
+            row = _select_one(txn, "WHERE id = ?", (invitation_id,))
+            if row is None or row["state"] != STATE_JOINED:
+                return "not_joined"
+            if row["claimant"] != user_id:
+                return "not_joined"
+            room_id = row["course_room_id"]
+            if not managed:
+                _delete_managed(txn, user_id, room_id)
+                return "deleted" if txn.rowcount == 1 else "unchanged"
+            # The record rests on the claimant's own confirmation, whose
+            # disclosure_version stays on the ack.
+            txn.execute(
+                "SELECT disclosure_version FROM pangea_invitation_ack"
+                " WHERE invitation_id = ? AND user_id = ?",
+                (invitation_id, user_id),
+            )
+            if txn.fetchone() is None:
+                return "no_ack"
+            txn.execute(
+                "INSERT INTO pangea_managed_account"
+                " (user_id, course_room_id, invited_by, since_ms)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT (user_id, course_room_id) DO NOTHING",
+                (user_id, room_id, row["invited_by"], now_ms),
+            )
+            return "inserted" if txn.rowcount == 1 else "unchanged"
+
+        return await self.db.runInteraction("pangea_managed_account_set", write)
+
     async def record_ack(
         self, invitation_id: str, user_id: str, version: int, now_ms: int
     ) -> None:

@@ -1371,7 +1371,7 @@ class TestMembershipRelease(_Base):
     async def test_leave_kick_or_ban_sets_the_invitation_left_and_deletes_the_managed_record(
         self,
     ):
-        release = MembershipRelease(self.h.store)
+        release = MembershipRelease(self.h.store, self.h.claims)
         for membership, sender in (
             ("leave", STUDENT),
             ("leave", TEACHER),
@@ -1389,7 +1389,7 @@ class TestMembershipRelease(_Base):
             self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
 
     async def test_other_events_release_nothing(self):
-        release = MembershipRelease(self.h.store)
+        release = MembershipRelease(self.h.store, self.h.claims)
         (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)
         await self.h.confirm(STUDENT, inv["invitation_id"])
@@ -1411,7 +1411,7 @@ class TestMembershipRelease(_Base):
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
 
     async def test_release_failure_is_reported_without_raising(self):
-        release = MembershipRelease(self.h.store)
+        release = MembershipRelease(self.h.store, self.h.claims)
         self.h.main.db_pool.error = RuntimeError("db down")
         with patch.object(report, "sentry_sdk") as sentry:
             await release.on_new_event(
@@ -1421,7 +1421,7 @@ class TestMembershipRelease(_Base):
         sentry.capture_message.assert_called_once()
 
     async def test_class_code_rejoin_restores_nothing(self):
-        release = MembershipRelease(self.h.store)
+        release = MembershipRelease(self.h.store, self.h.claims)
         (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)
         await self.h.confirm(STUDENT, inv["invitation_id"])
@@ -1447,6 +1447,134 @@ class TestMembershipRelease(_Base):
         await self.h.confirm(STUDENT, inv["invitation_id"])
         self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "left")
         self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+
+
+def _power_event(room_id: str) -> Any:
+    return SimpleNamespace(
+        type="m.room.power_levels",
+        room_id=room_id,
+        state_key="",
+        sender=TEACHER,
+        content={"users": {}},
+        is_state=lambda: True,
+    )
+
+
+class TestManagedRule(_Base):
+    """CONTRACTS C2.5 / SPEC INV-10: a joined invitation has a managed record
+    exactly while its claimant is not a course admin of that course."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.release = MembershipRelease(self.h.store, self.h.claims)
+
+    async def claimed(self, user: str = STUDENT) -> str:
+        (inv,) = await self.h.add(INVITED)
+        self.h.verify(user, INVITED_KEY)
+        status, body = await self.h.confirm(user, inv["invitation_id"])
+        self.assertEqual(body["result"], "claimed")
+        return inv["invitation_id"]
+
+    async def test_admins_own_claim_records_no_managed_account(self):
+        (inv,) = await self.h.add(INVITED)
+        await self.h.confirm(OTHER, inv["invitation_id"])
+        self.h.admins.admins.add((ROOM, OTHER))
+        status, body = await self.h.handlers.decide(
+            TEACHER,
+            {
+                "room_id": ROOM,
+                "invitation_id": inv["invitation_id"],
+                "user_id": OTHER,
+                "decision": "grant",
+            },
+        )
+        self.assertEqual((status, body["invitation"]["state"]), (200, "joined"))
+        self.assertIsNone(await self.h.store.managed_record(OTHER, ROOM))
+
+    async def test_claimant_losing_pl100_gets_a_managed_record_from_the_acks_disclosure_version(
+        self,
+    ):
+        self.h.admins.admins.add((ROOM, STUDENT))
+        ident = await self.claimed()
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        self.h.admins.admins.discard((ROOM, STUDENT))
+        await self.release.on_new_event(_power_event(ROOM), {})
+        record = await self.h.store.managed_record(STUDENT, ROOM)
+        self.assertEqual(
+            (record["user_id"], record["course_room_id"], record["invited_by"]),
+            (STUDENT, ROOM, TEACHER),
+        )
+        self.assertEqual(
+            (await self.h.store.get_ack(ident, STUDENT))["disclosure_version"], V
+        )
+        # Idempotent.
+        await self.release.on_new_event(_power_event(ROOM), {})
+        self.assertEqual(await self.h.store.managed_record(STUDENT, ROOM), record)
+        # The record rests on the confirmation: without one, none is made.
+        await self.h.store.set_managed(ident, STUDENT, False, 1)
+        await self.h.main.db_pool.runInteraction(
+            "drop-ack",
+            lambda txn: txn.execute(
+                "DELETE FROM pangea_invitation_ack WHERE invitation_id = ?", (ident,)
+            ),
+        )
+        await self.release.on_new_event(_power_event(ROOM), {})
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+
+    async def test_claimant_gaining_pl100_loses_the_managed_record(self):
+        await self.claimed()
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
+        self.h.admins.admins.add((ROOM, STUDENT))
+        await self.release.on_new_event(_power_event(ROOM), {})
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        await self.release.on_new_event(_power_event(ROOM), {})
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        # The invitation stays joined; only management changes.
+        _, joined = await self.h.handlers.mine_joined(STUDENT)
+        self.assertEqual(len(joined["invitations"]), 1)
+        # A power-level change in another course touches nothing here.
+        self.h.admins.admins.discard((ROOM, STUDENT))
+        await self.release.on_new_event(_power_event(OTHER_ROOM), {})
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+
+    async def test_login_repairs_a_missed_power_level_change(self):
+        from synapse_pangea_chat.email_invite.claim_by_email import ClaimByEmail
+
+        legacy = MagicMock()
+        legacy.prepared_for_emails = _async_return([])
+        api = MagicMock()
+        api._hs.get_datastores.return_value.main = self.h.main
+        hook = ClaimByEmail(api, legacy, MagicMock(), student_claims=self.h.claims)
+        await self.claimed()
+        # Promoted with no event seen: the next sign-in deletes the record.
+        self.h.admins.admins.add((ROOM, STUDENT))
+        await hook.on_user_login(STUDENT, None, None)
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        # Demoted with no event seen: the next sign-in records it again.
+        self.h.admins.admins.discard((ROOM, STUDENT))
+        await hook.on_user_login(STUDENT, None, None)
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
+
+    async def test_power_level_callback_failure_never_fails_the_event(self):
+        await self.claimed()
+        captured = self.capture_logs()
+        with patch.object(report, "sentry_sdk") as sentry:
+            self.h.main.db_pool.error = RuntimeError("DETAIL: " + INVITED_KEY)
+            await self.release.on_new_event(_power_event(ROOM), {})
+            self.h.main.db_pool.error = None
+            # A failing admin check for one claimant is reported, not raised.
+            failing = self.h.admins.is_course_admin
+
+            async def broken(room_id: str, user_id: str) -> bool:
+                raise RuntimeError("state read failed for " + INVITED_KEY)
+
+            self.h.admins.is_course_admin = broken  # type: ignore[method-assign]
+            await self.release.on_new_event(_power_event(ROOM), {})
+            self.h.admins.is_course_admin = failing  # type: ignore[method-assign]
+        self.assertEqual(sentry.capture_message.call_count, 2)
+        self.assertNotIn(INVITED_KEY, str(sentry.mock_calls))
+        self.assertNotIn(INVITED_KEY, captured.text())
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
 
 
 class TestInviteEmail(unittest.IsolatedAsyncioTestCase):

@@ -132,6 +132,69 @@ class StudentClaims:
                     user_id,
                 )
 
+    async def apply_managed_rule(self, row: Dict[str, Any]) -> None:
+        """C2.5 for one joined invitation: a managed record exactly while its
+        claimant is not a course admin (power level 100, creators count) of
+        the course. Raises on failure; callers report it."""
+        claimant = row["claimant"]
+        room_id = row["course_room_id"]
+        is_admin = await self._admins.is_course_admin(room_id, claimant)
+        result = await self._store.set_managed(
+            row["id"], claimant, not is_admin, now_ms()
+        )
+        if result in ("inserted", "deleted"):
+            logger.info(
+                "Managed record for %s in %s %s (invitation %s)",
+                claimant,
+                room_id,
+                result,
+                row["id"],
+            )
+        elif result == "no_ack":
+            logger.warning(
+                "Joined invitation %s has no confirmation by %s; not managed",
+                row["id"],
+                claimant,
+            )
+
+    async def apply_managed_rule_in_room(self, room_id: str) -> None:
+        """After a power-level change in a course. Never raises."""
+        try:
+            rows = [
+                r
+                for r in await self._store.list_room(room_id)
+                if r["state"] == STATE_JOINED
+            ]
+        except Exception as error:
+            report_failure("managed record power-level lookup", error, room=room_id)
+            return
+        for row in rows:
+            try:
+                await self.apply_managed_rule(row)
+            except Exception as error:
+                report_failure(
+                    "managed record power-level update",
+                    error,
+                    invitation=row["id"],
+                    user=row["claimant"],
+                )
+
+    async def repair_managed_for(self, user_id: str) -> None:
+        """At sign-in: re-apply C2.5 to the account's joined invitations, so a
+        missed power-level event is repaired. Never raises."""
+        try:
+            rows = await self._store.joined_by(user_id)
+        except Exception as error:
+            report_failure("managed record repair lookup", error, user=user_id)
+            return
+        for row in rows:
+            try:
+                await self.apply_managed_rule(row)
+            except Exception as error:
+                report_failure(
+                    "managed record repair", error, invitation=row["id"], user=user_id
+                )
+
     async def claim_confirmed_for(self, user_id: str) -> None:
         """The ``ClaimByEmail`` path: claim every ``invited`` row this account
         has confirmed and whose email now matches a verified address of it.
