@@ -148,10 +148,28 @@ async def respond_launch_not_available(request: SynapseRequest, launch: Launch) 
     )
 
 
+def logged_uri(uri: bytes) -> bytes:
+    """The request URI as Synapse should log it: path only, query redacted.
+
+    The LTI query strings carry platform-supplied values: the registration
+    token (Dynamic Registration), `login_hint` and `lti_message_hint` (login
+    initiation), which a platform may fill with an email or user id. Synapse's
+    access log writes the request URI when the request finishes, redacting
+    only `access_token` and `client_secret`. Matching parameter names is not
+    enough (percent-encoding spells a name many ways), so the whole query is
+    dropped; the arguments are already parsed by then.
+    """
+    path, separator, _ = uri.partition(b"?")
+    return path + b"?<redacted>" if separator else path
+
+
 class _Async(Resource):
     isLeaf = True
 
     def _run(self, handler: Callable[[SynapseRequest], Awaitable[None]], request):
+        # Every LTI path: keep platform-supplied query values out of the log.
+        if isinstance(request.uri, bytes):
+            request.uri = logged_uri(request.uri)
         run_in_background(self._guard, handler, request)
         return server.NOT_DONE_YET
 
@@ -387,24 +405,6 @@ def _respond_registration_page(
     finish_request(request)
 
 
-def logged_registration_uri(uri: bytes) -> bytes:
-    """The request URI as Synapse should log it: path only, query redacted.
-
-    Dynamic Registration puts the platform's registration token in the query
-    string, and Synapse's access log writes the request URI when the request
-    finishes, redacting only `access_token` and `client_secret`. Matching the
-    parameter name is not enough (percent-encoding spells it many ways), so
-    the whole query is dropped; the arguments are already parsed by then.
-    """
-    path, separator, _ = uri.partition(b"?")
-    return path + b"?<redacted>" if separator else path
-
-
-def _redact_registration_token(request: SynapseRequest) -> None:
-    if isinstance(request.uri, bytes):
-        request.uri = logged_registration_uri(request.uri)
-
-
 class LtiRegister(_Async):
     """Dynamic Registration: the platform opens this URL in its admin UI
     (GET with query parameters, or POST with the same as a form body)."""
@@ -432,7 +432,6 @@ class LtiRegister(_Async):
         return self._run(self._handle, request)
 
     async def _handle(self, request: SynapseRequest) -> None:
-        _redact_registration_token(request)
         config_url = _arg(request, "openid_configuration", 2048)
         frame_origin = None
         if config_url is not None and https_url(config_url) is not None:

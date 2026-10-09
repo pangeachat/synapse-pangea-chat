@@ -31,6 +31,8 @@ BASE = "http://localhost:8008/_synapse/client/pangea/v1/lti"
 LAUNCH_URL = BASE + "/launch"
 TOOL_KEY = new_rsa_key()
 EMAIL = "student.private@school.example"
+LOGIN_HINT = EMAIL
+MESSAGE_HINT = "message-hint-sentinel-7f3a"
 
 _SYNAPSE_CONFIG: Dict[str, Any] = {
     "public_baseurl": "http://localhost:8008/",
@@ -383,7 +385,18 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         )
         self.assertIn("/lti/register?<redacted>", info_and_above)
         self.assertNotIn(server.registration_token, info_and_above)
-        self.assertNotIn(EMAIL, logs)
+        # Login initiation's query carries the platform's hints (here an
+        # email and a sentinel); the logged URI drops that query too.
+        self.assertIn("/lti/login?<redacted>", info_and_above)
+        self.assertNotIn(LOGIN_HINT, info_and_above)
+        self.assertNotIn(MESSAGE_HINT, info_and_above)
+        # At every level, apart from Synapse's own pre-module DEBUG
+        # "Received request" line, no email appears (the id_token carries one).
+        beyond_request_lines = "\n".join(
+            line for line in logs.splitlines() if "Received request:" not in line
+        )
+        self.assertNotIn(EMAIL, beyond_request_lines)
+        self.assertNotIn(MESSAGE_HINT, beyond_request_lines)
         self.assertNotIn(token.split(".")[1], logs)
         for line in private_pem(TOOL_KEY).splitlines()[1:-1]:
             self.assertNotIn(line, logs)
@@ -410,8 +423,9 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
             BASE + "/login",
             params={
                 "iss": server.base_url,
-                "login_hint": "opaque-hint-1",
-                "lti_message_hint": "opaque-message-hint",
+                # Platforms may put an email or user id in the hints.
+                "login_hint": LOGIN_HINT,
+                "lti_message_hint": MESSAGE_HINT,
                 "target_link_uri": LAUNCH_URL,
                 "client_id": server.platform.client_id,
                 "lti_deployment_id": server.platform.deployment_id,
@@ -437,8 +451,8 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         self.assertEqual(query["prompt"], "none")
         self.assertEqual(query["client_id"], server.platform.client_id)
         self.assertEqual(query["redirect_uri"], LAUNCH_URL)
-        self.assertEqual(query["login_hint"], "opaque-hint-1")
-        self.assertEqual(query["lti_message_hint"], "opaque-message-hint")
+        self.assertEqual(query["login_hint"], LOGIN_HINT)
+        self.assertEqual(query["lti_message_hint"], MESSAGE_HINT)
         set_cookie = response.headers["Set-Cookie"]
         for attribute in ("HttpOnly", "Secure", "SameSite=None", "Max-Age=600"):
             self.assertIn(attribute, set_cookie)

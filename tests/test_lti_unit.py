@@ -879,7 +879,9 @@ class RegistrationUriRedactionTests(unittest.TestCase):
     is spelled, the URI Synapse logs carries no query at all."""
 
     def test_query_is_dropped_whatever_the_spelling(self):
-        from synapse_pangea_chat.lti.endpoints import logged_registration_uri
+        from synapse_pangea_chat.lti.endpoints import (
+            logged_uri as logged_registration_uri,
+        )
 
         path = b"/_synapse/client/pangea/v1/lti/register"
         for query in (
