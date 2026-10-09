@@ -56,6 +56,11 @@ from synapse_pangea_chat.notice_delivery.request import (
 )
 from synapse_pangea_chat.notice_delivery.schedule import NoticeSchedule
 from synapse_pangea_chat.notice_delivery.tokens import MILLISECONDS_PER_DAY, sign_token
+from synapse_pangea_chat.notice_delivery.transport_claim import (
+    PHASE_COMPLETE,
+    PHASE_PENDING,
+    TransportClaims,
+)
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -96,6 +101,7 @@ class DeliverNotice(Resource):
             config.notice_admin_requests_per_minute, config.notice_admin_burst
         )
         self._delivery_log = DeliveryLog(api, config)
+        self._transport_claims = TransportClaims(api)
         self.schedule = NoticeSchedule(api, self._deliver_scheduled)
         self._send_email_handler = self._hs.get_send_email_handler()
         self._app_name = self._hs.config.email.email_app_name
@@ -269,14 +275,32 @@ class DeliverNotice(Resource):
         if req is not None:
             if req.notice_event_id is not None:
                 await self._validate_notice(req)
-            record_id, previous = await self._delivery_log.reserve(req)
-            if previous is not None:
-                return {
-                    **previous,
-                    "notification_log_id": record_id,
-                    "log_status": "complete",
-                    "duplicate": True,
-                }
+            if req.caller_owns_record:
+                # The caller wrote the Notification_Log row and will write the receipt onto
+                # it; this module touches the record not at all (engagement-system doc).
+                # One delivery call per decision still means one transport: the claim
+                # below is the module's own, keyed by the caller's row.
+                record_id = req.notification_log_id
+                assert record_id is not None
+                claimed, previous = await self._transport_claims.claim(
+                    record_id, req.user_id, body
+                )
+                if not claimed and previous is not None:
+                    return {
+                        **previous,
+                        "notification_log_id": record_id,
+                        "log_status": "caller",
+                        "duplicate": True,
+                    }
+            else:
+                record_id, previous = await self._delivery_log.reserve(req)
+                if previous is not None:
+                    return {
+                        **previous,
+                        "notification_log_id": record_id,
+                        "log_status": "complete",
+                        "duplicate": True,
+                    }
         result: Dict[str, Any]
         if req is not None and req.notice_event_id is None:
             reason: Optional[str]
@@ -302,13 +326,27 @@ class DeliverNotice(Resource):
                     "push_rule_installed": False,
                 }
             else:
-                result = await self._deliver_once(body, req)
+                result = await self._transport(body, req, record_id)
             req = replace(req, notice_event_id=body.get("notice_event_id"))
             result["notice_event_id"] = req.notice_event_id
             result["notice_room_id"] = req.notice_room_id
         else:
-            result = await self._deliver_once(body, req)
-        if req is not None and record_id is not None:
+            result = await self._transport(body, req, record_id)
+        if req is not None and req.caller_owns_record:
+            assert record_id is not None
+            result.update(notification_log_id=record_id, log_status="caller")
+            uncertain = (result.get("reason") or "").endswith("send_failed")
+            # The claim replays this on a retry: counts only, never device tokens.
+            stored = dict(result)
+            push = result.get("push")
+            if push:
+                stored["push"] = {
+                    k: push.get(k) for k in ("attempted", "sent", "failed")
+                }
+            await self._transport_claims.finish(
+                record_id, PHASE_PENDING if uncertain else PHASE_COMPLETE, stored
+            )
+        elif req is not None and record_id is not None:
             result.update(
                 notification_log_id=record_id, log_status="complete", duplicate=False
             )
@@ -327,6 +365,24 @@ class DeliverNotice(Resource):
                 )
                 result["log_status"] = "pending_reconciliation"
         return result
+
+    async def _transport(
+        self,
+        body: Dict[str, Any],
+        req: Optional[NoticeRequest],
+        record_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """One transport attempt. For a caller-owned record an exception after the claim
+        leaves the claim uncertain with a sanitized reason, so a retry reconciles instead of
+        sending again."""
+        try:
+            return await self._deliver_once(body, req)
+        except Exception as error:
+            if req is not None and req.caller_owns_record and record_id is not None:
+                await self._transport_claims.mark_uncertain(
+                    record_id, type(error).__name__
+                )
+            raise
 
     async def _validate_notice(self, req: NoticeRequest) -> None:
         assert req.notice_event_id is not None
@@ -399,6 +455,12 @@ class DeliverNotice(Resource):
                 }
             )
             body["notice_event_id"] = event.event_id
+            if req.caller_owns_record and req.notification_log_id is not None:
+                # Persist the event on the claim before any transport, so a crash
+                # during SMTP or push leaves the reference reconciliation needs.
+                await self._transport_claims.record_event(
+                    req.notification_log_id, event.event_id
+                )
 
         method = (
             req.method
