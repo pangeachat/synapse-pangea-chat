@@ -1,4 +1,8 @@
+from unittest.mock import MagicMock
+
 import requests
+import yaml
+from synapse.util.macaroons import MacaroonGenerator
 
 from synapse_pangea_chat.notice_delivery import tokens
 from synapse_pangea_chat.notice_delivery.push_rule import (
@@ -226,6 +230,106 @@ class TestNoticeDeliveryE2E(BaseSynapseE2ETest):
 
             expired = requests.post(url, data={"t": "junk", "scope": "category"})
             self.assertEqual(expired.status_code, 400)
+        finally:
+            self._stop(started)
+
+    async def test_missed_message_unsubscribe_link_confirms_then_refuses(self):
+        """Synapse's own unsubscribe link, served by the module: opening it
+        changes nothing; the one-click POST records the refusal and removes
+        the email pusher."""
+        address = "alice@example.test"
+        started = await self.start_test_synapse(
+            module_config={
+                **self._module_config(),
+                "notice_missed_message_unsubscribe_enabled": True,
+            },
+            synapse_config_overrides={
+                "public_baseurl": f"{self.server_url}/",
+                "email": {
+                    "smtp_host": "localhost",
+                    "smtp_port": 2525,
+                    "notif_from": "Pangea Chat <noreply@example.test>",
+                    "enable_notifs": True,
+                    "notif_for_new_users": False,
+                    "client_base_url": APP_BASE_URL,
+                },
+            },
+        )
+        _, synapse_dir, config_path, *_ = started
+        try:
+            await self.register_user(
+                config_path, synapse_dir, "alice", "pw", admin=False
+            )
+            await self.register_user(
+                config_path, synapse_dir, "admin", "pw", admin=True
+            )
+            _, alice_token = await self.login_user("alice", "pw")
+            _, admin_token = await self.login_user("admin", "pw")
+            alice = {"Authorization": f"Bearer {alice_token}"}
+            user_id = "@alice:my.domain.name"
+
+            threepid = requests.put(
+                f"{self.server_url}/_synapse/admin/v2/users/{user_id}",
+                json={"threepids": [{"medium": "email", "address": address}]},
+                headers={"Authorization": f"Bearer {admin_token}"},
+            )
+            self.assertEqual(threepid.status_code, 200, threepid.text)
+            pusher = requests.post(
+                f"{self.server_url}/_matrix/client/v3/pushers/set",
+                json={
+                    "kind": "email",
+                    "app_id": "m.email",
+                    "pushkey": address,
+                    "app_display_name": "Email Notifications",
+                    "device_display_name": address,
+                    "lang": "en",
+                    "data": {},
+                },
+                headers=alice,
+            )
+            self.assertEqual(pusher.status_code, 200, pusher.text)
+
+            def email_pushkeys():
+                pushers = requests.get(
+                    f"{self.server_url}/_matrix/client/v3/pushers", headers=alice
+                ).json()["pushers"]
+                return [p["pushkey"] for p in pushers if p["app_id"] == "m.email"]
+
+            def preferences():
+                return requests.get(
+                    f"{self.server_url}/_matrix/client/v3/user/{user_id}/account_data/{PREFERENCES_TYPE}",
+                    headers=alice,
+                )
+
+            # The link Synapse's mailer builds, signed with this server's key.
+            with open(config_path, encoding="utf-8") as f:
+                secret = yaml.safe_load(f)["macaroon_secret_key"].encode()
+            token = MacaroonGenerator(
+                MagicMock(), "my.domain.name", secret
+            ).generate_delete_pusher_token(user_id, "m.email", address)
+            url = f"{self.server_url}/_synapse/client/unsubscribe"
+            params = {"access_token": token, "app_id": "m.email", "pushkey": address}
+
+            page = requests.get(url, params=params)
+            self.assertEqual(page.status_code, 200, page.text)
+            self.assertIn("Missed-message emails", page.text)
+            self.assertEqual(email_pushkeys(), [address], "GET must not act")
+            self.assertEqual(preferences().status_code, 404, "GET must not act")
+
+            one_click = requests.post(
+                url,
+                params=params,
+                data="List-Unsubscribe=One-Click",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            self.assertEqual(one_click.status_code, 200, one_click.text)
+            after = preferences().json()
+            self.assertEqual(after["refused"], ["missed_message"])
+            self.assertEqual(after["source"], "unsubscribe_link")
+            self.assertEqual(email_pushkeys(), [])
+
+            tampered = requests.get(url, params={**params, "pushkey": "x@example.test"})
+            self.assertEqual(tampered.status_code, 400)
         finally:
             self._stop(started)
 

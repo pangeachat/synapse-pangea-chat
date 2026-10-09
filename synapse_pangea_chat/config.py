@@ -131,6 +131,10 @@ class PangeaChatConfig:
     # Email is the fallback channel for notices when a person has no push
     # device. Off by default: turning it on is a rollout decision (deploy-note).
     notice_email_enabled: bool = False
+    # Serve the missed-message email's unsubscribe link (Synapse's own path) with
+    # a confirm page that records the refusal. Off by default: replacing a
+    # Synapse page is a rollout decision (deploy-note).
+    notice_missed_message_unsubscribe_enabled: bool = False
     # Install the per-user push rule that keeps Synapse's own mailer and
     # rule-driven push off p.room.notice events (the bot delivers those itself).
     notice_suppress_notice_push_rules: bool = True

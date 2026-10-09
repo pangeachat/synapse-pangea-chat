@@ -40,10 +40,13 @@ from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.moderation import refusal as moderation_refusal
 from synapse_pangea_chat.moderation import severity as moderation_severity
 from synapse_pangea_chat.notice_delivery import (
+    MISSED_MESSAGE_UNSUBSCRIBE_PATH,
     DeliverNotice,
+    MissedMessageUnsubscribe,
     NoticeClick,
     NoticeUnsubscribe,
     PrepareNotice,
+    RefusalStore,
 )
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
@@ -548,11 +551,24 @@ class PangeaChat:
             path="/_synapse/client/pangea/v1/deliver_nudge",
             resource=self.deliver_notice_resource,
         )
-        self.notice_unsubscribe_resource = NoticeUnsubscribe(api, config)
+        self.notice_refusal_store = RefusalStore(api)
+        self.notice_unsubscribe_resource = NoticeUnsubscribe(
+            api, config, self.notice_refusal_store
+        )
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/unsubscribe",
             resource=self.notice_unsubscribe_resource,
         )
+        if config.notice_missed_message_unsubscribe_enabled:
+            # Module resources are attached after Synapse's own, so this
+            # replaces Synapse's page at the path its missed-message email
+            # links to, in the body and in the List-Unsubscribe header.
+            self._api.register_web_resource(
+                path=MISSED_MESSAGE_UNSUBSCRIBE_PATH,
+                resource=MissedMessageUnsubscribe(
+                    api, config, self.notice_refusal_store
+                ),
+            )
         self.notice_click_resource = NoticeClick(api, config)
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/n",
@@ -962,6 +978,13 @@ class PangeaChat:
         notice_email_enabled = config.get("notice_email_enabled", False)
         if not isinstance(notice_email_enabled, bool):
             raise ValueError('Config "notice_email_enabled" must be a boolean')
+        notice_missed_message_unsubscribe_enabled = config.get(
+            "notice_missed_message_unsubscribe_enabled", False
+        )
+        if not isinstance(notice_missed_message_unsubscribe_enabled, bool):
+            raise ValueError(
+                'Config "notice_missed_message_unsubscribe_enabled" must be a boolean'
+            )
         notice_suppress_notice_push_rules = config.get(
             "notice_suppress_notice_push_rules", True
         )
@@ -1369,6 +1392,7 @@ class PangeaChat:
             send_push_burst_duration_seconds=send_push_burst_duration_seconds,
             send_push_sygnal_url=send_push_sygnal_url,
             notice_email_enabled=notice_email_enabled,
+            notice_missed_message_unsubscribe_enabled=notice_missed_message_unsubscribe_enabled,
             notice_suppress_notice_push_rules=notice_suppress_notice_push_rules,
             notice_token_secret=notice_token_secret,
             notice_token_ttl_days=notice_token_ttl_days,
