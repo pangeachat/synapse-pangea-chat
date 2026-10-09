@@ -82,6 +82,7 @@ def register_lti(
     redirects = LaunchRedirects(
         links=links,
         invitations=invitations.store,
+        claims=invitations.claims,
         login_tokens=login_token,
         app_base_url=config.app_base_url,
         admin_dash_base_url=config.admin_dash_base_url,

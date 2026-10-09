@@ -186,6 +186,7 @@ class Canvas:
         self.redirects = LaunchRedirects(
             links=self.links,
             invitations=self.h.store,
+            claims=self.h.claims,
             login_tokens=self.login_tokens,
             app_base_url=APP,
             admin_dash_base_url=DASH,
@@ -1415,6 +1416,44 @@ class TestLearnerLaunch(_Base):
         # Next launch: nothing left to confirm, straight to the app.
         target, query = await self.c.go(self.c.launch())
         self.assertEqual(target, APP + "/lti/token")
+
+    async def test_later_launch_retries_a_confirmed_claim_that_did_not_complete(
+        self,
+    ):
+        """The student confirmed, but the claim's join failed: the row is
+        acked and still Invited. A later launch retries the claim from that
+        recorded confirmation instead of skipping it for good."""
+        row = await self.canvas_row()
+        self.c.h.joiner.refuse.add(STUDENT)
+        with patch.object(report, "sentry_sdk"):
+            status, body = await self.c.learner_l1(
+                STUDENT, await self.c.ticket(self.c.launch())
+            )
+            self.assertEqual((status, body["claimed"]), (200, []))
+            self.assertIsNotNone(await self.c.h.store.get_ack(row["id"], STUDENT))
+            # Still refused: the launch still signs in, the row stays Invited,
+            # and the failure is reported, not raised into the launch.
+            target, _ = await self.c.go(self.c.launch())
+            self.assertEqual(target, APP + "/lti/token")
+            self.assertEqual((await self.c.h.row(row["id"]))["state"], "invited")
+        self.c.h.joiner.refuse.discard(STUDENT)
+        target, _ = await self.c.go(self.c.launch())
+        self.assertEqual(target, APP + "/lti/token")
+        joined = await self.c.h.row(row["id"])
+        self.assertEqual((joined["state"], joined["claimant"]), ("joined", STUDENT))
+        self.assertIsNotNone(await self.c.h.store.managed_record(STUDENT, ROOM))
+
+    async def test_later_launch_never_claims_without_the_accounts_own_confirmation(
+        self,
+    ):
+        await self.linked()
+        row = await self.canvas_row()
+        # Another account's confirmation does not count for this one.
+        await self.c.h.store.record_ack(row["id"], OTHER, V, NOW)
+        target, _ = await self.c.go(self.c.launch())
+        self.assertEqual(target, APP + "/lti/link")
+        self.assertEqual((await self.c.h.row(row["id"]))["state"], "invited")
+        self.assertEqual(self.c.h.joiner.joins, [])
 
     async def test_bound_ticket_with_the_accounts_own_token_returns_no_login_token(
         self,

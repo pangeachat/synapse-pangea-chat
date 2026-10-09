@@ -109,6 +109,7 @@ class LaunchRedirects:
         *,
         links: LtiLinkStore,
         invitations: StudentInvitationStore,
+        claims: StudentClaims,
         login_tokens: LoginTokens,
         app_base_url: str,
         admin_dash_base_url: str,
@@ -116,6 +117,7 @@ class LaunchRedirects:
     ) -> None:
         self._links = links
         self._invitations = invitations
+        self._claims = claims
         self._login_tokens = login_tokens
         self._app = app_base_url.rstrip("/")
         self._admin_dash_base_url = admin_dash_base_url
@@ -167,11 +169,14 @@ class LaunchRedirects:
                 now=self._clock_ms(),
             )
         if user_id is not None:
-            matching = await self._invitations.canvas_invited(
-                (launch.issuer, launch.context_id, launch.sub)
-            )
+            identity = (launch.issuer, launch.context_id, launch.sub)
+            matching = await self._invitations.canvas_invited(identity)
             confirmed = await self._invitations.acks_by(user_id)
             if all(row["id"] in confirmed for row in matching):
+                # Every match is confirmed by this account, yet still Invited:
+                # its claim did not complete (a failed join, say). Retry it on
+                # that recorded confirmation, as ClaimByEmail does at sign-in.
+                await self._retry_claims(matching, user_id, identity)
                 token = await self._login_tokens(user_id)
                 return f"{self._app}/lti/token?" + urlencode({"loginToken": token})
         # Not linked, or linked with invitations to confirm: the link page,
@@ -182,6 +187,24 @@ class LaunchRedirects:
         if title is not None:
             query["course"] = title
         return f"{self._app}/lti/link?" + urlencode(query)
+
+    async def _retry_claims(
+        self,
+        rows: List[Dict[str, Any]],
+        user_id: str,
+        identity: Tuple[str, str, str],
+    ) -> None:
+        """Never raises: a claim that fails again is reported, and the
+        launch still signs the student in."""
+        for row in rows:
+            try:
+                outcome, _ = await self._claims.claim(
+                    row["id"], user_id, canvas_identity=identity
+                )
+            except Exception as error:
+                report_failure("LTI launch claim retry", error, invitation=row["id"])
+                continue
+            logger.info("LTI launch claim retry: invitation %s %s", row["id"], outcome)
 
     async def __call__(self, request: SynapseRequest, launch: Launch) -> None:
         try:
