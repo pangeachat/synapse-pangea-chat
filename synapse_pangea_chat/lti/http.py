@@ -2,9 +2,9 @@
 
 Every URL fetched here was supplied by a platform (an OpenID configuration URL
 anyone can send to `/lti/register`, and the endpoints that document lists), so
-the requests go through Synapse's proxied, IP-blocklisted client: the
-homeserver's `ip_range_blocklist` stops them reaching private addresses.
-Redirects are not followed. Bodies are capped and read under a timeout.
+the requests honour the homeserver's proxy settings and its
+`ip_range_blocklist`, which stops them reaching private addresses. Redirects
+are not followed (a 3xx is a failure). Bodies are capped and read under a timeout.
 """
 
 from __future__ import annotations
@@ -16,7 +16,11 @@ from io import BytesIO
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
-from synapse.http.client import BodyExceededMaxSize, read_body_with_max_size
+from synapse.http.client import (
+    BodyExceededMaxSize,
+    SimpleHttpClient,
+    read_body_with_max_size,
+)
 from synapse.logging.context import make_deferred_yieldable
 from synapse.util.async_helpers import timeout_deferred
 from twisted.internet import defer
@@ -75,7 +79,17 @@ def host_of(url: str) -> str:
 
 class PlatformHttp:
     def __init__(self, hs: Any):
-        self._client = hs.get_proxied_blocklisted_http_client()
+        # The same proxy and IP block/allow lists as Synapse's
+        # get_proxied_blocklisted_http_client, but with redirects off: treq
+        # follows them by default, and a followed redirect would let a document
+        # served anywhere pass the issuer-host check of the URL it was asked for.
+        self._client = SimpleHttpClient(
+            hs,
+            treq_args={"allow_redirects": False},
+            ip_allowlist=hs.config.server.ip_range_allowlist,
+            ip_blocklist=hs.config.server.ip_range_blocklist,
+            use_proxy=True,
+        )
         self._clock = hs.get_clock()
 
     async def get_json(self, url: str) -> Any:

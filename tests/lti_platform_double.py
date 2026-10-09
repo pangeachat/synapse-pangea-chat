@@ -232,6 +232,12 @@ class HttpsPlatformServer:
             def do_GET(self) -> None:
                 if self.path == "/.well-known/openid-configuration":
                     self._json(200, server.openid_configuration())
+                elif self.path == "/redirect":
+                    # An open redirect on the platform's host.
+                    self.send_response(302)
+                    self.send_header("Location", "/.well-known/openid-configuration")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
                 elif self.path == "/jwks":
                     server.jwks_requests += 1
                     self._json(200, server.platform.jwks())

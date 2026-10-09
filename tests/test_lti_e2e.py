@@ -133,6 +133,21 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
             "course_navigation",
         )
 
+        # Redirects are never followed: the issuer-host check is against the
+        # URL the document was fetched from, so a redirect would let any
+        # document claim the redirecting host's issuer.
+        redirected = requests.get(
+            BASE + "/register",
+            params={
+                "openid_configuration": server.base_url + "/redirect",
+                "registration_token": server.registration_token,
+            },
+            timeout=30,
+        )
+        self.assertEqual(redirected.status_code, 400, redirected.text)
+        self.assertIn("configuration_status_302", redirected.text)
+        self.assertEqual(server.registrations, [])
+
         # Dynamic Registration lands the platform as pending.
         registered = requests.get(
             BASE + "/register",
