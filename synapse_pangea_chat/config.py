@@ -9,11 +9,14 @@ Unified configuration combining all previously separate synapse module configs:
 - limit_user_directory (from synapse-limit-user-directory)
 """
 
-from typing import List, Mapping, Optional
+from typing import TYPE_CHECKING, List, Mapping, Optional
 
 import attr
 
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
+
+if TYPE_CHECKING:
+    from synapse_pangea_chat.lti.keys import LtiSettings
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -287,3 +290,11 @@ class PangeaChatConfig:
     moderation_tier2_drain_timeout_seconds: float = 10.0
     # How often the supervisor looks for a worker that died.
     moderation_tier2_supervisor_interval_seconds: float = 30.0
+
+    # --- lti (LTI 1.3 tool core) ---
+    # Built from the module config's `lti` block, whose private key Ansible
+    # fills from Secrets Manager. None when the block is absent or unusable:
+    # then the LTI endpoints are not registered, and `lti_config_error` says
+    # why (never the key itself).
+    lti: Optional["LtiSettings"] = None
+    lti_config_error: Optional[str] = None
