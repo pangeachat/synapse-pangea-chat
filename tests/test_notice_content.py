@@ -139,10 +139,19 @@ class TestStructuredDelivery(unittest.IsolatedAsyncioTestCase):
         )
         handler._delivery_log.reserve = AsyncMock(return_value=("42", None))
         handler._delivery_log.finish = AsyncMock()
-        # The transport claim keeps its own small table; give it real SQL.
+        # The transport claim keeps its own small table; give it real SQL and
+        # close it with the test, or the e2e base's ResourceWarning guard trips
+        # when the connection is collected during a later test.
+        import weakref
+
         from tests.test_notice_schedule import SQLPool
 
-        handler._transport_claims._db = SQLPool()
+        pool = SQLPool()
+        # Suites that borrow this fixture through a throwaway instance never run
+        # its cleanups, so the pool closes with the handler it belongs to.
+        weakref.finalize(handler, pool.db.close)
+        self.addCleanup(pool.db.close)
+        handler._transport_claims._db = pool
         return handler, api
 
     async def test_force_email_while_active_and_replaces_slots_without_jinja(self):
@@ -283,8 +292,9 @@ class TestCallerOwnedTransportClaim(unittest.IsolatedAsyncioTestCase):
     per decision means one transport (engagement-system doc)."""
 
     def handler(self):
-        handler, api = TestStructuredDelivery().handler(active=False, sent=0)
-        self.addCleanup(handler._transport_claims._db.db.close)
+        fixture = TestStructuredDelivery()
+        handler, api = fixture.handler(active=False, sent=0)
+        self.addCleanup(fixture.doCleanups)
         return handler, api
 
     async def test_replaying_the_same_request_sends_once_and_answers_with_the_result(
@@ -374,7 +384,7 @@ class TestCallerOwnedBoundsAndPaths(unittest.IsolatedAsyncioTestCase):
     async def test_push_replay_sends_once(self):
         fixture = TestStructuredDelivery()
         handler, api = fixture.handler(active=False, sent=1)
-        self.addCleanup(handler._transport_claims._db.db.close)
+        self.addCleanup(fixture.doCleanups)
         body = {**request_body("push-only"), "notification_log_id": "row-9"}
         first = await handler.deliver(body)
         second = await handler.deliver(dict(body))
@@ -413,7 +423,7 @@ class TestCallerOwnedEventPersistedBeforeTransport(unittest.IsolatedAsyncioTestC
         fixture = TestStructuredDelivery()
         handler, api = fixture.handler(active=False, sent=0)
         pool = handler._transport_claims._db
-        self.addCleanup(pool.db.close)
+        self.addCleanup(fixture.doCleanups)
         api.create_and_send_event_into_room = AsyncMock(
             return_value=SimpleNamespace(event_id="$created")
         )
