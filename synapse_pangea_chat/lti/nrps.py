@@ -113,8 +113,10 @@ class NrpsClient:
                 document.get("members"), list
             ):
                 raise UpstreamError("bad_membership")
+            # Every page must name the linked Canvas course (NRPS 2.0's
+            # container carries its context); a page that does not is refused.
             context = document.get("context")
-            if isinstance(context, dict) and context.get("id") != context_id:
+            if not isinstance(context, dict) or context.get("id") != context_id:
                 raise UpstreamError("wrong_context")
             learners.extend(
                 learner

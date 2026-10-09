@@ -1076,6 +1076,16 @@ class TestNrps(_Base):
             (OTHER_ISSUER, OTHER_CONTEXT, OTHER_SUB),
         )
         self.assertEqual(await self.c.rows(ROOM), [])
+        # A page that does not name the linked context is refused: another
+        # context, no context, or a context without an id.
+        for context in ({"id": OTHER_CONTEXT}, None, {}):
+            page: Dict[str, Any] = {"members": [_member(SUB, "a@school.example")]}
+            if context is not None:
+                page["context"] = context
+            self.c.http.pages[NRPS_URL] = (page, None)
+            status, body = await self.c.import_(room=ROOM)
+            self.assertEqual(status, 502, (context, body))
+            self.assertEqual(await self.c.rows(ROOM), [])
         # A page that names another context than the linked one is refused.
         self.c.http.pages[NRPS_URL] = (
             _page([_member(SUB, "a@school.example")], OTHER_CONTEXT),
