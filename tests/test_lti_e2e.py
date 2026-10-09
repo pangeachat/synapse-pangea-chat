@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
@@ -264,7 +265,16 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
             headers=self._headers(admin_token),
             timeout=10,
         )
-        self.assertEqual(with_body.status_code, 200, with_body.text)
+        # The contract has no request body, so one is refused, not ignored.
+        self.assertEqual(with_body.status_code, 400, with_body.text)
+        self.assertEqual(with_body.json()["errcode"], "M_INVALID_PARAM")
+        empty_object = requests.post(
+            f"{BASE}/platforms/{platform_id}/approve",
+            json={},
+            headers=self._headers(admin_token),
+            timeout=10,
+        )
+        self.assertEqual(empty_object.status_code, 400, empty_object.text)
         rows = {
             r["client_id"]: r
             for r in self._get_platforms(admin_token).json()["platforms"]
@@ -284,16 +294,16 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         # A reused state (and so its nonce) is refused.
         replay = self._launch(token, state, cookie)
         self.assertEqual(replay.status_code, 400)
-        self.assertEqual(replay.json()["reason"], "unknown_state")
+        self.assertEqual(self._refusal(replay), "unknown_state")
 
         # A state presented without this browser's cookie is refused.
         state, nonce, cookie = self._login_ok(server)
         token = double.sign(double.claims(nonce=nonce, launch_url=LAUNCH_URL))
         no_cookie = self._launch(token, state, None)
         self.assertEqual(no_cookie.status_code, 400)
-        self.assertEqual(no_cookie.json()["reason"], "state_mismatch")
+        self.assertEqual(self._refusal(no_cookie), "state_mismatch")
         wrong_cookie = self._launch(token, state, (cookie[0], "x" + cookie[1]))
-        self.assertEqual(wrong_cookie.json()["reason"], "state_mismatch")
+        self.assertEqual(self._refusal(wrong_cookie), "state_mismatch")
         # ...and the state still works for its own browser, once.
         self.assertEqual(self._launch(token, state, cookie).status_code, 501)
 
@@ -303,7 +313,7 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         cross = double.sign(double.claims(nonce=nonce_b, launch_url=LAUNCH_URL))
         crossed = self._launch(cross, state_a, cookie_a)
         self.assertEqual(crossed.status_code, 400)
-        self.assertEqual(crossed.json()["reason"], "bad_nonce")
+        self.assertEqual(self._refusal(crossed), "bad_nonce")
 
         # An instructor launch takes the connect path.
         state, nonce, cookie = self._login_ok(server)
@@ -319,7 +329,7 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         claims = double.claims(nonce=nonce, launch_url=LAUNCH_URL)
         claims["https://purl.imsglobal.org/spec/lti/claim/deployment_id"] = "dep-x"
         unknown = self._launch(double.sign(claims), state, cookie)
-        self.assertEqual(unknown.json()["reason"], "unknown_deployment")
+        self.assertEqual(self._refusal(unknown), "unknown_deployment")
 
         # A platform that is no longer approved by the time the launch arrives
         # is refused at the launch too, not only at login.
@@ -328,7 +338,7 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         token = double.sign(double.claims(nonce=nonce, launch_url=LAUNCH_URL))
         refused = self._launch(token, state, cookie)
         self.assertEqual(refused.status_code, 403, refused.text)
-        self.assertEqual(refused.json()["reason"], "platform_not_approved")
+        self.assertEqual(self._refusal(refused), "platform_not_approved")
         self._set_platform_state(platform_id, "approved")
 
         # A key the platform never published is not fetched again and again.
@@ -339,7 +349,7 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         )
         before = server.jwks_requests
         self.assertEqual(
-            self._launch(rogue, state, cookie).json()["reason"], "unknown_key"
+            self._refusal(self._launch(rogue, state, cookie)), "unknown_key"
         )
         state, nonce, cookie = self._login_ok(server)
         rogue = double.sign(
@@ -391,7 +401,6 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
     def _approve(self, platform_id: str, token: Optional[str]) -> requests.Response:
         return requests.post(
             f"{BASE}/platforms/{platform_id}/approve",
-            json={},
             headers=self._headers(token),
             timeout=10,
         )
@@ -437,6 +446,21 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         value = rest.split(";", 1)[0]
         self.assertEqual(value, query["state"])
         return query["state"], query["nonce"], (name, value)
+
+    def _refusal(self, response: requests.Response) -> str:
+        """A refused launch is a minimal HTML page: no redirect, no JSON, and
+        nothing from the token echoed back. Returns its reason code."""
+        self.assertIn(response.status_code, (400, 403, 429), response.text)
+        self.assertTrue(
+            response.headers["Content-Type"].startswith("text/html"),
+            response.headers["Content-Type"],
+        )
+        self.assertNotIn("Location", response.headers)
+        for echoed in (EMAIL, "canvas-user-42", "canvas-course-7", "eyJ"):
+            self.assertNotIn(echoed, response.text)
+        match = re.search(r'data-reason="([a-z_]+)"', response.text)
+        assert match is not None, response.text
+        return match.group(1)
 
     def _launch(
         self, id_token: str, state: str, cookie: Optional[Tuple[str, str]]

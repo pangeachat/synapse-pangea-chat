@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import logging
 from typing import Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlencode, urlsplit
@@ -29,7 +30,7 @@ from synapse.api.errors import (
     MissingClientTokenError,
 )
 from synapse.http import server
-from synapse.http.server import finish_request, respond_with_json
+from synapse.http.server import finish_request, respond_with_html, respond_with_json
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
@@ -96,6 +97,24 @@ def _refuse(request: SynapseRequest, status: int, reason: str) -> None:
         status,
         {"errcode": errcode, "error": "LTI request refused", "reason": reason},
         send_cors=False,
+    )
+
+
+_LAUNCH_REFUSED_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Pangea Chat</title></head>
+<body><p>Pangea Chat could not open this page from your course. Go back to
+your course and open Pangea Chat again.</p>
+<p data-reason="{reason}">Reason: {reason}</p></body></html>
+"""
+
+
+def _refuse_launch(request: SynapseRequest, status: int, reason: str) -> None:
+    """The launch is a browser page (the platform's form POST), so a refusal
+    is a minimal HTML page: no redirect, and only our own reason code, never
+    anything from the token."""
+    request.setHeader(b"Cache-Control", b"no-store")
+    respond_with_html(
+        request, status, _LAUNCH_REFUSED_PAGE.format(reason=html.escape(reason))
     )
 
 
@@ -298,7 +317,7 @@ class LtiLaunch(_Async):
                 rejected.code,
                 platform_id or "-",
             )
-            _refuse(request, rejected.status, rejected.code)
+            _refuse_launch(request, rejected.status, rejected.code)
             return
         logger.info(
             "LTI launch verified: platform=%s path=%s", launch.platform_id, launch.path
@@ -542,6 +561,19 @@ class LtiPlatformsAdmin(_Async):
         segments = self._segments(request)
         if len(segments) != 2 or segments[1] != "approve":
             respond_with_json(request, 404, {"errcode": "M_NOT_FOUND"}, send_cors=True)
+            return
+        if request.content is not None and request.content.read(1):
+            # The contract has no body: deployments come only from the
+            # platform's registration, so a body is refused, never ignored.
+            respond_with_json(
+                request,
+                400,
+                {
+                    "errcode": "M_INVALID_PARAM",
+                    "error": "Approve takes no request body",
+                },
+                send_cors=True,
+            )
             return
         platform_id = segments[0]
         found = await self._store.approve(
