@@ -35,6 +35,8 @@ from synapse_pangea_chat.grant_instructor_analytics_access import (
     GrantInstructorAnalyticsAccess,
 )
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
+from synapse_pangea_chat.lti import register_lti
+from synapse_pangea_chat.lti.keys import LtiConfigError, LtiSettings, parse_lti_config
 from synapse_pangea_chat.moderation import ChatModeration, tier1_prefilter
 from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.moderation import refusal as moderation_refusal
@@ -589,6 +591,11 @@ class PangeaChat:
                 path="/_synapse/client/pangea/v1/user_directory/search",
                 resource=self.user_directory_search_resource,
             )
+
+        # --- LTI 1.3 tool core (Canvas) ---
+        # Registered only with a usable private key in config; otherwise the
+        # paths do not exist and the reason is logged.
+        self.lti_store = register_lti(api, config)
 
     async def _on_new_event_room_preview(
         self,
@@ -1315,8 +1322,22 @@ class PangeaChat:
 
         student_invitation_rate_limits = parse_rate_limits(config)
 
+        # --- lti config ---
+        # An unusable block does not stop Synapse: the LTI endpoints alone stay
+        # down (register_lti logs why), so a bad secret cannot take the whole
+        # homeserver offline.
+        lti_settings: Optional[LtiSettings] = None
+        lti_config_error: Optional[str] = None
+        if "lti" in config:
+            try:
+                lti_settings = parse_lti_config(config["lti"])
+            except LtiConfigError as e:
+                lti_config_error = str(e)
+
         return PangeaChatConfig(
             student_invitation_rate_limits=student_invitation_rate_limits,
+            lti=lti_settings,
+            lti_config_error=lti_config_error,
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
             course_plan_state_event_type=course_plan_state_event_type,
