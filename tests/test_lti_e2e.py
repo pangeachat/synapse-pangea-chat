@@ -315,7 +315,7 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         info_and_above = "\n".join(
             line for line in logs.splitlines() if " - DEBUG - " not in line
         )
-        self.assertIn("registration_token=<redacted>", info_and_above)
+        self.assertIn("/lti/register?<redacted>", info_and_above)
         self.assertNotIn(server.registration_token, info_and_above)
         self.assertNotIn(EMAIL, logs)
         self.assertNotIn(token.split(".")[1], logs)

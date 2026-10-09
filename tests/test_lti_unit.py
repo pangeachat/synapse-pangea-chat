@@ -850,6 +850,27 @@ class RegistrationArtifactTests(unittest.TestCase):
         self.assertEqual(urls.domain, "matrix.pangea.example")
 
 
+class RegistrationUriRedactionTests(unittest.TestCase):
+    """The registration token arrives in the query string; however its name
+    is spelled, the URI Synapse logs carries no query at all."""
+
+    def test_query_is_dropped_whatever_the_spelling(self):
+        from synapse_pangea_chat.lti.endpoints import logged_registration_uri
+
+        path = b"/_synapse/client/pangea/v1/lti/register"
+        for query in (
+            b"registration_token=SECRET&openid_configuration=x",
+            b"openid_configuration=x&registr%61tion_token=SECRET",
+            b"registration%5ftoken=SECRET",
+            b"registration%5Ftoken=SECRET;a=b",
+            b"%72egistration_token=SECRET",
+        ):
+            logged = logged_registration_uri(path + b"?" + query)
+            self.assertNotIn(b"SECRET", logged)
+            self.assertEqual(logged, path + b"?<redacted>")
+        self.assertEqual(logged_registration_uri(path), path)
+
+
 class LogRedactionTests(unittest.TestCase):
     """`no key or email in logs` (INV-8): rejection paths log a reason code,
     never the token, its claims or key material."""

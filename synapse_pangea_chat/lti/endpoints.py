@@ -19,7 +19,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlencode, urlsplit
 
@@ -371,16 +370,22 @@ def _respond_registration_page(
     finish_request(request)
 
 
-_REGISTRATION_TOKEN = re.compile(rb"((?:^|[?&])registration(?:_|%5[Ff])token=)[^&]*")
+def logged_registration_uri(uri: bytes) -> bytes:
+    """The request URI as Synapse should log it: path only, query redacted.
+
+    Dynamic Registration puts the platform's registration token in the query
+    string, and Synapse's access log writes the request URI when the request
+    finishes, redacting only `access_token` and `client_secret`. Matching the
+    parameter name is not enough (percent-encoding spells it many ways), so
+    the whole query is dropped; the arguments are already parsed by then.
+    """
+    path, separator, _ = uri.partition(b"?")
+    return path + b"?<redacted>" if separator else path
 
 
 def _redact_registration_token(request: SynapseRequest) -> None:
-    """Dynamic Registration puts the platform's registration token in the
-    query string, and Synapse's access log writes the request URI when the
-    request finishes, redacting only `access_token` and `client_secret`. The
-    arguments are already parsed, so the logged URI is redacted here."""
     if isinstance(request.uri, bytes):
-        request.uri = _REGISTRATION_TOKEN.sub(rb"\1<redacted>", request.uri)
+        request.uri = logged_registration_uri(request.uri)
 
 
 class LtiRegister(_Async):
