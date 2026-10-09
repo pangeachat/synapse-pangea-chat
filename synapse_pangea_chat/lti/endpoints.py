@@ -20,7 +20,7 @@ import hashlib
 import hmac
 import html
 import logging
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlencode, urlsplit
 
 from synapse.api.errors import (
@@ -428,6 +428,10 @@ class LtiRegister(_Async):
             registration_token = _arg(request, "registration_token")
             if config_url is None or frame_origin is None:
                 raise RegistrationRejected("bad_configuration_url")
+            if registration_token is None:
+                # The platform's initiation credential: without it this is not
+                # a platform-started registration, so nothing is fetched or sent.
+                raise RegistrationRejected("missing_registration_token")
             try:
                 document = await self._http.get_json(config_url)
             except UpstreamError as e:
@@ -489,6 +493,8 @@ class LtiPlatformsAdmin(_Async):
     def __init__(self, api: ModuleApi, store: LtiStore):
         super().__init__()
         self._api = api
+        self._auth = api._hs.get_auth()
+        self._store_main: Any = api._hs.get_datastores().main
         self._clock = api._hs.get_clock()
         self._store = store
 
@@ -500,7 +506,16 @@ class LtiPlatformsAdmin(_Async):
 
     async def _admin(self, request: SynapseRequest) -> Optional[str]:
         try:
-            requester = await self._api.get_user_by_req(request)
+            # Authenticated from the token directly rather than through
+            # get_user_by_req, which attaches the requester to the request and
+            # so writes the operator's mxid into Synapse's access log. Who
+            # approved is recorded on the platform row instead.
+            token = self._auth.get_access_token_from_request(request)
+            requester = await self._auth.get_user_by_access_token(token)
+            if requester.is_guest or await self._store_main.get_user_locked_status(
+                requester.user.to_string()
+            ):
+                raise AuthError(403, "Not allowed")
         # silent-ok: the caller's auth failure, answered 401
         except (
             MissingClientTokenError,

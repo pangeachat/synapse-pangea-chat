@@ -43,6 +43,17 @@ _SYNAPSE_CONFIG: Dict[str, Any] = {
 }
 
 
+def lti_info_lines(logs: str) -> str:
+    """INFO+ lines written for LTI requests: Synapse's access lines for LTI
+    paths and the LTI module's own lines."""
+    return "\n".join(
+        line
+        for line in logs.splitlines()
+        if " - DEBUG - " not in line
+        and ("/lti/" in line or "synapse_pangea_chat.lti" in line)
+    )
+
+
 class LtiEndpointsE2ETest(BaseSynapseE2ETest):
     async def _start(self, module_config: Dict[str, Any]) -> Tuple[Any, ...]:
         return await self.start_test_synapse(
@@ -134,6 +145,20 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         # v1 installs by Dynamic Registration only: there is no static
         # JSON config to install from.
         self.assertEqual(requests.get(BASE + "/config", timeout=10).status_code, 404)
+
+        # The registration token is required: without it nothing is fetched
+        # or sent.
+        no_token = requests.get(
+            BASE + "/register",
+            params={
+                "openid_configuration": server.base_url
+                + "/.well-known/openid-configuration",
+            },
+            timeout=30,
+        )
+        self.assertEqual(no_token.status_code, 400, no_token.text)
+        self.assertIn("missing_registration_token", no_token.text)
+        self.assertEqual(server.tokens_seen, [])
 
         # Redirects are never followed: the issuer-host check is against the
         # URL the document was fetched from, so a redirect would let any
@@ -390,24 +415,14 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         # logs` (INV-8).
         logs = self._logs()
         self.assertIn("LTI platform approved", logs)
-        # The module's own INFO+ lines never name the approving operator.
-        # (Synapse's access log shows the authenticated requester on every
-        # authenticated request; that line is Synapse's, not the module's.)
-        module_info = [
-            line
-            for line in logs.splitlines()
-            if "synapse.module.synapse_pangea_chat" in line
-            and " - DEBUG - " not in line
-        ]
-        self.assertTrue(any("LTI platform approved" in line for line in module_info))
-        self.assertFalse(
-            [
-                line
-                for line in module_info
-                if operator_id in line or "operator" in line.lower()
-            ],
-            "\n".join(module_info),
-        )
+        # No INFO+ line for an LTI request names the operator who listed or
+        # approved, Synapse's access lines included (the admin endpoints
+        # authenticate without attaching the requester to the request).
+        # Synapse's own /login handler logs the sign-in the test makes; that
+        # is not an LTI request.
+        lti_lines = lti_info_lines(logs)
+        self.assertIn("/lti/platforms", lti_lines)
+        self.assertNotIn(operator_id, lti_lines)
         # The registration token arrives in the query string (the Dynamic
         # Registration spec puts it there). Synapse's INFO access log records
         # the URI when the request finishes, so it must be redacted by then.

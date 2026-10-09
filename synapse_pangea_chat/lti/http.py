@@ -95,12 +95,11 @@ class PlatformHttp:
     async def get_json(self, url: str) -> Any:
         return await self._request("GET", url, None, {})
 
-    async def post_json(
-        self, url: str, body: Dict[str, Any], bearer: Optional[str]
-    ) -> Any:
-        headers = {"Content-Type": "application/json"}
-        if bearer:
-            headers["Authorization"] = f"Bearer {bearer}"
+    async def post_json(self, url: str, body: Dict[str, Any], bearer: str) -> Any:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {bearer}",
+        }
         return await self._request("POST", url, json.dumps(body).encode(), headers)
 
     async def _request(
