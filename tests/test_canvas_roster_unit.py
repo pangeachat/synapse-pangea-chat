@@ -166,9 +166,18 @@ class FakeServerAdmins:
         self.admins: set = set()
         self.error: Optional[Exception] = None
         self.checks: List[str] = []
+        #: Answers for the next checks, in order (True, False or an
+        #: exception), before falling back to `admins` / `error`: a flag that
+        #: flips between two reads in one request.
+        self.script: List[Any] = []
 
     async def __call__(self, user_id: str) -> bool:
         self.checks.append(user_id)
+        if self.script:
+            answer = self.script.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return bool(answer)
         if self.error is not None:
             raise self.error
         return user_id in self.admins
@@ -1647,6 +1656,60 @@ class TestNoLoginTokenForServerAdmins(_Base):
         self.c.server_admins.error = None
         self.assertEqual(await tokens.issue(STUDENT), "login-token-1")
         self.assertEqual(self.c.login_tokens.issued, [(STUDENT, "login-token-1")])
+
+    async def test_admin_flag_flipping_mid_link_step_never_leaves_writes_without_a_token(
+        self,
+    ):
+        """One admin decision per request: if the flag read passes and a
+        later read would fail or flip, the request still either refuses
+        before writing (401) or completes with its token, never a claim
+        written with no token."""
+        await self.linked()
+        row = await self.canvas_row()
+        for later in (True, RuntimeError("database down")):
+            ticket = await self.c.ticket(self.c.launch())
+            self.c.server_admins.checks.clear()
+            self.c.server_admins.script = [False, later]
+            before = await self.written()
+            status, body = await self.c.learner_l1(None, ticket)
+            self.c.server_admins.script = []
+            if status == 401:
+                self.assertEqual(await self.written(), before, later)
+            else:
+                self.assertEqual(status, 200, body)
+                self.assertIsNotNone(body["login_token"], later)
+                self.assertEqual(len(body["claimed"]), 1)
+                break
+            self.assertEqual(self.c.server_admins.checks, [STUDENT])
+        joined = await self.c.h.row(row["id"])
+        self.assertEqual(joined["state"], "joined")
+
+    async def test_admin_flag_flipping_mid_launch_never_writes_before_refusing(self):
+        await self.linked()
+        row = await self.canvas_row()
+        # Confirmed, but the claim's join failed: the launch would retry it.
+        self.c.h.joiner.refuse.add(STUDENT)
+        with patch.object(report, "sentry_sdk"):
+            await self.c.learner_l1(STUDENT, await self.c.ticket(self.c.launch()))
+        self.c.h.joiner.refuse.discard(STUDENT)
+        # An admin, a failed read, and a flag that passes then flips: the
+        # launch decides once, before the retry writes anything.
+        for script in ([True], [RuntimeError("database down")], [False, True]):
+            self.c.server_admins.script = list(script)
+            self.c.server_admins.checks.clear()
+            before = await self.written()
+            location = await self.c.redirects.location(self.c.launch())
+            self.c.server_admins.script = []
+            self.assertEqual(len(self.c.server_admins.checks), 1, script)
+            if location == APP + "/home/login":
+                self.assertEqual(await self.written(), before, script)
+                self.assertEqual(
+                    (await self.c.h.row(row["id"]))["state"], "invited", script
+                )
+            else:
+                self.assertEqual(script, [False, True])
+                self.assertTrue(location.startswith(APP + "/lti/token?loginToken="))
+                self.assertEqual((await self.c.h.row(row["id"]))["state"], "joined")
 
     async def test_non_admin_later_launch_is_unchanged(self):
         await self.linked()

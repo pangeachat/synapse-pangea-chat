@@ -209,22 +209,23 @@ class LaunchRedirects:
                 now=self._clock_ms(),
             )
         if user_id is not None:
-            if not await self._login_tokens.allowed(user_id):
-                # A server admin signs in themself: no token, and no bound
-                # ticket that would lead to one.
-                return f"{self._app}{SIGN_IN_PATH}"
+            # One admin decision per launch, made before anything is written:
+            # a server admin signs in themself, with no token and no bound
+            # ticket that would lead to one.
             identity = (launch.issuer, launch.context_id, launch.sub)
             matching = await self._invitations.canvas_invited(identity)
             confirmed = await self._invitations.acks_by(user_id)
             if all(row["id"] in confirmed for row in matching):
+                token = await self._login_tokens.issue(user_id)
+                if token is None:
+                    return f"{self._app}{SIGN_IN_PATH}"
                 # Every match is confirmed by this account, yet still Invited:
                 # its claim did not complete (a failed join, say). Retry it on
                 # that recorded confirmation, as ClaimByEmail does at sign-in.
                 await self._retry_claims(matching, user_id, identity)
-                token = await self._login_tokens.issue(user_id)
-                if token is None:
-                    return f"{self._app}{SIGN_IN_PATH}"
                 return f"{self._app}/lti/token?" + urlencode({"loginToken": token})
+            if not await self._login_tokens.allowed(user_id):
+                return f"{self._app}{SIGN_IN_PATH}"
         # Not linked, or linked with invitations to confirm: the link page,
         # the ticket bound to the linked account if there is one.
         ticket = await self._ticket(KIND_LEARNER, launch, None, user_id)
@@ -346,10 +347,6 @@ class LinkStep:
                 )
                 return TICKET_WRONG_ACCOUNT
             user_id = found.bound_user_id
-            if caller is None and not await self._login_tokens.allowed(user_id):
-                # Without a token this step would end in a login token; a
-                # server admin must sign in themself. Nothing is written.
-                return 401, UNAUTHORIZED
         else:
             if caller is None:
                 raise RuntimeError("unbound ticket consumed without a caller")
@@ -379,10 +376,16 @@ class LinkStep:
             logger.info("LTI instructor linked: platform=%s", found.platform_id)
             return 200, {"next": "connect", "connect_url": url}
 
+        login_token: Optional[str] = None
+        if caller is None:
+            # The one admin decision of this request, made before anything is
+            # written: a server admin must sign in themself (401, nothing
+            # written). A token minted here and then not returned (a later
+            # failure) is single use and expires in two minutes.
+            login_token = await self._login_tokens.issue(user_id)
+            if login_token is None:
+                return 401, UNAUTHORIZED
         claimed = await self._claim(found, user_id)
-        login_token = (
-            await self._login_tokens.issue(user_id) if caller is None else None
-        )
         logger.info(
             "LTI learner linked: platform=%s claimed=%d login_token=%s",
             found.platform_id,
