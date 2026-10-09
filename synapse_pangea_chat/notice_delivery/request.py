@@ -123,13 +123,15 @@ class NoticeRequest:
         return self.notification_log_id is not None
 
     def schedule_key(self) -> str:
-        """One schedule per decision. A request with decision context is keyed by
-        run and person, as the Notification_Log is; a caller-owned record is
-        keyed by its row, which the caller already made unique per decision."""
-        if self.log is not None:
-            parts = [self.log.run["run_id"], self.user_id]
-        else:
+        """One schedule per decision. A caller-owned record is keyed by its row
+        whether or not context travels with it, because the caller already made
+        the row unique per decision; otherwise by run and person, as the
+        Notification_Log is."""
+        if self.notification_log_id is not None:
             parts = [f"record:{self.notification_log_id}", self.user_id]
+        else:
+            assert self.log is not None
+            parts = [self.log.run["run_id"], self.user_id]
         return json.dumps(parts, separators=(",", ":"))
 
     @classmethod
@@ -206,6 +208,9 @@ class NoticeRequest:
             raise ValueError(
                 "log decision context is required unless notification_log_id names the caller's row"
             )
+        if log is None and data.get("eligibility"):
+            # recipient_not_returned and min_contact_spacing_ms read the decision's time and funnel.
+            raise ValueError("eligibility conditions require the log decision context")
         for key in ("activity_id", "session_room_id"):
             if key in data and data[key] is not None:
                 string(data, key)

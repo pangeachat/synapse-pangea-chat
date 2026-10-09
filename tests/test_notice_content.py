@@ -139,6 +139,10 @@ class TestStructuredDelivery(unittest.IsolatedAsyncioTestCase):
         )
         handler._delivery_log.reserve = AsyncMock(return_value=("42", None))
         handler._delivery_log.finish = AsyncMock()
+        # The transport claim keeps its own small table; give it real SQL.
+        from tests.test_notice_schedule import SQLPool
+
+        handler._transport_claims._db = SQLPool()
         return handler, api
 
     async def test_force_email_while_active_and_replaces_slots_without_jinja(self):
@@ -272,3 +276,84 @@ class TestDeliveryLog(unittest.IsolatedAsyncioTestCase):
         stored = log._request.await_args.args[2]["decision"]["delivery"]["response"]
         self.assertNotIn("devices", stored["push"])
         self.assertEqual(stored["push"]["sent"], 1)
+
+
+class TestCallerOwnedTransportClaim(unittest.IsolatedAsyncioTestCase):
+    """A caller-owned record skips the ledger, never the transport claim: one delivery call
+    per decision means one transport (engagement-system doc)."""
+
+    def handler(self):
+        handler, api = TestStructuredDelivery().handler(active=False, sent=0)
+        self.addCleanup(handler._transport_claims._db.db.close)
+        return handler, api
+
+    async def test_replaying_the_same_request_sends_once_and_answers_with_the_result(
+        self,
+    ):
+        handler, api = self.handler()
+        body = {**request_body("email-only"), "notification_log_id": "row-7"}
+        first = await handler.deliver(body)
+        second = await handler.deliver(dict(body))
+        send = api._hs.get_send_email_handler.return_value.send_email
+        self.assertEqual(send.await_count, 1)
+        self.assertEqual(first["channel"], "email")
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(second["channel"], "email")
+        self.assertEqual(second["log_status"], "caller")
+        handler._delivery_log.reserve.assert_not_awaited()
+
+    async def test_a_different_payload_under_the_same_row_is_a_conflict(self):
+        handler, api = self.handler()
+        body = {**request_body("email-only"), "notification_log_id": "row-7"}
+        await handler.deliver(body)
+        changed = {**body, "email": {**body["email"], "subject": "Something else"}}
+        with self.assertRaises(DeliveryConflict):
+            await handler.deliver(changed)
+        self.assertEqual(
+            api._hs.get_send_email_handler.return_value.send_email.await_count, 1
+        )
+
+    async def test_a_transport_failure_after_the_claim_blocks_a_retry_until_reconciled(
+        self,
+    ):
+        handler, api = self.handler()
+        api._hs.get_send_email_handler.return_value.send_email.side_effect = (
+            RuntimeError("smtp down")
+        )
+        body = {**request_body("email-only"), "notification_log_id": "row-7"}
+        # A failed email is a result with a send_failed reason, not an exception; the claim
+        # stays pending, so a retry reconciles instead of sending again.
+        first = await handler.deliver(body)
+        self.assertEqual(first["channel"], "none")
+        self.assertTrue(first["reason"].endswith("send_failed"))
+        with self.assertRaises(DeliveryConflict):
+            await handler.deliver(dict(body))
+        self.assertEqual(
+            api._hs.get_send_email_handler.return_value.send_email.await_count, 1
+        )
+
+    async def test_schedule_key_is_the_row_whether_or_not_context_travels(self):
+        with_context = NoticeRequest.parse(
+            {**request_body("email-only"), "notification_log_id": "row-7"}
+        )
+        without = {**request_body("email-only"), "notification_log_id": "row-7"}
+        del without["log"]
+        self.assertEqual(
+            with_context.schedule_key(), NoticeRequest.parse(without).schedule_key()
+        )
+        self.assertIn("record:row-7", with_context.schedule_key())
+
+    async def test_eligibility_conditions_need_the_decision_context(self):
+        body = {
+            **request_body("email-only"),
+            "notification_log_id": "row-7",
+            "scheduled_at": "2026-10-10T10:00:00+00:00",
+            "sender_id": "@admin:test",
+            "notice_content": {"notice_type": "check_in"},
+            "eligibility": {"recipient_not_returned": True},
+        }
+        del body["notice_event_id"]
+        del body["log"]
+        with self.assertRaises(ValueError):
+            NoticeRequest.parse(body)
