@@ -733,6 +733,25 @@ class OpenIdConfigurationCheckTests(unittest.TestCase):
     def test_not_an_object(self):
         self.assertRejected(self.URL, ["x"], "bad_configuration")
 
+    def test_product_family_is_kept_only_when_a_plain_code(self):
+        """It is platform-controlled and logged, so anything but a short code
+        (an email, a newline, a token) is dropped."""
+        family = "https://purl.imsglobal.org/spec/lti-platform-configuration"
+        for value, expected in (
+            ("canvas", "canvas"),
+            ("moodle", "moodle"),
+            ("student.private@school.example", None),
+            ("canvas\nFAKE LOG LINE", None),
+            ("x" * 65, None),
+            (7, None),
+        ):
+            doc = self._doc(**{family: {"product_family_code": value}})
+            self.assertEqual(
+                check_openid_configuration(self.URL, doc).product_family,
+                expected,
+                repr(value),
+            )
+
 
 class RegistrationArtifactTests(unittest.TestCase):
     """`dynamic registration response and the static JSON config both declare

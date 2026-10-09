@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlencode, urlsplit
 
@@ -370,6 +371,18 @@ def _respond_registration_page(
     finish_request(request)
 
 
+_REGISTRATION_TOKEN = re.compile(rb"((?:^|[?&])registration(?:_|%5[Ff])token=)[^&]*")
+
+
+def _redact_registration_token(request: SynapseRequest) -> None:
+    """Dynamic Registration puts the platform's registration token in the
+    query string, and Synapse's access log writes the request URI when the
+    request finishes, redacting only `access_token` and `client_secret`. The
+    arguments are already parsed, so the logged URI is redacted here."""
+    if isinstance(request.uri, bytes):
+        request.uri = _REGISTRATION_TOKEN.sub(rb"\1<redacted>", request.uri)
+
+
 class LtiRegister(_Async):
     """Dynamic Registration: the platform opens this URL in its admin UI."""
 
@@ -392,6 +405,7 @@ class LtiRegister(_Async):
         return self._run(self._handle, request)
 
     async def _handle(self, request: SynapseRequest) -> None:
+        _redact_registration_token(request)
         config_url = _arg(request, "openid_configuration", 2048)
         frame_origin = None
         if config_url is not None and https_url(config_url) is not None:

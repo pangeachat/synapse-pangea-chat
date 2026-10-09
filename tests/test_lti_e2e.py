@@ -280,6 +280,16 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         # logs` (INV-8).
         logs = self._logs()
         self.assertIn("LTI platform approved", logs)
+        # The registration token arrives in the query string (the Dynamic
+        # Registration spec puts it there). Synapse's INFO access log records
+        # the URI when the request finishes, so it must be redacted by then.
+        # (Synapse's own DEBUG "Received request" line is written before any
+        # module code runs and is out of the module's reach.)
+        info_and_above = "\n".join(
+            line for line in logs.splitlines() if " - DEBUG - " not in line
+        )
+        self.assertIn("registration_token=<redacted>", info_and_above)
+        self.assertNotIn(server.registration_token, info_and_above)
         self.assertNotIn(EMAIL, logs)
         self.assertNotIn(token.split(".")[1], logs)
         for line in private_pem(TOOL_KEY).splitlines()[1:-1]:

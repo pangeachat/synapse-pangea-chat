@@ -16,6 +16,7 @@ iframe), the NRPS `contextmembership.readonly` scope, and Canvas
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
@@ -32,6 +33,7 @@ CANVAS_PRIVACY_LEVEL = "https://canvas.instructure.com/lti/privacy_level"
 CANVAS_DISPLAY_TYPE = "https://canvas.instructure.com/lti/display_type"
 PLACEMENT = "course_navigation"
 MESSAGE_TYPE = "LtiResourceLinkRequest"
+_PRODUCT_FAMILY = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 class RegistrationRejected(Exception):
@@ -162,7 +164,12 @@ def check_openid_configuration(config_url: str, doc: Any) -> PlatformConfigurati
         raise RegistrationRejected("not_an_lti_platform")
     family = platform.get("product_family_code")
     return PlatformConfiguration(
-        product_family=family[:64] if isinstance(family, str) else None,
+        # Platform-controlled and logged: kept only when it is a plain code.
+        product_family=(
+            family
+            if isinstance(family, str) and _PRODUCT_FAMILY.match(family)
+            else None
+        ),
         **fields,
     )
 
