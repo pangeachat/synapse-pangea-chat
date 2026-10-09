@@ -1,15 +1,17 @@
 """The claim (CONTRACTS C2.4), used by every claim path.
 
-Paths: the student's confirm, the teacher's Grant and Approve all, and the
-``ClaimByEmail`` hook on every sign-in and verified-email addition. (The Canvas
-link step joins in release B.)
+Paths: the student's confirm, the teacher's Grant and Approve all, the
+``ClaimByEmail`` hook on every sign-in and verified-email addition, and the
+Canvas link step (a row imported with exactly the account's own linked Canvas
+identity).
 
 Order: (1) force-join the account to the course with the shared
 ``assign_room_membership`` join (a no-op when already joined; joining is
 harmless if step 2 then refuses, since a class-code join is allowed
 unmanaged); (2) one transaction that claims the row only if it is ``invited``,
-the account confirmed it, the account's verified email matches or the teacher
-granted it, and the account holds no other joined invitation in the course
+the account confirmed it, the account's verified email matches, the teacher
+granted it, or the Canvas identity matches, and the account holds no other
+joined invitation in the course
 (``StudentInvitationStore.claim_txn``). The claim records a managed account,
 except when the claimant is a course admin (power level 100) of that course:
 a teacher is never managed by a course they administer. Two concurrent claims of one row: one
@@ -30,7 +32,9 @@ from synapse_pangea_chat.student_invitations.store import (
     NOT_LIVE,
     STATE_INVITED,
     STATE_JOINED,
+    CanvasIdentity,
     StudentInvitationStore,
+    canvas_match,
 )
 
 logger = logging.getLogger(
@@ -72,10 +76,17 @@ class StudentClaims:
         self._admins = admins
 
     async def claim(
-        self, invitation_id: str, user_id: str, *, grant: bool = False
+        self,
+        invitation_id: str,
+        user_id: str,
+        *,
+        grant: bool = False,
+        canvas_identity: Optional[CanvasIdentity] = None,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Claim ``invitation_id`` for ``user_id``. ``grant`` is the teacher's
         Grant, recorded only if the claim it allows happens.
+        ``canvas_identity`` is the (issuer, Canvas course, Canvas user id) of
+        the account's own Canvas link, from a validated launch.
 
         Returns (outcome, row): ``claimed`` (also when already joined by this
         account), ``not_live``, ``not_eligible`` (no confirmation, or no email
@@ -95,7 +106,12 @@ class StudentClaims:
         email_match = row["email_key"] in await self._accounts.verified_email_keys(
             user_id
         )
-        if not (email_match or grant or ack["decision"] == "granted"):
+        if not (
+            email_match
+            or grant
+            or ack["decision"] == "granted"
+            or canvas_match(row, canvas_identity)
+        ):
             return NOT_ELIGIBLE, row
 
         room_id = row["course_room_id"]
@@ -113,6 +129,7 @@ class StudentClaims:
             grant=grant,
             now_ms=now_ms(),
             managed=not is_admin,
+            canvas_identity=canvas_identity,
         )
         if outcome == CLAIMED and claimed is not None:
             logger.info("Claimed student invitation %s for %s", invitation_id, user_id)

@@ -107,7 +107,7 @@ your course and open Pangea Chat again.</p>
 """
 
 
-def _refuse_launch(request: SynapseRequest, status: int, reason: str) -> None:
+def refuse_launch(request: SynapseRequest, status: int, reason: str) -> None:
     """The launch is a browser page (the platform's form POST), so a refusal
     is a minimal HTML page: no redirect, and only our own reason code, never
     anything from the token."""
@@ -130,20 +130,6 @@ def _set_state_cookie(request: SynapseRequest, state: str, max_age: int) -> None
             f"{cookie_name(state)}={value}; Path=/{PATH_PREFIX}launch; "
             f"Max-Age={max_age}; HttpOnly; Secure; SameSite=None"
         ).encode("ascii")
-    )
-
-
-async def respond_launch_not_available(request: SynapseRequest, launch: Launch) -> None:
-    """Placeholder until the link and connect steps land (lanes B2/B3)."""
-    respond_with_json(
-        request,
-        501,
-        {
-            "errcode": "ORG.PANGEA.LTI_LAUNCH_NOT_AVAILABLE",
-            "error": "This launch was verified, but its next step is not available yet",
-            "path": launch.path,
-        },
-        send_cors=False,
     )
 
 
@@ -334,7 +320,7 @@ class LtiLaunch(_Async):
                 rejected.code,
                 platform_id or "-",
             )
-            _refuse_launch(request, rejected.status, rejected.code)
+            refuse_launch(request, rejected.status, rejected.code)
             return
         logger.info(
             "LTI launch verified: platform=%s path=%s", launch.platform_id, launch.path

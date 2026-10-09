@@ -18,6 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlsplit
 
 import jwt
 from cryptography import x509
@@ -27,6 +28,7 @@ from cryptography.x509.oid import NameOID
 from jwt.utils import to_base64url_uint
 
 LTI = "https://purl.imsglobal.org/spec/lti/claim/"
+NRPS_CLAIM = "https://purl.imsglobal.org/spec/lti-nrps/claim/namesroleservice"
 LEARNER = "http://purl.imsglobal.org/vocab/lis/v2/membership#Learner"
 INSTRUCTOR = "http://purl.imsglobal.org/vocab/lis/v2/membership#Instructor"
 
@@ -82,6 +84,7 @@ class PlatformDouble:
         self.deployment_id = deployment_id
         self.kid = kid
         self.key = key or new_rsa_key()
+        self.nrps_url = issuer + "/nrps"
 
     def jwks(self) -> Dict[str, Any]:
         return {"keys": [public_jwk(self.key, self.kid)]}
@@ -94,6 +97,7 @@ class PlatformDouble:
         roles: Optional[List[str]] = None,
         sub: str = "canvas-user-42",
         email: str = "student.private@school.example",
+        context_id: str = "canvas-course-7",
     ) -> Dict[str, Any]:
         now = int(time.time())
         return {
@@ -111,7 +115,13 @@ class PlatformDouble:
             LTI + "target_link_uri": launch_url,
             LTI + "resource_link": {"id": "resource-link-1"},
             LTI + "roles": [LEARNER] if roles is None else roles,
-            LTI + "context": {"id": "canvas-course-7", "title": "Spanish 1"},
+            LTI + "context": {"id": context_id, "title": "Spanish 1"},
+            # Canvas adds the NRPS service to every launch once the tool has
+            # the contextmembership.readonly scope.
+            NRPS_CLAIM: {
+                "context_memberships_url": self.nrps_url,
+                "service_versions": ["2.0"],
+            },
         }
 
     def sign(
@@ -216,6 +226,11 @@ class HttpsPlatformServer:
         self.omit_deployment_id = False
         # Every Authorization header the registration endpoint received.
         self.tokens_seen: List[str] = []
+        # NRPS: the OAuth2 token endpoint and a paged membership container.
+        self.access_token = "nrps-access-token-e2e-5b7e"
+        self.token_requests: List[Dict[str, str]] = []
+        self.nrps_requests: List[Dict[str, str]] = []
+        self.nrps_pages: List[List[Dict[str, Any]]] = []
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -226,13 +241,48 @@ class HttpsPlatformServer:
             def log_message(self, format: str, *args: Any) -> None:
                 return
 
-            def _json(self, code: int, body: Any) -> None:
+            def _json(
+                self, code: int, body: Any, headers: Optional[Dict[str, str]] = None
+            ) -> None:
                 data = json.dumps(body).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
+                for name, value in (headers or {}).items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(data)
+
+            def _nrps(self) -> None:
+                server.nrps_requests.append(
+                    {
+                        "path": self.path,
+                        "authorization": self.headers.get("Authorization") or "",
+                        "accept": self.headers.get("Accept") or "",
+                    }
+                )
+                if self.headers.get("Authorization") != (
+                    f"Bearer {server.access_token}"
+                ):
+                    self._json(401, {})
+                    return
+                query = parse_qs(urlsplit(self.path).query)
+                page = int(query.get("page", ["1"])[0])
+                members = server.nrps_pages[page - 1] if server.nrps_pages else []
+                headers = {}
+                if page < len(server.nrps_pages):
+                    headers[
+                        "Link"
+                    ] = f'<{server.base_url}/nrps?page={page + 1}>; rel="next"'
+                self._json(
+                    200,
+                    {
+                        "id": server.base_url + "/nrps",
+                        "context": {"id": "canvas-course-7"},
+                        "members": members,
+                    },
+                    headers,
+                )
 
             def do_GET(self) -> None:
                 if self.path == "/.well-known/openid-configuration":
@@ -243,6 +293,8 @@ class HttpsPlatformServer:
                     self.send_header("Location", "/.well-known/openid-configuration")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
+                elif urlsplit(self.path).path == "/nrps":
+                    self._nrps()
                 elif self.path == "/jwks":
                     server.jwks_requests += 1
                     self._json(200, server.platform.jwks())
@@ -250,6 +302,19 @@ class HttpsPlatformServer:
                     self._json(404, {})
 
             def do_POST(self) -> None:
+                if self.path == "/token":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    form = parse_qs(self.rfile.read(length).decode("ascii"))
+                    server.token_requests.append({k: v[0] for k, v in form.items()})
+                    self._json(
+                        200,
+                        {
+                            "access_token": server.access_token,
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                        },
+                    )
+                    return
                 if self.path != "/register":
                     self._json(404, {})
                     return

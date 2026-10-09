@@ -548,7 +548,7 @@ async def guarded(name: str, call: Callable[[], Awaitable[Result]]) -> Result:
         return 500, INTERNAL
 
 
-def _read_json(request: SynapseRequest) -> Any:
+def read_json(request: SynapseRequest) -> Any:
     """The body as JSON, or None. Never logs it: it carries addresses."""
     try:
         raw = request.content.read(_MAX_BODY_BYTES + 1)
@@ -639,5 +639,5 @@ class StudentInvitationRoute(Resource):
             return 429, RATE_LIMITED
         if self._kind == "student" and self._method == "GET":
             return await self._handler(caller)
-        args = _read_json(request) if self._method == "POST" else _read_query(request)
+        args = read_json(request) if self._method == "POST" else _read_query(request)
         return await self._handler(caller, args)

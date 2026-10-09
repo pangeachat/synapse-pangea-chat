@@ -110,6 +110,11 @@ _ACK_SELECT = (
     " FROM pangea_invitation_ack "
 )
 
+# (lti_issuer, lti_context_id, lti_user_id): a Canvas identity.
+CanvasIdentity = Tuple[str, str, str]
+
+SOURCE_CANVAS = "canvas"
+
 # Claim outcomes (claim_txn and StudentClaims.claim).
 CLAIMED = "claimed"
 NOT_LIVE = "not_live"
@@ -127,6 +132,13 @@ def _ack(raw: Optional[Sequence[Any]]) -> Optional[Dict[str, Any]]:
     if raw is None:
         return None
     return dict(zip(ACK_COLUMNS, raw))
+
+
+def canvas_match(row: Dict[str, Any], identity: Optional[CanvasIdentity]) -> bool:
+    """True when the row was imported with exactly this Canvas identity."""
+    if identity is None or row["lti_user_id"] is None:
+        return False
+    return (row["lti_issuer"], row["lti_context_id"], row["lti_user_id"]) == identity
 
 
 def is_integrity_error(error: BaseException) -> bool:
@@ -245,6 +257,23 @@ class StudentInvitationStore:
             return rows
 
         return await self.db.runInteraction("pangea_student_invitation_keys", select)
+
+    async def canvas_invited(self, identity: CanvasIdentity) -> List[Dict]:
+        """``invited`` rows, in any course, imported with exactly this Canvas
+        identity."""
+        await self.ensure()
+        issuer, context_id, user_id = identity
+
+        def select(txn: Any) -> List[Dict]:
+            txn.execute(
+                _SELECT + "WHERE state = 'invited' AND lti_issuer = ?"
+                " AND lti_context_id = ? AND lti_user_id = ?"
+                " ORDER BY created_at_ms, id",
+                (issuer, context_id, user_id),
+            )
+            return [r for r in (_row(x) for x in txn.fetchall()) if r is not None]
+
+        return await self.db.runInteraction("pangea_student_invitation_canvas", select)
 
     async def acks_by(self, user_id: str) -> Dict[str, Dict[str, Any]]:
         """This account's confirmations, by invitation id."""
@@ -386,6 +415,92 @@ class StudentInvitationStore:
             return [by_key[key] for _, key in entries]
 
         return await self.db.runInteraction("pangea_student_invitation_add", write)
+
+    async def import_canvas(
+        self,
+        room_id: str,
+        issuer: str,
+        context_id: str,
+        learners: Sequence[Tuple[str, str, str]],
+        invited_by: str,
+        now_ms: int,
+        new_id: Any,
+    ) -> Dict[str, Any]:
+        """Upsert a Canvas roster (T11): (Canvas user id, email as Canvas
+        sent it, canonical key) per learner with a valid email. In one
+        transaction, per learner:
+
+        1. a row of this course already bound to (issuer, user id): unchanged,
+           its email never rewritten;
+        2. else a row with the same canonical email: no Canvas identity ->
+           the identity is attached and its state kept (``attached``); bound
+           to another Canvas user -> unchanged, reported in ``conflicts``;
+        3. else a new ``invited`` row, ``source=canvas`` (``imported``).
+
+        Concurrent imports converge through the unique indexes: a conflicting
+        insert either does nothing or aborts, and Synapse retries the whole
+        transaction against the new state.
+        """
+        await self.ensure()
+
+        def write(txn: Any) -> Dict[str, Any]:
+            counts = {"imported": 0, "attached": 0, "unchanged": 0}
+            conflicts: List[str] = []
+            for user_id, email, key in learners:
+                bound = _select_one(
+                    txn,
+                    "WHERE course_room_id = ? AND lti_issuer = ? AND lti_user_id = ?",
+                    (room_id, issuer, user_id),
+                )
+                if bound is not None:
+                    counts["unchanged"] += 1
+                    continue
+                same_email = _select_one(
+                    txn,
+                    "WHERE course_room_id = ? AND email_key = ?",
+                    (room_id, key),
+                )
+                if same_email is not None:
+                    if same_email["lti_user_id"] is not None:
+                        counts["unchanged"] += 1
+                        if same_email["id"] not in conflicts:
+                            conflicts.append(same_email["id"])
+                        continue
+                    txn.execute(
+                        "UPDATE pangea_student_invitation SET lti_issuer = ?,"
+                        " lti_context_id = ?, lti_user_id = ?"
+                        " WHERE id = ? AND lti_user_id IS NULL",
+                        (issuer, context_id, user_id, same_email["id"]),
+                    )
+                    if txn.rowcount != 1:
+                        raise RuntimeError("invitation identity changed under lock")
+                    counts["attached"] += 1
+                    continue
+                txn.execute(
+                    "INSERT INTO pangea_student_invitation"
+                    " (id, course_room_id, email_key, email, state, source,"
+                    "  invited_by, send_count, created_at_ms,"
+                    "  lti_issuer, lti_context_id, lti_user_id)"
+                    " VALUES (?, ?, ?, ?, 'invited', ?, ?, 0, ?, ?, ?, ?)",
+                    (
+                        new_id(),
+                        room_id,
+                        key,
+                        email,
+                        SOURCE_CANVAS,
+                        invited_by,
+                        now_ms,
+                        issuer,
+                        context_id,
+                        user_id,
+                    ),
+                )
+                counts["imported"] += 1
+            return {**counts, "conflicts": conflicts}
+
+        return await self.db.runInteraction(
+            "pangea_student_invitation_import_canvas", write
+        )
 
     async def reserve_send(
         self, room_id: str, invitation_id: str, expected: int, now_ms: int
@@ -581,16 +696,19 @@ class StudentInvitationStore:
         grant: bool,
         now_ms: int,
         managed: bool = True,
+        canvas_identity: Optional[CanvasIdentity] = None,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """The claim's database step (C2.4 step 2), all or nothing.
 
         Claims only an ``invited`` row this account has confirmed, when its
         verified email matches, or the teacher grants it now or granted it
-        before, and when the account holds no other joined invitation in the
-        course. A grant is recorded only together with the claim it allows.
-        ``managed`` is False when the claimant administers the course (owner
-        amendment 2026-10-09): a teacher is never managed by a course they
-        administer, so no managed record is written.
+        before, or ``canvas_identity`` (issuer, Canvas course, Canvas user id
+        of the account's own Canvas link) equals the identity the row was
+        imported with, and when the account holds no other joined invitation
+        in the course. A grant is recorded only together with the claim it
+        allows. ``managed`` is False when the claimant administers the course
+        (owner amendment 2026-10-09): a teacher is never managed by a course
+        they administer, so no managed record is written.
         """
         await self.ensure()
 
@@ -611,7 +729,12 @@ class StudentInvitationStore:
             ack = txn.fetchone()
             if ack is None:
                 return NOT_ELIGIBLE, row
-            if not (email_match or grant or ack[0] == DECISION_GRANTED):
+            if not (
+                email_match
+                or grant
+                or ack[0] == DECISION_GRANTED
+                or canvas_match(row, canvas_identity)
+            ):
                 return NOT_ELIGIBLE, row
             room_id = row["course_room_id"]
             # One claimed invitation per (course, account). The joined-per-

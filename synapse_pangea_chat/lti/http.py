@@ -13,8 +13,8 @@ import json
 import logging
 import re
 from io import BytesIO
-from typing import Any, Dict, Optional
-from urllib.parse import urlsplit
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode, urlsplit
 
 from synapse.http.client import (
     BodyExceededMaxSize,
@@ -93,21 +93,50 @@ class PlatformHttp:
         self._clock = hs.get_clock()
 
     async def get_json(self, url: str) -> Any:
-        return await self._request("GET", url, None, {})
+        body, _ = await self._request("GET", url, None, {})
+        return body
 
     async def post_json(self, url: str, body: Dict[str, Any], bearer: str) -> Any:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {bearer}",
         }
-        return await self._request("POST", url, json.dumps(body).encode(), headers)
+        answer, _ = await self._request("POST", url, json.dumps(body).encode(), headers)
+        return answer
+
+    async def post_form(self, url: str, fields: Dict[str, str]) -> Any:
+        """A form-encoded POST (the OAuth2 token request)."""
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        answer, _ = await self._request(
+            "POST", url, urlencode(fields).encode("ascii"), headers
+        )
+        return answer
+
+    async def get_page(
+        self, url: str, bearer: str, accept: str
+    ) -> Tuple[Any, Optional[str]]:
+        """A GET with a bearer token, returning the JSON body and the URL of
+        the `rel="next"` Link header, if any (NRPS paging)."""
+        headers = {"Authorization": f"Bearer {bearer}"}
+        body, response_headers = await self._request(
+            "GET", url, None, headers, accept=accept
+        )
+        values = [
+            v.decode("latin-1") for v in response_headers.getRawHeaders(b"Link") or []
+        ]
+        return body, next_link(values)
 
     async def _request(
-        self, method: str, url: str, data: Optional[bytes], headers: Dict[str, str]
-    ) -> Any:
+        self,
+        method: str,
+        url: str,
+        data: Optional[bytes],
+        headers: Dict[str, str],
+        accept: str = "application/json",
+    ) -> Tuple[Any, Headers]:
         if https_url(url) is None:
             raise UpstreamError("not_https")
-        raw_headers = Headers({b"Accept": [b"application/json"]})
+        raw_headers = Headers({b"Accept": [accept.encode("ascii")]})
         for name, value in headers.items():
             raw_headers.addRawHeader(name, value)
         try:
@@ -136,6 +165,21 @@ class PlatformHttp:
         if not 200 <= response.code < 300:
             raise UpstreamError(f"status_{response.code}")
         try:
-            return json.loads(stream.getvalue().decode("utf-8"))
+            return json.loads(stream.getvalue().decode("utf-8")), response.headers
         except (UnicodeDecodeError, ValueError):
             raise UpstreamError("not_json") from None
+
+
+_LINK = re.compile(r"<([^>]*)>\s*((?:;\s*[^;,]*)*)")
+_REL_NEXT = re.compile(r';\s*rel\s*=\s*"?([^";]*)"?', re.IGNORECASE)
+
+
+def next_link(values: List[str]) -> Optional[str]:
+    """The target of the `rel="next"` entry of Link header values (RFC 8288),
+    or None. The caller still checks where it points."""
+    for value in values:
+        for match in _LINK.finditer(value):
+            rel = _REL_NEXT.search(match.group(2))
+            if rel is not None and "next" in rel.group(1).lower().split():
+                return match.group(1).strip()
+    return None

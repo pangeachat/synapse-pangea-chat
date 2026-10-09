@@ -145,6 +145,9 @@ class PangeaChatConfig:
     invite_by_email_requests_per_burst: int = 5
     invite_by_email_burst_duration_seconds: int = 60
     app_base_url: str = "https://app.pangea.chat"
+    # admin-dash, where an instructor's Canvas launch completes the course
+    # connect (`<admin_dash_base_url>/canvas-connect`).
+    admin_dash_base_url: str = "https://admin.pangea.chat"
 
     # --- send_push config ---
     send_push_requests_per_burst: int = 10

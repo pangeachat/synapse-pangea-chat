@@ -29,6 +29,7 @@ from .test_logcontext_e2e import LEAK_MARKERS
 
 BASE = "http://localhost:8008/_synapse/client/pangea/v1/lti"
 LAUNCH_URL = BASE + "/launch"
+APP = "https://app.pangea.chat"
 TOOL_KEY = new_rsa_key()
 EMAIL = "student.private@school.example"
 LOGIN_HINT = EMAIL
@@ -318,8 +319,9 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         state, nonce, cookie = self._login_ok(server)
         token = double.sign(double.claims(nonce=nonce, launch_url=LAUNCH_URL))
         launched = self._launch(token, state, cookie)
-        self.assertEqual(launched.status_code, 501, launched.text)
-        self.assertEqual(launched.json()["path"], "learner")
+        # A verified launch goes on to the next step (lanes B2/B3): a
+        # first-time learner to the app's link page.
+        self.assertEqual(self._redirect(launched), ("learner", APP + "/lti/link"))
         self.assertEqual(server.jwks_requests, 1)
 
         # A reused state (and so its nonce) is refused.
@@ -336,7 +338,7 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         wrong_cookie = self._launch(token, state, (cookie[0], "x" + cookie[1]))
         self.assertEqual(self._refusal(wrong_cookie), "state_mismatch")
         # ...and the state still works for its own browser, once.
-        self.assertEqual(self._launch(token, state, cookie).status_code, 501)
+        self.assertEqual(self._launch(token, state, cookie).status_code, 302)
 
         # A token minted for another login's nonce is refused.
         state_a, _, cookie_a = self._login_ok(server)
@@ -352,7 +354,8 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
             double.claims(nonce=nonce, launch_url=LAUNCH_URL, roles=[INSTRUCTOR])
         )
         self.assertEqual(
-            self._launch(token, state, cookie).json()["path"], "instructor"
+            self._redirect(self._launch(token, state, cookie)),
+            ("instructor", APP + "/lti/link"),
         )
 
         # A launch for a deployment the platform never registered is refused.
@@ -502,6 +505,15 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         value = rest.split(";", 1)[0]
         self.assertEqual(value, query["state"])
         return query["state"], query["nonce"], (name, value)
+
+    def _redirect(self, response: requests.Response) -> Tuple[str, str]:
+        """(role path, target without query) of a verified launch's redirect."""
+        self.assertEqual(response.status_code, 302, response.text)
+        location = urlparse(response.headers["Location"])
+        query = parse_qs(location.query)
+        self.assertIn("ticket", query)
+        path = "instructor" if query.get("role") == ["instructor"] else "learner"
+        return path, f"{location.scheme}://{location.netloc}{location.path}"
 
     def _refusal(self, response: requests.Response) -> str:
         """A refused launch is a minimal HTML page: no redirect, no JSON, and

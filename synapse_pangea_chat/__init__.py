@@ -595,7 +595,7 @@ class PangeaChat:
         # --- LTI 1.3 tool core (Canvas) ---
         # Registered only with a usable private key in config; otherwise the
         # paths do not exist and the reason is logged.
-        self.lti_store = register_lti(api, config)
+        self.lti_store = register_lti(api, config, self.student_invitations)
 
     async def _on_new_event_room_preview(
         self,
@@ -953,6 +953,12 @@ class PangeaChat:
             "invite_by_email_burst_duration_seconds", 60
         )
         app_base_url = config.get("app_base_url", "https://app.pangea.chat")
+        # Where an instructor's Canvas launch completes the course connect.
+        admin_dash_base_url = config.get(
+            "admin_dash_base_url", "https://admin.pangea.chat"
+        )
+        if not isinstance(admin_dash_base_url, str) or not admin_dash_base_url:
+            raise ValueError("admin_dash_base_url must be a non-empty string")
 
         # --- send_push config ---
         send_push_requests_per_burst = config.get("send_push_requests_per_burst", 10)
@@ -1396,6 +1402,7 @@ class PangeaChat:
             invite_by_email_requests_per_burst=invite_by_email_requests_per_burst,
             invite_by_email_burst_duration_seconds=invite_by_email_burst_duration_seconds,
             app_base_url=app_base_url,
+            admin_dash_base_url=admin_dash_base_url,
             send_push_requests_per_burst=send_push_requests_per_burst,
             send_push_burst_duration_seconds=send_push_burst_duration_seconds,
             send_push_sygnal_url=send_push_sygnal_url,
