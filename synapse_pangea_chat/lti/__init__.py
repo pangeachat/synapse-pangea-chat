@@ -23,7 +23,11 @@ from synapse_pangea_chat.lti.nrps import NrpsClient
 from synapse_pangea_chat.lti.registration import PATH_PREFIX, tool_urls
 from synapse_pangea_chat.lti.routes import KIND_TICKET, LtiRoute
 from synapse_pangea_chat.lti.store import LtiStore
-from synapse_pangea_chat.lti.student_launch import LaunchRedirects, LinkStep
+from synapse_pangea_chat.lti.student_launch import (
+    LaunchRedirects,
+    LinkStep,
+    LoginTokens,
+)
 from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
 from synapse_pangea_chat.student_invitations.rate_limits import limit_for
 from synapse_pangea_chat.student_invitations.rooms import ModuleCourseAdmins
@@ -64,8 +68,10 @@ def register_lti(
         admin_dash_base_url=config.admin_dash_base_url,
     )
 
-    async def login_token(user_id: str) -> str:
+    async def mint_login_token(user_id: str) -> str:
         return await api.create_login_token(user_id, duration_in_ms=LOGIN_TOKEN_MS)
+
+    login_token = LoginTokens(mint_login_token, api.is_user_admin)
 
     # Read through Any, as the student invitation stores do: the lookup is a
     # @cached store method, which mypy cannot type without Synapse's plugin.

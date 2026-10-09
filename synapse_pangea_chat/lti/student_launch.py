@@ -14,6 +14,7 @@ Launch redirects (`LaunchRedirects`):
 | Learner, not linked | `<app>/lti/link?ticket=<learner ticket>&course=<title>` |
 | Learner, linked, unconfirmed matching invitations | the same, the ticket bound to that account |
 | Learner, linked, nothing to confirm | `<app>/lti/token?loginToken=<token>` |
+| Learner, linked, a Synapse server admin | `<app>/home/login` (own sign-in; no token, no ticket) |
 | Instructor/Administrator, not linked | `<app>/lti/link?ticket=<instructor ticket>&role=instructor` |
 | Instructor/Administrator, linked | `<admin-dash>/canvas-connect?ticket=<connect ticket>` |
 
@@ -73,10 +74,12 @@ from synapse_pangea_chat.student_invitations.store import (
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.lti.student_launch")
 
 Result = Tuple[int, Dict[str, Any]]
-LoginTokens = Callable[[str], Awaitable[str]]
+MintToken = Callable[[str], Awaitable[str]]
 ExternalIds = Callable[[str, str, str], Awaitable[None]]
 
 MAX_TITLE_LENGTH = 200
+# The client's normal sign-in page.
+SIGN_IN_PATH = "/home/login"
 ALREADY_LINKED: Result = (
     409,
     {
@@ -101,6 +104,43 @@ def _course_title(launch: Launch) -> Optional[str]:
     return title.strip()[:MAX_TITLE_LENGTH]
 
 
+class LoginTokens:
+    """The only way this package issues a login token.
+
+    Never for a Synapse server admin (owner decision 2026-10-09): an LTI
+    platform's say-so must not open a homeserver admin account. The flag is
+    read when the token would be issued, so an account promoted after its
+    Canvas link is covered, and a failed read means no token (fail closed).
+    A refusal is logged with its reason only.
+    """
+
+    def __init__(
+        self, mint: MintToken, is_server_admin: Callable[[str], Awaitable[bool]]
+    ) -> None:
+        self._mint = mint
+        self._is_server_admin = is_server_admin
+
+    async def allowed(self, user_id: str) -> bool:
+        try:
+            admin = await self._is_server_admin(user_id)
+        except Exception as error:
+            logger.warning(
+                "LTI login token refused: admin check failed (%s)",
+                type(error).__name__,
+            )
+            return False
+        if admin is not False:
+            logger.info("LTI login token refused: server admin")
+            return False
+        return True
+
+    async def issue(self, user_id: str) -> Optional[str]:
+        """A login token, or None when the account may not get one."""
+        if not await self.allowed(user_id):
+            return None
+        return await self._mint(user_id)
+
+
 class LaunchRedirects:
     """The `on_launch` step B1's launch endpoint hands each verified launch."""
 
@@ -110,7 +150,7 @@ class LaunchRedirects:
         links: LtiLinkStore,
         invitations: StudentInvitationStore,
         claims: StudentClaims,
-        login_tokens: LoginTokens,
+        login_tokens: "LoginTokens",
         app_base_url: str,
         admin_dash_base_url: str,
         clock_ms: Callable[[], int] = now_ms,
@@ -169,6 +209,10 @@ class LaunchRedirects:
                 now=self._clock_ms(),
             )
         if user_id is not None:
+            if not await self._login_tokens.allowed(user_id):
+                # A server admin signs in themself: no token, and no bound
+                # ticket that would lead to one.
+                return f"{self._app}{SIGN_IN_PATH}"
             identity = (launch.issuer, launch.context_id, launch.sub)
             matching = await self._invitations.canvas_invited(identity)
             confirmed = await self._invitations.acks_by(user_id)
@@ -177,7 +221,9 @@ class LaunchRedirects:
                 # its claim did not complete (a failed join, say). Retry it on
                 # that recorded confirmation, as ClaimByEmail does at sign-in.
                 await self._retry_claims(matching, user_id, identity)
-                token = await self._login_tokens(user_id)
+                token = await self._login_tokens.issue(user_id)
+                if token is None:
+                    return f"{self._app}{SIGN_IN_PATH}"
                 return f"{self._app}/lti/token?" + urlencode({"loginToken": token})
         # Not linked, or linked with invitations to confirm: the link page,
         # the ticket bound to the linked account if there is one.
@@ -244,7 +290,7 @@ class LinkStep:
         invitations: StudentInvitationStore,
         claims: StudentClaims,
         course_links: CourseLinks,
-        login_tokens: LoginTokens,
+        login_tokens: "LoginTokens",
         external_ids: ExternalIds,
         clock_ms: Callable[[], int] = now_ms,
     ) -> None:
@@ -300,6 +346,10 @@ class LinkStep:
                 )
                 return TICKET_WRONG_ACCOUNT
             user_id = found.bound_user_id
+            if caller is None and not await self._login_tokens.allowed(user_id):
+                # Without a token this step would end in a login token; a
+                # server admin must sign in themself. Nothing is written.
+                return 401, UNAUTHORIZED
         else:
             if caller is None:
                 raise RuntimeError("unbound ticket consumed without a caller")
@@ -330,7 +380,9 @@ class LinkStep:
             return 200, {"next": "connect", "connect_url": url}
 
         claimed = await self._claim(found, user_id)
-        login_token = await self._login_tokens(user_id) if caller is None else None
+        login_token = (
+            await self._login_tokens.issue(user_id) if caller is None else None
+        )
         logger.info(
             "LTI learner linked: platform=%s claimed=%d login_token=%s",
             found.platform_id,

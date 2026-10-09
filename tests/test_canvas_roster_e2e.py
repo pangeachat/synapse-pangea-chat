@@ -439,9 +439,22 @@ class CanvasRosterE2ETest(BaseSynapseE2ETest):
         second = self.call("POST", "/_matrix/client/v3/login", None, body=login)
         self.assertEqual(second.status_code, 403, second.text)
 
+        # -- A server admin never gets a launch login token -----------------
+        promoted = self.call(
+            "PUT",
+            "/_synapse/admin/v2/users/" + quote(self.users["student"], safe=""),
+            self.tokens["root"],
+            body={"admin": True},
+        )
+        self.assertEqual(promoted.status_code, 200, promoted.text)
+        admin_launch = self.launch(server, sub=STUDENT_SUB, roles=[LEARNER])
+        self.assertEqual(admin_launch.status_code, 302, admin_launch.text)
+        self.assertEqual(admin_launch.headers["Location"], APP + "/home/login")
+
         # -- Logs ------------------------------------------------------------
         logs = "\n".join(self.server_stdout_lines + self.server_stderr_lines)
         self.assertIn("LTI roster imported", logs)
+        self.assertIn("LTI login token refused: server admin", logs)
         self.assertIn("/lti/course_status?<redacted>", logs)
         beyond_request_lines = "\n".join(
             line for line in logs.splitlines() if "Received request:" not in line

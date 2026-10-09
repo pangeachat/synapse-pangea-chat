@@ -40,7 +40,11 @@ from synapse_pangea_chat.lti.nrps import (
 from synapse_pangea_chat.lti.registration import NRPS_SCOPE
 from synapse_pangea_chat.lti.routes import KIND_TICKET, LtiRoute
 from synapse_pangea_chat.lti.store import LtiStore
-from synapse_pangea_chat.lti.student_launch import LaunchRedirects, LinkStep
+from synapse_pangea_chat.lti.student_launch import (
+    LaunchRedirects,
+    LinkStep,
+    LoginTokens,
+)
 from synapse_pangea_chat.lti.validation import (
     CLAIM_CONTEXT,
     PATH_INSTRUCTOR,
@@ -155,6 +159,21 @@ class FakeLoginTokens:
         return token
 
 
+class FakeServerAdmins:
+    """Synapse's server-admin flag, read at the moment a token is issued."""
+
+    def __init__(self) -> None:
+        self.admins: set = set()
+        self.error: Optional[Exception] = None
+        self.checks: List[str] = []
+
+    async def __call__(self, user_id: str) -> bool:
+        self.checks.append(user_id)
+        if self.error is not None:
+            raise self.error
+        return user_id in self.admins
+
+
 class FakeExternalIds:
     def __init__(self) -> None:
         self.recorded: List[Tuple[str, str, str]] = []
@@ -173,6 +192,8 @@ class Canvas:
         self.http = FakeNrpsHttp()
         self.nrps = NrpsClient(self.http, TOOL_KEY, lambda: self.now / 1000)
         self.login_tokens = FakeLoginTokens()
+        self.server_admins = FakeServerAdmins()
+        tokens = LoginTokens(self.login_tokens, self.server_admins)
         self.external_ids = FakeExternalIds()
         self.course_links = CourseLinks(
             links=self.links,
@@ -187,7 +208,7 @@ class Canvas:
             links=self.links,
             invitations=self.h.store,
             claims=self.h.claims,
-            login_tokens=self.login_tokens,
+            login_tokens=tokens,
             app_base_url=APP,
             admin_dash_base_url=DASH,
             clock_ms=lambda: self.now,
@@ -197,7 +218,7 @@ class Canvas:
             invitations=self.h.store,
             claims=self.h.claims,
             course_links=self.course_links,
-            login_tokens=self.login_tokens,
+            login_tokens=tokens,
             external_ids=self.external_ids,
             clock_ms=lambda: self.now,
         )
@@ -1558,6 +1579,100 @@ class TestLearnerLaunch(_Base):
             ACCESS_TOKEN,
         ):
             self.assertNotIn(secret, text)
+
+
+class TestNoLoginTokenForServerAdmins(_Base):
+    """Owner decision 2026-10-09: a Canvas launch never issues a login token
+    to a Synapse server admin. The admin signs in themself on the normal
+    sign-in page; the check runs when the token would be issued, and fails
+    closed."""
+
+    async def test_server_admin_later_launch_gets_no_login_token(self):
+        await self.linked()
+        # Promoted after the link was made.
+        self.c.server_admins.admins.add(STUDENT)
+        captured = _capture()
+        self.addCleanup(captured.detach)
+        location = await self.c.redirects.location(self.c.launch())
+        self.assertEqual(location, APP + "/home/login")
+        self.assertEqual(self.c.login_tokens.issued, [])
+        # Nor a ticket that would lead to one: unconfirmed rows to claim
+        # change nothing.
+        await self.canvas_row()
+        tickets_before = await self.c.table("lti_ticket")
+        location = await self.c.redirects.location(self.c.launch())
+        self.assertEqual(location, APP + "/home/login")
+        self.assertEqual(await self.c.table("lti_ticket"), tickets_before)
+        self.assertEqual(self.c.login_tokens.issued, [])
+        text = captured.text()
+        self.assertIn("LTI login token refused: server admin", text)
+        self.assertNotIn(STUDENT, text)
+        self.assertNotIn(SUB, text)
+
+    async def test_bound_ticket_of_an_account_promoted_since_gets_no_login_token(
+        self,
+    ):
+        await self.linked()
+        await self.canvas_row()
+        ticket = await self.c.ticket(self.c.launch())
+        self.c.server_admins.admins.add(STUDENT)
+        before = await self.written()
+        status, body = await self.c.learner_l1(None, ticket)
+        self.assertEqual(status, 401, body)
+        self.assertEqual(await self.written(), before)
+        self.assertEqual(self.c.login_tokens.issued, [])
+        # Signing in themself, the admin still confirms and claims normally.
+        ticket = await self.c.links.issue_ticket(
+            KIND_LEARNER,
+            platform_id=self.c.platform_ids[ISSUER],
+            issuer=ISSUER,
+            sub=SUB,
+            context_id=CONTEXT,
+            deployment_id=DEPLOYMENT,
+            nrps_url=None,
+            bound_user_id=STUDENT,
+            now_ms=self.c.now,
+        )
+        status, body = await self.c.learner_l1(STUDENT, ticket)
+        self.assertEqual((status, len(body["claimed"])), (200, 1), body)
+        self.assertIsNone(body["login_token"])
+
+    async def test_login_tokens_never_mint_for_an_admin_whoever_calls(self):
+        tokens = LoginTokens(self.c.login_tokens, self.c.server_admins)
+        self.c.server_admins.admins.add(STUDENT)
+        self.assertIsNone(await tokens.issue(STUDENT))
+        self.c.server_admins.admins.clear()
+        self.c.server_admins.error = RuntimeError("down")
+        self.assertIsNone(await tokens.issue(STUDENT))
+        self.c.server_admins.error = None
+        self.assertEqual(await tokens.issue(STUDENT), "login-token-1")
+        self.assertEqual(self.c.login_tokens.issued, [(STUDENT, "login-token-1")])
+
+    async def test_non_admin_later_launch_is_unchanged(self):
+        await self.linked()
+        target, query = await self.c.go(self.c.launch())
+        self.assertEqual(target, APP + "/lti/token")
+        self.assertEqual(self.c.login_tokens.issued, [(STUDENT, query["loginToken"])])
+        # The flag was read when the token was issued.
+        self.assertIn(STUDENT, self.c.server_admins.checks)
+
+    async def test_an_error_in_the_admin_check_means_no_token(self):
+        await self.linked()
+        self.c.server_admins.error = RuntimeError("database down")
+        captured = _capture()
+        self.addCleanup(captured.detach)
+        location = await self.c.redirects.location(self.c.launch())
+        self.assertEqual(location, APP + "/home/login")
+        await self.canvas_row()
+        self.c.server_admins.error = None
+        ticket = await self.c.ticket(self.c.launch())
+        self.c.server_admins.error = RuntimeError("database down")
+        status, body = await self.c.learner_l1(None, ticket)
+        self.assertEqual(status, 401, body)
+        self.assertEqual(self.c.login_tokens.issued, [])
+        text = captured.text()
+        self.assertIn("LTI login token refused: admin check failed", text)
+        self.assertNotIn(STUDENT, text)
 
 
 class _Captured(logging.Handler):
