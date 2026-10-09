@@ -122,6 +122,16 @@ class NoticeRequest:
     def caller_owns_record(self) -> bool:
         return self.notification_log_id is not None
 
+    def schedule_key(self) -> str:
+        """One schedule per decision. A request with decision context is keyed by
+        run and person, as the Notification_Log is; a caller-owned record is
+        keyed by its row, which the caller already made unique per decision."""
+        if self.log is not None:
+            parts = [self.log.run["run_id"], self.user_id]
+        else:
+            parts = [f"record:{self.notification_log_id}", self.user_id]
+        return json.dumps(parts, separators=(",", ":"))
+
     @classmethod
     def parse(cls, data: Dict[str, Any]) -> NoticeRequest:
         validate_eligibility(data)

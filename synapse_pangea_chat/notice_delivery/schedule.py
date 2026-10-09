@@ -80,7 +80,7 @@ class NoticeSchedule:
         if len(payload.encode()) > 768_000:
             raise ValueError("Scheduled request is too large")
         fingerprint = hashlib.sha256(payload.encode()).hexdigest()
-        key = json.dumps([req.log.run["run_id"], req.user_id], separators=(",", ":"))
+        key = req.schedule_key()
         await self._ensure_table()
 
         def insert(txn):
