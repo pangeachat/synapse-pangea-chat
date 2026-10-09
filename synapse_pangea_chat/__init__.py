@@ -61,6 +61,8 @@ from synapse_pangea_chat.room_preview import (
     invalidate_room_cache,
 )
 from synapse_pangea_chat.safety_incidents import register_safety_incidents
+from synapse_pangea_chat.student_invitations import register_student_invitations
+from synapse_pangea_chat.student_invitations.rate_limits import parse_rate_limits
 from synapse_pangea_chat.user_activity import (
     CourseActivities,
     UserActivity,
@@ -346,9 +348,14 @@ class PangeaChat:
             course_claim_store,
             course_claim_notifier,
         )
+        # --- Student invitations (seats): routes, claim, leave release ---
+        self.student_invitations = register_student_invitations(api, config)
         # Registers its own sign-in and verified-address callbacks.
         self.claim_by_email = ClaimByEmail(
-            api, course_claim_store.invitations, provisioner
+            api,
+            course_claim_store.invitations,
+            provisioner,
+            student_claims=self.student_invitations.claims,
         )
         for endpoint, mode in (
             ("create_course_space", "prepare"),
@@ -1306,7 +1313,10 @@ class PangeaChat:
                 "would shorten the first cooldown rather than cap the last"
             )
 
+        student_invitation_rate_limits = parse_rate_limits(config)
+
         return PangeaChatConfig(
+            student_invitation_rate_limits=student_invitation_rate_limits,
             public_courses_burst_duration_seconds=public_courses_burst_duration_seconds,
             public_courses_requests_per_burst=public_courses_requests_per_burst,
             course_plan_state_event_type=course_plan_state_event_type,

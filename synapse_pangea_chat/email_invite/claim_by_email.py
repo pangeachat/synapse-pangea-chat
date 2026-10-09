@@ -7,6 +7,11 @@ requesting address claims it without the link, through the same first claim
 It runs when the account signs in, and when a verified address is added to it:
 email sign-up stores the address during registration and the app signs in from
 that response without a separate login, so a sign-in check alone would miss it.
+
+The same two moments claim a student invitation the account has already
+confirmed but could not claim then, because the invited address was not yet
+verified on it (``student_invitations.claim``). An invitation the account has
+not confirmed is never claimed here: the student sees it in the app instead.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from synapse.module_api import ModuleApi
 from synapse_pangea_chat.email_invite.course_invitations import CourseInvitationStore
 from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
 from synapse_pangea_chat.room_code.constants import ERRCODE_CODE_NOT_FOUND
+from synapse_pangea_chat.student_invitations.claim import StudentClaims
 
 try:
     import sentry_sdk  # type: ignore[import-not-found]
@@ -45,10 +51,12 @@ class ClaimByEmail:
         api: ModuleApi,
         invitations: CourseInvitationStore,
         provisioner: CourseProvisioner,
+        student_claims: Optional[StudentClaims] = None,
     ) -> None:
         self._store = api._hs.get_datastores().main
         self._invitations = invitations
         self._provisioner = provisioner
+        self._student_claims = student_claims
         api.register_account_validity_callbacks(on_user_login=self.on_user_login)
         api.register_third_party_rules_callbacks(
             on_add_user_third_party_identifier=self.on_add_user_third_party_identifier
@@ -61,12 +69,34 @@ class ClaimByEmail:
         auth_provider_id: Optional[str],
     ) -> None:
         await self.claim_for(user_id)
+        await self._claim_student_invitations(user_id)
 
     async def on_add_user_third_party_identifier(
         self, user_id: str, medium: str, address: str
     ) -> None:
         if medium == EMAIL_MEDIUM:
             await self.claim_for(user_id)
+            await self._claim_student_invitations(user_id)
+
+    async def _claim_student_invitations(self, user_id: str) -> None:
+        if self._student_claims is None:
+            return
+        # claim_confirmed_for reports its own failures; this guard is for
+        # anything it did not foresee, since nothing may fail the sign-in.
+        try:
+            await self._student_claims.claim_confirmed_for(user_id)
+        except Exception as e:
+            logger.error(
+                "Student invitation claims failed for %s: %s",
+                user_id,
+                type(e).__name__,
+            )
+            if sentry_sdk is not None:
+                sentry_sdk.capture_message(
+                    f"student invitation claims failed for {user_id}: "
+                    f"{type(e).__name__}",
+                    level="error",
+                )
 
     async def claim_for(self, user_id: str) -> None:
         # Synapse awaits these callbacks inside the sign-in or registration

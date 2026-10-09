@@ -9,11 +9,27 @@ Unified configuration combining all previously separate synapse module configs:
 - limit_user_directory (from synapse-limit-user-directory)
 """
 
-from typing import List, Mapping, Optional
+from typing import List, Mapping, Optional, Tuple
 
 import attr
 
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
+
+# The managed-account disclosure shown under "Your teacher will manage this
+# account." on every confirmation screen (CONTROLS-SPEC.md §8). A confirmation
+# records the version it was shown, so a later change of the text bumps the
+# version and is never mistaken for consent to the old one. `{course}` is a
+# literal placeholder the client fills with the course name.
+MANAGED_DISCLOSURE_VERSION = 2
+MANAGED_DISCLOSURE_TEXT = (
+    "While you're in {course}, your teacher can limit who you can chat with to "
+    "people in the course, pause your messages to anyone except your teachers, "
+    "and turn off public rooms and your public profile. Some courses (K-12) "
+    "start with these limits on. Your teacher can't read your private "
+    "messages, sign in as you, or delete your account. If you leave the "
+    "course, your teacher stops managing your account. You can download or "
+    "delete your data at any time."
+)
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -116,6 +132,11 @@ class PangeaChatConfig:
     safety_report_burst_duration_seconds: int = 60
     safety_incidents_requests_per_burst: int = 60
     safety_incidents_burst_duration_seconds: int = 60
+
+    # --- student_invitations config ---
+    # Per-route (requests per burst, burst seconds), keyed by route name; see
+    # student_invitations/rate_limits.py for the routes and their defaults.
+    student_invitation_rate_limits: Mapping[str, Tuple[int, int]] = attr.Factory(dict)
 
     # --- invite_by_email config ---
     invite_by_email_requests_per_burst: int = 5
