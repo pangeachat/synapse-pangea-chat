@@ -1,15 +1,16 @@
 """The two emails of a requested course's claim (knock-with-code, "Claiming a course").
 
 1. Course ready: sent by ``create_course_space`` to the requesting address. It
-   carries the claim twice, as a link behind a button and as a printed code
-   with store badges for a teacher who installs the app first, and nothing
-   that belongs with students.
+   carries the claim once, as a link behind a button, says the tap leads to
+   sign-up or log-in, and carries nothing that belongs with students. No
+   printed code and no store badges (decided 2026-10-09): a teacher who
+   installs the app first claims by signing in with the requesting address.
 2. Course claimed: sent once the admin code is used, to the requesting address
    rather than the claiming account. It carries the class link.
 3. Claim reminder: sent on a server admin's request to a course not yet
-   claimed, with a new claim link and code, carried as the first email carries
-   them. The caller renders its words, so it does not change when the message
-   catalog's templates arrive.
+   claimed, with a new claim link carried as the first email carries it. The
+   caller renders its words, so it does not change when the message catalog's
+   templates arrive.
 
 Both go through Synapse's own mail path (the homeserver's ``email`` config), and
 the templates ship inside the package, as the notice emails' do.
@@ -39,15 +40,6 @@ MAX_SUBJECT_TITLE_LENGTH = 100
 #: How long a send may take before the caller stops waiting.
 SEND_TIMEOUT_SECONDS = 120
 
-#: Where a teacher without the app gets it. One store listing serves every
-#: environment, so these are not per-environment config.
-APP_STORE_URL = "https://apps.apple.com/app/id1445118630"
-GOOGLE_PLAY_URL = "https://play.google.com/store/apps/details?id=com.talktolearn.chat"
-
-#: Each store's official badge, from the brand library (business ``brand/``).
-APP_STORE_BADGE_URL = "https://assets.pangea.chat/brand/App-Store-Badge.png"
-GOOGLE_PLAY_BADGE_URL = "https://assets.pangea.chat/brand/Google-Play-Badge.png"
-
 
 def _subject_title(title: str) -> str:
     # A Subject header cannot carry line breaks.
@@ -55,14 +47,9 @@ def _subject_title(title: str) -> str:
 
 
 def _claim_template_vars(claim_url: str, claim_code: str) -> dict[str, str]:
-    return {
-        "claim_url": claim_url,
-        "claim_code": claim_code,
-        "app_store_url": APP_STORE_URL,
-        "google_play_url": GOOGLE_PLAY_URL,
-        "app_store_badge_url": APP_STORE_BADGE_URL,
-        "google_play_badge_url": GOOGLE_PLAY_BADGE_URL,
-    }
+    # The code stays available to the templates for a future caller-rendered
+    # layout, but no shipped template prints it (decided 2026-10-09).
+    return {"claim_url": claim_url, "claim_code": claim_code}
 
 
 def reminder_paragraphs(body: str) -> list[str]:

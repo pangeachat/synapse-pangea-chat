@@ -5,9 +5,7 @@ Your request: "{{ request_summary }}"
 {{ course_title }}
 {% if course_description %}{{ course_description }}
 {% endif %}
-Open the course to become its teacher. If you don't have a {{ app_name }} account yet, you'll create one first.
+Open the course to become its teacher. You'll be taken to {{ app_name }} to sign up or log in, and the course is yours as soon as you do.
 
 Open your course:
 {{ claim_url }}
-
-{% include "_claim_code.txt" %}
