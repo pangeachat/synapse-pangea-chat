@@ -1,13 +1,13 @@
-Your course is ready
+Your quest is ready
 {% if request_summary %}
 Your request: "{{ request_summary }}"
 {% endif %}
 {{ course_title }}
 {% if course_description %}{{ course_description }}
 {% endif %}
-Open the course to become its teacher. If you don't have a {{ app_name }} account yet, you'll create one first.
+Open it and try an activity to see how your students can use the language together. You'll be taken to {{ app_name }} to sign up or log in, and the quest is yours as soon as you do.
 
-Open your course:
+Start my quest:
 {{ claim_url }}
 
-{% include "_claim_code.txt" %}
+Installed the app first? Tap the link again after you sign in.

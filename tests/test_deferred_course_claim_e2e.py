@@ -83,7 +83,7 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
                 self.assertIsNone(result["room_id"])
                 self.assertEqual(result["delivery_outcome"], "accepted")
                 self.assertNotIn(EMAIL, prepared.text)
-                ready = sink.wait_for(EMAIL, "Your course is ready")
+                ready = sink.wait_for(EMAIL, "Your quest is ready")
                 self.assertIsNotNone(ready)
                 code = re.search(
                     re.escape(APP) + r"/([a-zA-Z0-9]{7})", body_text(ready)
@@ -285,7 +285,7 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
                     },
                 )
                 self.assertEqual(other.status_code, 200, other.text)
-                race_mail = sink.wait_for("race@school.example", "Your course is ready")
+                race_mail = sink.wait_for("race@school.example", "Your quest is ready")
                 race_code = re.search(
                     re.escape(APP) + r"/([a-zA-Z0-9]{7})", body_text(race_mail)
                 ).group(1)

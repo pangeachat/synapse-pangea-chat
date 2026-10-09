@@ -1,28 +1,39 @@
 {% extends "_course_email_base.html" %}
-{% from "_cta_button.html" import cta_button %}
-{% block title %}Your course is ready{% endblock %}
+{% block title %}Your quest is ready{% endblock %}
 {% block body %}
                 <p style="font-size: 20px; font-weight: 700; margin-bottom: 12px">
-                  Your course is ready
+                  Your quest is ready
                 </p>
                 {% if request_summary %}
                 <p style="margin-bottom: 4px; font-size: 14px; color: #666">Your request:</p>
                 <p style="font-style: italic">&ldquo;{{ request_summary }}&rdquo;</p>
                 {% endif %}
-                <div class="feature">
-                  <p style="margin: 0 0 6px; font-weight: 700; color: #1a1a2e">
-                    {{ course_title }}
-                  </p>
-                  {% if course_description %}
-                  <p style="margin: 0; color: #333; font-size: 16px; line-height: 1.5">
-                    {{ course_description }}
-                  </p>
-                  {% endif %}
-                </div>
                 <p>
-                  Open the course to become its teacher. If you don't have a
-                  {{ app_name }} account yet, you'll create one first.
+                  Open it and try an activity to see how your students can use the
+                  language together. You'll be taken to {{ app_name }} to sign up or
+                  log in, and the quest is yours as soon as you do.
                 </p>
-{{ cta_button(claim_url, "Open your course") }}
-{% include "_claim_code.html" %}
+                {#- The quest card: the canonical course_invite/teacher_invite copy in the
+                    engagement repo. One medium per email: the current CMS cover when the
+                    request carried one, otherwise the title alone. The button lives
+                    inside the card. -#}
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border: 1px solid #ded8ef; border-radius: 16px; overflow: hidden; margin: 0 0 16px">
+                  {% if course_image_url %}
+                  <tr>
+                    <td><img src="{{ course_image_url }}" alt="{{ course_title }}" width="520" style="display: block; width: 100%; height: auto; border: 0" /></td>
+                  </tr>
+                  {% endif %}
+                  <tr>
+                    <td style="padding: 24px; text-align: center">
+                      <p style="margin: 0 0 6px; font-weight: 700; font-size: 18px; color: #1a1a2e">{{ course_title }}</p>
+                      {% if course_description %}
+                      <p style="margin: 0 0 16px; color: #333; font-size: 15px; line-height: 1.5">{{ course_description }}</p>
+                      {% endif %}
+                      <a href="{{ claim_url }}" style="display: inline-block; background: #6236d5; color: #ffffff; padding: 16px 28px; border-radius: 12px; text-decoration: none; font-weight: bold">Start my quest</a>
+                    </td>
+                  </tr>
+                </table>
+                <p style="font-size: 14px; color: #555">
+                  Installed the app first? Tap the button again after you sign in.
+                </p>
 {% endblock %}

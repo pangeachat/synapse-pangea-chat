@@ -19,10 +19,6 @@ from urllib.parse import quote
 import psycopg2
 import requests
 
-from synapse_pangea_chat.email_invite.course_claim_emails import (
-    APP_STORE_URL,
-    GOOGLE_PLAY_URL,
-)
 from tests.base_e2e import BaseSynapseE2ETest
 from tests.smtp_sink import SmtpSink, body_text
 
@@ -164,18 +160,19 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 )
 
                 # Email 1: the claim link and nothing that belongs with students.
-                ready = sink.wait_for(REQUESTED, "Your course is ready")
+                ready = sink.wait_for(REQUESTED, "Your quest is ready")
                 self.assertIsNotNone(ready)
                 assert ready is not None
                 ready_text = body_text(ready)
                 self.assertIn(f"{APP_BASE_URL}/{admin_code}", ready_text)
-                # The code is printed as well, with the store links, for a
-                # teacher who installs the app before opening the link.
-                self.assertIn(
+                # The link is the only claim path in mail (decided 2026-10-09):
+                # no printed code, no store links, and the re-tap line instead.
+                self.assertNotIn(
                     admin_code, ready_text.replace(f"{APP_BASE_URL}/{admin_code}", "")
                 )
-                self.assertIn(APP_STORE_URL, ready_text)
-                self.assertIn(GOOGLE_PLAY_URL, ready_text)
+                self.assertNotIn("apps.apple.com", ready_text)
+                self.assertNotIn("play.google.com", ready_text)
+                self.assertIn("Tap the link again after you sign in", ready_text)
                 self.assertIn("Spanish 1 practice for my class", ready_text)
                 self.assertNotIn(class_code, ready_text)
 
@@ -305,7 +302,7 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 self.assertEqual(response.status_code, 200, response.text)
                 room_id = response.json()["room_id"]
                 first_code = response.json()["admin_access_code"]
-                self.assertIsNotNone(sink.wait_for(REQUESTED, "Your course is ready"))
+                self.assertIsNotNone(sink.wait_for(REQUESTED, "Your quest is ready"))
 
                 reminder_body = {
                     "room_id": room_id,
@@ -329,10 +326,11 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 start = reminder_text.index(prefix) + len(prefix)
                 reminder_code = reminder_text[start : start + 7]
                 self.assertNotEqual(reminder_code.lower(), first_code.lower())
-                self.assertIn(
+                self.assertNotIn(
                     reminder_code, reminder_text.replace(prefix + reminder_code, "")
                 )
-                self.assertIn(APP_STORE_URL, reminder_text)
+                self.assertNotIn("apps.apple.com", reminder_text)
+                self.assertIn("Tap the link again after you sign in", reminder_text)
 
                 # Both links open the course until it is claimed.
                 for code in (first_code, reminder_code):
