@@ -46,7 +46,7 @@ Lives in the `email_invite/` sub-package alongside `invite_by_email`.
 
 `POST /_synapse/client/pangea/v1/send_course_claim_reminder`
 
-Sends the requesting address a reminder carrying a new claim link for a course not yet claimed ([knock-with-code](knock-with-code.instructions.md), "A reminder carries a new claim link"). Like the first email, it also prints the new code and links to the App Store and Google Play. Also how a first email that failed to send is sent again.
+Sends the requesting address a reminder carrying a new claim link for a course not yet claimed ([knock-with-code](knock-with-code.instructions.md), "A reminder carries a new claim link"). Like the first email, it carries the link alone and says to tap it again after signing in; no code and no store links (decided 2026-10-09). Also how a first email that failed to send is sent again.
 
 - **Auth**: Bearer token of a server admin (the bot).
 - **Input**: `room_id`, and the rendered message: `subject`, `body` (plain text; a blank line separates paragraphs) and `cta_label`. The claim link is the button's target and is never passed in. The caller renders the text so the endpoint does not change when the message catalog's templates arrive.

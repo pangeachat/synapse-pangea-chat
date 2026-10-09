@@ -47,9 +47,10 @@ def _subject_title(title: str) -> str:
 
 
 def _claim_template_vars(claim_url: str, claim_code: str) -> dict[str, str]:
-    # The code stays available to the templates for a future caller-rendered
-    # layout, but no shipped template prints it (decided 2026-10-09).
-    return {"claim_url": claim_url, "claim_code": claim_code}
+    # The code is accepted for the callers' sake and never rendered
+    # (decided 2026-10-09): the link is the only claim path in mail.
+    del claim_code
+    return {"claim_url": claim_url}
 
 
 def reminder_paragraphs(body: str) -> list[str]:
@@ -94,21 +95,26 @@ class CourseClaimMailer:
         claim_url: str,
         claim_code: str,
         claims_by_address: bool = False,
+        course_image_url: str = "",
     ) -> None:
-        """``claims_by_address``: signing in with this address claims the
-        course (claim_by_email), so the email may say so. Only a prepared
-        invitation is matched; a room-backed course is claimed by its link."""
+        """The canonical course_invite/teacher_invite email (engagement repo):
+        the quest card with the current cover when the request carried one,
+        and "Start my quest" inside it. ``claims_by_address`` is accepted for
+        the callers' sake; the email no longer varies by it, because the link
+        is the only claim path in mail and the re-tap line covers every
+        sign-in address."""
+        del claims_by_address
         template_vars = {
             "app_name": self._app_name,
             "course_title": course_title,
             "course_description": course_description,
             "request_summary": request_summary,
+            "course_image_url": course_image_url,
             **_claim_template_vars(claim_url, claim_code),
-            "claims_by_address": claims_by_address,
         }
         await self._send(
             email_address=email_address,
-            subject=f"Your course is ready: {_subject_title(course_title)}",
+            subject=f"Your quest is ready: {_subject_title(course_title)}",
             app_name=self._app_name,
             html=self._ready_html.render(**template_vars),
             text=self._ready_text.render(**template_vars),

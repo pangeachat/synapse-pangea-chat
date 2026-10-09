@@ -2,3 +2,5 @@
 
 {% endfor %}{{ cta_label }}:
 {{ claim_url }}
+
+Installed the app first? Tap the link again after you sign in.

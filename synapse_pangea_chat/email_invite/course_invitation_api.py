@@ -179,6 +179,7 @@ class CourseInvitationAPI(Resource):
                     claim_url=url,
                     claim_code=code,
                     claims_by_address=True,
+                    course_image_url=spec.get("image_url") or "",
                 )
             else:
                 await self.mailer.send_course_reminder(

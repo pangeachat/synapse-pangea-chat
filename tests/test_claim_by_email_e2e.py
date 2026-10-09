@@ -90,11 +90,9 @@ class TestClaimByEmailE2E(BaseSynapseE2ETest):
                 op = tokens["operator"]
 
                 first = self.prepare(op, "first", REQUESTED)
-                ready = sink.wait_for(REQUESTED, "Your course is ready")
+                ready = sink.wait_for(REQUESTED, "Your quest is ready")
                 self.assertIsNotNone(ready)
-                self.assertIn(
-                    "sign in with this address", " ".join(body_text(ready).split())
-                )
+                self.assertIn("sign up or log in", " ".join(body_text(ready).split()))
                 code = re.search(
                     re.escape(APP) + r"/([a-zA-Z0-9]{7})", body_text(ready)
                 ).group(1)
