@@ -404,3 +404,38 @@ class TestCallerOwnedBoundsAndPaths(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (await queue.get(accepted["schedule_id"]))["status"], "complete"
         )
+
+
+class TestCallerOwnedEventPersistedBeforeTransport(unittest.IsolatedAsyncioTestCase):
+    async def test_created_notice_event_is_on_the_claim_when_transport_starts(self):
+        from tests.test_notice_schedule import scheduled_body
+
+        fixture = TestStructuredDelivery()
+        handler, api = fixture.handler(active=False, sent=0)
+        pool = handler._transport_claims._db
+        self.addCleanup(pool.db.close)
+        api.create_and_send_event_into_room = AsyncMock(
+            return_value=SimpleNamespace(event_id="$created")
+        )
+        seen = {}
+
+        async def send_email(**kwargs):
+            seen["row"] = pool.db.execute(
+                "SELECT phase, notice_event_id FROM pangea_notice_transport_claim WHERE record_id = ?",
+                ("row-13",),
+            ).fetchone()
+
+        api._hs.get_send_email_handler.return_value.send_email = AsyncMock(
+            side_effect=send_email
+        )
+        body = {
+            **scheduled_body(),
+            "notification_log_id": "row-13",
+            "_schedule_id": "sch-1",
+        }
+        with patch.object(
+            handler, "_validate_scheduled_target", AsyncMock(return_value=None)
+        ):
+            result = await handler._deliver_scheduled(body)
+        self.assertEqual(result["notice_event_id"], "$created")
+        self.assertEqual(seen["row"], ("claimed", "$created"))

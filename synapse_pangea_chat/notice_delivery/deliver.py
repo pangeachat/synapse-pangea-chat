@@ -330,10 +330,6 @@ class DeliverNotice(Resource):
             req = replace(req, notice_event_id=body.get("notice_event_id"))
             result["notice_event_id"] = req.notice_event_id
             result["notice_room_id"] = req.notice_room_id
-            if req.caller_owns_record and record_id is not None:
-                await self._transport_claims.record_event(
-                    record_id, req.notice_event_id
-                )
         else:
             result = await self._transport(body, req, record_id)
         if req is not None and req.caller_owns_record:
@@ -459,6 +455,12 @@ class DeliverNotice(Resource):
                 }
             )
             body["notice_event_id"] = event.event_id
+            if req.caller_owns_record and req.notification_log_id is not None:
+                # Persist the event on the claim before any transport, so a crash
+                # during SMTP or push leaves the reference reconciliation needs.
+                await self._transport_claims.record_event(
+                    req.notification_log_id, event.event_id
+                )
 
         method = (
             req.method
