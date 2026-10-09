@@ -218,7 +218,7 @@ class TestStructuredDelivery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["channel"], "email")
         self.assertEqual(result["notification_log_id"], "row-7")
         self.assertEqual(result["log_status"], "caller")
-        self.assertFalse(result["duplicate"])
+        self.assertNotIn("duplicate", result)
 
     async def test_caller_owned_record_needs_no_log_context(self):
         body = {**request_body("email-only"), "notification_log_id": "row-7"}
@@ -297,7 +297,7 @@ class TestCallerOwnedTransportClaim(unittest.IsolatedAsyncioTestCase):
         send = api._hs.get_send_email_handler.return_value.send_email
         self.assertEqual(send.await_count, 1)
         self.assertEqual(first["channel"], "email")
-        self.assertFalse(first["duplicate"])
+        self.assertNotIn("duplicate", first)
         self.assertTrue(second["duplicate"])
         self.assertEqual(second["channel"], "email")
         self.assertEqual(second["log_status"], "caller")
@@ -357,3 +357,50 @@ class TestCallerOwnedTransportClaim(unittest.IsolatedAsyncioTestCase):
         del body["log"]
         with self.assertRaises(ValueError):
             NoticeRequest.parse(body)
+
+
+class TestCallerOwnedBoundsAndPaths(unittest.IsolatedAsyncioTestCase):
+    def test_id_bounds(self):
+        for bad in ("", "x" * 129, 7, None):
+            body = {**request_body("email-only"), "notification_log_id": bad}
+            with self.subTest(bad=bad):
+                if bad is None:
+                    # An explicit null is the same as absent: the module records.
+                    self.assertFalse(NoticeRequest.parse(body).caller_owns_record)
+                else:
+                    with self.assertRaises(ValueError):
+                        NoticeRequest.parse(body)
+
+    async def test_push_replay_sends_once(self):
+        fixture = TestStructuredDelivery()
+        handler, api = fixture.handler(active=False, sent=1)
+        self.addCleanup(handler._transport_claims._db.db.close)
+        body = {**request_body("push-only"), "notification_log_id": "row-9"}
+        first = await handler.deliver(body)
+        second = await handler.deliver(dict(body))
+        self.assertEqual(first["channel"], "push")
+        self.assertNotIn("duplicate", first)
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(second["push"], {"attempted": 1, "sent": 1, "failed": 0})
+
+    async def test_scheduled_request_with_an_id_and_no_log_enqueues_and_fires(self):
+        from synapse_pangea_chat.notice_delivery.schedule import NoticeSchedule
+        from tests.test_notice_delivery_unit import NOW_MS
+        from tests.test_notice_schedule import SQLPool, scheduled_body
+
+        api = _api()
+        pool = SQLPool()
+        self.addCleanup(pool.db.close)
+        api._hs.get_datastores.return_value.main.db_pool = pool
+        execute = AsyncMock(return_value={"channel": "email", "log_status": "caller"})
+        queue = NoticeSchedule(api, execute)
+        body = {**scheduled_body(), "notification_log_id": "row-11"}
+        del body["log"]
+        accepted = await queue.enqueue(body)
+        self.assertEqual(accepted["status"], "queued")
+        api._hs.get_clock.return_value.time_msec.return_value = NOW_MS + 60000
+        await queue.run_due()
+        execute.assert_awaited_once()
+        self.assertEqual(
+            (await queue.get(accepted["schedule_id"]))["status"], "complete"
+        )

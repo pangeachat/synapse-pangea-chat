@@ -338,14 +338,17 @@ class DeliverNotice(Resource):
             result = await self._transport(body, req, record_id)
         if req is not None and req.caller_owns_record:
             assert record_id is not None
-            result.update(
-                notification_log_id=record_id,
-                log_status="caller",
-                duplicate=False,
-            )
+            result.update(notification_log_id=record_id, log_status="caller")
             uncertain = (result.get("reason") or "").endswith("send_failed")
+            # The claim replays this on a retry: counts only, never device tokens.
+            stored = dict(result)
+            push = result.get("push")
+            if push:
+                stored["push"] = {
+                    k: push.get(k) for k in ("attempted", "sent", "failed")
+                }
             await self._transport_claims.finish(
-                record_id, PHASE_PENDING if uncertain else PHASE_COMPLETE, result
+                record_id, PHASE_PENDING if uncertain else PHASE_COMPLETE, stored
             )
         elif req is not None and record_id is not None:
             result.update(
