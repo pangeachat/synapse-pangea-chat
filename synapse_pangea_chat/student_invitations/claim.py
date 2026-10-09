@@ -117,7 +117,23 @@ class StudentClaims:
         if outcome == CLAIMED and claimed is not None:
             logger.info("Claimed student invitation %s for %s", invitation_id, user_id)
             await self._release_if_gone(room_id, user_id)
+            await self._recheck_managed(claimed)
         return outcome, claimed if claimed is not None else row
+
+    async def _recheck_managed(self, row: Dict[str, Any]) -> None:
+        # The admin check ran before the claim transaction, and a power-level
+        # event in between found no joined row to fix. Re-reading now that the
+        # row is joined closes that window; a later event finds the row. A
+        # failure leaves the claim standing and the next sign-in repairs it.
+        try:
+            await self.apply_managed_rule(row)
+        except Exception as error:
+            report_failure(
+                "managed record check after claim",
+                error,
+                invitation=row["id"],
+                user=row["claimant"],
+            )
 
     async def _release_if_gone(self, room_id: str, user_id: str) -> None:
         # A leave between the join and the claim transaction would otherwise

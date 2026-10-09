@@ -1555,6 +1555,29 @@ class TestManagedRule(_Base):
         await hook.on_user_login(STUDENT, None, None)
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
 
+    async def test_power_level_change_during_a_claim_is_applied(self):
+        for promoted_mid_claim in (True, False):
+            h = Harness()
+            # The student's answers in order: before the claim transaction,
+            # then every read after it.
+            answers = [not promoted_mid_claim]
+
+            async def changing(room_id: str, user_id: str) -> bool:
+                if user_id != STUDENT:
+                    return (room_id, user_id) in h.admins.admins
+                return answers.pop(0) if answers else promoted_mid_claim
+
+            h.admins.is_course_admin = changing  # type: ignore[method-assign]
+            (inv,) = await h.add(INVITED)
+            h.verify(STUDENT, INVITED_KEY)
+            status, body = await h.confirm(STUDENT, inv["invitation_id"])
+            self.assertEqual(body["result"], "claimed")
+            record = await h.store.managed_record(STUDENT, ROOM)
+            if promoted_mid_claim:
+                self.assertIsNone(record, "promoted during the claim")
+            else:
+                self.assertIsNotNone(record, "demoted during the claim")
+
     async def test_power_level_callback_failure_never_fails_the_event(self):
         await self.claimed()
         captured = self.capture_logs()
