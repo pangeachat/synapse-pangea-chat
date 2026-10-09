@@ -1043,6 +1043,55 @@ class TestAddAndSend(_Base):
         status, body = await self.h.confirm(STUDENT, ident)
         self.assertEqual(body["result"], "claimed")
 
+    async def test_re_invite_is_a_fresh_invitation_from_the_new_inviter(self):
+        coteacher = "@coteacher:x"
+        self.h.admins.admins.add((ROOM, coteacher))
+        self.h.main.membership[(ROOM, STUDENT)] = "join"
+        self.h.verify(STUDENT, INVITED_KEY)
+        # First invited by the teacher through "invite to a seat" (no
+        # address as entered), with a Canvas identity, then claimed and left.
+        status, made = await self.h.handlers.invite_member(
+            TEACHER, {"room_id": ROOM, "user_id": STUDENT}
+        )
+        self.assertEqual(status, 200, made)
+        ident = made["invitation_id"]
+        await self.h.main.db_pool.runInteraction(
+            "canvas",
+            lambda txn: txn.execute(
+                "UPDATE pangea_student_invitation SET lti_issuer = 'iss',"
+                " lti_context_id = 'ctx', lti_user_id = 'sub', created_at_ms = 1"
+                " WHERE id = ?",
+                (ident,),
+            ),
+        )
+        await self.h.confirm(STUDENT, ident)
+        await self.h.store.release_on_leave(ROOM, STUDENT)
+        # Re-added by the co-teacher, typed by hand, from a CSV.
+        status, body = await self.h.handlers.add(
+            coteacher, {"room_id": ROOM, "emails": [INVITED], "source": "csv"}
+        )
+        self.assertEqual(status, 200, body)
+        (again,) = body["invitations"]
+        self.assertEqual(again["invitation_id"], ident)
+        self.assertEqual(
+            (again["state"], again["invited_by"], again["source"], again["email"]),
+            ("invited", coteacher, "csv", INVITED),
+        )
+        self.assertFalse(again["canvas_identity"])
+        self.assertGreater(again["created_at_ms"], 1)
+        row = await self.h.row(ident)
+        self.assertEqual(
+            (row["lti_issuer"], row["lti_context_id"], row["lti_user_id"]),
+            (None, None, None),
+        )
+        # The managed record of the new claim names the new inviter.
+        status, claimed = await self.h.confirm(STUDENT, ident)
+        self.assertEqual(claimed["result"], "claimed")
+        record = await self.h.store.managed_record(STUDENT, ROOM)
+        self.assertEqual(record["invited_by"], coteacher)
+        _, joined = await self.h.handlers.mine_joined(STUDENT)
+        self.assertEqual(joined["invitations"][0]["invited_by"], coteacher)
+
     async def test_re_invite_resets_a_revoked_row_and_keeps_its_send_count(self):
         (inv,) = await self.h.add(INVITED)
         ident = inv["invitation_id"]

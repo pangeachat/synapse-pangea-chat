@@ -335,8 +335,10 @@ class StudentInvitationStore:
         """Add (email as entered or None, email key) pairs to a course.
 
         Per (course, key): a live row is returned unchanged; a ``revoked`` or
-        ``left`` row is reset to ``invited`` (claimant cleared, its
-        confirmations deleted, send count kept); otherwise a row is created.
+        ``left`` row is reset to a fresh ``invited`` row from this inviter,
+        source and address (claimant and Canvas identity cleared, its
+        confirmations and decisions deleted, send count kept); otherwise a
+        row is created.
         Returns one row per entry, in entry order.
         """
         await self.ensure()
@@ -362,10 +364,16 @@ class StudentInvitationStore:
                 if row is None:
                     raise RuntimeError("invitation row missing after insert")
                 if row["state"] in (STATE_REVOKED, STATE_LEFT):
+                    # A fresh invitation from this inviter, source and
+                    # address; only the send count carries over. A Canvas
+                    # identity is cleared: this path is never a Canvas import.
                     txn.execute(
                         "UPDATE pangea_student_invitation SET state = 'invited',"
-                        " claimant = NULL, joined_at_ms = NULL WHERE id = ?",
-                        (row["id"],),
+                        " claimant = NULL, joined_at_ms = NULL, email = ?,"
+                        " source = ?, invited_by = ?, created_at_ms = ?,"
+                        " lti_issuer = NULL, lti_context_id = NULL,"
+                        " lti_user_id = NULL WHERE id = ?",
+                        (email, source, invited_by, now_ms, row["id"]),
                     )
                     txn.execute(
                         "DELETE FROM pangea_invitation_ack WHERE invitation_id = ?",
