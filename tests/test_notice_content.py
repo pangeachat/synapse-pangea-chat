@@ -205,6 +205,28 @@ class TestStructuredDelivery(unittest.IsolatedAsyncioTestCase):
             await handler.deliver(request_body())
         api._hs.get_send_email_handler.return_value.send_email.assert_not_awaited()
 
+    async def test_caller_owned_record_is_never_reserved_or_finished(self):
+        handler, api = self.handler(active=False, sent=0)
+        body = {**request_body("email-only"), "notification_log_id": "row-7"}
+        result = await handler.deliver(body)
+        handler._delivery_log.reserve.assert_not_awaited()
+        handler._delivery_log.finish.assert_not_awaited()
+        self.assertEqual(result["channel"], "email")
+        self.assertEqual(result["notification_log_id"], "row-7")
+        self.assertEqual(result["log_status"], "caller")
+        self.assertFalse(result["duplicate"])
+
+    async def test_caller_owned_record_needs_no_log_context(self):
+        body = {**request_body("email-only"), "notification_log_id": "row-7"}
+        del body["log"]
+        req = NoticeRequest.parse(body)
+        self.assertIsNone(req.log)
+        self.assertTrue(req.caller_owns_record)
+        without_either = request_body("email-only")
+        del without_either["log"]
+        with self.assertRaises(ValueError):
+            NoticeRequest.parse(without_either)
+
     async def test_post_send_log_outage_reports_actual_delivery(self):
         handler, api = self.handler()
         handler._delivery_log.finish.side_effect = RuntimeError("CMS unavailable")

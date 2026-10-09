@@ -269,14 +269,19 @@ class DeliverNotice(Resource):
         if req is not None:
             if req.notice_event_id is not None:
                 await self._validate_notice(req)
-            record_id, previous = await self._delivery_log.reserve(req)
-            if previous is not None:
-                return {
-                    **previous,
-                    "notification_log_id": record_id,
-                    "log_status": "complete",
-                    "duplicate": True,
-                }
+            if req.caller_owns_record:
+                # The caller wrote the Notification_Log row and will write the receipt onto
+                # it; this module touches the record not at all (engagement-system doc).
+                record_id = req.notification_log_id
+            else:
+                record_id, previous = await self._delivery_log.reserve(req)
+                if previous is not None:
+                    return {
+                        **previous,
+                        "notification_log_id": record_id,
+                        "log_status": "complete",
+                        "duplicate": True,
+                    }
         result: Dict[str, Any]
         if req is not None and req.notice_event_id is None:
             reason: Optional[str]
@@ -308,7 +313,13 @@ class DeliverNotice(Resource):
             result["notice_room_id"] = req.notice_room_id
         else:
             result = await self._deliver_once(body, req)
-        if req is not None and record_id is not None:
+        if req is not None and req.caller_owns_record:
+            result.update(
+                notification_log_id=record_id,
+                log_status="caller",
+                duplicate=False,
+            )
+        elif req is not None and record_id is not None:
             result.update(
                 notification_log_id=record_id, log_status="complete", duplicate=False
             )

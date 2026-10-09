@@ -113,7 +113,14 @@ class NoticeRequest:
     method: str
     push: Optional[PushContent]
     email: Optional[EmailContent]
-    log: DecisionContext
+    log: Optional[DecisionContext]
+    notification_log_id: Optional[str] = None
+    """The caller's Notification_Log row. When present the caller owns the record: this module
+    reserves nothing, finishes nothing, and the caller writes the receipt onto its own row."""
+
+    @property
+    def caller_owns_record(self) -> bool:
+        return self.notification_log_id is not None
 
     @classmethod
     def parse(cls, data: Dict[str, Any]) -> NoticeRequest:
@@ -179,8 +186,16 @@ class NoticeRequest:
             raise ValueError("push content is required for this delivery method")
         if method in {"use-available", "email-only"} and email is None:
             raise ValueError("email content is required for this delivery method")
-        if not isinstance(data.get("log"), dict):
-            raise ValueError("log decision context is required")
+        record_id = None
+        if data.get("notification_log_id") is not None:
+            record_id = string(data, "notification_log_id", 128)
+        log = None
+        if isinstance(data.get("log"), dict):
+            log = DecisionContext.parse(data["log"])
+        elif record_id is None:
+            raise ValueError(
+                "log decision context is required unless notification_log_id names the caller's row"
+            )
         for key in ("activity_id", "session_room_id"):
             if key in data and data[key] is not None:
                 string(data, key)
@@ -193,7 +208,8 @@ class NoticeRequest:
             method,
             push,
             email,
-            DecisionContext.parse(data["log"]),
+            log,
+            record_id,
         )
 
 
@@ -205,6 +221,7 @@ def is_structured(data: Dict[str, Any]) -> bool:
             "email",
             "delivery_method",
             "log",
+            "notification_log_id",
             "scheduled_at",
             "eligibility",
         )
