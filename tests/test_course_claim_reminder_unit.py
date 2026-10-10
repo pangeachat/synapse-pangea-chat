@@ -189,3 +189,146 @@ class TestReminderTemplate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCallerRenderedReminder(unittest.TestCase):
+    def test_validation_wants_the_claim_slot_in_both_parts_and_no_refusal_or_second_link(
+        self,
+    ) -> None:
+        from synapse_pangea_chat.email_invite.course_claim_emails import (
+            validate_rendered,
+        )
+
+        self.assertIsNone(
+            validate_rendered('<a href="{{cta_url}}">go</a>', "go {{cta_url}}")
+        )
+        self.assertIn(
+            "html must contain",
+            str(validate_rendered("<p>x</p>", "go {{cta_url}}")),
+        )
+        self.assertIn(
+            "text must contain",
+            str(validate_rendered('<a href="{{cta_url}}">go</a>', "go")),
+        )
+        self.assertIn(
+            "unsubscribe",
+            str(
+                validate_rendered(
+                    '<a href="{{cta_url}}">go</a><a href="{{unsubscribe_url}}">u</a>',
+                    "go {{cta_url}}",
+                )
+            ),
+        )
+        self.assertIn(
+            "cta2_url",
+            str(
+                validate_rendered(
+                    '<a href="{{cta_url}}">go</a>', "go {{cta_url}} {{cta2_url}}"
+                )
+            ),
+        )
+
+    def test_slots_are_filled_literally_and_escaped_in_html(self) -> None:
+        from synapse_pangea_chat.email_invite.course_claim_emails import (
+            fill_claim_slots,
+        )
+
+        html, text = fill_claim_slots(
+            '<a href="{{cta_url}}">go</a><p>{{receiving_reason}}</p><p>{{postal_address}}</p>',
+            "go {{cta_url}}\n{{receiving_reason}}\n{{postal_address}}",
+            claim_url="https://app.x/abc?x=1&y=2",
+            receiving_reason="You asked <us>",
+            postal_address="1 Main St",
+        )
+        self.assertIn('href="https://app.x/abc?x=1&amp;y=2"', html)
+        self.assertIn("You asked &lt;us&gt;", html)
+        self.assertIn("go https://app.x/abc?x=1&y=2", text)
+        self.assertIn("1 Main St", text)
+        self.assertNotIn("{{", html + text)
+
+
+class TestV2RemindCallerRendered(unittest.IsolatedAsyncioTestCase):
+    def _resource(self):
+        from synapse_pangea_chat.email_invite.course_invitation_api import (
+            CourseInvitationAPI,
+        )
+
+        api: Any = MagicMock()
+        invitations = MagicMock()
+        invitations.get = AsyncMock(
+            return_value={
+                "invitation_id": "inv-1",
+                "status": "prepared",
+                "requested_email": "t@x.org",
+                "specification": {},
+            }
+        )
+        invitations.status = AsyncMock(
+            return_value={"invitation_id": "inv-1", "status": "prepared"}
+        )
+        resource = CourseInvitationAPI(
+            api, PangeaChatConfig(), MagicMock(), invitations, MagicMock(), "reminder"
+        )
+        resource.code = AsyncMock(return_value="c0de123")
+        resource.send = AsyncMock()
+        return resource
+
+    async def test_html_and_text_ride_to_the_mailer_with_the_claim_slot(self) -> None:
+        r = self._resource()
+        await r.remind(
+            {
+                "invitation_id": "inv-1",
+                "subject": "s",
+                "body": "b",
+                "cta_label": "Accept",
+                "html": '<a href="{{cta_url}}">Accept</a>',
+                "text": "Accept: {{cta_url}}",
+                "receiving_reason": "You were invited.",
+            }
+        )
+        rendered = r.send.await_args.kwargs["rendered"]
+        self.assertEqual(
+            (rendered["html"], rendered["text"], rendered["receiving_reason"]),
+            (
+                '<a href="{{cta_url}}">Accept</a>',
+                "Accept: {{cta_url}}",
+                "You were invited.",
+            ),
+        )
+
+    async def test_a_rendered_email_without_the_slot_or_with_a_refusal_link_is_refused(
+        self,
+    ) -> None:
+        from synapse.api.errors import SynapseError
+
+        r = self._resource()
+        for html, text in (
+            ("<p>no slot</p>", "Accept: {{cta_url}}"),
+            ('<a href="{{cta_url}}">a</a>', "no slot"),
+            (
+                '<a href="{{cta_url}}">a</a><a href="{{unsubscribe_url}}">u</a>',
+                "Accept: {{cta_url}}",
+            ),
+        ):
+            with self.subTest(html=html), self.assertRaises(SynapseError) as caught:
+                await r.remind(
+                    {
+                        "invitation_id": "inv-1",
+                        "subject": "s",
+                        "body": "b",
+                        "cta_label": "Accept",
+                        "html": html,
+                        "text": text,
+                    }
+                )
+            self.assertEqual(caught.exception.code, 400)
+        r.send.assert_not_awaited()
+        await r.remind(
+            {
+                "invitation_id": "inv-1",
+                "subject": "s",
+                "body": "b",
+                "cta_label": "Accept",
+            }
+        )
+        self.assertNotIn("html", r.send.await_args.kwargs["rendered"])

@@ -12,6 +12,7 @@ from twisted.mail.smtp import SMTPDeliveryError
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
+from synapse_pangea_chat.email_invite.course_claim_emails import validate_rendered
 from synapse_pangea_chat.email_invite.course_claim_reminder import (
     _capture_exception,
     _text_field,
@@ -152,6 +153,20 @@ class CourseInvitationAPI(Resource):
             raise SynapseError(
                 400, "invitation_id, subject, body and cta_label are required"
             )
+        # A caller that rendered the whole email sends html and text with the
+        # claim link as a slot; the module fills the slots and sends that.
+        if body.get("html") is not None or body.get("text") is not None:
+            html = _text_field(body, "html", 384_000)
+            text = _text_field(body, "text", 128_000)
+            if not html or not text:
+                raise SynapseError(400, "html and text must both be present")
+            problem = validate_rendered(html, text)
+            if problem:
+                raise SynapseError(400, problem)
+            reason = body.get("receiving_reason", "")
+            if not isinstance(reason, str) or len(reason) > 2000:
+                raise SynapseError(400, "Invalid receiving_reason")
+            rendered.update(html=html, text=text, receiving_reason=reason.strip())
         invitation = await self.invitations.get(ident)
         if not invitation:
             raise SynapseError(404, "Invitation not found")
