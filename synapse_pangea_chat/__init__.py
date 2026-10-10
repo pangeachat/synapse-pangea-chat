@@ -27,6 +27,9 @@ from synapse_pangea_chat.email_invite.course_claim_reminder import (
 )
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.email_invite.course_invitation_api import CourseInvitationAPI
+from synapse_pangea_chat.email_invite.instructor_invitations import (
+    InstructorInvitationAPI,
+)
 from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
 from synapse_pangea_chat.email_policy import EmailPolicy
 from synapse_pangea_chat.export_user_data import ExportUserData
@@ -369,8 +372,18 @@ class PangeaChat:
                     mode,
                 ),
             )
+        # Additional-instructor invitations into an existing course: prepared
+        # here, emailed by the caller through the v2 reminder endpoint, and
+        # claimed through the same code path as a first claim.
+        api.register_web_resource(
+            path="/_synapse/client/pangea/v2/instructor_invitations",
+            resource=InstructorInvitationAPI(
+                api, config, course_claim_store, course_claim_store.invitations
+            ),
+        )
 
         # --- Room Code ---
+
         self.knock_with_code_resource = KnockWithCode(
             api, config, course_claim_store, course_claim_notifier, provisioner
         )
