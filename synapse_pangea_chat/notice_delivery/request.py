@@ -12,6 +12,7 @@ from synapse_pangea_chat.notice_delivery.categories import DELIVERABLE_CATEGORIE
 from synapse_pangea_chat.notice_delivery.common import (
     DESTINATION_KINDS,
     external_host_allowed,
+    workspace_path_ok,
 )
 from synapse_pangea_chat.notice_delivery.eligibility import validate_eligibility
 
@@ -26,6 +27,7 @@ DESTINATION_IDS = {
     "course": frozenset({"course_room_id"}),
     "subscription": frozenset(),
     "external": frozenset({"url"}),
+    "workspace": frozenset({"path"}),
 }
 
 
@@ -50,6 +52,7 @@ class Destination:
     session_room_id: Optional[str] = None
     course_room_id: Optional[str] = None
     url: Optional[str] = None
+    path: Optional[str] = None
 
     def compact(self) -> Dict[str, str]:
         """The token payload form: ``k`` plus only the ids this kind carries."""
@@ -59,6 +62,7 @@ class Destination:
             ("s", self.session_room_id),
             ("c", self.course_room_id),
             ("u", self.url),
+            ("p", self.path),
         ):
             if value:
                 result[key] = value
@@ -84,6 +88,7 @@ class Destination:
             ("session_room_id", 512),
             ("course_room_id", 512),
             ("url", 2048),
+            ("path", 1024),
         ):
             ids[key] = string(data, key, limit) if data.get(key) is not None else None
             if ids[key] is not None and key not in DESTINATION_IDS[kind]:
@@ -97,6 +102,10 @@ class Destination:
         ):
             raise ValueError(
                 f"{name} of kind external requires an https url on an allowed host"
+            )
+        if kind == "workspace" and not workspace_path_ok(ids["path"]):
+            raise ValueError(
+                f"{name} of kind workspace requires a relative path starting with one slash"
             )
         return cls(kind, **ids)
 

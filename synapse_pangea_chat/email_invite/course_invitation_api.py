@@ -139,7 +139,13 @@ class CourseInvitationAPI(Resource):
         ident, created = await self.invitations.prepare(
             operator, key, spec, email, code, self.api._hs.get_clock().time_msec()
         )
-        if created:
+        # ``send_email: false`` prepares the invitation and sends nothing: the caller (the
+        # engagement runner) sends the delivery itself through the reminder endpoint with its own
+        # rendered copy, so the first email is content the runner owns, not a template here.
+        send_email = body.get("send_email", True)
+        if not isinstance(send_email, bool):
+            raise SynapseError(400, "send_email must be a boolean")
+        if created and send_email:
             await self.send(ident, code, email, spec=spec)
         return await self.invitations.status(ident)
 
