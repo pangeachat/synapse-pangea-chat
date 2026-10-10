@@ -203,22 +203,28 @@ class TestCallerRenderedReminder(unittest.TestCase):
             validate_rendered('<a href="{{cta_url}}">go</a>', "go {{cta_url}}")
         )
         self.assertIn(
-            "html must contain", str(validate_rendered("<p>x</p>", "go {{cta_url}}")
+            "html must contain",
+            str(validate_rendered("<p>x</p>", "go {{cta_url}}")),
         )
         self.assertIn(
-            "text must contain", str(validate_rendered('<a href="{{cta_url}}">go</a>', "go")
+            "text must contain",
+            str(validate_rendered('<a href="{{cta_url}}">go</a>', "go")),
         )
         self.assertIn(
             "unsubscribe",
-            str(validate_rendered(
-                '<a href="{{cta_url}}">go</a><a href="{{unsubscribe_url}}">u</a>',
-                "go {{cta_url}}",
+            str(
+                validate_rendered(
+                    '<a href="{{cta_url}}">go</a><a href="{{unsubscribe_url}}">u</a>',
+                    "go {{cta_url}}",
+                )
             ),
         )
         self.assertIn(
             "cta2_url",
-            str(validate_rendered(
-                '<a href="{{cta_url}}">go</a>', "go {{cta_url}} {{cta2_url}}"
+            str(
+                validate_rendered(
+                    '<a href="{{cta_url}}">go</a>', "go {{cta_url}} {{cta2_url}}"
+                )
             ),
         )
 
