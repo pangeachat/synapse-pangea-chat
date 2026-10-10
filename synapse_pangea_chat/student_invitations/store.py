@@ -615,13 +615,12 @@ class StudentInvitationStore:
         invitation_id: str,
         expected: int,
         now_ms: int,
-        actor: str,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
-        """Compare-and-set the send count before a send, recording the
-        ``invite_sent`` (first) or ``invite_resent`` event with it.
+        """Compare-and-set the send count before a send. The send's event is
+        written by ``record_sent`` once the email is accepted.
 
-        Returns ("reserved", row before, plus the event's ``event_id``),
-        ("not_invited", None) or ("stale", None)."""
+        Returns ("reserved", row before), ("not_invited", None) or
+        ("stale", None)."""
         await self.ensure()
 
         def write(txn: Any) -> Tuple[str, Optional[Dict]]:
@@ -640,21 +639,13 @@ class StudentInvitationStore:
             )
             if txn.rowcount != 1:
                 return "stale", None
-            event_id = record_event(
-                txn,
-                room_id=room_id,
-                actor=actor,
-                action=INVITE_SENT if row["send_count"] == 0 else INVITE_RESENT,
-                now_ms=now_ms,
-                invitation_id=invitation_id,
-            )
-            return "reserved", {**row, "event_id": event_id}
+            return "reserved", row
 
         return await self.db.runInteraction("pangea_student_invitation_send", write)
 
     async def release_send(self, before: Dict[str, Any]) -> None:
         """Undo a reservation whose email was not sent, unless the row moved
-        on. The send never happened, so its event goes with the count."""
+        on. A failed send wrote no event, so the ledger is untouched."""
 
         def write(txn: Any) -> None:
             txn.execute(
@@ -668,13 +659,28 @@ class StudentInvitationStore:
                     before["send_count"] + 1,
                 ),
             )
-            if txn.rowcount == 1:
-                txn.execute(
-                    "DELETE FROM pangea_student_invitation_event WHERE event_id = ?",
-                    (before["event_id"],),
-                )
 
         await self.db.runInteraction("pangea_student_invitation_unsend", write)
+
+    async def record_sent(
+        self, before: Dict[str, Any], actor: str, now_ms: int
+    ) -> None:
+        """The email of a reserved send was accepted: append its
+        ``invite_sent`` (first send) or ``invite_resent`` event. This is the
+        step that completes the send, so a failed send writes no event."""
+        await self.ensure()
+
+        def write(txn: Any) -> None:
+            record_event(
+                txn,
+                room_id=before["course_room_id"],
+                actor=actor,
+                action=INVITE_SENT if before["send_count"] == 0 else INVITE_RESENT,
+                now_ms=now_ms,
+                invitation_id=before["id"],
+            )
+
+        await self.db.runInteraction("pangea_student_invitation_sent", write)
 
     async def revoke(
         self, room_id: str, invitation_id: str, actor: str, now_ms: int

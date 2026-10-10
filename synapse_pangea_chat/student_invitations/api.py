@@ -321,7 +321,7 @@ class StudentInvitationHandlers:
         stopped: Optional[str] = None
         for ident, expected in parsed:
             status, before = await self._store.reserve_send(
-                room_id, ident, expected, now_ms(), caller
+                room_id, ident, expected, now_ms()
             )
             if status != "reserved" or before is None:
                 results.append(
@@ -348,6 +348,12 @@ class StudentInvitationHandlers:
                     stopped = reason
                     break
                 continue
+            try:
+                await self._store.record_sent(before, caller, now_ms())
+            except Exception as error:
+                # The email went out and its count stands; only the ledger
+                # row is missing. Reported (ids only), not turned into an error.
+                report_failure("invite sent event", error, invitation=ident)
             results.append({"invitation_id": ident, "outcome": "sent", "reason": None})
         logger.info(
             "student invitations send: room=%s sent=%d of %d",

@@ -1856,22 +1856,87 @@ class TestEvents(_Base):
         self.assertIsNone(await self.h.store.get_request(inv["invitation_id"], OTHER))
         self.assertEqual(await self.h.events(), before)
 
-    async def test_a_send_that_failed_removes_its_event_with_the_count(self):
+    async def test_a_failed_send_writes_no_event_and_the_ledger_is_never_rewritten(
+        self,
+    ):
+        """Append-only: a send's event is written only once its email was
+        accepted, so a failed send writes none and nothing is undone."""
         (inv,) = await self.h.add(INVITED)
+        touched: List[str] = []
+
+        def watch(sql: str, args: Any) -> None:
+            if "pangea_student_invitation_event" in sql and not sql.lstrip().startswith(
+                ("SELECT", "CREATE")
+            ):
+                touched.append(sql.split()[0])
+
+        self.h.main.db_pool.on_statement = watch
         self.h.mailer.fail_with = RuntimeError("mail down")
-        await self.h.handlers.send(
-            TEACHER,
-            {
-                "room_id": ROOM,
-                "items": [
-                    {"invitation_id": inv["invitation_id"], "expected_send_count": 0}
-                ],
-            },
-        )
+        send = {
+            "room_id": ROOM,
+            "items": [
+                {"invitation_id": inv["invitation_id"], "expected_send_count": 0}
+            ],
+        }
+        await self.h.handlers.send(TEACHER, send)
+        self.assertEqual(touched, [])
         self.assertEqual((await self.h.row(inv["invitation_id"]))["send_count"], 0)
         self.assertEqual(
             [e["action"] for e in await self.h.events()], ["students_added"]
         )
+        # A send that succeeds appends exactly one event, and only appends.
+        self.h.mailer.fail_with = None
+        await self.h.handlers.send(TEACHER, send)
+        self.h.main.db_pool.on_statement = None
+        self.assertEqual(touched, ["INSERT"])
+        self.assertEqual(
+            [e["action"] for e in await self.h.events()],
+            ["invite_sent", "students_added"],
+        )
+
+    async def test_a_sent_email_stays_sent_if_its_event_cannot_be_written(self):
+        (inv,) = await self.h.add(INVITED)
+
+        def refuse_the_event(sql: str, args: Any) -> None:
+            if sql.startswith("INSERT INTO pangea_student_invitation_event"):
+                raise RuntimeError("event write refused")
+
+        self.h.main.db_pool.on_statement = refuse_the_event
+        with patch.object(report, "sentry_sdk") as sentry:
+            status, body = await self.h.handlers.send(
+                TEACHER,
+                {
+                    "room_id": ROOM,
+                    "items": [
+                        {
+                            "invitation_id": inv["invitation_id"],
+                            "expected_send_count": 0,
+                        }
+                    ],
+                },
+            )
+        self.h.main.db_pool.on_statement = None
+        self.assertEqual(body["results"][0]["outcome"], "sent", body)
+        self.assertEqual((await self.h.row(inv["invitation_id"]))["send_count"], 1)
+        self.assertEqual(len(self.h.mailer.sent), 1)
+        self.assertIn("invite sent event failed", str(sentry.mock_calls))
+
+    def test_no_code_path_deletes_or_updates_ledger_rows(self):
+        import pathlib
+        import re
+
+        import synapse_pangea_chat
+
+        package = pathlib.Path(synapse_pangea_chat.__file__).parent
+        rewrite = re.compile(
+            r"(DELETE\s+FROM|UPDATE)\s+pangea_student_invitation_event", re.IGNORECASE
+        )
+        offenders = [
+            str(path.relative_to(package))
+            for path in package.rglob("*.py")
+            if rewrite.search(path.read_text(encoding="utf-8"))
+        ]
+        self.assertEqual(offenders, [])
 
     async def test_canvas_and_member_events(self):
         self.h.main.membership[(ROOM, STUDENT)] = "join"
