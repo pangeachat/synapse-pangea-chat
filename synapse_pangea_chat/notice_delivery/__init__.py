@@ -2,7 +2,7 @@
 communication preferences, the logged-out unsubscribe surface, and the
 first-party click record.
 
-Design: the org user-communication-controls and engagement-decisions docs;
+Design: the engagement repo's notices doc and engagement-decisions docs;
 contracts: instructions/notice-delivery.instructions.md.
 """
 
