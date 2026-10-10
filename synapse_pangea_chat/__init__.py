@@ -354,7 +354,9 @@ class PangeaChat:
             course_claim_store.invitations,
             course_claim_store,
             course_claim_notifier,
+            blocked_join_gate_enabled=config.blocked_join_gate_enabled,
         )
+
         # Registers its own sign-in and verified-address callbacks.
         self.claim_by_email = ClaimByEmail(
             api, course_claim_store.invitations, provisioner

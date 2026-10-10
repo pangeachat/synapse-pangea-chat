@@ -28,11 +28,16 @@ MARKER = "org.pangea.course_invitation"
 
 
 class CourseProvisioner:
-    def __init__(self, api, invitations, claims, notifier):
+    def __init__(
+        self, api, invitations, claims, notifier, blocked_join_gate_enabled=True
+    ):
         self.api = api
         self.invitations = invitations
         self.claims = claims
         self.notifier = notifier
+        # The same off switch knock_with_code honours (blocked-join-gate).
+        self.blocked_join_gate_enabled = blocked_join_gate_enabled
+
         self.store = api._hs.get_datastores().main
 
     async def authorized(self, invitation, user):
@@ -212,8 +217,12 @@ class CourseProvisioner:
         membership = member.content.get("membership") if member else None
         # Bans and blocks are preserved, and a block is never revealed: the
         # same answer as a code that does not exist (blocked-join-gate).
-        if membership == "ban" or await is_blocked_by_room_admin(self.api, room, user):
+        if membership == "ban" or (
+            self.blocked_join_gate_enabled
+            and await is_blocked_by_room_admin(self.api, room, user)
+        ):
             raise unavailable()
+
         read_as_prepared = invitation["status"] == "prepared"
         invitation, create = await self.invitations.reserve_creation(
             invitation["invitation_id"], user

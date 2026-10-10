@@ -421,6 +421,12 @@ class TestClaim(_Base):
         self.assertEqual((await self._invitation())["status"], "prepared")
         self.assertEqual(self.room.membership_writes, [])
 
+    async def test_the_gate_switch_turns_the_block_check_off(self):
+        self.blocked.return_value = True
+        self.provisioner.blocked_join_gate_enabled = False
+        self.assertEqual(await self._claim(), ROOM)
+        self.blocked.assert_not_awaited()
+
     async def test_a_revoked_invitation_claims_nothing(self):
         await self.invitations.revoke(self.ident)
         with self.assertRaises(SynapseError) as error:
