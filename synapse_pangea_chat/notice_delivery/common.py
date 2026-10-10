@@ -14,7 +14,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.notice_delivery.common")
 
-DESTINATION_KINDS = ("app", "activity", "course", "subscription", "external")
+DESTINATION_KINDS = (
+    "app",
+    "activity",
+    "course",
+    "subscription",
+    "external",
+    "workspace",
+)
+#: A workspace path is relative to the app: it starts with a single slash and never names a scheme or host.
+WORKSPACE_PATH_MAX = 1024
 #: The client's panel token for the subscription settings page: a
 #: `settingspage` panel whose param is the `subscription` subpage
 #: (client routing.instructions.md, "Reading a workspace URL").
@@ -116,6 +125,15 @@ def preference_rows(raw_preferences):
     ]
 
 
+def workspace_path_ok(path: Any) -> bool:
+    """A workspace path: one leading slash, no scheme or host, printable, bounded."""
+    if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+        return False
+    if len(path) > WORKSPACE_PATH_MAX or "://" in path or "\\" in path:
+        return False
+    return all(32 <= ord(ch) < 127 for ch in path)
+
+
 def external_host_allowed(url: Any, hosts: Iterable[str]) -> bool:
     """Whether ``url`` is an https link to one of the allowed ``hosts``."""
     if not isinstance(url, str):
@@ -153,6 +171,10 @@ def destination_url(
         return f"{base}/?{urlencode({'c': destination['c'], 'left': 'course'})}"
     if kind == "subscription":
         return f"{base}/?right={SUBSCRIPTION_PANEL_TOKEN}"
+    if kind == "workspace" and workspace_path_ok(destination.get("p")):
+        # Any in-app destination the client's URL grammar can express, signed as the path the
+        # caller built; a new in-app surface needs no change here.
+        return f"{base}{destination['p']}"
     if kind == "external":
         url = destination.get("u")
         if external_host_allowed(url, external_link_hosts):

@@ -77,6 +77,10 @@ class TestDestinationParsing(unittest.TestCase):
                 {"kind": "external", "url": BOOKING},
                 {"k": "external", "u": BOOKING},
             ),
+            "workspace": (
+                {"kind": "workspace", "path": "/?c=%21course%3Ax&left=practice"},
+                {"k": "workspace", "p": "/?c=%21course%3Ax&left=practice"},
+            ),
         }
         for kind, (given, compact) in cases.items():
             with self.subTest(kind=kind):
@@ -100,6 +104,13 @@ class TestDestinationParsing(unittest.TestCase):
                 "kind": "external",
                 "url": "http://calendar.app.google/x",
             },
+            "workspace without path": {"kind": "workspace"},
+            "workspace with a host": {"kind": "workspace", "path": "//evil.example/x"},
+            "workspace with a scheme": {
+                "kind": "workspace",
+                "path": "/https://evil.example",
+            },
+            "workspace not rooted": {"kind": "workspace", "path": "?c=x"},
             "external to an unlisted host": {
                 "kind": "external",
                 "url": "https://evil.example/x",
@@ -206,6 +217,10 @@ class TestClickResolution(unittest.IsolatedAsyncioTestCase):
                 "https://app.example.test/?right=settingspage:subscription",
             ),
             "external": ({"k": "external", "u": BOOKING}, BOOKING),
+            "workspace": (
+                {"k": "workspace", "p": "/?c=%21course%3Ax&left=practice"},
+                "https://app.example.test/?c=%21course%3Ax&left=practice",
+            ),
         }
         for kind, (compact, expected) in cases.items():
             with self.subTest(kind=kind):

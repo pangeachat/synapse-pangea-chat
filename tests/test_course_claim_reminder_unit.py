@@ -332,3 +332,43 @@ class TestV2RemindCallerRendered(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertNotIn("html", r.send.await_args.kwargs["rendered"])
+
+
+class TestV2PrepareWithoutEmail(unittest.IsolatedAsyncioTestCase):
+    def _resource(self):
+        from synapse_pangea_chat.email_invite.course_invitation_api import (
+            CourseInvitationAPI,
+        )
+
+        api: Any = MagicMock()
+        api._hs.get_clock.return_value.time_msec.return_value = 7
+        invitations = MagicMock()
+        invitations.prepare = AsyncMock(return_value=("inv-9", True))
+        invitations.status = AsyncMock(
+            return_value={"invitation_id": "inv-9", "status": "prepared"}
+        )
+        resource = CourseInvitationAPI(
+            api, PangeaChatConfig(), MagicMock(), invitations, MagicMock(), "prepare"
+        )
+        resource.code = AsyncMock(return_value="c0de123")
+        resource.send = AsyncMock()
+        return resource
+
+    async def test_send_email_false_prepares_and_sends_nothing(self) -> None:
+        r = self._resource()
+        body = {
+            "request_key": "k",
+            "teacher_email": "t@x.org",
+            "title": "T",
+            "course_plan_id": "plan",
+            "target_language": "es",
+        }
+        out = await r.prepare("@op:x", {**body, "send_email": False})
+        self.assertEqual(out["status"], "prepared")
+        r.send.assert_not_awaited()
+        await r.prepare("@op:x", body)
+        r.send.assert_awaited_once()
+        from synapse.api.errors import SynapseError
+
+        with self.assertRaises(SynapseError):
+            await r.prepare("@op:x", {**body, "send_email": "no"})
