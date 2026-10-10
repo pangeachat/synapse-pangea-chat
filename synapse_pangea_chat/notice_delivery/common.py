@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import TYPE_CHECKING, Optional
-from urllib.parse import quote, urlencode
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional
+from urllib.parse import quote, urlencode, urlsplit
 
 from synapse.module_api import ModuleApi
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
+
+logger = logging.getLogger("synapse.module.synapse_pangea_chat.notice_delivery.common")
+
+DESTINATION_KINDS = ("app", "activity", "course", "subscription", "external")
+#: The client's panel token for the subscription settings page: a
+#: `settingspage` panel whose param is the `subscription` subpage
+#: (client routing.instructions.md, "Reading a workspace URL").
+SUBSCRIPTION_PANEL_TOKEN = "settingspage:subscription"
+
 
 TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
 
@@ -104,3 +114,52 @@ def preference_rows(raw_preferences):
         for category, label in CATEGORY_LABELS.items()
         if category in GLOBAL_OFF_CATEGORIES
     ]
+
+
+def external_host_allowed(url: Any, hosts: Iterable[str]) -> bool:
+    """Whether ``url`` is an https link to one of the allowed ``hosts``."""
+    if not isinstance(url, str):
+        return False
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and bool(host) and host in {h.lower() for h in hosts}
+
+
+def token_destination(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The compact destination a click token names. Links issued before
+    destinations existed carry only the activity ids, and resolve as they
+    always did."""
+    compact = payload.get("d")
+    if isinstance(compact, dict) and compact.get("k") in DESTINATION_KINDS:
+        return compact
+    if isinstance(payload.get("a"), str):
+        return {"k": "activity", "a": payload["a"], "s": payload.get("s")}
+    return {"k": "app"}
+
+
+def destination_url(
+    app_base_url: str, destination: Dict[str, Any], external_link_hosts: Iterable[str]
+) -> str:
+    """The URL a click on a destination lands on. The workspace URL grammar is
+    the client's (routing.instructions.md): ``?c=`` is the course context and
+    ``left=course`` opens its card; ``?right=`` opens a settings page."""
+    base = app_base_url.rstrip("/")
+    kind = destination.get("k")
+    if kind == "activity":
+        return app_url(
+            base, activity_id=destination.get("a"), session_room_id=destination.get("s")
+        )
+    if kind == "course" and isinstance(destination.get("c"), str):
+        return f"{base}/?{urlencode({'c': destination['c'], 'left': 'course'})}"
+    if kind == "subscription":
+        return f"{base}/?right={SUBSCRIPTION_PANEL_TOKEN}"
+    if kind == "external":
+        url = destination.get("u")
+        if external_host_allowed(url, external_link_hosts):
+            return str(url)
+        # A host removed from the allowlist retires the links already sent:
+        # the person still lands somewhere safe, and the fallback is logged.
+        logger.warning(
+            "notice external destination host no longer allowed; redirecting home"
+        )
+    return f"{base}/"

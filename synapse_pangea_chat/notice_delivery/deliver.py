@@ -6,7 +6,7 @@ import html
 import json
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Dict, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, cast
 
 from synapse.api.constants import PresenceState
 from synapse.api.errors import (
@@ -21,6 +21,7 @@ from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.config import DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS
 from synapse_pangea_chat.direct_push.direct_push import DirectPush
 from synapse_pangea_chat.direct_push.types import SendPushRequest
 from synapse_pangea_chat.notice_delivery.categories import (
@@ -51,6 +52,8 @@ from synapse_pangea_chat.notice_delivery.push_rule import ensure_bot_notice_push
 from synapse_pangea_chat.notice_delivery.rate_limit import AdminRateLimiter
 from synapse_pangea_chat.notice_delivery.request import (
     EMAIL_ONLY,
+    SECONDARY_SLOT,
+    Destination,
     NoticeRequest,
     is_structured,
 )
@@ -102,7 +105,10 @@ class DeliverNotice(Resource):
         )
         self._delivery_log = DeliveryLog(api, config)
         self._transport_claims = TransportClaims(api)
-        self.schedule = NoticeSchedule(api, self._deliver_scheduled)
+        self.schedule = NoticeSchedule(
+            api, self._deliver_scheduled, config.notice_external_link_hosts
+        )
+
         self._send_email_handler = self._hs.get_send_email_handler()
         self._app_name = self._hs.config.email.email_app_name
         [self._email_html, self._email_text] = api.read_templates(
@@ -157,7 +163,7 @@ class DeliverNotice(Resource):
                     request, 400, {"error": "Invalid JSON"}, send_cors=True
                 )
                 return
-            error = self._validate(body)
+            error = self._validate(body, self._config.notice_external_link_hosts)
             if error is not None:
                 respond_with_json(request, 400, {"error": error}, send_cors=True)
                 return
@@ -207,10 +213,12 @@ class DeliverNotice(Resource):
         return parsed if isinstance(parsed, dict) else None
 
     @staticmethod
-    def _validate(body: Dict[str, Any]) -> Optional[str]:
+    def _validate(
+        body: Dict[str, Any], external_link_hosts: Optional[Iterable[str]] = None
+    ) -> Optional[str]:
         if is_structured(body):
             try:
-                NoticeRequest.parse(body)
+                NoticeRequest.parse(body, external_link_hosts=external_link_hosts)
             except ValueError as error:
                 return str(error)
             return None
@@ -224,25 +232,44 @@ class DeliverNotice(Resource):
         content = body.get("content")
         if content is not None and not isinstance(content, dict):
             return "content must be an object"
+        if body.get("secondary_destination") is not None:
+            # The flat body renders the module's own template, which has one
+            # call to action; a second link needs caller-rendered email.
+            return "secondary_destination requires structured email content"
+        if body.get("destination") is not None:
+            try:
+                Destination.parse(
+                    body["destination"],
+                    DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS
+                    if external_link_hosts is None
+                    else external_link_hosts,
+                )
+            except ValueError as error:
+                return str(error)
         return None
+
+    def _parse(self, body: Dict[str, Any]) -> NoticeRequest:
+        return NoticeRequest.parse(
+            body, external_link_hosts=self._config.notice_external_link_hosts
+        )
 
     async def deliver(
         self, body: Dict[str, Any], *, requested_by: Optional[str] = None
     ) -> Dict[str, Any]:
         """Shared entry point for HTTP operators and trusted internal flows."""
-        error = self._validate(body)
+        error = self._validate(body, self._config.notice_external_link_hosts)
         if error:
             raise ValueError(error)
         if "scheduled_at" in body:
             body = {**body, "_requested_by": requested_by or body["sender_id"]}
-            req = NoticeRequest.parse(body)
+            req = self._parse(body)
             await self._validate_scheduled_target(body, req)
             return await self.schedule.enqueue(body)
         return await self._deliver_now(body)
 
     async def _deliver_scheduled(self, body: Dict[str, Any]) -> Dict[str, Any]:
         # Revalidate persisted content and eligibility; never run through enqueue.
-        NoticeRequest.parse(body)
+        self._parse(body)
         return await self._deliver_now(body)
 
     async def _validate_scheduled_target(
@@ -270,8 +297,9 @@ class DeliverNotice(Resource):
 
     async def _deliver_now(self, body: Dict[str, Any]) -> Dict[str, Any]:
         body = dict(body)
-        req = NoticeRequest.parse(body) if is_structured(body) else None
+        req = self._parse(body) if is_structured(body) else None
         record_id = None
+
         if req is not None:
             if req.notice_event_id is not None:
                 await self._validate_notice(req)
@@ -590,27 +618,48 @@ class DeliverNotice(Resource):
         now = now_ms(self._api)
         ttl_ms = self._config.notice_token_ttl_days * MILLISECONDS_PER_DAY
         variant = _optional_str(body.get("variant"))
-        click_token = sign_token(
-            secret,
-            {
-                "k": TOKEN_KIND_CLICK,
-                "u": user_id,
-                "e": _optional_str(body.get("notice_event_id")),
-                "r": _optional_str(body.get("notice_room_id")),
-                "v": variant,
-                "a": _optional_str(body.get("activity_id")),
-                "s": _optional_str(body.get("session_room_id")),
-            },
-            now_ms=now,
-            ttl_ms=ttl_ms,
-        )
+        if req is not None:
+            primary, secondary = req.destination, req.secondary_destination
+        else:
+            primary = (
+                Destination.parse(
+                    body["destination"], self._config.notice_external_link_hosts
+                )
+                if body.get("destination") is not None
+                else Destination.from_ids(body)
+            )
+            secondary = None
+
+        def click_token(destination: Destination, link: str) -> str:
+            # Each link is its own signed token naming its destination and
+            # which link it is; `a`/`s` stay for links issued before `d`.
+            return sign_token(
+                secret,
+                {
+                    "k": TOKEN_KIND_CLICK,
+                    "u": user_id,
+                    "e": _optional_str(body.get("notice_event_id")),
+                    "r": _optional_str(body.get("notice_room_id")),
+                    "v": variant,
+                    "a": _optional_str(body.get("activity_id")),
+                    "s": _optional_str(body.get("session_room_id")),
+                    "d": destination.compact(),
+                    "l": link,
+                },
+                now_ms=now,
+                ttl_ms=ttl_ms,
+            )
+
         unsubscribe_token = sign_token(
             secret,
             {"k": TOKEN_KIND_UNSUBSCRIBE, "u": user_id, "c": category},
             now_ms=now,
             ttl_ms=ttl_ms,
         )
-        cta_url = click_url(base, click_token)
+        cta_url = click_url(base, click_token(primary, "cta"))
+        cta2_url = (
+            click_url(base, click_token(secondary, "cta2")) if secondary else None
+        )
         unsub_url = unsubscribe_url(base, unsubscribe_token)
 
         email_content = req.email if req else None
@@ -645,7 +694,10 @@ class DeliverNotice(Resource):
                 "{{receiving_reason}}": email_content.receiving_reason,
                 "{{postal_address}}": self._config.notice_email_postal_address or "",
             }
+            if cta2_url is not None:
+                replacements[SECONDARY_SLOT] = cta2_url
             rendered_html, rendered_text = email_content.html, email_content.text
+
             for slot, value in replacements.items():
                 rendered_html = rendered_html.replace(
                     slot, html.escape(value, quote=True)

@@ -7,7 +7,7 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, cast
+from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, cast
 
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.storage.engines import PostgresEngine
@@ -25,9 +25,14 @@ TABLE = "pangea_notice_schedule"
 
 class NoticeSchedule:
     def __init__(
-        self, api: Any, execute: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]
+        self,
+        api: Any,
+        execute: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
+        external_link_hosts: Optional[Iterable[str]] = None,
     ):
         self._api = api
+        self._external_link_hosts = external_link_hosts
+
         self._db = api._hs.get_datastores().main.db_pool
         self._clock = api._hs.get_clock()
         self._execute = execute
@@ -71,8 +76,9 @@ class NoticeSchedule:
         self._ready = True
 
     async def enqueue(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        req = NoticeRequest.parse(body)
+        req = NoticeRequest.parse(body, external_link_hosts=self._external_link_hosts)
         timestamp = datetime.fromisoformat(body["scheduled_at"].replace("Z", "+00:00"))
+
         due = int(timestamp.timestamp() * 1000)
         payload = json.dumps(
             body, sort_keys=True, separators=(",", ":"), allow_nan=False
