@@ -5,7 +5,7 @@ description: "Notice delivery — the Synapse module's channel selection, commun
 
 # Notice Delivery — Synapse Module
 
-This module provides shared notice delivery for automated Synapse flows and operators. The [user-communication-controls](../../../.github/.github/instructions/user-communication-controls.instructions.md) catalog owns message categories, variants, refusability, and allowed delivery methods. For `use-available`, delivery selects in-app when the person is active, push when a working device accepts it, then email. Refusals use the same first-party account-data store regardless of caller or channel. Nothing here defines a separate catalog.
+This module provides shared notice delivery for automated Synapse flows and operators. The [notices](../../../engagement/.github/instructions/notices.instructions.md) catalog owns message categories, variants, refusability, and allowed delivery methods. For `use-available`, delivery selects in-app when the person is active, push when a working device accepts it, then email. Refusals use the same first-party account-data store regardless of caller or channel. Nothing here defines a separate catalog.
 
 For Synapse Admin API, Module API, and Matrix spec documentation links, see [synapse-docs.instructions.md](../../../.github/.github/instructions/synapse-docs.instructions.md).
 
