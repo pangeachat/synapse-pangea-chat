@@ -72,6 +72,7 @@ PREFIX = "/_synapse/client/pangea/v1/"
 MAX_ADD = 500
 MAX_SEND = 50
 SOURCES_ADDED = ("manual", "csv")
+SOURCE_MEMBER = "member"
 # Not a full RFC 5322 check: one "@", no spaces, a dot in the domain. Synapse
 # canonicalises the rest the way it stores verified addresses.
 _EMAIL_SHAPE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
@@ -164,6 +165,17 @@ def invitation_view(
     row: Dict[str, Any],
     pending_count: int = 0,
     same_student_as: Optional[str] = None,
+) -> Dict[str, Any]:
+    view = _view_fields(row, pending_count, same_student_as)
+    if row["source"] == SOURCE_MEMBER:
+        # The course member this "Invite to a seat" row was made for, so the
+        # roster can join the two. Never the address.
+        view["user_id"] = row["member_user_id"]
+    return view
+
+
+def _view_fields(
+    row: Dict[str, Any], pending_count: int, same_student_as: Optional[str]
 ) -> Dict[str, Any]:
     return {
         "invitation_id": row["id"],
@@ -420,7 +432,13 @@ class StudentInvitationHandlers:
         if key is None:
             return _conflict("ORG.PANGEA.NO_EMAIL", "User has no email")
         (row,) = await self._store.add(
-            room_id, [(None, key)], "member", caller, now_ms(), self._new_id
+            room_id,
+            [(None, key)],
+            SOURCE_MEMBER,
+            caller,
+            now_ms(),
+            self._new_id,
+            member_user_id=user_id,
         )
         logger.info(
             "student invitation %s for member %s by %s", row["id"], user_id, caller

@@ -633,6 +633,15 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         self.assertEqual(set(made), {"invitation_id", "state"})
         listed = self.listing(room)[made["invitation_id"]]
         self.assertEqual((listed["email"], listed["source"]), (None, "member"))
+        # D2: the row names the member it was made for (never the address).
+        self.assertEqual(listed["user_id"], self.users["member"])
+        self.assertTrue(
+            all(
+                "user_id" not in row
+                for row in self.listing(room).values()
+                if row["source"] != "member"
+            )
+        )
         self.assertNotIn(MEMBER, str(self.listing(room)))
         self.assertEqual(
             self.ok("GET", SI + "mine/pending", self.tokens["member"])["invitations"][

@@ -1262,6 +1262,72 @@ class TestInviteMember(_Base):
             joined, {"invitation_id": body["invitation_id"], "state": "joined"}
         )
 
+    async def test_list_names_the_member_a_member_invitation_was_made_for_and_no_other_row(
+        self,
+    ):
+        """D2: T3 carries `user_id` on `source=member` rows (never the
+        address), so the roster can join the row to its course member. No
+        other row kind gains the field."""
+        self.h.main.membership[(ROOM, STUDENT)] = "join"
+        self.h.verify(STUDENT, "member@school.example")
+        (manual,) = await self.h.add("manual@school.example")
+        status, made = await self.h.handlers.invite_member(
+            TEACHER, {"room_id": ROOM, "user_id": STUDENT}
+        )
+        self.assertEqual(status, 200, made)
+        listed = await self.h.listing()
+        member_row = listed[made["invitation_id"]]
+        self.assertEqual(member_row["user_id"], STUDENT)
+        self.assertIsNone(member_row["email"])
+        self.assertNotIn("school", str(member_row))
+        self.assertNotIn("user_id", listed[manual["invitation_id"]])
+        # The member it was made for, even after the address moves to
+        # another course member, or the member leaves.
+        self.h.main.threepids.pop(STUDENT)
+        self.h.main.membership[(ROOM, OTHER)] = "join"
+        self.h.verify(OTHER, "member@school.example")
+        self.h.main.membership[(ROOM, STUDENT)] = "leave"
+        self.assertEqual(
+            (await self.h.listing())[made["invitation_id"]]["user_id"], STUDENT
+        )
+        # A manual add of a revoked member row's address makes it a manual row
+        # again: it no longer names a member.
+        await self.h.handlers.revoke(
+            TEACHER, {"room_id": ROOM, "invitation_id": made["invitation_id"]}
+        )
+        (readded,) = await self.h.add("member@school.example")
+        self.assertEqual(readded["invitation_id"], made["invitation_id"])
+        self.assertNotIn("user_id", readded)
+        self.assertIsNone((await self.h.row(made["invitation_id"]))["member_user_id"])
+
+    async def test_an_existing_table_gains_the_member_column(self):
+        """A database created before `member_user_id` existed is migrated
+        in place, and its rows keep their data."""
+        pool = self.h.main.db_pool
+        pool.connection.execute(
+            "CREATE TABLE pangea_student_invitation (id TEXT PRIMARY KEY,"
+            " course_room_id TEXT NOT NULL, email_key TEXT NOT NULL, email TEXT,"
+            " state TEXT NOT NULL, source TEXT NOT NULL, invited_by TEXT NOT NULL,"
+            " claimant TEXT, send_count BIGINT NOT NULL DEFAULT 0,"
+            " last_sent_at_ms BIGINT, created_at_ms BIGINT NOT NULL,"
+            " joined_at_ms BIGINT, lti_issuer TEXT, lti_context_id TEXT,"
+            " lti_user_id TEXT, UNIQUE (course_room_id, email_key))"
+        )
+        pool.connection.execute(
+            "INSERT INTO pangea_student_invitation (id, course_room_id, email_key,"
+            " state, source, invited_by, created_at_ms)"
+            " VALUES ('old', ?, 'old@school.example', 'invited', 'manual', ?, 1)",
+            (ROOM, TEACHER),
+        )
+        pool.connection.commit()
+        row = await self.h.row("old")
+        self.assertIsNone(row["member_user_id"])
+        self.assertEqual(row["email_key"], "old@school.example")
+        # Running the migration again is harmless.
+        store = StudentInvitationStore(self.h.api._hs)
+        await store.ensure()
+        self.assertEqual((await store.get("old"))["email_key"], "old@school.example")
+
     async def test_invite_member_refusals(self):
         status, body = await self.h.handlers.invite_member(
             TEACHER, {"room_id": ROOM, "user_id": STUDENT}

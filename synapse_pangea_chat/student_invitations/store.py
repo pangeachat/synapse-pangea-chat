@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from synapse.storage.engines import PostgresEngine
+
 STATE_INVITED = "invited"
 STATE_JOINED = "joined"
 STATE_LEFT = "left"
@@ -52,6 +54,7 @@ SCHEMA = (
         lti_issuer TEXT,
         lti_context_id TEXT,
         lti_user_id TEXT,
+        member_user_id TEXT,
         UNIQUE (course_room_id, email_key))""",
     """CREATE UNIQUE INDEX IF NOT EXISTS pangea_student_invitation_one_joined
         ON pangea_student_invitation (course_room_id, claimant)
@@ -96,6 +99,7 @@ COLUMNS = (
     "lti_issuer",
     "lti_context_id",
     "lti_user_id",
+    "member_user_id",
 )
 _SELECT = "SELECT " + ", ".join(COLUMNS) + " FROM pangea_student_invitation "
 ACK_COLUMNS = (
@@ -183,6 +187,7 @@ class StudentInvitationStore:
         def create(txn: Any) -> None:
             for sql in SCHEMA:
                 txn.execute(sql)
+            _add_member_column(txn)
 
         await self.db.runInteraction("pangea_student_invitation_schema", create)
         self._ready = True
@@ -363,8 +368,11 @@ class StudentInvitationStore:
         invited_by: str,
         now_ms: int,
         new_id: Any,
+        member_user_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Add (email as entered or None, email key) pairs to a course.
+        ``member_user_id`` is the course member an "Invite to a seat" row is
+        made for (``source=member``); None for every other source.
 
         Per (course, key): a live row is returned unchanged; a ``revoked`` or
         ``left`` row is reset to a fresh ``invited`` row from this inviter,
@@ -383,10 +391,19 @@ class StudentInvitationStore:
                 txn.execute(
                     "INSERT INTO pangea_student_invitation"
                     " (id, course_room_id, email_key, email, state, source,"
-                    "  invited_by, send_count, created_at_ms)"
-                    " VALUES (?, ?, ?, ?, 'invited', ?, ?, 0, ?)"
+                    "  invited_by, send_count, created_at_ms, member_user_id)"
+                    " VALUES (?, ?, ?, ?, 'invited', ?, ?, 0, ?, ?)"
                     " ON CONFLICT (course_room_id, email_key) DO NOTHING",
-                    (new_id(), room_id, key, email, source, invited_by, now_ms),
+                    (
+                        new_id(),
+                        room_id,
+                        key,
+                        email,
+                        source,
+                        invited_by,
+                        now_ms,
+                        member_user_id,
+                    ),
                 )
                 row = _select_one(
                     txn,
@@ -404,8 +421,8 @@ class StudentInvitationStore:
                         " claimant = NULL, joined_at_ms = NULL, email = ?,"
                         " source = ?, invited_by = ?, created_at_ms = ?,"
                         " lti_issuer = NULL, lti_context_id = NULL,"
-                        " lti_user_id = NULL WHERE id = ?",
-                        (email, source, invited_by, now_ms, row["id"]),
+                        " lti_user_id = NULL, member_user_id = ? WHERE id = ?",
+                        (email, source, invited_by, now_ms, member_user_id, row["id"]),
                     )
                     txn.execute(
                         "DELETE FROM pangea_invitation_ack WHERE invitation_id = ?",
@@ -786,6 +803,22 @@ class StudentInvitationStore:
                 # another invitation in this course by the same account.
                 return ALREADY_CLAIMED_IN_COURSE, None
             raise
+
+
+def _add_member_column(txn: Any) -> None:
+    """`member_user_id` came after the table: add it to a table created
+    without it. Idempotent, and safe for two workers at once on Postgres."""
+    if isinstance(getattr(txn, "database_engine", None), PostgresEngine):
+        txn.execute(
+            "ALTER TABLE pangea_student_invitation"
+            " ADD COLUMN IF NOT EXISTS member_user_id TEXT"
+        )
+        return
+    txn.execute("PRAGMA table_info(pangea_student_invitation)")
+    if "member_user_id" not in {column[1] for column in txn.fetchall()}:
+        txn.execute(
+            "ALTER TABLE pangea_student_invitation ADD COLUMN member_user_id TEXT"
+        )
 
 
 def _delete_managed(txn: Any, user_id: str, room_id: str) -> None:
