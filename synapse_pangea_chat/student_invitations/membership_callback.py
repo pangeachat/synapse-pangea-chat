@@ -54,13 +54,11 @@ class MembershipRelease:
                 "student invitation release",
                 error,
                 room=event.room_id,
-                user=event.state_key,
             )
             return
         if released is not None:
             logger.info(
-                "Student invitation %s left: %s is no longer in %s",
+                "Student invitation %s left: its claimant is no longer in %s",
                 released,
-                event.state_key,
                 event.room_id,
             )

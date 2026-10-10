@@ -272,9 +272,8 @@ class StudentInvitationHandlers:
             room_id, entries, source, caller, now_ms(), self._new_id
         )
         logger.info(
-            "student invitations added: room=%s caller=%s count=%d",
+            "student invitations added: room=%s count=%d",
             room_id,
-            caller,
             len(entries),
         )
         return 200, {"invitations": await self._views(room_id, rows)}
@@ -334,9 +333,8 @@ class StudentInvitationHandlers:
                 continue
             results.append({"invitation_id": ident, "outcome": "sent", "reason": None})
         logger.info(
-            "student invitations send: room=%s caller=%s sent=%d of %d",
+            "student invitations send: room=%s sent=%d of %d",
             room_id,
-            caller,
             sum(1 for r in results if r["outcome"] == "sent"),
             len(parsed),
         )
@@ -359,7 +357,7 @@ class StudentInvitationHandlers:
         row = await self._store.revoke(room_id, ident)
         if row is None:
             return 404, NOT_FOUND
-        logger.info("student invitation %s revoked by %s", ident, caller)
+        logger.info("student invitation %s revoked", ident)
         return 200, {"invitation": await self._view(room_id, row)}
 
     async def pending_approvals(self, caller: str, query: Any) -> Result:
@@ -386,11 +384,11 @@ class StudentInvitationHandlers:
                 return 404, NOT_FOUND
             if status == "not_live":
                 return _conflict(*_NOT_LIVE)
-            logger.info("student invitation %s: %s denied", ident, user_id)
+            logger.info("student invitation %s: approval denied", ident)
             return 200, {"invitation": await self._view(room_id, denied)}
         outcome, claimed = await self._approvals.grant(ident, user_id)
         if outcome == CLAIMED and claimed is not None:
-            logger.info("student invitation %s: %s granted", ident, user_id)
+            logger.info("student invitation %s: approval granted", ident)
             return 200, {"invitation": await self._view(room_id, claimed)}
         if outcome == ALREADY_CLAIMED_IN_COURSE:
             return _conflict(*_ALREADY)
@@ -405,10 +403,9 @@ class StudentInvitationHandlers:
             return refusal
         result = await self._approvals.approve_all(room_id)
         logger.info(
-            "student invitations approve_all: room=%s caller=%s granted=%d"
+            "student invitations approve_all: room=%s granted=%d"
             " skipped=%d refused=%d",
             room_id,
-            caller,
             len(result["granted"]),
             len(result["skipped_multiple"]),
             len(result["refused"]),
@@ -440,9 +437,7 @@ class StudentInvitationHandlers:
             self._new_id,
             member_user_id=user_id,
         )
-        logger.info(
-            "student invitation %s for member %s by %s", row["id"], user_id, caller
-        )
+        logger.info("student invitation %s created for a course member", row["id"])
         return 200, {"invitation_id": row["id"], "state": row["state"]}
 
     async def live(self, caller: str, query: Any) -> Result:
@@ -481,7 +476,7 @@ class StudentInvitationHandlers:
         if row["state"] == STATE_JOINED:
             return 200, claimed
         await self._store.record_ack(ident, caller, version, now_ms())
-        logger.info("student invitation %s confirmed by %s", ident, caller)
+        logger.info("student invitation %s confirmed", ident)
         # The claim itself requires the verified-email match (or a grant) and
         # joins nothing without one.
         outcome, _ = await self._claims.claim(ident, caller)

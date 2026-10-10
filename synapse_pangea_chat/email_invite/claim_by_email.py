@@ -90,12 +90,10 @@ class ClaimByEmail:
         try:
             await self._student_claims.repair_managed_for(user_id)
         except Exception as e:
-            logger.error(
-                "Managed record repair failed for %s: %s", user_id, type(e).__name__
-            )
+            logger.error("Managed record repair failed: %s", type(e).__name__)
             if sentry_sdk is not None:
                 sentry_sdk.capture_message(
-                    f"managed record repair failed for {user_id}: {type(e).__name__}",
+                    f"managed record repair failed: {type(e).__name__}",
                     level="error",
                 )
 
@@ -107,15 +105,10 @@ class ClaimByEmail:
         try:
             await self._student_claims.claim_confirmed_for(user_id)
         except Exception as e:
-            logger.error(
-                "Student invitation claims failed for %s: %s",
-                user_id,
-                type(e).__name__,
-            )
+            logger.error("Student invitation claims failed: %s", type(e).__name__)
             if sentry_sdk is not None:
                 sentry_sdk.capture_message(
-                    f"student invitation claims failed for {user_id}: "
-                    f"{type(e).__name__}",
+                    f"student invitation claims failed: {type(e).__name__}",
                     level="error",
                 )
 
@@ -135,11 +128,7 @@ class ClaimByEmail:
             emails = [t.address for t in threepids if t.medium == EMAIL_MEDIUM]
             invitations = await self._invitations.prepared_for_emails(emails)
         except Exception as e:
-            logger.error(
-                "Could not look up prepared courses for %s: %s",
-                user_id,
-                type(e).__name__,
-            )
+            logger.error("Could not look up prepared courses: %s", type(e).__name__)
             _capture_exception(e)
             return
         for invitation in invitations:
@@ -152,34 +141,22 @@ class ClaimByEmail:
                 if e.errcode == ERRCODE_CODE_NOT_FOUND:
                     # Revoked, or claimed by another account's link, since the
                     # lookup: the same outcome the link would give.
-                    logger.info(
-                        "Invitation %s is no longer claimable for %s", ident, user_id
-                    )
+                    logger.info("Invitation %s is no longer claimable", ident)
                     continue
                 logger.error(
-                    "Claim of %s by verified address failed for %s: %s",
-                    ident,
-                    user_id,
-                    e.errcode,
+                    "Claim of %s by verified address failed: %s", ident, e.errcode
                 )
                 _capture_exception(e)
                 continue
             except Exception as e:
                 logger.error(
-                    "Claim of %s by verified address failed for %s: %s",
+                    "Claim of %s by verified address failed: %s",
                     ident,
-                    user_id,
                     type(e).__name__,
                 )
                 _capture_exception(e)
                 continue
             if room is None:
-                logger.info(
-                    "Invitation %s is being claimed for %s by another request",
-                    ident,
-                    user_id,
-                )
+                logger.info("Invitation %s is being claimed by another request", ident)
                 continue
-            logger.info(
-                "Claimed invitation %s for %s by verified address", ident, user_id
-            )
+            logger.info("Claimed invitation %s by verified address", ident)

@@ -12,16 +12,20 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import time
 import unittest
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import jwt
-from synapse.api.errors import InvalidClientTokenError
+from synapse.api.errors import InvalidClientTokenError, SynapseError
 
 from synapse_pangea_chat.config import PangeaChatConfig
+from synapse_pangea_chat.email_invite import claim_by_email as claim_by_email_module
+from synapse_pangea_chat.email_invite.claim_by_email import ClaimByEmail
 from synapse_pangea_chat.lti import nrps as nrps_module
 from synapse_pangea_chat.lti.course_link import CourseLinks
 from synapse_pangea_chat.lti.http import UpstreamError, next_link
@@ -53,10 +57,18 @@ from synapse_pangea_chat.lti.validation import (
     LaunchRejected,
 )
 from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
+from synapse_pangea_chat.room_code.constants import ERRCODE_CODE_NOT_FOUND
 from synapse_pangea_chat.student_invitations import report
 from synapse_pangea_chat.student_invitations.accounts import Accounts
-from synapse_pangea_chat.student_invitations.api import RATE_LIMITED, UNAUTHORIZED
+from synapse_pangea_chat.student_invitations.api import (
+    RATE_LIMITED,
+    UNAUTHORIZED,
+    guarded,
+)
 from synapse_pangea_chat.student_invitations.invite_email import InviteMailer
+from synapse_pangea_chat.student_invitations.membership_callback import (
+    MembershipRelease,
+)
 from tests.test_student_invitations_unit import (
     OTHER,
     OTHER_ROOM,
@@ -68,6 +80,7 @@ from tests.test_student_invitations_unit import (
     FakeRooms,
     Harness,
     V,
+    _member_event,
 )
 
 from .lti_platform_double import INSTRUCTOR, LEARNER, new_rsa_key, private_pem
@@ -84,6 +97,7 @@ OTHER_NRPS_URL = OTHER_ISSUER + "/api/lti/courses/9/names_and_roles"
 APP = "https://app.example.test"
 DASH = "https://admin.example.test"
 SUB = "canvas-user-42"
+FOURTH = "@fourth:x"
 TEACHER_SUB = "canvas-teacher-1"
 OTHER_SUB = "canvas-user-77"
 CANVAS_EMAIL = "canvas.student@school.example"
@@ -1604,6 +1618,186 @@ class TestLearnerLaunch(_Base):
             self.assertNotIn(secret, text)
 
 
+class TestNoUserIdsInLogs(_Base):
+    """Owner decision 2026-10-10: Matrix user ids are never logged, as emails
+    are not. Drives the invitation, claim, release, sign-in hook, Canvas
+    connect, import and link flows, success and failure, and reads every
+    captured line and every Sentry message."""
+
+    MXID = re.compile(r"@[A-Za-z0-9._=/+-]+:[A-Za-z0-9.-]+")
+    EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
+
+    async def test_no_user_id_in_logs(self):
+        captured = _capture()
+        self.addCleanup(captured.detach)
+        h = self.c.h
+        with patch.object(report, "sentry_sdk") as sentry, patch.object(
+            claim_by_email_module, "sentry_sdk"
+        ) as hook_sentry:
+            # Invitations: add, send, revoke, decide, approve_all, invite_member.
+            a, b, c, d = await h.add(
+                "a@school.example",
+                "b@school.example",
+                "c@school.example",
+                "d@school.example",
+            )
+            await h.handlers.send(
+                TEACHER,
+                {
+                    "room_id": ROOM,
+                    "items": [
+                        {"invitation_id": a["invitation_id"], "expected_send_count": 0}
+                    ],
+                },
+            )
+            h.mailer.fail_with = RuntimeError("refused")
+            await h.handlers.send(
+                TEACHER,
+                {
+                    "room_id": ROOM,
+                    "items": [
+                        {"invitation_id": b["invitation_id"], "expected_send_count": 0}
+                    ],
+                },
+            )
+            h.mailer.fail_with = None
+            await h.handlers.revoke(
+                TEACHER, {"room_id": ROOM, "invitation_id": d["invitation_id"]}
+            )
+            await h.confirm(OTHER, b["invitation_id"])
+            await h.confirm(THIRD, b["invitation_id"])
+            for user, decision in ((OTHER, "deny"), (THIRD, "grant")):
+                status, body = await h.handlers.decide(
+                    TEACHER,
+                    {
+                        "room_id": ROOM,
+                        "invitation_id": b["invitation_id"],
+                        "user_id": user,
+                        "decision": decision,
+                    },
+                )
+                self.assertEqual(status, 200, body)
+            await h.confirm(OTHER, c["invitation_id"])
+            await h.handlers.approve_all(TEACHER, {"room_id": ROOM})
+            h.main.membership[(ROOM, STUDENT)] = "join"
+            h.verify(STUDENT, "member@school.example")
+            status, body = await h.handlers.invite_member(
+                TEACHER, {"room_id": ROOM, "user_id": STUDENT}
+            )
+            self.assertEqual(status, 200, body)
+            # Claim by confirmation, then leave; then the same paths failing.
+            h.verify(STUDENT, "a@school.example", 2)
+            status, body = await h.confirm(STUDENT, a["invitation_id"])
+            self.assertEqual(body["result"], "claimed", body)
+            release = MembershipRelease(h.store, h.claims)
+            await release.on_new_event(
+                _member_event(ROOM, STUDENT, "leave", STUDENT), {}
+            )
+            h.main.db_pool.error = RuntimeError("down")
+            await release.on_new_event(
+                _member_event(ROOM, STUDENT, "leave", STUDENT), {}
+            )
+            await h.claims.claim_confirmed_for(STUDENT)
+            await h.claims.repair_managed_for(STUDENT)
+            await guarded("confirm", lambda: h.confirm(STUDENT, a["invitation_id"]))
+            h.main.db_pool.error = None
+            h.joiner.refuse.add(STUDENT)
+            await guarded("confirm", lambda: h.confirm(STUDENT, c["invitation_id"]))
+            h.joiner.refuse.clear()
+            # Canvas: connect, import, link, relaunch.
+            await self.linked(OTHER, OTHER_SUB)
+            await self.canvas_row("logged@school.example")
+            ticket = await self.c.ticket(self.c.launch())
+            await self.c.learner_l1(STUDENT, "bogus")
+            await self.c.learner_l1(STUDENT, ticket)
+            await self.c.redirects.location(self.c.launch())
+            # A leave during the claim, a claim by the verified-address hook
+            # and its failures, a power-level pass on a row without its
+            # confirmation, a sign-in pass over an unclaimable confirmation.
+            e, f = await h.add("e@school.example", "f@school.example")
+            h.verify(FOURTH, "e@school.example")
+            original = h.joiner.force_join
+
+            async def join_then_leave(room_id: str, user_id: str) -> Dict[str, Any]:
+                result = await original(room_id, user_id)
+                h.main.membership[(room_id, user_id)] = "leave"
+                return result
+
+            h.joiner.force_join = join_then_leave  # type: ignore[method-assign]
+            await h.confirm(FOURTH, e["invitation_id"])
+            h.joiner.force_join = original  # type: ignore[method-assign]
+            legacy = MagicMock()
+            legacy.prepared_for_emails = AsyncMock(return_value=[])
+            provisioner = MagicMock()
+            api = MagicMock()
+            api._hs.get_datastores.return_value.main = h.main
+            hook = ClaimByEmail(api, legacy, provisioner, student_claims=h.claims)
+            await h.confirm(FOURTH, f["invitation_id"])
+            h.verify(FOURTH, "f@school.example", 2)
+            await hook.on_add_user_third_party_identifier(
+                FOURTH, "email", "f@school.example"
+            )
+            self.assertEqual((await h.row(f["invitation_id"]))["claimant"], FOURTH)
+            with patch.object(
+                h.claims, "claim_confirmed_for", side_effect=RuntimeError("x")
+            ), patch.object(
+                h.claims, "repair_managed_for", side_effect=RuntimeError("x")
+            ):
+                await hook.on_user_login(FOURTH, None, None)
+            legacy.prepared_for_emails = AsyncMock(side_effect=RuntimeError("x"))
+            await hook.claim_for(FOURTH)
+            legacy.prepared_for_emails = AsyncMock(
+                return_value=[{"invitation_id": "prepared-1"}]
+            )
+            for outcome in (
+                SynapseError(404, "gone", errcode=ERRCODE_CODE_NOT_FOUND),
+                SynapseError(500, "boom", errcode="M_UNKNOWN"),
+                RuntimeError("x"),
+                None,
+                "!room:x",
+            ):
+                if isinstance(outcome, BaseException):
+                    provisioner.claim = AsyncMock(side_effect=outcome)
+                else:
+                    provisioner.claim = AsyncMock(return_value=outcome)
+                await hook.claim_for(FOURTH)
+            await h.main.db_pool.runInteraction(
+                "drop-ack",
+                lambda txn: txn.execute(
+                    "DELETE FROM pangea_invitation_ack WHERE invitation_id = ?",
+                    (f["invitation_id"],),
+                ),
+            )
+            await release.on_new_event(
+                SimpleNamespace(
+                    type="m.room.power_levels",
+                    room_id=ROOM,
+                    state_key="",
+                    sender=TEACHER,
+                    content={"users": {}},
+                    is_state=lambda: True,
+                ),
+                {},
+            )
+            (g,) = await h.add("g@school.example")
+            h.verify(FOURTH, "g@school.example", 3)
+            await h.confirm(FOURTH, g["invitation_id"])
+            await h.claims.claim_confirmed_for(FOURTH)
+        text = captured.text()
+        for covered in (
+            "LTI roster imported",
+            "student invitation",
+            "left during",
+            "not claimed",
+            "no confirmation",
+        ):
+            self.assertIn(covered, text)
+        self.assertTrue(hook_sentry.capture_message.called)
+        everything = text + "\n" + str(sentry.mock_calls) + str(hook_sentry.mock_calls)
+        for pattern in (self.MXID, self.EMAIL):
+            self.assertEqual(pattern.findall(everything), [], text)
+
+
 class TestNoLoginTokenForServerAdmins(_Base):
     """Owner decision 2026-10-09: a Canvas launch never issues a login token
     to a Synapse server admin. The admin signs in themself on the normal
@@ -1780,7 +1974,7 @@ def _capture() -> _Captured:
     return _Captured()
 
 
-del time, THIRD
+del time
 
 if __name__ == "__main__":
     unittest.main()

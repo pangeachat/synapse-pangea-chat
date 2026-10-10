@@ -132,7 +132,7 @@ class StudentClaims:
             canvas_identity=canvas_identity,
         )
         if outcome == CLAIMED and claimed is not None:
-            logger.info("Claimed student invitation %s for %s", invitation_id, user_id)
+            logger.info("Claimed student invitation %s", invitation_id)
             await self._release_if_gone(room_id, user_id)
             await self._recheck_managed(claimed)
         return outcome, claimed if claimed is not None else row
@@ -149,7 +149,6 @@ class StudentClaims:
                 "managed record check after claim",
                 error,
                 invitation=row["id"],
-                user=row["claimant"],
             )
 
     async def _release_if_gone(self, room_id: str, user_id: str) -> None:
@@ -160,9 +159,8 @@ class StudentClaims:
             released = await self._store.release_on_leave(room_id, user_id)
             if released is not None:
                 logger.info(
-                    "Released student invitation %s: %s left during its claim",
+                    "Released student invitation %s: its claimant left during the claim",
                     released,
-                    user_id,
                 )
 
     async def apply_managed_rule(self, row: Dict[str, Any]) -> None:
@@ -177,17 +175,15 @@ class StudentClaims:
         )
         if result in ("inserted", "deleted"):
             logger.info(
-                "Managed record for %s in %s %s (invitation %s)",
-                claimant,
-                room_id,
+                "Managed record %s in %s (invitation %s)",
                 result,
+                room_id,
                 row["id"],
             )
         elif result == "no_ack":
             logger.warning(
-                "Joined invitation %s has no confirmation by %s; not managed",
+                "Joined invitation %s has no confirmation by its claimant; not managed",
                 row["id"],
-                claimant,
             )
 
     async def apply_managed_rule_in_room(self, room_id: str) -> None:
@@ -209,7 +205,6 @@ class StudentClaims:
                     "managed record power-level update",
                     error,
                     invitation=row["id"],
-                    user=row["claimant"],
                 )
 
     async def repair_managed_for(self, user_id: str) -> None:
@@ -218,15 +213,13 @@ class StudentClaims:
         try:
             rows = await self._store.joined_by(user_id)
         except Exception as error:
-            report_failure("managed record repair lookup", error, user=user_id)
+            report_failure("managed record repair lookup", error)
             return
         for row in rows:
             try:
                 await self.apply_managed_rule(row)
             except Exception as error:
-                report_failure(
-                    "managed record repair", error, invitation=row["id"], user=user_id
-                )
+                report_failure("managed record repair", error, invitation=row["id"])
 
     async def claim_confirmed_for(self, user_id: str) -> None:
         """The ``ClaimByEmail`` path: claim every ``invited`` row this account
@@ -241,7 +234,7 @@ class StudentClaims:
                 if row["id"] in acks
             ]
         except Exception as error:
-            report_failure("student invitation lookup at sign-in", error, user=user_id)
+            report_failure("student invitation lookup at sign-in", error)
             return
         for row in rows:
             try:
@@ -251,13 +244,11 @@ class StudentClaims:
                     "student invitation claim at sign-in",
                     error,
                     invitation=row["id"],
-                    user=user_id,
                 )
                 continue
             if outcome != CLAIMED:
                 logger.info(
-                    "Student invitation %s not claimed for %s at sign-in: %s",
+                    "Student invitation %s not claimed at sign-in: %s",
                     row["id"],
-                    user_id,
                     outcome,
                 )
