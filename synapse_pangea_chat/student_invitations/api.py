@@ -4,7 +4,7 @@ Base path ``/_synapse/client/pangea/v1``. Teacher routes take the teacher's own
 token and require course admin (power level 100 in the course space,
 re-checked on every request; room-version creators count); every refusal is
 the one 403 body, so a route is no oracle for which rooms exist. Student
-routes take the student's own token. ``hint`` and ``managed_disclosure`` are
+routes take the student's own token. ``hint`` is
 public and limited per client IP.
 
 Order of checks, as ``course_member_emails``: token (401), rate limit (429),
@@ -20,7 +20,17 @@ import json
 import logging
 import re
 import secrets
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+)
 
 from synapse.api.errors import (
     AuthError,
@@ -37,10 +47,6 @@ from synapse.util.threepids import validate_email
 from twisted.mail.smtp import SMTPDeliveryError
 from twisted.web.resource import Resource
 
-from synapse_pangea_chat.config import (
-    MANAGED_DISCLOSURE_TEXT,
-    MANAGED_DISCLOSURE_VERSION,
-)
 from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
 from synapse_pangea_chat.student_invitations.accounts import Accounts, email_key
 from synapse_pangea_chat.student_invitations.approvals import Approvals
@@ -49,6 +55,7 @@ from synapse_pangea_chat.student_invitations.claim import (
     StudentClaims,
     now_ms,
 )
+from synapse_pangea_chat.student_invitations.events import ACTIONS
 from synapse_pangea_chat.student_invitations.hint_lookup import (
     hintable,
     mask_email,
@@ -195,6 +202,16 @@ def _view_fields(
     }
 
 
+def _parse_cursor(value: Any) -> Optional[Tuple[int, str]]:
+    """A T12 cursor, ``<ts_ms>.<event_id>``, or None if malformed."""
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    ts, separator, event_id = value.partition(".")
+    if not separator or not ts.isdigit() or len(ts) > 15 or not event_id:
+        return None
+    return int(ts), event_id
+
+
 def _send_failure(error: BaseException) -> str:
     if isinstance(error, SMTPDeliveryError) and 500 <= int(error.code or 0) < 600:
         return "address_rejected"
@@ -304,7 +321,7 @@ class StudentInvitationHandlers:
         stopped: Optional[str] = None
         for ident, expected in parsed:
             status, before = await self._store.reserve_send(
-                room_id, ident, expected, now_ms()
+                room_id, ident, expected, now_ms(), caller
             )
             if status != "reserved" or before is None:
                 results.append(
@@ -354,7 +371,7 @@ class StudentInvitationHandlers:
         ident = _string(body.get("invitation_id"))
         if ident is None:
             return _bad("'invitation_id' is required")
-        row = await self._store.revoke(room_id, ident)
+        row = await self._store.revoke(room_id, ident, caller, now_ms())
         if row is None:
             return 404, NOT_FOUND
         logger.info("student invitation %s revoked", ident)
@@ -376,17 +393,17 @@ class StudentInvitationHandlers:
         if ident is None or user_id is None or decision not in ("grant", "deny"):
             return _bad("'invitation_id', 'user_id' and 'decision' are required")
         row = await self._store.in_room(room_id, ident)
-        if row is None or await self._store.get_ack(ident, user_id) is None:
+        if row is None or await self._store.get_request(ident, user_id) is None:
             return 404, NOT_FOUND
         if decision == "deny":
-            status, denied = await self._store.deny(ident, user_id)
-            if status == "no_ack" or denied is None:
+            status, denied = await self._store.deny(ident, user_id, caller, now_ms())
+            if status == "no_request" or denied is None:
                 return 404, NOT_FOUND
             if status == "not_live":
                 return _conflict(*_NOT_LIVE)
             logger.info("student invitation %s: approval denied", ident)
             return 200, {"invitation": await self._view(room_id, denied)}
-        outcome, claimed = await self._approvals.grant(ident, user_id)
+        outcome, claimed = await self._approvals.grant(ident, user_id, caller)
         if outcome == CLAIMED and claimed is not None:
             logger.info("student invitation %s: approval granted", ident)
             return 200, {"invitation": await self._view(room_id, claimed)}
@@ -394,14 +411,14 @@ class StudentInvitationHandlers:
             return _conflict(*_ALREADY)
         if outcome == NOT_LIVE:
             return _conflict(*_NOT_LIVE)
-        # The confirmation went away since the read above (a re-invite).
+        # The request went away since the read above (a re-invite).
         return 404, NOT_FOUND
 
     async def approve_all(self, caller: str, body: Any) -> Result:
         room_id, refusal = await self._admin_room(caller, body)
         if room_id is None:
             return refusal
-        result = await self._approvals.approve_all(room_id)
+        result = await self._approvals.approve_all(room_id, caller)
         logger.info(
             "student invitations approve_all: room=%s granted=%d"
             " skipped=%d refused=%d",
@@ -452,64 +469,79 @@ class StudentInvitationHandlers:
             return 200, {"live": False, "state": None}
         return 200, {"live": row["state"] in LIVE_STATES, "state": row["state"]}
 
+    async def events(self, caller: str, query: Any) -> Result:
+        """T12: this course's activity, newest first, one page at a time."""
+        room_id, refusal = await self._admin_room(caller, query)
+        if room_id is None:
+            return refusal
+        bounds: Dict[str, Optional[int]] = {}
+        for name in ("from", "to"):
+            raw = query.get(name)
+            if raw is None:
+                bounds[name] = None
+            elif isinstance(raw, str) and raw.isdigit() and len(raw) <= 15:
+                bounds[name] = int(raw)
+            else:
+                return _bad(f"'{name}' must be milliseconds since the epoch")
+        action = query.get("action")
+        if action is not None and action not in ACTIONS:
+            return _bad("'action' is not a known event action")
+        cursor = query.get("cursor")
+        before = None
+        if cursor is not None:
+            before = _parse_cursor(cursor)
+            if before is None:
+                return _bad("'cursor' is not valid")
+        events, after = await self._store.events(
+            room_id,
+            from_ms=bounds["from"],
+            to_ms=bounds["to"],
+            action=action,
+            before=before,
+        )
+        return 200, {
+            "events": events,
+            "next_cursor": f"{after[0]}.{after[1]}" if after is not None else None,
+        }
+
     # --- student routes ---
 
-    async def confirm(self, caller: str, body: Any) -> Result:
-        if not isinstance(body, dict):
-            return _bad("Request body must be a JSON object")
-        ident = _string(body.get("invitation_id"))
-        version = body.get("disclosure_version")
-        if ident is None or isinstance(version, bool) or not isinstance(version, int):
-            return _bad("'invitation_id' and 'disclosure_version' are required")
-        if version != MANAGED_DISCLOSURE_VERSION:
-            return _conflict(
-                "ORG.PANGEA.DISCLOSURE_OUTDATED", "The disclosure has changed"
-            )
-        row = await self._store.get(ident)
+    async def open(self, caller: str, invitation_id: str) -> Result:
+        """S1, a signed-in student opening their invitation link: claimed at
+        once if the account has the invited address verified; otherwise a
+        request for the teacher, answered ``pending`` (or ``denied``).
+        Idempotent."""
+        ident = _string(invitation_id)
+        row = await self._store.get(ident) if ident is not None else None
         if row is None or not (
             row["state"] == STATE_INVITED
             or (row["state"] == STATE_JOINED and row["claimant"] == caller)
         ):
             return 404, NOT_FOUND
         room_id = row["course_room_id"]
-        claimed = {"result": "claimed", "invitation_id": ident, "room_id": room_id}
+        answer = {"invitation_id": row["id"], "room_id": room_id}
         if row["state"] == STATE_JOINED:
-            return 200, claimed
-        await self._store.record_ack(ident, caller, version, now_ms())
-        logger.info("student invitation %s confirmed", ident)
-        # The claim itself requires the verified-email match (or a grant) and
-        # joins nothing without one.
-        outcome, _ = await self._claims.claim(ident, caller)
+            return 200, {"result": "claimed", **answer}
+        if row["email_key"] not in await self._accounts.verified_email_keys(caller):
+            # Another address records a request for the teacher: a request
+            # never stands in for a claim.
+            status, request = await self._store.record_request(
+                row["id"], caller, now_ms()
+            )
+            if status == "not_live" or request is None:
+                return 404, NOT_FOUND
+            if request["decision"] == DECISION_DENIED:
+                return 200, {"result": "denied", **answer}
+            logger.info("student invitation %s requested", row["id"])
+            return 200, {"result": "pending", **answer}
+        outcome, _ = await self._claims.claim(row["id"], caller)
         if outcome == CLAIMED:
-            return 200, claimed
+            return 200, {"result": "claimed", **answer}
         if outcome == ALREADY_CLAIMED_IN_COURSE:
             return _conflict(*_ALREADY)
         if outcome == NOT_LIVE:
             return 404, NOT_FOUND
-        ack = await self._store.get_ack(ident, caller)
-        result = (
-            "denied"
-            if ack is not None and ack["decision"] == DECISION_DENIED
-            else "pending_approval"
-        )
-        return 200, {"result": result, "invitation_id": ident, "room_id": room_id}
-
-    async def mine_pending(self, caller: str) -> Result:
-        keys = await self._accounts.verified_email_keys(caller)
-        acks = await self._store.acks_by(caller)
-        rows = [
-            r for r in await self._store.invited_for_keys(keys) if r["id"] not in acks
-        ]
-        return 200, {
-            "invitations": [
-                {
-                    "invitation_id": r["id"],
-                    "room_id": r["course_room_id"],
-                    "course_name": await self._rooms.course_name(r["course_room_id"]),
-                }
-                for r in rows
-            ]
-        }
+        return 200, {"result": "pending", **answer}
 
     async def mine_joined(self, caller: str) -> Result:
         rows = await self._store.joined_by(caller)
@@ -536,12 +568,6 @@ class StudentInvitationHandlers:
         return 200, {
             "course_name": await self._rooms.course_name(row["course_room_id"]),
             "masked_email_hint": mask_email(row["email_key"]),
-        }
-
-    async def disclosure(self) -> Result:
-        return 200, {
-            "version": MANAGED_DISCLOSURE_VERSION,
-            "text": MANAGED_DISCLOSURE_TEXT,
         }
 
 
@@ -637,6 +663,16 @@ class StudentInvitationRoute(Resource):
             if self._limiter.is_rate_limited(request.getClientAddress().host):
                 return 429, RATE_LIMITED
             return await self._handler(_read_query(request))
+        caller = await self._caller(request)
+        if not isinstance(caller, str):
+            return caller
+        if self._kind == "student" and self._method == "GET":
+            return await self._handler(caller)
+        args = read_json(request) if self._method == "POST" else _read_query(request)
+        return await self._handler(caller, args)
+
+    async def _caller(self, request: SynapseRequest) -> Union[str, Result]:
+        """The signed-in caller, or the 401 or 429 to answer."""
         try:
             requester = await self._auth.get_user_by_req(request)
         # silent-ok: the caller's own auth failure, answered 401
@@ -650,7 +686,43 @@ class StudentInvitationRoute(Resource):
         caller = requester.user.to_string()
         if self._limiter.is_rate_limited(caller):
             return 429, RATE_LIMITED
-        if self._kind == "student" and self._method == "GET":
-            return await self._handler(caller)
-        args = read_json(request) if self._method == "POST" else _read_query(request)
-        return await self._handler(caller, args)
+        return caller
+
+
+class InvitationOpenRoute(StudentInvitationRoute):
+    """S1, ``POST …/student_invitations/{invitation_id}/open`` with ``{}``.
+    Twisted has moved the id segment to ``prepath`` when this leaf is reached
+    through ``StudentInvitationsRoot``; ``postpath`` must be exactly
+    ``open``."""
+
+    async def _dispatch(self, request: SynapseRequest) -> Result:
+        if [segment for segment in request.postpath or [] if segment] != [b"open"]:
+            return 404, NOT_FOUND
+        try:
+            ident = (request.prepath or [])[-1].decode("utf-8")
+        # silent-ok: an undecodable id is no invitation, answered 404
+        except (IndexError, UnicodeDecodeError):
+            return 404, NOT_FOUND
+        caller = await self._caller(request)
+        if not isinstance(caller, str):
+            return caller
+        if read_json(request) != {}:
+            return _bad("The request body must be an empty JSON object")
+        return await self._handler(caller, ident)
+
+
+class StudentInvitationsRoot(Resource):
+    """``…/student_invitations``: its fixed routes (``add``, ``list``, …)
+    are its children; any other segment is an invitation id, served by the
+    open route."""
+
+    def __init__(self, open_route: InvitationOpenRoute) -> None:
+        super().__init__()
+        self._open = open_route
+
+    def getChild(self, path: bytes, request: Any) -> Resource:
+        return self._open
+
+    def render(self, request: SynapseRequest) -> Any:
+        respond_with_json(request, 404, NOT_FOUND, send_cors=True)
+        return server.NOT_DONE_YET

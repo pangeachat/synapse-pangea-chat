@@ -98,7 +98,6 @@ def register_lti(
         invitations=invitations.store,
         claims=invitations.claims,
         course_links=course_links,
-        login_tokens=login_token,
         external_ids=record_external_id,
     )
     urls = tool_urls(api.public_baseurl)

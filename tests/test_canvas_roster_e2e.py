@@ -5,7 +5,7 @@ registers, signs launches, issues NRPS tokens and serves a paged roster.
 One flow, in order: registration and approval; an instructor's first launch,
 own sign-in and link; the connect to a course they administer; the status
 read; the roster import through the module's real HTTP client; a student's
-first launch, own sign-in, confirmation and claim; a later launch's login
+first launch, own sign-in and claim; a later launch's login
 token, used once with the standard `m.login.token`. Then the logs.
 """
 
@@ -20,8 +20,6 @@ from urllib.parse import parse_qs, quote, urlparse
 import jwt
 import psycopg2
 import requests
-
-from synapse_pangea_chat.config import MANAGED_DISCLOSURE_VERSION
 
 from .base_e2e import BaseSynapseE2ETest
 from .lti_platform_double import (
@@ -44,7 +42,6 @@ STUDENT_SUB = "canvas-student-sub-31"
 TEACHER_SUB = "canvas-teacher-sub-8"
 CANVAS_EMAIL = "canvas.reported@school.example"
 NO_EMAIL_SUB = "canvas-noemail-sub-55"
-V = MANAGED_DISCLOSURE_VERSION
 LIMITS = {
     "rc_login": {
         "address": {"per_second": 9999, "burst_count": 9999},
@@ -369,8 +366,22 @@ class CanvasRosterE2ETest(BaseSynapseE2ETest):
         )
         invitation_id = row[0]
         self.assertEqual(row[1:], ("invited", "canvas", STUDENT_SUB))
+        # The ledger has the connect and the import, by the teacher.
+        events = self.ok(
+            "GET",
+            P + "student_invitations/events",
+            self.tokens["teacher"],
+            params={"room_id": room},
+        )["events"]
+        self.assertEqual(
+            [(e["action"], e["actor"], e["count"]) for e in events[:2]],
+            [
+                ("canvas_roster_imported", self.users["teacher"], 1),
+                ("canvas_connected", self.users["teacher"], None),
+            ],
+        )
 
-        # -- Student: first launch, own sign-in, confirmation, claim -------
+        # -- Student: first launch, own sign-in, claim (no checkbox) -------
         target, query = self.redirect(
             self.launch(server, sub=STUDENT_SUB, roles=[LEARNER])
         )
@@ -378,7 +389,7 @@ class CanvasRosterE2ETest(BaseSynapseE2ETest):
         self.assertEqual(query["course"], "Spanish 1")
         self.assertNotIn("loginToken", query)
         link_ticket = query["ticket"]
-        body = {"ticket": link_ticket, "confirmed": True, "disclosure_version": V}
+        body = {"ticket": link_ticket}
         self.assertEqual(
             self.call("POST", LTI + "link", None, body=body).status_code, 401
         )
@@ -388,7 +399,6 @@ class CanvasRosterE2ETest(BaseSynapseE2ETest):
             {
                 "next": "app",
                 "claimed": [{"invitation_id": invitation_id, "room_id": room}],
-                "login_token": None,
             },
         )
         replay = self.call("POST", LTI + "link", self.tokens["student"], body=body)

@@ -1,5 +1,5 @@
 """Student invitations against a real Synapse, Postgres and SMTP sink: the
-routes' auth and power-level gates, the invite email, the confirm claim, the
+routes' auth and power-level gates, the invite email, the open claim, the
 verified-address claim at sign-in, the leave/kick/ban release, and the
 database's own guard against two claims racing."""
 
@@ -9,16 +9,15 @@ import os
 import shutil
 import tempfile
 import threading
+import time
+import unittest
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import psycopg2
 import requests
+import testing.postgresql
 
-from synapse_pangea_chat.config import (
-    MANAGED_DISCLOSURE_TEXT,
-    MANAGED_DISCLOSURE_VERSION,
-)
 from tests.base_e2e import BaseSynapseE2ETest
 from tests.smtp_sink import SmtpSink, body_text
 
@@ -36,7 +35,6 @@ OTHER = "other@gmail.example"
 ADDRESSES = (INVITED_KEY, SECOND, THIRD, LATE, MEMBER, OTHER)
 FORBIDDEN = {"error": "Forbidden: course admin required", "errcode": "M_FORBIDDEN"}
 NOT_FOUND = {"error": "Not found", "errcode": "M_NOT_FOUND"}
-V = MANAGED_DISCLOSURE_VERSION
 SYNAPSE_LIMITS = {
     "rc_login": {
         "address": {"per_second": 9999, "burst_count": 9999},
@@ -202,26 +200,41 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         )
         return {i["invitation_id"]: i for i in body["invitations"]}
 
-    def confirm(self, name: str, ident: str, version: int = V) -> requests.Response:
+    def open(self, name: str, ident: str) -> requests.Response:
         return self.call(
-            "POST",
-            SI + "confirm",
-            self.tokens[name],
-            body={"invitation_id": ident, "disclosure_version": version},
+            "POST", SI + quote(ident, safe="") + "/open", self.tokens[name], body={}
         )
+
+    def events(self, room: str, name: str = "teacher") -> List[Dict[str, Any]]:
+        return self.ok(
+            "GET", SI + "events", self.tokens[name], params={"room_id": room}
+        )["events"]
 
     def managed(self, user_id: str, room: str) -> Optional[Tuple[Any, ...]]:
         conn = psycopg2.connect(self.database_url)
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT user_id, course_room_id, invited_by FROM pangea_managed_account"
+                    "SELECT user_id, course_room_id FROM pangea_managed_account"
                     " WHERE user_id = %s AND course_room_id = %s",
                     (user_id, room),
                 )
                 return cur.fetchone()
         finally:
             conn.close()
+
+    def managed_soon(
+        self, user_id: str, room: str, expected: Optional[Tuple[Any, ...]]
+    ) -> Optional[Tuple[Any, ...]]:
+        """The managed record once the power-level callback, which runs after
+        the event is persisted, has applied (up to 10 s); the caller asserts
+        the value."""
+        deadline = time.monotonic() + 10
+        while True:
+            found = self.managed(user_id, room)
+            if found == expected or time.monotonic() > deadline:
+                return found
+            time.sleep(0.2)
 
     def module_log_lines(self) -> List[str]:
         return [
@@ -246,9 +259,7 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         (inv,) = self.add(room, INVITED)
         ident = inv["invitation_id"]
         self.bind("outsider", OTHER)
-        self.assertEqual(
-            self.confirm("outsider", ident).json()["result"], "pending_approval"
-        )
+        self.assertEqual(self.open("outsider", ident).json()["result"], "pending")
 
         calls = [
             ("POST", "add", {"emails": [SECOND], "source": "manual"}),
@@ -272,6 +283,7 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             ("POST", "approve_all", {}),
             ("POST", "invite_member", {"user_id": self.users["coteacher"]}),
             ("GET", "live", {"invitation_id": ident}),
+            ("GET", "events", None),
         ]
         for caller in ("coteacher", "outsider", "student"):
             for target in (room, "!unknown:my.domain.name", other_room):
@@ -300,9 +312,24 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             resp = self.call(method, SI + path, None, body={"room_id": room})
             self.assertEqual(resp.status_code, 401, path)
             self.assertEqual(resp.json()["errcode"], "M_UNAUTHORIZED")
-        for path in ("confirm", "mine/pending", "mine/joined"):
-            resp = self.call("POST" if path == "confirm" else "GET", SI + path, None)
+        for method, path in (("POST", ident + "/open"), ("GET", "mine/joined")):
+            resp = self.call(
+                method, SI + path, None, body={} if method == "POST" else None
+            )
             self.assertEqual(resp.status_code, 401, path)
+        # The removed routes are gone.
+        for method, path in (
+            ("POST", SI + "confirm"),
+            ("GET", SI + "mine/pending"),
+            ("GET", P + "managed_disclosure"),
+        ):
+            gone = self.call(
+                method,
+                path,
+                self.tokens["student"],
+                body={} if method == "POST" else None,
+            )
+            self.assertEqual(gone.status_code, 404, path)
         # Nothing changed, nothing was sent.
         listed = self.listing(room)
         self.assertEqual(list(listed), [ident])
@@ -364,7 +391,7 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         # managed (owner amendment 2026-10-09).
         self.bind("teacher", THIRD)
         (own,) = self.add(room, THIRD)
-        claimed = self.confirm("teacher", own["invitation_id"])
+        claimed = self.open("teacher", own["invitation_id"])
         self.assertEqual(claimed.json()["result"], "claimed", claimed.text)
         self.assertEqual(self.listing(room)[own["invitation_id"]]["state"], "joined")
         self.assertIsNone(self.managed(self.users["teacher"], room))
@@ -429,7 +456,7 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             ("skipped", "stale"),
         )
 
-        # Public reads: hint and disclosure.
+        # Public read: the hint.
         hint = self.ok(
             "GET", SI + "hint", None, params={"invitation_id": a["invitation_id"]}
         )
@@ -437,29 +464,9 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             hint,
             {"course_name": "Spanish 101", "masked_email_hint": "s***@school.example"},
         )
-        disclosure = self.ok("GET", P + "managed_disclosure", None)
-        self.assertEqual(disclosure, {"version": V, "text": MANAGED_DISCLOSURE_TEXT})
-
-        # The student with the invited address verified sees it, confirms, claims.
-        pending = self.ok("GET", SI + "mine/pending", self.tokens["student"])
-        self.assertEqual(
-            pending,
-            {
-                "invitations": [
-                    {
-                        "invitation_id": a["invitation_id"],
-                        "room_id": room,
-                        "course_name": "Spanish 101",
-                    }
-                ]
-            },
-        )
-        outdated = self.confirm("student", a["invitation_id"], V - 1)
-        self.assertEqual(
-            (outdated.status_code, outdated.json()["errcode"]),
-            (409, "ORG.PANGEA.DISCLOSURE_OUTDATED"),
-        )
-        claimed = self.confirm("student", a["invitation_id"])
+        # The student with the invited address verified opens the link and
+        # is claimed at once: no checkbox (seats amendment 2026-10-10).
+        claimed = self.open("student", a["invitation_id"])
         self.assertEqual(
             (claimed.status_code, claimed.json()),
             (
@@ -473,8 +480,7 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         )
         self.assertIn(room, self.joined_rooms("student"))
         self.assertEqual(
-            self.managed(self.users["student"], room),
-            (self.users["student"], room, self.users["teacher"]),
+            self.managed(self.users["student"], room), (self.users["student"], room)
         )
         self.assertEqual(
             self.ok("GET", SI + "mine/joined", self.tokens["student"]),
@@ -489,20 +495,16 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             },
         )
         self.assertEqual(
-            self.ok("GET", SI + "mine/pending", self.tokens["student"]),
-            {"invitations": []},
-        )
-        self.assertEqual(
             self.call(
                 "GET", SI + "hint", None, params={"invitation_id": a["invitation_id"]}
             ).json(),
             NOT_FOUND,
         )
 
-        # Another address: a pending approval the teacher grants.
+        # Another address: a request the teacher grants.
         self.assertEqual(
-            self.confirm("other", b["invitation_id"]).json()["result"],
-            "pending_approval",
+            self.open("other", b["invitation_id"]).json()["result"],
+            "pending",
         )
         self.assertNotIn(room, self.joined_rooms("other"))
         (row,) = self.ok(
@@ -529,10 +531,10 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         self.assertEqual(granted["invitation"]["state"], "joined")
         self.assertIn(room, self.joined_rooms("other"))
 
-        # A confirmed invitation is claimed when its address is verified later.
+        # A requested invitation is claimed when its address is verified later.
         self.assertEqual(
-            self.confirm("late", late["invitation_id"]).json()["result"],
-            "pending_approval",
+            self.open("late", late["invitation_id"]).json()["result"],
+            "pending",
         )
         self.bind("late", LATE)
         self.assertEqual(self.listing(room)[late["invitation_id"]]["state"], "joined")
@@ -553,7 +555,7 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             body={"user_id": self.users["other"]},
         )
         self.assertEqual(
-            self.confirm("third", c["invitation_id"]).json()["result"], "claimed"
+            self.open("third", c["invitation_id"]).json()["result"], "claimed"
         )
         self.ok(
             "POST",
@@ -589,14 +591,14 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             {"invitations": []},
         )
 
-        # Re-invite resets the row; a fresh confirmation claims again.
+        # Re-invite resets the row; opening it claims again.
         (again,) = self.add(room, INVITED)
         self.assertEqual(
             (again["invitation_id"], again["state"], again["send_count"]),
             (a["invitation_id"], "invited", 1),
         )
         self.assertEqual(
-            self.confirm("student", a["invitation_id"]).json()["result"], "claimed"
+            self.open("student", a["invitation_id"]).json()["result"], "claimed"
         )
 
         # Invite to a seat: from the member's own address, which nothing returns.
@@ -643,24 +645,21 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             )
         )
         self.assertNotIn(MEMBER, str(self.listing(room)))
-        self.assertEqual(
-            self.ok("GET", SI + "mine/pending", self.tokens["member"])["invitations"][
-                0
-            ]["invitation_id"],
-            made["invitation_id"],
-        )
+        # The member's next sign-in claims it (no prompt).
+        await self.login_user("member", "member-pw-123")
+        self.assertEqual(self.listing(room)[made["invitation_id"]]["state"], "joined")
 
         # Power levels: a claimant who becomes a course admin is no longer
         # managed; stepping back down records it again (C2.5).
         self.set_power(room, "late", 100)
-        self.assertIsNone(self.managed(self.users["late"], room))
+        self.assertIsNone(self.managed_soon(self.users["late"], room, None))
         url = self.state_url(room, "m.room.power_levels")
         content = self.ok("GET", url, self.tokens["late"])
         content["users"][self.users["late"]] = 0
         self.ok("PUT", url, self.tokens["late"], body=content)
         self.assertEqual(
-            self.managed(self.users["late"], room),
-            (self.users["late"], room, self.users["teacher"]),
+            self.managed_soon(self.users["late"], room, (self.users["late"], room)),
+            (self.users["late"], room),
         )
 
         # Revoke releases the managed record and keeps the membership.
@@ -673,6 +672,24 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         self.assertEqual(revoked["invitation"]["state"], "revoked")
         self.assertIsNone(self.managed(self.users["late"], room))
         self.assertEqual(self.membership(room, "late"), "join")
+
+        # The ledger recorded it all, with no address, read by course admins only.
+        actions = {e["action"] for e in self.events(room)}
+        for action in (
+            "students_added",
+            "invite_sent",
+            "request_made",
+            "request_granted",
+            "invitation_claimed",
+            "student_left",
+            "invitation_withdrawn",
+        ):
+            self.assertIn(action, actions)
+        self.assertNotIn("school", str(self.events(room)))
+        refused = self.call(
+            "GET", SI + "events", self.tokens["student"], params={"room_id": room}
+        )
+        self.assertEqual((refused.status_code, refused.json()), (403, FORBIDDEN))
 
         # No address in any of the module's log lines.
         lines = "\n".join(self.module_log_lines()).lower()
@@ -711,8 +728,6 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             limited.json(), {"error": "Rate limited", "errcode": "M_LIMIT_EXCEEDED"}
         )
         self.assertNotIn("school", limited.text)
-        # The disclosure has its own budget.
-        self.ok("GET", P + "managed_disclosure", None)
 
     async def test_concurrent_claims_never_double_claim(self):
         await self.boot()
@@ -739,9 +754,7 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         )
         shared = self.add(room, THIRD)[0]["invitation_id"]
         for name in ("a", "b"):
-            self.assertEqual(
-                self.confirm(name, shared).json()["result"], "pending_approval"
-            )
+            self.assertEqual(self.open(name, shared).json()["result"], "pending")
 
         def run(calls: List[Any]) -> List[requests.Response]:
             results: List[Optional[requests.Response]] = [None] * len(calls)
@@ -760,11 +773,11 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
                 t.join(timeout=60)
             return [r for r in results if r is not None]
 
-        # One account, two invitations of one course, confirmed at once.
+        # One account, two invitations of one course, opened at once.
         responses = run(
             [
-                lambda: self.confirm("student", first["invitation_id"]),
-                lambda: self.confirm("student", second["invitation_id"]),
+                lambda: self.open("student", first["invitation_id"]),
+                lambda: self.open("student", second["invitation_id"]),
             ]
         )
         outcomes = sorted(
@@ -805,3 +818,69 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         loser = self.users["b"] if claimant == self.users["a"] else self.users["a"]
         self.assertIsNone(self.managed(loser, room))
         self.assertIsNotNone(self.managed(claimant, room))
+
+
+class TestSchemaMigrationOnPostgres(unittest.TestCase):
+    """The in-place migration on real Postgres (Synapse's engine): tables of
+    the earlier build gain and lose columns, keep their rows, and a second
+    run changes nothing."""
+
+    def test_earlier_tables_are_migrated_in_place_and_idempotently(self) -> None:
+        from synapse.storage.engines import PostgresEngine
+
+        from synapse_pangea_chat.student_invitations.store import migrate
+
+        class Txn:
+            def __init__(self, cursor: Any) -> None:
+                self._cursor = cursor
+                self.database_engine = PostgresEngine.__new__(PostgresEngine)
+
+            def execute(self, sql: str, args: Any = ()) -> None:
+                self._cursor.execute(sql.replace("?", "%s"), args)
+
+            def fetchall(self) -> List[Any]:
+                return self._cursor.fetchall()
+
+        with testing.postgresql.Postgresql() as pg:
+            conn = psycopg2.connect(**pg.dsn())
+            try:
+                cur = conn.cursor()
+                for sql in (
+                    "CREATE TABLE pangea_student_invitation (id TEXT PRIMARY KEY,"
+                    " email_key TEXT NOT NULL)",
+                    "CREATE TABLE pangea_invitation_ack (invitation_id TEXT,"
+                    " user_id TEXT, acked_at_ms BIGINT NOT NULL,"
+                    " disclosure_version INTEGER NOT NULL, decision TEXT,"
+                    " PRIMARY KEY (invitation_id, user_id))",
+                    "INSERT INTO pangea_invitation_ack VALUES ('i', 'u', 5, 2, NULL)",
+                    "CREATE TABLE pangea_managed_account (user_id TEXT,"
+                    " course_room_id TEXT, invited_by TEXT NOT NULL,"
+                    " since_ms BIGINT NOT NULL, PRIMARY KEY (user_id, course_room_id))",
+                    "INSERT INTO pangea_managed_account VALUES ('u', 'r', 't', 7)",
+                ):
+                    cur.execute(sql)
+                for _ in range(2):
+                    migrate(Txn(cur))
+                conn.commit()
+                columns: Dict[str, List[str]] = {}
+                cur.execute(
+                    "SELECT table_name, column_name FROM information_schema.columns"
+                    " WHERE table_schema = current_schema() ORDER BY ordinal_position"
+                )
+                for table, column in cur.fetchall():
+                    columns.setdefault(table, []).append(column)
+                self.assertEqual(
+                    columns["pangea_invitation_ack"],
+                    ["invitation_id", "user_id", "requested_at_ms", "decision"],
+                )
+                self.assertEqual(
+                    columns["pangea_managed_account"],
+                    ["user_id", "course_room_id", "created_at_ms"],
+                )
+                self.assertIn("member_user_id", columns["pangea_student_invitation"])
+                cur.execute("SELECT * FROM pangea_invitation_ack")
+                self.assertEqual(cur.fetchall(), [("i", "u", 5, None)])
+                cur.execute("SELECT * FROM pangea_managed_account")
+                self.assertEqual(cur.fetchall(), [("u", "r", 7)])
+            finally:
+                conn.close()

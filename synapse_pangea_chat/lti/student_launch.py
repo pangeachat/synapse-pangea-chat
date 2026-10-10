@@ -12,19 +12,18 @@ Launch redirects (`LaunchRedirects`):
 | Launch | Goes to |
 |---|---|
 | Learner, not linked | `<app>/lti/link?ticket=<learner ticket>&course=<title>` |
-| Learner, linked, unconfirmed matching invitations | the same, the ticket bound to that account |
-| Learner, linked, nothing to confirm | `<app>/lti/token?loginToken=<token>` |
-| Learner, linked, a Synapse server admin | `<app>/home/login` (own sign-in; no token, no ticket) |
+| Learner, linked | its matching invitations claimed, then `<app>/lti/token?loginToken=<token>` |
+| Learner, linked, a Synapse server admin | `<app>/home/login` (own sign-in; no token, no ticket, no claim) |
 | Instructor/Administrator, not linked | `<app>/lti/link?ticket=<instructor ticket>&role=instructor` |
 | Instructor/Administrator, linked | `<admin-dash>/canvas-connect?ticket=<connect ticket>` |
 
-The link step (`LinkStep`, `POST lti/link`) checks the body first (it needs no
-ticket), then consumes the ticket in one update, whatever happens after; any
-refusal after that writes nothing. An unbound ticket links the caller's own
-account (their token is required); a bound one acts only for the account it
-is bound to. A learner ticket then records the confirmation on, and claims,
-only the invitations imported with exactly the ticket's (issuer, Canvas
-course, `sub`).
+The link step (`LinkStep`, `POST lti/link`, body `{ticket}`) needs the
+account's own token, checks the body, then consumes the ticket in one update,
+whatever happens after; any refusal after that writes nothing. It links the
+caller's own account; a learner ticket then claims only the invitations
+imported with exactly the ticket's (issuer, Canvas course, `sub`). No
+checkbox: managed-account consent is in Pangea's Terms (seats amendment
+2026-10-10).
 """
 
 from __future__ import annotations
@@ -36,10 +35,8 @@ from urllib.parse import urlencode
 from synapse.http.server import finish_request
 from synapse.http.site import SynapseRequest
 
-from synapse_pangea_chat.config import MANAGED_DISCLOSURE_VERSION
 from synapse_pangea_chat.lti.course_link import (
     TICKET_INVALID,
-    TICKET_WRONG_ACCOUNT,
     CourseLinks,
     bad,
     issue_connect_url,
@@ -51,8 +48,6 @@ from synapse_pangea_chat.lti.link_store import (
     KIND_INSTRUCTOR,
     KIND_LEARNER,
     TICKET_OK,
-    TICKET_UNBOUND,
-    TICKET_WRONG_KIND,
     LtiLinkStore,
     Ticket,
 )
@@ -85,13 +80,6 @@ ALREADY_LINKED: Result = (
     {
         "error": "This Canvas account or Pangea account is already linked",
         "errcode": "ORG.PANGEA.LTI_ALREADY_LINKED",
-    },
-)
-DISCLOSURE_OUTDATED: Result = (
-    409,
-    {
-        "error": "The disclosure has changed",
-        "errcode": "ORG.PANGEA.DISCLOSURE_OUTDATED",
     },
 )
 
@@ -210,48 +198,34 @@ class LaunchRedirects:
             )
         if user_id is not None:
             # One admin decision per launch, made before anything is written:
-            # a server admin signs in themself, with no token and no bound
-            # ticket that would lead to one.
-            identity = (launch.issuer, launch.context_id, launch.sub)
-            matching = await self._invitations.canvas_invited(identity)
-            confirmed = await self._invitations.acks_by(user_id)
-            if all(row["id"] in confirmed for row in matching):
-                token = await self._login_tokens.issue(user_id)
-                if token is None:
-                    return f"{self._app}{SIGN_IN_PATH}"
-                # Every match is confirmed by this account, yet still Invited:
-                # its claim did not complete (a failed join, say). Retry it on
-                # that recorded confirmation, as ClaimByEmail does at sign-in.
-                await self._retry_claims(matching, user_id, identity)
-                return f"{self._app}/lti/token?" + urlencode({"loginToken": token})
-            if not await self._login_tokens.allowed(user_id):
+            # a server admin signs in themself, with no token and no claim.
+            token = await self._login_tokens.issue(user_id)
+            if token is None:
                 return f"{self._app}{SIGN_IN_PATH}"
-        # Not linked, or linked with invitations to confirm: the link page,
-        # the ticket bound to the linked account if there is one.
-        ticket = await self._ticket(KIND_LEARNER, launch, None, user_id)
+            # The exact-identity rows (including any imported since the
+            # link) are claimed now; the identity is the match.
+            await self._claim_rows(launch, user_id)
+            return f"{self._app}/lti/token?" + urlencode({"loginToken": token})
+        ticket = await self._ticket(KIND_LEARNER, launch, None, None)
         query = {"ticket": ticket}
         title = _course_title(launch)
         if title is not None:
             query["course"] = title
         return f"{self._app}/lti/link?" + urlencode(query)
 
-    async def _retry_claims(
-        self,
-        rows: List[Dict[str, Any]],
-        user_id: str,
-        identity: Tuple[str, str, str],
-    ) -> None:
-        """Never raises: a claim that fails again is reported, and the
-        launch still signs the student in."""
-        for row in rows:
+    async def _claim_rows(self, launch: Launch, user_id: str) -> None:
+        """Never raises: a claim that fails is reported, and the launch
+        still signs the student in (the next launch retries it)."""
+        identity = (launch.issuer, launch.context_id, launch.sub)
+        for row in await self._invitations.canvas_invited(identity):
             try:
                 outcome, _ = await self._claims.claim(
                     row["id"], user_id, canvas_identity=identity
                 )
             except Exception as error:
-                report_failure("LTI launch claim retry", error, invitation=row["id"])
+                report_failure("LTI launch claim", error, invitation=row["id"])
                 continue
-            logger.info("LTI launch claim retry: invitation %s %s", row["id"], outcome)
+            logger.info("LTI launch claim: invitation %s %s", row["id"], outcome)
 
     async def __call__(self, request: SynapseRequest, launch: Launch) -> None:
         try:
@@ -291,7 +265,6 @@ class LinkStep:
         invitations: StudentInvitationStore,
         claims: StudentClaims,
         course_links: CourseLinks,
-        login_tokens: "LoginTokens",
         external_ids: ExternalIds,
         clock_ms: Callable[[], int] = now_ms,
     ) -> None:
@@ -299,67 +272,37 @@ class LinkStep:
         self._invitations = invitations
         self._claims = claims
         self._course_links = course_links
-        self._login_tokens = login_tokens
         self._external_ids = external_ids
         self._clock_ms = clock_ms
 
     async def link(self, caller: Optional[str], body: Any) -> Result:
         """`caller` is the signed-in account, or None when no token was sent."""
-        if not isinstance(body, dict):
-            return bad("Request body must be a JSON object")
+        if caller is None:
+            # Every link ticket is unbound: only the account's own sign-in
+            # links it. Not consumed.
+            return 401, UNAUTHORIZED
+        if not isinstance(body, dict) or set(body) != {"ticket"}:
+            return bad("Expected exactly 'ticket'")
         ticket = ticket_arg(body.get("ticket"))
         if ticket is None:
             return bad("'ticket' is required")
-        learner = "confirmed" in body or "disclosure_version" in body
-        allowed = (
-            {"ticket", "confirmed", "disclosure_version"} if learner else {"ticket"}
-        )
-        if set(body) - allowed:
-            return bad("Unexpected fields")
-        if learner:
-            version = body.get("disclosure_version")
-            if body.get("confirmed") is not True:
-                return bad("'confirmed' must be true")
-            if isinstance(version, bool) or not isinstance(version, int):
-                return bad("'disclosure_version' is required")
-            if version != MANAGED_DISCLOSURE_VERSION:
-                return DISCLOSURE_OUTDATED
-        kind = KIND_LEARNER if learner else KIND_INSTRUCTOR
-
         outcome, found = await self._links.consume_ticket(
-            ticket, kind=kind, require_bound=caller is None, now_ms=self._clock_ms()
+            ticket,
+            kinds=(KIND_LEARNER, KIND_INSTRUCTOR),
+            now_ms=self._clock_ms(),
         )
-        if outcome == TICKET_WRONG_KIND and found is not None:
-            if found.kind in (KIND_LEARNER, KIND_INSTRUCTOR):
-                # The other link kind: the body is wrong for it (a learner
-                # ticket without the confirmation). Not consumed.
-                return bad("This ticket needs the other form of the link step")
-            return TICKET_INVALID
-        if outcome == TICKET_UNBOUND:
-            return 401, UNAUTHORIZED
         if outcome != TICKET_OK or found is None:
             return TICKET_INVALID
-
-        if found.bound_user_id is not None:
-            if caller is not None and caller != found.bound_user_id:
-                logger.info(
-                    "LTI link refused: platform=%s wrong account", found.platform_id
-                )
-                return TICKET_WRONG_ACCOUNT
-            user_id = found.bound_user_id
-        else:
-            if caller is None:
-                raise RuntimeError("unbound ticket consumed without a caller")
-            user_id = caller
-            linked = await self._links.link_user(
-                found.issuer, found.sub, user_id, self._clock_ms()
+        user_id = caller
+        linked = await self._links.link_user(
+            found.issuer, found.sub, user_id, self._clock_ms()
+        )
+        if linked == CONFLICT:
+            logger.info(
+                "LTI link refused: platform=%s already linked", found.platform_id
             )
-            if linked == CONFLICT:
-                logger.info(
-                    "LTI link refused: platform=%s already linked", found.platform_id
-                )
-                return ALREADY_LINKED
-            await self._mirror(found, user_id)
+            return ALREADY_LINKED
+        await self._mirror(found, user_id)
 
         if found.kind == KIND_INSTRUCTOR:
             if found.nrps_url is None:
@@ -376,23 +319,13 @@ class LinkStep:
             logger.info("LTI instructor linked: platform=%s", found.platform_id)
             return 200, {"next": "connect", "connect_url": url}
 
-        login_token: Optional[str] = None
-        if caller is None:
-            # The one admin decision of this request, made before anything is
-            # written: a server admin must sign in themself (401, nothing
-            # written). A token minted here and then not returned (a later
-            # failure) is single use and expires in two minutes.
-            login_token = await self._login_tokens.issue(user_id)
-            if login_token is None:
-                return 401, UNAUTHORIZED
         claimed = await self._claim(found, user_id)
         logger.info(
-            "LTI learner linked: platform=%s claimed=%d login_token=%s",
+            "LTI learner linked: platform=%s claimed=%d",
             found.platform_id,
             len(claimed),
-            "issued" if login_token else "none",
         )
-        return 200, {"next": "app", "claimed": claimed, "login_token": login_token}
+        return 200, {"next": "app", "claimed": claimed}
 
     async def _mirror(self, ticket: Ticket, user_id: str) -> None:
         # Synapse's own external-id record of the link, for its admin tools.
@@ -404,14 +337,11 @@ class LinkStep:
             report_failure("LTI external id record", error, platform=ticket.platform_id)
 
     async def _claim(self, ticket: Ticket, user_id: str) -> List[Dict[str, str]]:
-        """Confirm and claim the invitations imported with exactly this
-        Canvas identity (C2.4): the identity is the match, never an email."""
+        """Claim the invitations imported with exactly this Canvas identity
+        (C2.4): the identity is the match, never an email."""
         identity = (ticket.issuer, ticket.context_id, ticket.sub)
         claimed: List[Dict[str, str]] = []
         for row in await self._invitations.canvas_invited(identity):
-            await self._invitations.record_ack(
-                row["id"], user_id, MANAGED_DISCLOSURE_VERSION, now_ms()
-            )
             try:
                 outcome, _ = await self._claims.claim(
                     row["id"], user_id, canvas_identity=identity

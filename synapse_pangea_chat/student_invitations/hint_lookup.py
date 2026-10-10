@@ -1,4 +1,4 @@
-"""The public invitation hint and the managed-account disclosure.
+"""The public invitation hint.
 
 ``GET .../student_invitations/hint?invitation_id=`` answers, for an ``invited``
 invitation only, the course name and a masked hint of the invited address

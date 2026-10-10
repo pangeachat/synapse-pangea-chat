@@ -79,7 +79,6 @@ from tests.test_student_invitations_unit import (
     FakeMain,
     FakeRooms,
     Harness,
-    V,
     _member_event,
 )
 
@@ -241,7 +240,6 @@ class Canvas:
             invitations=self.h.store,
             claims=self.h.claims,
             course_links=self.course_links,
-            login_tokens=tokens,
             external_ids=self.external_ids,
             clock_ms=lambda: self.now,
         )
@@ -318,7 +316,7 @@ class Canvas:
     async def learner_l1(
         self, caller: Optional[str], ticket: str
     ) -> Tuple[int, Dict[str, Any]]:
-        return await self.l1(caller, ticket, confirmed=True, disclosure_version=V)
+        return await self.l1(caller, ticket)
 
     async def connect(
         self, caller: str, ticket: str, room: str = ROOM, **extra: Any
@@ -812,7 +810,7 @@ class TestImport(_Base):
             "pasted@school.example", "joined@school.example", "revoked@school.example"
         )
         self.c.h.verify(STUDENT, "joined@school.example")
-        await self.c.h.confirm(STUDENT, joined["invitation_id"])
+        await self.c.h.open(STUDENT, joined["invitation_id"])
         await self.c.h.handlers.revoke(
             TEACHER, {"room_id": ROOM, "invitation_id": revoked["invitation_id"]}
         )
@@ -1278,7 +1276,7 @@ class TestLearnerLaunch(_Base):
         # Someone else signing in is linked themself, never the email's owner.
         status, body = await self.c.learner_l1(OTHER, query["ticket"])
         self.assertEqual(status, 200, body)
-        self.assertEqual(body["login_token"], None)
+        self.assertNotIn("login_token", body)
         self.assertEqual(await self.c.links.linked_user(ISSUER, SUB), OTHER)
         self.assertEqual(self.c.login_tokens.issued, [])
 
@@ -1296,7 +1294,9 @@ class TestLearnerLaunch(_Base):
         self.assertEqual(self.c.h.main.threepids.get(STUDENT, []), [])
         # The row with the Canvas-reported address is not claimed by it.
         self.assertEqual((await self.c.h.row(inv["invitation_id"]))["state"], "invited")
-        self.assertIsNone(await self.c.h.store.get_ack(inv["invitation_id"], STUDENT))
+        self.assertIsNone(
+            await self.c.h.store.get_request(inv["invitation_id"], STUDENT)
+        )
 
     async def test_claim_only_exact_issuer_context_sub(self):
         await self.c.platform(OTHER_ISSUER, "other-client")
@@ -1326,17 +1326,15 @@ class TestLearnerLaunch(_Base):
         self.assertEqual([c["invitation_id"] for c in body["claimed"]], [exact["id"]])
         for ident in ("row-other-issuer", "row-other-sub"):
             self.assertEqual((await self.c.h.row(ident))["state"], "invited")
-            self.assertIsNone(await self.c.h.store.get_ack(ident, STUDENT))
+            self.assertIsNone(await self.c.h.store.get_request(ident, STUDENT))
         joined = await self.c.h.row(exact["id"])
         self.assertEqual((joined["state"], joined["claimant"]), ("joined", STUDENT))
         self.assertIsNotNone(await self.c.h.store.managed_record(STUDENT, ROOM))
-        ack = await self.c.h.store.get_ack(exact["id"], STUDENT)
-        assert ack is not None
-        self.assertEqual(ack["disclosure_version"], V)
+        # The identity is the match: no request is written.
+        self.assertIsNone(await self.c.h.store.get_request(exact["id"], STUDENT))
 
     async def test_canvas_claim_transaction_rechecks_the_identity_itself(self):
         row = await self.canvas_row()
-        await self.c.h.store.record_ack(row["id"], STUDENT, V, NOW)
         for identity in (
             (OTHER_ISSUER, CONTEXT, SUB),
             (ISSUER, OTHER_CONTEXT, SUB),
@@ -1372,37 +1370,44 @@ class TestLearnerLaunch(_Base):
         self.assertEqual(status, 200, body)
         self.assertEqual(body["claimed"], [])
         self.assertEqual((await self.c.h.row(row["id"]))["state"], "invited")
-        self.assertIsNone(await self.c.h.store.get_ack(row["id"], STUDENT))
+        self.assertIsNone(await self.c.h.store.get_request(row["id"], STUDENT))
         self.assertEqual(self.c.h.joiner.joins, [])
+        # The store looks up only rows of exactly that identity.
+        self.assertEqual(
+            await self.c.h.store.canvas_invited((ISSUER, OTHER_CONTEXT, SUB)), []
+        )
+        self.assertEqual(
+            [
+                r["id"]
+                for r in await self.c.h.store.canvas_invited((ISSUER, CONTEXT, SUB))
+            ],
+            [row["id"]],
+        )
 
-    async def test_link_step_refuses_without_confirmation(self):
+    async def test_link_step_takes_only_the_ticket_and_the_accounts_own_token(self):
+        """Seats amendment 2026-10-10: no checkbox. The body is `{ticket}`;
+        the old confirmation fields, or no token, are refused unconsumed."""
         row = await self.canvas_row()
         ticket = await self.c.ticket(self.c.launch())
         before = await self.written()
-        for body in (
-            {},
-            {"confirmed": False, "disclosure_version": V},
-            {"confirmed": "true", "disclosure_version": V},
+        for extra in (
             {"confirmed": True},
-            {"confirmed": True, "disclosure_version": "2"},
-            {"disclosure_version": V},
+            {"disclosure_version": 2},
+            {"confirmed": True, "disclosure_version": 2},
         ):
-            status, answer = await self.c.l1(STUDENT, ticket, **body)
-            self.assertEqual(
-                (status, answer["errcode"]), (400, "M_INVALID_PARAM"), body
-            )
-        status, answer = await self.c.l1(
-            STUDENT, ticket, confirmed=True, disclosure_version=V - 1
-        )
-        self.assertEqual(
-            (status, answer["errcode"]), (409, "ORG.PANGEA.DISCLOSURE_OUTDATED")
-        )
+            status, answer = await self.c.l1(STUDENT, ticket, **extra)
+            self.assertEqual((status, answer["errcode"]), (400, "M_INVALID_PARAM"))
+        status, answer = await self.c.l1(None, ticket)
+        self.assertEqual(status, 401, answer)
         self.assertEqual(await self.written(), before)
         self.assertEqual((await self.c.h.row(row["id"]))["state"], "invited")
         # None of these consumed the ticket.
         status, answer = await self.c.learner_l1(STUDENT, ticket)
         self.assertEqual(status, 200, answer)
-        self.assertEqual(len(answer["claimed"]), 1)
+        self.assertEqual(
+            answer,
+            {"next": "app", "claimed": [{"invitation_id": row["id"], "room_id": ROOM}]},
+        )
 
     async def test_expired_link_ticket_is_rejected_and_writes_no_link(self):
         await self.canvas_row()
@@ -1428,59 +1433,21 @@ class TestLearnerLaunch(_Base):
         self.assertEqual(await self.written(), before)
         self.assertEqual(await self.c.links.linked_user(ISSUER, SUB), STUDENT)
 
-    async def test_link_ticket_returned_by_a_different_signed_in_account_than_the_one_it_binds_is_rejected(
-        self,
-    ):
-        await self.linked()
-        row = await self.canvas_row()
-        # The later launch binds its ticket to the linked account.
-        target, query = await self.c.go(self.c.launch())
-        self.assertEqual(target, APP + "/lti/link")
-        before = await self.written()
-        status, body = await self.c.learner_l1(OTHER, query["ticket"])
-        self.assertEqual(status, 403, body)
-        self.assertEqual(await self.written(), before)
-        self.assertEqual(body["errcode"], "ORG.PANGEA.TICKET_WRONG_ACCOUNT")
-        self.assertEqual((await self.c.h.row(row["id"]))["state"], "invited")
-        self.assertIsNone(await self.c.h.store.get_ack(row["id"], OTHER))
-        self.assertIsNone(await self.c.h.store.get_ack(row["id"], STUDENT))
-        self.assertEqual(self.c.login_tokens.issued, [])
-        self.assertEqual(await self.c.links.linked_user(ISSUER, SUB), STUDENT)
-        # Consumed by the refused attempt.
-        status, body = await self.c.learner_l1(STUDENT, query["ticket"])
-        self.assertEqual(status, 410, body)
-
-    async def test_later_launch_with_a_newly_imported_matching_row_asks_for_confirmation_then_claims(
+    async def test_later_launch_claims_a_newly_imported_matching_row_then_signs_in(
         self,
     ):
         await self.linked()
         # Imported after the first launch.
         row = await self.canvas_row()
         target, query = await self.c.go(self.c.launch())
-        self.assertEqual(target, APP + "/lti/link")
-        self.assertEqual(set(query), {"ticket", "course"})
-        self.assertEqual(self.c.login_tokens.issued, [])
-        # Confirmed from the link page; the bound ticket needs no token and
-        # the login token is issued only now, after the confirmation.
-        status, body = await self.c.learner_l1(None, query["ticket"])
-        self.assertEqual(status, 200, body)
-        self.assertEqual(body["next"], "app")
-        self.assertEqual(
-            body["claimed"], [{"invitation_id": row["id"], "room_id": ROOM}]
-        )
-        self.assertEqual(self.c.login_tokens.issued, [(STUDENT, body["login_token"])])
+        self.assertEqual((target, set(query)), (APP + "/lti/token", {"loginToken"}))
         joined = await self.c.h.row(row["id"])
         self.assertEqual((joined["state"], joined["claimant"]), ("joined", STUDENT))
-        # Next launch: nothing left to confirm, straight to the app.
-        target, query = await self.c.go(self.c.launch())
-        self.assertEqual(target, APP + "/lti/token")
+        self.assertIsNone(await self.c.h.store.get_request(row["id"], STUDENT))
 
-    async def test_later_launch_retries_a_confirmed_claim_that_did_not_complete(
-        self,
-    ):
-        """The student confirmed, but the claim's join failed: the row is
-        acked and still Invited. A later launch retries the claim from that
-        recorded confirmation instead of skipping it for good."""
+    async def test_later_launch_retries_a_claim_that_did_not_complete(self):
+        """The join failed at the link step: the row is still Invited. Every
+        later launch tries the exact-identity claim again."""
         row = await self.canvas_row()
         self.c.h.joiner.refuse.add(STUDENT)
         with patch.object(report, "sentry_sdk"):
@@ -1488,7 +1455,6 @@ class TestLearnerLaunch(_Base):
                 STUDENT, await self.c.ticket(self.c.launch())
             )
             self.assertEqual((status, body["claimed"]), (200, []))
-            self.assertIsNotNone(await self.c.h.store.get_ack(row["id"], STUDENT))
             # Still refused: the launch still signs in, the row stays Invited,
             # and the failure is reported, not raised into the launch.
             target, _ = await self.c.go(self.c.launch())
@@ -1501,28 +1467,16 @@ class TestLearnerLaunch(_Base):
         self.assertEqual((joined["state"], joined["claimant"]), ("joined", STUDENT))
         self.assertIsNotNone(await self.c.h.store.managed_record(STUDENT, ROOM))
 
-    async def test_later_launch_never_claims_without_the_accounts_own_confirmation(
-        self,
-    ):
+    async def test_later_launch_claims_only_its_own_identity_rows(self):
         await self.linked()
-        row = await self.canvas_row()
-        # Another account's confirmation does not count for this one.
-        await self.c.h.store.record_ack(row["id"], OTHER, V, NOW)
+        mine = await self.canvas_row()
+        theirs = await self.canvas_row(email="t@school.example", sub=OTHER_SUB)
+        # Another account's request on this account's row changes nothing.
+        await self.c.h.store.record_request(mine["id"], OTHER, NOW)
         target, _ = await self.c.go(self.c.launch())
-        self.assertEqual(target, APP + "/lti/link")
-        self.assertEqual((await self.c.h.row(row["id"]))["state"], "invited")
-        self.assertEqual(self.c.h.joiner.joins, [])
-
-    async def test_bound_ticket_with_the_accounts_own_token_returns_no_login_token(
-        self,
-    ):
-        await self.linked()
-        await self.canvas_row()
-        ticket = await self.c.ticket(self.c.launch())
-        status, body = await self.c.learner_l1(STUDENT, ticket)
-        self.assertEqual(status, 200, body)
-        self.assertIsNone(body["login_token"])
-        self.assertEqual(self.c.login_tokens.issued, [])
+        self.assertEqual(target, APP + "/lti/token")
+        self.assertEqual((await self.c.h.row(mine["id"]))["claimant"], STUDENT)
+        self.assertEqual((await self.c.h.row(theirs["id"]))["state"], "invited")
 
     async def test_canvas_identity_already_linked_to_another_account_is_refused(self):
         await self.linked(STUDENT, SUB)
@@ -1535,7 +1489,7 @@ class TestLearnerLaunch(_Base):
             (status, body["errcode"]), (409, "ORG.PANGEA.LTI_ALREADY_LINKED")
         )
         self.assertEqual((await self.c.h.row(row["id"]))["state"], "invited")
-        self.assertIsNone(await self.c.h.store.get_ack(row["id"], STUDENT))
+        self.assertIsNone(await self.c.h.store.get_request(row["id"], STUDENT))
         # A first-launch ticket for SUB (already linked to STUDENT) presented
         # by OTHER: refused, never re-linked. (A linked SUB's launch gets a
         # login token, not a ticket; the store issues an unbound one directly,
@@ -1561,23 +1515,19 @@ class TestLearnerLaunch(_Base):
         learner = await self.c.ticket(self.c.launch())
         instructor = await self.c.ticket(self.c.launch(roles=(INSTRUCTOR,)))
         connect = await self.c.connect_ticket(teacher=OTHER, sub="canvas-teacher-2")
-        # A learner ticket in the instructor form, and the reverse: 400, not
-        # consumed.
-        status, body = await self.c.l1(STUDENT, learner)
-        self.assertEqual(status, 400, body)
-        status, body = await self.c.learner_l1(TEACHER, instructor)
-        self.assertEqual(status, 400, body)
-        # A connect ticket is not a link ticket.
+        # A connect ticket is not a link ticket; nor is an unknown one.
         status, body = await self.c.l1(OTHER, connect)
         self.assertEqual(status, 410, body)
         status, body = await self.c.learner_l1(STUDENT, "no-such-ticket")
         self.assertEqual(status, 410, body)
-        # Unknown fields are refused.
+        # Unknown fields are refused, unconsumed.
         status, body = await self.c.l1(TEACHER, instructor, room_id=ROOM)
         self.assertEqual(status, 400, body)
-        # The two link tickets still work.
-        self.assertEqual((await self.c.learner_l1(STUDENT, learner))[0], 200)
-        self.assertEqual((await self.c.l1(TEACHER, instructor))[0], 200)
+        # Both link tickets take the same body.
+        status, body = await self.c.learner_l1(STUDENT, learner)
+        self.assertEqual((status, body["next"]), (200, "app"))
+        status, body = await self.c.l1(TEACHER, instructor)
+        self.assertEqual((status, body["next"]), (200, "connect"))
 
     async def test_tickets_are_opaque_and_stored_only_as_a_hash(self):
         ticket = await self.c.ticket(self.c.launch())
@@ -1664,8 +1614,8 @@ class TestNoUserIdsInLogs(_Base):
             await h.handlers.revoke(
                 TEACHER, {"room_id": ROOM, "invitation_id": d["invitation_id"]}
             )
-            await h.confirm(OTHER, b["invitation_id"])
-            await h.confirm(THIRD, b["invitation_id"])
+            await h.open(OTHER, b["invitation_id"])
+            await h.open(THIRD, b["invitation_id"])
             for user, decision in ((OTHER, "deny"), (THIRD, "grant")):
                 status, body = await h.handlers.decide(
                     TEACHER,
@@ -1677,7 +1627,7 @@ class TestNoUserIdsInLogs(_Base):
                     },
                 )
                 self.assertEqual(status, 200, body)
-            await h.confirm(OTHER, c["invitation_id"])
+            await h.open(OTHER, c["invitation_id"])
             await h.handlers.approve_all(TEACHER, {"room_id": ROOM})
             h.main.membership[(ROOM, STUDENT)] = "join"
             h.verify(STUDENT, "member@school.example")
@@ -1687,7 +1637,7 @@ class TestNoUserIdsInLogs(_Base):
             self.assertEqual(status, 200, body)
             # Claim by confirmation, then leave; then the same paths failing.
             h.verify(STUDENT, "a@school.example", 2)
-            status, body = await h.confirm(STUDENT, a["invitation_id"])
+            status, body = await h.open(STUDENT, a["invitation_id"])
             self.assertEqual(body["result"], "claimed", body)
             release = MembershipRelease(h.store, h.claims)
             await release.on_new_event(
@@ -1697,12 +1647,12 @@ class TestNoUserIdsInLogs(_Base):
             await release.on_new_event(
                 _member_event(ROOM, STUDENT, "leave", STUDENT), {}
             )
-            await h.claims.claim_confirmed_for(STUDENT)
+            await h.claims.claim_matching_for(STUDENT)
             await h.claims.repair_managed_for(STUDENT)
-            await guarded("confirm", lambda: h.confirm(STUDENT, a["invitation_id"]))
+            await guarded("open", lambda: h.open(STUDENT, a["invitation_id"]))
             h.main.db_pool.error = None
             h.joiner.refuse.add(STUDENT)
-            await guarded("confirm", lambda: h.confirm(STUDENT, c["invitation_id"]))
+            await guarded("open", lambda: h.open(STUDENT, c["invitation_id"]))
             h.joiner.refuse.clear()
             # Canvas: connect, import, link, relaunch.
             await self.linked(OTHER, OTHER_SUB)
@@ -1724,7 +1674,7 @@ class TestNoUserIdsInLogs(_Base):
                 return result
 
             h.joiner.force_join = join_then_leave  # type: ignore[method-assign]
-            await h.confirm(FOURTH, e["invitation_id"])
+            await h.open(FOURTH, e["invitation_id"])
             h.joiner.force_join = original  # type: ignore[method-assign]
             legacy = MagicMock()
             legacy.prepared_for_emails = AsyncMock(return_value=[])
@@ -1732,14 +1682,14 @@ class TestNoUserIdsInLogs(_Base):
             api = MagicMock()
             api._hs.get_datastores.return_value.main = h.main
             hook = ClaimByEmail(api, legacy, provisioner, student_claims=h.claims)
-            await h.confirm(FOURTH, f["invitation_id"])
+            await h.open(FOURTH, f["invitation_id"])
             h.verify(FOURTH, "f@school.example", 2)
             await hook.on_add_user_third_party_identifier(
                 FOURTH, "email", "f@school.example"
             )
             self.assertEqual((await h.row(f["invitation_id"]))["claimant"], FOURTH)
             with patch.object(
-                h.claims, "claim_confirmed_for", side_effect=RuntimeError("x")
+                h.claims, "claim_matching_for", side_effect=RuntimeError("x")
             ), patch.object(
                 h.claims, "repair_managed_for", side_effect=RuntimeError("x")
             ):
@@ -1781,18 +1731,21 @@ class TestNoUserIdsInLogs(_Base):
             )
             (g,) = await h.add("g@school.example")
             h.verify(FOURTH, "g@school.example", 3)
-            await h.confirm(FOURTH, g["invitation_id"])
-            await h.claims.claim_confirmed_for(FOURTH)
+            await h.open(FOURTH, g["invitation_id"])
+            await h.claims.claim_matching_for(FOURTH)
         text = captured.text()
         for covered in (
             "LTI roster imported",
             "student invitation",
             "left during",
             "not claimed",
-            "no confirmation",
         ):
             self.assertIn(covered, text)
         self.assertTrue(hook_sentry.capture_message.called)
+        # Never an exception capture: it ships each frame's local variables
+        # (the user id, the addresses), which no message check can see.
+        self.assertFalse(hook_sentry.capture_exception.called)
+        self.assertFalse(sentry.capture_exception.called)
         everything = text + "\n" + str(sentry.mock_calls) + str(hook_sentry.mock_calls)
         for pattern in (self.MXID, self.EMAIL):
             self.assertEqual(pattern.findall(everything), [], text)
@@ -1813,50 +1766,18 @@ class TestNoLoginTokenForServerAdmins(_Base):
         location = await self.c.redirects.location(self.c.launch())
         self.assertEqual(location, APP + "/home/login")
         self.assertEqual(self.c.login_tokens.issued, [])
-        # Nor a ticket that would lead to one: unconfirmed rows to claim
-        # change nothing.
-        await self.canvas_row()
+        # Nor a ticket, nor a claim: a matching row stays invited.
+        row = await self.canvas_row()
         tickets_before = await self.c.table("lti_ticket")
         location = await self.c.redirects.location(self.c.launch())
         self.assertEqual(location, APP + "/home/login")
         self.assertEqual(await self.c.table("lti_ticket"), tickets_before)
         self.assertEqual(self.c.login_tokens.issued, [])
+        self.assertEqual((await self.c.h.row(row["id"]))["state"], "invited")
         text = captured.text()
         self.assertIn("LTI login token refused: server admin", text)
         self.assertNotIn(STUDENT, text)
         self.assertNotIn(SUB, text)
-
-    async def test_bound_ticket_of_an_account_promoted_since_gets_no_login_token(
-        self,
-    ):
-        await self.linked()
-        await self.canvas_row()
-        ticket = await self.c.ticket(self.c.launch())
-        self.c.server_admins.admins.add(STUDENT)
-        before = await self.written()
-        status, body = await self.c.learner_l1(None, ticket)
-        self.assertEqual(status, 401, body)
-        self.assertEqual(await self.written(), before)
-        self.assertEqual(self.c.login_tokens.issued, [])
-        # The ticket itself is consumed (C5.1): it cannot be retried with a
-        # token either; a relaunch issues a new one.
-        status, body = await self.c.learner_l1(STUDENT, ticket)
-        self.assertEqual(status, 410, body)
-        # Signing in themself, the admin still confirms and claims normally.
-        ticket = await self.c.links.issue_ticket(
-            KIND_LEARNER,
-            platform_id=self.c.platform_ids[ISSUER],
-            issuer=ISSUER,
-            sub=SUB,
-            context_id=CONTEXT,
-            deployment_id=DEPLOYMENT,
-            nrps_url=None,
-            bound_user_id=STUDENT,
-            now_ms=self.c.now,
-        )
-        status, body = await self.c.learner_l1(STUDENT, ticket)
-        self.assertEqual((status, len(body["claimed"])), (200, 1), body)
-        self.assertIsNone(body["login_token"])
 
     async def test_login_tokens_never_mint_for_an_admin_whoever_calls(self):
         tokens = LoginTokens(self.c.login_tokens, self.c.server_admins)
@@ -1869,37 +1790,10 @@ class TestNoLoginTokenForServerAdmins(_Base):
         self.assertEqual(await tokens.issue(STUDENT), "login-token-1")
         self.assertEqual(self.c.login_tokens.issued, [(STUDENT, "login-token-1")])
 
-    async def test_admin_flag_flipping_mid_link_step_never_leaves_writes_without_a_token(
-        self,
-    ):
-        """One admin decision per request: if the flag read passes and a
-        later read would fail or flip, the request still either refuses
-        before writing (401) or completes with its token, never a claim
-        written with no token."""
-        await self.linked()
-        row = await self.canvas_row()
-        for later in (True, RuntimeError("database down")):
-            ticket = await self.c.ticket(self.c.launch())
-            self.c.server_admins.checks.clear()
-            self.c.server_admins.script = [False, later]
-            before = await self.written()
-            status, body = await self.c.learner_l1(None, ticket)
-            self.c.server_admins.script = []
-            if status == 401:
-                self.assertEqual(await self.written(), before, later)
-            else:
-                self.assertEqual(status, 200, body)
-                self.assertIsNotNone(body["login_token"], later)
-                self.assertEqual(len(body["claimed"]), 1)
-                break
-            self.assertEqual(self.c.server_admins.checks, [STUDENT])
-        joined = await self.c.h.row(row["id"])
-        self.assertEqual(joined["state"], "joined")
-
     async def test_admin_flag_flipping_mid_launch_never_writes_before_refusing(self):
-        await self.linked()
+        # A matching row the link step could not claim (its join failed):
+        # a launch would claim it.
         row = await self.canvas_row()
-        # Confirmed, but the claim's join failed: the launch would retry it.
         self.c.h.joiner.refuse.add(STUDENT)
         with patch.object(report, "sentry_sdk"):
             await self.c.learner_l1(STUDENT, await self.c.ticket(self.c.launch()))
@@ -1938,12 +1832,6 @@ class TestNoLoginTokenForServerAdmins(_Base):
         self.addCleanup(captured.detach)
         location = await self.c.redirects.location(self.c.launch())
         self.assertEqual(location, APP + "/home/login")
-        await self.canvas_row()
-        self.c.server_admins.error = None
-        ticket = await self.c.ticket(self.c.launch())
-        self.c.server_admins.error = RuntimeError("database down")
-        status, body = await self.c.learner_l1(None, ticket)
-        self.assertEqual(status, 401, body)
         self.assertEqual(self.c.login_tokens.issued, [])
         text = captured.text()
         self.assertIn("LTI login token refused: admin check failed", text)

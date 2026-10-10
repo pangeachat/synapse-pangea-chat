@@ -15,8 +15,10 @@ from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimi
 from synapse_pangea_chat.student_invitations.accounts import Accounts
 from synapse_pangea_chat.student_invitations.api import (
     PREFIX,
+    InvitationOpenRoute,
     StudentInvitationHandlers,
     StudentInvitationRoute,
+    StudentInvitationsRoot,
 )
 from synapse_pangea_chat.student_invitations.approvals import Approvals
 from synapse_pangea_chat.student_invitations.claim import StudentClaims
@@ -122,17 +124,11 @@ def register_student_invitations(api: ModuleApi, config: Any) -> StudentInvitati
             "teacher",
             h.live,
         ),
-        "student_invitations_confirm": (
-            "student_invitations/confirm",
-            "POST",
-            "student",
-            h.confirm,
-        ),
-        "student_invitations_mine_pending": (
-            "student_invitations/mine/pending",
+        "student_invitations_events": (
+            "student_invitations/events",
             "GET",
-            "student",
-            h.mine_pending,
+            "teacher",
+            h.events,
         ),
         "student_invitations_mine_joined": (
             "student_invitations/mine/joined",
@@ -145,12 +141,6 @@ def register_student_invitations(api: ModuleApi, config: Any) -> StudentInvitati
             "GET",
             "public",
             h.hint,
-        ),
-        "managed_disclosure": (
-            "managed_disclosure",
-            "GET",
-            "public",
-            lambda _query: h.disclosure(),
         ),
     }
     for name, (path, method, kind, handler) in routes.items():
@@ -168,6 +158,26 @@ def register_student_invitations(api: ModuleApi, config: Any) -> StudentInvitati
                 ),
             ),
         )
+    # S1 open: `student_invitations/{invitation_id}/open`. The fixed routes
+    # above become children of this root, so only other segments reach it.
+    burst, seconds = limit_for(
+        config.student_invitation_rate_limits, "student_invitations_open"
+    )
+    api.register_web_resource(
+        path=PREFIX + "student_invitations",
+        resource=StudentInvitationsRoot(
+            InvitationOpenRoute(
+                homeserver,
+                "student_invitations_open",
+                "POST",
+                "student",
+                h.open,
+                SlidingWindowRateLimiter(
+                    requests_per_burst=burst, burst_duration_seconds=seconds
+                ),
+            )
+        ),
+    )
     api.register_third_party_rules_callbacks(
         on_new_event=MembershipRelease(store, claims).on_new_event
     )

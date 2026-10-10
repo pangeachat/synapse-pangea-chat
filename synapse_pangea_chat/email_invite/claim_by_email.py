@@ -8,10 +8,9 @@ It runs when the account signs in, and when a verified address is added to it:
 email sign-up stores the address during registration and the app signs in from
 that response without a separate login, so a sign-in check alone would miss it.
 
-The same two moments claim a student invitation the account has already
-confirmed but could not claim then, because the invited address was not yet
-verified on it (``student_invitations.claim``). An invitation the account has
-not confirmed is never claimed here: the student sees it in the app instead.
+The same two moments claim every live student invitation whose address the
+account has verified (``student_invitations.claim``; no confirmation, seats
+amendment 2026-10-10).
 Each sign-in also re-applies the managed-record rule to the account's joined
 invitations (managed exactly while not a course admin there), repairing a
 missed power-level event.
@@ -43,9 +42,12 @@ logger = logging.getLogger(
 EMAIL_MEDIUM = "email"
 
 
-def _capture_exception(e: Exception) -> None:
+def _report(what: str, e: Exception) -> None:
+    """Sentry gets a message with the exception type only. Never
+    ``capture_exception``: it ships each frame's local variables, and these
+    frames hold the account's user id and addresses."""
     if sentry_sdk is not None:
-        sentry_sdk.capture_exception(e)
+        sentry_sdk.capture_message(f"{what} failed: {type(e).__name__}", level="error")
 
 
 class ClaimByEmail:
@@ -100,10 +102,10 @@ class ClaimByEmail:
     async def _claim_student_invitations(self, user_id: str) -> None:
         if self._student_claims is None:
             return
-        # claim_confirmed_for reports its own failures; this guard is for
+        # claim_matching_for reports its own failures; this guard is for
         # anything it did not foresee, since nothing may fail the sign-in.
         try:
-            await self._student_claims.claim_confirmed_for(user_id)
+            await self._student_claims.claim_matching_for(user_id)
         except Exception as e:
             logger.error("Student invitation claims failed: %s", type(e).__name__)
             if sentry_sdk is not None:
@@ -129,7 +131,7 @@ class ClaimByEmail:
             invitations = await self._invitations.prepared_for_emails(emails)
         except Exception as e:
             logger.error("Could not look up prepared courses: %s", type(e).__name__)
-            _capture_exception(e)
+            _report("prepared course lookup", e)
             return
         for invitation in invitations:
             ident = invitation["invitation_id"]
@@ -146,7 +148,7 @@ class ClaimByEmail:
                 logger.error(
                     "Claim of %s by verified address failed: %s", ident, e.errcode
                 )
-                _capture_exception(e)
+                _report(f"prepared course claim {ident}", e)
                 continue
             except Exception as e:
                 logger.error(
@@ -154,7 +156,7 @@ class ClaimByEmail:
                     ident,
                     type(e).__name__,
                 )
-                _capture_exception(e)
+                _report(f"prepared course claim {ident}", e)
                 continue
             if room is None:
                 logger.info("Invitation %s is being claimed by another request", ident)

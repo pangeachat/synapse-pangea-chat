@@ -20,6 +20,12 @@ from typing import Any, Optional, Tuple
 
 import attr
 
+from synapse_pangea_chat.student_invitations.events import (
+    CANVAS_CONNECTED,
+    EVENT_SCHEMA,
+    record_event,
+)
+
 KIND_LEARNER = "learner_link"
 KIND_INSTRUCTOR = "instructor_link"
 KIND_CONNECT = "connect"
@@ -28,9 +34,7 @@ MAX_TICKET_LENGTH = 128
 
 # consume_ticket outcomes
 TICKET_OK = "ok"
-TICKET_INVALID = "invalid"  # unknown, expired or already consumed
-TICKET_WRONG_KIND = "wrong_kind"  # live, but not the kind this step takes
-TICKET_UNBOUND = "unbound"  # live, but needs the account's own sign-in
+TICKET_INVALID = "invalid"  # unknown, expired, consumed or another kind
 
 # link_user / link_course outcomes
 LINKED = "linked"
@@ -73,8 +77,7 @@ SCHEMA = (
 # The ticket's fields, in `Ticket` order.
 _SELECT_TICKET = (
     "SELECT kind, platform_id, issuer, sub, context_id, deployment_id, nrps_url,"
-    " bound_user_id, consumed_at_ms, expires_at_ms FROM lti_ticket"
-    " WHERE ticket_hash = ?"
+    " bound_user_id FROM lti_ticket WHERE ticket_hash = ?"
 )
 _TICKET_FIELDS = 8
 
@@ -116,7 +119,8 @@ class LtiLinkStore:
             return
 
         def create(txn: Any) -> None:
-            for sql in SCHEMA:
+            # The ledger table too: a connect is recorded with its link.
+            for sql in SCHEMA + EVENT_SCHEMA:
                 txn.execute(sql)
 
         await self._db.runInteraction("lti_link_schema", create)
@@ -166,42 +170,32 @@ class LtiLinkStore:
         return ticket
 
     async def consume_ticket(
-        self, ticket: str, *, kind: str, require_bound: bool, now_ms: int
+        self, ticket: str, *, kinds: Tuple[str, ...], now_ms: int
     ) -> Tuple[str, Optional[Ticket]]:
-        """Consume a live ticket of `kind` in one conditional update.
-
-        Of two concurrent presentations exactly one consumes it. A ticket that
-        is live but of another kind (returned, unconsumed, so the caller can
-        tell which), or unbound when `require_bound` (no signed-in caller), is
-        left unconsumed and reported as such; anything else that is not
-        consumable is `invalid`.
-        """
+        """Consume a live ticket of one of `kinds` in one conditional update:
+        (`ok`, ticket), or (`invalid`, None) when it is unknown, expired,
+        already consumed or of another kind (then it stays unconsumed). Of
+        two concurrent presentations exactly one consumes it."""
         await self.ensure()
         key = _hash(ticket)
+        if not 1 <= len(kinds) <= 2:
+            raise ValueError("one or two ticket kinds")
+        first, second = kinds[0], kinds[-1]
 
         def take(txn: Any) -> Tuple[str, Optional[Ticket]]:
-            sql = (
+            txn.execute(
                 "UPDATE lti_ticket SET consumed_at_ms = ?"
-                " WHERE ticket_hash = ? AND kind = ? AND consumed_at_ms IS NULL"
-                " AND expires_at_ms > ?"
+                " WHERE ticket_hash = ? AND kind IN (?, ?)"
+                " AND consumed_at_ms IS NULL AND expires_at_ms > ?",
+                (now_ms, key, first, second, now_ms),
             )
-            if require_bound:
-                sql += " AND bound_user_id IS NOT NULL"
-            txn.execute(sql, (now_ms, key, kind, now_ms))
-            consumed = txn.rowcount == 1
+            if txn.rowcount != 1:
+                return TICKET_INVALID, None
             txn.execute(_SELECT_TICKET, (key,))
             row = txn.fetchone()
-            if consumed:
-                if row is None:
-                    raise RuntimeError("ticket row missing after consume")
-                return TICKET_OK, Ticket(*row[:_TICKET_FIELDS])
-            if row is None or row[-2] is not None or row[-1] <= now_ms:
-                return TICKET_INVALID, None
-            if row[0] != kind:
-                return TICKET_WRONG_KIND, Ticket(*row[:_TICKET_FIELDS])
-            if require_bound and row[7] is None:
-                return TICKET_UNBOUND, None
-            return TICKET_INVALID, None
+            if row is None:
+                raise RuntimeError("ticket row missing after consume")
+            return TICKET_OK, Ticket(*row[:_TICKET_FIELDS])
 
         return await self._db.runInteraction("lti_consume_ticket", take)
 
@@ -303,6 +297,15 @@ class LtiLinkStore:
                     now_ms,
                 ),
             )
-            return LINKED if txn.rowcount == 1 else CONFLICT
+            if txn.rowcount != 1:
+                return CONFLICT
+            record_event(
+                txn,
+                room_id=room_id,
+                actor=linked_by,
+                action=CANVAS_CONNECTED,
+                now_ms=now_ms,
+            )
+            return LINKED
 
         return await self._db.runInteraction("lti_link_course", write)

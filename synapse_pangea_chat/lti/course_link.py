@@ -189,7 +189,9 @@ class CourseLinks:
         if ticket is None or room_id is None:
             return bad("'ticket' and a valid 'room_id' are required")
         outcome, found = await self._links.consume_ticket(
-            ticket, kind=KIND_CONNECT, require_bound=True, now_ms=self._clock_ms()
+            ticket,
+            kinds=(KIND_CONNECT,),
+            now_ms=self._clock_ms(),
         )
         if outcome != TICKET_OK or found is None:
             return TICKET_INVALID

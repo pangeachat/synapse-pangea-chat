@@ -21,12 +21,13 @@ DEFAULT_LIMITS: Dict[str, Tuple[int, int]] = {
     "student_invitations_invite_member": (60, 60),
     # choreo calls it once per seat assignment, with the teacher's token.
     "student_invitations_live": (300, 60),
-    "student_invitations_confirm": (10, 60),
-    "student_invitations_mine_pending": (60, 60),
+    # S1 open (was confirm; same limit).
+    "student_invitations_open": (10, 60),
+    # T12, the activity read.
+    "student_invitations_events": (60, 60),
     # choreo reads it with the student's token on a full gate recompute.
     "student_invitations_mine_joined": (120, 60),
     "student_invitations_hint": (10, 60),
-    "managed_disclosure": (60, 60),
     # Canvas (CONTRACTS C5 L1-L2, C2 T10-T11). The link step may come without
     # a token (a bound ticket), so it counts per client IP.
     "lti_link": (30, 60),

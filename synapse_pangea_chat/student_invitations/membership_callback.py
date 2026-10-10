@@ -2,9 +2,8 @@
 
 When the claimant of a joined invitation leaves the course space, or is
 kicked (a ``leave`` sent by someone else) or banned from it, the invitation
-becomes ``left`` and the managed record is deleted, as the disclosure
-promises. Rejoining with the class code restores nothing: a re-invite and a
-fresh confirmation are needed.
+becomes ``left`` and the managed record is deleted. Rejoining with the class
+code restores nothing: a re-invite is needed.
 
 The same callback watches the course's ``m.room.power_levels``: the managed
 record exists exactly while a joined claimant is not a course admin there
@@ -17,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping, Tuple
 
-from synapse_pangea_chat.student_invitations.claim import StudentClaims
+from synapse_pangea_chat.student_invitations.claim import StudentClaims, now_ms
 from synapse_pangea_chat.student_invitations.report import report_failure
 from synapse_pangea_chat.student_invitations.store import StudentInvitationStore
 
@@ -47,7 +46,7 @@ class MembershipRelease:
             return
         try:
             released = await self._store.release_on_leave(
-                event.room_id, event.state_key
+                event.room_id, event.state_key, now_ms()
             )
         except Exception as error:
             report_failure(

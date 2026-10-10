@@ -56,6 +56,12 @@ class Accounts:
         )
         return chosen.get(user_id)
 
+    async def user_for_email_key(self, key: str) -> Optional[str]:
+        """The account that has this canonical address verified, if any
+        (Synapse binds an address to at most one account)."""
+        user_id = await self._main.get_user_id_by_threepid(EMAIL_MEDIUM, key)
+        return user_id if isinstance(user_id, str) else None
+
     async def display_name(self, user_id: str) -> Optional[str]:
         name = await self._main.get_profile_displayname(UserID.from_string(user_id))
         return name if isinstance(name, str) and name else None

@@ -9,26 +9,27 @@ callback on real events and the sent email are covered end to end in
 
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 from unittest.mock import MagicMock, patch
 
-from synapse_pangea_chat.config import (
-    MANAGED_DISCLOSURE_TEXT,
-    MANAGED_DISCLOSURE_VERSION,
-    PangeaChatConfig,
-)
+from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
+from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
 from synapse_pangea_chat.student_invitations import report
 from synapse_pangea_chat.student_invitations.accounts import Accounts
 from synapse_pangea_chat.student_invitations.api import (
+    InvitationOpenRoute,
     StudentInvitationHandlers,
+    StudentInvitationsRoot,
     guarded,
 )
 from synapse_pangea_chat.student_invitations.approvals import Approvals
-from synapse_pangea_chat.student_invitations.claim import StudentClaims
+from synapse_pangea_chat.student_invitations.claim import StudentClaims, now_ms
 from synapse_pangea_chat.student_invitations.hint_lookup import mask_email
 from synapse_pangea_chat.student_invitations.invite_email import InviteMailer
 from synapse_pangea_chat.student_invitations.membership_callback import (
@@ -45,7 +46,6 @@ OTHER = "@other:x"
 THIRD = "@third:x"
 INVITED = "Student@School.example"
 INVITED_KEY = "student@school.example"
-V = MANAGED_DISCLOSURE_VERSION
 ADDRESSES = (
     "student@school.example",
     "other@gmail.example",
@@ -79,6 +79,13 @@ class FakeMain:
             SimpleNamespace(medium="email", address=a, added_at=t, validated_at=t)
             for a, t in self.threepids.get(user_id, [])
         ]
+
+    async def get_user_id_by_threepid(self, medium: str, address: str) -> Optional[str]:
+        # Synapse binds an address to at most one account, stored canonical.
+        for user_id, entries in self.threepids.items():
+            if medium == "email" and any(a.lower() == address for a, _ in entries):
+                return user_id
+        return None
 
     async def get_profile_displayname(self, user: Any) -> Optional[str]:
         return self.displaynames.get(user.to_string())
@@ -177,12 +184,13 @@ class Harness:
         assert status == 200, body
         return body["invitations"]
 
-    async def confirm(
-        self, user: str, invitation_id: str, version: int = V
-    ) -> Tuple[int, Dict[str, Any]]:
-        return await self.handlers.confirm(
-            user, {"invitation_id": invitation_id, "disclosure_version": version}
-        )
+    async def open(self, user: str, invitation_id: str) -> Tuple[int, Dict[str, Any]]:
+        return await self.handlers.open(user, invitation_id)
+
+    async def events(self, room: str = ROOM, **query: str) -> List[Dict[str, Any]]:
+        status, body = await self.handlers.events(TEACHER, {"room_id": room, **query})
+        assert status == 200, body
+        return body["events"]
 
     async def row(self, invitation_id: str) -> Dict[str, Any]:
         row = await self.store.get(invitation_id)
@@ -211,23 +219,20 @@ class _Base(unittest.IsolatedAsyncioTestCase):
 
 
 class TestClaimRules(_Base):
-    async def test_claim_requires_confirmation_plus_email_match_or_grant(self):
+    async def test_a_verified_match_claims_with_no_confirmation_and_another_address_only_requests(
+        self,
+    ):
+        """Seats amendment 2026-10-10: no checkbox. A verified match claims at
+        once; another address records a request, and claims nothing."""
         (inv,) = await self.h.add(INVITED)
         ident = inv["invitation_id"]
-        # Verified email match, but no confirmation: nothing is claimed.
-        self.h.verify(STUDENT, INVITED_KEY)
-        outcome, _ = await self.h.claims.claim(ident, STUDENT)
-        self.assertEqual(outcome, "not_eligible")
-        self.assertEqual((await self.h.row(ident))["state"], "invited")
-        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
-        self.assertEqual(self.h.joiner.joins, [])
-        # Confirmation, no match and no grant: a pending approval, no claim.
-        status, body = await self.h.confirm(OTHER, ident)
-        self.assertEqual((status, body["result"]), (200, "pending_approval"))
+        status, body = await self.h.open(OTHER, ident)
+        self.assertEqual((status, body["result"]), (200, "pending"))
+        self.assertIsNotNone(await self.h.store.get_request(ident, OTHER))
         self.assertEqual((await self.h.row(ident))["state"], "invited")
         self.assertNotIn((ROOM, OTHER), self.h.joiner.joins)
-        # Confirmation plus match claims.
-        status, body = await self.h.confirm(STUDENT, ident)
+        self.h.verify(STUDENT, INVITED_KEY)
+        status, body = await self.h.open(STUDENT, ident)
         self.assertEqual(
             (status, body),
             (200, {"result": "claimed", "invitation_id": ident, "room_id": ROOM}),
@@ -235,18 +240,21 @@ class TestClaimRules(_Base):
         row = await self.h.row(ident)
         self.assertEqual((row["state"], row["claimant"]), ("joined", STUDENT))
         self.assertIn((ROOM, STUDENT), self.h.joiner.joins)
+        # A match never writes a request: a request never stands in for a claim.
+        self.assertIsNone(await self.h.store.get_request(ident, STUDENT))
 
     async def test_claim_transaction_rechecks_every_rule_itself(self):
         """The database step refuses on its own, whatever the caller checked."""
-        (inv,) = await self.h.add(INVITED)
+        (inv, by_match) = await self.h.add(INVITED, "second@school.example")
         ident = inv["invitation_id"]
-        # No confirmation: refused even with a match and a grant.
-        outcome, _ = await self.h.store.claim_txn(
-            ident, STUDENT, email_match=True, grant=True, now_ms=1
-        )
-        self.assertEqual(outcome, "not_eligible")
-        # Confirmation, but no match and no grant: refused.
-        await self.h.store.record_ack(ident, STUDENT, V, 2)
+        # No match, no request: refused, even with the teacher's grant.
+        for grant in (False, True):
+            outcome, _ = await self.h.store.claim_txn(
+                ident, STUDENT, email_match=False, grant=grant, now_ms=1
+            )
+            self.assertEqual(outcome, "not_eligible", grant)
+        # A request with no decision and no grant: refused.
+        await self.h.store.record_request(ident, STUDENT, 2)
         outcome, _ = await self.h.store.claim_txn(
             ident, STUDENT, email_match=False, grant=False, now_ms=3
         )
@@ -254,26 +262,35 @@ class TestClaimRules(_Base):
         row = await self.h.row(ident)
         self.assertEqual((row["state"], row["claimant"]), ("invited", None))
         self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
-        self.assertIsNone((await self.h.store.get_ack(ident, STUDENT))["decision"])
-        # A grant claims, and records the decision with the claim.
+        self.assertIsNone((await self.h.store.get_request(ident, STUDENT))["decision"])
+        # A grant of the request claims, and records the decision with it.
         outcome, row = await self.h.store.claim_txn(
-            ident, STUDENT, email_match=False, grant=True, now_ms=4
+            ident, STUDENT, email_match=False, grant=True, now_ms=4, actor=TEACHER
         )
         self.assertEqual(outcome, "claimed")
         self.assertEqual(
             (row["state"], row["claimant"], row["joined_at_ms"]), ("joined", STUDENT, 4)
         )
         self.assertEqual(
-            (await self.h.store.get_ack(ident, STUDENT))["decision"], "granted"
+            (await self.h.store.get_request(ident, STUDENT))["decision"], "granted"
         )
         self.assertEqual(
-            (await self.h.store.managed_record(STUDENT, ROOM))["since_ms"], 4
+            await self.h.store.managed_record(STUDENT, ROOM),
+            {"user_id": STUDENT, "course_room_id": ROOM, "created_at_ms": 4},
+        )
+        # A verified match needs no request at all.
+        outcome, _ = await self.h.store.claim_txn(
+            by_match["invitation_id"], OTHER, email_match=True, grant=False, now_ms=5
+        )
+        self.assertEqual(outcome, "claimed")
+        self.assertIsNone(
+            await self.h.store.get_request(by_match["invitation_id"], OTHER)
         )
 
     async def test_managed_record_alone_blocks_a_second_claim_in_the_course(self):
         first, second = await self.h.add(INVITED, "second@school.example")
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.confirm(STUDENT, first["invitation_id"])
+        await self.h.open(STUDENT, first["invitation_id"])
         # Even if the joined row were missed, the managed record refuses.
         await self.h.main.db_pool.runInteraction(
             "simulate",
@@ -282,7 +299,6 @@ class TestClaimRules(_Base):
                 (first["invitation_id"],),
             ),
         )
-        await self.h.store.record_ack(second["invitation_id"], STUDENT, V, 9)
         outcome, _ = await self.h.store.claim_txn(
             second["invitation_id"], STUDENT, email_match=True, grant=False, now_ms=9
         )
@@ -299,7 +315,7 @@ class TestClaimRules(_Base):
         self.h.admins.admins.add((ROOM, STUDENT))
         self.h.verify(STUDENT, INVITED_KEY)
         self.h.verify(STUDENT, "second@school.example", 2)
-        status, body = await self.h.confirm(STUDENT, own["invitation_id"])
+        status, body = await self.h.open(STUDENT, own["invitation_id"])
         self.assertEqual((status, body["result"]), (200, "claimed"))
         row = await self.h.row(own["invitation_id"])
         self.assertEqual((row["state"], row["claimant"]), ("joined", STUDENT))
@@ -310,28 +326,27 @@ class TestClaimRules(_Base):
             [i["invitation_id"] for i in joined["invitations"]], [own["invitation_id"]]
         )
         # Every other rule still holds: one claimed invitation per course.
-        status, body = await self.h.confirm(STUDENT, elsewhere["invitation_id"])
+        status, body = await self.h.open(STUDENT, elsewhere["invitation_id"])
         self.assertEqual(
             (status, body["errcode"]), (409, "ORG.PANGEA.ALREADY_CLAIMED_IN_COURSE")
         )
         # Admin of this course only: in another course the claim is managed.
-        status, body = await self.h.confirm(STUDENT, other_course["invitation_id"])
+        status, body = await self.h.open(STUDENT, other_course["invitation_id"])
         self.assertEqual(body["result"], "claimed")
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, OTHER_ROOM))
 
     async def test_non_admin_claim_still_records_managed(self):
         (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)
-        status, body = await self.h.confirm(STUDENT, inv["invitation_id"])
+        status, body = await self.h.open(STUDENT, inv["invitation_id"])
         self.assertEqual(body["result"], "claimed")
         record = await self.h.store.managed_record(STUDENT, ROOM)
-        self.assertEqual(
-            (record["user_id"], record["course_room_id"], record["invited_by"]),
-            (STUDENT, ROOM, TEACHER),
-        )
+        # The managed record carries only its time (no disclosure, no inviter).
+        self.assertEqual(set(record), {"user_id", "course_room_id", "created_at_ms"})
+        self.assertEqual((record["user_id"], record["course_room_id"]), (STUDENT, ROOM))
         self.assertIn((ROOM, STUDENT), self.h.admins.checks)
 
-    async def test_grant_without_confirmation_claims_nothing(self):
+    async def test_grant_without_a_request_claims_nothing(self):
         (inv,) = await self.h.add(INVITED)
         status, body = await self.h.handlers.decide(
             TEACHER,
@@ -348,19 +363,19 @@ class TestClaimRules(_Base):
     async def test_unverified_or_other_address_never_matches(self):
         (inv,) = await self.h.add(INVITED)
         self.h.verify(OTHER, "student@school.example.evil")
-        status, body = await self.h.confirm(OTHER, inv["invitation_id"])
-        self.assertEqual(body["result"], "pending_approval")
+        status, body = await self.h.open(OTHER, inv["invitation_id"])
+        self.assertEqual(body["result"], "pending")
         self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
 
-    async def test_confirmation_from_another_account_never_blocks_the_rightful_email_match(
+    async def test_a_request_from_another_account_never_blocks_the_rightful_email_match(
         self,
     ):
         (inv,) = await self.h.add(INVITED)
         ident = inv["invitation_id"]
-        status, body = await self.h.confirm(OTHER, ident)
-        self.assertEqual(body["result"], "pending_approval")
+        status, body = await self.h.open(OTHER, ident)
+        self.assertEqual(body["result"], "pending")
         self.h.verify(STUDENT, INVITED_KEY)
-        status, body = await self.h.confirm(STUDENT, ident)
+        status, body = await self.h.open(STUDENT, ident)
         self.assertEqual((status, body["result"]), (200, "claimed"))
         self.assertEqual((await self.h.row(ident))["claimant"], STUDENT)
         # The forwarded-link account is no longer a pending approval.
@@ -369,9 +384,9 @@ class TestClaimRules(_Base):
     async def test_invitation_claimed_by_at_most_one_account(self):
         (inv,) = await self.h.add(INVITED)
         ident = inv["invitation_id"]
-        await self.h.confirm(OTHER, ident)
+        await self.h.open(OTHER, ident)
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.confirm(STUDENT, ident)
+        await self.h.open(STUDENT, ident)
         # A later grant for the other confirmation cannot move the claim.
         status, body = await self.h.handlers.decide(
             TEACHER,
@@ -387,7 +402,6 @@ class TestClaimRules(_Base):
         )
         # And at the transaction level, a second account's claim is refused.
         self.h.verify(THIRD, INVITED_KEY)
-        await self.h.store.record_ack(ident, THIRD, V, 5)
         outcome, _ = await self.h.store.claim_txn(
             ident, THIRD, email_match=True, grant=False, now_ms=6
         )
@@ -396,8 +410,8 @@ class TestClaimRules(_Base):
         self.assertEqual((row["state"], row["claimant"]), ("joined", STUDENT))
         self.assertIsNone(await self.h.store.managed_record(OTHER, ROOM))
         self.assertIsNone(await self.h.store.managed_record(THIRD, ROOM))
-        # A third account confirming sees the one 404 body.
-        status, body = await self.h.confirm(THIRD, ident)
+        # A third account opening it sees the one 404 body.
+        status, body = await self.h.open(THIRD, ident)
         self.assertEqual((status, body["errcode"]), (404, "M_NOT_FOUND"))
 
     async def test_second_invitation_in_the_same_course_refused_for_an_account_that_already_claimed_one(
@@ -406,21 +420,22 @@ class TestClaimRules(_Base):
         first, second = await self.h.add(INVITED, "second@school.example")
         self.h.verify(STUDENT, INVITED_KEY)
         self.h.verify(STUDENT, "second@school.example", 2)
-        status, body = await self.h.confirm(STUDENT, first["invitation_id"])
+        status, body = await self.h.open(STUDENT, first["invitation_id"])
         self.assertEqual(body["result"], "claimed")
-        status, body = await self.h.confirm(STUDENT, second["invitation_id"])
+        status, body = await self.h.open(STUDENT, second["invitation_id"])
         self.assertEqual(
             (status, body["errcode"]), (409, "ORG.PANGEA.ALREADY_CLAIMED_IN_COURSE")
         )
-        # The confirmation is recorded; the roster marks the duplicate.
-        self.assertIsNotNone(
-            await self.h.store.get_ack(second["invitation_id"], STUDENT)
+        # No request is written (the address matches); the roster marks the
+        # duplicate from the verified address alone (read time).
+        self.assertIsNone(
+            await self.h.store.get_request(second["invitation_id"], STUDENT)
         )
         listed = await self.h.listing()
         self.assertEqual(listed[second["invitation_id"]]["state"], "invited")
         self.assertEqual(listed[second["invitation_id"]]["same_student_as"], STUDENT)
         self.assertIsNone(listed[first["invitation_id"]]["same_student_as"])
-        # A grant is refused the same way and records no decision.
+        # There is no request to grant.
         status, body = await self.h.handlers.decide(
             TEACHER,
             {
@@ -430,13 +445,8 @@ class TestClaimRules(_Base):
                 "decision": "grant",
             },
         )
-        self.assertEqual(
-            (status, body["errcode"]), (409, "ORG.PANGEA.ALREADY_CLAIMED_IN_COURSE")
-        )
-        ack = await self.h.store.get_ack(second["invitation_id"], STUDENT)
-        self.assertIsNone(ack["decision"])
+        self.assertEqual((status, body["errcode"]), (404, "M_NOT_FOUND"))
         # The database refuses it even past the handler's own check.
-        await self.h.store.record_ack(second["invitation_id"], STUDENT, V, 9)
         outcome, _ = await self.h.store.claim_txn(
             second["invitation_id"], STUDENT, email_match=True, grant=False, now_ms=9
         )
@@ -445,7 +455,7 @@ class TestClaimRules(_Base):
     async def test_one_joined_invitation_per_course_holds_in_the_database_itself(self):
         first, second = await self.h.add(INVITED, "second@school.example")
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.confirm(STUDENT, first["invitation_id"])
+        await self.h.open(STUDENT, first["invitation_id"])
         with self.assertRaises(Exception) as raised:
             await self.h.main.db_pool.runInteraction(
                 "bypass",
@@ -462,7 +472,7 @@ class TestClaimRules(_Base):
         (b,) = await self.h.add(INVITED, room=OTHER_ROOM)
         self.h.verify(STUDENT, INVITED_KEY)
         for inv in (a, b):
-            status, body = await self.h.confirm(STUDENT, inv["invitation_id"])
+            status, body = await self.h.open(STUDENT, inv["invitation_id"])
             self.assertEqual(body["result"], "claimed")
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, OTHER_ROOM))
@@ -470,8 +480,8 @@ class TestClaimRules(_Base):
     async def test_every_claim_writes_managed_record_revoke_deletes_it(self):
         (by_email, by_grant) = await self.h.add(INVITED, "third@school.example")
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.confirm(STUDENT, by_email["invitation_id"])
-        await self.h.confirm(OTHER, by_grant["invitation_id"])
+        await self.h.open(STUDENT, by_email["invitation_id"])
+        await self.h.open(OTHER, by_grant["invitation_id"])
         status, _ = await self.h.handlers.decide(
             TEACHER,
             {
@@ -485,8 +495,7 @@ class TestClaimRules(_Base):
         for user in (STUDENT, OTHER):
             record = await self.h.store.managed_record(user, ROOM)
             self.assertEqual(
-                (record["user_id"], record["course_room_id"], record["invited_by"]),
-                (user, ROOM, TEACHER),
+                (record["user_id"], record["course_room_id"]), (user, ROOM)
             )
         status, body = await self.h.handlers.revoke(
             TEACHER, {"room_id": ROOM, "invitation_id": by_email["invitation_id"]}
@@ -506,57 +515,45 @@ class TestClaimRules(_Base):
         )
         self.assertEqual((status, body["errcode"]), (404, "M_NOT_FOUND"))
         # A revoked invitation cannot be claimed again.
-        status, body = await self.h.confirm(STUDENT, by_email["invitation_id"])
+        status, body = await self.h.open(STUDENT, by_email["invitation_id"])
         self.assertEqual((status, body["errcode"]), (404, "M_NOT_FOUND"))
 
     async def test_claim_join_failure_claims_nothing(self):
         (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)
         self.h.joiner.refuse.add(STUDENT)
-        status, body = await guarded(
-            "confirm", lambda: self.h.confirm(STUDENT, inv["invitation_id"])
-        )
+        with patch.object(report, "sentry_sdk") as sentry:
+            status, body = await guarded(
+                "open", lambda: self.h.open(STUDENT, inv["invitation_id"])
+            )
         self.assertEqual((status, body), (500, {"error": "Internal server error"}))
+        # The failure is the refused join itself, not anything else.
+        self.assertIn((ROOM, STUDENT), self.h.joiner.joins)
+        self.assertIn("ClaimJoinFailed", str(sentry.mock_calls))
         self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
         self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
 
 
-class TestConfirm(_Base):
-    async def test_confirm_records_the_current_managed_disclosure_version_on_the_ack(
-        self,
-    ):
-        (inv,) = await self.h.add(INVITED)
-        status, _ = await self.h.confirm(OTHER, inv["invitation_id"])
-        self.assertEqual(status, 200)
-        ack = await self.h.store.get_ack(inv["invitation_id"], OTHER)
-        self.assertEqual(ack["disclosure_version"], MANAGED_DISCLOSURE_VERSION)
-        self.assertIsNone(ack["decision"])
+class TestOpen(_Base):
+    """S1 open (seats amendment 2026-10-10): no body, no disclosure."""
 
-    async def test_confirm_with_an_outdated_disclosure_records_nothing(self):
+    async def test_open_with_another_address_records_a_request_once(self):
         (inv,) = await self.h.add(INVITED)
-        self.h.verify(STUDENT, INVITED_KEY)
-        for version in (V - 1, V + 1):
-            status, body = await self.h.confirm(STUDENT, inv["invitation_id"], version)
-            self.assertEqual(
-                (status, body["errcode"]), (409, "ORG.PANGEA.DISCLOSURE_OUTDATED")
-            )
-        self.assertIsNone(await self.h.store.get_ack(inv["invitation_id"], STUDENT))
-        self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
+        ident = inv["invitation_id"]
+        for _ in range(2):
+            status, body = await self.h.open(OTHER, ident)
+            self.assertEqual((status, body["result"]), (200, "pending"))
+        request = await self.h.store.get_request(ident, OTHER)
+        self.assertEqual(
+            set(request), {"invitation_id", "user_id", "requested_at_ms", "decision"}
+        )
+        self.assertIsNone(request["decision"])
+        self.assertEqual(
+            [e["action"] for e in await self.h.events()],
+            ["request_made", "students_added"],
+        )
 
-    async def test_confirm_rejects_malformed_bodies(self):
-        (inv,) = await self.h.add(INVITED)
-        for body in (
-            None,
-            [],
-            {"invitation_id": inv["invitation_id"]},
-            {"invitation_id": 5, "disclosure_version": V},
-            {"invitation_id": inv["invitation_id"], "disclosure_version": True},
-            {"invitation_id": inv["invitation_id"], "disclosure_version": "2"},
-        ):
-            status, payload = await self.h.handlers.confirm(STUDENT, body)
-            self.assertEqual((status, payload["errcode"]), (400, "M_INVALID_PARAM"))
-
-    async def test_confirm_answers_one_404_for_unknown_revoked_left_or_taken(self):
+    async def test_open_answers_one_404_for_unknown_revoked_left_or_taken(self):
         a, b, c = await self.h.add(
             INVITED, "second@school.example", "third@school.example"
         )
@@ -564,34 +561,36 @@ class TestConfirm(_Base):
             TEACHER, {"room_id": ROOM, "invitation_id": b["invitation_id"]}
         )
         self.h.verify(THIRD, "third@school.example")
-        await self.h.confirm(THIRD, c["invitation_id"])
-        await self.h.store.release_on_leave(ROOM, THIRD)
+        await self.h.open(THIRD, c["invitation_id"])
+        await self.h.store.release_on_leave(ROOM, THIRD, 1)
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.confirm(STUDENT, a["invitation_id"])
+        await self.h.open(STUDENT, a["invitation_id"])
         bodies = []
         for ident in (
             "unknown",
+            "",
+            "x" * 300,
             b["invitation_id"],
             c["invitation_id"],
             a["invitation_id"],
         ):
-            status, body = await self.h.confirm(OTHER, ident)
+            status, body = await self.h.open(OTHER, ident)
             self.assertEqual(status, 404)
             bodies.append(body)
-            self.assertIsNone(await self.h.store.get_ack(ident, OTHER))
+            self.assertIsNone(await self.h.store.get_request(ident, OTHER))
         self.assertTrue(all(b == bodies[0] for b in bodies), bodies)
         self.assertEqual(bodies[0], {"error": "Not found", "errcode": "M_NOT_FOUND"})
 
-    async def test_confirm_by_the_claimant_again_is_claimed(self):
+    async def test_open_by_the_claimant_again_is_claimed(self):
         (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.confirm(STUDENT, inv["invitation_id"])
-        status, body = await self.h.confirm(STUDENT, inv["invitation_id"])
+        await self.h.open(STUDENT, inv["invitation_id"])
+        status, body = await self.h.open(STUDENT, inv["invitation_id"])
         self.assertEqual((status, body["result"]), (200, "claimed"))
 
-    async def test_confirm_after_a_deny_says_denied(self):
+    async def test_open_after_a_deny_says_denied(self):
         (inv,) = await self.h.add(INVITED)
-        await self.h.confirm(OTHER, inv["invitation_id"])
+        await self.h.open(OTHER, inv["invitation_id"])
         await self.h.handlers.decide(
             TEACHER,
             {
@@ -601,21 +600,52 @@ class TestConfirm(_Base):
                 "decision": "deny",
             },
         )
-        status, body = await self.h.confirm(OTHER, inv["invitation_id"])
+        status, body = await self.h.open(OTHER, inv["invitation_id"])
         self.assertEqual((status, body["result"]), (200, "denied"))
 
-    async def test_disclosure_read_returns_the_controls_spec_text_and_its_version(self):
-        status, body = await self.h.handlers.disclosure()
-        self.assertEqual(status, 200)
-        self.assertEqual(body, {"version": 2, "text": MANAGED_DISCLOSURE_TEXT})
-        self.assertIn("{course}", body["text"])
-        self.assertTrue(
-            body["text"].startswith("While you're in {course}, your teacher")
+    async def test_open_route_takes_the_id_from_the_path_and_an_empty_body(self):
+        calls: List[Any] = []
+
+        async def handler(caller: str, ident: str) -> Tuple[int, Any]:
+            calls.append((caller, ident))
+            return 200, {}
+
+        class Auth:
+            async def get_user_by_req(self, request: Any) -> Any:
+                return MagicMock(user=MagicMock(to_string=lambda: STUDENT))
+
+        homeserver = MagicMock()
+        homeserver.get_auth.return_value = Auth()
+        route = InvitationOpenRoute(
+            homeserver,
+            "student_invitations_open",
+            "POST",
+            "student",
+            handler,
+            SlidingWindowRateLimiter(requests_per_burst=50, burst_duration_seconds=60),
         )
-        self.assertIn(
-            "If you leave the course, your teacher stops managing", body["text"]
-        )
-        self.assertTrue(body["text"].endswith("delete your data at any time."))
+        root = StudentInvitationsRoot(route)
+        self.assertIs(root.getChild(b"inv-1", MagicMock()), route)
+
+        def request(postpath: List[bytes], body: bytes) -> Any:
+            r = MagicMock()
+            r.prepath = [b"_synapse", b"student_invitations", b"inv-1"]
+            r.postpath = postpath
+            r.content = io.BytesIO(body)
+            return r
+
+        self.assertEqual(await route._dispatch(request([b"open"], b"{}")), (200, {}))
+        self.assertEqual(calls, [(STUDENT, "inv-1")])
+        # The body is exactly `{}`.
+        for body in (b"", b'{"x": 1}', b"[]", b"not json"):
+            status, answer = await route._dispatch(request([b"open"], body))
+            self.assertEqual(
+                (status, answer["errcode"]), (400, "M_INVALID_PARAM"), body
+            )
+        for postpath in ([], [b"close"], [b"open", b"more"]):
+            status, _ = await route._dispatch(request(postpath, b"{}"))
+            self.assertEqual(status, 404, postpath)
+        self.assertEqual(len(calls), 1)
 
 
 class TestApprovals(_Base):
@@ -635,7 +665,7 @@ class TestApprovals(_Base):
         self.h.verify(OTHER, "zz-later@gmail.example", 9)
         self.h.verify(OTHER, "other@gmail.example", 3)
         self.h.main.displaynames[OTHER] = "Other Person"
-        await self.h.confirm(OTHER, inv["invitation_id"])
+        await self.h.open(OTHER, inv["invitation_id"])
         (pending,) = await self.h.pending()
         self.assertEqual(
             {k: v for k, v in pending.items() if k != "acked_at_ms"},
@@ -655,15 +685,15 @@ class TestApprovals(_Base):
     async def test_grant_claims_and_closes_other_pending_approvals(self):
         (inv,) = await self.h.add(INVITED)
         ident = inv["invitation_id"]
-        await self.h.confirm(OTHER, ident)
-        await self.h.confirm(THIRD, ident)
+        await self.h.open(OTHER, ident)
+        await self.h.open(THIRD, ident)
         self.assertEqual(len(await self.h.pending()), 2)
         status, body = await self.decide(ident, OTHER, "grant")
         self.assertEqual(status, 200, body)
         self.assertEqual(body["invitation"]["state"], "joined")
         self.assertEqual(body["invitation"]["claimant"], OTHER)
         self.assertEqual(
-            (await self.h.store.get_ack(ident, OTHER))["decision"], "granted"
+            (await self.h.store.get_request(ident, OTHER))["decision"], "granted"
         )
         self.assertIsNotNone(await self.h.store.managed_record(OTHER, ROOM))
         self.assertIn((ROOM, OTHER), self.h.joiner.joins)
@@ -680,11 +710,11 @@ class TestApprovals(_Base):
     async def test_deny_sets_denied_and_removes_the_row_from_pending_approvals(self):
         (inv,) = await self.h.add(INVITED)
         ident = inv["invitation_id"]
-        await self.h.confirm(OTHER, ident)
+        await self.h.open(OTHER, ident)
         status, body = await self.decide(ident, OTHER, "deny")
         self.assertEqual((status, body["invitation"]["state"]), (200, "invited"))
         self.assertEqual(
-            (await self.h.store.get_ack(ident, OTHER))["decision"], "denied"
+            (await self.h.store.get_request(ident, OTHER))["decision"], "denied"
         )
         self.assertEqual(await self.h.pending(), [])
         self.assertIsNone(await self.h.store.managed_record(OTHER, ROOM))
@@ -699,10 +729,10 @@ class TestApprovals(_Base):
     ):
         (inv,) = await self.h.add(INVITED)
         ident = inv["invitation_id"]
-        await self.h.confirm(OTHER, ident)
+        await self.h.open(OTHER, ident)
         await self.decide(ident, OTHER, "deny")
         self.h.verify(OTHER, INVITED_KEY)
-        await self.h.claims.claim_confirmed_for(OTHER)
+        await self.h.claims.claim_matching_for(OTHER)
         row = await self.h.row(ident)
         self.assertEqual((row["state"], row["claimant"]), ("joined", OTHER))
         self.assertIsNotNone(await self.h.store.managed_record(OTHER, ROOM))
@@ -714,12 +744,12 @@ class TestApprovals(_Base):
         self.assertEqual((status, body["errcode"]), (404, "M_NOT_FOUND"))
         status, body = await self.decide("missing", OTHER, "deny")
         self.assertEqual((status, body["errcode"]), (404, "M_NOT_FOUND"))
-        await self.h.confirm(OTHER, ident)
+        await self.h.open(OTHER, ident)
         status, body = await self.decide(ident, OTHER, "maybe")
         self.assertEqual((status, body["errcode"]), (400, "M_INVALID_PARAM"))
         # An invitation of another course is unknown in this one.
         (elsewhere,) = await self.h.add(INVITED, room=OTHER_ROOM)
-        await self.h.confirm(OTHER, elsewhere["invitation_id"])
+        await self.h.open(OTHER, elsewhere["invitation_id"])
         status, body = await self.decide(elsewhere["invitation_id"], OTHER, "grant")
         self.assertEqual((status, body["errcode"]), (404, "M_NOT_FOUND"))
         await self.h.handlers.revoke(TEACHER, {"room_id": ROOM, "invitation_id": ident})
@@ -736,13 +766,13 @@ class TestApprovals(_Base):
             "third@school.example",
             "member@school.example",
         )
-        await self.h.confirm(OTHER, single["invitation_id"])
-        await self.h.confirm(THIRD, double["invitation_id"])
-        await self.h.confirm("@fourth:x", double["invitation_id"])
-        # dup's only pending account already holds a joined invitation here.
+        await self.h.open(OTHER, single["invitation_id"])
+        await self.h.open(THIRD, double["invitation_id"])
+        await self.h.open("@fourth:x", double["invitation_id"])
+        # dup's only requesting account already holds a joined invitation here.
         self.h.verify(STUDENT, "member@school.example")
-        await self.h.confirm(STUDENT, none["invitation_id"])
-        await self.h.confirm(STUDENT, dup["invitation_id"])
+        await self.h.open(STUDENT, none["invitation_id"])
+        await self.h.open(STUDENT, dup["invitation_id"])
         status, body = await self.h.handlers.approve_all(TEACHER, {"room_id": ROOM})
         self.assertEqual(status, 200, body)
         self.assertEqual(body["granted"], [single["invitation_id"]])
@@ -778,22 +808,23 @@ class TestReads(_Base):
         (elsewhere,) = await self.h.add("other@gmail.example", room=OTHER_ROOM)
         for address in ADDRESSES:
             self.h.verify(STUDENT, address)
-        await self.h.confirm(STUDENT, joined["invitation_id"])
+        await self.h.open(STUDENT, joined["invitation_id"])
         # Each other row is claimed by STUDENT in turn and then taken away.
+        # (Never opened, the last row stays invited.)
         await self.h.handlers.revoke(
             TEACHER, {"room_id": ROOM, "invitation_id": joined["invitation_id"]}
         )
-        await self.h.confirm(STUDENT, revoked["invitation_id"])
+        await self.h.open(STUDENT, revoked["invitation_id"])
         await self.h.handlers.revoke(
             TEACHER, {"room_id": ROOM, "invitation_id": revoked["invitation_id"]}
         )
-        await self.h.confirm(STUDENT, left["invitation_id"])
-        await self.h.store.release_on_leave(ROOM, STUDENT)
+        await self.h.open(STUDENT, left["invitation_id"])
+        await self.h.store.release_on_leave(ROOM, STUDENT, 1)
         await self.h.add(INVITED)  # re-invite resets the first row
-        await self.h.confirm(STUDENT, joined["invitation_id"])
+        await self.h.open(STUDENT, joined["invitation_id"])
         # Another user's claim in another course.
         self.h.verify(OTHER, "other@gmail.example")
-        await self.h.confirm(OTHER, elsewhere["invitation_id"])
+        await self.h.open(OTHER, elsewhere["invitation_id"])
         status, body = await self.h.handlers.mine_joined(STUDENT)
         self.assertEqual(
             (status, body),
@@ -817,48 +848,6 @@ class TestReads(_Base):
             [elsewhere["invitation_id"]],
         )
         status, body = await self.h.handlers.mine_joined(THIRD)
-        self.assertEqual(body, {"invitations": []})
-
-    async def test_my_pending_returns_only_live_invited_rows_matching_the_callers_verified_emails_that_the_caller_has_not_confirmed(
-        self,
-    ):
-        wanted, confirmed, revoked, unmatched = await self.h.add(
-            INVITED,
-            "second@school.example",
-            "third@school.example",
-            "other@gmail.example",
-        )
-        (other_course,) = await self.h.add(INVITED, room=OTHER_ROOM)
-        for address in (INVITED_KEY, "second@school.example", "third@school.example"):
-            self.h.verify(STUDENT, address)
-        await self.h.store.record_ack(confirmed["invitation_id"], STUDENT, V, 1)
-        await self.h.handlers.revoke(
-            TEACHER, {"room_id": ROOM, "invitation_id": revoked["invitation_id"]}
-        )
-        status, body = await self.h.handlers.mine_pending(STUDENT)
-        self.assertEqual(status, 200)
-        self.assertEqual(
-            sorted(body["invitations"], key=lambda i: i["room_id"]),
-            sorted(
-                [
-                    {
-                        "invitation_id": wanted["invitation_id"],
-                        "room_id": ROOM,
-                        "course_name": "Spanish 101",
-                    },
-                    {
-                        "invitation_id": other_course["invitation_id"],
-                        "room_id": OTHER_ROOM,
-                        "course_name": "French 201",
-                    },
-                ],
-                key=lambda i: i["room_id"],
-            ),
-        )
-        # No email anywhere in the answer.
-        self.assertNotIn("@school", str(body))
-        # An unverified account sees nothing.
-        status, body = await self.h.handlers.mine_pending(THIRD)
         self.assertEqual(body, {"invitations": []})
 
     async def test_live_reports_state_in_this_course_only(self):
@@ -900,8 +889,8 @@ class TestAdminGate(_Base):
     ):
         (inv,) = await self.h.add(INVITED)
         self.h.main.threepids[OTHER] = [("other@gmail.example", 1)]
-        await self.h.confirm(OTHER, inv["invitation_id"])
-        for name in ("list", "pending_approvals", "live"):
+        await self.h.open(OTHER, inv["invitation_id"])
+        for name in ("list", "pending_approvals", "live", "events"):
             status, body = await getattr(self.h.handlers, name)(
                 STUDENT, {"room_id": ROOM, "invitation_id": inv["invitation_id"]}
             )
@@ -1011,15 +1000,15 @@ class TestAddAndSend(_Base):
             status, body = await self.h.handlers.add(TEACHER, bad)
             self.assertEqual((status, body["errcode"]), (400, "M_INVALID_PARAM"))
 
-    async def test_re_invite_resets_a_left_row_to_invited_and_deletes_old_confirmations(
+    async def test_re_invite_resets_a_left_row_to_invited_and_deletes_old_requests(
         self,
     ):
         (inv,) = await self.h.add(INVITED)
         ident = inv["invitation_id"]
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.confirm(OTHER, ident)
-        await self.h.confirm(STUDENT, ident)
-        await self.h.store.release_on_leave(ROOM, STUDENT)
+        await self.h.open(OTHER, ident)
+        await self.h.open(STUDENT, ident)
+        await self.h.store.release_on_leave(ROOM, STUDENT, 1)
         self.assertEqual((await self.h.row(ident))["state"], "left")
         status, body = await self.h.handlers.send(
             TEACHER,
@@ -1035,13 +1024,11 @@ class TestAddAndSend(_Base):
             (again["state"], again["claimant"], again["joined_at_ms"]),
             ("invited", None, None),
         )
-        self.assertIsNone(await self.h.store.get_ack(ident, STUDENT))
-        self.assertIsNone(await self.h.store.get_ack(ident, OTHER))
-        # A fresh confirmation is required: sign-in alone claims nothing.
-        await self.h.claims.claim_confirmed_for(STUDENT)
-        self.assertEqual((await self.h.row(ident))["state"], "invited")
-        status, body = await self.h.confirm(STUDENT, ident)
-        self.assertEqual(body["result"], "claimed")
+        self.assertIsNone(await self.h.store.get_request(ident, OTHER))
+        self.assertEqual(await self.h.pending(), [])
+        # The re-invited row is claimed again by the matching address.
+        await self.h.claims.claim_matching_for(STUDENT)
+        self.assertEqual((await self.h.row(ident))["claimant"], STUDENT)
 
     async def test_re_invite_is_a_fresh_invitation_from_the_new_inviter(self):
         coteacher = "@coteacher:x"
@@ -1064,8 +1051,8 @@ class TestAddAndSend(_Base):
                 (ident,),
             ),
         )
-        await self.h.confirm(STUDENT, ident)
-        await self.h.store.release_on_leave(ROOM, STUDENT)
+        await self.h.open(STUDENT, ident)
+        await self.h.store.release_on_leave(ROOM, STUDENT, 1)
         # Re-added by the co-teacher, typed by hand, from a CSV.
         status, body = await self.h.handlers.add(
             coteacher, {"room_id": ROOM, "emails": [INVITED], "source": "csv"}
@@ -1084,11 +1071,10 @@ class TestAddAndSend(_Base):
             (row["lti_issuer"], row["lti_context_id"], row["lti_user_id"]),
             (None, None, None),
         )
-        # The managed record of the new claim names the new inviter.
-        status, claimed = await self.h.confirm(STUDENT, ident)
+        # The new claim's joined invitation names the new inviter.
+        status, claimed = await self.h.open(STUDENT, ident)
         self.assertEqual(claimed["result"], "claimed")
-        record = await self.h.store.managed_record(STUDENT, ROOM)
-        self.assertEqual(record["invited_by"], coteacher)
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
         _, joined = await self.h.handlers.mine_joined(STUDENT)
         self.assertEqual(joined["invitations"][0]["invited_by"], coteacher)
 
@@ -1102,11 +1088,11 @@ class TestAddAndSend(_Base):
                 "items": [{"invitation_id": ident, "expected_send_count": 0}],
             },
         )
-        await self.h.confirm(OTHER, ident)
+        await self.h.open(OTHER, ident)
         await self.h.handlers.revoke(TEACHER, {"room_id": ROOM, "invitation_id": ident})
         (again,) = await self.h.add(INVITED)
         self.assertEqual((again["state"], again["send_count"]), ("invited", 1))
-        self.assertIsNone(await self.h.store.get_ack(ident, OTHER))
+        self.assertIsNone(await self.h.store.get_request(ident, OTHER))
 
     async def test_send_is_compare_and_set_per_row(self):
         a, b = await self.h.add(INVITED, "second@school.example")
@@ -1244,17 +1230,13 @@ class TestInviteMember(_Base):
         self.assertNotIn("school", str(body))
         self.assertNotIn("school", captured.text())
         self.assertNotIn("school", str(sentry.mock_calls))
-        # Idempotent; the student sees it in "my pending".
+        # Idempotent.
         status, again = await self.h.handlers.invite_member(
             TEACHER, {"room_id": ROOM, "user_id": STUDENT}
         )
         self.assertEqual(again, body)
-        _, mine = await self.h.handlers.mine_pending(STUDENT)
-        self.assertEqual(
-            [i["invitation_id"] for i in mine["invitations"]], [body["invitation_id"]]
-        )
         # Once claimed, the joined invitation is returned.
-        await self.h.confirm(STUDENT, body["invitation_id"])
+        await self.h.open(STUDENT, body["invitation_id"])
         status, joined = await self.h.handlers.invite_member(
             TEACHER, {"room_id": ROOM, "user_id": STUDENT}
         )
@@ -1343,7 +1325,7 @@ class TestInviteMember(_Base):
     async def test_invite_member_returns_a_joined_invitation_the_member_holds(self):
         (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.confirm(STUDENT, inv["invitation_id"])
+        await self.h.open(STUDENT, inv["invitation_id"])
         self.h.verify(STUDENT, "another@school.example", 0)
         status, body = await self.h.handlers.invite_member(
             TEACHER, {"room_id": ROOM, "user_id": STUDENT}
@@ -1368,10 +1350,10 @@ class TestHint(_Base):
             TEACHER, {"room_id": ROOM, "invitation_id": revoked["invitation_id"]}
         )
         self.h.verify(STUDENT, "third@school.example")
-        await self.h.confirm(STUDENT, joined["invitation_id"])
+        await self.h.open(STUDENT, joined["invitation_id"])
         self.h.verify(OTHER, "other@gmail.example")
-        await self.h.confirm(OTHER, left["invitation_id"])
-        await self.h.store.release_on_leave(ROOM, OTHER)
+        await self.h.open(OTHER, left["invitation_id"])
+        await self.h.store.release_on_leave(ROOM, OTHER, 1)
         status, body = await self.h.handlers.hint(
             {"invitation_id": live["invitation_id"]}
         )
@@ -1416,13 +1398,13 @@ class TestClaimByEmailHook(_Base):
             api, self.legacy, MagicMock(), student_claims=self.h.claims
         )
 
-    async def test_confirmed_pending_invitation_is_claimed_when_the_invited_email_is_later_added_and_verified(
+    async def test_a_requested_invitation_is_claimed_when_the_invited_email_is_later_added_and_verified(
         self,
     ):
         (inv,) = await self.h.add(INVITED)
         ident = inv["invitation_id"]
-        status, body = await self.h.confirm(STUDENT, ident)
-        self.assertEqual(body["result"], "pending_approval")
+        status, body = await self.h.open(STUDENT, ident)
+        self.assertEqual(body["result"], "pending")
         # Sign-in alone, without the address, claims nothing.
         await self.hook.on_user_login(STUDENT, None, None)
         self.assertEqual((await self.h.row(ident))["state"], "invited")
@@ -1438,30 +1420,65 @@ class TestClaimByEmailHook(_Base):
     ):
         (inv,) = await self.h.add(INVITED)
         ident = inv["invitation_id"]
-        await self.h.confirm(OTHER, ident)
-        await self.h.confirm(STUDENT, ident)
+        await self.h.open(OTHER, ident)
+        await self.h.open(STUDENT, ident)
         self.assertEqual(len(await self.h.pending()), 2)
         self.h.verify(STUDENT, INVITED_KEY)
         await self.hook.on_add_user_third_party_identifier(
             STUDENT, "email", INVITED_KEY
         )
         record = await self.h.store.managed_record(STUDENT, ROOM)
-        self.assertEqual(
-            (record["invited_by"], record["course_room_id"]), (TEACHER, ROOM)
-        )
+        self.assertEqual(record["course_room_id"], ROOM)
         self.assertEqual(await self.h.pending(), [])
         self.assertEqual((await self.h.listing())[ident]["pending_count"], 0)
 
-    async def test_unconfirmed_matching_invitation_is_not_claimed_at_sign_in(self):
+    async def test_a_matching_invitation_is_claimed_at_sign_in_with_no_step(self):
+        """Seats amendment 2026-10-10: no prompt, no checkbox."""
         (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)
         await self.hook.on_user_login(STUDENT, None, None)
-        self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
-        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        row = await self.h.row(inv["invitation_id"])
+        self.assertEqual((row["state"], row["claimant"]), ("joined", STUDENT))
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
+        self.assertIsNone(await self.h.store.get_request(inv["invitation_id"], STUDENT))
+
+    async def test_sign_in_claims_the_oldest_matching_row_per_course_and_marks_the_rest(
+        self,
+    ):
+        (oldest,) = await self.h.add(INVITED)
+        (newer,) = await self.h.add("second@school.example")
+        (elsewhere,) = await self.h.add("second@school.example", room=OTHER_ROOM)
+        # Distinct creation times, so "oldest" is the rule under test and not
+        # a tie broken by id.
+        for ident, created in ((oldest, 1000), (newer, 2000), (elsewhere, 3000)):
+            await self.h.main.db_pool.runInteraction(
+                "created",
+                lambda txn, i=ident["invitation_id"], t=created: txn.execute(
+                    "UPDATE pangea_student_invitation SET created_at_ms = ? WHERE id = ?",
+                    (t, i),
+                ),
+            )
+        self.h.verify(STUDENT, "second@school.example", 1)
+        self.h.verify(STUDENT, INVITED_KEY, 2)
+        await self.hook.on_user_login(STUDENT, None, None)
+        self.assertEqual(
+            (await self.h.row(oldest["invitation_id"]))["claimant"], STUDENT
+        )
+        self.assertEqual((await self.h.row(newer["invitation_id"]))["state"], "invited")
+        # One claim per course: the other course's row is claimed too.
+        self.assertEqual(
+            (await self.h.row(elsewhere["invitation_id"]))["claimant"], STUDENT
+        )
+        listed = await self.h.listing()
+        self.assertEqual(listed[newer["invitation_id"]]["same_student_as"], STUDENT)
+        self.assertIsNone(listed[oldest["invitation_id"]]["same_student_as"])
+        # A row is never claimed twice: signing in again changes nothing.
+        await self.hook.on_user_login(STUDENT, None, None)
+        self.assertEqual((await self.h.row(newer["invitation_id"]))["state"], "invited")
 
     async def test_claim_never_fails_login(self):
         (inv,) = await self.h.add(INVITED)
-        await self.h.confirm(STUDENT, inv["invitation_id"])
+        await self.h.open(STUDENT, inv["invitation_id"])
         self.h.verify(STUDENT, INVITED_KEY)
         captured = self.capture_logs()
         with patch.object(report, "sentry_sdk") as sentry:
@@ -1494,7 +1511,7 @@ class TestMembershipRelease(_Base):
         ):
             (inv,) = await self.h.add(INVITED)
             self.h.main.threepids[STUDENT] = [(INVITED_KEY, 1)]
-            status, body = await self.h.confirm(STUDENT, inv["invitation_id"])
+            status, body = await self.h.open(STUDENT, inv["invitation_id"])
             self.assertEqual(body["result"], "claimed", membership)
             await release.on_new_event(
                 _member_event(ROOM, STUDENT, membership, sender), {}
@@ -1507,7 +1524,7 @@ class TestMembershipRelease(_Base):
         release = MembershipRelease(self.h.store, self.h.claims)
         (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.confirm(STUDENT, inv["invitation_id"])
+        await self.h.open(STUDENT, inv["invitation_id"])
         for event in (
             _member_event(ROOM, STUDENT, "join", STUDENT),
             _member_event(OTHER_ROOM, STUDENT, "leave", STUDENT),
@@ -1539,10 +1556,10 @@ class TestMembershipRelease(_Base):
         release = MembershipRelease(self.h.store, self.h.claims)
         (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.confirm(STUDENT, inv["invitation_id"])
+        await self.h.open(STUDENT, inv["invitation_id"])
         await release.on_new_event(_member_event(ROOM, STUDENT, "leave", STUDENT), {})
         await release.on_new_event(_member_event(ROOM, STUDENT, "join", STUDENT), {})
-        await self.h.claims.claim_confirmed_for(STUDENT)
+        await self.h.claims.claim_matching_for(STUDENT)
         self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "left")
         self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
         _, joined = await self.h.handlers.mine_joined(STUDENT)
@@ -1559,7 +1576,7 @@ class TestMembershipRelease(_Base):
             return result
 
         self.h.joiner.force_join = join_then_leave  # type: ignore[method-assign]
-        await self.h.confirm(STUDENT, inv["invitation_id"])
+        await self.h.open(STUDENT, inv["invitation_id"])
         self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "left")
         self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
 
@@ -1586,13 +1603,13 @@ class TestManagedRule(_Base):
     async def claimed(self, user: str = STUDENT) -> str:
         (inv,) = await self.h.add(INVITED)
         self.h.verify(user, INVITED_KEY)
-        status, body = await self.h.confirm(user, inv["invitation_id"])
+        status, body = await self.h.open(user, inv["invitation_id"])
         self.assertEqual(body["result"], "claimed")
         return inv["invitation_id"]
 
     async def test_admins_own_claim_records_no_managed_account(self):
         (inv,) = await self.h.add(INVITED)
-        await self.h.confirm(OTHER, inv["invitation_id"])
+        await self.h.open(OTHER, inv["invitation_id"])
         self.h.admins.admins.add((ROOM, OTHER))
         status, body = await self.h.handlers.decide(
             TEACHER,
@@ -1606,35 +1623,20 @@ class TestManagedRule(_Base):
         self.assertEqual((status, body["invitation"]["state"]), (200, "joined"))
         self.assertIsNone(await self.h.store.managed_record(OTHER, ROOM))
 
-    async def test_claimant_losing_pl100_gets_a_managed_record_from_the_acks_disclosure_version(
-        self,
-    ):
+    async def test_claimant_losing_pl100_gets_a_managed_record(self):
+        """Rebuilt from the joined invitation alone: no request, no disclosure
+        (seats amendment 2026-10-10)."""
         self.h.admins.admins.add((ROOM, STUDENT))
         ident = await self.claimed()
         self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        self.assertIsNone(await self.h.store.get_request(ident, STUDENT))
         self.h.admins.admins.discard((ROOM, STUDENT))
         await self.release.on_new_event(_power_event(ROOM), {})
         record = await self.h.store.managed_record(STUDENT, ROOM)
-        self.assertEqual(
-            (record["user_id"], record["course_room_id"], record["invited_by"]),
-            (STUDENT, ROOM, TEACHER),
-        )
-        self.assertEqual(
-            (await self.h.store.get_ack(ident, STUDENT))["disclosure_version"], V
-        )
+        self.assertEqual((record["user_id"], record["course_room_id"]), (STUDENT, ROOM))
         # Idempotent.
         await self.release.on_new_event(_power_event(ROOM), {})
         self.assertEqual(await self.h.store.managed_record(STUDENT, ROOM), record)
-        # The record rests on the confirmation: without one, none is made.
-        await self.h.store.set_managed(ident, STUDENT, False, 1)
-        await self.h.main.db_pool.runInteraction(
-            "drop-ack",
-            lambda txn: txn.execute(
-                "DELETE FROM pangea_invitation_ack WHERE invitation_id = ?", (ident,)
-            ),
-        )
-        await self.release.on_new_event(_power_event(ROOM), {})
-        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
 
     async def test_claimant_gaining_pl100_loses_the_managed_record(self):
         await self.claimed()
@@ -1685,7 +1687,7 @@ class TestManagedRule(_Base):
             h.admins.is_course_admin = changing  # type: ignore[method-assign]
             (inv,) = await h.add(INVITED)
             h.verify(STUDENT, INVITED_KEY)
-            status, body = await h.confirm(STUDENT, inv["invitation_id"])
+            status, body = await h.open(STUDENT, inv["invitation_id"])
             self.assertEqual(body["result"], "claimed")
             record = await h.store.managed_record(STUDENT, ROOM)
             if promoted_mid_claim:
@@ -1713,6 +1715,321 @@ class TestManagedRule(_Base):
         self.assertNotIn(INVITED_KEY, str(sentry.mock_calls))
         self.assertNotIn(INVITED_KEY, captured.text())
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
+
+
+class TestRouteTree(unittest.TestCase):
+    def test_fixed_routes_survive_the_open_root_in_synapses_resource_tree(self):
+        """The open root sits at the fixed routes' parent path. Synapse's
+        tree builder moves the fixed routes under it, whichever is registered
+        first, and Twisted serves a fixed child before the root's getChild."""
+        from synapse.util.httpresourcetree import create_resource_tree
+        from twisted.web.resource import Resource, getChildForRequest
+
+        for root_first in (True, False):
+            add_route, events_route, joined_route, open_route = (
+                Resource(),
+                Resource(),
+                Resource(),
+                MagicMock(spec=InvitationOpenRoute),
+            )
+            for leaf in (add_route, events_route, joined_route):
+                leaf.isLeaf = True
+            open_route.isLeaf = True
+            fixed = {
+                "/p/student_invitations/add": add_route,
+                "/p/student_invitations/events": events_route,
+                "/p/student_invitations/mine/joined": joined_route,
+            }
+            tree: Dict[str, Any] = {}
+            root = {"/p/student_invitations": StudentInvitationsRoot(open_route)}
+            for part in (root, fixed) if root_first else (fixed, root):
+                tree.update(part)
+            top = create_resource_tree(tree, Resource())
+
+            def resolve(path: bytes) -> Any:
+                request = MagicMock()
+                request.postpath = path.split(b"/")[1:]
+                request.prepath = []
+                return getChildForRequest(top, request)
+
+            self.assertIs(resolve(b"/p/student_invitations/add"), add_route)
+            self.assertIs(resolve(b"/p/student_invitations/events"), events_route)
+            self.assertIs(resolve(b"/p/student_invitations/mine/joined"), joined_route)
+            self.assertIs(resolve(b"/p/student_invitations/inv-1/open"), open_route)
+
+
+class TestEvents(_Base):
+    """The activity ledger (seats amendment 2026-10-10, §2): append-only,
+    written in the same transaction as each change, no email, actor only to
+    course admins, never logged."""
+
+    async def test_every_invitation_action_writes_its_event_with_its_actor(self):
+        (a, b, c) = await self.h.add(
+            INVITED, "second@school.example", "third@school.example"
+        )
+        send = {
+            "room_id": ROOM,
+            "items": [{"invitation_id": a["invitation_id"], "expected_send_count": 0}],
+        }
+        await self.h.handlers.send(TEACHER, send)
+        send["items"][0]["expected_send_count"] = 1
+        await self.h.handlers.send(TEACHER, send)
+        await self.h.open(OTHER, b["invitation_id"])
+        await self.h.handlers.decide(
+            TEACHER,
+            {
+                "room_id": ROOM,
+                "invitation_id": b["invitation_id"],
+                "user_id": OTHER,
+                "decision": "deny",
+            },
+        )
+        await self.h.handlers.decide(
+            TEACHER,
+            {
+                "room_id": ROOM,
+                "invitation_id": b["invitation_id"],
+                "user_id": OTHER,
+                "decision": "grant",
+            },
+        )
+        self.h.verify(STUDENT, INVITED_KEY)
+        await self.h.open(STUDENT, a["invitation_id"])
+        await self.h.store.release_on_leave(ROOM, STUDENT, now_ms())
+        await self.h.handlers.revoke(
+            TEACHER, {"room_id": ROOM, "invitation_id": c["invitation_id"]}
+        )
+        events = list(reversed(await self.h.events()))
+        self.assertEqual(
+            [(e["action"], e["actor"], e["target"], e["count"]) for e in events],
+            [
+                ("students_added", TEACHER, None, 3),
+                ("invite_sent", TEACHER, a["invitation_id"], None),
+                ("invite_resent", TEACHER, a["invitation_id"], None),
+                ("request_made", "system", b["invitation_id"], None),
+                ("request_denied", TEACHER, b["invitation_id"], None),
+                ("request_granted", TEACHER, b["invitation_id"], None),
+                ("invitation_claimed", "system", b["invitation_id"], None),
+                ("invitation_claimed", "system", a["invitation_id"], None),
+                ("student_left", "system", a["invitation_id"], None),
+                ("invitation_withdrawn", TEACHER, c["invitation_id"], None),
+            ],
+        )
+        self.assertEqual(
+            set(events[0]),
+            {"event_id", "time_ms", "actor", "action", "target", "count"},
+        )
+        self.assertNotIn("school", str(events))
+        # Repeats that change nothing write nothing.
+        before = len(await self.h.events())
+        await self.h.add("second@school.example", "third@school.example")
+        # (a live row, unchanged, and the revoked row, reset: one event, count 1)
+        await self.h.handlers.revoke(
+            TEACHER, {"room_id": ROOM, "invitation_id": c["invitation_id"]}
+        )
+        await self.h.handlers.revoke(
+            TEACHER, {"room_id": ROOM, "invitation_id": c["invitation_id"]}
+        )
+        actions = [e["action"] for e in await self.h.events()][
+            : len(await self.h.events()) - before
+        ]
+        self.assertEqual(actions, ["invitation_withdrawn", "students_added"])
+        latest = (await self.h.events())[1]
+        self.assertEqual((latest["count"], latest["target"]), (1, c["invitation_id"]))
+
+    async def test_an_event_is_written_in_the_same_transaction_as_its_change(self):
+        (inv,) = await self.h.add(INVITED)
+        before = await self.h.events()
+
+        def refuse_the_event(sql: str, args: Any) -> None:
+            if sql.startswith("INSERT INTO pangea_student_invitation_event"):
+                raise RuntimeError("event write refused")
+
+        self.h.main.db_pool.on_statement = refuse_the_event
+        with self.assertRaises(RuntimeError):
+            await self.h.store.revoke(ROOM, inv["invitation_id"], TEACHER, 5)
+        with self.assertRaises(RuntimeError):
+            await self.h.store.record_request(inv["invitation_id"], OTHER, 5)
+        self.h.main.db_pool.on_statement = None
+        # Neither change landed without its event.
+        self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
+        self.assertIsNone(await self.h.store.get_request(inv["invitation_id"], OTHER))
+        self.assertEqual(await self.h.events(), before)
+
+    async def test_a_send_that_failed_removes_its_event_with_the_count(self):
+        (inv,) = await self.h.add(INVITED)
+        self.h.mailer.fail_with = RuntimeError("mail down")
+        await self.h.handlers.send(
+            TEACHER,
+            {
+                "room_id": ROOM,
+                "items": [
+                    {"invitation_id": inv["invitation_id"], "expected_send_count": 0}
+                ],
+            },
+        )
+        self.assertEqual((await self.h.row(inv["invitation_id"]))["send_count"], 0)
+        self.assertEqual(
+            [e["action"] for e in await self.h.events()], ["students_added"]
+        )
+
+    async def test_canvas_and_member_events(self):
+        self.h.main.membership[(ROOM, STUDENT)] = "join"
+        self.h.verify(STUDENT, "member@school.example")
+        _, made = await self.h.handlers.invite_member(
+            TEACHER, {"room_id": ROOM, "user_id": STUDENT}
+        )
+        await self.h.store.import_canvas(
+            ROOM,
+            "https://canvas.example",
+            "ctx",
+            [("u1", "a@school.example", "a@school.example")],
+            TEACHER,
+            now_ms(),
+            lambda: "canvas-row",
+        )
+        events = await self.h.events()
+        self.assertEqual(
+            [(e["action"], e["actor"], e["target"], e["count"]) for e in events],
+            [
+                ("canvas_roster_imported", TEACHER, None, 1),
+                ("students_added", TEACHER, made["invitation_id"], 1),
+            ],
+        )
+
+    async def test_events_read_is_admin_gated_filtered_and_paged(self):
+        rows = await self.h.add(*[f"s{i}@school.example" for i in range(3)])
+        for i, row in enumerate(rows):
+            await self.h.store.revoke(ROOM, row["invitation_id"], TEACHER, 1000 + i)
+        (elsewhere,) = await self.h.add(INVITED, room=OTHER_ROOM)
+        status, body = await self.h.handlers.events(STUDENT, {"room_id": ROOM})
+        self.assertEqual((status, body["errcode"]), (403, "M_FORBIDDEN"))
+        withdrawn = await self.h.events(action="invitation_withdrawn")
+        self.assertEqual([e["time_ms"] for e in withdrawn], [1002, 1001, 1000])
+        self.assertEqual(
+            [
+                e["time_ms"]
+                for e in await self.h.events(
+                    action="invitation_withdrawn", **{"from": "1001", "to": "1002"}
+                )
+            ],
+            [1001],
+        )
+        # Another course's events never show.
+        self.assertNotIn(elsewhere["invitation_id"], str(await self.h.events()))
+        for bad in (
+            {"from": "x"},
+            {"to": "-1"},
+            {"action": "nope"},
+            {"cursor": "abc"},
+            {"cursor": "1."},
+        ):
+            status, body = await self.h.handlers.events(
+                TEACHER, {"room_id": ROOM, **bad}
+            )
+            self.assertEqual((status, body["errcode"]), (400, "M_INVALID_PARAM"), bad)
+        # Paging: newest first, a cursor until the last page.
+        with patch("synapse_pangea_chat.student_invitations.store.EVENTS_PAGE", 2):
+            status, first = await self.h.handlers.events(
+                TEACHER, {"room_id": ROOM, "action": "invitation_withdrawn"}
+            )
+            self.assertEqual([e["time_ms"] for e in first["events"]], [1002, 1001])
+            self.assertIsNotNone(first["next_cursor"])
+            status, second = await self.h.handlers.events(
+                TEACHER,
+                {
+                    "room_id": ROOM,
+                    "action": "invitation_withdrawn",
+                    "cursor": first["next_cursor"],
+                },
+            )
+            self.assertEqual([e["time_ms"] for e in second["events"]], [1000])
+            self.assertIsNone(second["next_cursor"])
+            # Stable for a fixed `to`: an event arriving between two page
+            # reads moves no row between pages.
+            fixed = {"room_id": ROOM, "to": str(now_ms() + 1)}
+            status, page1 = await self.h.handlers.events(TEACHER, fixed)
+            # A new event is written at the time it happens, at or after `to`.
+            await asyncio.sleep(0.002)
+            later = await self.h.add("late@school.example")
+            status, page2 = await self.h.handlers.events(
+                TEACHER, {**fixed, "cursor": page1["next_cursor"]}
+            )
+            status, again1 = await self.h.handlers.events(TEACHER, fixed)
+            self.assertEqual(
+                [e["event_id"] for e in again1["events"]],
+                [e["event_id"] for e in page1["events"]],
+            )
+            seen = [e["event_id"] for e in page1["events"] + page2["events"]]
+            self.assertEqual(len(seen), len(set(seen)))
+            self.assertNotIn(later[0]["invitation_id"], str(page2["events"]))
+
+    async def test_the_actor_is_never_logged(self):
+        captured = self.capture_logs()
+        (inv,) = await self.h.add(INVITED)
+        await self.h.handlers.revoke(
+            TEACHER, {"room_id": ROOM, "invitation_id": inv["invitation_id"]}
+        )
+        await self.h.events()
+        self.assertTrue(captured.text())
+        self.assertNotIn(TEACHER, captured.text())
+
+
+class TestMigration(_Base):
+    async def test_tables_of_earlier_builds_are_brought_to_the_current_columns(self):
+        """In place and idempotent: requests lose disclosure_version and
+        rename acked_at_ms; the managed record keeps only created_at."""
+        pool = self.h.main.db_pool
+        for sql in (
+            "CREATE TABLE pangea_invitation_ack (invitation_id TEXT NOT NULL,"
+            " user_id TEXT NOT NULL, acked_at_ms BIGINT NOT NULL,"
+            " disclosure_version INTEGER NOT NULL, decision TEXT,"
+            " PRIMARY KEY (invitation_id, user_id))",
+            "INSERT INTO pangea_invitation_ack VALUES ('i', 'u', 5, 2, 'denied')",
+            "CREATE TABLE pangea_managed_account (user_id TEXT NOT NULL,"
+            " course_room_id TEXT NOT NULL, invited_by TEXT NOT NULL,"
+            " since_ms BIGINT NOT NULL, PRIMARY KEY (user_id, course_room_id))",
+            "INSERT INTO pangea_managed_account VALUES ('u', '!r:x', '@t:x', 7)",
+        ):
+            pool.connection.execute(sql)
+        pool.connection.commit()
+        for _ in range(2):
+            store = StudentInvitationStore(self.h.api._hs)
+            self.assertEqual(
+                await store.get_request("i", "u"),
+                {
+                    "invitation_id": "i",
+                    "user_id": "u",
+                    "requested_at_ms": 5,
+                    "decision": "denied",
+                },
+            )
+            self.assertEqual(
+                await store.managed_record("u", "!r:x"),
+                {"user_id": "u", "course_room_id": "!r:x", "created_at_ms": 7},
+            )
+
+        def columns(table: str) -> set:
+            rows = pool.connection.execute(
+                "SELECT name FROM pragma_table_info(?)", (table,)
+            )
+            return {row[0] for row in rows}
+
+        self.assertEqual(
+            columns("pangea_managed_account"),
+            {"user_id", "course_room_id", "created_at_ms"},
+        )
+        self.assertEqual(
+            columns("pangea_invitation_ack"),
+            {"invitation_id", "user_id", "requested_at_ms", "decision"},
+        )
+        # The migrated tables take new rows.
+        (inv,) = await self.h.add(INVITED)
+        status, body = await self.h.open(OTHER, inv["invitation_id"])
+        self.assertEqual((status, body["result"]), (200, "pending"))
+        self.h.verify(STUDENT, INVITED_KEY)
+        status, body = await self.h.open(STUDENT, inv["invitation_id"])
+        self.assertEqual(body["result"], "claimed")
 
 
 class TestInviteEmail(unittest.IsolatedAsyncioTestCase):
@@ -1807,10 +2124,10 @@ class TestNoEmailInLogs(_Base):
             a, b = await self.h.add(INVITED, "second@school.example")
             self.h.verify(STUDENT, INVITED_KEY)
             self.h.verify(OTHER, "other@gmail.example")
-            await self.h.confirm(OTHER, a["invitation_id"])
+            await self.h.open(OTHER, a["invitation_id"])
             await self.h.pending()
             await self.h.handlers.approve_all(TEACHER, {"room_id": ROOM})
-            await self.h.confirm(STUDENT, b["invitation_id"])
+            await self.h.open(STUDENT, b["invitation_id"])
             await self.h.handlers.send(
                 TEACHER,
                 {
@@ -1832,9 +2149,11 @@ class TestNoEmailInLogs(_Base):
             )
             self.h.main.db_pool.error = RuntimeError("DETAIL: (" + INVITED_KEY + ")")
             status, _ = await guarded(
-                "confirm", lambda: self.h.confirm(STUDENT, a["invitation_id"])
+                "open", lambda: self.h.open(STUDENT, a["invitation_id"])
             )
             self.assertEqual(status, 500)
+            # The open reached the database, whose error carried the address.
+            self.assertIn("open failed (RuntimeError)", captured.text())
             self.h.main.db_pool.error = None
             await self.h.handlers.add(
                 TEACHER, {"room_id": ROOM, "emails": ["bad", INVITED], "source": "csv"}

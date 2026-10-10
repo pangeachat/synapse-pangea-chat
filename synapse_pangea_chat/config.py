@@ -18,22 +18,6 @@ from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSIO
 if TYPE_CHECKING:
     from synapse_pangea_chat.lti.keys import LtiSettings
 
-# The managed-account disclosure shown under "Your teacher will manage this
-# account." on every confirmation screen (CONTROLS-SPEC.md §8). A confirmation
-# records the version it was shown, so a later change of the text bumps the
-# version and is never mistaken for consent to the old one. `{course}` is a
-# literal placeholder the client fills with the course name.
-MANAGED_DISCLOSURE_VERSION = 2
-MANAGED_DISCLOSURE_TEXT = (
-    "While you're in {course}, your teacher can limit who you can chat with to "
-    "people in the course, pause your messages to anyone except your teachers, "
-    "and turn off public rooms and your public profile. Some courses (K-12) "
-    "start with these limits on. Your teacher can't read your private "
-    "messages, sign in as you, or delete your account. If you leave the "
-    "course, your teacher stops managing your account. You can download or "
-    "delete your data at any time."
-)
-
 
 @attr.s(auto_attribs=True, frozen=True)
 class PangeaChatConfig:

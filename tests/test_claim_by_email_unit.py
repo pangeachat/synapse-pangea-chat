@@ -97,7 +97,7 @@ class TestClaimByEmail(unittest.IsolatedAsyncioTestCase):
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
-        capture = patch.object(claim_by_email, "_capture_exception")
+        capture = patch.object(claim_by_email, "_report")
         self.captured = capture.start()
         self.addCleanup(capture.stop)
 
@@ -198,7 +198,7 @@ class TestClaimByEmail(unittest.IsolatedAsyncioTestCase):
         self.create_room.side_effect = RuntimeError("room creation failed")
         await self.claimer.on_user_login(TEACHER, None, None)
         self.captured.assert_called_once()
-        self.assertIsInstance(self.captured.call_args.args[0], RuntimeError)
+        self.assertIsInstance(self.captured.call_args.args[1], RuntimeError)
         # Failing after the reservation leaves a partial claim held for this
         # account, which later sign-ins do not retry (only the link resumes it).
         row = await self.invitations.get(self.ident)
