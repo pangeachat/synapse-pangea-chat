@@ -10,7 +10,10 @@ from synapse.module_api import ModuleApi
 from synapse_pangea_chat.activity_session_previews import ActivitySessionPreviews
 from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
 from synapse_pangea_chat.blocked_join_gate import BlockedJoinGate
-from synapse_pangea_chat.config import PangeaChatConfig
+from synapse_pangea_chat.config import (
+    DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS,
+    PangeaChatConfig,
+)
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
 from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
@@ -27,6 +30,9 @@ from synapse_pangea_chat.email_invite.course_claim_reminder import (
 )
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.email_invite.course_invitation_api import CourseInvitationAPI
+from synapse_pangea_chat.email_invite.instructor_invitations import (
+    InstructorInvitationAPI,
+)
 from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
 from synapse_pangea_chat.email_policy import EmailPolicy
 from synapse_pangea_chat.export_user_data import ExportUserData
@@ -348,7 +354,9 @@ class PangeaChat:
             course_claim_store.invitations,
             course_claim_store,
             course_claim_notifier,
+            blocked_join_gate_enabled=config.blocked_join_gate_enabled,
         )
+
         # Registers its own sign-in and verified-address callbacks.
         self.claim_by_email = ClaimByEmail(
             api, course_claim_store.invitations, provisioner
@@ -369,8 +377,18 @@ class PangeaChat:
                     mode,
                 ),
             )
+        # Additional-instructor invitations into an existing course: prepared
+        # here, emailed by the caller through the v2 reminder endpoint, and
+        # claimed through the same code path as a first claim.
+        api.register_web_resource(
+            path="/_synapse/client/pangea/v2/instructor_invitations",
+            resource=InstructorInvitationAPI(
+                api, config, course_claim_store, course_claim_store.invitations
+            ),
+        )
 
         # --- Room Code ---
+
         self.knock_with_code_resource = KnockWithCode(
             api, config, course_claim_store, course_claim_notifier, provisioner
         )
@@ -1044,6 +1062,19 @@ class PangeaChat:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f'Config "{key}" must be an integer >= 1')
             notice_admin_limits[key] = value
+        notice_external_link_hosts = config.get(
+            "notice_external_link_hosts", list(DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS)
+        )
+        if not isinstance(notice_external_link_hosts, list) or not all(
+            isinstance(host, str) and host.strip() and "/" not in host
+            for host in notice_external_link_hosts
+        ):
+            raise ValueError(
+                'Config "notice_external_link_hosts" must be a list of host names'
+            )
+        notice_external_link_hosts = [
+            host.strip().lower() for host in notice_external_link_hosts
+        ]
 
         blocked_join_gate_enabled = config.get("blocked_join_gate_enabled", True)
         if not isinstance(blocked_join_gate_enabled, bool):
@@ -1403,6 +1434,7 @@ class PangeaChat:
                 "notice_admin_requests_per_minute"
             ],
             notice_admin_burst=notice_admin_limits["notice_admin_burst"],
+            notice_external_link_hosts=notice_external_link_hosts,
             delayed_push_enabled=delayed_push_enabled,
             delayed_push_delay_ms=delayed_push_delay_ms,
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,

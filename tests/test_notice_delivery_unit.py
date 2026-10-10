@@ -48,6 +48,8 @@ def _config(**overrides):
     config.notice_admin_burst = 100
     config.app_base_url = "https://app.example.test"
     config.send_push_sygnal_url = "https://sygnal.example.test"
+    config.notice_external_link_hosts = ["calendar.app.google", "admin.pangea.chat"]
+
     for key, value in overrides.items():
         setattr(config, key, value)
     return config

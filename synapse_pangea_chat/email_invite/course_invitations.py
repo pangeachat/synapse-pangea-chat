@@ -50,6 +50,13 @@ def unavailable() -> SynapseError:
     )
 
 
+def invitation_kind(invitation) -> str:
+    """``instructor`` for an additional-instructor invitation into an existing
+    course, else ``course`` (the first claim, which creates the room)."""
+    spec = invitation.get("specification") or {}
+    return "instructor" if spec.get("kind") == "instructor" else "course"
+
+
 def recovery_required() -> SynapseError:
     return SynapseError(
         503,
@@ -82,21 +89,40 @@ class CourseInvitationStore:
         result["specification"] = json.loads(result["specification"])
         return result
 
-    async def prepare(self, operator, key, spec, email, code, now):
+    async def prepare(self, operator, key, spec, email, code, now, room_id=None):
+        """Insert a prepared invitation, or find the one this operator's key
+        already names. With ``room_id`` the invitation targets that existing
+        course (an instructor invitation) and is identified by room and
+        address; without it, by the course specification and address."""
         await self.ensure()
         invitation_id = str(uuid4())
-        canonical = json.dumps({"spec": spec, "email": email}, sort_keys=True)
+        identity = (
+            {"room_id": room_id, "email": email}
+            if room_id
+            else {"spec": spec, "email": email}
+        )
+        canonical = json.dumps(identity, sort_keys=True)
         digest = hashlib.sha256(canonical.encode()).hexdigest()
 
         def insert(txn):
             txn.execute(
                 """INSERT INTO pangea_course_invitation
                 (invitation_id, operator_id, request_key, input_digest,
-                 specification, requested_email, status, created_at_ms)
-                VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?)
+                 specification, requested_email, status, room_id, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?)
                 ON CONFLICT (operator_id, request_key) DO NOTHING""",
-                (invitation_id, operator, key, digest, json.dumps(spec), email, now),
+                (
+                    invitation_id,
+                    operator,
+                    key,
+                    digest,
+                    json.dumps(spec),
+                    email,
+                    room_id,
+                    now,
+                ),
             )
+
             created = txn.rowcount == 1
             txn.execute(
                 "SELECT invitation_id, input_digest FROM pangea_course_invitation WHERE operator_id = ? AND request_key = ?",
@@ -234,6 +260,51 @@ class CourseInvitationStore:
 
         await self.db.runInteraction("pangea_invitation_complete", update)
 
+    async def complete_instructor(self, invitation_id, user, room_id, now):
+        """Completion of an additional-instructor invitation: the grant is
+        recorded and the requesting address cleared. No claim row is written
+        and nothing owes a share kit — the instructor claim transfers no
+        ownership (knock-with-code.instructions.md, "Codes, share kit and
+        existing courses")."""
+
+        def update(txn):
+            txn.execute(
+                """UPDATE pangea_course_invitation
+                SET status = 'completed', completed_at_ms = ?, requested_email = NULL
+                WHERE invitation_id = ? AND claimant = ? AND room_id = ? AND status = 'provisioning'""",
+                (now, invitation_id, user, room_id),
+            )
+            if txn.rowcount == 1:
+                return
+            txn.execute(
+                "SELECT status FROM pangea_course_invitation WHERE invitation_id = ? AND claimant = ?",
+                (invitation_id, user),
+            )
+            row = txn.fetchone()
+            if not row or row[0] != "completed":
+                raise recovery_required()
+
+        await self.db.runInteraction("pangea_invitation_complete_instructor", update)
+
+    async def list_instructor(self, status):
+        """Instructor invitations in ``status``, newest first, as ``status()``
+        reports them. Never the address."""
+        await self.ensure()
+
+        def select(txn):
+            txn.execute(
+                SELECT + "WHERE status = ? ORDER BY created_at_ms DESC, invitation_id",
+                (status,),
+            )
+            return [self.row(r) for r in txn.fetchall()]
+
+        rows = await self.db.runInteraction("pangea_invitation_list", select)
+        return [
+            await self.status(row["invitation_id"])
+            for row in rows
+            if invitation_kind(row) == "instructor"
+        ]
+
     async def begin_delivery(self, invitation_id, code, now):
         attempt = str(uuid4())
 
@@ -301,9 +372,11 @@ class CourseInvitationStore:
                 "completed_at_ms",
             )
         }
+        result["kind"] = invitation_kind(row)
         result["deliveries"] = await self.db.runInteraction(
             "pangea_invitation_deliveries", deliveries
         )
+
         result["delivery_outcome"] = (
             result["deliveries"][-1]["outcome"] if result["deliveries"] else "unsent"
         )

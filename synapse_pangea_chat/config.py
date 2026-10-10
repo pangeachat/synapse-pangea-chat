@@ -15,6 +15,15 @@ import attr
 
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 
+#: Hosts a notice's external destination may point at. A notice link is a
+#: signed redirect, so an unlisted host would turn our mail into an open
+#: redirect; the list is the booking page and the teacher dashboards.
+DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS = (
+    "calendar.app.google",
+    "admin.pangea.chat",
+    "admin.staging.pangea.chat",
+)
+
 
 @attr.s(auto_attribs=True, frozen=True)
 class PangeaChatConfig:
@@ -149,6 +158,11 @@ class PangeaChatConfig:
     notice_public_burst_duration_seconds: int = 60
     notice_admin_requests_per_minute: int = 600
     notice_admin_burst: int = 100
+    # Hosts an `external` notice destination may link to; re-checked when the
+    # link is clicked, so removing a host retires links already sent.
+    notice_external_link_hosts: List[str] = attr.Factory(
+        lambda: list(DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS)
+    )
 
     # --- delayed_push config ---
     delayed_push_enabled: bool = False

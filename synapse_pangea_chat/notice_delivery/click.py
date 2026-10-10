@@ -22,7 +22,9 @@ from twisted.web.resource import Resource
 from synapse_pangea_chat.notice_delivery.common import (
     TOKEN_KIND_CLICK,
     app_url,
+    destination_url,
     now_ms,
+    token_destination,
     token_secret,
 )
 from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
@@ -81,12 +83,13 @@ class NoticeClick(Resource):
                 )
                 respond_with_redirect(request, destination.encode("utf-8"))
                 return
-            destination = app_url(
+            destination = destination_url(
                 self._config.app_base_url,
-                activity_id=payload.get("a"),
-                session_room_id=payload.get("s"),
+                token_destination(payload),
+                self._config.notice_external_link_hosts,
             )
             await self.record_open(payload)
+
             respond_with_redirect(request, destination.encode("utf-8"))
         except Exception:  # noqa: BLE001
             logger.exception("Error handling notice click")
@@ -125,6 +128,10 @@ class NoticeClick(Resource):
                         "notification_event_id": notice_event_id,
                         "check_in_type": payload.get("v") or "default",
                         "opened_at_ts": now_ms(self._api),
+                        "link": payload.get("l")
+                        if payload.get("l") in ("cta", "cta2")
+                        else "cta",
+                        "destination_kind": token_destination(payload)["k"],
                     },
                 }
             )

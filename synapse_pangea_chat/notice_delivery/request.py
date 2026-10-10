@@ -3,16 +3,30 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
+from synapse_pangea_chat.config import DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS
 from synapse_pangea_chat.notice_delivery.categories import DELIVERABLE_CATEGORIES
+from synapse_pangea_chat.notice_delivery.common import (
+    DESTINATION_KINDS,
+    external_host_allowed,
+)
 from synapse_pangea_chat.notice_delivery.eligibility import validate_eligibility
 
 EMAIL_ONLY = frozenset({"teacher_setup", "weekly_class_report", "campaigns"})
 METHODS = frozenset({"use-available", "email-only", "push-only", "in-app-only"})
 LINK_SLOTS = ("{{cta_url}}", "{{unsubscribe_url}}")
+SECONDARY_SLOT = "{{cta2_url}}"
+#: The ids each destination kind carries; any other id on it is a mistake.
+DESTINATION_IDS = {
+    "app": frozenset(),
+    "activity": frozenset({"activity_id", "session_room_id"}),
+    "course": frozenset({"course_room_id"}),
+    "subscription": frozenset(),
+    "external": frozenset({"url"}),
+}
 
 
 def string(data: Dict[str, Any], key: str, limit: int = 512) -> str:
@@ -25,6 +39,88 @@ def string(data: Dict[str, Any], key: str, limit: int = 512) -> str:
 
 
 @dataclass(frozen=True)
+class Destination:
+    """Where a notice's action link lands: the app home, an activity (with
+    its session when one exists), a course, the subscription page, or an
+    allowed external page. The signed link binds it (notices.instructions.md,
+    "Notice destinations")."""
+
+    kind: str
+    activity_id: Optional[str] = None
+    session_room_id: Optional[str] = None
+    course_room_id: Optional[str] = None
+    url: Optional[str] = None
+
+    def compact(self) -> Dict[str, str]:
+        """The token payload form: ``k`` plus only the ids this kind carries."""
+        result = {"k": self.kind}
+        for key, value in (
+            ("a", self.activity_id),
+            ("s", self.session_room_id),
+            ("c", self.course_room_id),
+            ("u", self.url),
+        ):
+            if value:
+                result[key] = value
+        return result
+
+    @classmethod
+    def parse(
+        cls,
+        data: Any,
+        external_link_hosts: Iterable[str],
+        name: str = "destination",
+    ) -> Destination:
+        if not isinstance(data, dict):
+            raise ValueError(f"{name} must be an object")
+        kind = string(data, "kind", 32)
+        if kind not in DESTINATION_KINDS:
+            raise ValueError(
+                f"{name}.kind must be one of {', '.join(DESTINATION_KINDS)}"
+            )
+        ids: Dict[str, Optional[str]] = {}
+        for key, limit in (
+            ("activity_id", 512),
+            ("session_room_id", 512),
+            ("course_room_id", 512),
+            ("url", 2048),
+        ):
+            ids[key] = string(data, key, limit) if data.get(key) is not None else None
+            if ids[key] is not None and key not in DESTINATION_IDS[kind]:
+                raise ValueError(f"{name} of kind {kind} takes no {key}")
+        if kind == "activity" and not ids["activity_id"]:
+            raise ValueError(f"{name} of kind activity requires activity_id")
+        if kind == "course" and not (ids["course_room_id"] or "").startswith("!"):
+            raise ValueError(f"{name} of kind course requires a course_room_id")
+        if kind == "external" and not external_host_allowed(
+            ids["url"], external_link_hosts
+        ):
+            raise ValueError(
+                f"{name} of kind external requires an https url on an allowed host"
+            )
+        return cls(kind, **ids)
+
+    @classmethod
+    def from_ids(cls, data: Dict[str, Any]) -> Destination:
+        """The destination a request without a destination object means: its
+        top-level activity (and session) ids, else the app home. This is how
+        every notice resolved before destinations existed."""
+        activity_id = data.get("activity_id")
+        if isinstance(activity_id, str) and activity_id.strip():
+            session = data.get("session_room_id")
+            return cls(
+                "activity",
+                activity_id=activity_id.strip(),
+                session_room_id=(
+                    session.strip()
+                    if isinstance(session, str) and session.strip()
+                    else None
+                ),
+            )
+        return cls("app")
+
+
+@dataclass(frozen=True)
 class EmailContent:
     subject: str
     html: str
@@ -32,7 +128,7 @@ class EmailContent:
     receiving_reason: str
 
     @classmethod
-    def parse(cls, data: Dict[str, Any]) -> EmailContent:
+    def parse(cls, data: Dict[str, Any], secondary: bool = False) -> EmailContent:
         subject = string(data, "subject", 120)
         if "\r" in subject or "\n" in subject:
             raise ValueError("email subject must be one line")
@@ -41,6 +137,16 @@ class EmailContent:
         for slot in LINK_SLOTS:
             if slot not in html or slot not in text:
                 raise ValueError(f"email html and text must both contain {slot}")
+        has_secondary = SECONDARY_SLOT in html and SECONDARY_SLOT in text
+        if secondary and not has_secondary:
+            raise ValueError(
+                f"email html and text must both contain {SECONDARY_SLOT} when secondary_destination is present"
+            )
+        if not secondary and (SECONDARY_SLOT in html or SECONDARY_SLOT in text):
+            raise ValueError(
+                f"email contains {SECONDARY_SLOT} but the request has no secondary_destination"
+            )
+
         reason = string(data, "receiving_reason", 2000)
         if "{{receiving_reason}}" not in html or "{{receiving_reason}}" not in text:
             raise ValueError(
@@ -117,6 +223,8 @@ class NoticeRequest:
     notification_log_id: Optional[str] = None
     """The caller's Notification_Log row. When present the caller owns the record: this module
     reserves nothing, finishes nothing, and the caller writes the receipt onto its own row."""
+    destination: Destination = field(default_factory=lambda: Destination("app"))
+    secondary_destination: Optional[Destination] = None
 
     @property
     def caller_owns_record(self) -> bool:
@@ -135,8 +243,33 @@ class NoticeRequest:
         return json.dumps(parts, separators=(",", ":"))
 
     @classmethod
-    def parse(cls, data: Dict[str, Any]) -> NoticeRequest:
+    def parse(
+        cls,
+        data: Dict[str, Any],
+        external_link_hosts: Optional[Iterable[str]] = None,
+    ) -> NoticeRequest:
+        """``external_link_hosts`` is the configured allowlist for external
+        destinations; without one, the module's default list applies."""
         validate_eligibility(data)
+        hosts = (
+            DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS
+            if external_link_hosts is None
+            else external_link_hosts
+        )
+        for key in ("activity_id", "session_room_id"):
+            if key in data and data[key] is not None:
+                string(data, key)
+        destination = (
+            Destination.parse(data["destination"], hosts)
+            if data.get("destination") is not None
+            else Destination.from_ids(data)
+        )
+        secondary = None
+        if data.get("secondary_destination") is not None:
+            secondary = Destination.parse(
+                data["secondary_destination"], hosts, "secondary_destination"
+            )
+
         user = string(data, "user_id")
         category = string(data, "category")
         variant = string(data, "variant")
@@ -193,7 +326,8 @@ class NoticeRequest:
         if "email" in data:
             if not isinstance(data["email"], dict):
                 raise ValueError("email must be an object")
-            email = EmailContent.parse(data["email"])
+            email = EmailContent.parse(data["email"], secondary=secondary is not None)
+
         if method in {"use-available", "push-only"} and push is None:
             raise ValueError("push content is required for this delivery method")
         if method in {"use-available", "email-only"} and email is None:
@@ -211,9 +345,6 @@ class NoticeRequest:
         if log is None and data.get("eligibility"):
             # recipient_not_returned and min_contact_spacing_ms read the decision's time and funnel.
             raise ValueError("eligibility conditions require the log decision context")
-        for key in ("activity_id", "session_room_id"):
-            if key in data and data[key] is not None:
-                string(data, key)
         return cls(
             user,
             category,
@@ -225,6 +356,8 @@ class NoticeRequest:
             email,
             log,
             record_id,
+            destination,
+            secondary,
         )
 
 
