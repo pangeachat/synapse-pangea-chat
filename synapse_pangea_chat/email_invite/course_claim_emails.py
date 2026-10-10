@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+from html import escape as html_escape
 from typing import Any, Optional
 
 from synapse.logging.context import make_deferred_yieldable, run_in_background
@@ -53,6 +54,39 @@ def _claim_template_vars(claim_url: str, claim_code: str) -> dict[str, str]:
     return {"claim_url": claim_url}
 
 
+CLAIM_SLOT = "{{cta_url}}"
+RENDERED_SLOTS = (CLAIM_SLOT, "{{receiving_reason}}", "{{postal_address}}")
+#: A pre-claim email has no account to refuse from; the request record is its refusal store.
+FORBIDDEN_SLOTS = ("{{unsubscribe_url}}", "{{cta2_url}}")
+
+
+def validate_rendered(html: str, text: str) -> str | None:
+    """Why a caller-rendered reminder is refused, or None: both parts carry the
+    claim slot and neither carries a slot this mail cannot fill."""
+    for part, name in ((html, "html"), (text, "text")):
+        if CLAIM_SLOT not in part:
+            return f"{name} must contain {CLAIM_SLOT}"
+        for slot in FORBIDDEN_SLOTS:
+            if slot in part:
+                return f"{name} must not contain {slot}: pre-claim mail carries no refusal link and one call to action"
+    return None
+
+
+def fill_claim_slots(
+    html: str, text: str, *, claim_url: str, receiving_reason: str, postal_address: str
+) -> tuple[str, str]:
+    """Literal replacement of the slots, the values escaped in the HTML."""
+    values = {
+        CLAIM_SLOT: claim_url,
+        "{{receiving_reason}}": receiving_reason,
+        "{{postal_address}}": postal_address,
+    }
+    for slot, value in values.items():
+        html = html.replace(slot, html_escape(value, quote=True))
+        text = text.replace(slot, value)
+    return html, text
+
+
 def reminder_paragraphs(body: str) -> list[str]:
     """A reminder body's paragraphs: separated by a blank line, each with its
     own line breaks folded into spaces."""
@@ -61,11 +95,14 @@ def reminder_paragraphs(body: str) -> list[str]:
 
 
 class CourseClaimMailer:
-    def __init__(self, api: ModuleApi) -> None:
+    def __init__(self, api: ModuleApi, postal_address: str = "") -> None:
         hs: Any = api._hs
         self._send_email_handler = hs.get_send_email_handler()
         self._clock = hs.get_clock()
         self._app_name = hs.config.email.email_app_name
+        # The sender's postal address for a caller-rendered email's footer slot
+        # (the same value notice emails carry).
+        self._postal_address = postal_address
         [
             self._ready_html,
             self._ready_text,
@@ -151,20 +188,39 @@ class CourseClaimMailer:
         cta_label: str,
         claim_url: str,
         claim_code: str,
+        html: str | None = None,
+        text: str | None = None,
+        receiving_reason: str | None = None,
     ) -> None:
-        template_vars = {
-            "app_name": self._app_name,
-            "subject": subject,
-            "paragraphs": reminder_paragraphs(body),
-            "cta_label": cta_label,
-            **_claim_template_vars(claim_url, claim_code),
-        }
+        """The reminder around the caller's body in the module's template, or,
+        when the caller rendered the whole email (``html`` and ``text`` with
+        the ``{{cta_url}}`` slot), that email with the claim link and the
+        footer slots filled by literal replacement. Caller content is never
+        evaluated as a template."""
+        if html is not None and text is not None:
+            rendered_html, rendered_text = fill_claim_slots(
+                html,
+                text,
+                claim_url=claim_url,
+                receiving_reason=receiving_reason or "",
+                postal_address=self._postal_address,
+            )
+        else:
+            template_vars = {
+                "app_name": self._app_name,
+                "subject": subject,
+                "paragraphs": reminder_paragraphs(body),
+                "cta_label": cta_label,
+                **_claim_template_vars(claim_url, claim_code),
+            }
+            rendered_html = self._reminder_html.render(**template_vars)
+            rendered_text = self._reminder_text.render(**template_vars)
         await self._send(
             email_address=email_address,
             subject=_subject_title(subject),
             app_name=self._app_name,
-            html=self._reminder_html.render(**template_vars),
-            text=self._reminder_text.render(**template_vars),
+            html=rendered_html,
+            text=rendered_text,
         )
 
     async def _send(self, **kwargs: Any) -> None:

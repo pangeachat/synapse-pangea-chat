@@ -344,7 +344,9 @@ class PangeaChat:
         # address and sends the claim link; knock_with_code takes the claim and
         # sends the class link (knock-with-code.instructions.md).
         course_claim_store = CourseClaimStore(api._hs)
-        course_claim_mailer = CourseClaimMailer(api)
+        course_claim_mailer = CourseClaimMailer(
+            api, postal_address=config.notice_email_postal_address or ""
+        )
         course_claim_notifier = CourseClaimNotifier(
             api, config, course_claim_store, course_claim_mailer
         )
