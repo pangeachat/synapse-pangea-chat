@@ -18,8 +18,7 @@ An authorized operator can read current status through `GET /_synapse/client/pan
 
 Additional-instructor invitations into an existing course are prepared and listed through `/_synapse/client/pangea/v2/instructor_invitations`. They share the status, revocation and reminder resources above, and every status read names the invitation's `kind`, `instructor` or `course`. Their contract, including what the claim does and does not do, is owned by [knock-with-code](knock-with-code.instructions.md#codes-share-kit-and-existing-courses).
 
-Persist the invitation before emailing.
- Failed first delivery leaves it prepared and eligible for an explicit resend, not marked delivered. The v2 reminder endpoint accepts an invitation ID; v1 continues to resolve a room ID to its legacy invitation. Both mint a new code for the same invitation and email the requesting address, returning the send result without the code. Missing, revoked or completed invitations are refused. Recover a partial claim before sending another reminder.
+Persist the invitation before emailing. Failed first delivery leaves it prepared and eligible for an explicit resend, not marked delivered. The v2 reminder endpoint accepts an invitation ID; v1 continues to resolve a room ID to its legacy invitation. Both mint a new code for the same invitation and email the requesting address, returning the send result without the code. Missing, revoked or completed invitations are refused. Recover a partial claim before sending another reminder.
 
 The caller continues applying the communication controls and funnel timing and recording actual decisions in Notification_Log. CMS and contact records mirror invitation and eventual room references; they do not authorize a claim. Ending the outreach schedule does not revoke the invitation.
 
