@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from copy import deepcopy
 
 from synapse.types import create_requester
@@ -25,6 +26,15 @@ from synapse_pangea_chat.room_code.instructor_access import (
 )
 
 MARKER = "org.pangea.course_invitation"
+
+
+def _plain(value):
+    """A plain-dict copy of a (possibly frozen) JSON-like structure."""
+    if isinstance(value, Mapping):
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value
 
 
 class CourseProvisioner:
@@ -259,7 +269,9 @@ class CourseProvisioner:
                 )
                 state = await self.api.get_room_state(room)
             power = state.get(("m.room.power_levels", ""))
-            content = deepcopy(power.content) if power else {}
+            # Event content arrives as Synapse's immutable mapping, which cannot be
+            # deep-copied (pickle refuses it); rebuild it as plain dicts instead.
+            content = _plain(power.content) if power else {}
             users = dict(content.get("users", {}))
             if users.get(user, content.get("users_default", 0)) < 100:
                 users[user] = 100
