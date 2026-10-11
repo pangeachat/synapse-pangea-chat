@@ -50,6 +50,9 @@ def _first_arg(request: SynapseRequest, key: bytes) -> Optional[str]:
         return None
 
 
+OPEN_RECORD_WINDOW_SECONDS = 60
+
+
 class NoticeClick(Resource):
     isLeaf = True
 
@@ -57,9 +60,17 @@ class NoticeClick(Resource):
         super().__init__()
         self._api = api
         self._config = config
+        # Per client address, for links that fail verification only: a class
+        # opening the same email on one school network shares an address, and
+        # a validly signed link always reaches the destination it names.
         self._rate_limiter = SlidingWindowRateLimiter(
             requests_per_burst=config.notice_public_requests_per_burst,
             burst_duration_seconds=config.notice_public_burst_duration_seconds,
+        )
+        # One open record per link per minute, so a link fetched over and over
+        # cannot flood the person's DM; the redirect is never withheld.
+        self._open_limiter = SlidingWindowRateLimiter(
+            requests_per_burst=1, burst_duration_seconds=OPEN_RECORD_WINDOW_SECONDS
         )
 
     def render_GET(self, request: SynapseRequest):
@@ -71,16 +82,18 @@ class NoticeClick(Resource):
             self._config.app_base_url, activity_id=None, session_room_id=None
         )
         try:
-            if self._rate_limiter.is_rate_limited(request.getClientAddress().host):
-                respond_with_redirect(request, destination.encode("utf-8"))
-                return
-            payload = self._verify(_first_arg(request, b"t"))
+            token = _first_arg(request, b"t")
+            payload = self._verify(token)
             if payload is None:
                 # An expired or forged link still lands the person in the app;
-                # only the open goes unrecorded.
-                logger.warning(
-                    "notice click link invalid or expired; redirecting without record"
-                )
+                # only the open goes unrecorded. The address limit only quiets
+                # the log for a caller sending bad links in bulk.
+                if not self._rate_limiter.is_rate_limited(
+                    request.getClientAddress().host
+                ):
+                    logger.warning(
+                        "notice click link invalid or expired; redirecting without record"
+                    )
                 respond_with_redirect(request, destination.encode("utf-8"))
                 return
             destination = destination_url(
@@ -88,7 +101,8 @@ class NoticeClick(Resource):
                 token_destination(payload),
                 self._config.notice_external_link_hosts,
             )
-            await self.record_open(payload)
+            if not self._open_limiter.is_rate_limited(str(token)):
+                await self.record_open(payload)
 
             respond_with_redirect(request, destination.encode("utf-8"))
         except Exception:  # noqa: BLE001
