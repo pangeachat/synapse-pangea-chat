@@ -372,3 +372,39 @@ class TestV2PrepareWithoutEmail(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(SynapseError):
             await r.prepare("@op:x", {**body, "send_email": "no"})
+
+
+class TestClaimedEmailSlots(unittest.TestCase):
+    def test_the_claimed_email_carries_the_class_link_and_nothing_else_to_fill(
+        self,
+    ) -> None:
+        from synapse_pangea_chat.email_invite.course_claim_emails import (
+            fill_class_slots,
+            validate_claimed,
+        )
+
+        def problem(html: str, text: str) -> str:
+            return validate_claimed(html, text) or ""
+
+        self.assertIsNone(
+            validate_claimed('<a href="{{class_url}}">Join</a>', "Join: {{class_url}}")
+        )
+        self.assertIn("{{class_url}}", problem("<p>no link</p>", "{{class_url}}"))
+        self.assertIn(
+            "{{cta_url}}",
+            problem("{{class_url}} {{cta_url}}", "{{class_url}}"),
+        )
+        self.assertIn(
+            "{{unsubscribe_url}}",
+            problem("{{class_url}}", "{{class_url}} {{unsubscribe_url}}"),
+        )
+        html, text = fill_class_slots(
+            '<a href="{{class_url}}">{{class_code}}</a>{{receiving_reason}}',
+            "{{class_url}} {{postal_address}}",
+            class_url="https://app.example/a&b",
+            class_code="c1",
+            receiving_reason="<r>",
+            postal_address="1 St",
+        )
+        self.assertEqual(html, '<a href="https://app.example/a&amp;b">c1</a>&lt;r&gt;')
+        self.assertEqual(text, "https://app.example/a&b 1 St")

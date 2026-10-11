@@ -30,6 +30,11 @@ SCHEMA = (
         attempt_id TEXT PRIMARY KEY, invitation_id TEXT NOT NULL,
         created_at_ms BIGINT NOT NULL, finished_at_ms BIGINT,
         outcome TEXT NOT NULL)""",
+    # The caller-rendered share kit sent at claim, with the class link as a slot.
+    """CREATE TABLE IF NOT EXISTS pangea_course_invitation_claimed_email (
+        invitation_id TEXT PRIMARY KEY, subject TEXT NOT NULL, html TEXT NOT NULL,
+        text TEXT NOT NULL, receiving_reason TEXT NOT NULL,
+        stored_at_ms BIGINT NOT NULL)""",
 )
 COLUMNS = (
     "invitation_id",
@@ -342,6 +347,43 @@ class CourseInvitationStore:
             )
 
         await self.db.runInteraction("pangea_invitation_delivery_finish", update)
+
+    async def store_claimed_email(self, invitation_id, email, now):
+        """Keep the caller-rendered email to send when this invitation is claimed (the latest
+        one the caller sent replaces any earlier)."""
+        await self.ensure()
+        await self.db.simple_upsert(
+            "pangea_course_invitation_claimed_email",
+            keyvalues={"invitation_id": invitation_id},
+            values={
+                **{
+                    k: email[k] for k in ("subject", "html", "text", "receiving_reason")
+                },
+                "stored_at_ms": now,
+            },
+            desc="pangea_store_claimed_email",
+        )
+
+    async def claimed_email_for_room(self, room_id):
+        """The stored claimed email of the invitation whose course is this room, or None."""
+        await self.ensure()
+
+        def read(txn):
+            txn.execute(
+                """SELECT c.subject, c.html, c.text, c.receiving_reason
+                FROM pangea_course_invitation_claimed_email c
+                JOIN pangea_course_invitation i ON i.invitation_id = c.invitation_id
+                WHERE i.room_id = ?""",
+                (room_id,),
+            )
+            row = txn.fetchone()
+            return (
+                dict(zip(("subject", "html", "text", "receiving_reason"), row))
+                if row
+                else None
+            )
+
+        return await self.db.runInteraction("pangea_claimed_email_for_room", read)
 
     async def status(self, invitation_id):
         row = await self.get(invitation_id)
