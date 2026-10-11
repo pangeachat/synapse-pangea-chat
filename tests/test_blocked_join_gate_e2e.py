@@ -12,7 +12,6 @@ from .base_e2e import BaseSynapseE2ETest
 
 logger = logging.getLogger(__name__)
 
-PASSWORD = "123123123"
 ACCESS_CODE = "blk1234"
 
 # Setup issues a burst of invites/joins/knocks; lift the default ratelimits so
@@ -31,7 +30,9 @@ SYNAPSE_CONFIG_OVERRIDES = {
 }
 
 
-class TestBlockedJoinGateE2E(BaseSynapseE2ETest):
+class BlockedJoinGateMixin:
+    server_url: str
+
     def _headers(self, token: str) -> Dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
 
@@ -116,195 +117,140 @@ class TestBlockedJoinGateE2E(BaseSynapseE2ETest):
         self.assertNotIn("block", response.text.lower())
         self.assertNotIn("ignor", response.text.lower())
 
+
+class TestBlockedJoinGateE2E(BlockedJoinGateMixin, BaseSynapseE2ETest):
     async def test_blocked_requester_is_refused_on_every_entry_path(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                synapse_config_overrides=SYNAPSE_CONFIG_OVERRIDES
-            )
+        await self.homeserver(synapse_config_overrides=SYNAPSE_CONFIG_OVERRIDES)
 
-            # Non-server-admin accounts: Synapse bypasses user_may_join_room
-            # for server admins, so admin=True would mask the join gate.
-            for name in ("owner", "coadmin", "member", "requester"):
-                await self.register_user(
-                    config_path=config_path,
-                    dir=synapse_dir,
-                    user=name,
-                    password=PASSWORD,
-                    admin=False,
+        # Non-server-admin accounts: Synapse bypasses user_may_join_room
+        # for server admins, so admin=True would mask the join gate.
+        owner_id, owner_token = await self.new_user("owner")
+        coadmin_id, coadmin_token = await self.new_user("coadmin")
+        member_id, member_token = await self.new_user("member")
+        requester_id, requester_token = await self.new_user("requester")
+        # Server admin for the assign_room_membership exemption scenario.
+        _, sysadmin_token = await self.new_user("sysadmin", admin=True)
+
+        knock_room = await self.create_room(owner_token, "knock")
+        public_room = await self.create_room(owner_token, "public")
+        code_room = await self.create_room(
+            owner_token, "knock", access_code=ACCESS_CODE
+        )
+        rooms = [knock_room, public_room, code_room]
+
+        # coadmin (PL 100) and member (PL 0) join every room.
+        for room_id in rooms:
+            for uid, tok in (
+                (coadmin_id, coadmin_token),
+                (member_id, member_token),
+            ):
+                self.assertTrue(
+                    await self.invite_user_to_room(room_id, uid, owner_token)
                 )
-            # Server admin for the assign_room_membership exemption scenario.
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="sysadmin",
-                password=PASSWORD,
-                admin=True,
-            )
-            owner_id, owner_token = await self.login_user("owner", PASSWORD)
-            coadmin_id, coadmin_token = await self.login_user("coadmin", PASSWORD)
-            member_id, member_token = await self.login_user("member", PASSWORD)
-            requester_id, requester_token = await self.login_user("requester", PASSWORD)
+                self.assertTrue(await self.accept_room_invitation(room_id, tok))
+            await self.set_power_level(room_id, owner_token, coadmin_id, 100)
 
-            knock_room = await self.create_room(owner_token, "knock")
-            public_room = await self.create_room(owner_token, "public")
-            code_room = await self.create_room(
-                owner_token, "knock", access_code=ACCESS_CODE
-            )
-            rooms = [knock_room, public_room, code_room]
-
-            # coadmin (PL 100) and member (PL 0) join every room.
-            for room_id in rooms:
-                for uid, tok in (
-                    (coadmin_id, coadmin_token),
-                    (member_id, member_token),
-                ):
-                    self.assertTrue(
-                        await self.invite_user_to_room(room_id, uid, owner_token)
-                    )
-                    self.assertTrue(await self.accept_room_invitation(room_id, tok))
-                await self.set_power_level(room_id, owner_token, coadmin_id, 100)
-
-            def deny_knock(room_id: str) -> None:
-                # Owner denies the knock so the requester is back to no
-                # membership before the next scenario.
-                requests.post(
-                    f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/kick",
-                    json={"user_id": requester_id},
-                    headers=self._headers(owner_token),
-                )
-
-            # --- A non-admin's block does not gate anything ---
-            await self.set_ignore_list(member_token, member_id, [requester_id])
-            self.assertEqual(
-                self.knock(knock_room, requester_token).status_code,
-                200,
-                "knock should pass when only a PL-0 member blocks the requester",
-            )
-            deny_knock(knock_room)
-
-            # --- Only one of two admins blocks: still not gated ---
-            await self.set_ignore_list(coadmin_token, coadmin_id, [requester_id])
-            self.assertEqual(
-                self.knock(knock_room, requester_token).status_code,
-                200,
-                "knock should pass while another admin has not blocked",
-            )
-            deny_knock(knock_room)
-
-            # --- Every admin blocks the requester ---
-            await self.set_ignore_list(owner_token, owner_id, [requester_id])
-
-            # Knock: refused before it lands, no knock membership recorded.
-            self.assert_generic_forbidden(self.knock(knock_room, requester_token))
-            self.assertNotEqual(
-                self.membership(knock_room, requester_id, owner_token), "knock"
-            )
-
-            # Direct join to a public room: refused.
-            self.assert_generic_forbidden(self.join(public_room, requester_token))
-            self.assertIsNone(self.membership(public_room, requester_id, owner_token))
-
-            # A pending invite does not override the block.
-            self.assertTrue(
-                await self.invite_user_to_room(public_room, requester_id, owner_token)
-            )
-            self.assert_generic_forbidden(self.join(public_room, requester_token))
-            self.assertEqual(
-                self.membership(public_room, requester_id, owner_token), "invite"
-            )
-
-            # knock_with_code: the code is valid but every matched room is
-            # blocked, so a generic 403 with no ban errcode and no room list.
-            response = self.knock_with_code(ACCESS_CODE, requester_token)
-            self.assert_generic_forbidden(response)
-            self.assertNotIn("banned", response.json())
-            self.assertNotIn("rooms", response.json())
-            self.assertIsNone(self.membership(code_room, requester_id, owner_token))
-
-            # --- Server-initiated entry is exempt while every admin blocks ---
-            sysadmin_id, sysadmin_token = await self.login_user("sysadmin", PASSWORD)
-            response = requests.post(
-                f"{self.server_url}/_synapse/client/pangea/v1/assign_room_membership",
-                json={
-                    "room_id": public_room,
-                    "user_ids": [requester_id],
-                    "force_join": True,
-                },
-                headers=self._headers(sysadmin_token),
-            )
-            self.assertEqual(response.status_code, 200, response.text)
-            self.assertEqual(
-                self.membership(public_room, requester_id, owner_token),
-                "join",
-                "orchestrated force-join must bypass the gate",
-            )
-            # Put the requester back outside for the un-block scenario below.
+        def deny_knock(room_id: str) -> None:
+            # Owner denies the knock so the requester is back to no
+            # membership before the next scenario.
             requests.post(
-                f"{self.server_url}/_matrix/client/v3/rooms/{public_room}/leave",
-                json={},
-                headers=self._headers(requester_token),
+                f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/kick",
+                json={"user_id": requester_id},
+                headers=self._headers(owner_token),
             )
 
-            # --- One admin un-blocks: every path opens again ---
-            await self.set_ignore_list(coadmin_token, coadmin_id, [])
-            self.assertEqual(self.knock(knock_room, requester_token).status_code, 200)
-            self.assertEqual(self.join(public_room, requester_token).status_code, 200)
-            self.assertEqual(
-                self.knock_with_code(ACCESS_CODE, requester_token).status_code, 200
-            )
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # --- A non-admin's block does not gate anything ---
+        await self.set_ignore_list(member_token, member_id, [requester_id])
+        self.assertEqual(
+            self.knock(knock_room, requester_token).status_code,
+            200,
+            "knock should pass when only a PL-0 member blocks the requester",
+        )
+        deny_knock(knock_room)
 
+        # --- Only one of two admins blocks: still not gated ---
+        await self.set_ignore_list(coadmin_token, coadmin_id, [requester_id])
+        self.assertEqual(
+            self.knock(knock_room, requester_token).status_code,
+            200,
+            "knock should pass while another admin has not blocked",
+        )
+        deny_knock(knock_room)
+
+        # --- Every admin blocks the requester ---
+        await self.set_ignore_list(owner_token, owner_id, [requester_id])
+
+        # Knock: refused before it lands, no knock membership recorded.
+        self.assert_generic_forbidden(self.knock(knock_room, requester_token))
+        self.assertNotEqual(
+            self.membership(knock_room, requester_id, owner_token), "knock"
+        )
+
+        # Direct join to a public room: refused.
+        self.assert_generic_forbidden(self.join(public_room, requester_token))
+        self.assertIsNone(self.membership(public_room, requester_id, owner_token))
+
+        # A pending invite does not override the block.
+        self.assertTrue(
+            await self.invite_user_to_room(public_room, requester_id, owner_token)
+        )
+        self.assert_generic_forbidden(self.join(public_room, requester_token))
+        self.assertEqual(
+            self.membership(public_room, requester_id, owner_token), "invite"
+        )
+
+        # knock_with_code: the code is valid but every matched room is
+        # blocked, so a generic 403 with no ban errcode and no room list.
+        response = self.knock_with_code(ACCESS_CODE, requester_token)
+        self.assert_generic_forbidden(response)
+        self.assertNotIn("banned", response.json())
+        self.assertNotIn("rooms", response.json())
+        self.assertIsNone(self.membership(code_room, requester_id, owner_token))
+
+        # --- Server-initiated entry is exempt while every admin blocks ---
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/assign_room_membership",
+            json={
+                "room_id": public_room,
+                "user_ids": [requester_id],
+                "force_join": True,
+            },
+            headers=self._headers(sysadmin_token),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            self.membership(public_room, requester_id, owner_token),
+            "join",
+            "orchestrated force-join must bypass the gate",
+        )
+        # Put the requester back outside for the un-block scenario below.
+        requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{public_room}/leave",
+            json={},
+            headers=self._headers(requester_token),
+        )
+
+        # --- One admin un-blocks: every path opens again ---
+        await self.set_ignore_list(coadmin_token, coadmin_id, [])
+        self.assertEqual(self.knock(knock_room, requester_token).status_code, 200)
+        self.assertEqual(self.join(public_room, requester_token).status_code, 200)
+        self.assertEqual(
+            self.knock_with_code(ACCESS_CODE, requester_token).status_code, 200
+        )
+
+
+class TestBlockedJoinGateDisabledE2E(BlockedJoinGateMixin, BaseSynapseE2ETest):
     async def test_gate_can_be_disabled_by_config(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={"blocked_join_gate_enabled": False},
-                synapse_config_overrides=SYNAPSE_CONFIG_OVERRIDES,
-            )
-            for name in ("owner", "requester"):
-                await self.register_user(
-                    config_path=config_path,
-                    dir=synapse_dir,
-                    user=name,
-                    password=PASSWORD,
-                    admin=False,
-                )
-            owner_id, owner_token = await self.login_user("owner", PASSWORD)
-            requester_id, requester_token = await self.login_user("requester", PASSWORD)
-            room_id = await self.create_room(owner_token, "knock", ACCESS_CODE)
-            await self.set_ignore_list(owner_token, owner_id, [requester_id])
+        await self.homeserver(
+            module_config={"blocked_join_gate_enabled": False},
+            synapse_config_overrides=SYNAPSE_CONFIG_OVERRIDES,
+        )
+        owner_id, owner_token = await self.new_user("owner")
+        requester_id, requester_token = await self.new_user("requester")
+        room_id = await self.create_room(owner_token, "knock", ACCESS_CODE)
+        await self.set_ignore_list(owner_token, owner_id, [requester_id])
 
-            self.assertEqual(self.knock(room_id, requester_token).status_code, 200)
-            self.assertEqual(
-                self.knock_with_code(ACCESS_CODE, requester_token).status_code, 200
-            )
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        self.assertEqual(self.knock(room_id, requester_token).status_code, 200)
+        self.assertEqual(
+            self.knock_with_code(ACCESS_CODE, requester_token).status_code, 200
+        )
