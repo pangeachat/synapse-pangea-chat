@@ -10,7 +10,7 @@ with a ``course_plan_id`` fallback, and full pages.
 """
 
 import unittest
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote
 
 import requests
@@ -22,6 +22,13 @@ PUBLIC_COURSES_PATH = "/_synapse/client/pangea/v1/public_courses"
 
 
 class TestPublicCoursesLanguageFilterE2E(BaseSynapseE2ETest):
+    def setUp(self) -> None:
+        super().setUp()
+        # Every room this test creates, course or not. The catalog lists every
+        # published course on the homeserver, which the class's tests share,
+        # so assertions read only the entries for these rooms.
+        self.my_room_ids: Set[str] = set()
+
     async def _create_public_course_room(
         self,
         access_token: str,
@@ -59,7 +66,9 @@ class TestPublicCoursesLanguageFilterE2E(BaseSynapseE2ETest):
             timeout=10,
         )
         self.assertEqual(response.status_code, 200, response.text)
-        return response.json()["room_id"]
+        room_id = response.json()["room_id"]
+        self.my_room_ids.add(room_id)
+        return room_id
 
     def _set_course_plan(
         self, access_token: str, room_id: str, content: Dict[str, Any]
@@ -92,157 +101,131 @@ class TestPublicCoursesLanguageFilterE2E(BaseSynapseE2ETest):
             timeout=10,
         )
 
-    @staticmethod
-    def _names(body: Dict[str, Any]) -> List[str]:
-        return sorted(c.get("name") or "" for c in body["chunk"])
+    def _mine(self, body: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The catalog entries for rooms this test created."""
+        return [c for c in body["chunk"] if c["room_id"] in self.my_room_ids]
+
+    def _names(self, body: Dict[str, Any]) -> List[str]:
+        return sorted(c.get("name") or "" for c in self._mine(body))
 
     async def test_catalog_eligibility_language_filter_and_paging(self) -> None:
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver()
+        _, token = await self.new_user("teacher", admin=True)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        await self._create_public_course_room(
+            token, "Base Spanish", {"uuid": "plan-es", "l2": "es"}
+        )
+        await self._create_public_course_room(
+            token, "Regional Spanish", {"uuid": "plan-es-es", "l2": "es-ES"}
+        )
+        await self._create_public_course_room(
+            token, "French", {"uuid": "plan-fr", "l2": "fr"}
+        )
+        # A quest with zero missions is still a published course: Synapse
+        # cannot see quest content and does not check it.
+        await self._create_public_course_room(
+            token, "Empty Quest", {"uuid": "plan-empty", "l2": "de"}
+        )
+        # Server-side course spaces write course_plan_id, not uuid.
+        await self._create_public_course_room(
+            token, "Fallback Id", {"course_plan_id": "plan-fallback", "l2": "it"}
+        )
+        # No l2 at all.
+        await self._create_public_course_room(
+            token, "No Language", {"uuid": "plan-nolang"}
+        )
+        # Public room with no course plan: not a course.
+        await self._create_public_course_room(token, "Just A Room", None)
+        # Carries a plan, but is not published in the room directory: the
+        # other half of the conjunction. It shares an l2 with the Spanish
+        # courses, so dropping the publication check would surface it in
+        # both the unfiltered catalog and the ?target_language=es one.
+        await self._create_public_course_room(
+            token,
+            "Unlisted Course",
+            {"uuid": "plan-unlisted", "l2": "es"},
+            visibility="private",
+        )
+        # Had a plan, then had it removed: no longer a course.
+        removed_room = await self._create_public_course_room(
+            token, "Removed Plan", {"uuid": "plan-removed", "l2": "es"}
+        )
+        self._set_course_plan(token, removed_room, {})
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="teacher",
-                password="123123123",
-                admin=True,
-            )
-            _, token = await self.login_user(user="teacher", password="123123123")
+        unfiltered = self._get_courses(token)
+        self.assertEqual(
+            self._names(unfiltered),
+            [
+                "Base Spanish",
+                "Empty Quest",
+                "Fallback Id",
+                "French",
+                "No Language",
+                "Regional Spanish",
+            ],
+            f"unexpected catalog: {unfiltered}",
+        )
 
-            await self._create_public_course_room(
-                token, "Base Spanish", {"uuid": "plan-es", "l2": "es"}
-            )
-            await self._create_public_course_room(
-                token, "Regional Spanish", {"uuid": "plan-es-es", "l2": "es-ES"}
-            )
-            await self._create_public_course_room(
-                token, "French", {"uuid": "plan-fr", "l2": "fr"}
-            )
-            # A quest with zero missions is still a published course: Synapse
-            # cannot see quest content and does not check it.
-            await self._create_public_course_room(
-                token, "Empty Quest", {"uuid": "plan-empty", "l2": "de"}
-            )
-            # Server-side course spaces write course_plan_id, not uuid.
-            await self._create_public_course_room(
-                token, "Fallback Id", {"course_plan_id": "plan-fallback", "l2": "it"}
-            )
-            # No l2 at all.
-            await self._create_public_course_room(
-                token, "No Language", {"uuid": "plan-nolang"}
-            )
-            # Public room with no course plan: not a course.
-            await self._create_public_course_room(token, "Just A Room", None)
-            # Carries a plan, but is not published in the room directory: the
-            # other half of the conjunction. It shares an l2 with the Spanish
-            # courses, so dropping the publication check would surface it in
-            # both the unfiltered catalog and the ?target_language=es one.
-            await self._create_public_course_room(
-                token,
-                "Unlisted Course",
-                {"uuid": "plan-unlisted", "l2": "es"},
-                visibility="private",
-            )
-            # Had a plan, then had it removed: no longer a course.
-            removed_room = await self._create_public_course_room(
-                token, "Removed Plan", {"uuid": "plan-removed", "l2": "es"}
-            )
-            self._set_course_plan(token, removed_room, {})
+        course_ids = {c["name"]: c["course_id"] for c in self._mine(unfiltered)}
+        self.assertEqual(course_ids["Base Spanish"], "plan-es")
+        self.assertEqual(course_ids["Fallback Id"], "plan-fallback")
 
-            unfiltered = self._get_courses(token)
-            self.assertEqual(
-                self._names(unfiltered),
-                [
-                    "Base Spanish",
-                    "Empty Quest",
-                    "Fallback Id",
-                    "French",
-                    "No Language",
-                    "Regional Spanish",
-                ],
-                f"unexpected catalog: {unfiltered}",
+        self.assertIsNone(
+            next(
+                c["target_language"]
+                for c in self._mine(unfiltered)
+                if c["name"] == "No Language"
             )
+        )
 
-            course_ids = {c["name"]: c["course_id"] for c in unfiltered["chunk"]}
-            self.assertEqual(course_ids["Base Spanish"], "plan-es")
-            self.assertEqual(course_ids["Fallback Id"], "plan-fallback")
+        # issue #53: a base-code filter matches regionally-tagged courses.
+        filtered = self._get_courses(token, target_language="es")
+        self.assertEqual(self._names(filtered), ["Base Spanish", "Regional Spanish"])
+        # ...and a room with no l2 is excluded once a filter is passed.
+        self.assertNotIn("No Language", self._names(filtered))
 
-            self.assertIsNone(
-                next(
-                    c["target_language"]
-                    for c in unfiltered["chunk"]
-                    if c["name"] == "No Language"
-                )
-            )
+        regional = self._get_courses(token, target_language="es-MX")
+        self.assertEqual(self._names(regional), ["Base Spanish", "Regional Spanish"])
 
-            # issue #53: a base-code filter matches regionally-tagged courses.
-            filtered = self._get_courses(token, target_language="es")
-            self.assertEqual(
-                self._names(filtered), ["Base Spanish", "Regional Spanish"]
-            )
-            # ...and a room with no l2 is excluded once a filter is passed.
-            self.assertNotIn("No Language", self._names(filtered))
+        french = self._get_courses(token, target_language="fr")
+        self.assertEqual(self._names(french), ["French"])
 
-            regional = self._get_courses(token, target_language="es-MX")
-            self.assertEqual(
-                self._names(regional), ["Base Spanish", "Regional Spanish"]
-            )
+        # Paging: filtering happens before the page is cut, so pages are
+        # full while the catalog has more, and next_batch means more exist.
+        # The walk covers the whole catalog, other tests' courses included.
+        seen: List[str] = []
+        params: Dict[str, str] = {"limit": "2"}
+        for _ in range(100):
+            page = self._get_courses(token, **params)
+            seen.extend(c["room_id"] for c in page["chunk"])
+            if page["next_batch"] is None:
+                break
+            self.assertEqual(len(page["chunk"]), 2, f"thin page: {page}")
+            params = {"limit": "2", "since": page["next_batch"]}
+        else:
+            self.fail(f"paging never reached the end of the catalog: {seen}")
 
-            french = self._get_courses(token, target_language="fr")
-            self.assertEqual(self._names(french), ["French"])
+        self.assertEqual(len(seen), len(set(seen)), f"a room came back twice: {seen}")
+        self.assertEqual(seen, sorted(seen), "paging must walk in room-id order")
+        my_seen = [room_id for room_id in seen if room_id in self.my_room_ids]
+        self.assertEqual(len(my_seen), 6)
+        self.assertEqual(
+            my_seen,
+            sorted(c["room_id"] for c in self._mine(unfiltered)),
+            "paging must walk the catalog in room-id order without gaps",
+        )
 
-            # Paging: filtering happens before the page is cut, so pages are
-            # full while the catalog has more, and next_batch means more exist.
-            seen: List[str] = []
-            params: Dict[str, str] = {"limit": "2"}
-            for _ in range(6):
-                page = self._get_courses(token, **params)
-                seen.extend(c["room_id"] for c in page["chunk"])
-                if page["next_batch"] is None:
-                    break
-                self.assertEqual(len(page["chunk"]), 2, f"thin page: {page}")
-                params = {"limit": "2", "since": page["next_batch"]}
+        # A cursor or filter the catalog cannot honor is refused. Serving
+        # 200 with an empty chunk (bad cursor) or the whole catalog (bad
+        # filter) would answer a question the caller did not ask.
+        for bad_params in ({"since": "abc"}, {"since": "-5"}):
+            rejected = self._get_courses_raw(token, **bad_params)
+            self.assertEqual(rejected.status_code, 400, rejected.text)
+            self.assertEqual(rejected.json()["errcode"], "M_INVALID_PARAM")
 
-            self.assertEqual(len(seen), 6)
-            self.assertEqual(len(set(seen)), 6)
-            self.assertEqual(
-                seen,
-                sorted(c["room_id"] for c in unfiltered["chunk"]),
-                "paging must walk the catalog in room-id order without gaps",
-            )
-
-            # A cursor or filter the catalog cannot honor is refused. Serving
-            # 200 with an empty chunk (bad cursor) or the whole catalog (bad
-            # filter) would answer a question the caller did not ask.
-            for bad_params in ({"since": "abc"}, {"since": "-5"}):
-                rejected = self._get_courses_raw(token, **bad_params)
-                self.assertEqual(rejected.status_code, 400, rejected.text)
-                self.assertEqual(rejected.json()["errcode"], "M_INVALID_PARAM")
-
-            bad_filter = self._get_courses_raw(token, target_language="-")
-            self.assertEqual(bad_filter.status_code, 400, bad_filter.text)
-            self.assertEqual(bad_filter.json()["errcode"], "M_INVALID_PARAM")
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        bad_filter = self._get_courses_raw(token, target_language="-")
+        self.assertEqual(bad_filter.status_code, 400, bad_filter.text)
+        self.assertEqual(bad_filter.json()["errcode"], "M_INVALID_PARAM")
 
 
 if __name__ == "__main__":

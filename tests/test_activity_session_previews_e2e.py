@@ -33,80 +33,40 @@ MANY_CHILDREN_COUNT = 110
 
 class TestActivitySessionPreviewsE2E(BaseSynapseE2ETest):
     async def test_activity_session_previews(self) -> None:
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=MODULE_CONFIG,
-                synapse_config_overrides=SYNAPSE_CONFIG_OVERRIDES,
-            )
+        await self.homeserver(
+            module_config=MODULE_CONFIG,
+            synapse_config_overrides=SYNAPSE_CONFIG_OVERRIDES,
+        )
+        member_id, member_token = await self.new_user("member")
+        outsider_id, outsider_token = await self.new_user("outsider")
+        self._server_name = member_id.split(":", 1)[1]
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="member",
-                password="pw1",
-                admin=False,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="outsider",
-                password="pw2",
-                admin=False,
-            )
-            member_id, member_token = await self.login_user("member", "pw1")
-            outsider_id, outsider_token = await self.login_user("outsider", "pw2")
-            self._server_name = member_id.split(":", 1)[1]
+        self.previews_url = (
+            f"{self.server_url}/_synapse/client/pangea/v1/activity_session_previews"
+        )
 
-            self.previews_url = (
-                f"{self.server_url}"
-                "/_synapse/client/pangea/v1/activity_session_previews"
-            )
+        # One space with a mixed set of children: two sessions for two
+        # different activities, a plain chat, and a removed session.
+        space_id = await self._create_space(member_token)
+        session_1 = await self._create_session_room(member_token, "act-1")
+        session_2 = await self._create_session_room(member_token, "act-2")
+        chat = await self.create_private_room(member_token)
+        removed = await self._create_session_room(member_token, "act-removed")
+        for child in (session_1, session_2, chat, removed):
+            self._add_child(member_token, space_id, child)
+        self._remove_child(member_token, space_id, removed)
 
-            # One space with a mixed set of children: two sessions for two
-            # different activities, a plain chat, and a removed session.
-            space_id = await self._create_space(member_token)
-            session_1 = await self._create_session_room(member_token, "act-1")
-            session_2 = await self._create_session_room(member_token, "act-2")
-            chat = await self.create_private_room(member_token)
-            removed = await self._create_session_room(member_token, "act-removed")
-            for child in (session_1, session_2, chat, removed):
-                self._add_child(member_token, space_id, child)
-            self._remove_child(member_token, space_id, removed)
-
-            await self._test_returns_only_session_children(
-                member_token, space_id, session_1, session_2, chat, removed
-            )
-            await self._test_activity_scope(
-                member_token, space_id, session_1, session_2
-            )
-            await self._test_preview_shape(member_token, space_id, session_1)
-            await self._test_non_member_space_dropped(outsider_token, space_id)
-            await self._test_mixed_membership_batch(
-                member_token, outsider_id, outsider_token, space_id, session_1
-            )
-            await self._test_no_rooms_param(member_token)
-            await self._test_many_children_all_found(member_token)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        await self._test_returns_only_session_children(
+            member_token, space_id, session_1, session_2, chat, removed
+        )
+        await self._test_activity_scope(member_token, space_id, session_1, session_2)
+        await self._test_preview_shape(member_token, space_id, session_1)
+        await self._test_non_member_space_dropped(outsider_token, space_id)
+        await self._test_mixed_membership_batch(
+            member_token, outsider_id, outsider_token, space_id, session_1
+        )
+        await self._test_no_rooms_param(member_token)
+        await self._test_many_children_all_found(member_token)
 
     # --- scenario helpers -------------------------------------------------
 
