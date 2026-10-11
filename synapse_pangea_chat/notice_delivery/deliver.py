@@ -87,6 +87,19 @@ def _optional_str(value: Any) -> Optional[str]:
     return None
 
 
+def _push_content(body: Dict[str, Any], req: Optional[NoticeRequest]) -> Dict[str, Any]:
+    """The push payload's content. A caller's structured push carries only
+    ``pangea.*`` routing keys; the client's tap handler writes the opened record
+    from ``check_in_type``, so the service sets it from the validated variant."""
+    if not (req and req.push):
+        return body.get("content") or {}
+    content = dict(req.push.content)
+    variant = _optional_str(body.get("variant"))
+    if variant:
+        content["check_in_type"] = variant
+    return content
+
+
 class DeliverNotice(Resource):
     isLeaf = True
 
@@ -522,9 +535,7 @@ class DeliverNotice(Resource):
             "room_id": _optional_str(body.get("notice_room_id")),
             "event_id": _optional_str(body.get("notice_event_id")),
             "type": BOT_NOTICE_EVENT_TYPE,
-            "content": req.push.content
-            if req and req.push
-            else body.get("content") or {},
+            "content": _push_content(body, req),
             "prio": "high",
         }
         push = await self._direct_push._send_push(
