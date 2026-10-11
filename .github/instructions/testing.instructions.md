@@ -60,7 +60,7 @@ Why each piece:
 
 ## CI
 
-CI runs three jobs on every push to main and every PR: code style (`tox -e check_codestyle`), types (`tox -e check_types`), and the full unit & integration suite (`run-tests`) — the same `unittest discover` command as local runs, against the runner's preinstalled PostgreSQL. Staging smoke-tests still run only locally/manually.
+CI runs on every push to main and every PR: code style (`tox -e check_codestyle`), types (`tox -e check_types`), the unit tests in one job, and the end-to-end modules (those that boot a homeserver through `BaseSynapseE2ETest`) spread over six parallel jobs against the runner's preinstalled PostgreSQL. `scripts/select_tests.py` decides which modules each job runs, balancing the E2E shards by test count, so between them every module runs exactly once, the same tests a local `unittest discover` runs. The `Unit & integration tests` check passes only when the unit job and every shard passed. Each E2E test starts its own Synapse and PostgreSQL, about 8 seconds a test, so the shards are what keep a run near five minutes. Staging smoke-tests still run only locally/manually.
 
 ## Manual Testing
 
