@@ -60,8 +60,10 @@ class TestEmailCtaStyle(unittest.TestCase):
                 with self.subTest(template=name):
                     self.assertTrue(links)
                     for link in links:
-                        self.assertIn("display:block;width:100%;", link)
-                        self.assertIn("box-sizing:border-box;", link)
+                        # display:block alone fills the column; width:100% plus padding overflowed in Gmail on iOS.
+                        self.assertIn("display:block;", link)
+                        self.assertNotIn("width:100%", link)
+                        self.assertNotIn("box-sizing", link)
                         self.assertIn("border-radius:9999px;", link)
 
     def test_no_email_template_keeps_the_old_button_shape(self) -> None:
