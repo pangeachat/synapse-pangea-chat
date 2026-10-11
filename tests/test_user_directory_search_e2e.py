@@ -34,8 +34,6 @@ _SYNAPSE_CONFIG = {
     },
 }
 
-_ENDPOINT = "http://localhost:8008/_synapse/client/pangea/v1/user_directory/search"
-
 
 def _module_config(
     filter_search_if_missing_public_attribute: bool = True,
@@ -46,7 +44,7 @@ def _module_config(
     return {
         "limit_user_directory_public_attribute_search_path": "profile.user_settings.public",
         "limit_user_directory_whitelist_requester_id_patterns": [
-            "@whitelisted:my.domain.name"
+            r"^@whitelisted_t\d+:my\.domain\.name$"
         ],
         "limit_user_directory_whitelist_candidate_user_id_patterns": (
             whitelist_candidate_user_id_patterns or []
@@ -59,10 +57,24 @@ def _module_config(
     }
 
 
-class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
-    """Tests for ``POST /_synapse/client/pangea/v1/user_directory/search``."""
+class UserDirectorySearchHelpers:
+    """Helpers shared by the endpoint's test classes, one class per config."""
 
     # ── helpers ──────────────────────────────────────────────────────
+
+    def _endpoint(self) -> str:
+        return f"{self.server_url}/_synapse/client/pangea/v1/user_directory/search"
+
+    def _term(self, prefix: str) -> str:
+        """A search term matching only this test's users named ``prefix...``.
+
+        The directory tokenises a localpart such as ``usr0_t3`` into ``usr0``
+        and ``t3``, and the search ANDs a prefix match per word, so adding the
+        tag leaves out the users of every earlier test on the shared server.
+        (A later test's tag, such as ``t30``, shares the prefix, but none of
+        its users exist yet.)
+        """
+        return f"{prefix} {self.tag}"
 
     def _search(
         self,
@@ -71,7 +83,7 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
         limit: int = 50,
     ) -> Dict[str, Any]:
         resp = requests.post(
-            _ENDPOINT,
+            self._endpoint(),
             json={"search_term": search_term, "limit": limit},
             headers={"Authorization": f"Bearer {access_token}"},
         )
@@ -114,7 +126,7 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
                 return last_results
             if nudge_room_id is not None:
                 requests.put(
-                    f"http://localhost:8008/_matrix/client/v3/rooms/{nudge_room_id}"
+                    f"{self.server_url}/_matrix/client/v3/rooms/{nudge_room_id}"
                     f"/send/m.room.message/{uuid.uuid4().hex}",
                     json={"msgtype": "m.text", "body": "nudge directory updater"},
                     headers={"Authorization": f"Bearer {access_token}"},
@@ -125,28 +137,17 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
 
     async def _set_public(self, user_id: str, value: bool, access_token: str) -> None:
         get_resp = requests.get(
-            f"http://localhost:8008/_matrix/client/v3/user/{user_id}/account_data/profile",
+            f"{self.server_url}/_matrix/client/v3/user/{user_id}/account_data/profile",
             headers={"Authorization": f"Bearer {access_token}"},
         )
         body: dict = {} if get_resp.status_code == 404 else get_resp.json()
         body.setdefault("user_settings", {})["public"] = value
         put_resp = requests.put(
-            f"http://localhost:8008/_matrix/client/v3/user/{user_id}/account_data/profile",
+            f"{self.server_url}/_matrix/client/v3/user/{user_id}/account_data/profile",
             json=body,
             headers={"Authorization": f"Bearer {access_token}"},
         )
         self.assertEqual(put_resp.status_code, 200)
-
-    async def _register_and_login(
-        self,
-        config_path: str,
-        synapse_dir: str,
-        username: str,
-        password: str,
-        admin: bool = False,
-    ) -> Tuple[str, str]:
-        await self.register_user(config_path, synapse_dir, username, password, admin)
-        return await self.login_user(username, password)
 
     def _set_locked_by_admin(
         self,
@@ -157,470 +158,257 @@ class TestUserDirectorySearchEndpoint(BaseSynapseE2ETest):
     ) -> None:
         encoded_user_id = quote(target_user_id, safe="")
         resp = requests.put(
-            f"http://localhost:8008/_synapse/admin/v2/users/{encoded_user_id}",
+            f"{self.server_url}/_synapse/admin/v2/users/{encoded_user_id}",
             json={"locked": locked},
             headers={"Authorization": f"Bearer {admin_access_token}"},
         )
         self.assertEqual(resp.status_code, 200, resp.text)
 
-    # ── tests ────────────────────────────────────────────────────────
+
+class TestUserDirectorySearchEndpoint(UserDirectorySearchHelpers, BaseSynapseE2ETest):
+    """Tests for ``POST /_synapse/client/pangea/v1/user_directory/search``."""
 
     async def test_public_users_always_visible(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=_module_config(),
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
+        await self.homeserver(
+            module_config=_module_config(),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
 
-            # Create 6 users: 2 private, 2 public, 2 unset
-            creds: List[Tuple[str, str]] = []
-            for i in range(6):
-                creds.append(
-                    await self._register_and_login(
-                        config_path, synapse_dir, f"usr{i}", f"pass{i}"
-                    )
-                )
+        # Create 6 users: 2 private, 2 public, 2 unset
+        creds: List[Tuple[str, str]] = []
+        for i in range(6):
+            creds.append(await self.new_user(f"usr{i}"))
 
-            # usr0, usr1 → private
-            await self._set_public(creds[0][0], False, creds[0][1])
-            await self._set_public(creds[1][0], False, creds[1][1])
-            # usr2, usr3 → public
-            await self._set_public(creds[2][0], True, creds[2][1])
-            await self._set_public(creds[3][0], True, creds[3][1])
-            # usr4, usr5 → no attribute set
+        # usr0, usr1 → private
+        await self._set_public(creds[0][0], False, creds[0][1])
+        await self._set_public(creds[1][0], False, creds[1][1])
+        # usr2, usr3 → public
+        await self._set_public(creds[2][0], True, creds[2][1])
+        await self._set_public(creds[3][0], True, creds[3][1])
+        # usr4, usr5 → no attribute set
 
-            # A regular user (usr0) searches — should see only public users
-            results = self._search_user_ids("usr", creds[0][1])
-            self.assertIn(creds[2][0], results)
-            self.assertIn(creds[3][0], results)
-            # Private and unset should NOT be visible
-            self.assertNotIn(creds[1][0], results)
-            self.assertNotIn(creds[4][0], results)
-            self.assertNotIn(creds[5][0], results)
-            # Self should never appear
-            self.assertNotIn(creds[0][0], results)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # A regular user (usr0) searches — should see only public users
+        results = self._search_user_ids(self._term("usr"), creds[0][1])
+        self.assertIn(creds[2][0], results)
+        self.assertIn(creds[3][0], results)
+        # Private and unset should NOT be visible
+        self.assertNotIn(creds[1][0], results)
+        self.assertNotIn(creds[4][0], results)
+        self.assertNotIn(creds[5][0], results)
+        # Self should never appear
+        self.assertNotIn(creds[0][0], results)
 
     async def test_private_user_visible_via_shared_room(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=_module_config(),
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
+        await self.homeserver(
+            module_config=_module_config(),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
 
-            (user_a, token_a) = await self._register_and_login(
-                config_path, synapse_dir, "sharedA", "passA"
-            )
-            (user_b, token_b) = await self._register_and_login(
-                config_path, synapse_dir, "sharedB", "passB"
-            )
+        (user_a, token_a) = await self.new_user("sharedA")
+        (user_b, token_b) = await self.new_user("sharedB")
 
-            await self._set_public(user_a, False, token_a)
-            await self._set_public(user_b, False, token_b)
+        await self._set_public(user_a, False, token_a)
+        await self._set_public(user_b, False, token_b)
 
-            # Before sharing a room, B should NOT appear for A
-            results_before = self._search_user_ids("sharedB", token_a)
-            self.assertNotIn(user_b, results_before)
+        # Before sharing a room, B should NOT appear for A
+        results_before = self._search_user_ids(self._term("sharedB"), token_a)
+        self.assertNotIn(user_b, results_before)
 
-            # Create a private room and invite B
-            resp = requests.post(
-                "http://localhost:8008/_matrix/client/v3/createRoom",
-                headers={"Authorization": f"Bearer {token_a}"},
-                json={"preset": "private_chat", "is_direct": True},
-            )
-            self.assertEqual(resp.status_code, 200)
-            room_id = resp.json()["room_id"]
+        # Create a private room and invite B
+        resp = requests.post(
+            f"{self.server_url}/_matrix/client/v3/createRoom",
+            headers={"Authorization": f"Bearer {token_a}"},
+            json={"preset": "private_chat", "is_direct": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        room_id = resp.json()["room_id"]
 
-            requests.post(
-                f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/invite",
-                headers={"Authorization": f"Bearer {token_a}"},
-                json={"user_id": user_b},
-            )
-            requests.post(
-                f"http://localhost:8008/_matrix/client/v3/join/{room_id}",
-                headers={"Authorization": f"Bearer {token_b}"},
-            )
+        requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/invite",
+            headers={"Authorization": f"Bearer {token_a}"},
+            json={"user_id": user_b},
+        )
+        requests.post(
+            f"{self.server_url}/_matrix/client/v3/join/{room_id}",
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
 
-            # Now B should appear for A
-            results_after = await self._search_user_ids_with_retry(
-                "sharedB",
-                token_a,
-                required_user_ids=[user_b],
-                nudge_room_id=room_id,
-            )
-            self.assertIn(user_b, results_after)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Now B should appear for A
+        results_after = await self._search_user_ids_with_retry(
+            self._term("sharedB"),
+            token_a,
+            required_user_ids=[user_b],
+            nudge_room_id=room_id,
+        )
+        self.assertIn(user_b, results_after)
 
     async def test_whitelisted_requester_sees_all(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=_module_config(),
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
+        await self.homeserver(
+            module_config=_module_config(),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
 
-            creds: List[Tuple[str, str]] = []
-            for i in range(4):
-                creds.append(
-                    await self._register_and_login(
-                        config_path, synapse_dir, f"vis{i}", f"pass{i}"
-                    )
-                )
-            # vis0 public, vis1 private, vis2/vis3 unset
-            await self._set_public(creds[0][0], True, creds[0][1])
-            await self._set_public(creds[1][0], False, creds[1][1])
+        creds: List[Tuple[str, str]] = []
+        for i in range(4):
+            creds.append(await self.new_user(f"vis{i}"))
+        # vis0 public, vis1 private, vis2/vis3 unset
+        await self._set_public(creds[0][0], True, creds[0][1])
+        await self._set_public(creds[1][0], False, creds[1][1])
 
-            # Register whitelisted admin
-            (wl_user, wl_token) = await self._register_and_login(
-                config_path, synapse_dir, "whitelisted", "pass", admin=True
-            )
+        # Register whitelisted admin
+        (wl_user, wl_token) = await self.new_user("whitelisted", admin=True)
 
-            results = self._search_user_ids("vis", wl_token)
-            # Whitelisted sees ALL four users
-            for uid, _ in creds:
-                self.assertIn(uid, results)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
-
-    async def test_whitelisted_candidate_visible_without_public_profile(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=_module_config(
-                    whitelist_candidate_user_id_patterns=[r"^@bot:my\.domain\.name$"],
-                ),
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
-
-            (bot_user, _) = await self._register_and_login(
-                config_path, synapse_dir, "bot", "botpass"
-            )
-            (other_bot_user, _) = await self._register_and_login(
-                config_path, synapse_dir, "botfriend", "botfriendpass"
-            )
-            (_, searcher_token) = await self._register_and_login(
-                config_path, synapse_dir, "candidate_searcher", "pass"
-            )
-
-            results = await self._search_user_ids_with_retry(
-                "bot",
-                searcher_token,
-                required_user_ids=[bot_user],
-            )
-            self.assertIn(bot_user, results)
-            self.assertNotIn(other_bot_user, results)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        results = self._search_user_ids(self._term("vis"), wl_token)
+        # Whitelisted sees ALL four users
+        for uid, _ in creds:
+            self.assertIn(uid, results)
 
     async def test_self_excluded(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=_module_config(),
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
+        await self.homeserver(
+            module_config=_module_config(),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
 
-            (user_id, token) = await self._register_and_login(
-                config_path, synapse_dir, "selftest", "pass"
-            )
-            await self._set_public(user_id, True, token)
+        (user_id, token) = await self.new_user("selftest")
+        await self._set_public(user_id, True, token)
 
-            results = self._search_user_ids("selftest", token)
-            self.assertNotIn(user_id, results)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
-
-    async def test_missing_attribute_not_filtered_when_config_false(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=_module_config(
-                    filter_search_if_missing_public_attribute=False,
-                    user_directory_search_requests_per_burst=120,
-                ),
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
-
-            (pub_user, pub_token) = await self._register_and_login(
-                config_path, synapse_dir, "pubflag", "pass"
-            )
-            (miss_user, miss_token) = await self._register_and_login(
-                config_path, synapse_dir, "missflag", "pass"
-            )
-            (searcher, searcher_token) = await self._register_and_login(
-                config_path, synapse_dir, "searcher", "pass"
-            )
-
-            await self._set_public(pub_user, True, pub_token)
-            await self._set_public(searcher, True, searcher_token)
-            # missflag: no public attribute set
-
-            pub_results = await self._search_user_ids_with_retry(
-                "pubflag",
-                searcher_token,
-                required_user_ids=[pub_user],
-            )
-            self.assertIn(pub_user, pub_results)
-
-            miss_results = await self._search_user_ids_with_retry(
-                "missflag",
-                searcher_token,
-                required_user_ids=[miss_user],
-            )
-            self.assertIn(miss_user, miss_results)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        results = self._search_user_ids(self._term("selftest"), token)
+        self.assertNotIn(user_id, results)
 
     async def test_limit_respected(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=_module_config(),
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
+        await self.homeserver(
+            module_config=_module_config(),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
 
-            # Create 5 public users
-            for i in range(5):
-                (uid, tok) = await self._register_and_login(
-                    config_path, synapse_dir, f"lim{i}", f"pass{i}"
-                )
-                await self._set_public(uid, True, tok)
+        # Create 5 public users
+        lim_users: List[str] = []
+        for i in range(5):
+            (uid, tok) = await self.new_user(f"lim{i}")
+            await self._set_public(uid, True, tok)
+            lim_users.append(uid)
 
-            (searcher, s_token) = await self._register_and_login(
-                config_path, synapse_dir, "srch", "pass"
-            )
-            await self._set_public(searcher, True, s_token)
+        (searcher, s_token) = await self.new_user("srch")
+        await self._set_public(searcher, True, s_token)
 
-            data = self._search("lim", s_token, limit=2)
-            self.assertEqual(len(data["results"]), 2)
-            self.assertTrue(data["limited"])
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        data = self._search(self._term("lim"), s_token, limit=2)
+        self.assertEqual(len(data["results"]), 2)
+        self.assertTrue(data["limited"])
+        self.assertLessEqual({r["user_id"] for r in data["results"]}, set(lim_users))
 
     async def test_auth_required(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=_module_config(),
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
+        await self.homeserver(
+            module_config=_module_config(),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
 
-            resp = requests.post(
-                _ENDPOINT,
-                json={"search_term": "test"},
-            )
-            self.assertEqual(resp.status_code, 403)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        resp = requests.post(
+            self._endpoint(),
+            json={"search_term": "test"},
+        )
+        self.assertEqual(resp.status_code, 403)
 
     async def test_empty_search_returns_empty(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=_module_config(),
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
+        await self.homeserver(
+            module_config=_module_config(),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
 
-            (uid, token) = await self._register_and_login(
-                config_path, synapse_dir, "emptytest", "pass"
-            )
+        (uid, token) = await self.new_user("emptytest")
 
-            resp = requests.post(
-                _ENDPOINT,
-                json={"search_term": ""},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            self.assertEqual(resp.status_code, 400)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        resp = requests.post(
+            self._endpoint(),
+            json={"search_term": ""},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(resp.status_code, 400)
 
     async def test_locked_user_visibility_respects_synapse_config(self) -> None:
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=_module_config(),
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
+        await self.homeserver(
+            module_config=_module_config(),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
 
-            (admin_user, admin_token) = await self._register_and_login(
-                config_path,
-                synapse_dir,
-                "adminlock",
-                "pass",
-                admin=True,
-            )
-            (target_user, target_token) = await self._register_and_login(
-                config_path,
-                synapse_dir,
-                "lockedtarget",
-                "pass",
-            )
-            (searcher_user, searcher_token) = await self._register_and_login(
-                config_path,
-                synapse_dir,
-                "lockedsearcher",
-                "pass",
-            )
+        (admin_user, admin_token) = await self.new_user("adminlock", admin=True)
+        (target_user, target_token) = await self.new_user("lockedtarget")
+        (searcher_user, searcher_token) = await self.new_user("lockedsearcher")
 
-            # Make users public so visibility is not blocked by profile-sharing rules.
-            await self._set_public(admin_user, True, admin_token)
-            await self._set_public(target_user, True, target_token)
-            await self._set_public(searcher_user, True, searcher_token)
+        # Make users public so visibility is not blocked by profile-sharing rules.
+        await self._set_public(admin_user, True, admin_token)
+        await self._set_public(target_user, True, target_token)
+        await self._set_public(searcher_user, True, searcher_token)
 
-            # Lock target via Synapse admin endpoint.
-            self._set_locked_by_admin(
-                admin_access_token=admin_token,
-                target_user_id=target_user,
-                locked=True,
-            )
+        # Lock target via Synapse admin endpoint.
+        self._set_locked_by_admin(
+            admin_access_token=admin_token,
+            target_user_id=target_user,
+            locked=True,
+        )
 
-            # _SYNAPSE_CONFIG sets show_locked_users=True, matching Synapse behavior.
-            # Locked users should still be returned in search results.
-            results = self._search_user_ids("lockedtarget", searcher_token)
-            self.assertIn(target_user, results)
+        # _SYNAPSE_CONFIG sets show_locked_users=True, matching Synapse behavior.
+        # Locked users should still be returned in search results.
+        results = self._search_user_ids(self._term("lockedtarget"), searcher_token)
+        self.assertIn(target_user, results)
 
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+
+class TestUserDirectorySearchWhitelistedCandidate(
+    UserDirectorySearchHelpers, BaseSynapseE2ETest
+):
+    """The endpoint with a candidate user-ID allowlist configured."""
+
+    async def test_whitelisted_candidate_visible_without_public_profile(self) -> None:
+        await self.homeserver(
+            module_config=_module_config(
+                whitelist_candidate_user_id_patterns=[r"^@bot_t\d+:my\.domain\.name$"],
+            ),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
+
+        (bot_user, _) = await self.new_user("bot")
+        (other_bot_user, _) = await self.new_user("botfriend")
+        (_, searcher_token) = await self.new_user("candidate_searcher")
+
+        results = await self._search_user_ids_with_retry(
+            self._term("bot"),
+            searcher_token,
+            required_user_ids=[bot_user],
+        )
+        self.assertIn(bot_user, results)
+        self.assertNotIn(other_bot_user, results)
+
+
+class TestUserDirectorySearchMissingAttributeVisible(
+    UserDirectorySearchHelpers, BaseSynapseE2ETest
+):
+    """The endpoint configured to show users with no public attribute."""
+
+    async def test_missing_attribute_not_filtered_when_config_false(self) -> None:
+        await self.homeserver(
+            module_config=_module_config(
+                filter_search_if_missing_public_attribute=False,
+                user_directory_search_requests_per_burst=120,
+            ),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
+
+        (pub_user, pub_token) = await self.new_user("pubflag")
+        (miss_user, miss_token) = await self.new_user("missflag")
+        (searcher, searcher_token) = await self.new_user("searcher")
+
+        await self._set_public(pub_user, True, pub_token)
+        await self._set_public(searcher, True, searcher_token)
+        # missflag: no public attribute set
+
+        pub_results = await self._search_user_ids_with_retry(
+            self._term("pubflag"),
+            searcher_token,
+            required_user_ids=[pub_user],
+        )
+        self.assertIn(pub_user, pub_results)
+
+        miss_results = await self._search_user_ids_with_retry(
+            self._term("missflag"),
+            searcher_token,
+            required_user_ids=[miss_user],
+        )
+        self.assertIn(miss_user, miss_results)
