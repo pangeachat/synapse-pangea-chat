@@ -230,12 +230,14 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             current.stop()
             current = None
         if current is None:
-            current = await self._boot(module_config, synapse_config_overrides, key)
+            current = await self._boot_homeserver(
+                module_config, synapse_config_overrides, key
+            )
             cls._shared_homeserver = current
             if not cls.__dict__.get("_shared_cleanup_registered", False):
                 cls._shared_cleanup_registered = True
                 cls.addClassCleanup(cls._stop_shared_homeserver)
-        self._attach(current)
+        self._attach_homeserver(current)
         return current
 
     @classmethod
@@ -245,7 +247,15 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         if shared is not None:
             shared.stop()
 
-    def _attach(self, homeserver: Homeserver) -> None:
+    def stop_homeserver(self) -> None:
+        """Stop the class's homeserver now, for a test of the shutdown itself.
+
+        The server's output stays readable through `server_log()`; the next
+        test to ask for a homeserver boots a fresh one.
+        """
+        type(self)._stop_shared_homeserver()
+
+    def _attach_homeserver(self, homeserver: Homeserver) -> None:
         self._attached = homeserver
         self.server_url = homeserver.url
         # Exposed so a test can read the module's own tables back out of the
@@ -287,9 +297,9 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         class is two users. The token is the one registration issues, so no
         login (and none of the per-address login rate limit) is spent.
         """
-        return await self._register(self.localpart(name), password, admin)
+        return await self._register_localpart(self.localpart(name), password, admin)
 
-    async def _register(
+    async def _register_localpart(
         self, localpart: str, password: str, admin: bool
     ) -> Tuple[str, str]:
         """Shared-secret registration, as `register_new_matrix_user` does it."""
@@ -330,7 +340,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
     ) -> None:
         """Block until Synapse has drained its startup background updates.
 
-        See the `background_updates` note in `_boot`: until the user-directory
+        See the `background_updates` note in `_boot_homeserver`: until the user-directory
         rebuild has run, a test can watch its own registrations vanish from
         the directory. Synapse deletes a row from `background_updates` as each
         update completes, so an empty table is the done signal.
@@ -374,12 +384,12 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
 
         Returns (postgres, synapse_dir, config_path, server_process, stdout_thread, stderr_thread).
         """
-        homeserver = await self._boot(
+        homeserver = await self._boot_homeserver(
             module_config,
             synapse_config_overrides,
             _config_key(module_config, synapse_config_overrides),
         )
-        self._attach(homeserver)
+        self._attach_homeserver(homeserver)
         return (
             homeserver.postgres,
             homeserver.synapse_dir,
@@ -389,7 +399,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             homeserver.stderr_thread,
         )
 
-    async def _boot(
+    async def _boot_homeserver(
         self,
         module_config: Optional[Dict[str, Any]],
         synapse_config_overrides: Optional[Dict[str, Any]],
@@ -707,7 +717,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
 
         For a test that needs a particular localpart; prefer `new_user`.
         """
-        await self._register(user, password, admin)
+        await self._register_localpart(user, password, admin)
 
     async def login_user(self, user: str, password: str) -> Tuple[str, str]:
         """Returns (user_id, access_token)."""
