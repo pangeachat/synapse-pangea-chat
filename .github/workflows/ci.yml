@@ -30,10 +30,10 @@ jobs:
       - run: python -m pip install tox
       - run: tox -e check_types
 
-  run-tests:
-    name: Unit & integration tests
+  unit-tests:
+    name: Unit tests
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
@@ -47,12 +47,48 @@ jobs:
           python -m pip install -e ".[dev]"
           # synapse 1.124.0 still imports pkg_resources, dropped in setuptools 81
           python -m pip install "setuptools<81"
-      - name: Run test suite
-        # The E2E base class (tests/base_e2e.py) boots a real Synapse against a
-        # throwaway PostgreSQL from testing.postgresql, which needs the server
-        # binaries (initdb + postgres) on PATH. The runner image ships them
-        # under /usr/lib/postgresql/<major>/bin without exposing them on PATH.
+      - name: Run unit tests
+        # Every module that does not boot a homeserver: about 1,150 tests in
+        # well under a minute. scripts/select_tests.py decides which is which.
+        run: python -m unittest $(python scripts/select_tests.py unit)
+
+  e2e-tests:
+    name: E2E tests (shard ${{ matrix.shard }} of 6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          python-version: "3.13"
+          cache: "pip"
+      - name: Install package with dev extras
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m pip install "setuptools<81"
+      - name: Run this shard's E2E modules
+        # Each E2E test boots a real Synapse against a throwaway PostgreSQL
+        # (tests/base_e2e.py), about 8 seconds a test, which is why the E2E
+        # modules are split over six jobs, balanced by test count. testing.postgresql
+        # needs the server binaries (initdb + postgres) on PATH; the runner image
+        # ships them under /usr/lib/postgresql/<major>/bin without exposing them.
         run: |
           PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)
           PATH="$PG_BIN:$PATH" LC_ALL=C.UTF-8 LANG=C.UTF-8 \
-            python -m unittest discover -s tests -t . -p 'test_*.py'
+            python -m unittest $(python scripts/select_tests.py e2e --shard ${{ matrix.shard }} --of 6)
+
+  run-tests:
+    # The one result to read (and the name earlier tooling watches): green only
+    # when the unit job and every E2E shard passed.
+    name: Unit & integration tests
+    runs-on: ubuntu-latest
+    needs: [unit-tests, e2e-tests]
+    if: always()
+    steps:
+      - run: |
+          test "${{ needs.unit-tests.result }}" = success
+          test "${{ needs.e2e-tests.result }}" = success
