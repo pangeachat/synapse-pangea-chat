@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import gc
 import hashlib
 import hmac
@@ -54,13 +55,107 @@ def _config_key(
     )
 
 
+class _Database:
+    """One homeserver's database, in the PostgreSQL this process shares."""
+
+    def __init__(self, admin_url: str, name: str) -> None:
+        self._admin_url = admin_url
+        self.name = name
+        dsn = parse_dsn(admin_url)
+        dsn["dbname"] = name
+        self.url = psycopg2.extensions.make_dsn(**dsn)
+
+    def stop(self) -> None:
+        """Drop the database; a failure is logged, as teardown must not raise."""
+        try:
+            conn = psycopg2.connect(self._admin_url)
+            try:
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    cur.execute(f"DROP DATABASE IF EXISTS {self.name} WITH (FORCE)")
+            finally:
+                conn.close()
+        except psycopg2.Error:
+            logger.warning("Could not drop test database %s", self.name, exc_info=True)
+
+
+_postgres: Optional[testing.postgresql.Postgresql] = None
+_databases_created = 0
+
+
+def _new_database() -> _Database:
+    """A fresh, empty database for one homeserver.
+
+    Starting PostgreSQL, initdb included, costs most of a second; a database
+    in a running one costs milliseconds. So a test process starts one
+    PostgreSQL on first use, stops it at exit, and gives every homeserver a
+    database of its own in it.
+    """
+    global _postgres, _databases_created
+    if _postgres is None:
+        _postgres = testing.postgresql.Postgresql()
+        atexit.register(_postgres.stop)
+    _databases_created += 1
+    database = _Database(_postgres.url(), f"homeserver{_databases_created}")
+    conn = psycopg2.connect(_postgres.url())
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                f"CREATE DATABASE {database.name} WITH TEMPLATE template0 "
+                "LC_COLLATE 'C' LC_CTYPE 'C'"
+            )
+    finally:
+        conn.close()
+    return database
+
+
+_config_template: Optional[str] = None
+
+
+def _write_generated_config(synapse_dir: str) -> str:
+    """Write Synapse's generated config into `synapse_dir`; returns homeserver.yaml.
+
+    Generating imports Synapse in a subprocess, a second or more, so a process
+    generates once and gives each server a copy, with the paths that pointed
+    into the template directory pointed into the server's own. The servers
+    share keys and secrets, which matters to nothing a test does: each has its
+    own database, so a token from one means nothing to another.
+    """
+    global _config_template
+    if _config_template is None:
+        template = tempfile.mkdtemp()
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "synapse.app.homeserver",
+                f"--server-name={SERVER_NAME}",
+                f"--config-path={os.path.join(template, 'homeserver.yaml')}",
+                "--report-stats=no",
+                "--generate-config",
+            ]
+        )
+        atexit.register(shutil.rmtree, template, True)
+        _config_template = template
+    for name in os.listdir(_config_template):
+        source = os.path.join(_config_template, name)
+        if not os.path.isfile(source):
+            continue
+        with open(source, "r", encoding="utf-8") as f:
+            text = f.read()
+        with open(os.path.join(synapse_dir, name), "w", encoding="utf-8") as f:
+            f.write(text.replace(_config_template, synapse_dir))
+    return os.path.join(synapse_dir, "homeserver.yaml")
+
+
 def _stop(
     *,
     server_process: Optional[subprocess.Popen] = None,
     stdout_thread: Optional[threading.Thread] = None,
     stderr_thread: Optional[threading.Thread] = None,
     synapse_dir: Optional[str] = None,
-    postgres: Any = None,
+    database: Optional[_Database] = None,
 ) -> None:
     if server_process is not None:
         server_process.terminate()
@@ -75,13 +170,13 @@ def _stop(
         stderr_thread.join(timeout=10)
     if synapse_dir is not None and os.path.exists(synapse_dir):
         shutil.rmtree(synapse_dir)
-    if postgres is not None:
-        postgres.stop()
+    if database is not None:
+        database.stop()
 
 
 @dataclass
 class Homeserver:
-    """One running test Synapse, the PostgreSQL behind it, and where it lives."""
+    """One running test Synapse, its database, and where it lives."""
 
     url: str
     key: str
@@ -89,7 +184,7 @@ class Homeserver:
     synapse_dir: str
     database_url: str
     registration_shared_secret: str
-    postgres: testing.postgresql.Postgresql
+    database: _Database
     server_process: subprocess.Popen
     stdout_thread: threading.Thread
     stderr_thread: threading.Thread
@@ -113,7 +208,7 @@ class Homeserver:
             stdout_thread=self.stdout_thread,
             stderr_thread=self.stderr_thread,
             synapse_dir=self.synapse_dir,
-            postgres=self.postgres,
+            database=self.database,
         )
 
 
@@ -259,8 +354,8 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         self._attached = homeserver
         self.server_url = homeserver.url
         # Exposed so a test can read the module's own tables back out of the
-        # database Synapse is actually using. `postgres.url()` points at the
-        # default database, not the one created for this run, so a test that
+        # database Synapse is actually using. The shared PostgreSQL's own URL
+        # points at its default database, not this server's, so a test that
         # reaches for it queries an empty schema and reports a missing row as
         # a missing feature.
         self.database_url = homeserver.database_url
@@ -370,7 +465,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         module_config: Optional[Dict[str, Any]] = None,
         synapse_config_overrides: Optional[Dict[str, Any]] = None,
     ) -> Tuple[
-        testing.postgresql.Postgresql,
+        _Database,
         str,
         str,
         subprocess.Popen,
@@ -382,7 +477,8 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         For a test about the boot and teardown cycle itself; every other test
         uses the class's shared `homeserver`.
 
-        Returns (postgres, synapse_dir, config_path, server_process, stdout_thread, stderr_thread).
+        Returns (database, synapse_dir, config_path, server_process, stdout_thread, stderr_thread);
+        pass them all to `stop_synapse`.
         """
         homeserver = await self._boot_homeserver(
             module_config,
@@ -391,7 +487,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         )
         self._attach_homeserver(homeserver)
         return (
-            homeserver.postgres,
+            homeserver.database,
             homeserver.synapse_dir,
             homeserver.config_path,
             homeserver.server_process,
@@ -406,7 +502,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         key: str,
     ) -> Homeserver:
         """Start a test Synapse server backed by PostgreSQL, on a free port."""
-        postgres: Optional[testing.postgresql.Postgresql] = None
+        database: Optional[_Database] = None
         synapse_dir: Optional[str] = None
         server_process: Optional[subprocess.Popen] = None
         stdout_thread: Optional[threading.Thread] = None
@@ -414,20 +510,11 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
         try:
-            postgres, db_url = await self._start_postgres()
+            database = _new_database()
+            db_url = database.url
 
             synapse_dir = tempfile.mkdtemp()
-            config_path = os.path.join(synapse_dir, "homeserver.yaml")
-            generate_config_cmd = [
-                sys.executable,
-                "-m",
-                "synapse.app.homeserver",
-                f"--server-name={SERVER_NAME}",
-                f"--config-path={config_path}",
-                "--report-stats=no",
-                "--generate-config",
-            ]
-            subprocess.check_call(generate_config_cmd)
+            config_path = _write_generated_config(synapse_dir)
 
             with open(config_path, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
@@ -591,13 +678,9 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             stdout_thread.start()
             stderr_thread.start()
 
-            max_wait_time = 30
-            wait_interval = 1
-            total_wait_time = 0
+            deadline = time.monotonic() + 30
             server_ready = False
-            while not server_ready and total_wait_time < max_wait_time:
-                if server_process.poll() is not None:
-                    break
+            while time.monotonic() < deadline and server_process.poll() is None:
                 try:
                     response = requests.get(f"{url}/health", timeout=10)
                     if response.status_code == 200:
@@ -605,9 +688,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                         break
                 except requests.exceptions.ConnectionError:
                     pass
-                finally:
-                    await asyncio.sleep(wait_interval)
-                    total_wait_time += wait_interval
+                await asyncio.sleep(0.1)
 
             # A server that failed to bind its port exits; anything still
             # answering /health then is some other process.
@@ -642,7 +723,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 synapse_dir=synapse_dir,
                 database_url=db_url,
                 registration_shared_secret=config["registration_shared_secret"],
-                postgres=postgres,
+                database=database,
                 server_process=server_process,
                 stdout_thread=stdout_thread,
                 stderr_thread=stderr_thread,
@@ -655,59 +736,8 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 stdout_thread=stdout_thread,
                 stderr_thread=stderr_thread,
                 synapse_dir=synapse_dir,
-                postgres=postgres,
+                database=database,
             )
-            raise e
-
-    async def _start_postgres(
-        self,
-    ) -> Tuple[testing.postgresql.Postgresql, str]:
-        postgresql = None
-        try:
-            postgresql = testing.postgresql.Postgresql()
-            postgres_url = postgresql.url()
-
-            max_waiting_time = 10
-            wait_interval = 1
-            total_wait_time = 0
-            postgres_is_up = False
-            while total_wait_time < max_waiting_time and not postgres_is_up:
-                try:
-                    conn = psycopg2.connect(postgres_url)
-                    conn.close()
-                    postgres_is_up = True
-                    break
-                except psycopg2.OperationalError:
-                    await asyncio.sleep(wait_interval)
-                    total_wait_time += wait_interval
-
-            if not postgres_is_up:
-                postgresql.stop()
-                self.fail("Postgres did not start successfully")
-
-            dbname = "testdb"
-            conn = psycopg2.connect(postgres_url)
-            conn.autocommit = True
-            cursor = conn.cursor()
-            cursor.execute(
-                f"""
-                CREATE DATABASE {dbname}
-                WITH TEMPLATE template0
-                LC_COLLATE 'C'
-                LC_CTYPE 'C';
-            """
-            )
-            cursor.close()
-            conn.close()
-
-            dsn_params = parse_dsn(postgres_url)
-            dsn_params["dbname"] = dbname
-            postgres_url_testdb = psycopg2.extensions.make_dsn(**dsn_params)
-
-            return postgresql, postgres_url_testdb
-        except Exception as e:
-            if postgresql is not None:
-                postgresql.stop()
             raise e
 
     async def register_user(
@@ -745,13 +775,16 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         synapse_dir: Optional[str] = None,
         postgres: Any = None,
     ) -> None:
-        """Clean up a `start_test_synapse` server. Call in finally blocks."""
+        """Clean up a `start_test_synapse` server. Call in finally blocks.
+
+        `postgres` is the database `start_test_synapse` returned first.
+        """
         _stop(
             server_process=server_process,
             stdout_thread=stdout_thread,
             stderr_thread=stderr_thread,
             synapse_dir=synapse_dir,
-            postgres=postgres,
+            database=postgres,
         )
 
     async def create_private_room(self, access_token: str) -> str:
