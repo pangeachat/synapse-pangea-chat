@@ -15,7 +15,7 @@ The first consumer is the `lm whois` contact-lookup tool in `admin/email-marketi
 
 **Server admins only.** A non-admin caller is refused, whether or not a match exists.
 
-The bar is high because the endpoint is, by construction, an oracle: anyone who can call it can test any address in the world for "is this person a Pangea Chat user?" That is a privacy disclosure about our users to whoever holds the token, so it sits at the same level as the module's other privileged operations (delete user, export user data). Calls are rate limited per caller, so a leaked admin token still cannot sweep a mailing list quickly.
+The bar is high because the endpoint is, by construction, an oracle: anyone who can call it can test any address in the world for "is this person a Pangea Chat user?" That is a privacy disclosure about our users to whoever holds the token, so it sits at the same level as the module's other privileged operations (delete user, export user data). Calls are rate limited per caller, so a leaked admin token still cannot sweep a mailing list quickly. The one exception is an exact list of service accounts named in config (`find_user_by_email_rate_limit_exempt_user_ids`): the engagement runner's bot checks the whole Educators list against accounts on every run, which the limit would stop after ten addresses. Will accepted the cost on 2026-10-11: a leaked token of an exempt account could sweep a list. An exempt caller still has to be a server admin.
 
 ## Contract
 

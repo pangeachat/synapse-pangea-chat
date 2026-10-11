@@ -913,6 +913,19 @@ class PangeaChat:
             raise ValueError(
                 "find_user_by_email_burst_duration_seconds must be an integer >= 1"
             )
+        find_user_by_email_rate_limit_exempt_user_ids = config.get(
+            "find_user_by_email_rate_limit_exempt_user_ids", []
+        )
+        if not isinstance(
+            find_user_by_email_rate_limit_exempt_user_ids, list
+        ) or not all(
+            isinstance(u, str) and u.startswith("@") and ":" in u
+            for u in find_user_by_email_rate_limit_exempt_user_ids
+        ):
+            raise ValueError(
+                "find_user_by_email_rate_limit_exempt_user_ids must be a list of "
+                "full Matrix user IDs"
+            )
 
         # --- course_member_emails config ---
         course_member_emails_enabled = config.get("course_member_emails_enabled", False)
@@ -1400,6 +1413,7 @@ class PangeaChat:
             user_directory_search_burst_duration_seconds=user_directory_search_burst_duration_seconds,
             find_user_by_email_requests_per_burst=find_user_by_email_requests_per_burst,
             find_user_by_email_burst_duration_seconds=find_user_by_email_burst_duration_seconds,
+            find_user_by_email_rate_limit_exempt_user_ids=find_user_by_email_rate_limit_exempt_user_ids,
             course_member_emails_enabled=course_member_emails_enabled,
             course_member_emails_requests_per_burst=course_member_emails_requests_per_burst,
             course_member_emails_burst_duration_seconds=course_member_emails_burst_duration_seconds,
