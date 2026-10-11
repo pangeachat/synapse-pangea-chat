@@ -36,7 +36,7 @@ The former `deliver_nudge` and `prepare_nudge` URLs remain compatibility aliases
 
 ## Email appearance
 
-Notice emails use the standard [Pangea Brand template](../../../admin/email-marketing/templates/base.html), including its logo, header, gold accents, NSF badge, and company footer. The message body and call to action occupy its content area; the footer shows a simple “Unsubscribe” link, which retains its category-specific destination.
+Notice emails use the [brand email layout](../../../synapse-templates/.github/instructions/brand-email-layout.instructions.md), the one every Pangea email uses: its logo, header, gold accents, NSF badge, call-to-action button and company footer. The package carries a generated copy of it, never edited by hand. The message body and call to action occupy its content area; the footer shows a simple “Unsubscribe” link, which retains its category-specific destination.
 
 Course/activity images use email-accessible HTTPS URLs within the brand template, with alternative text and a useful plaintext version.
 

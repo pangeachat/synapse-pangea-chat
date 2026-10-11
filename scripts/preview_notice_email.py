@@ -33,7 +33,9 @@ def template_context(data_path: Path | None = None):
         "category_label": "conversation and course suggestions",
     }
     values["postal_address"] = (
-        env.get_template("brand_base.html").make_module(values).brand_postal_address
+        env.get_template("_brand_email_footer.html")
+        .make_module(values)
+        .brand_postal_address
     )
     if data_path:
         values.update(json.loads(data_path.read_text()))

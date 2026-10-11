@@ -42,7 +42,7 @@ class TestNoticeEmailSMTP(BaseSynapseE2ETest):
         self.addCleanup(smtp.stop)
         brand_address = (
             Environment(loader=FileSystemLoader(TEMPLATES_DIR))
-            .get_template("brand_base.html")
+            .get_template("_brand_email_footer.html")
             .module.brand_postal_address
         )
         started = await self.start_test_synapse(

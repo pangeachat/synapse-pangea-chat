@@ -1,6 +1,10 @@
-{% extends "_course_email_base.html" %}
-{% block title %}Your course is ready to go{% endblock %}
-{% block body %}
+{% extends "_brand_email_base.html" %}
+{% from "_brand_cta_button.html" import cta_button %}
+{% set title = "Your course is ready to go" %}
+{% set show_unsubscribe = false %}
+{% block content %}
+            <tr>
+              <td class="body-content" style="padding:36px 40px 24px;">
                 <p style="font-size: 20px; font-weight: 700; margin-bottom: 12px">
                   Congratulations! Your task-based conversation journey is ready
                   to go!
@@ -25,4 +29,6 @@
                   cover your students' seats, just hit reply for an invoice, to
                   redeem a promotional offer, or any other questions.
                 </p>
+              </td>
+            </tr>
 {% endblock %}

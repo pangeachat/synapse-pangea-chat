@@ -1,4 +1,5 @@
-{% extends "brand_base.html" %}
+{% extends "_brand_email_base.html" %}
+{% from "_brand_cta_button.html" import cta_button %}
 {% block content %}
             <tr>
               <td class="body-content" style="padding:36px 40px 24px;">
@@ -9,9 +10,7 @@
                   <a href="{{ cta_url }}"><img src="{{ image.url }}" alt="{{ image.alt }}" width="520" style="display:block;width:100%;max-width:520px;height:auto;border:0;border-radius:12px;" /></a>
                 </p>
                 {% endfor %}
-                <div class="cta-block" style="text-align:center;padding:8px 0 24px;">
-                  <a class="cta-button" href="{{ cta_url }}" style="display:block;width:100%;box-sizing:border-box;text-align:center;background-color:#5e3acf;color:#ffffff;text-decoration:none;padding:16px 24px;border-radius:9999px;font-weight:600;font-size:16px;">{{ cta_label }}</a>
-                </div>
+                {{ cta_button(cta_url, cta_label) }}
               </td>
             </tr>
 {% endblock %}
