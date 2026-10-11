@@ -138,6 +138,43 @@ class TestIsRateLimited(unittest.TestCase):
         self.assertFalse(is_rate_limited("@admin_b:my.domain.name", config))
         self.assertTrue(is_rate_limited("@admin_a:my.domain.name", config))
 
+    def test_an_exempt_caller_is_never_limited_and_no_one_else_is_exempt(self):
+        config = PangeaChatConfig(
+            find_user_by_email_requests_per_burst=1,
+            find_user_by_email_burst_duration_seconds=60,
+            find_user_by_email_rate_limit_exempt_user_ids=["@bot:my.domain.name"],
+        )
+
+        for _ in range(50):
+            self.assertFalse(is_rate_limited("@bot:my.domain.name", config))
+        self.assertFalse(is_rate_limited("@admin:my.domain.name", config))
+        self.assertTrue(is_rate_limited("@admin:my.domain.name", config))
+        # exact IDs only: a lookalike on another server is limited as usual
+        self.assertFalse(is_rate_limited("@bot:other.name", config))
+        self.assertTrue(is_rate_limited("@bot:other.name", config))
+
+
+class TestExemptConfig(unittest.TestCase):
+    def test_the_exempt_list_must_be_full_user_ids(self):
+        from synapse_pangea_chat import PangeaChat
+
+        base = {
+            "cms_base_url": "http://cms.example.test",
+            "cms_service_api_key": "test-api-key",
+        }
+        key = "find_user_by_email_rate_limit_exempt_user_ids"
+        parsed = PangeaChat.parse_config({**base, key: ["@bot:x.org"]})
+        self.assertEqual(
+            parsed.find_user_by_email_rate_limit_exempt_user_ids, ["@bot:x.org"]
+        )
+        self.assertEqual(
+            PangeaChat.parse_config(base).find_user_by_email_rate_limit_exempt_user_ids,
+            [],
+        )
+        for bad in ("@bot:x.org", ["bot"], [1]):
+            with self.assertRaises(ValueError):
+                PangeaChat.parse_config({**base, key: bad})
+
 
 if __name__ == "__main__":
     unittest.main()

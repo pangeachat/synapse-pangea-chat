@@ -114,6 +114,10 @@ class PangeaChatConfig:
     # --- find_user_by_email config ---
     find_user_by_email_requests_per_burst: int = 10
     find_user_by_email_burst_duration_seconds: int = 60
+    # Exact user IDs the per-caller limit does not apply to: a service account
+    # whose job is to check a whole mailing list against accounts (the
+    # engagement runner's bot). Still server-admin only.
+    find_user_by_email_rate_limit_exempt_user_ids: List[str] = attr.Factory(list)
 
     # --- course_member_emails config ---
     # A course admin reads the sign-in email of each student in the course.
