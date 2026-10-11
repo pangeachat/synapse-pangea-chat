@@ -23,9 +23,6 @@ logging.basicConfig(
 )
 
 _SYNAPSE_CONFIG = {
-    "rc_login": {
-        "address": {"per_second": 9999, "burst_count": 9999},
-    },
     "user_directory": {
         "enabled": True,
         "search_all_users": True,

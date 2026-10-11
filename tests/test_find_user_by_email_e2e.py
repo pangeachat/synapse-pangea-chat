@@ -16,12 +16,6 @@ from .base_e2e import BaseSynapseE2ETest
 
 logger = logging.getLogger(__name__)
 
-_SYNAPSE_CONFIG = {
-    "rc_login": {
-        "address": {"per_second": 9999, "burst_count": 9999},
-    },
-}
-
 
 def _module_config(
     find_user_by_email_requests_per_burst: int = 100,
@@ -95,10 +89,7 @@ class TestFindUserByEmailEndpoint(FindUserByEmailHelpers, BaseSynapseE2ETest):
     # ── tests ────────────────────────────────────────────────────────
 
     async def test_admin_resolves_account_by_email(self) -> None:
-        await self.homeserver(
-            module_config=_module_config(),
-            synapse_config_overrides=_SYNAPSE_CONFIG,
-        )
+        await self.homeserver(module_config=_module_config())
 
         (_, admin_token) = await self.new_user("rootadmin", admin=True)
         (teacher_id, teacher_token) = await self.new_user("teacher")
@@ -149,10 +140,7 @@ class TestFindUserByEmailEndpoint(FindUserByEmailHelpers, BaseSynapseE2ETest):
                 self.assertEqual(self._lookup_ok(probe, admin_token)["results"], [])
 
     async def test_address_maps_to_one_account_and_deactivation_clears_it(self) -> None:
-        await self.homeserver(
-            module_config=_module_config(),
-            synapse_config_overrides=_SYNAPSE_CONFIG,
-        )
+        await self.homeserver(module_config=_module_config())
 
         (_, admin_token) = await self.new_user("rootadmin", admin=True)
         (first_id, _) = await self.new_user("dupe1")
@@ -191,10 +179,7 @@ class TestFindUserByEmailEndpoint(FindUserByEmailHelpers, BaseSynapseE2ETest):
         self.assertEqual(self._lookup_ok(shared, admin_token)["results"], [])
 
     async def test_access_control_and_validation(self) -> None:
-        await self.homeserver(
-            module_config=_module_config(),
-            synapse_config_overrides=_SYNAPSE_CONFIG,
-        )
+        await self.homeserver(module_config=_module_config())
 
         (_, admin_token) = await self.new_user("rootadmin", admin=True)
         (target_id, _) = await self.new_user("target")
@@ -244,8 +229,7 @@ class TestFindUserByEmailRateLimit(FindUserByEmailHelpers, BaseSynapseE2ETest):
             module_config=_module_config(
                 find_user_by_email_requests_per_burst=3,
                 find_user_by_email_burst_duration_seconds=60,
-            ),
-            synapse_config_overrides=_SYNAPSE_CONFIG,
+            )
         )
 
         (_, admin_token) = await self.new_user("rootadmin", admin=True)

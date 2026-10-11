@@ -14,10 +14,6 @@ import requests
 from .base_e2e import BaseSynapseE2ETest
 
 _SYNAPSE_CONFIG = {
-    "rc_login": {
-        "address": {"per_second": 9999, "burst_count": 9999},
-        "account": {"per_second": 9999, "burst_count": 9999},
-    },
     "rc_joins": {
         "local": {"per_second": 9999, "burst_count": 9999},
     },

@@ -1,8 +1,6 @@
 import asyncio
 import atexit
 import gc
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -24,6 +22,7 @@ import requests
 import testing.postgresql
 import yaml
 from psycopg2.extensions import parse_dsn
+from synapse._scripts.register_new_matrix_user import request_registration
 
 logger = logging.getLogger(__name__)
 
@@ -389,46 +388,37 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         """Register a user unique to this test; returns (user_id, access_token).
 
         The localpart is `localpart(name)`, so the same name in two tests of a
-        class is two users. The token is the one registration issues, so no
-        login (and none of the per-address login rate limit) is spent.
+        class is two users.
         """
         return await self._register_localpart(self.localpart(name), password, admin)
 
     async def _register_localpart(
         self, localpart: str, password: str, admin: bool
     ) -> Tuple[str, str]:
-        """Shared-secret registration, as `register_new_matrix_user` does it."""
+        """Register through Synapse's own shared-secret client, then log in.
+
+        The client `register_new_matrix_user` runs, called in-process rather
+        than in a subprocess that imports Synapse for every user.
+        """
         if self._attached is None:
             raise AssertionError("Start a homeserver before registering users")
-        url = f"{self.server_url}/_synapse/admin/v1/register"
-        nonce_response = requests.get(url, timeout=30)
-        self.assertEqual(nonce_response.status_code, 200, nonce_response.text)
-        nonce = nonce_response.json()["nonce"]
-        mac = hmac.new(
-            key=self._attached.registration_shared_secret.encode("utf8"),
-            digestmod=hashlib.sha1,
+        output: list[str] = []
+
+        def failed(_code: int) -> None:
+            raise AssertionError(
+                f"Registering {localpart} failed: " + " | ".join(output)
+            )
+
+        request_registration(
+            localpart,
+            password,
+            self.server_url,
+            self._attached.registration_shared_secret,
+            admin=admin,
+            _print=output.append,
+            exit=failed,
         )
-        mac.update(nonce.encode("utf8"))
-        mac.update(b"\x00")
-        mac.update(localpart.encode("utf8"))
-        mac.update(b"\x00")
-        mac.update(password.encode("utf8"))
-        mac.update(b"\x00")
-        mac.update(b"admin" if admin else b"notadmin")
-        response = requests.post(
-            url,
-            json={
-                "nonce": nonce,
-                "username": localpart,
-                "password": password,
-                "mac": mac.hexdigest(),
-                "admin": admin,
-            },
-            timeout=30,
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        return body["user_id"], body["access_token"]
+        return await self.login_user(localpart, password)
 
     async def _wait_for_background_updates(
         self, db_url: str, timeout_seconds: float = 60.0
