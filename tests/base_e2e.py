@@ -1,14 +1,19 @@
 import asyncio
 import gc
+import hashlib
+import hmac
+import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import warnings
+from dataclasses import dataclass, field
 from typing import IO, Any, Dict, Optional, Tuple, Union, cast
 from unittest.mock import patch
 
@@ -21,6 +26,8 @@ from psycopg2.extensions import parse_dsn
 
 logger = logging.getLogger(__name__)
 
+SERVER_NAME = "my.domain.name"
+
 
 def _is_ignorable_resource_warning(warning: warnings.WarningMessage) -> bool:
     message = str(warning.message)
@@ -30,13 +37,115 @@ def _is_ignorable_resource_warning(warning: warnings.WarningMessage) -> bool:
     )
 
 
-class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
-    """Base class for Synapse E2E tests with shared infrastructure methods."""
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
-    server_url = "http://localhost:8008"
+
+def _config_key(
+    module_config: Optional[Dict[str, Any]],
+    synapse_config_overrides: Optional[Dict[str, Any]],
+) -> str:
+    return json.dumps(
+        [module_config or {}, synapse_config_overrides or {}],
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _stop(
+    *,
+    server_process: Optional[subprocess.Popen] = None,
+    stdout_thread: Optional[threading.Thread] = None,
+    stderr_thread: Optional[threading.Thread] = None,
+    synapse_dir: Optional[str] = None,
+    postgres: Any = None,
+) -> None:
+    if server_process is not None:
+        server_process.terminate()
+        try:
+            server_process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            server_process.kill()
+            server_process.wait(timeout=30)
+    if stdout_thread is not None:
+        stdout_thread.join(timeout=10)
+    if stderr_thread is not None:
+        stderr_thread.join(timeout=10)
+    if synapse_dir is not None and os.path.exists(synapse_dir):
+        shutil.rmtree(synapse_dir)
+    if postgres is not None:
+        postgres.stop()
+
+
+@dataclass
+class Homeserver:
+    """One running test Synapse, the PostgreSQL behind it, and where it lives."""
+
+    url: str
+    key: str
+    config_path: str
+    synapse_dir: str
+    database_url: str
+    registration_shared_secret: str
+    postgres: testing.postgresql.Postgresql
+    server_process: subprocess.Popen
+    stdout_thread: threading.Thread
+    stderr_thread: threading.Thread
+    stdout_lines: list[str] = field(default_factory=list)
+    stderr_lines: list[str] = field(default_factory=list)
+
+    def running(self) -> bool:
+        return self.server_process.poll() is None
+
+    def log_tail(self, lines: int = 20) -> str:
+        return (
+            "stdout_tail=\n"
+            + "\n".join(self.stdout_lines[-lines:])
+            + "\nstderr_tail=\n"
+            + "\n".join(self.stderr_lines[-lines:])
+        )
+
+    def stop(self) -> None:
+        _stop(
+            server_process=self.server_process,
+            stdout_thread=self.stdout_thread,
+            stderr_thread=self.stderr_thread,
+            synapse_dir=self.synapse_dir,
+            postgres=self.postgres,
+        )
+
+
+class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
+    """Base class for Synapse E2E tests with shared infrastructure methods.
+
+    The tests of one class share one homeserver (see `homeserver`), because
+    booting Synapse and PostgreSQL is most of what an E2E test costs. Sharing
+    means a test runs on a server that earlier tests in its class have used, so
+    each test registers its own users through `new_user`, whose localparts are
+    unique to the test, and asserts only on what it created itself — never on
+    server-wide contents such as "the directory holds two users".
+    """
+
+    server_url: str
+    database_url: str
+    # Set on each concrete class the first time one of its tests asks for a
+    # homeserver; read through `cls.__dict__` so a subclass never inherits
+    # its parent's server.
+    _shared_homeserver: Optional[Homeserver] = None
 
     def setUp(self) -> None:
         super().setUp()
+
+        cls = type(self)
+        cls._tests_started = cls.__dict__.get("_tests_started", 0) + 1
+        # Unique among the tests of this class, so among everything on the
+        # shared homeserver: suffix it onto anything that must not collide
+        # with an earlier test's (localparts, aliases, email addresses).
+        self.tag = f"t{cls._tests_started}"
+        self._attached: Optional[Homeserver] = None
+        self._log_marks = (0, 0)
 
         self._resource_warning_context = warnings.catch_warnings(record=True)
         self._caught_resource_warnings = self._resource_warning_context.__enter__()
@@ -84,38 +193,147 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 "ResourceWarning emitted during E2E test:\n" f"{warning_messages}"
             )
 
-    def _assert_server_port_free(self) -> None:
-        """Fail fast if something else already serves ``server_url``.
+        # A shared homeserver that died during this test is this test's
+        # failure, not the next one's: report it here, with the server's last
+        # words, and let the next test boot a fresh one.
+        shared = type(self).__dict__.get("_shared_homeserver")
+        if shared is not None and shared is self._attached and not shared.running():
+            type(self)._shared_homeserver = None
+            shared.stop()
+            self.fail(
+                "The shared homeserver exited during this test "
+                f"(exit_code={shared.server_process.returncode}).\n"
+                f"{shared.log_tail()}"
+            )
 
-        The readiness poll below only asks whether *something* answers /health.
-        A foreign homeserver on the same port satisfies it, after which the whole
-        test runs against that server instead of the one under test — module
-        routes come back 404 M_UNRECOGNIZED and read as a broken endpoint rather
-        than an occupied port. Checking first turns that into a clear message.
+    async def homeserver(
+        self,
+        *,
+        module_config: Optional[Dict[str, Any]] = None,
+        synapse_config_overrides: Optional[Dict[str, Any]] = None,
+    ) -> Homeserver:
+        """This class's shared homeserver, started on first use.
+
+        A test asking for a different configuration from the one running
+        restarts it, so a class whose tests need different configurations is
+        still correct, but pays a boot at every change. Give each
+        configuration its own class instead. Anything the configuration
+        points at (an SMTP sink, a mock CMS) must outlive the test, so start
+        it in ``setUpClass`` rather than per test; a per-test port in the
+        configuration means a boot per test.
         """
-        try:
-            requests.get(f"{self.server_url}/health", timeout=5)
-        except requests.exceptions.RequestException:
-            return  # nothing listening, which is what we want
+        cls = type(self)
+        key = _config_key(module_config, synapse_config_overrides)
+        current = cls.__dict__.get("_shared_homeserver")
+        if current is not None and (current.key != key or not current.running()):
+            cls._shared_homeserver = None
+            current.stop()
+            current = None
+        if current is None:
+            current = await self._boot(module_config, synapse_config_overrides, key)
+            cls._shared_homeserver = current
+            if not cls.__dict__.get("_shared_cleanup_registered", False):
+                cls._shared_cleanup_registered = True
+                cls.addClassCleanup(cls._stop_shared_homeserver)
+        self._attach(current)
+        return current
 
-        self.fail(
-            f"{self.server_url} is already served by another process, so this "
-            "test would silently run against it instead of the Synapse it "
-            "starts. Stop whatever holds that port (a local-stack Synapse in "
-            "Docker/Colima is the usual culprit) and re-run.\n"
-            "Find it with: lsof -nP -iTCP:8008 -sTCP:LISTEN"
+    @classmethod
+    def _stop_shared_homeserver(cls) -> None:
+        shared = cls.__dict__.get("_shared_homeserver")
+        cls._shared_homeserver = None
+        if shared is not None:
+            shared.stop()
+
+    def _attach(self, homeserver: Homeserver) -> None:
+        self._attached = homeserver
+        self.server_url = homeserver.url
+        # Exposed so a test can read the module's own tables back out of the
+        # database Synapse is actually using. `postgres.url()` points at the
+        # default database, not the one created for this run, so a test that
+        # reaches for it queries an empty schema and reports a missing row as
+        # a missing feature.
+        self.database_url = homeserver.database_url
+        # The whole of the server's output, for the per-test servers of
+        # `start_test_synapse`; a test on a shared server reads `server_log`.
+        self.server_stdout_lines = homeserver.stdout_lines
+        self.server_stderr_lines = homeserver.stderr_lines
+        self._log_marks = (len(homeserver.stdout_lines), len(homeserver.stderr_lines))
+
+    def server_log(self) -> list[str]:
+        """What the homeserver has written since this test attached to it.
+
+        On a shared server the earlier tests' output is still in the buffers,
+        so a test asserting on log lines must read only its own.
+        """
+        if self._attached is None:
+            raise AssertionError("No homeserver is attached to this test")
+        stdout_mark, stderr_mark = self._log_marks
+        return (
+            self._attached.stdout_lines[stdout_mark:]
+            + self._attached.stderr_lines[stderr_mark:]
         )
+
+    def localpart(self, name: str) -> str:
+        """The localpart `new_user(name)` registers in this test."""
+        return f"{name}_{self.tag}"
+
+    async def new_user(
+        self, name: str, *, admin: bool = False, password: str = "pw"
+    ) -> Tuple[str, str]:
+        """Register a user unique to this test; returns (user_id, access_token).
+
+        The localpart is `localpart(name)`, so the same name in two tests of a
+        class is two users. The token is the one registration issues, so no
+        login (and none of the per-address login rate limit) is spent.
+        """
+        return await self._register(self.localpart(name), password, admin)
+
+    async def _register(
+        self, localpart: str, password: str, admin: bool
+    ) -> Tuple[str, str]:
+        """Shared-secret registration, as `register_new_matrix_user` does it."""
+        if self._attached is None:
+            raise AssertionError("Start a homeserver before registering users")
+        url = f"{self.server_url}/_synapse/admin/v1/register"
+        nonce_response = requests.get(url, timeout=30)
+        self.assertEqual(nonce_response.status_code, 200, nonce_response.text)
+        nonce = nonce_response.json()["nonce"]
+        mac = hmac.new(
+            key=self._attached.registration_shared_secret.encode("utf8"),
+            digestmod=hashlib.sha1,
+        )
+        mac.update(nonce.encode("utf8"))
+        mac.update(b"\x00")
+        mac.update(localpart.encode("utf8"))
+        mac.update(b"\x00")
+        mac.update(password.encode("utf8"))
+        mac.update(b"\x00")
+        mac.update(b"admin" if admin else b"notadmin")
+        response = requests.post(
+            url,
+            json={
+                "nonce": nonce,
+                "username": localpart,
+                "password": password,
+                "mac": mac.hexdigest(),
+                "admin": admin,
+            },
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        return body["user_id"], body["access_token"]
 
     async def _wait_for_background_updates(
         self, db_url: str, timeout_seconds: float = 60.0
     ) -> None:
         """Block until Synapse has drained its startup background updates.
 
-        See the `background_updates` note in `start_test_synapse`: until the
-        user-directory rebuild has run, a test can watch its own registrations
-        vanish from the directory. Synapse deletes a row from
-        `background_updates` as each update completes, so an empty table is
-        the done signal.
+        See the `background_updates` note in `_boot`: until the user-directory
+        rebuild has run, a test can watch its own registrations vanish from
+        the directory. Synapse deletes a row from `background_updates` as each
+        update completes, so an empty table is the done signal.
         """
         deadline = time.monotonic() + timeout_seconds
         conn = psycopg2.connect(db_url)
@@ -149,12 +367,35 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         threading.Thread,
         threading.Thread,
     ]:
-        """Start a test Synapse server backed by PostgreSQL.
+        """Start a homeserver of this test's own, which the test must stop.
+
+        For a test about the boot and teardown cycle itself; every other test
+        uses the class's shared `homeserver`.
 
         Returns (postgres, synapse_dir, config_path, server_process, stdout_thread, stderr_thread).
         """
-        self._assert_server_port_free()
+        homeserver = await self._boot(
+            module_config,
+            synapse_config_overrides,
+            _config_key(module_config, synapse_config_overrides),
+        )
+        self._attach(homeserver)
+        return (
+            homeserver.postgres,
+            homeserver.synapse_dir,
+            homeserver.config_path,
+            homeserver.server_process,
+            homeserver.stdout_thread,
+            homeserver.stderr_thread,
+        )
 
+    async def _boot(
+        self,
+        module_config: Optional[Dict[str, Any]],
+        synapse_config_overrides: Optional[Dict[str, Any]],
+        key: str,
+    ) -> Homeserver:
+        """Start a test Synapse server backed by PostgreSQL, on a free port."""
         postgres: Optional[testing.postgresql.Postgresql] = None
         synapse_dir: Optional[str] = None
         server_process: Optional[subprocess.Popen] = None
@@ -162,18 +403,8 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         stderr_thread: Optional[threading.Thread] = None
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
-        # Exposed so tests can assert on server log output (e.g. the
-        # logcontext-leak regression test).
-        self.server_stdout_lines = stdout_lines
-        self.server_stderr_lines = stderr_lines
         try:
             postgres, db_url = await self._start_postgres()
-            # Exposed so a test can read the module's own tables back out of
-            # the database Synapse is actually using. `postgres.url()` points
-            # at the default database, not the one created for this run, so a
-            # test that reaches for it queries an empty schema and reports a
-            # missing row as a missing feature.
-            self.database_url = db_url
 
             synapse_dir = tempfile.mkdtemp()
             config_path = os.path.join(synapse_dir, "homeserver.yaml")
@@ -181,7 +412,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 sys.executable,
                 "-m",
                 "synapse.app.homeserver",
-                "--server-name=my.domain.name",
+                f"--server-name={SERVER_NAME}",
                 f"--config-path={config_path}",
                 "--report-stats=no",
                 "--generate-config",
@@ -214,6 +445,19 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 "name": "psycopg2",
                 "args": dsn_params,
             }
+
+            # A free port per server rather than the generated 8008, so a test
+            # run never collides with a local-stack Synapse, and two runs can
+            # proceed side by side. A caller that brings its own listeners
+            # (to know the URL before the server starts) keeps them.
+            if synapse_config_overrides and "listeners" in synapse_config_overrides:
+                port = synapse_config_overrides["listeners"][0]["port"]
+            else:
+                port = _free_port()
+                for listener in config["listeners"]:
+                    listener["port"] = port
+                    listener["bind_addresses"] = ["127.0.0.1"]
+            url = f"http://127.0.0.1:{port}"
 
             workspace_root = os.path.abspath(
                 os.path.join(os.path.dirname(__file__), "..", "..")
@@ -259,6 +503,24 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             # 1.124, where Synapse ignores it.
             config["rc_room_creation"] = {"per_second": 1000, "burst_count": 1000}
 
+            # These limits are keyed by client address, and every test talks
+            # from 127.0.0.1, so on a shared homeserver each test would inherit
+            # the buckets earlier tests drained. A test's own override of one
+            # of these keys still wins.
+            unlimited = {"per_second": 9999, "burst_count": 9999}
+            config["rc_login"] = {
+                "address": unlimited,
+                "account": unlimited,
+                "failed_attempts": unlimited,
+            }
+            config["rc_registration"] = unlimited
+            config["rc_3pid_validation"] = unlimited
+
+            # Every registration and login hashes a password; the default 12
+            # rounds cost a quarter of a second each, and nothing under test
+            # depends on the hash's strength.
+            config["bcrypt_rounds"] = 4
+
             # A fresh database boots with ~54 pending background updates, run
             # one batch per sleep interval (1 s by default). Four of them
             # rebuild the user directory, and `populate_user_directory_process_rooms`
@@ -273,8 +535,8 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             # request, and `_wait_for_background_updates` below proves it did.
             config["background_updates"] = {"sleep_enabled": False}
             if synapse_config_overrides:
-                for key, value in synapse_config_overrides.items():
-                    config[key] = value
+                for key_name, value in synapse_config_overrides.items():
+                    config[key_name] = value
 
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(config, f)
@@ -327,7 +589,7 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 if server_process.poll() is not None:
                     break
                 try:
-                    response = requests.get(f"{self.server_url}/health", timeout=10)
+                    response = requests.get(f"{url}/health", timeout=10)
                     if response.status_code == 200:
                         server_ready = True
                         break
@@ -337,7 +599,9 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                     await asyncio.sleep(wait_interval)
                     total_wait_time += wait_interval
 
-            if not server_ready:
+            # A server that failed to bind its port exits; anything still
+            # answering /health then is some other process.
+            if not server_ready or server_process.poll() is not None:
                 if server_process.poll() is None:
                     server_process.terminate()
                     try:
@@ -361,30 +625,28 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 )
 
             await self._wait_for_background_updates(db_url)
-            return (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
+            return Homeserver(
+                url=url,
+                key=key,
+                config_path=config_path,
+                synapse_dir=synapse_dir,
+                database_url=db_url,
+                registration_shared_secret=config["registration_shared_secret"],
+                postgres=postgres,
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                stdout_lines=stdout_lines,
+                stderr_lines=stderr_lines,
             )
         except Exception as e:
-            if server_process is not None:
-                server_process.terminate()
-                try:
-                    server_process.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    server_process.kill()
-                    server_process.wait(timeout=30)
-            if stdout_thread is not None:
-                stdout_thread.join(timeout=10)
-            if stderr_thread is not None:
-                stderr_thread.join(timeout=10)
-            if synapse_dir is not None and os.path.exists(synapse_dir):
-                shutil.rmtree(synapse_dir)
-            if postgres is not None:
-                postgres.stop()
+            _stop(
+                server_process=server_process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                synapse_dir=synapse_dir,
+                postgres=postgres,
+            )
             raise e
 
     async def _start_postgres(
@@ -441,19 +703,11 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
     async def register_user(
         self, config_path: str, dir: str, user: str, password: str, admin: bool
     ) -> None:
-        register_user_cmd = [
-            sys.executable,
-            "-m",
-            "synapse._scripts.register_new_matrix_user",
-            f"-c={config_path}",
-            f"--user={user}",
-            f"--password={password}",
-        ]
-        if admin:
-            register_user_cmd.append("--admin")
-        else:
-            register_user_cmd.append("--no-admin")
-        subprocess.check_call(register_user_cmd, cwd=dir)
+        """Register `user` exactly as named, on the homeserver this test started.
+
+        For a test that needs a particular localpart; prefer `new_user`.
+        """
+        await self._register(user, password, admin)
 
     async def login_user(self, user: str, password: str) -> Tuple[str, str]:
         """Returns (user_id, access_token)."""
@@ -481,22 +735,14 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
         synapse_dir: Optional[str] = None,
         postgres: Any = None,
     ) -> None:
-        """Clean up Synapse server resources. Call in finally blocks."""
-        if server_process is not None:
-            server_process.terminate()
-            try:
-                server_process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                server_process.kill()
-                server_process.wait(timeout=30)
-        if stdout_thread is not None:
-            stdout_thread.join(timeout=10)
-        if stderr_thread is not None:
-            stderr_thread.join(timeout=10)
-        if synapse_dir is not None and os.path.exists(synapse_dir):
-            shutil.rmtree(synapse_dir)
-        if postgres is not None:
-            postgres.stop()
+        """Clean up a `start_test_synapse` server. Call in finally blocks."""
+        _stop(
+            server_process=server_process,
+            stdout_thread=stdout_thread,
+            stderr_thread=stderr_thread,
+            synapse_dir=synapse_dir,
+            postgres=postgres,
+        )
 
     async def create_private_room(self, access_token: str) -> str:
         headers = {"Authorization": f"Bearer {access_token}"}
