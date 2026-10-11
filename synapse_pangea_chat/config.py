@@ -22,6 +22,9 @@ DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS = (
     "calendar.app.google",
     "admin.pangea.chat",
     "admin.staging.pangea.chat",
+    # The website's course request and pricing pages, where the teacher funnel's
+    # create_course and pricing steps point until the dashboard carries them.
+    "pangea.chat",
 )
 
 
