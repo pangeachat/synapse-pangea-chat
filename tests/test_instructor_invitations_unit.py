@@ -360,6 +360,41 @@ class TestClaim(_Base):
         self.assertEqual(row["completed_at_ms"], 10)
         self.assertIsNone(row["requested_email"])
 
+    async def test_frozen_power_levels_content_is_copied_without_pickling(self):
+        # Synapse hands event content over as an immutable mapping that pickle (and
+        # so deepcopy) refuses; the staging claim of 2026-10-10 failed on exactly that.
+        from collections.abc import Mapping
+
+        class Frozen(Mapping):
+            def __init__(self, data):
+                self._d = data
+
+            def __getitem__(self, k):
+                return self._d[k]
+
+            def __iter__(self):
+                return iter(self._d)
+
+            def __len__(self):
+                return len(self._d)
+
+            def __reduce__(self):
+                raise TypeError("cannot pickle 'builtins.JsonObject' object")
+
+        self.room.state[("m.room.power_levels", "")] = _event(
+            Frozen(
+                {
+                    "users": Frozen({OWNER: 100}),
+                    "events": Frozen({"m.room.power_levels": 100}),
+                }
+            )
+        )
+        room = await self.provisioner.claim(await self._invitation(), TEACHER)
+        self.assertEqual(room, ROOM)
+        grant = next(e for e in self.room.events if e["type"] == "m.room.power_levels")
+        self.assertEqual(grant["content"]["users"][TEACHER], 100)
+        self.assertEqual(grant["content"]["events"], {"m.room.power_levels": 100})
+
     async def test_a_joined_student_is_promoted_without_an_invite(self):
         self.room.state[("m.room.member", TEACHER)] = _event({"membership": "join"})
         self.assertEqual(await self._claim(), ROOM)
