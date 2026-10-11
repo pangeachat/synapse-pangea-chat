@@ -52,7 +52,7 @@ class TestNoticeEmailSMTP(BaseSynapseE2ETest):
     async def test_real_delivery_has_brand_mime_and_working_unsubscribe(self):
         brand_address = (
             Environment(loader=FileSystemLoader(TEMPLATES_DIR))
-            .get_template("brand_base.html")
+            .get_template("_brand_email_footer.html")
             .module.brand_postal_address
         )
         await self.homeserver(

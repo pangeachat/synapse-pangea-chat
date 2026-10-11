@@ -43,7 +43,7 @@ For immediate delivery (see [Scheduled notices](#scheduled-notices) for deferred
 }
 ```
 
-The HTML placeholder above is illustrative, not a sendable body. Render the standard `notice_delivery/templates/brand_base.html` shell (or an activity-card template extending it), passing literal `{{cta_url}}`, `{{unsubscribe_url}}`, `{{receiving_reason}}`, and `{{postal_address}}` into those template slots. Both email bodies must retain all four placeholders. Synapse replaces them literally, escaping HTML values; it does not evaluate caller HTML as Jinja. The receiving reason is required and must be accurate for the recipient. Never pass credentials, email addresses, names, or message bodies in the log context.
+The HTML placeholder above is illustrative, not a sendable body. Render the standard `notice_delivery/templates/_brand_email_base.html` shell, generated from the brand email layout in synapse-templates, or an activity-card template extending it, passing literal `{{cta_url}}`, `{{unsubscribe_url}}`, `{{receiving_reason}}`, and `{{postal_address}}` into those template slots. Both email bodies must retain all four placeholders. Synapse replaces them literally, escaping HTML values; it does not evaluate caller HTML as Jinja. The receiving reason is required and must be accurate for the recipient. Never pass credentials, email addresses, names, or message bodies in the log context.
 
 `use-available` requires both channel payloads. `email-only` requires email and `push-only` requires push. Either can include the other payload, which is also validated. `in-app-only` uses the already-recorded notice. Email-only categories remain email-only; `allow_notifications` remains in-app-only. Credential and consuming course-claim emails keep their dedicated paths.
 

@@ -74,7 +74,7 @@ If the teacher doesn't have a Pangea account, the client handles this: the code 
 ## Dependencies
 
 - **The two emails** are sent through Synapse's own mail path (the homeserver's `email` config), so they go out from its sender and stream. A failed first email is captured and answered as `emailed: false` rather than failing the request, because the space already exists and a retry would make a second one. The claim record is written before the first email; if it cannot be written the request fails and names the room, because the admin code lives in that record and the course could not otherwise be claimed.
-- **Email templates** ship inside the package (`email_invite/templates/`), as the nudge emails' do, and are read through the module API's template loader. They are not in [synapse-templates](../../../synapse-templates/): that repo is pinned to a tag per environment, so a template there would need a tag and an inventory bump in each environment before the module that sends it could load.
+- **Email templates** ship inside the package (`email_invite/templates/`), as the nudge emails' do, and are read through the module API's template loader. They are not in [synapse-templates](../../../synapse-templates/): that repo is pinned to a tag per environment, so a template there would need a tag and an inventory bump in each environment before the module that sends it could load. Their layout is the [brand email layout](../../../synapse-templates/.github/instructions/brand-email-layout.instructions.md); the package carries a generated copy of it for the same reason, never edited by hand.
 
 ## Future Work
 

@@ -29,11 +29,11 @@ The optional output directory contains `email.eml`, `email.html`, and `email.txt
 
 ## Updating the brand shell
 
-The design source is `pangeachat/admin` at `email-marketing/templates/base.html`. To refresh the packaged Jinja shell from your admin checkout:
+The brand email layout's source is in synapse-templates; its design and drift check are in that repo's `brand-email-layout.instructions.md`. The `_brand_*` templates in this package are generated from it, so a brand change is made there and regenerated here:
 
 ```sh
-.venv/bin/python scripts/import_brand_email.py ../admin
-.venv/bin/python scripts/import_brand_email.py ../admin --check
+.venv/bin/python ../synapse-templates/scripts/brand_email.py write module .
+.venv/bin/python ../synapse-templates/scripts/brand_email.py check module . --ref origin/main
 ```
 
-The importer preserves the brand markup and adapts only the template-engine slots, message body, removal of campaign receiving-reason copy, unsubscribe link, and configurable postal address. It fails if expected source slots change. `brand_base.html` and its shared `brand_footer.html` are generated; edit the admin source and reimport for brand changes. Notice-specific content lives in `notice_email.html`. The preview's default postal address is imported from the source footer; deployed delivery continues to use its required configuration value.
+Notice-specific content lives in `notice_email.html`. The preview's default postal address comes from the layout's footer; deployed delivery continues to use its required configuration value.

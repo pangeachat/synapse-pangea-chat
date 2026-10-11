@@ -1,6 +1,10 @@
-{% extends "_course_email_base.html" %}
-{% block title %}Your quest is ready{% endblock %}
-{% block body %}
+{% extends "_brand_email_base.html" %}
+{% from "_brand_cta_button.html" import cta_button %}
+{% set title = "Your quest is ready" %}
+{% set show_unsubscribe = false %}
+{% block content %}
+            <tr>
+              <td class="body-content" style="padding:36px 40px 24px;">
                 <p style="font-size: 20px; font-weight: 700; margin-bottom: 12px">
                   Your quest is ready
                 </p>
@@ -29,11 +33,13 @@
                       {% if course_description %}
                       <p style="margin: 0 0 16px; color: #333; font-size: 15px; line-height: 1.5">{{ course_description }}</p>
                       {% endif %}
-                      <a class="cta-button" href="{{ claim_url }}" style="display:block;width:100%;box-sizing:border-box;text-align:center;background-color:#5e3acf;color:#ffffff;text-decoration:none;padding:16px 24px;border-radius:9999px;font-weight:600;font-size:16px;">Start my quest</a>
+                      {{ cta_button(claim_url, "Start my quest", block_padding="0", outlook=false) }}
                     </td>
                   </tr>
                 </table>
                 <p style="font-size: 14px; color: #555">
                   Installed the app first? Tap the button again after you sign in.
                 </p>
+              </td>
+            </tr>
 {% endblock %}
