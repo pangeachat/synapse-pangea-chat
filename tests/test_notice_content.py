@@ -188,7 +188,12 @@ class TestStructuredDelivery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await handler.deliver(request_body()))["channel"], "push")
         payload = handler._direct_push._send_push.await_args.args[2]
         self.assertEqual(payload["title"], "An activity")
-        self.assertEqual(payload["content"], {"pangea.activity_id": "activity-1"})
+        # The tap handler writes the opened record from check_in_type, which callers
+        # cannot send (pangea.* keys only); the service sets it from the variant.
+        self.assertEqual(
+            payload["content"],
+            {"pangea.activity_id": "activity-1", "check_in_type": "do_activity"},
+        )
 
     async def test_forced_email_still_refused_and_logged(self):
         handler, api = self.handler(preferences={"all_off": True})
