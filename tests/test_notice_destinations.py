@@ -418,7 +418,12 @@ class TestConfig(unittest.TestCase):
         config = PangeaChat.parse_config(base)
         self.assertEqual(
             config.notice_external_link_hosts,
-            ["calendar.app.google", "admin.pangea.chat", "admin.staging.pangea.chat"],
+            [
+                "calendar.app.google",
+                "admin.pangea.chat",
+                "admin.staging.pangea.chat",
+                "pangea.chat",
+            ],
         )
         custom = PangeaChat.parse_config(
             {**base, "notice_external_link_hosts": [" Booking.Example "]}
