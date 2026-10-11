@@ -48,18 +48,22 @@ jobs:
           # synapse 1.124.0 still imports pkg_resources, dropped in setuptools 81
           python -m pip install "setuptools<81"
       - name: Run unit tests
-        # Every module that does not boot a homeserver: about 1,150 tests in
-        # well under a minute. scripts/select_tests.py decides which is which.
-        run: python -m unittest $(python scripts/select_tests.py unit)
+        # Every class that does not boot a homeserver: about 1,150 tests in
+        # well under a minute. scripts/select_tests.py decides which is which;
+        # it runs on its own line so a failed discovery fails the step.
+        run: |
+          TESTS=$(python scripts/select_tests.py unit)
+          test -n "$TESTS"  # with no names, unittest would discover and run everything
+          python -m unittest $TESTS
 
   e2e-tests:
-    name: E2E tests (shard ${{ matrix.shard }} of 6)
+    name: E2E tests (shard ${{ matrix.shard }} of 3)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5]
+        shard: [0, 1, 2]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
@@ -70,16 +74,19 @@ jobs:
         run: |
           python -m pip install -e ".[dev]"
           python -m pip install "setuptools<81"
-      - name: Run this shard's E2E modules
-        # Each E2E test boots a real Synapse against a throwaway PostgreSQL
-        # (tests/base_e2e.py), about 8 seconds a test, which is why the E2E
-        # modules are split over six jobs, balanced by test count. testing.postgresql
+      - name: Run this shard's E2E classes
+        # The tests of each E2E class share one real Synapse, and the classes of
+        # a job share one throwaway PostgreSQL (tests/base_e2e.py). Shards are
+        # balanced on each class's cost (scripts/select_tests.py); the slowest
+        # tests are printed so that its measured list can be refreshed. testing.postgresql
         # needs the server binaries (initdb + postgres) on PATH; the runner image
         # ships them under /usr/lib/postgresql/<major>/bin without exposing them.
         run: |
           PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)
+          TESTS=$(python scripts/select_tests.py e2e --shard ${{ matrix.shard }} --of 3)
+          test -n "$TESTS"
           PATH="$PG_BIN:$PATH" LC_ALL=C.UTF-8 LANG=C.UTF-8 \
-            python -m unittest $(python scripts/select_tests.py e2e --shard ${{ matrix.shard }} --of 6)
+            python -m unittest --durations 10 $TESTS
 
   run-tests:
     # The one result to read (and the name earlier tooling watches): green only

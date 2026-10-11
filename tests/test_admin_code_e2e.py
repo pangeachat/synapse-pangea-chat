@@ -44,7 +44,7 @@ class TestAdminCodeE2E(BaseSynapseE2ETest):
     ):
         """Set room join rules with both student and admin access codes."""
         headers = {"Authorization": f"Bearer {access_token}"}
-        url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/m.room.join_rules"
+        url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state/m.room.join_rules"
         content = {
             JOIN_RULE_CONTENT_KEY: KNOCK_JOIN_RULE_VALUE,
             ACCESS_CODE_JOIN_RULE_CONTENT_KEY: access_code,
@@ -57,7 +57,7 @@ class TestAdminCodeE2E(BaseSynapseE2ETest):
         self, access_code: str, access_token: str
     ) -> requests.Response:
         """Send a knock-with-code request. Returns the response."""
-        url = "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code"
+        url = f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code"
         response = requests.post(
             url,
             json={"access_code": access_code},
@@ -68,7 +68,7 @@ class TestAdminCodeE2E(BaseSynapseE2ETest):
     async def get_join_rules(self, room_id: str, access_token: str) -> Dict[str, Any]:
         """Get the current join rules for a room."""
         headers = {"Authorization": f"Bearer {access_token}"}
-        url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/m.room.join_rules"
+        url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state/m.room.join_rules"
         response = requests.get(url, headers=headers)
         self.assertEqual(response.status_code, 200)
         return response.json()
@@ -78,7 +78,7 @@ class TestAdminCodeE2E(BaseSynapseE2ETest):
     ) -> int:
         """Get a user's power level in a room."""
         headers = {"Authorization": f"Bearer {access_token}"}
-        url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/m.room.power_levels"
+        url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state/m.room.power_levels"
         response = requests.get(url, headers=headers)
         self.assertEqual(response.status_code, 200)
         power_levels = response.json()
@@ -90,7 +90,7 @@ class TestAdminCodeE2E(BaseSynapseE2ETest):
         self, room_id: str, user_id: str, access_token: str
     ) -> bool:
         """Wait for a user to be invited to a room."""
-        url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{user_id}"
+        url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{user_id}"
         total_wait_time = 0
         max_wait_time = 5
         wait_interval = 1
@@ -129,320 +129,171 @@ class TestAdminCodeE2E(BaseSynapseE2ETest):
     async def join_room(self, room_id: str, access_token: str):
         """Join a room."""
         headers = {"Authorization": f"Bearer {access_token}"}
-        url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/join"
+        url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/join"
         response = requests.post(url, json={}, headers=headers)
         self.assertEqual(response.status_code, 200)
 
     async def test_admin_code_promotes_and_burns(self) -> None:
         """Knock with admin code: user is invited, promoted to power 100,
         and admin_access_code is removed from join rules."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        student_code = "stud3n1"
+        admin_code = "adm1nc1"
 
-        try:
-            student_code = "stud3n1"
-            admin_code = "adm1nc1"
+        await self.homeserver()
 
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        creator_id, creator_token = await self.new_user("creator", admin=True)
+        teacher_id, teacher_token = await self.new_user("teacher", admin=True)
 
-            # Register users
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="creator",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="teacher",
-                password="123123123",
-                admin=True,
-            )
+        # Create room and set knockable with both codes
+        room_id = await self.create_private_room(creator_token)
+        await self.set_room_knockable_with_both_codes(
+            room_id=room_id,
+            access_token=creator_token,
+            access_code=student_code,
+            admin_access_code=admin_code,
+        )
 
-            creator_id, creator_token = await self.login_user(
-                user="creator", password="123123123"
-            )
-            teacher_id, teacher_token = await self.login_user(
-                user="teacher", password="123123123"
-            )
+        # Teacher knocks with admin code
+        response = await self.knock_with_code(admin_code, teacher_token)
+        self.assertEqual(response.status_code, 200)
 
-            # Create room and set knockable with both codes
-            room_id = await self.create_private_room(creator_token)
-            await self.set_room_knockable_with_both_codes(
-                room_id=room_id,
-                access_token=creator_token,
-                access_code=student_code,
-                admin_access_code=admin_code,
-            )
+        # Wait for invitation
+        invited = await self.wait_for_room_invitation(
+            room_id=room_id,
+            user_id=teacher_id,
+            access_token=creator_token,
+        )
+        self.assertTrue(invited, "Teacher should be invited via admin code")
 
-            # Teacher knocks with admin code
-            response = await self.knock_with_code(admin_code, teacher_token)
-            self.assertEqual(response.status_code, 200)
+        # Teacher joins
+        await self.join_room(room_id=room_id, access_token=teacher_token)
 
-            # Wait for invitation
-            invited = await self.wait_for_room_invitation(
-                room_id=room_id,
-                user_id=teacher_id,
-                access_token=creator_token,
-            )
-            self.assertTrue(invited, "Teacher should be invited via admin code")
+        # Verify teacher was promoted to power level 100
+        # Allow a small delay for state to propagate
+        await asyncio.sleep(1)
+        power = await self.get_user_power_level(
+            room_id=room_id,
+            user_id=teacher_id,
+            access_token=creator_token,
+        )
+        self.assertEqual(power, 100, "Teacher should be promoted to power level 100")
 
-            # Teacher joins
-            await self.join_room(room_id=room_id, access_token=teacher_token)
-
-            # Verify teacher was promoted to power level 100
-            # Allow a small delay for state to propagate
-            await asyncio.sleep(1)
-            power = await self.get_user_power_level(
-                room_id=room_id,
-                user_id=teacher_id,
-                access_token=creator_token,
-            )
-            self.assertEqual(
-                power, 100, "Teacher should be promoted to power level 100"
-            )
-
-            # Verify admin code was burned from join rules
-            join_rules = await self.get_join_rules(
-                room_id=room_id, access_token=creator_token
-            )
-            self.assertNotIn(
-                ADMIN_ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
-                join_rules,
-                "admin_access_code should be removed after use",
-            )
-            # Student code should still be present
-            self.assertEqual(
-                join_rules.get(ACCESS_CODE_JOIN_RULE_CONTENT_KEY),
-                student_code,
-                "Student access_code should remain after admin code is burned",
-            )
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Verify admin code was burned from join rules
+        join_rules = await self.get_join_rules(
+            room_id=room_id, access_token=creator_token
+        )
+        self.assertNotIn(
+            ADMIN_ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
+            join_rules,
+            "admin_access_code should be removed after use",
+        )
+        # Student code should still be present
+        self.assertEqual(
+            join_rules.get(ACCESS_CODE_JOIN_RULE_CONTENT_KEY),
+            student_code,
+            "Student access_code should remain after admin code is burned",
+        )
 
     async def test_burned_admin_code_rejected(self) -> None:
         """After admin code is burned, a second user trying it gets no match."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        student_code = "stud3n2"
+        admin_code = "adm1nc2"
 
-        try:
-            student_code = "stud3n2"
-            admin_code = "adm1nc2"
+        await self.homeserver()
 
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        creator_id, creator_token = await self.new_user("creator", admin=True)
+        teacher1_id, teacher1_token = await self.new_user("teacher1", admin=True)
+        teacher2_id, teacher2_token = await self.new_user("teacher2", admin=True)
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="creator",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="teacher1",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="teacher2",
-                password="123123123",
-                admin=True,
-            )
+        room_id = await self.create_private_room(creator_token)
+        await self.set_room_knockable_with_both_codes(
+            room_id=room_id,
+            access_token=creator_token,
+            access_code=student_code,
+            admin_access_code=admin_code,
+        )
 
-            creator_id, creator_token = await self.login_user(
-                user="creator", password="123123123"
-            )
-            teacher1_id, teacher1_token = await self.login_user(
-                user="teacher1", password="123123123"
-            )
-            teacher2_id, teacher2_token = await self.login_user(
-                user="teacher2", password="123123123"
-            )
+        # First teacher uses admin code — should succeed
+        response = await self.knock_with_code(admin_code, teacher1_token)
+        self.assertEqual(response.status_code, 200)
 
-            room_id = await self.create_private_room(creator_token)
-            await self.set_room_knockable_with_both_codes(
-                room_id=room_id,
-                access_token=creator_token,
-                access_code=student_code,
-                admin_access_code=admin_code,
-            )
+        invited = await self.wait_for_room_invitation(
+            room_id=room_id,
+            user_id=teacher1_id,
+            access_token=creator_token,
+        )
+        self.assertTrue(invited, "First teacher should be invited")
 
-            # First teacher uses admin code — should succeed
-            response = await self.knock_with_code(admin_code, teacher1_token)
-            self.assertEqual(response.status_code, 200)
+        burned = await self.wait_until_admin_code_burned(
+            room_id=room_id,
+            access_token=creator_token,
+            max_wait_time=10,
+        )
+        self.assertTrue(burned, "Admin code should be burned after first use")
 
-            invited = await self.wait_for_room_invitation(
-                room_id=room_id,
-                user_id=teacher1_id,
-                access_token=creator_token,
-            )
-            self.assertTrue(invited, "First teacher should be invited")
-
-            burned = await self.wait_until_admin_code_burned(
-                room_id=room_id,
-                access_token=creator_token,
-                max_wait_time=10,
-            )
-            self.assertTrue(burned, "Admin code should be burned after first use")
-
-            # Second teacher tries same admin code — should fail (code burned).
-            # A burned code no longer matches any room, so it answers the
-            # code-not-found 404 (issue #197).
-            response2 = await self.knock_with_code(admin_code, teacher2_token)
-            self.assertEqual(response2.status_code, 404, response2.text)
-            self.assertEqual(
-                response2.json().get("errcode"), "ORG.PANGEA.CODE_NOT_FOUND"
-            )
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Second teacher tries same admin code — should fail (code burned).
+        # A burned code no longer matches any room, so it answers the
+        # code-not-found 404 (issue #197).
+        response2 = await self.knock_with_code(admin_code, teacher2_token)
+        self.assertEqual(response2.status_code, 404, response2.text)
+        self.assertEqual(response2.json().get("errcode"), "ORG.PANGEA.CODE_NOT_FOUND")
 
     async def test_student_code_still_works_after_admin_burn(self) -> None:
         """Student access_code continues to work after admin code is burned."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        student_code = "stud3n3"
+        admin_code = "adm1nc3"
 
-        try:
-            student_code = "stud3n3"
-            admin_code = "adm1nc3"
+        await self.homeserver()
 
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        creator_id, creator_token = await self.new_user("creator", admin=True)
+        teacher_id, teacher_token = await self.new_user("teacher", admin=True)
+        student_id, student_token = await self.new_user("student", admin=True)
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="creator",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="teacher",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="student",
-                password="123123123",
-                admin=True,
-            )
+        room_id = await self.create_private_room(creator_token)
+        await self.set_room_knockable_with_both_codes(
+            room_id=room_id,
+            access_token=creator_token,
+            access_code=student_code,
+            admin_access_code=admin_code,
+        )
 
-            creator_id, creator_token = await self.login_user(
-                user="creator", password="123123123"
-            )
-            teacher_id, teacher_token = await self.login_user(
-                user="teacher", password="123123123"
-            )
-            student_id, student_token = await self.login_user(
-                user="student", password="123123123"
-            )
+        # Teacher uses admin code (burns it)
+        response = await self.knock_with_code(admin_code, teacher_token)
+        self.assertEqual(response.status_code, 200)
 
-            room_id = await self.create_private_room(creator_token)
-            await self.set_room_knockable_with_both_codes(
-                room_id=room_id,
-                access_token=creator_token,
-                access_code=student_code,
-                admin_access_code=admin_code,
-            )
+        await self.wait_for_room_invitation(
+            room_id=room_id,
+            user_id=teacher_id,
+            access_token=creator_token,
+        )
+        await asyncio.sleep(2)
 
-            # Teacher uses admin code (burns it)
-            response = await self.knock_with_code(admin_code, teacher_token)
-            self.assertEqual(response.status_code, 200)
+        # Student uses regular access code — should still work
+        response2 = await self.knock_with_code(student_code, student_token)
+        self.assertEqual(
+            response2.status_code,
+            200,
+            "Student code should still work after admin code is burned",
+        )
 
-            await self.wait_for_room_invitation(
-                room_id=room_id,
-                user_id=teacher_id,
-                access_token=creator_token,
-            )
-            await asyncio.sleep(2)
+        invited = await self.wait_for_room_invitation(
+            room_id=room_id,
+            user_id=student_id,
+            access_token=creator_token,
+        )
+        self.assertTrue(
+            invited,
+            "Student should be invited via student code after admin code burn",
+        )
 
-            # Student uses regular access code — should still work
-            response2 = await self.knock_with_code(student_code, student_token)
-            self.assertEqual(
-                response2.status_code,
-                200,
-                "Student code should still work after admin code is burned",
-            )
-
-            invited = await self.wait_for_room_invitation(
-                room_id=room_id,
-                user_id=student_id,
-                access_token=creator_token,
-            )
-            self.assertTrue(
-                invited,
-                "Student should be invited via student code after admin code burn",
-            )
-
-            # Verify student is NOT promoted (regular code, not admin)
-            await self.join_room(room_id=room_id, access_token=student_token)
-            await asyncio.sleep(1)
-            power = await self.get_user_power_level(
-                room_id=room_id,
-                user_id=student_id,
-                access_token=creator_token,
-            )
-            self.assertLess(
-                power, 100, "Student should NOT be promoted to admin via regular code"
-            )
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Verify student is NOT promoted (regular code, not admin)
+        await self.join_room(room_id=room_id, access_token=student_token)
+        await asyncio.sleep(1)
+        power = await self.get_user_power_level(
+            room_id=room_id,
+            user_id=student_id,
+            access_token=creator_token,
+        )
+        self.assertLess(
+            power, 100, "Student should NOT be promoted to admin via regular code"
+        )

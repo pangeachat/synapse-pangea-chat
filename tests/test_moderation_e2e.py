@@ -39,6 +39,18 @@ logger = logging.getLogger(__name__)
 
 
 class TestModerationE2E(BaseSynapseE2ETest):
+    mock_moderation: MockModerationServer
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.mock_moderation = MockModerationServer().start()
+        cls.addClassCleanup(cls.mock_moderation.stop)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mock_moderation.reset()
+
     def _send_message(
         self, room_id: str, token: str, body: str, txn: str
     ) -> requests.Response:
@@ -120,136 +132,104 @@ class TestModerationE2E(BaseSynapseE2ETest):
         self.fail(f"event {event_id} was never redacted; last seen: {last}")
 
     async def test_tier1_blocks_and_tier2_redacts(self) -> None:
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        mock_moderation = MockModerationServer().start()
+        await self.homeserver(
+            module_config={
+                "moderation": {
+                    "tier1_enabled": True,
+                    "tier1_phone_regions": ["US"],
+                    "tier2_enabled": True,
+                    "choreo_base_url": self.mock_moderation.base_url,
+                    "choreo_access_token": "syt_mock_service_token",
+                    "exempt_user_id_globs": ["@exemptbot:*"],
+                },
+            }
+        )
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "moderation": {
-                        "tier1_enabled": True,
-                        "tier1_phone_regions": ["US"],
-                        "tier2_enabled": True,
-                        "choreo_base_url": mock_moderation.base_url,
-                        "choreo_access_token": "syt_mock_service_token",
-                        "exempt_user_id_globs": ["@exemptbot:*"],
-                    },
-                }
-            )
+        user_id, token = await self.new_user("learner")
+        room_id = await self.create_private_room(token)
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="learner",
-                password="p4ssword!",
-                admin=False,
-            )
-            user_id, token = await self.login_user("learner", "p4ssword!")
-            room_id = await self.create_private_room(token)
+        # --- Tier 1: phone number rejected at send time ---
+        resp = self._send_message(
+            room_id, token, "text me at 415-555-2671", "txn-t1-block"
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json().get("errcode"), "M_FORBIDDEN")
+        # The statement of reasons, read off the wire a client reads it
+        # off. This is the only assertion that proves the whole chain -
+        # our tuple survives `spamchecker_callbacks`, reaches
+        # `handlers/message.py`, and our `error` REPLACES Synapse's fixed
+        # "rejected as probable spam" inside `cs_error`. A unit test can
+        # pin each link; only this one pins them joined together.
+        refusal_body = resp.json()
+        self.assertEqual(
+            refusal_body.get("error"),
+            moderation_refusal.DEFAULT_MESSAGES[REASON_CONTACT_DETAILS],
+        )
+        self.assertIs(refusal_body.get(moderation_refusal.AUTOMATED_FIELD), True)
+        self.assertEqual(
+            refusal_body.get(moderation_refusal.REASON_FIELD),
+            REASON_CONTACT_DETAILS,
+        )
+        # The rule family and nothing finer: no digit of the number the
+        # learner typed comes back to them.
+        self.assertFalse(
+            [ch for ch in str(refusal_body.get("error", "")) if ch.isdigit()],
+            f"a digit reached the learner's refusal: {refusal_body!r}",
+        )
 
-            # --- Tier 1: phone number rejected at send time ---
-            resp = self._send_message(
-                room_id, token, "text me at 415-555-2671", "txn-t1-block"
-            )
-            self.assertEqual(resp.status_code, 403)
-            self.assertEqual(resp.json().get("errcode"), "M_FORBIDDEN")
-            # The statement of reasons, read off the wire a client reads it
-            # off. This is the only assertion that proves the whole chain -
-            # our tuple survives `spamchecker_callbacks`, reaches
-            # `handlers/message.py`, and our `error` REPLACES Synapse's fixed
-            # "rejected as probable spam" inside `cs_error`. A unit test can
-            # pin each link; only this one pins them joined together.
-            refusal_body = resp.json()
-            self.assertEqual(
-                refusal_body.get("error"),
-                moderation_refusal.DEFAULT_MESSAGES[REASON_CONTACT_DETAILS],
-            )
-            self.assertIs(refusal_body.get(moderation_refusal.AUTOMATED_FIELD), True)
-            self.assertEqual(
-                refusal_body.get(moderation_refusal.REASON_FIELD),
-                REASON_CONTACT_DETAILS,
-            )
-            # The rule family and nothing finer: no digit of the number the
-            # learner typed comes back to them.
-            self.assertFalse(
-                [ch for ch in str(refusal_body.get("error", "")) if ch.isdigit()],
-                f"a digit reached the learner's refusal: {refusal_body!r}",
-            )
+        # --- Tier 1: clean message lands ---
+        resp = self._send_message(room_id, token, "hola, ¿qué tal?", "txn-clean")
+        self.assertEqual(resp.status_code, 200)
+        clean_event_id = resp.json()["event_id"]
 
-            # --- Tier 1: clean message lands ---
-            resp = self._send_message(room_id, token, "hola, ¿qué tal?", "txn-clean")
-            self.assertEqual(resp.status_code, 200)
-            clean_event_id = resp.json()["event_id"]
+        # --- Tier 2: flagged message is redacted after the fact ---
+        resp = self._send_message(
+            room_id, token, f"something awful {FLAG_MARKER}", "txn-t2-flag"
+        )
+        self.assertEqual(resp.status_code, 200)
+        flagged_event_id = resp.json()["event_id"]
 
-            # --- Tier 2: flagged message is redacted after the fact ---
-            resp = self._send_message(
-                room_id, token, f"something awful {FLAG_MARKER}", "txn-t2-flag"
-            )
-            self.assertEqual(resp.status_code, 200)
-            flagged_event_id = resp.json()["event_id"]
+        redacted = self._wait_for_redaction(room_id, flagged_event_id, token)
+        redacted_because = redacted.get("unsigned", {}).get("redacted_because", {})
+        self.assertIn(
+            "Removed by Pangea content moderation",
+            redacted_because.get("content", {}).get("reason", ""),
+        )
+        # Self-redaction: the redaction is authored by the offender.
+        self.assertEqual(redacted_because.get("sender"), user_id)
 
-            redacted = self._wait_for_redaction(room_id, flagged_event_id, token)
-            redacted_because = redacted.get("unsigned", {}).get("redacted_because", {})
-            self.assertIn(
-                "Removed by Pangea content moderation",
-                redacted_because.get("content", {}).get("reason", ""),
-            )
-            # Self-redaction: the redaction is authored by the offender.
-            self.assertEqual(redacted_because.get("sender"), user_id)
+        # --- Tier 2: a self-harm disclosure is preserved, durably ---
+        # The one guarantee that must survive a restart and a second
+        # instance, so it is asserted against the real table on the real
+        # database rather than against the module's memory.
+        resp = self._send_message(
+            room_id, token, f"i want to hurt myself {PRESERVE_MARKER}", "txn-t2-sh"
+        )
+        self.assertEqual(resp.status_code, 200)
+        disclosure_event_id = resp.json()["event_id"]
+        row = self._wait_for_disposition(disclosure_event_id)
+        self.assertEqual(row["disposition"], "preserved")
+        self.assertEqual(row["category"], "self_harm")
+        self.assertEqual(row["room_id"], room_id)
+        # A safeguarding record is read by people: it carries the room and
+        # the event and nothing about the learner or what they wrote.
+        flattened = " ".join(str(value) for value in row.values())
+        self.assertNotIn(user_id, flattened)
+        self.assertNotIn("hurt myself", flattened)
+        disclosure = self._get_event(room_id, disclosure_event_id, token)
+        assert disclosure is not None
+        self.assertIn("hurt myself", disclosure["content"].get("body", ""))
 
-            # --- Tier 2: a self-harm disclosure is preserved, durably ---
-            # The one guarantee that must survive a restart and a second
-            # instance, so it is asserted against the real table on the real
-            # database rather than against the module's memory.
-            resp = self._send_message(
-                room_id, token, f"i want to hurt myself {PRESERVE_MARKER}", "txn-t2-sh"
-            )
-            self.assertEqual(resp.status_code, 200)
-            disclosure_event_id = resp.json()["event_id"]
-            row = self._wait_for_disposition(disclosure_event_id)
-            self.assertEqual(row["disposition"], "preserved")
-            self.assertEqual(row["category"], "self_harm")
-            self.assertEqual(row["room_id"], room_id)
-            # A safeguarding record is read by people: it carries the room and
-            # the event and nothing about the learner or what they wrote.
-            flattened = " ".join(str(value) for value in row.values())
-            self.assertNotIn(user_id, flattened)
-            self.assertNotIn("hurt myself", flattened)
-            disclosure = self._get_event(room_id, disclosure_event_id, token)
-            assert disclosure is not None
-            self.assertIn("hurt myself", disclosure["content"].get("body", ""))
-
-            # --- Tier 2: the clean message was checked but survives ---
-            # Give the background check a moment before asserting content.
-            await asyncio.sleep(2)
-            clean_event = self._get_event(room_id, clean_event_id, token)
-            assert clean_event is not None
-            self.assertEqual(clean_event["content"].get("body"), "hola, ¿qué tal?")
-            self.assertTrue(
-                any("hola" in t for t in mock_moderation.seen_texts),
-                f"clean message never reached moderation: {mock_moderation.seen_texts}",
-            )
-
-        finally:
-            mock_moderation.stop()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # --- Tier 2: the clean message was checked but survives ---
+        # Give the background check a moment before asserting content.
+        await asyncio.sleep(2)
+        clean_event = self._get_event(room_id, clean_event_id, token)
+        assert clean_event is not None
+        self.assertEqual(clean_event["content"].get("body"), "hola, ¿qué tal?")
+        self.assertTrue(
+            any("hola" in t for t in self.mock_moderation.seen_texts),
+            f"clean message never reached moderation: {self.mock_moderation.seen_texts}",
+        )
 
 
 if __name__ == "__main__":

@@ -108,6 +108,12 @@ class MockModerationServer:
         homeserver with checks genuinely in flight."""
         self._httpd.delay_seconds = seconds
 
+    def reset(self) -> None:
+        """Forget the texts seen so far and answer without delay again, for a
+        server that outlives one test."""
+        self._httpd.seen_texts.clear()
+        self._httpd.delay_seconds = 0.0
+
     @property
     def base_url(self) -> str:
         host, port = self._httpd.server_address[:2]

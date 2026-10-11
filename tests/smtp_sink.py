@@ -3,6 +3,10 @@
 The test homeserver is pointed at it through its ``email`` config, so a test
 can read back what Synapse actually sent: the rendered templates, through
 Synapse's own mail path, rather than what a handler meant to send.
+
+Its port is in that config, so a sink lives as long as the test class's shared
+homeserver: started in ``setUpClass``, stopped by a class cleanup. It keeps
+every test's mail, so a test reads by its own recipient address.
 """
 
 from __future__ import annotations
@@ -76,11 +80,11 @@ class SmtpSink:
         self._messages: List[tuple[List[str], Message]] = []
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
-    def __enter__(self) -> "SmtpSink":
+    def start(self) -> "SmtpSink":
         self._thread.start()
         return self
 
-    def __exit__(self, *_: object) -> None:
+    def stop(self) -> None:
         self._server.shutdown()
         self._server.server_close()
 

@@ -26,12 +26,17 @@ KNOCK_WITH_CODE_PATH = "/_synapse/client/pangea/v1/knock_with_code"
 INSTRUCTOR_INVITATIONS_PATH = "/_synapse/client/pangea/v2/instructor_invitations"
 REMINDER_PATH = "/_synapse/client/pangea/v2/send_course_claim_reminder"
 APP_BASE_URL = "https://app.example.test"
-OWNER_EMAIL = "owner@school.example"
-COLLEAGUE_EMAIL = "colleague@school.example"
-PASSWORD = "123123123"
 
 
 class TestInstructorInvitationE2E(BaseSynapseE2ETest):
+    sink: SmtpSink
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.sink = SmtpSink().start()
+        cls.addClassCleanup(cls.sink.stop)
+
     def _post(self, path: str, token: str, body: Dict[str, Any]) -> requests.Response:
         return requests.post(
             f"{self.server_url}{path}",
@@ -82,130 +87,97 @@ class TestInstructorInvitationE2E(BaseSynapseE2ETest):
         return response.json()
 
     async def test_an_invited_instructor_claims_with_the_rendered_link(self) -> None:
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        owner_email = f"owner+{self.tag}@school.example"
+        colleague_email = f"colleague+{self.tag}@school.example"
+        await self.homeserver(
+            module_config={"app_base_url": APP_BASE_URL},
+            synapse_config_overrides={"email": self.sink.synapse_email_config()},
+        )
+        _, bot = await self.new_user("bot", admin=True)
+        owner_id, owner = await self.new_user("owner")
+        colleague_id, colleague = await self.new_user("colleague")
 
-        with SmtpSink() as sink:
-            try:
-                (
-                    postgres,
-                    synapse_dir,
-                    config_path,
-                    server_process,
-                    stdout_thread,
-                    stderr_thread,
-                ) = await self.start_test_synapse(
-                    module_config={"app_base_url": APP_BASE_URL},
-                    synapse_config_overrides={"email": sink.synapse_email_config()},
-                )
-                for user, admin in (
-                    ("bot", True),
-                    ("owner", False),
-                    ("colleague", False),
-                ):
-                    await self.register_user(
-                        config_path=config_path,
-                        dir=synapse_dir,
-                        user=user,
-                        password=PASSWORD,
-                        admin=admin,
-                    )
-                _, bot = await self.login_user("bot", PASSWORD)
-                owner_id, owner = await self.login_user("owner", PASSWORD)
-                colleague_id, colleague = await self.login_user("colleague", PASSWORD)
+        # An existing course with a joined instructor.
+        created = self._post(
+            CREATE_COURSE_SPACE_PATH,
+            bot,
+            {
+                "title": "Spanish 1",
+                "course_plan_id": "plan-instructor",
+                "target_language": "es",
+                "teacher_email": owner_email,
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        room_id = created.json()["room_id"]
+        await self._claim(owner, created.json()["admin_access_code"], room_id)
+        levels = self._power_levels(owner, room_id)
+        self.assertEqual(levels["users"].get(owner_id), 100)
 
-                # An existing course with a joined instructor.
-                created = self._post(
-                    CREATE_COURSE_SPACE_PATH,
-                    bot,
-                    {
-                        "title": "Spanish 1",
-                        "course_plan_id": "plan-instructor",
-                        "target_language": "es",
-                        "teacher_email": OWNER_EMAIL,
-                    },
-                )
-                self.assertEqual(created.status_code, 200, created.text)
-                room_id = created.json()["room_id"]
-                await self._claim(owner, created.json()["admin_access_code"], room_id)
-                levels = self._power_levels(owner, room_id)
-                self.assertEqual(levels["users"].get(owner_id), 100)
+        # Prepared without mail; the answer carries neither address
+        # nor code.
+        prepared = self._post(
+            INSTRUCTOR_INVITATIONS_PATH,
+            bot,
+            {
+                "request_key": f"e2e-instructor-1-{self.tag}",
+                "room_id": room_id,
+                "teacher_email": colleague_email,
+            },
+        )
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        invitation_id = prepared.json()["invitation_id"]
+        self.assertEqual(prepared.json()["status"], "prepared")
+        self.assertNotIn(colleague_email, prepared.text)
+        await asyncio.sleep(1)
+        self.assertEqual(self.sink.messages_to(colleague_email), [])
 
-                # Prepared without mail; the answer carries neither address
-                # nor code.
-                prepared = self._post(
-                    INSTRUCTOR_INVITATIONS_PATH,
-                    bot,
-                    {
-                        "request_key": "e2e-instructor-1",
-                        "room_id": room_id,
-                        "teacher_email": COLLEAGUE_EMAIL,
-                    },
-                )
-                self.assertEqual(prepared.status_code, 200, prepared.text)
-                invitation_id = prepared.json()["invitation_id"]
-                self.assertEqual(prepared.json()["status"], "prepared")
-                self.assertNotIn(COLLEAGUE_EMAIL, prepared.text)
-                await asyncio.sleep(1)
-                self.assertEqual(sink.messages_to(COLLEAGUE_EMAIL), [])
+        # The caller's rendered email, with the claim link as a slot.
+        sent = self._post(
+            REMINDER_PATH,
+            bot,
+            {
+                "invitation_id": invitation_id,
+                "subject": "Join Spanish 1 as an instructor",
+                "body": "You were invited to teach Spanish 1.",
+                "cta_label": "Accept",
+                "html": '<p>You were invited.</p><a href="{{cta_url}}">Accept</a>',
+                "text": "You were invited.\n\nAccept: {{cta_url}}",
+                "receiving_reason": "A teacher of this course invited you.",
+            },
+        )
+        self.assertEqual(sent.status_code, 200, sent.text)
+        mail = self.sink.wait_for(colleague_email, "Join Spanish 1")
+        self.assertIsNotNone(mail)
+        assert mail is not None
+        text = body_text(mail)
+        self.assertNotIn("{{", text)
+        found = re.search(re.escape(APP_BASE_URL) + r"/(\w+)", text)
+        self.assertIsNotNone(found, text)
+        assert found is not None
+        code = found.group(1)
 
-                # The caller's rendered email, with the claim link as a slot.
-                sent = self._post(
-                    REMINDER_PATH,
-                    bot,
-                    {
-                        "invitation_id": invitation_id,
-                        "subject": "Join Spanish 1 as an instructor",
-                        "body": "You were invited to teach Spanish 1.",
-                        "cta_label": "Accept",
-                        "html": '<p>You were invited.</p><a href="{{cta_url}}">Accept</a>',
-                        "text": "You were invited.\n\nAccept: {{cta_url}}",
-                        "receiving_reason": "A teacher of this course invited you.",
-                    },
-                )
-                self.assertEqual(sent.status_code, 200, sent.text)
-                mail = sink.wait_for(COLLEAGUE_EMAIL, "Join Spanish 1")
-                self.assertIsNotNone(mail)
-                assert mail is not None
-                text = body_text(mail)
-                self.assertNotIn("{{", text)
-                found = re.search(re.escape(APP_BASE_URL) + r"/(\w+)", text)
-                self.assertIsNotNone(found, text)
-                assert found is not None
-                code = found.group(1)
+        # The claim: invited, joined and promoted, the owner untouched.
+        await self._claim(colleague, code, room_id)
+        levels = self._power_levels(colleague, room_id)
+        self.assertEqual(levels["users"].get(colleague_id), 100)
+        self.assertEqual(levels["users"].get(owner_id), 100)
 
-                # The claim: invited, joined and promoted, the owner untouched.
-                await self._claim(colleague, code, room_id)
-                levels = self._power_levels(colleague, room_id)
-                self.assertEqual(levels["users"].get(colleague_id), 100)
-                self.assertEqual(levels["users"].get(owner_id), 100)
+        listed = self._get(INSTRUCTOR_INVITATIONS_PATH + "?status=completed", bot)
+        self.assertEqual(listed.status_code, 200, listed.text)
+        # Every completed instructor invitation on the homeserver; this
+        # test's course has exactly one.
+        [row] = [r for r in listed.json()["invitations"] if r["room_id"] == room_id]
+        self.assertEqual(
+            (row["invitation_id"], row["claimant"], row["room_id"]),
+            (invitation_id, colleague_id, room_id),
+        )
+        self.assertNotIn(colleague_email, listed.text)
+        self.assertNotIn(code, listed.text)
 
-                listed = self._get(
-                    INSTRUCTOR_INVITATIONS_PATH + "?status=completed", bot
-                )
-                self.assertEqual(listed.status_code, 200, listed.text)
-                [row] = listed.json()["invitations"]
-                self.assertEqual(
-                    (row["invitation_id"], row["claimant"], row["room_id"]),
-                    (invitation_id, colleague_id, room_id),
-                )
-                self.assertNotIn(COLLEAGUE_EMAIL, listed.text)
-                self.assertNotIn(code, listed.text)
-
-                # The code is spent: a second use does not grant anything new.
-                again = self._post(KNOCK_WITH_CODE_PATH, bot, {"access_code": code})
-                self.assertNotEqual(again.status_code, 500, again.text)
-            finally:
-                self.stop_synapse(
-                    server_process=server_process,
-                    stdout_thread=stdout_thread,
-                    stderr_thread=stderr_thread,
-                    synapse_dir=synapse_dir,
-                    postgres=postgres,
-                )
+        # The code is spent: a second use does not grant anything new.
+        again = self._post(KNOCK_WITH_CODE_PATH, bot, {"access_code": code})
+        self.assertNotEqual(again.status_code, 500, again.text)
 
 
 if __name__ == "__main__":

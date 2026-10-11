@@ -12,7 +12,7 @@ space this endpoint created was one the catalog would find.
 """
 
 import unittest
-from typing import Any, Dict, List
+from typing import Any, Collection, Dict, List
 from urllib.parse import quote
 
 import requests
@@ -100,147 +100,123 @@ class TestCreateCourseSpaceE2E(BaseSynapseE2ETest):
         return {course["room_id"]: course for course in body["chunk"]}
 
     @staticmethod
-    def _room_ids(body: Dict[str, Any]) -> List[str]:
-        return sorted(course["room_id"] for course in body["chunk"])
+    def _room_ids(body: Dict[str, Any], mine: Collection[str]) -> List[str]:
+        """The catalog's room ids among *mine*, the rooms this test created.
+
+        The class's tests share a homeserver, so the catalog also lists what
+        the others published.
+        """
+        return sorted(
+            course["room_id"] for course in body["chunk"] if course["room_id"] in mine
+        )
 
     async def test_course_plan_state_event_and_catalog_visibility(self) -> None:
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver()
+        _, token = await self.new_user("teacher", admin=True)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        # --- A space created with a target language ---------------------
+        # The language is passed padded to prove trimming happens before
+        # the value reaches room state, where the catalog matches on it.
+        spanish = self._create_course_space(
+            token,
+            title="Spanish for Travel",
+            teacher_email="teacher@example.com",
+            description="A travel course",
+            course_plan_id="plan-es-mx",
+            target_language="  es-MX  ",
+        )
+        spanish_room_id = spanish["room_id"]
+        created_room_ids = {spanish_room_id}
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="teacher",
-                password="123123123",
-                admin=True,
-            )
-            _, token = await self.login_user(user="teacher", password="123123123")
+        spanish_content = self._get_course_plan_content(token, spanish_room_id)
 
-            # --- A space created with a target language ---------------------
-            # The language is passed padded to prove trimming happens before
-            # the value reaches room state, where the catalog matches on it.
-            spanish = self._create_course_space(
-                token,
-                title="Spanish for Travel",
-                teacher_email="teacher@example.com",
-                description="A travel course",
-                course_plan_id="plan-es-mx",
-                target_language="  es-MX  ",
-            )
-            spanish_room_id = spanish["room_id"]
+        # The plan id lands under ``uuid``, preserved exactly. Writing it
+        # under ``course_plan_id`` would still be read by the catalog's
+        # fallback, so nothing downstream would fail — which is why this
+        # is asserted on the key and not only on the behaviour.
+        self.assertEqual(spanish_content.get("uuid"), "plan-es-mx")
+        self.assertNotIn("course_plan_id", spanish_content)
+        self.assertEqual(spanish_content.get("l2"), "es-MX")
 
-            spanish_content = self._get_course_plan_content(token, spanish_room_id)
+        # --- A space created without one --------------------------------
+        no_language = self._create_course_space(
+            token,
+            title="Unspecified Language",
+            teacher_email="teacher@example.com",
+            course_plan_id="plan-nolang",
+        )
+        no_language_room_id = no_language["room_id"]
+        created_room_ids.add(no_language_room_id)
 
-            # The plan id lands under ``uuid``, preserved exactly. Writing it
-            # under ``course_plan_id`` would still be read by the catalog's
-            # fallback, so nothing downstream would fail — which is why this
-            # is asserted on the key and not only on the behaviour.
-            self.assertEqual(spanish_content.get("uuid"), "plan-es-mx")
-            self.assertNotIn("course_plan_id", spanish_content)
-            self.assertEqual(spanish_content.get("l2"), "es-MX")
+        no_language_content = self._get_course_plan_content(token, no_language_room_id)
 
-            # --- A space created without one --------------------------------
-            no_language = self._create_course_space(
-                token,
-                title="Unspecified Language",
-                teacher_email="teacher@example.com",
-                course_plan_id="plan-nolang",
-            )
-            no_language_room_id = no_language["room_id"]
+        self.assertEqual(no_language_content.get("uuid"), "plan-nolang")
+        # Absent, not null and not empty: the key is simply not there.
+        self.assertNotIn("l2", no_language_content)
 
-            no_language_content = self._get_course_plan_content(
-                token, no_language_room_id
-            )
+        # --- Blank and non-string target languages ----------------------
+        # Each is a distinct way a caller can fail to supply a language,
+        # and all three must produce the same state as omitting it.
+        for label, target_language in (
+            ("empty", ""),
+            ("whitespace", "   "),
+            ("non-string", 42),
+        ):
+            with self.subTest(target_language=label):
+                blank = self._create_course_space(
+                    token,
+                    title=f"Blank {label}",
+                    teacher_email="teacher@example.com",
+                    course_plan_id=f"plan-blank-{label}",
+                    target_language=target_language,
+                )
+                created_room_ids.add(blank["room_id"])
+                blank_content = self._get_course_plan_content(token, blank["room_id"])
+                self.assertEqual(blank_content.get("uuid"), f"plan-blank-{label}")
+                self.assertNotIn("l2", blank_content)
 
-            self.assertEqual(no_language_content.get("uuid"), "plan-nolang")
-            # Absent, not null and not empty: the key is simply not there.
-            self.assertNotIn("l2", no_language_content)
+        # --- Published, these spaces are courses the catalog finds -------
+        self._publish_to_directory(token, spanish_room_id)
+        self._publish_to_directory(token, no_language_room_id)
 
-            # --- Blank and non-string target languages ----------------------
-            # Each is a distinct way a caller can fail to supply a language,
-            # and all three must produce the same state as omitting it.
-            for label, target_language in (
-                ("empty", ""),
-                ("whitespace", "   "),
-                ("non-string", 42),
-            ):
-                with self.subTest(target_language=label):
-                    blank = self._create_course_space(
-                        token,
-                        title=f"Blank {label}",
-                        teacher_email="teacher@example.com",
-                        course_plan_id=f"plan-blank-{label}",
-                        target_language=target_language,
-                    )
-                    blank_content = self._get_course_plan_content(
-                        token, blank["room_id"]
-                    )
-                    self.assertEqual(blank_content.get("uuid"), f"plan-blank-{label}")
-                    self.assertNotIn("l2", blank_content)
+        unfiltered = self._get_courses(token)
+        self.assertEqual(
+            self._room_ids(unfiltered, created_room_ids),
+            sorted([spanish_room_id, no_language_room_id]),
+            f"unexpected catalog: {unfiltered}",
+        )
 
-            # --- Published, these spaces are courses the catalog finds -------
-            self._publish_to_directory(token, spanish_room_id)
-            self._publish_to_directory(token, no_language_room_id)
+        # What the catalog serves is what the catalog's own extractors read
+        # off the stored state. Restating the key names here would let the
+        # write and the read drift apart while both tests kept passing.
+        courses = self._by_room_id(unfiltered)
+        self.assertEqual(
+            courses[spanish_room_id]["course_id"],
+            extract_plan_id(spanish_content),
+        )
+        self.assertEqual(
+            courses[spanish_room_id]["target_language"],
+            extract_l2(spanish_content),
+        )
+        self.assertEqual(
+            courses[no_language_room_id]["course_id"],
+            extract_plan_id(no_language_content),
+        )
+        self.assertIsNone(
+            courses[no_language_room_id]["target_language"],
+            "a space created without a target language has no l2 to serve",
+        )
 
-            unfiltered = self._get_courses(token)
-            self.assertEqual(
-                self._room_ids(unfiltered),
-                sorted([spanish_room_id, no_language_room_id]),
-                f"unexpected catalog: {unfiltered}",
-            )
+        # A base-code filter matches the regionally-tagged space this
+        # endpoint wrote (issue #53), and excludes the one with no l2.
+        filtered = self._get_courses(token, target_language="es")
+        self.assertEqual(self._room_ids(filtered, created_room_ids), [spanish_room_id])
 
-            # What the catalog serves is what the catalog's own extractors read
-            # off the stored state. Restating the key names here would let the
-            # write and the read drift apart while both tests kept passing.
-            courses = self._by_room_id(unfiltered)
-            self.assertEqual(
-                courses[spanish_room_id]["course_id"],
-                extract_plan_id(spanish_content),
-            )
-            self.assertEqual(
-                courses[spanish_room_id]["target_language"],
-                extract_l2(spanish_content),
-            )
-            self.assertEqual(
-                courses[no_language_room_id]["course_id"],
-                extract_plan_id(no_language_content),
-            )
-            self.assertIsNone(
-                courses[no_language_room_id]["target_language"],
-                "a space created without a target language has no l2 to serve",
-            )
+        regional = self._get_courses(token, target_language="es-ES")
+        self.assertEqual(self._room_ids(regional, created_room_ids), [spanish_room_id])
 
-            # A base-code filter matches the regionally-tagged space this
-            # endpoint wrote (issue #53), and excludes the one with no l2.
-            filtered = self._get_courses(token, target_language="es")
-            self.assertEqual(self._room_ids(filtered), [spanish_room_id])
-
-            regional = self._get_courses(token, target_language="es-ES")
-            self.assertEqual(self._room_ids(regional), [spanish_room_id])
-
-            other = self._get_courses(token, target_language="fr")
-            self.assertEqual(self._room_ids(other), [])
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        other = self._get_courses(token, target_language="fr")
+        self.assertEqual(self._room_ids(other, created_room_ids), [])
 
     async def test_members_can_add_space_children(self) -> None:
         """A regular member can attach a room to a server-created course space.
@@ -251,51 +227,21 @@ class TestCreateCourseSpaceE2E(BaseSynapseE2ETest):
         power levels rather than the constant: the test is that Synapse
         accepted and applied the override at creation.
         """
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver()
+        _, token = await self.new_user("teacher", admin=True)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        created = self._create_course_space(
+            token,
+            title="Members add children",
+            teacher_email="teacher@example.com",
+            course_plan_id="plan-space-child",
+        )
+        power_levels = self._get_power_levels(token, created["room_id"])
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="teacher",
-                password="123123123",
-                admin=True,
-            )
-            _, token = await self.login_user(user="teacher", password="123123123")
-
-            created = self._create_course_space(
-                token,
-                title="Members add children",
-                teacher_email="teacher@example.com",
-                course_plan_id="plan-space-child",
-            )
-            power_levels = self._get_power_levels(token, created["room_id"])
-
-            self.assertEqual(power_levels["events"]["m.space.child"], 0)
-            # Only the child write is opened up; other state stays admin-gated.
-            self.assertEqual(power_levels["state_default"], 50)
-            self.assertEqual(power_levels["users_default"], 0)
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        self.assertEqual(power_levels["events"]["m.space.child"], 0)
+        # Only the child write is opened up; other state stays admin-gated.
+        self.assertEqual(power_levels["state_default"], 50)
+        self.assertEqual(power_levels["users_default"], 0)
 
     async def test_course_requires_analytics_access_to_join(self) -> None:
         """A server-created course requires instructor analytics access to join.
@@ -308,55 +254,25 @@ class TestCreateCourseSpaceE2E(BaseSynapseE2ETest):
         event and an explicit false behave the same, which is why this asserts
         the stored event exists and is true rather than merely not false.
         """
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver()
+        _, token = await self.new_user("teacher", admin=True)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        created = self._create_course_space(
+            token,
+            title="Analytics required",
+            teacher_email="teacher@example.com",
+            course_plan_id="plan-analytics",
+        )
+        room_id_path = quote(created["room_id"], safe="")
+        response = requests.get(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}"
+            "/state/pangea.course_settings",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="teacher",
-                password="123123123",
-                admin=True,
-            )
-            _, token = await self.login_user(user="teacher", password="123123123")
-
-            created = self._create_course_space(
-                token,
-                title="Analytics required",
-                teacher_email="teacher@example.com",
-                course_plan_id="plan-analytics",
-            )
-            room_id_path = quote(created["room_id"], safe="")
-            response = requests.get(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}"
-                "/state/pangea.course_settings",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
-            )
-
-            self.assertEqual(response.status_code, 200, response.text)
-            self.assertIs(response.json().get("require_analytics_access"), True)
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIs(response.json().get("require_analytics_access"), True)
 
 
 if __name__ == "__main__":

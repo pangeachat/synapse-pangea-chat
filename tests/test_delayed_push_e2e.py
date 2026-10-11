@@ -28,11 +28,12 @@ _ARRIVAL_SECONDS = 10.0
 
 
 class _RecordingSygnal:
-    """A push gateway that records the event id of every event push it gets."""
+    """A push gateway that records, per pushkey, the event id of every event
+    push it gets."""
 
     def __init__(self) -> None:
         stub = self
-        self.event_ids: List[str] = []
+        self.pushes: List[Tuple[str, str]] = []
         self._lock = threading.Lock()
 
         class _Handler(BaseHTTPRequestHandler):
@@ -45,7 +46,10 @@ class _RecordingSygnal:
                 # Badge-only updates carry no event.
                 if notification.get("event_id"):
                     with stub._lock:
-                        stub.event_ids.append(notification["event_id"])
+                        for device in notification["devices"]:
+                            stub.pushes.append(
+                                (device["pushkey"], notification["event_id"])
+                            )
                 payload = b'{"rejected": []}'
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -56,15 +60,15 @@ class _RecordingSygnal:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.url = f"http://127.0.0.1:{self._server.server_port}/_matrix/push/v1/notify"
 
-    def received(self) -> List[str]:
+    def received(self, pushkey: str) -> List[str]:
         with self._lock:
-            return list(self.event_ids)
+            return [event_id for key, event_id in self.pushes if key == pushkey]
 
-    def wait_for(self, count: int, timeout: float) -> List[str]:
+    def wait_for(self, pushkey: str, count: int, timeout: float) -> List[str]:
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and len(self.received()) < count:
+        while time.monotonic() < deadline and len(self.received(pushkey)) < count:
             time.sleep(0.1)
-        return self.received()
+        return self.received(pushkey)
 
     def start(self) -> "_RecordingSygnal":
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
@@ -106,6 +110,21 @@ class _OpenWebTab:
 
 
 class TestDelayedPushRingE2E(BaseSynapseE2ETest):
+    sygnal: _RecordingSygnal
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.sygnal = _RecordingSygnal().start()
+        cls.addClassCleanup(cls.sygnal.stop)
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The gateway serves every test of the class, and a hold an earlier
+        # test left can release its push into a later one; each test reads
+        # only the pushes to its own bob's phone.
+        self.pushkey = f"bob-phone-{self.tag}"
+
     def _send(self, room_id: str, token: str, event_type: str, content: dict) -> str:
         response = requests.put(
             f"{self.server_url}/_matrix/client/v3/rooms/{quote(room_id)}/send/"
@@ -167,7 +186,7 @@ class TestDelayedPushRingE2E(BaseSynapseE2ETest):
         )
         self.assertEqual(response.status_code, 200, response.text)
 
-    def _set_pusher(self, token: str, url: str) -> None:
+    def _set_pusher(self, token: str) -> None:
         response = requests.post(
             f"{self.server_url}/_matrix/client/v3/pushers/set",
             json={
@@ -175,17 +194,17 @@ class TestDelayedPushRingE2E(BaseSynapseE2ETest):
                 "app_id": "com.talktolearn.chat",
                 "app_display_name": "Pangea Chat",
                 "device_display_name": "Test phone",
-                "pushkey": "bob-phone",
+                "pushkey": self.pushkey,
                 "lang": "en",
-                "data": {"url": url},
+                "data": {"url": self.sygnal.url},
             },
             headers={"Authorization": f"Bearer {token}"},
             timeout=10,
         )
         self.assertEqual(response.status_code, 200, response.text)
 
-    async def _start_synapse_with_delayed_push(self):
-        return await self.start_test_synapse(
+    async def _start_synapse_with_delayed_push(self) -> None:
+        await self.homeserver(
             module_config={
                 "delayed_push": {
                     "enabled": True,
@@ -202,13 +221,11 @@ class TestDelayedPushRingE2E(BaseSynapseE2ETest):
         )
 
     async def _alice_and_bob_in_rooms(
-        self, config_path: str, synapse_dir: str, room_count: int
+        self, room_count: int
     ) -> Tuple[str, str, str, List[str]]:
         """Returns (alice_token, bob_id, bob_token, room_ids)."""
-        await self.register_user(config_path, synapse_dir, "alice", "pw", admin=False)
-        await self.register_user(config_path, synapse_dir, "bob", "pw", admin=False)
-        _, alice_token = await self.login_user("alice", "pw")
-        bob_id, bob_token = await self.login_user("bob", "pw")
+        _, alice_token = await self.new_user("alice")
+        bob_id, bob_token = await self.new_user("bob")
         room_ids = []
         for _ in range(room_count):
             room_id = await self.create_private_room(alice_token)
@@ -238,81 +255,53 @@ class TestDelayedPushRingE2E(BaseSynapseE2ETest):
         self.assertEqual(response.status_code, 200, response.text)
 
     async def test_ring_releases_a_held_message_while_the_callee_is_online(self):
-        postgres = synapse_dir = config_path = None
-        server_process = stdout_thread = stderr_thread = None
-        web_tab = None
-        sygnal = _RecordingSygnal().start()
+        await self._start_synapse_with_delayed_push()
+        alice_token, _, bob_token, (room_id,) = await self._alice_and_bob_in_rooms(
+            room_count=1
+        )
+        self._set_client_ring_push_rule(bob_token)
+        self._set_pusher(bob_token)
+        web_tab = _OpenWebTab(self.server_url, bob_token).start()
         try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_delayed_push()
-            alice_token, _, bob_token, (room_id,) = await self._alice_and_bob_in_rooms(
-                config_path, synapse_dir, room_count=1
-            )
-            self._set_client_ring_push_rule(bob_token)
-            self._set_pusher(bob_token, sygnal.url)
-            web_tab = _OpenWebTab(self.server_url, bob_token).start()
             await asyncio.sleep(1)
 
             # Bob is online on web, so a message to his phone is held. Proving
             # the hold is real here is what makes the ring's arrival meaningful.
             held_message = self._message(room_id, alice_token, "hi")
             await asyncio.sleep(_QUIET_SECONDS)
-            self.assertEqual(sygnal.received(), [], "the message was not held")
+            self.assertEqual(
+                self.sygnal.received(self.pushkey), [], "the message was not held"
+            )
 
             # The ring releases the hold: the held message, then the ring.
             ring = self._ring(room_id, alice_token)
-            self.assertEqual(sygnal.wait_for(2, _ARRIVAL_SECONDS), [held_message, ring])
+            self.assertEqual(
+                self.sygnal.wait_for(self.pushkey, 2, _ARRIVAL_SECONDS),
+                [held_message, ring],
+            )
 
             # Past the ring, holding resumes.
             self._message(room_id, alice_token, "still there?")
             await asyncio.sleep(_QUIET_SECONDS)
-            self.assertEqual(sygnal.received(), [held_message, ring])
+            self.assertEqual(self.sygnal.received(self.pushkey), [held_message, ring])
         finally:
-            if web_tab is not None:
-                web_tab.stop()
-            sygnal.stop()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+            web_tab.stop()
 
     async def test_ring_behind_mentions_read_on_web_still_sends(self):
         # Synapse limits each fetch to 20 rows before dropping read ones, and
         # keeps read mentions, so 20 of them behind the held message used to
         # empty every later fetch and stop all pushes to the phone.
-        postgres = synapse_dir = config_path = None
-        server_process = stdout_thread = stderr_thread = None
-        web_tab = None
-        sygnal = _RecordingSygnal().start()
+        await self._start_synapse_with_delayed_push()
+        (
+            alice_token,
+            bob_id,
+            bob_token,
+            (call_room, busy_room),
+        ) = await self._alice_and_bob_in_rooms(room_count=2)
+        self._set_client_ring_push_rule(bob_token)
+        self._set_pusher(bob_token)
+        web_tab = _OpenWebTab(self.server_url, bob_token).start()
         try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_delayed_push()
-            (
-                alice_token,
-                bob_id,
-                bob_token,
-                (call_room, busy_room),
-            ) = await self._alice_and_bob_in_rooms(
-                config_path, synapse_dir, room_count=2
-            )
-            self._set_client_ring_push_rule(bob_token)
-            self._set_pusher(bob_token, sygnal.url)
-            web_tab = _OpenWebTab(self.server_url, bob_token).start()
             await asyncio.sleep(1)
 
             held_message = self._message(call_room, alice_token, "hi")
@@ -323,18 +312,14 @@ class TestDelayedPushRingE2E(BaseSynapseE2ETest):
                 )
             self._read(busy_room, mention, bob_token)
             await asyncio.sleep(_QUIET_SECONDS)
-            self.assertEqual(sygnal.received(), [], "the messages were not held")
+            self.assertEqual(
+                self.sygnal.received(self.pushkey), [], "the messages were not held"
+            )
 
             ring = self._ring(call_room, alice_token)
-            self.assertEqual(sygnal.wait_for(2, _ARRIVAL_SECONDS), [held_message, ring])
-        finally:
-            if web_tab is not None:
-                web_tab.stop()
-            sygnal.stop()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
+            self.assertEqual(
+                self.sygnal.wait_for(self.pushkey, 2, _ARRIVAL_SECONDS),
+                [held_message, ring],
             )
+        finally:
+            web_tab.stop()

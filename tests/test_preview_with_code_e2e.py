@@ -8,12 +8,28 @@ from .base_e2e import BaseSynapseE2ETest
 logger = logging.getLogger(__name__)
 
 
-PREVIEW_WITH_CODE_URL = (
-    "http://localhost:8008/_synapse/client/pangea/v1/preview_with_code"
-)
+PREVIEW_WITH_CODE_PATH = "/_synapse/client/pangea/v1/preview_with_code"
+
+# The validation test sends more requests from one user than the default
+# burst of 5 allows; the limiter is keyed by user, so the other tests on this
+# server are indifferent to it.
+PREVIEW_MODULE_CONFIG = {"preview_with_code_requests_per_burst": 100}
+
+RATE_LIMIT_MODULE_CONFIG = {
+    "preview_with_code_requests_per_burst": 2,
+    "preview_with_code_burst_duration_seconds": 60,
+}
 
 
-class TestE2EPreviewWithCode(BaseSynapseE2ETest):
+class PreviewWithCodeHelpers:
+    def _code(self, stem: str) -> str:
+        """A 7-character access code unique to this test on the shared server.
+
+        Codes are looked up server-wide, so a fixed one would also find an
+        earlier test's room. The tag carries a digit, so the code stays valid.
+        """
+        return stem[: 7 - len(self.tag)] + self.tag
+
     async def _create_course_room(
         self,
         access_token: str,
@@ -107,6 +123,9 @@ class TestE2EPreviewWithCode(BaseSynapseE2ETest):
             return response.json().get("membership")
         return None
 
+    def _preview_url(self) -> str:
+        return f"{self.server_url}{PREVIEW_WITH_CODE_PATH}"
+
     def _post_preview(
         self,
         body: Any,
@@ -118,355 +137,225 @@ class TestE2EPreviewWithCode(BaseSynapseE2ETest):
             headers["Authorization"] = f"Bearer {access_token}"
         if send_content_type:
             headers["Content-Type"] = "application/json"
-        return requests.post(PREVIEW_WITH_CODE_URL, json=body, headers=headers)
+        return requests.post(self._preview_url(), json=body, headers=headers)
 
+
+class TestE2EPreviewWithCode(PreviewWithCodeHelpers, BaseSynapseE2ETest):
     async def test_preview_with_code_happy_path(self) -> None:
         """Happy path: returns top-level metadata, PL=100 admins, and pangea state-event bag.
         Also verifies the call has no membership side effects on the caller.
         """
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(module_config=PREVIEW_MODULE_CONFIG)
+        admin1_id, admin1_token = await self.new_user("admin1", admin=True)
+        admin2_id, admin2_token = await self.new_user("admin2", admin=True)
+        ta1_id, ta1_token = await self.new_user("ta1", admin=True)
+        student_id, student_token = await self.new_user("student", admin=True)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        access_code = self._code("abc1234")
+        room_id = await self._create_course_room(
+            admin1_token,
+            name="Spanish 101",
+            topic="Beginner Spanish course",
+        )
 
-            for username in ("admin1", "admin2", "ta1", "student"):
-                await self.register_user(
-                    config_path=config_path,
-                    dir=synapse_dir,
-                    user=username,
-                    password="123123123",
-                    admin=True,
-                )
+        await self._set_state_event(
+            room_id=room_id,
+            access_token=admin1_token,
+            event_type="m.room.avatar",
+            content={"url": "mxc://example.org/courseAvatar"},
+        )
 
-            admin1_id, admin1_token = await self.login_user("admin1", "123123123")
-            admin2_id, admin2_token = await self.login_user("admin2", "123123123")
-            ta1_id, ta1_token = await self.login_user("ta1", "123123123")
-            student_id, student_token = await self.login_user("student", "123123123")
+        await self.invite_user_to_room(
+            room_id=room_id, user_id=admin2_id, access_token=admin1_token
+        )
+        await self.accept_room_invitation(room_id=room_id, access_token=admin2_token)
+        await self.invite_user_to_room(
+            room_id=room_id, user_id=ta1_id, access_token=admin1_token
+        )
+        await self.accept_room_invitation(room_id=room_id, access_token=ta1_token)
 
-            access_code = "abc1234"
-            room_id = await self._create_course_room(
-                admin1_token,
-                name="Spanish 101",
-                topic="Beginner Spanish course",
-            )
+        await self._set_power_levels(
+            room_id=room_id,
+            access_token=admin1_token,
+            users_power_levels={
+                admin1_id: 100,
+                admin2_id: 100,
+                ta1_id: 50,
+            },
+        )
 
-            await self._set_state_event(
-                room_id=room_id,
-                access_token=admin1_token,
-                event_type="m.room.avatar",
-                content={"url": "mxc://example.org/courseAvatar"},
-            )
+        await self._set_state_event(
+            room_id=room_id,
+            access_token=admin1_token,
+            event_type="pangea.course_plan",
+            content={"uuid": "course-uuid-123"},
+        )
+        await self._set_state_event(
+            room_id=room_id,
+            access_token=admin1_token,
+            event_type="pangea.teacher_mode",
+            content={"enabled": True, "activitiesToUnlockTopic": 3},
+        )
+        await self._set_state_event(
+            room_id=room_id,
+            access_token=admin1_token,
+            event_type="pangea.analytics_settings",
+            content={"blockedConstructs": []},
+        )
 
-            await self.invite_user_to_room(
-                room_id=room_id, user_id=admin2_id, access_token=admin1_token
-            )
-            await self.accept_room_invitation(
-                room_id=room_id, access_token=admin2_token
-            )
-            await self.invite_user_to_room(
-                room_id=room_id, user_id=ta1_id, access_token=admin1_token
-            )
-            await self.accept_room_invitation(room_id=room_id, access_token=ta1_token)
+        await self._set_join_rules_with_code(
+            room_id=room_id,
+            access_token=admin1_token,
+            access_code=access_code,
+        )
 
-            await self._set_power_levels(
-                room_id=room_id,
-                access_token=admin1_token,
-                users_power_levels={
-                    admin1_id: 100,
-                    admin2_id: 100,
-                    ta1_id: 50,
-                },
-            )
+        self.assertIsNone(
+            await self._get_membership(room_id, student_id, admin1_token),
+            "Student should not have any membership before the call",
+        )
 
-            await self._set_state_event(
-                room_id=room_id,
-                access_token=admin1_token,
-                event_type="pangea.course_plan",
-                content={"uuid": "course-uuid-123"},
-            )
-            await self._set_state_event(
-                room_id=room_id,
-                access_token=admin1_token,
-                event_type="pangea.teacher_mode",
-                content={"enabled": True, "activitiesToUnlockTopic": 3},
-            )
-            await self._set_state_event(
-                room_id=room_id,
-                access_token=admin1_token,
-                event_type="pangea.analytics_settings",
-                content={"blockedConstructs": []},
-            )
+        response = self._post_preview(
+            {"access_code": access_code}, access_token=student_token
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertIn("rooms", data)
+        self.assertEqual(len(data["rooms"]), 1)
 
-            await self._set_join_rules_with_code(
-                room_id=room_id,
-                access_token=admin1_token,
-                access_code=access_code,
-            )
+        room = data["rooms"][0]
+        self.assertEqual(room["room_id"], room_id)
+        self.assertEqual(room["name"], "Spanish 101")
+        self.assertEqual(room["topic"], "Beginner Spanish course")
+        self.assertEqual(room["avatar_url"], "mxc://example.org/courseAvatar")
 
-            self.assertIsNone(
-                await self._get_membership(room_id, student_id, admin1_token),
-                "Student should not have any membership before the call",
-            )
+        admin_user_ids = {a["user_id"] for a in room["admins"]}
+        self.assertEqual(admin_user_ids, {admin1_id, admin2_id})
+        self.assertNotIn(ta1_id, admin_user_ids)
+        self.assertNotIn(student_id, admin_user_ids)
+        for entry in room["admins"]:
+            self.assertIn("avatar_url", entry)
 
-            response = self._post_preview(
-                {"access_code": access_code}, access_token=student_token
-            )
-            self.assertEqual(response.status_code, 200, response.text)
-            data = response.json()
-            self.assertIn("rooms", data)
-            self.assertEqual(len(data["rooms"]), 1)
+        state_events = room["state_events"]
+        self.assertIn("pangea.course_plan", state_events)
+        self.assertEqual(
+            state_events["pangea.course_plan"]["default"]["content"],
+            {"uuid": "course-uuid-123"},
+        )
+        self.assertIn("pangea.teacher_mode", state_events)
+        self.assertEqual(
+            state_events["pangea.teacher_mode"]["default"]["content"],
+            {"enabled": True, "activitiesToUnlockTopic": 3},
+        )
+        self.assertIn("pangea.analytics_settings", state_events)
+        self.assertNotIn(
+            "pangea.course_chat_list",
+            state_events,
+            "Unset pangea types should not appear in the bag",
+        )
+        self.assertNotIn(
+            "m.room.name",
+            state_events,
+            "m.room.* state events live in top-level fields, not the bag",
+        )
 
-            room = data["rooms"][0]
-            self.assertEqual(room["room_id"], room_id)
-            self.assertEqual(room["name"], "Spanish 101")
-            self.assertEqual(room["topic"], "Beginner Spanish course")
-            self.assertEqual(room["avatar_url"], "mxc://example.org/courseAvatar")
-
-            admin_user_ids = {a["user_id"] for a in room["admins"]}
-            self.assertEqual(admin_user_ids, {admin1_id, admin2_id})
-            self.assertNotIn(ta1_id, admin_user_ids)
-            self.assertNotIn(student_id, admin_user_ids)
-            for entry in room["admins"]:
-                self.assertIn("avatar_url", entry)
-
-            state_events = room["state_events"]
-            self.assertIn("pangea.course_plan", state_events)
-            self.assertEqual(
-                state_events["pangea.course_plan"]["default"]["content"],
-                {"uuid": "course-uuid-123"},
-            )
-            self.assertIn("pangea.teacher_mode", state_events)
-            self.assertEqual(
-                state_events["pangea.teacher_mode"]["default"]["content"],
-                {"enabled": True, "activitiesToUnlockTopic": 3},
-            )
-            self.assertIn("pangea.analytics_settings", state_events)
-            self.assertNotIn(
-                "pangea.course_chat_list",
-                state_events,
-                "Unset pangea types should not appear in the bag",
-            )
-            self.assertNotIn(
-                "m.room.name",
-                state_events,
-                "m.room.* state events live in top-level fields, not the bag",
-            )
-
-            self.assertIsNone(
-                await self._get_membership(room_id, student_id, admin1_token),
-                "preview_with_code must be read-only — no invite/join side effects",
-            )
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        self.assertIsNone(
+            await self._get_membership(room_id, student_id, admin1_token),
+            "preview_with_code must be read-only — no invite/join side effects",
+        )
 
     async def test_preview_with_code_admin_code_returns_preview(self) -> None:
         """Admin codes resolve to a preview the same as join codes."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(module_config=PREVIEW_MODULE_CONFIG)
+        creator_id, creator_token = await self.new_user("creator", admin=True)
+        _, viewer_token = await self.new_user("viewer", admin=True)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        admin_code = self._code("admn123")
+        room_id = await self._create_course_room(
+            creator_token, name="Hidden room", topic="Admin code only"
+        )
+        await self._set_power_levels(
+            room_id=room_id,
+            access_token=creator_token,
+            users_power_levels={creator_id: 100},
+        )
+        await self._set_join_rules_with_code(
+            room_id=room_id,
+            access_token=creator_token,
+            admin_access_code=admin_code,
+        )
 
-            for username in ("creator", "viewer"):
-                await self.register_user(
-                    config_path=config_path,
-                    dir=synapse_dir,
-                    user=username,
-                    password="123123123",
-                    admin=True,
-                )
-            creator_id, creator_token = await self.login_user("creator", "123123123")
-            _, viewer_token = await self.login_user("viewer", "123123123")
-
-            admin_code = "admn123"
-            room_id = await self._create_course_room(
-                creator_token, name="Hidden room", topic="Admin code only"
-            )
-            await self._set_power_levels(
-                room_id=room_id,
-                access_token=creator_token,
-                users_power_levels={creator_id: 100},
-            )
-            await self._set_join_rules_with_code(
-                room_id=room_id,
-                access_token=creator_token,
-                admin_access_code=admin_code,
-            )
-
-            response = self._post_preview(
-                {"access_code": admin_code}, access_token=viewer_token
-            )
-            self.assertEqual(response.status_code, 200, response.text)
-            rooms = response.json()["rooms"]
-            self.assertEqual(len(rooms), 1)
-            self.assertEqual(rooms[0]["room_id"], room_id)
-            self.assertEqual({a["user_id"] for a in rooms[0]["admins"]}, {creator_id})
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = self._post_preview(
+            {"access_code": admin_code}, access_token=viewer_token
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        rooms = response.json()["rooms"]
+        self.assertEqual(len(rooms), 1)
+        self.assertEqual(rooms[0]["room_id"], room_id)
+        self.assertEqual({a["user_id"] for a in rooms[0]["admins"]}, {creator_id})
 
     async def test_preview_with_code_validation(self) -> None:
         """Validation: bad bodies, missing auth, unknown codes."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(module_config=PREVIEW_MODULE_CONFIG)
+        _, caller_token = await self.new_user("caller", admin=True)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={"preview_with_code_requests_per_burst": 100}
-            )
+        response = self._post_preview({"access_code": "abc1234"})
+        self.assertEqual(response.status_code, 403, response.text)
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="caller",
-                password="123123123",
-                admin=True,
-            )
-            _, caller_token = await self.login_user("caller", "123123123")
+        response = self._post_preview({}, access_token=caller_token)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("access_code", response.json()["error"])
 
-            response = self._post_preview({"access_code": "abc1234"})
-            self.assertEqual(response.status_code, 403, response.text)
+        response = self._post_preview({"access_code": 123}, access_token=caller_token)
+        self.assertEqual(response.status_code, 400)
 
-            response = self._post_preview({}, access_token=caller_token)
-            self.assertEqual(response.status_code, 400)
-            self.assertIn("access_code", response.json()["error"])
-
+        for bad in ("short", "toolong1", "abcdefg", "abc!234"):
             response = self._post_preview(
-                {"access_code": 123}, access_token=caller_token
+                {"access_code": bad}, access_token=caller_token
             )
-            self.assertEqual(response.status_code, 400)
-
-            for bad in ("short", "toolong1", "abcdefg", "abc!234"):
-                response = self._post_preview(
-                    {"access_code": bad}, access_token=caller_token
-                )
-                self.assertEqual(
-                    response.status_code,
-                    400,
-                    f"expected 400 for invalid access code {bad!r}",
-                )
-
-            response = self._post_preview(
-                {"access_code": "zzz9999"}, access_token=caller_token
-            )
-            self.assertEqual(response.status_code, 400)
-            self.assertIn("No rooms found", response.json()["error"])
-
-            response = requests.post(
-                PREVIEW_WITH_CODE_URL,
-                data="not json",
-                headers={
-                    "Authorization": f"Bearer {caller_token}",
-                    "Content-Type": "text/plain",
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
+            self.assertEqual(
+                response.status_code,
+                400,
+                f"expected 400 for invalid access code {bad!r}",
             )
 
+        response = self._post_preview(
+            {"access_code": "zzz9999"}, access_token=caller_token
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("No rooms found", response.json()["error"])
+
+        response = requests.post(
+            self._preview_url(),
+            data="not json",
+            headers={
+                "Authorization": f"Bearer {caller_token}",
+                "Content-Type": "text/plain",
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+
+class TestE2EPreviewWithCodeRateLimit(PreviewWithCodeHelpers, BaseSynapseE2ETest):
     async def test_preview_with_code_rate_limit(self) -> None:
         """Per-user rate limiter returns 429 once the burst is exceeded."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(module_config=RATE_LIMIT_MODULE_CONFIG)
+        _, caller_token = await self.new_user("caller", admin=True)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "preview_with_code_requests_per_burst": 2,
-                    "preview_with_code_burst_duration_seconds": 60,
-                }
-            )
-
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="caller",
-                password="123123123",
-                admin=True,
-            )
-            _, caller_token = await self.login_user("caller", "123123123")
-
-            for i in range(2):
-                response = self._post_preview(
-                    {"access_code": "zzz9999"}, access_token=caller_token
-                )
-                self.assertEqual(
-                    response.status_code,
-                    400,
-                    f"request {i} should pass the rate limiter",
-                )
-
+        for i in range(2):
             response = self._post_preview(
                 {"access_code": "zzz9999"}, access_token=caller_token
             )
             self.assertEqual(
                 response.status_code,
-                429,
-                "third request in burst should be rate limited",
+                400,
+                f"request {i} should pass the rate limiter",
             )
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+
+        response = self._post_preview(
+            {"access_code": "zzz9999"}, access_token=caller_token
+        )
+        self.assertEqual(
+            response.status_code,
+            429,
+            "third request in burst should be rate limited",
+        )
