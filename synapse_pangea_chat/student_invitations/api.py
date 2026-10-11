@@ -534,6 +534,10 @@ class StudentInvitationHandlers:
             status, request = await self._store.record_request(
                 row["id"], caller, now_ms()
             )
+            if status == "already_in_course":
+                # Identity is the account and its verified address, never the
+                # link it opened (owner rule 2026-10-11): nothing written.
+                return _conflict(*_ALREADY)
             if status == "not_live" or request is None:
                 return 404, NOT_FOUND
             if request["decision"] == DECISION_DENIED:

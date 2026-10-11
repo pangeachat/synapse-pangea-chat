@@ -553,6 +553,53 @@ class TestOpen(_Base):
             ["request_made", "students_added"],
         )
 
+    async def test_an_account_already_in_the_course_opening_another_invitation_writes_nothing(
+        self,
+    ):
+        """Owner rule 2026-10-11: identity comes from the account and its
+        verified address, never from which link was opened. Ana, already
+        joined through her own invitation, opens Ben's link: 409, and no
+        request or event; Ben's own request still stands alone."""
+        ana, ben = await self.h.add(INVITED, "ben@school.example")
+        self.h.verify(STUDENT, INVITED_KEY)
+        status, body = await self.h.open(STUDENT, ana["invitation_id"])
+        self.assertEqual(body["result"], "claimed")
+        events_before = await self.h.events()
+        joins_before = list(self.h.joiner.joins)
+        status, body = await self.h.open(STUDENT, ben["invitation_id"])
+        self.assertEqual(
+            (status, body["errcode"]), (409, "ORG.PANGEA.ALREADY_CLAIMED_IN_COURSE")
+        )
+        self.assertIsNone(await self.h.store.get_request(ben["invitation_id"], STUDENT))
+        self.assertEqual(await self.h.events(), events_before)
+        self.assertEqual(self.h.joiner.joins, joins_before)
+        # The rule holds in the request's own transaction too (an open that
+        # passed the first check while the same account joined elsewhere).
+        status, written = await self.h.store.record_request(
+            ben["invitation_id"], STUDENT, 9
+        )
+        self.assertEqual((status, written), ("already_in_course", None))
+        self.assertIsNone(await self.h.store.get_request(ben["invitation_id"], STUDENT))
+        self.assertEqual(await self.h.events(), events_before)
+        # Ben's real account requests; only Ben is pending, and the row is
+        # not marked as Ana's.
+        status, body = await self.h.open(OTHER, ben["invitation_id"])
+        self.assertEqual(body["result"], "pending")
+        self.assertEqual(
+            [
+                (p["invitation_id"], p["user_id"], p["same_student"])
+                for p in await self.h.pending()
+            ],
+            [(ben["invitation_id"], OTHER, False)],
+        )
+        self.assertIsNone(
+            (await self.h.listing())[ben["invitation_id"]]["same_student_as"]
+        )
+        # In another course Ana's invitation is opened normally.
+        (elsewhere,) = await self.h.add("ben@school.example", room=OTHER_ROOM)
+        status, body = await self.h.open(STUDENT, elsewhere["invitation_id"])
+        self.assertEqual(body["result"], "pending")
+
     async def test_open_answers_one_404_for_unknown_revoked_left_or_taken(self):
         a, b, c = await self.h.add(
             INVITED, "second@school.example", "third@school.example"
@@ -769,10 +816,12 @@ class TestApprovals(_Base):
         await self.h.open(OTHER, single["invitation_id"])
         await self.h.open(THIRD, double["invitation_id"])
         await self.h.open("@fourth:x", double["invitation_id"])
-        # dup's only requesting account already holds a joined invitation here.
+        # dup's only requesting account requested it before claiming another
+        # invitation here (once in the course, an account can no longer
+        # request: owner rule 2026-10-11).
+        await self.h.open(STUDENT, dup["invitation_id"])
         self.h.verify(STUDENT, "member@school.example")
         await self.h.open(STUDENT, none["invitation_id"])
-        await self.h.open(STUDENT, dup["invitation_id"])
         status, body = await self.h.handlers.approve_all(TEACHER, {"room_id": ROOM})
         self.assertEqual(status, 200, body)
         self.assertEqual(body["granted"], [single["invitation_id"]])

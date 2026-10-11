@@ -781,7 +781,10 @@ class StudentInvitationStore:
         """Record this account's request on an ``invited`` row (the caller
         has checked that the account does not have the invited address
         verified). Idempotent: an existing request and its decision stay.
-        Returns ("ok", request) or ("not_live", None)."""
+        Returns ("ok", request), ("not_live", None), or
+        ("already_in_course", None) when the account holds a joined
+        invitation in this course: then nothing is written (owner rule
+        2026-10-11), checked here, in the write's own transaction."""
         await self.ensure()
 
         def write(txn: Any) -> Tuple[str, Optional[Dict]]:
@@ -789,6 +792,8 @@ class StudentInvitationStore:
             row = _select_one(txn, "WHERE id = ?", (invitation_id,))
             if row is None or row["state"] != STATE_INVITED:
                 return "not_live", None
+            if _joined_in_course(txn, row["course_room_id"], user_id) is not None:
+                return "already_in_course", None
             txn.execute(
                 "INSERT INTO pangea_invitation_ack"
                 " (invitation_id, user_id, requested_at_ms, decision)"
