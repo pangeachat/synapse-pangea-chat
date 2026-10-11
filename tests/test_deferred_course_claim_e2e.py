@@ -118,9 +118,32 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
                         "subject": "Invitation reminder",
                         "body": "Your prepared course awaits.",
                         "cta_label": "Claim course",
+                        # The share kit the caller rendered, sent at the claim with the class link filled in.
+                        "claimed_email": {
+                            "subject": "Your class link is ready",
+                            "html": '<p>Share <a href="{{class_url}}">this link</a> ({{class_code}}).</p><p>{{receiving_reason}}</p>',
+                            "text": "Share this link: {{class_url}}\n{{receiving_reason}}",
+                            "receiving_reason": "You asked us for a course.",
+                        },
                     },
                 )
                 self.assertEqual(reminder.status_code, 200, reminder.text)
+                refused = self.post(
+                    "v2/send_course_claim_reminder",
+                    op,
+                    {
+                        "invitation_id": ident,
+                        "subject": "x",
+                        "body": "x",
+                        "cta_label": "x",
+                        "claimed_email": {
+                            "subject": "x",
+                            "html": "<p>{{cta_url}}</p>",
+                            "text": "{{class_url}}",
+                        },
+                    },
+                )
+                self.assertEqual(refused.status_code, 400, refused.text)
                 message = sink.wait_for(EMAIL, "Invitation reminder")
                 new_code = re.search(
                     re.escape(APP) + r"/([a-zA-Z0-9]{7})", body_text(message)
@@ -156,7 +179,13 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
                         "require_analytics_access"
                     ]
                 )
-                self.assertIsNotNone(sink.wait_for(EMAIL, "Invite your students"))
+                share_kit = sink.wait_for(EMAIL, "Your class link is ready")
+                class_code = self.state(teacher, room, "m.room.join_rules")[
+                    "access_code"
+                ]
+                self.assertIn(APP + "/" + class_code, body_text(share_kit))
+                self.assertIn("You asked us for a course.", body_text(share_kit))
+                self.assertNotIn("{{", body_text(share_kit))
                 for link in (code, new_code):
                     replay = self.post(
                         "v1/knock_with_code", teacher, {"access_code": link}

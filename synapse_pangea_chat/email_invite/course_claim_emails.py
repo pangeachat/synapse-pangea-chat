@@ -72,6 +72,46 @@ def validate_rendered(html: str, text: str) -> str | None:
     return None
 
 
+CLASS_SLOT = "{{class_url}}"
+CLASS_CODE_SLOT = "{{class_code}}"
+#: The share kit goes after the claim: it carries the class link, never a claim link or a refusal link.
+CLAIMED_FORBIDDEN_SLOTS = (CLAIM_SLOT, "{{unsubscribe_url}}", "{{cta2_url}}")
+
+
+def validate_claimed(html: str, text: str) -> str | None:
+    """Why a caller-rendered claimed email is refused, or None: both parts carry
+    the class link slot and neither carries a slot this mail cannot fill."""
+    for part, name in ((html, "html"), (text, "text")):
+        if CLASS_SLOT not in part:
+            return f"{name} must contain {CLASS_SLOT}"
+        for slot in CLAIMED_FORBIDDEN_SLOTS:
+            if slot in part:
+                return f"{name} must not contain {slot}: the claimed email carries the class link only"
+    return None
+
+
+def fill_class_slots(
+    html: str,
+    text: str,
+    *,
+    class_url: str,
+    class_code: str,
+    receiving_reason: str,
+    postal_address: str,
+) -> tuple[str, str]:
+    """Literal replacement of the claimed email's slots, the values escaped in the HTML."""
+    values = {
+        CLASS_SLOT: class_url,
+        CLASS_CODE_SLOT: class_code,
+        "{{receiving_reason}}": receiving_reason,
+        "{{postal_address}}": postal_address,
+    }
+    for slot, value in values.items():
+        html = html.replace(slot, html_escape(value, quote=True))
+        text = text.replace(slot, value)
+    return html, text
+
+
 def fill_claim_slots(
     html: str, text: str, *, claim_url: str, receiving_reason: str, postal_address: str
 ) -> tuple[str, str]:
@@ -164,7 +204,29 @@ class CourseClaimMailer:
         course_title: str,
         class_url: str,
         class_code: str,
+        rendered: dict[str, str] | None = None,
     ) -> None:
+        """The share kit at claim: the caller's rendered email with the class link
+        filled in by literal replacement when one was stored for the invitation,
+        else the module's own template (invitations prepared before the caller
+        rendered it). Caller content is never evaluated as a template."""
+        if rendered is not None:
+            html, text = fill_class_slots(
+                rendered["html"],
+                rendered["text"],
+                class_url=class_url,
+                class_code=class_code,
+                receiving_reason=rendered.get("receiving_reason") or "",
+                postal_address=self._postal_address,
+            )
+            await self._send(
+                email_address=email_address,
+                subject=_subject_title(rendered["subject"]),
+                app_name=self._app_name,
+                html=html,
+                text=text,
+            )
+            return
         template_vars = {
             "app_name": self._app_name,
             "course_title": course_title,

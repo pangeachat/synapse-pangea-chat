@@ -12,7 +12,10 @@ from twisted.mail.smtp import SMTPDeliveryError
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
-from synapse_pangea_chat.email_invite.course_claim_emails import validate_rendered
+from synapse_pangea_chat.email_invite.course_claim_emails import (
+    validate_claimed,
+    validate_rendered,
+)
 from synapse_pangea_chat.email_invite.course_claim_reminder import (
     _capture_exception,
     _text_field,
@@ -173,6 +176,7 @@ class CourseInvitationAPI(Resource):
             if not isinstance(reason, str) or len(reason) > 2000:
                 raise SynapseError(400, "Invalid receiving_reason")
             rendered.update(html=html, text=text, receiving_reason=reason.strip())
+        claimed = self._claimed_email(body)
         invitation = await self.invitations.get(ident)
         if not invitation:
             raise SynapseError(404, "Invitation not found")
@@ -181,10 +185,40 @@ class CourseInvitationAPI(Resource):
                 409,
                 "Recover partial claims before sending; completed or revoked invitations cannot be reminded",
             )
+        if claimed is not None:
+            # Stored before the send, so the share kit at claim is the caller's whatever this
+            # delivery's outcome.
+            await self.invitations.store_claimed_email(
+                ident, claimed, self.api._hs.get_clock().time_msec()
+            )
         await self.send(
             ident, await self.code(), invitation["requested_email"], rendered=rendered
         )
         return await self.invitations.status(ident)
+
+    @staticmethod
+    def _claimed_email(body):
+        """The caller-rendered email to send at the claim, validated, or None."""
+        given = body.get("claimed_email")
+        if given is None:
+            return None
+        if not isinstance(given, dict):
+            raise SynapseError(400, "claimed_email must be an object")
+        email = {
+            "subject": _text_field(given, "subject", 200),
+            "html": _text_field(given, "html", 384_000),
+            "text": _text_field(given, "text", 128_000),
+        }
+        if not all(email.values()):
+            raise SynapseError(400, "claimed_email needs subject, html and text")
+        problem = validate_claimed(email["html"], email["text"])
+        if problem:
+            raise SynapseError(400, "claimed_email: " + problem)
+        reason = given.get("receiving_reason", "")
+        if not isinstance(reason, str) or len(reason) > 2000:
+            raise SynapseError(400, "Invalid claimed_email.receiving_reason")
+        email["receiving_reason"] = reason.strip()
+        return email
 
     async def send(self, ident, code, email, spec=None, rendered=None):
         clock = self.api._hs.get_clock()
