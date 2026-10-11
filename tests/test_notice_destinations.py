@@ -399,7 +399,9 @@ class TestSchedulePassThrough(unittest.IsolatedAsyncioTestCase):
 
     async def test_enqueue_honours_the_configured_allowlist(self):
         api = _api()
-        api._hs.get_datastores.return_value.main.db_pool = SQLPool()
+        pool = SQLPool()
+        self.addCleanup(pool.db.close)
+        api._hs.get_datastores.return_value.main.db_pool = pool
         queue = NoticeSchedule(api, AsyncMock(), ["admin.pangea.chat"])
         body = body_with({"kind": "external", "url": BOOKING})
         del body["notice_event_id"]

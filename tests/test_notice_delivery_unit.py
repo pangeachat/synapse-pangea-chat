@@ -627,6 +627,27 @@ class TestClick(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(redirects, [b"https://app.example.test/"])
         api.create_and_send_event_into_room.assert_not_awaited()
 
+    async def test_a_valid_link_always_reaches_its_destination_from_one_address(self):
+        # A class opening the same email on one school network shares an address
+        # (found by the engagement load harness: the 31st click a minute landed on
+        # the app home); a valid link is never throttled, and its open is recorded
+        # once per link per minute so a refetched link cannot flood the DM.
+        api = _api()
+        handler = NoticeClick(api, _config())
+        redirects = []
+        with patch(
+            "synapse_pangea_chat.notice_delivery.click.respond_with_redirect",
+            new=lambda request, url, *a, **k: redirects.append(url),
+        ):
+            for _ in range(40):
+                await handler._async_render_GET(
+                    _FakeRequest(args={b"t": [self._token().encode()]})
+                )
+        self.assertEqual(
+            redirects, [b"https://app.example.test/act-1?roomid=%21s%3Ax"] * 40
+        )
+        self.assertEqual(api.create_and_send_event_into_room.await_count, 1)
+
     async def test_record_failure_still_redirects(self):
         api = _api()
         api.create_and_send_event_into_room = AsyncMock(
