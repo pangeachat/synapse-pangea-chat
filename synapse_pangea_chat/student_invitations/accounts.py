@@ -66,6 +66,10 @@ class Accounts:
         name = await self._main.get_profile_displayname(UserID.from_string(user_id))
         return name if isinstance(name, str) and name else None
 
+    async def is_server_admin(self, user_id: str) -> bool:
+        """Whether the account is a Synapse server admin (never managed)."""
+        return bool(await self._main.is_server_admin(user_id))
+
     async def membership(self, room_id: str, user_id: str) -> Optional[str]:
         membership, _ = await self._main.get_local_current_membership_for_user_in_room(
             user_id, room_id

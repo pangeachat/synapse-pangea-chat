@@ -120,8 +120,9 @@ class StudentClaims:
             raise ClaimJoinFailed(joined.get("action", "failed"))
 
         # A course admin claiming an invitation in their own course is
-        # joined but never managed by it (owner amendment 2026-10-09).
-        is_admin = await self._admins.is_course_admin(room_id, user_id)
+        # joined but never managed by it (owner amendment 2026-10-09), and a
+        # Synapse server admin is never managed at all (owner, 2026-10-12).
+        is_admin = await self._unmanaged(room_id, user_id)
         outcome, claimed = await self._store.claim_txn(
             invitation_id,
             user_id,
@@ -137,6 +138,13 @@ class StudentClaims:
             await self._release_if_gone(room_id, user_id)
             await self._recheck_managed(claimed)
         return outcome, claimed if claimed is not None else row
+
+    async def _unmanaged(self, room_id: str, user_id: str) -> bool:
+        """Never managed here: a course admin of this course, or a Synapse
+        server admin."""
+        if await self._admins.is_course_admin(room_id, user_id):
+            return True
+        return await self._accounts.is_server_admin(user_id)
 
     async def _recheck_managed(self, row: Dict[str, Any]) -> None:
         # The admin check ran before the claim transaction, and a power-level
@@ -167,10 +175,11 @@ class StudentClaims:
     async def apply_managed_rule(self, row: Dict[str, Any]) -> None:
         """C2.5 for one joined invitation: a managed record exactly while its
         claimant is not a course admin (power level 100, creators count) of
-        the course. Raises on failure; callers report it."""
+        the course and not a Synapse server admin. Raises on failure; callers report it.
+        """
         claimant = row["claimant"]
         room_id = row["course_room_id"]
-        is_admin = await self._admins.is_course_admin(room_id, claimant)
+        is_admin = await self._unmanaged(room_id, claimant)
         result = await self._store.set_managed(
             row["id"], claimant, not is_admin, now_ms()
         )

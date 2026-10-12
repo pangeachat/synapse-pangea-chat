@@ -73,6 +73,12 @@ class FakeMain:
         self.threepids: Dict[str, List[Tuple[str, int]]] = {}
         self.displaynames: Dict[str, str] = {}
         self.membership: Dict[Tuple[str, str], str] = {}
+        self.server_admins: Set[str] = set()
+
+    async def is_server_admin(self, user: str) -> bool:
+        # Synapse's store takes the user id string (registration.py).
+        assert isinstance(user, str), user
+        return user in self.server_admins
 
     async def user_get_threepids(self, user_id: str) -> List[Any]:
         return [
@@ -1671,6 +1677,22 @@ class TestManagedRule(_Base):
         )
         self.assertEqual((status, body["invitation"]["state"]), (200, "joined"))
         self.assertIsNone(await self.h.store.managed_record(OTHER, ROOM))
+
+    async def test_a_server_admins_claim_records_no_managed_account(self):
+        """A Synapse server admin is never a managed account (owner decision
+        2026-10-12, B5): not at the claim, not after a power-level change,
+        not at the sign-in repair."""
+        self.h.main.server_admins.add(STUDENT)
+        await self.claimed()
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        await self.release.on_new_event(_power_event(ROOM), {})
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        await self.h.claims.repair_managed_for(STUDENT)
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        # Losing server admin: the next rule application manages the account.
+        self.h.main.server_admins.discard(STUDENT)
+        await self.h.claims.repair_managed_for(STUDENT)
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
 
     async def test_claimant_losing_pl100_gets_a_managed_record(self):
         """Rebuilt from the joined invitation alone: no request, no disclosure
