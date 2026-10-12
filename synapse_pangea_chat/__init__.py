@@ -41,6 +41,7 @@ from synapse_pangea_chat.grant_instructor_analytics_access import (
     GrantInstructorAnalyticsAccess,
 )
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
+from synapse_pangea_chat.member_analytics_profiles import MemberAnalyticsProfiles
 from synapse_pangea_chat.moderation import ChatModeration, tier1_prefilter
 from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.moderation import refusal as moderation_refusal
@@ -472,6 +473,13 @@ class PangeaChat:
                 path="/_synapse/client/pangea/v1/course_member_emails",
                 resource=self.course_member_emails_resource,
             )
+
+        # --- Member Analytics Profiles ---
+        self.member_analytics_profiles_resource = MemberAnalyticsProfiles(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/member_analytics_profiles",
+            resource=self.member_analytics_profiles_resource,
+        )
 
         # --- Safety page: reports and the incident read ---
         # Always registered: a report is recorded whether or not moderation is
@@ -954,6 +962,17 @@ class PangeaChat:
                 "course_member_emails_burst_duration_seconds must be an integer >= 1"
             )
 
+        # --- member_analytics_profiles config ---
+        member_analytics_profiles_limits: Dict[str, int] = {}
+        for key, default in (
+            ("member_analytics_profiles_requests_per_burst", 30),
+            ("member_analytics_profiles_burst_duration_seconds", 60),
+        ):
+            value = config.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{key} must be an integer >= 1")
+            member_analytics_profiles_limits[key] = value
+
         # --- safety incidents config ---
         safety_limits: Dict[str, int] = {}
         for key, default in (
@@ -1417,6 +1436,12 @@ class PangeaChat:
             course_member_emails_enabled=course_member_emails_enabled,
             course_member_emails_requests_per_burst=course_member_emails_requests_per_burst,
             course_member_emails_burst_duration_seconds=course_member_emails_burst_duration_seconds,
+            member_analytics_profiles_requests_per_burst=member_analytics_profiles_limits[
+                "member_analytics_profiles_requests_per_burst"
+            ],
+            member_analytics_profiles_burst_duration_seconds=member_analytics_profiles_limits[
+                "member_analytics_profiles_burst_duration_seconds"
+            ],
             safety_report_requests_per_burst=safety_limits[
                 "safety_report_requests_per_burst"
             ],
