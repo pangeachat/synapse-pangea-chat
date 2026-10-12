@@ -101,6 +101,9 @@ class StudentClaims:
         if row is None:
             return NOT_LIVE, None
         if row["state"] == STATE_JOINED and row["claimant"] == user_id:
+            # Already this account's: re-apply the managed rule, so a later
+            # course-admin or server-admin change is not left stale.
+            await self._recheck_managed(row)
             return CLAIMED, row
         if row["state"] != STATE_INVITED:
             return NOT_LIVE, row

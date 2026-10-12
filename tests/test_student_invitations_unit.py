@@ -1694,6 +1694,17 @@ class TestManagedRule(_Base):
         await self.h.claims.repair_managed_for(STUDENT)
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
 
+    async def test_promoted_to_server_admin_loses_the_record_on_the_next_claim(self):
+        """A claim path that finds the row already joined by this account
+        re-applies the rule, so a later server-admin promotion is not left
+        managed until the next sign-in."""
+        ident = await self.claimed()
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
+        self.h.main.server_admins.add(STUDENT)
+        outcome, _ = await self.h.claims.claim(ident, STUDENT)
+        self.assertEqual(outcome, "claimed")
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+
     async def test_claimant_losing_pl100_gets_a_managed_record(self):
         """Rebuilt from the joined invitation alone: no request, no disclosure
         (seats amendment 2026-10-10)."""
