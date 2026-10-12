@@ -161,13 +161,13 @@ class _Async(Resource):
 async def admit_deployment(
     store: LtiStore, platform_id: str, deployment_id: str, known: frozenset
 ) -> None:
-    """After a verified launch: a deployment not in `known` is the approved
-    platform's new one, recorded once (LTI Core 1.3 section 3.1.3). Raises
-    `LaunchRejected` when it cannot be recorded because the platform is no
-    longer approved; a concurrent launch that recorded it first is fine."""
-    if deployment_id in known:
-        return
-    if await store.bind_deployment(platform_id, deployment_id):
+    """After a verified launch, before it is acted on: the platform must still
+    be approved (it was read before the token was verified), and a deployment
+    not in `known` is its new one, recorded once (LTI Core 1.3 section
+    3.1.3). Raises `LaunchRejected` when the platform is no longer approved."""
+    if deployment_id not in known and await store.bind_deployment(
+        platform_id, deployment_id
+    ):
         logger.info("LTI deployment bound: platform=%s", platform_id)
         return
     current = await store.get_platform(platform_id)

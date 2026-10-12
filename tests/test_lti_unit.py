@@ -910,18 +910,19 @@ class DeploymentBindingStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_admit_refuses_once_approval_is_lost(self):
-        """Bound by a concurrent launch, then the platform is un-approved: a
-        launch that read the deployments before is refused, not let through
-        because the row now exists."""
+        """The platform is un-approved after the launch read it: refused
+        whether the deployment was already known, was bound meanwhile by a
+        concurrent launch, or is new (and then not recorded)."""
         await self.store.approve(self.platform_id, operator="@op:x", now_ms=2)
         await self.store.bind_deployment(self.platform_id, "1:abc")
         self.pool.connection.execute(
             "UPDATE lti_platform SET state = 'pending' WHERE platform_id = ?",
             (self.platform_id,),
         )
-        with self.assertRaises(LaunchRejected) as caught:
-            await admit_deployment(self.store, self.platform_id, "1:abc", frozenset())
-        self.assertEqual(caught.exception.code, "platform_not_approved")
+        for known in (frozenset({"1:abc"}), frozenset()):
+            with self.assertRaises(LaunchRejected) as caught:
+                await admit_deployment(self.store, self.platform_id, "1:abc", known)
+            self.assertEqual(caught.exception.code, "platform_not_approved")
         with self.assertRaises(LaunchRejected):
             await admit_deployment(self.store, self.platform_id, "2:new", frozenset())
         self.assertNotIn("2:new", await self.store.deployments(self.platform_id))
