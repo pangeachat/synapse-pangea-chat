@@ -7,6 +7,7 @@ from urllib.parse import quote
 import psycopg2
 import requests
 
+from synapse_pangea_chat.email_invite.course_claim_emails import class_qr_png
 from tests.base_e2e import BaseSynapseE2ETest
 from tests.smtp_sink import SmtpSink, body_text
 
@@ -105,7 +106,7 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
                 # The share kit the caller rendered, sent at the claim with the class link filled in.
                 "claimed_email": {
                     "subject": "Your class link is ready",
-                    "html": '<p>Share <a href="{{class_url}}">this link</a> ({{class_code}}).</p><p>{{receiving_reason}}</p>',
+                    "html": '<p>Share <a href="{{class_url}}">this link</a> ({{class_code}}).</p><img src="{{class_qr}}" alt="QR code"><p>{{receiving_reason}}</p>',
                     "text": "Share this link: {{class_url}}\n{{receiving_reason}}",
                     "receiving_reason": "You asked us for a course.",
                 },
@@ -160,6 +161,16 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
         share_kit = self.sink.wait_for(email, "Your class link is ready")
         class_code = self.state(teacher, room, "m.room.join_rules")["access_code"]
         self.assertIn(APP + "/" + class_code, body_text(share_kit))
+        # The QR code of that link rides along as an inline image the HTML references.
+        images = [p for p in share_kit.walk() if p.get_content_type() == "image/png"]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(
+            images[0].get_payload(decode=True), class_qr_png(APP + "/" + class_code)
+        )
+        self.assertIn(
+            'src="cid:' + images[0]["Content-ID"].strip("<>") + '"',
+            body_text(share_kit),
+        )
         self.assertIn("You asked us for a course.", body_text(share_kit))
         self.assertNotIn("{{", body_text(share_kit))
         for link in (code, new_code):

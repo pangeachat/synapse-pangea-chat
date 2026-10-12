@@ -408,3 +408,27 @@ class TestClaimedEmailSlots(unittest.TestCase):
         )
         self.assertEqual(html, '<a href="https://app.example/a&amp;b">c1</a>&lt;r&gt;')
         self.assertEqual(text, "https://app.example/a&b 1 St")
+        # The QR code is an image source in the HTML; plain text cannot show it.
+        self.assertIsNone(
+            validate_claimed(
+                '<a href="{{class_url}}">Join</a><img src="{{class_qr}}">',
+                "Join: {{class_url}}",
+            )
+        )
+        self.assertIn(
+            "{{class_qr}}",
+            problem("{{class_url}}", "{{class_url}} {{class_qr}}"),
+        )
+        html, text = fill_class_slots(
+            '<img src="{{class_qr}}"><a href="{{class_url}}">x</a>',
+            "{{class_url}}",
+            class_url="https://app.example/c1",
+            class_code="c1",
+            receiving_reason="",
+            postal_address="",
+            class_qr_src="cid:class-qr.1@host",
+        )
+        self.assertEqual(
+            html,
+            '<img src="cid:class-qr.1@host"><a href="https://app.example/c1">x</a>',
+        )

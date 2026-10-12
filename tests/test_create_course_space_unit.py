@@ -303,10 +303,15 @@ class TestClaimEmailTemplates(unittest.TestCase):
                     course_title="Spanish 1",
                     class_url="https://app.pangea.chat/cls4abc",
                     class_code="cls4abc",
+                    class_qr_src="cid:class-qr.1@host",
                 )
                 self.assertIn("https://app.pangea.chat/cls4abc", out)
                 self.assertIn("cls4abc", out)
                 self.assertNotIn("Apple Inc.", out)
+                if name.endswith(".html"):
+                    self.assertIn('src="cid:class-qr.1@host"', out)
+                else:
+                    self.assertNotIn("cid:", out)
 
     def test_html_escapes_request_text(self) -> None:
         out = (
@@ -419,3 +424,149 @@ class TestMailerBound(unittest.IsolatedAsyncioTestCase):
             bounded.call_args.kwargs["timeout"],
             course_claim_emails.SEND_TIMEOUT_SECONDS,
         )
+
+
+class TestShareKitQrCode(unittest.IsolatedAsyncioTestCase):
+    """The share kit carries the class link's QR code as an inline image
+    (create-course-space.instructions.md): attached where the HTML asks for it,
+    and sent through Synapse's own mailer, whose internals are checked here
+    against the Synapse version the tests run."""
+
+    CLASS_URL = "https://app.pangea.chat/cls4abc"
+
+    def _mailer(self) -> tuple[Any, Any]:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from synapse.handlers.send_email import SendEmailHandler
+
+        from synapse_pangea_chat.email_invite import course_claim_emails
+
+        hs = MagicMock()
+        email_config = hs.config.email
+        email_config.email_notif_from = "%(app)s <noreply@pangea.example>"
+        email_config.email_smtp_host = "smtp.example"
+        email_config.email_smtp_port = 25
+        email_config.email_smtp_user = None
+        email_config.email_smtp_pass = None
+        email_config.require_transport_security = False
+        email_config.enable_smtp_tls = True
+        email_config.force_tls = False
+        email_config.email_tlsname = None
+        handler = SendEmailHandler(hs)
+        sendmail = AsyncMock()
+        handler._sendmail = sendmail  # type: ignore[method-assign]
+
+        env = TestClaimEmailTemplates._env()
+        api = MagicMock()
+        api._hs.config.email.email_app_name = "Pangea Chat"
+        api._hs.get_send_email_handler.return_value = handler
+        api.read_templates.side_effect = lambda names, custom_template_directory: [
+            env.get_template(name) for name in names
+        ]
+        return course_claim_emails.CourseClaimMailer(api), sendmail
+
+    async def _send_claimed(self, rendered: dict[str, str] | None) -> Any:
+        import email
+        from unittest.mock import patch
+
+        from synapse_pangea_chat.email_invite import course_claim_emails
+
+        mailer, sendmail = self._mailer()
+        with patch.object(
+            course_claim_emails,
+            "timeout_deferred",
+            side_effect=lambda deferred, timeout, clock: deferred,
+        ):
+            await mailer.send_course_claimed(
+                email_address="teacher@school.example",
+                course_title="Spanish 1",
+                class_url=self.CLASS_URL,
+                class_code="cls4abc",
+                rendered=rendered,
+            )
+        sendmail.assert_awaited_once()
+        args = sendmail.await_args.args
+        self.assertEqual(
+            args[1:5],
+            ("smtp.example", 25, "noreply@pangea.example", "teacher@school.example"),
+        )
+        return email.message_from_bytes(args[5])
+
+    def _assert_qr_attached(self, message: Any) -> None:
+        from synapse_pangea_chat.email_invite.course_claim_emails import class_qr_png
+
+        self.assertEqual(message.get_content_type(), "multipart/alternative")
+        plain, related = message.get_payload()
+        self.assertEqual(plain.get_content_type(), "text/plain")
+        self.assertEqual(related.get_content_type(), "multipart/related")
+        html_part, image = related.get_payload()
+        self.assertEqual(html_part.get_content_type(), "text/html")
+        self.assertEqual(image.get_content_type(), "image/png")
+        self.assertTrue(image["Content-Disposition"].startswith("inline"))
+        content_id = image["Content-ID"].strip("<>")
+        html = html_part.get_payload(decode=True).decode()
+        self.assertIn(f'src="cid:{content_id}"', html)
+        self.assertNotIn("{{class_qr}}", html)
+        # The image is the QR code of the link the email prints.
+        self.assertEqual(image.get_payload(decode=True), class_qr_png(self.CLASS_URL))
+        self.assertNotIn("cid:", plain.get_payload(decode=True).decode())
+        # The headers Synapse's own mailer sets.
+        self.assertEqual(message["From"], "Pangea Chat <noreply@pangea.example>")
+        self.assertEqual(message["To"], "teacher@school.example")
+        self.assertEqual(message["Auto-Submitted"], "auto-generated")
+        self.assertEqual(message["X-Auto-Response-Suppress"], "All")
+        self.assertIsNotNone(message["Message-ID"])
+        self.assertIsNotNone(message["Date"])
+
+    async def test_a_caller_kit_with_the_slot_carries_the_qr_code(self) -> None:
+        message = await self._send_claimed(
+            {
+                "subject": "Invite your students to Spanish 1",
+                "html": '<p><a href="{{class_url}}">{{class_code}}</a></p>'
+                '<img src="{{class_qr}}" width="200" height="200" alt="QR code">',
+                "text": "{{class_url}} {{class_code}}",
+            }
+        )
+        self.assertEqual(message["Subject"], "Invite your students to Spanish 1")
+        self._assert_qr_attached(message)
+
+    async def test_a_caller_kit_without_the_slot_sends_with_no_image(self) -> None:
+        """A kit stored before the slot existed still sends, through Synapse's
+        own mailer, with no image part."""
+        message = await self._send_claimed(
+            {
+                "subject": "Invite your students to Spanish 1",
+                "html": '<p><a href="{{class_url}}">{{class_code}}</a></p>',
+                "text": "{{class_url}} {{class_code}}",
+            }
+        )
+        self.assertEqual(message.get_content_type(), "multipart/alternative")
+        types = [part.get_content_type() for part in message.walk()]
+        self.assertEqual(types, ["multipart/alternative", "text/plain", "text/html"])
+        self.assertIn(
+            self.CLASS_URL, message.get_payload()[1].get_payload(decode=True).decode()
+        )
+
+    async def test_the_module_template_carries_the_qr_code(self) -> None:
+        message = await self._send_claimed(None)
+        self.assertEqual(message["Subject"], "Invite your students to Spanish 1")
+        self._assert_qr_attached(message)
+
+    def test_the_transport_the_mailer_borrows_takes_what_it_passes(self) -> None:
+        """``_sendmail`` is Synapse-internal: a rename or a changed keyword
+        fails here rather than in a claimed teacher's inbox."""
+        import inspect
+
+        from synapse.handlers import send_email
+
+        params = inspect.signature(send_email._sendmail).parameters
+        for name in (
+            "username",
+            "password",
+            "require_auth",
+            "require_tls",
+            "enable_tls",
+            "force_tls",
+            "tlsname",
+        ):
+            self.assertIn(name, params)
