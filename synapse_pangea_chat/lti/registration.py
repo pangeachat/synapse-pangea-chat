@@ -161,6 +161,10 @@ def registered_client(response: Any) -> tuple[str, str]:
         raise RegistrationRejected("bad_registration_response")
     tool = response.get(TOOL_CONFIGURATION)
     deployment_id = tool.get("deployment_id") if isinstance(tool, dict) else None
+    if deployment_id is None:
+        # Canvas returns it as a top-level member of the response
+        # (canvas-lms render_registration), not inside the tool configuration.
+        deployment_id = response.get("deployment_id")
     if not isinstance(deployment_id, str) or not 0 < len(deployment_id) <= 255:
         raise RegistrationRejected("missing_deployment_id")
     return client_id, deployment_id

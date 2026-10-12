@@ -869,6 +869,33 @@ class RegistrationArtifactTests(unittest.TestCase):
             ("c", "d"),
         )
 
+    def test_registration_response_deployment_id_at_top_level_is_accepted(self):
+        """Canvas returns the deployment id as a top-level member of the
+        registration response, not inside the tool configuration
+        (canvas-lms dynamic_registration_controller.rb render_registration);
+        Moodle puts it inside. Both are read; the tool configuration wins."""
+        tool = "https://purl.imsglobal.org/spec/lti-tool-configuration"
+        self.assertEqual(
+            registered_client(
+                {"client_id": "c", tool: {"domain": "x"}, "deployment_id": "1:abc"}
+            ),
+            ("c", "1:abc"),
+        )
+        self.assertEqual(
+            registered_client(
+                {
+                    "client_id": "c",
+                    "deployment_id": "top",
+                    tool: {"deployment_id": "in"},
+                }
+            ),
+            ("c", "in"),
+        )
+        for bad in ("", 7, None):
+            with self.assertRaises(RegistrationRejected) as caught:
+                registered_client({"client_id": "c", tool: {}, "deployment_id": bad})
+            self.assertEqual(caught.exception.code, "missing_deployment_id")
+
     def test_urls_hang_off_public_baseurl(self):
         urls = tool_urls("https://matrix.pangea.example")
         self.assertEqual(
