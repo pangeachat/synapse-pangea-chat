@@ -126,6 +126,11 @@ class PangeaChatConfig:
     course_member_emails_requests_per_burst: int = 20
     course_member_emails_burst_duration_seconds: int = 60
 
+    # --- member_analytics_profiles config ---
+    # A room member reads every joined member's analytics profile at once.
+    member_analytics_profiles_requests_per_burst: int = 30
+    member_analytics_profiles_burst_duration_seconds: int = 60
+
     # --- safety incidents config ---
     # Per-caller limits on the Safety page's report and read endpoints.
     safety_report_requests_per_burst: int = 30
