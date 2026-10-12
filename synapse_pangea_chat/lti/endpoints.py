@@ -158,6 +158,23 @@ class _Async(Resource):
             )
 
 
+async def admit_deployment(
+    store: LtiStore, platform_id: str, deployment_id: str, known: frozenset
+) -> None:
+    """After a verified launch: a deployment not in `known` is the approved
+    platform's new one, recorded once (LTI Core 1.3 section 3.1.3). Raises
+    `LaunchRejected` when it cannot be recorded because the platform is no
+    longer approved; a concurrent launch that recorded it first is fine."""
+    if deployment_id in known:
+        return
+    if await store.bind_deployment(platform_id, deployment_id):
+        logger.info("LTI deployment bound: platform=%s", platform_id)
+        return
+    current = await store.get_platform(platform_id)
+    if current is None or not current.approved:
+        raise LaunchRejected("platform_not_approved", status=403)
+
+
 class LtiLogin(_Async):
     """OIDC third-party login initiation (GET or POST from the platform)."""
 
@@ -299,16 +316,9 @@ class LtiLaunch(_Async):
                 launch_url=self._urls.launch,
                 allow_new_deployment=True,
             )
-            if launch.deployment_id not in known:
-                # First verified launch of a deployment of this approved
-                # platform: recorded once. Refused if the platform lost its
-                # approval since it was read above.
-                if await self._store.bind_deployment(platform_id, launch.deployment_id):
-                    logger.info("LTI deployment bound: platform=%s", platform_id)
-                elif launch.deployment_id not in (
-                    await self._store.deployments(platform_id)
-                ):
-                    raise LaunchRejected("platform_not_approved", status=403)
+            await admit_deployment(
+                self._store, platform_id, launch.deployment_id, known
+            )
         except LaunchRejected as rejected:
             logger.info(
                 "LTI launch rejected: reason=%s platform=%s",

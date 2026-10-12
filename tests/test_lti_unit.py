@@ -22,6 +22,7 @@ from twisted.python.failure import Failure
 
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.lti import keys as lti_keys
+from synapse_pangea_chat.lti.endpoints import admit_deployment
 from synapse_pangea_chat.lti.keys import LtiConfigError, parse_lti_config
 from synapse_pangea_chat.lti.platform_jwks import PlatformKeyCache
 from synapse_pangea_chat.lti.registration import (
@@ -869,7 +870,8 @@ class DeploymentBindingStoreTests(unittest.IsolatedAsyncioTestCase):
     un-approval (the state is checked in the same statement)."""
 
     async def asyncSetUp(self) -> None:
-        self.store = LtiStore(DbPoolDouble())
+        self.pool = DbPoolDouble()
+        self.store = LtiStore(self.pool)
         self.platform_id = await self.store.create_platform(
             issuer="https://canvas.instructure.com",
             client_id="10000000000001",
@@ -898,6 +900,31 @@ class DeploymentBindingStoreTests(unittest.IsolatedAsyncioTestCase):
             frozenset({"1:abc", "2:def"}),
         )
         self.assertFalse(await self.store.bind_deployment("no-such-platform", "x"))
+
+    async def test_admit_records_a_new_deployment_of_an_approved_platform(self):
+        await self.store.approve(self.platform_id, operator="@op:x", now_ms=2)
+        await admit_deployment(self.store, self.platform_id, "1:abc", frozenset())
+        await admit_deployment(self.store, self.platform_id, "1:abc", frozenset())
+        self.assertEqual(
+            await self.store.deployments(self.platform_id), frozenset({"1:abc"})
+        )
+
+    async def test_admit_refuses_once_approval_is_lost(self):
+        """Bound by a concurrent launch, then the platform is un-approved: a
+        launch that read the deployments before is refused, not let through
+        because the row now exists."""
+        await self.store.approve(self.platform_id, operator="@op:x", now_ms=2)
+        await self.store.bind_deployment(self.platform_id, "1:abc")
+        self.pool.connection.execute(
+            "UPDATE lti_platform SET state = 'pending' WHERE platform_id = ?",
+            (self.platform_id,),
+        )
+        with self.assertRaises(LaunchRejected) as caught:
+            await admit_deployment(self.store, self.platform_id, "1:abc", frozenset())
+        self.assertEqual(caught.exception.code, "platform_not_approved")
+        with self.assertRaises(LaunchRejected):
+            await admit_deployment(self.store, self.platform_id, "2:new", frozenset())
+        self.assertNotIn("2:new", await self.store.deployments(self.platform_id))
 
 
 class InstructureHostsTests(unittest.TestCase):
