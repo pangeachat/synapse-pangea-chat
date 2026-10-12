@@ -32,7 +32,7 @@ Each profile is returned exactly as stored. The client parses it the same way it
 
 ## One response, no paging
 
-The whole room comes back at once. The Leaderboard must have every member's numbers before it ranks anyone, so one page of profiles would give it nothing it could show. A profile is a few hundred bytes, so a room of several hundred members is a few hundred kilobytes at most.
+The whole room comes back at once. The Leaderboard must have every member's numbers before it ranks anyone, so one page of profiles would give it nothing it could show. A profile is a few hundred bytes, so a room of several hundred members is typically a few hundred kilobytes.
 
 ## What it never does
 

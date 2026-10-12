@@ -81,7 +81,11 @@ class MemberAnalyticsProfiles(Resource):
                 return
 
             room_ids = request.args.get(b"room_id") or []
-            room_id = room_ids[0].decode("utf-8") if len(room_ids) == 1 else ""
+            try:
+                room_id = room_ids[0].decode("utf-8") if len(room_ids) == 1 else ""
+            # silent-ok: bytes that are not UTF-8 are no room id - answered 400
+            except UnicodeDecodeError:
+                room_id = ""
             if not _is_valid_room_id(room_id):
                 respond_with_json(
                     request,
@@ -111,6 +115,9 @@ class MemberAnalyticsProfiles(Resource):
                 iterable=member_ids,
                 retcols=("full_user_id", "fields"),
                 desc="pangea_member_analytics_profiles",
+                # One query for the whole room; the default reads it 100
+                # members at a time.
+                batch_size=max(1, len(member_ids)),
             )
             profiles = analytics_profiles_by_member(member_ids, rows)
             logger.info(
@@ -155,12 +162,27 @@ def analytics_profiles_by_member(
         fields = fields_by_user.get(user_id)
         # SQLite has no JSON type and hands back the column as text.
         if isinstance(fields, str):
-            fields = json.loads(fields)
-        if isinstance(fields, Mapping) and ANALYTICS_PROFILE_FIELD in fields:
-            profiles[user_id] = {
-                ANALYTICS_PROFILE_FIELD: fields[ANALYTICS_PROFILE_FIELD]
-            }
+            try:
+                fields = json.loads(fields)
+            # silent-ok: left as text, which is logged below as unexpected
+            except ValueError:
+                pass
+        if fields is None:
+            profiles[user_id] = {}
+        elif isinstance(fields, Mapping):
+            profiles[user_id] = (
+                {ANALYTICS_PROFILE_FIELD: fields[ANALYTICS_PROFILE_FIELD]}
+                if ANALYTICS_PROFILE_FIELD in fields
+                else {}
+            )
         else:
+            # Synapse writes only an object or NULL to this column.
+            logger.warning(
+                "member_analytics_profiles: unexpected profile fields type %s "
+                "for %s; answered as no profile",
+                type(fields).__name__,
+                user_id,
+            )
             profiles[user_id] = {}
     return profiles
 

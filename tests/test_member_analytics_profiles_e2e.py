@@ -53,7 +53,7 @@ class MemberAnalyticsProfilesHelpers:
         url = f"{self.server_url}/_matrix/client/v3/profile/{quote(user_id, safe='')}"
         return f"{url}/{field}" if field else url
 
-    def _publish(self, user_id: str, token: str, profile: Dict[str, Any]) -> None:
+    def _publish(self, user_id: str, token: str, profile: Any) -> None:
         resp = requests.put(
             self._profile_url(user_id, FIELD),
             json={FIELD: profile},
@@ -138,13 +138,63 @@ class TestMemberAnalyticsProfilesEndpoint(
 
         # Validation and authentication.
         self.assertEqual(self._call({"room_id": room}, None).status_code, 401)
-        for bad in ({}, {"room_id": ""}, {"room_id": "not-a-room"}):
+        # The last is two bytes that are not UTF-8.
+        for bad in ({}, {"room_id": ""}, {"room_id": "not-a-room"}, "room_id=%FF%FE"):
             with self.subTest(bad=bad):
                 self.assertEqual(self._call(bad, alice).status_code, 400)
         two_rooms = self._call([("room_id", room), ("room_id", room)], alice)
         self.assertEqual(two_rooms.status_code, 400, two_rooms.text)
 
         self.assertIn("member_analytics_profiles: room=", "\n".join(self.server_log()))
+
+    async def test_a_kicked_or_banned_caller_is_refused(self) -> None:
+        await self.homeserver(
+            module_config=_module_config(),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
+        (_, alice) = await self.new_user("alice")
+        (frank_id, frank) = await self.new_user("frank")
+        (gina_id, gina) = await self.new_user("gina")
+        (_, outsider) = await self.new_user("outsider")
+        room = self._create_room(alice)
+        for token in (frank, gina):
+            self._room_post(room, "join", token)
+        self._room_post(room, "kick", alice, user_id=frank_id)
+        self._room_post(room, "ban", alice, user_id=gina_id)
+
+        refusal = self._call({"room_id": room}, outsider)
+        self.assertEqual(refusal.status_code, 403, refusal.text)
+        for token in (frank, gina):
+            resp = self._call({"room_id": room}, token)
+            self.assertEqual(resp.status_code, 403, resp.text)
+            self.assertEqual(resp.json(), refusal.json())
+
+    async def test_a_value_that_is_not_an_object_comes_back_as_stored(
+        self,
+    ) -> None:
+        await self.homeserver(
+            module_config=_module_config(),
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
+        (alice_id, alice) = await self.new_user("alice")
+        (hank_id, hank) = await self.new_user("hank")
+        (ivy_id, ivy) = await self.new_user("ivy")
+        # The profile API accepts any JSON value for a custom field, so a
+        # member can store one the app never writes.
+        self._publish(hank_id, hank, None)
+        self._publish(ivy_id, ivy, "just-a-string")
+        room = self._create_room(alice)
+        for token in (hank, ivy):
+            self._room_post(room, "join", token)
+
+        self.assertEqual(
+            self._profiles(room, alice),
+            {
+                alice_id: {},
+                hank_id: {FIELD: None},
+                ivy_id: {FIELD: "just-a-string"},
+            },
+        )
 
 
 class TestMemberAnalyticsProfilesRateLimit(

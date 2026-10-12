@@ -50,6 +50,18 @@ class TestAnalyticsProfilesByMember(unittest.TestCase):
         )
         self.assertEqual(profiles, {"@a:home": {}})
 
+    def test_an_unexpected_column_value_is_logged_and_answered_empty(self):
+        with self.assertLogs(
+            "synapse.module.synapse_pangea_chat.member_analytics_profiles",
+            level="WARNING",
+        ) as logs:
+            profiles = analytics_profiles_by_member(
+                ["@a:home", "@b:home"],
+                [("@a:home", ["not", "an", "object"]), ("@b:home", "not json")],
+            )
+        self.assertEqual(profiles, {"@a:home": {}, "@b:home": {}})
+        self.assertEqual(len(logs.records), 2)
+
 
 class TestRateLimit(unittest.TestCase):
     def setUp(self) -> None:
