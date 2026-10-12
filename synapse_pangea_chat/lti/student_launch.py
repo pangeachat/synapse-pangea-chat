@@ -11,11 +11,15 @@ Launch redirects (`LaunchRedirects`):
 
 | Launch | Goes to |
 |---|---|
-| Learner, not linked | `<app>/lti/link?ticket=<learner ticket>&course=<title>` |
-| Learner, linked | its matching invitations claimed, then `<app>/lti/token?loginToken=<token>` |
+| Learner, not linked | `<app>/lti/link#ticket=<learner ticket>&course=<title>` |
+| Learner, linked | its matching invitations claimed, then `<app>/lti/token#loginToken=<token>` |
 | Learner, linked, a Synapse server admin | `<app>/home/login` (own sign-in; no token, no ticket, no claim) |
-| Instructor/Administrator, not linked | `<app>/lti/link?ticket=<instructor ticket>&role=instructor` |
-| Instructor/Administrator, linked | `<admin-dash>/canvas-connect?ticket=<connect ticket>` |
+| Instructor/Administrator, not linked | `<app>/lti/link#ticket=<instructor ticket>&role=instructor` |
+| Instructor/Administrator, linked | `<admin-dash>/canvas-connect#ticket=<connect ticket>` |
+
+Tickets and login tokens ride in the URL fragment, never the query: a
+browser never sends a fragment to the server, so no web host or proxy can
+log them (CONTRACTS C5.2, 2026-10-12).
 
 The link step (`LinkStep`, `POST lti/link`, body `{ticket}`) needs the
 account's own token, checks the body, then consumes the ticket in one update,
@@ -181,7 +185,7 @@ class LaunchRedirects:
                 raise LaunchRejected("missing_nrps")
             if user_id is None:
                 ticket = await self._ticket(KIND_INSTRUCTOR, launch, nrps_url, None)
-                return f"{self._app}/lti/link?" + urlencode(
+                return f"{self._app}/lti/link#" + urlencode(
                     {"ticket": ticket, "role": "instructor"}
                 )
             return await issue_connect_url(
@@ -205,13 +209,13 @@ class LaunchRedirects:
             # The exact-identity rows (including any imported since the
             # link) are claimed now; the identity is the match.
             await self._claim_rows(launch, user_id)
-            return f"{self._app}/lti/token?" + urlencode({"loginToken": token})
+            return f"{self._app}/lti/token#" + urlencode({"loginToken": token})
         ticket = await self._ticket(KIND_LEARNER, launch, None, None)
         query = {"ticket": ticket}
         title = _course_title(launch)
         if title is not None:
             query["course"] = title
-        return f"{self._app}/lti/link?" + urlencode(query)
+        return f"{self._app}/lti/link#" + urlencode(query)
 
     async def _claim_rows(self, launch: Launch, user_id: str) -> None:
         """Never raises: a claim that fails is reported, and the launch
@@ -246,7 +250,7 @@ class LaunchRedirects:
             "LTI launch redirected: platform=%s path=%s to=%s",
             launch.platform_id,
             launch.path,
-            location.split("?", 1)[0],
+            location.split("#", 1)[0].split("?", 1)[0],
         )
         request.setHeader(b"Cache-Control", b"no-store")
         request.setHeader(b"Referrer-Policy", b"no-referrer")

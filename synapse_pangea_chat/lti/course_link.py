@@ -116,7 +116,8 @@ async def issue_connect_url(
         now_ms=now,
     )
     base = admin_dash_base_url.rstrip("/")
-    return f"{base}/canvas-connect?" + urlencode({"ticket": ticket})
+    # The fragment, never the query: no web host can log it (C5.2).
+    return f"{base}/canvas-connect#" + urlencode({"ticket": ticket})
 
 
 class CourseLinks:

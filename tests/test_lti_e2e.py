@@ -510,7 +510,9 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         """(role path, target without query) of a verified launch's redirect."""
         self.assertEqual(response.status_code, 302, response.text)
         location = urlparse(response.headers["Location"])
-        query = parse_qs(location.query)
+        # Hand-off values ride in the fragment, so no web host logs them.
+        self.assertEqual(location.query, "")
+        query = parse_qs(location.fragment)
         self.assertIn("ticket", query)
         path = "instructor" if query.get("role") == ["instructor"] else "learner"
         return path, f"{location.scheme}://{location.netloc}{location.path}"

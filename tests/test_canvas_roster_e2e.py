@@ -159,7 +159,9 @@ class CanvasRosterE2ETest(BaseSynapseE2ETest):
         self.assertEqual(response.status_code, 302, response.text)
         self.assertEqual(response.headers.get("Cache-Control"), "no-store")
         location = urlparse(response.headers["Location"])
-        query = {k: v[0] for k, v in parse_qs(location.query).items()}
+        # Hand-off values ride in the fragment, so no web host logs them.
+        self.assertEqual(location.query, "")
+        query = {k: v[0] for k, v in parse_qs(location.fragment).items()}
         return f"{location.scheme}://{location.netloc}{location.path}", query
 
     # -- the flow -------------------------------------------------------------
@@ -263,7 +265,8 @@ class CanvasRosterE2ETest(BaseSynapseE2ETest):
             f"{connect_url.scheme}://{connect_url.netloc}{connect_url.path}",
             DASH + "/canvas-connect",
         )
-        connect_ticket = parse_qs(connect_url.query)["ticket"][0]
+        self.assertEqual(connect_url.query, "")
+        connect_ticket = parse_qs(connect_url.fragment)["ticket"][0]
 
         status = self.call(
             "GET",

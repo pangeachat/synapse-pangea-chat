@@ -130,6 +130,13 @@ def _page(members: List[Dict[str, Any]], context: str = CONTEXT) -> Dict[str, An
     return {"id": NRPS_URL, "context": {"id": context}, "members": members}
 
 
+
+def fragment_ticket(url: str) -> str:
+    """The ticket of a hand-off URL: in its fragment, never its query."""
+    parts = urlsplit(url)
+    assert parts.query == "", url
+    return parse_qs(parts.fragment)["ticket"][0]
+
 class FakeNrpsHttp:
     """The two platform calls NRPS makes: the token POST and the page GET."""
 
@@ -298,10 +305,14 @@ class Canvas:
         )
 
     async def go(self, launch: Launch) -> Tuple[str, Dict[str, str]]:
-        """The launch's redirect: (scheme://host/path, query)."""
+        """The launch's redirect: (scheme://host/path, fragment params).
+
+        The hand-off values travel in the URL fragment, never the query, so
+        no web host can log them (C5.2, 2026-10-12)."""
         location = await self.redirects.location(launch)
         parts = urlsplit(location)
-        query = {k: v[0] for k, v in parse_qs(parts.query).items()}
+        assert parts.query == "", location
+        query = {k: v[0] for k, v in parse_qs(parts.fragment).items()}
         return f"{parts.scheme}://{parts.netloc}{parts.path}", query
 
     async def ticket(self, launch: Launch) -> str:
@@ -333,7 +344,7 @@ class Canvas:
             return query["ticket"]
         status, body = await self.l1(teacher, query["ticket"])
         assert status == 200, body
-        return parse_qs(urlsplit(body["connect_url"]).query)["ticket"][0]
+        return fragment_ticket(body["connect_url"])
 
     async def connected(self, room: str = ROOM, **launch: Any) -> None:
         status, body = await self.connect(
@@ -461,7 +472,7 @@ class TestInstructorLink(_Base):
         self.assertEqual(await self.c.links.linked_user(ISSUER, TEACHER_SUB), TEACHER)
         self.assertEqual(self.c.login_tokens.issued, [])
         # The connect ticket it issues is bound to the signed-in account.
-        ticket = parse_qs(urlsplit(body["connect_url"]).query)["ticket"][0]
+        ticket = fragment_ticket(body["connect_url"])
         status, body = await self.c.connect(OTHER, ticket)
         self.assertEqual(status, 403, body)
         self.assertEqual(body["errcode"], "ORG.PANGEA.TICKET_WRONG_ACCOUNT")
@@ -1814,7 +1825,7 @@ class TestNoLoginTokenForServerAdmins(_Base):
                 )
             else:
                 self.assertEqual(script, [False, True])
-                self.assertTrue(location.startswith(APP + "/lti/token?loginToken="))
+                self.assertTrue(location.startswith(APP + "/lti/token#loginToken="))
                 self.assertEqual((await self.c.h.row(row["id"]))["state"], "joined")
 
     async def test_non_admin_later_launch_is_unchanged(self):
