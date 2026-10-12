@@ -104,10 +104,11 @@ class LtiStore:
         token_url: str,
         jwks_uri: str,
         product_family: Optional[str],
-        deployment_id: str,
+        deployment_id: Optional[str],
         now_ms: int,
     ) -> str:
-        """Record a newly registered platform as pending; returns its id."""
+        """Record a newly registered platform as pending; returns its id. A
+        registration that reported no deployment records none."""
         await self.ensure()
         platform_id = secrets.token_urlsafe(16)
 
@@ -134,10 +135,12 @@ class LtiStore:
                     now_ms,
                 ),
             )
-            txn.execute(
-                "INSERT INTO lti_deployment (platform_id, deployment_id) VALUES (?, ?)",
-                (platform_id, deployment_id),
-            )
+            if deployment_id is not None:
+                txn.execute(
+                    "INSERT INTO lti_deployment (platform_id, deployment_id)"
+                    " VALUES (?, ?)",
+                    (platform_id, deployment_id),
+                )
             return platform_id
 
         return await self._db.runInteraction("lti_create_platform", insert)
@@ -239,6 +242,25 @@ class LtiStore:
             return frozenset(row[0] for row in txn.fetchall())
 
         return await self._db.runInteraction("lti_deployments", select)
+
+    async def bind_deployment(self, platform_id: str, deployment_id: str) -> bool:
+        """Record a deployment of an APPROVED platform, first seen in a
+        verified launch. True when newly recorded; False when it was already
+        known or the platform is not approved (checked in the same statement,
+        so a platform un-approved meanwhile records nothing)."""
+        await self.ensure()
+
+        def insert(txn: Any) -> bool:
+            txn.execute(
+                """INSERT INTO lti_deployment (platform_id, deployment_id)
+                SELECT platform_id, ? FROM lti_platform
+                WHERE platform_id = ? AND state = 'approved'
+                ON CONFLICT (platform_id, deployment_id) DO NOTHING""",
+                (deployment_id, platform_id),
+            )
+            return txn.rowcount == 1
+
+        return await self._db.runInteraction("lti_bind_deployment", insert)
 
     # -- state and nonce ----------------------------------------------------
 

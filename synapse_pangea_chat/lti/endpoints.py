@@ -85,20 +85,6 @@ def _client_ip(request: SynapseRequest) -> str:
     return request.getClientAddress().host
 
 
-def _refuse(request: SynapseRequest, status: int, reason: str) -> None:
-    errcode = (
-        "ORG.PANGEA.LTI_PLATFORM_NOT_APPROVED"
-        if reason == "platform_not_approved"
-        else "ORG.PANGEA.LTI_REJECTED"
-    )
-    respond_with_json(
-        request,
-        status,
-        {"errcode": errcode, "error": "LTI request refused", "reason": reason},
-        send_cors=False,
-    )
-
-
 _LAUNCH_REFUSED_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Pangea Chat</title></head>
 <body><p>Pangea Chat could not open this page from your course. Go back to
@@ -196,37 +182,34 @@ class LtiLogin(_Async):
 
     async def _handle(self, request: SynapseRequest) -> None:
         if self._rate_limiter.is_rate_limited(_client_ip(request)):
-            _refuse(request, 429, "rate_limited")
+            refuse_launch(request, 429, "rate_limited")
             return
         issuer = _arg(request, "iss")
         login_hint = _arg(request, "login_hint")
         target = _arg(request, "target_link_uri")
         client_id = _arg(request, "client_id", 255)
-        deployment_id = _arg(request, "lti_deployment_id", 255)
         message_hint = _arg(request, "lti_message_hint")
         if issuer is None or login_hint is None:
-            _refuse(request, 400, "missing_parameter")
+            refuse_launch(request, 400, "missing_parameter")
             return
         if target != self._urls.launch:
-            _refuse(request, 400, "bad_target_link_uri")
+            refuse_launch(request, 400, "bad_target_link_uri")
             return
         platforms = await self._store.platforms_for_issuer(issuer, client_id)
         if not platforms:
-            _refuse(request, 400, "unknown_platform")
+            refuse_launch(request, 400, "unknown_platform")
             return
         if len(platforms) > 1:
-            _refuse(request, 400, "ambiguous_platform")
+            refuse_launch(request, 400, "ambiguous_platform")
             return
         [platform] = platforms
         if not platform.approved:
             logger.info("LTI login refused: platform=%s pending", platform.platform_id)
-            _refuse(request, 403, "platform_not_approved")
+            refuse_launch(request, 403, "platform_not_approved")
             return
-        if deployment_id is not None and deployment_id not in (
-            await self._store.deployments(platform.platform_id)
-        ):
-            _refuse(request, 403, "unknown_deployment")
-            return
+        # An unknown `lti_deployment_id` is not refused here: an approved
+        # platform's new deployment is recorded from its verified launch (LTI
+        # Core 1.3 section 3.1.3), and login carries no signature to trust.
 
         state, nonce = await self._store.issue_state(
             platform.platform_id, now_ms=self._clock.time_msec(), ttl_ms=STATE_TTL_MS
@@ -306,14 +289,26 @@ class LtiLaunch(_Async):
             key = await self._key_cache.get_key(platform.jwks_uri, kid)
             if key is None:
                 raise LaunchRejected("unknown_key")
+            known = await self._store.deployments(platform_id)
             launch = verify_launch(
                 id_token or "",
                 platform=platform,
                 key=key,
                 expected_nonce=nonce,
-                known_deployments=await self._store.deployments(platform_id),
+                known_deployments=known,
                 launch_url=self._urls.launch,
+                allow_new_deployment=True,
             )
+            if launch.deployment_id not in known:
+                # First verified launch of a deployment of this approved
+                # platform: recorded once. Refused if the platform lost its
+                # approval since it was read above.
+                if await self._store.bind_deployment(platform_id, launch.deployment_id):
+                    logger.info("LTI deployment bound: platform=%s", platform_id)
+                elif launch.deployment_id not in (
+                    await self._store.deployments(platform_id)
+                ):
+                    raise LaunchRejected("platform_not_approved", status=403)
         except LaunchRejected as rejected:
             logger.info(
                 "LTI launch rejected: reason=%s platform=%s",

@@ -130,12 +130,12 @@ def _page(members: List[Dict[str, Any]], context: str = CONTEXT) -> Dict[str, An
     return {"id": NRPS_URL, "context": {"id": context}, "members": members}
 
 
-
 def fragment_ticket(url: str) -> str:
     """The ticket of a hand-off URL: in its fragment, never its query."""
     parts = urlsplit(url)
     assert parts.query == "", url
     return parse_qs(parts.fragment)["ticket"][0]
+
 
 class FakeNrpsHttp:
     """The two platform calls NRPS makes: the token POST and the page GET."""

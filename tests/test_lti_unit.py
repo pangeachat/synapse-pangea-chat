@@ -32,7 +32,7 @@ from synapse_pangea_chat.lti.registration import (
     registration_request,
     tool_urls,
 )
-from synapse_pangea_chat.lti.store import Platform
+from synapse_pangea_chat.lti.store import LtiStore, Platform
 from synapse_pangea_chat.lti.validation import (
     LaunchRejected,
     read_header,
@@ -51,6 +51,7 @@ from .lti_platform_double import (
     public_jwk,
     public_pem,
 )
+from .moderation_doubles import DbPoolDouble
 
 TOOL_KEY = new_rsa_key()
 OTHER_KEY = new_rsa_key()
@@ -216,6 +217,50 @@ class LaunchValidationTests(unittest.TestCase):
     def test_missing_deployment(self):
         token = self.double.sign(self._claims(**{LTI + "deployment_id": _DROP}))
         self.assertRejected(token, "unknown_deployment")
+
+    def test_new_deployment_accepted_only_when_binding_is_allowed(self):
+        """An approved platform's launch may carry a deployment not seen yet
+        (LTI Core 1.3 section 3.1.3: several deployments share one client_id);
+        the launch endpoint then records it. Malformed ids never pass."""
+        token = self.double.sign(self._claims(**{LTI + "deployment_id": "dep-new"}))
+        launch = verify_launch(
+            token,
+            platform=self.platform,
+            key=_pyjwk(self.double),
+            expected_nonce=self.nonce,
+            known_deployments=frozenset(),
+            launch_url=LAUNCH_URL,
+            allow_new_deployment=True,
+        )
+        self.assertEqual(launch.deployment_id, "dep-new")
+        self.assertRejected(token, "unknown_deployment", deployments=frozenset())
+        for bad in (_DROP, "", 7, "x" * 256):
+            token = self.double.sign(self._claims(**{LTI + "deployment_id": bad}))
+            with self.assertRaises(LaunchRejected) as caught:
+                verify_launch(
+                    token,
+                    platform=self.platform,
+                    key=_pyjwk(self.double),
+                    expected_nonce=self.nonce,
+                    known_deployments=frozenset(),
+                    launch_url=LAUNCH_URL,
+                    allow_new_deployment=True,
+                )
+            self.assertEqual(caught.exception.code, "unknown_deployment", repr(bad))
+
+    def test_binding_never_applies_to_a_pending_platform(self):
+        token = self.double.sign(self._claims(**{LTI + "deployment_id": "dep-new"}))
+        with self.assertRaises(LaunchRejected) as caught:
+            verify_launch(
+                token,
+                platform=_platform(state="pending"),
+                key=_pyjwk(self.double),
+                expected_nonce=self.nonce,
+                known_deployments=frozenset(),
+                launch_url=LAUNCH_URL,
+                allow_new_deployment=True,
+            )
+        self.assertEqual(caught.exception.code, "platform_not_approved")
 
     def test_wrong_message_type(self):
         token = self.double.sign(
@@ -818,6 +863,138 @@ class OpenIdConfigurationCheckTests(unittest.TestCase):
             )
 
 
+class DeploymentBindingStoreTests(unittest.IsolatedAsyncioTestCase):
+    """`bind_deployment`: an approved platform's new deployment is recorded
+    once; a pending platform's never is, even if a launch raced its
+    un-approval (the state is checked in the same statement)."""
+
+    async def asyncSetUp(self) -> None:
+        self.store = LtiStore(DbPoolDouble())
+        self.platform_id = await self.store.create_platform(
+            issuer="https://canvas.instructure.com",
+            client_id="10000000000001",
+            auth_login_url="https://sso.canvaslms.com/api/lti/authorize_redirect",
+            token_url="https://sso.canvaslms.com/login/oauth2/token",
+            jwks_uri="https://sso.canvaslms.com/api/lti/security/jwks",
+            product_family="canvas",
+            deployment_id=None,
+            now_ms=1,
+        )
+
+    async def test_registration_without_a_deployment_records_none(self):
+        self.assertEqual(await self.store.deployments(self.platform_id), frozenset())
+
+    async def test_pending_platform_never_binds(self):
+        self.assertFalse(await self.store.bind_deployment(self.platform_id, "1:abc"))
+        self.assertEqual(await self.store.deployments(self.platform_id), frozenset())
+
+    async def test_approved_platform_binds_each_new_deployment_once(self):
+        await self.store.approve(self.platform_id, operator="@op:x", now_ms=2)
+        self.assertTrue(await self.store.bind_deployment(self.platform_id, "1:abc"))
+        self.assertFalse(await self.store.bind_deployment(self.platform_id, "1:abc"))
+        self.assertTrue(await self.store.bind_deployment(self.platform_id, "2:def"))
+        self.assertEqual(
+            await self.store.deployments(self.platform_id),
+            frozenset({"1:abc", "2:def"}),
+        )
+        self.assertFalse(await self.store.bind_deployment("no-such-platform", "x"))
+
+
+class InstructureHostsTests(unittest.TestCase):
+    """Instructure-hosted Canvas serves its OpenID configuration from the
+    issuer host but its OIDC, JWKS, token and registration endpoints from the
+    paired sso host (RESEARCH-canvas-lti.md section 1). Only those documented
+    pairs are allowed; every other platform keeps the same-host rule."""
+
+    PAIRS = (
+        ("canvas.instructure.com", "sso.canvaslms.com"),
+        ("canvas.beta.instructure.com", "sso.beta.canvaslms.com"),
+        ("canvas.test.instructure.com", "sso.test.canvaslms.com"),
+    )
+
+    def _doc(self, issuer_host: str, sso_host: str, **overrides: Any) -> Dict[str, Any]:
+        doc = {
+            "issuer": f"https://{issuer_host}",
+            "authorization_endpoint": f"https://{sso_host}/api/lti/authorize_redirect",
+            "token_endpoint": f"https://{sso_host}/login/oauth2/token",
+            "jwks_uri": f"https://{sso_host}/api/lti/security/jwks",
+            "registration_endpoint": f"https://{sso_host}/api/lti/registrations",
+            "id_token_signing_alg_values_supported": ["RS256"],
+            "https://purl.imsglobal.org/spec/lti-platform-configuration": {
+                "product_family_code": "canvas"
+            },
+        }
+        doc.update(overrides)
+        return doc
+
+    @staticmethod
+    def _url(host: str) -> str:
+        return f"https://{host}/api/lti/security/openid-configuration"
+
+    def assertRejected(self, url: str, doc: Any, code: str) -> None:
+        with self.assertRaises(RegistrationRejected) as caught:
+            check_openid_configuration(url, doc)
+        self.assertEqual(caught.exception.code, code)
+
+    def test_cloud_canvas_endpoints_on_the_paired_sso_host_are_accepted(self):
+        for issuer_host, sso_host in self.PAIRS:
+            result = check_openid_configuration(
+                self._url(issuer_host), self._doc(issuer_host, sso_host)
+            )
+            self.assertEqual(result.issuer, f"https://{issuer_host}")
+            self.assertEqual(
+                result.registration_endpoint,
+                f"https://{sso_host}/api/lti/registrations",
+            )
+
+    def test_cloud_canvas_endpoints_on_the_issuer_host_are_accepted(self):
+        """The old (still working) domain: everything on canvas.instructure.com."""
+        host = "canvas.instructure.com"
+        check_openid_configuration(self._url(host), self._doc(host, host))
+
+    def test_another_environments_sso_host_is_refused(self):
+        self.assertRejected(
+            self._url("canvas.instructure.com"),
+            self._doc("canvas.instructure.com", "sso.beta.canvaslms.com"),
+            "registration_endpoint_host_mismatch",
+        )
+
+    def test_each_cloud_endpoint_must_be_on_the_pair(self):
+        """Never trust a host from the document beyond the allowlist."""
+        issuer_host, sso_host = self.PAIRS[0]
+        for field, code in (
+            ("authorization_endpoint", "authorization_endpoint_host_mismatch"),
+            ("token_endpoint", "token_endpoint_host_mismatch"),
+            ("jwks_uri", "jwks_uri_host_mismatch"),
+            ("registration_endpoint", "registration_endpoint_host_mismatch"),
+        ):
+            for host in (
+                "evil.example",
+                "sso.canvaslms.com.evil.example",
+                f"{sso_host}:8443",
+            ):
+                doc = self._doc(issuer_host, sso_host, **{field: f"https://{host}/x"})
+                self.assertRejected(self._url(issuer_host), doc, code)
+
+    def test_other_platforms_never_get_the_sso_allowance(self):
+        """A self-hosted Canvas, or anyone else, keeps the same-host rule even
+        when it names an Instructure sso host."""
+        for issuer_host in ("canvas.school.example", "instructure.com.evil.example"):
+            self.assertRejected(
+                self._url(issuer_host),
+                self._doc(issuer_host, "sso.canvaslms.com"),
+                "registration_endpoint_host_mismatch",
+            )
+
+    def test_the_sso_host_cannot_serve_the_configuration_itself(self):
+        """The issuer must still be on the configuration URL's host."""
+        self.assertRejected(
+            self._url("sso.canvaslms.com"),
+            self._doc("canvas.instructure.com", "sso.canvaslms.com"),
+            "issuer_host_mismatch",
+        )
+
+
 class RegistrationArtifactTests(unittest.TestCase):
     """`dynamic registration response ... declares course_navigation, a
     new-window launch, NRPS contextmembership.readonly and privacy_level
@@ -851,19 +1028,26 @@ class RegistrationArtifactTests(unittest.TestCase):
             message["https://canvas.instructure.com/lti/display_type"], "new_window"
         )
 
-    def test_registration_response_must_carry_a_deployment_id(self):
-        """Approval adds no deployments, so without one the platform could
-        never launch: such a registration is refused."""
+    def test_registration_response_without_a_deployment_id_is_accepted(self):
+        """The deployment id is optional in the registration response (LTI
+        DR 1.0 section 3.6.1; Canvas sends none without lti_registrations_next):
+        the platform is recorded pending and its deployments are bound from
+        launches after approval. A malformed one is still refused."""
         tool = "https://purl.imsglobal.org/spec/lti-tool-configuration"
         for response in (
             {"client_id": "c"},
             {"client_id": "c", tool: {}},
+            {"client_id": "c", tool: {"deployment_id": None}},
+        ):
+            self.assertEqual(registered_client(response), ("c", None), response)
+        for response in (
             {"client_id": "c", tool: {"deployment_id": ""}},
             {"client_id": "c", tool: {"deployment_id": 7}},
+            {"client_id": "c", tool: {"deployment_id": "x" * 256}},
         ):
             with self.assertRaises(RegistrationRejected) as caught:
                 registered_client(response)
-            self.assertEqual(caught.exception.code, "missing_deployment_id")
+            self.assertEqual(caught.exception.code, "bad_deployment_id")
         self.assertEqual(
             registered_client({"client_id": "c", tool: {"deployment_id": "d"}}),
             ("c", "d"),
@@ -891,10 +1075,10 @@ class RegistrationArtifactTests(unittest.TestCase):
             ),
             ("c", "in"),
         )
-        for bad in ("", 7, None):
+        for bad in ("", 7):
             with self.assertRaises(RegistrationRejected) as caught:
                 registered_client({"client_id": "c", tool: {}, "deployment_id": bad})
-            self.assertEqual(caught.exception.code, "missing_deployment_id")
+            self.assertEqual(caught.exception.code, "bad_deployment_id")
 
     def test_urls_hang_off_public_baseurl(self):
         urls = tool_urls("https://matrix.pangea.example")

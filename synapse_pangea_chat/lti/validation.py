@@ -165,7 +165,12 @@ def verify_launch(
     expected_nonce: str,
     known_deployments: frozenset,
     launch_url: str,
+    allow_new_deployment: bool = False,
 ) -> Launch:
+    """Validate a launch's id_token. `allow_new_deployment` lets a well-formed
+    deployment id outside `known_deployments` through, for the launch
+    endpoint to record (an approved platform's new deployment, LTI Core 1.3
+    section 3.1.3); it never applies to an unapproved platform."""
     if not platform.approved:
         raise LaunchRejected("platform_not_approved", status=403)
     read_header(id_token)
@@ -193,7 +198,7 @@ def verify_launch(
     if (
         not isinstance(deployment_id, str)
         or not _short_string(deployment_id)
-        or deployment_id not in known_deployments
+        or (deployment_id not in known_deployments and not allow_new_deployment)
     ):
         raise LaunchRejected("unknown_deployment", status=403)
 

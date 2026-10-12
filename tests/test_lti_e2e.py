@@ -201,8 +201,9 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         self.assertIn("org.imsglobal.lti.close", posted.text)
         self.assertEqual(len(server.registrations), 1)
 
-        # A registration response without a deployment id is refused and
-        # stores nothing: such a platform could never launch.
+        # A registration response without a deployment id (Canvas without
+        # lti_registrations_next) is still recorded, pending; its deployment
+        # is bound from a verified launch after approval.
         server.omit_deployment_id = True
         server.client_id_override = "pangea-client-no-deployment"
         no_deployment = requests.get(
@@ -216,8 +217,8 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         )
         server.omit_deployment_id = False
         server.client_id_override = None
-        self.assertEqual(no_deployment.status_code, 400, no_deployment.text)
-        self.assertIn("missing_deployment_id", no_deployment.text)
+        self.assertEqual(no_deployment.status_code, 200, no_deployment.text)
+        self.assertIn("org.imsglobal.lti.close", no_deployment.text)
 
         # Dynamic Registration by GET lands the platform as pending.
         registered = requests.get(
@@ -262,8 +263,13 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         listed = self._get_platforms(admin_token)
         self.assertEqual(listed.status_code, 200, listed.text)
         rows = {r["client_id"]: r for r in listed.json()["platforms"]}
-        self.assertEqual(set(rows), {"pangea-client-post", double.client_id})
+        self.assertEqual(
+            set(rows),
+            {"pangea-client-post", "pangea-client-no-deployment", double.client_id},
+        )
         self.assertEqual(rows["pangea-client-post"]["state"], "pending")
+        no_dep = rows["pangea-client-no-deployment"]
+        self.assertEqual((no_dep["state"], no_dep["deployment_ids"]), ("pending", []))
         row = rows[double.client_id]
         self.assertEqual(row["state"], "pending")
         self.assertEqual(row["issuer"], server.base_url)
@@ -273,12 +279,11 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
         self.assertEqual(self._get_platforms(user_token).status_code, 403)
         self.assertEqual(self._get_platforms(None).status_code, 401)
 
-        # `pending platform launch refused` (INV-8), first at login.
+        # `pending platform launch refused` (INV-8), first at login: the same
+        # HTML refusal page a refused launch gets (a browser lands here).
         pending_login = self._login(server)
         self.assertEqual(pending_login.status_code, 403, pending_login.text)
-        self.assertEqual(
-            pending_login.json()["errcode"], "ORG.PANGEA.LTI_PLATFORM_NOT_APPROVED"
-        )
+        self.assertEqual(self._refusal(pending_login), "platform_not_approved")
 
         # `approve endpoint refuses non-server-admin`.
         self.assertEqual(self._approve(platform_id, user_token).status_code, 403)
@@ -358,22 +363,57 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
             ("instructor", APP + "/lti/link"),
         )
 
-        # A launch for a deployment the platform never registered is refused.
+        # A new deployment of the APPROVED platform (several deployments
+        # share one client_id, LTI Core 1.3 section 3.1.3) is accepted and
+        # recorded once, from its verified launch.
+        deployment_claim = "https://purl.imsglobal.org/spec/lti/claim/deployment_id"
+        for _ in range(2):
+            state, nonce, cookie = self._login_ok(server)
+            claims = double.claims(nonce=nonce, launch_url=LAUNCH_URL)
+            claims[deployment_claim] = "dep-x"
+            self.assertEqual(
+                self._redirect(self._launch(double.sign(claims), state, cookie)),
+                ("learner", APP + "/lti/link"),
+            )
+        rows = {
+            r["client_id"]: r
+            for r in self._get_platforms(admin_token).json()["platforms"]
+        }
+        self.assertEqual(
+            rows[double.client_id]["deployment_ids"],
+            sorted([double.deployment_id, "dep-x"]),
+        )
+        # A launch whose signature fails records nothing.
         state, nonce, cookie = self._login_ok(server)
         claims = double.claims(nonce=nonce, launch_url=LAUNCH_URL)
-        claims["https://purl.imsglobal.org/spec/lti/claim/deployment_id"] = "dep-x"
-        unknown = self._launch(double.sign(claims), state, cookie)
-        self.assertEqual(self._refusal(unknown), "unknown_deployment")
+        claims[deployment_claim] = "dep-forged"
+        forged = double.sign(claims)
+        head, _, signature = forged.rpartition(".")
+        flipped = "B" if signature[10] == "A" else "A"
+        forged = f"{head}.{signature[:10]}{flipped}{signature[11:]}"
+        self.assertEqual(
+            self._refusal(self._launch(forged, state, cookie)), "bad_signature"
+        )
 
         # A platform that is no longer approved by the time the launch arrives
-        # is refused at the launch too, not only at login.
+        # is refused at the launch too, not only at login, and its new
+        # deployment is not recorded.
         state, nonce, cookie = self._login_ok(server)
         self._set_platform_state(platform_id, "pending")
-        token = double.sign(double.claims(nonce=nonce, launch_url=LAUNCH_URL))
-        refused = self._launch(token, state, cookie)
+        claims = double.claims(nonce=nonce, launch_url=LAUNCH_URL)
+        claims[deployment_claim] = "dep-y"
+        refused = self._launch(double.sign(claims), state, cookie)
         self.assertEqual(refused.status_code, 403, refused.text)
         self.assertEqual(self._refusal(refused), "platform_not_approved")
         self._set_platform_state(platform_id, "approved")
+        rows = {
+            r["client_id"]: r
+            for r in self._get_platforms(admin_token).json()["platforms"]
+        }
+        self.assertEqual(
+            rows[double.client_id]["deployment_ids"],
+            sorted([double.deployment_id, "dep-x"]),
+        )
 
         # A key the platform never published is not fetched again and again.
         state, nonce, cookie = self._login_ok(server)
