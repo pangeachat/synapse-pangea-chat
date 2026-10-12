@@ -10,7 +10,12 @@ requires-python = ">=3.10"
 
 classifiers = ["License :: OSI Approved :: Apache Software License"]
 
-dependencies = ["attrs", "phonenumbers"]
+dependencies = [
+  "attrs",
+  "phonenumbers",
+  # The share kit's QR code. Pure Python with no dependencies; writes PNG itself.
+  "segno >= 1.6, < 2",
+]
 
 [project.optional-dependencies]
 dev = [

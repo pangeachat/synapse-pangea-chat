@@ -19,6 +19,7 @@ from urllib.parse import quote
 import psycopg2
 import requests
 
+from synapse_pangea_chat.email_invite.course_claim_emails import class_qr_png
 from tests.base_e2e import BaseSynapseE2ETest
 from tests.smtp_sink import SmtpSink, body_text
 
@@ -200,6 +201,13 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
         assert claimed is not None
         claimed_text = body_text(claimed)
         self.assertIn(f"{APP_BASE_URL}/{class_code}", claimed_text)
+        # The module's own template carries the link's QR code, inline.
+        images = [p for p in claimed.walk() if p.get_content_type() == "image/png"]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(
+            images[0].get_payload(decode=True),
+            class_qr_png(f"{APP_BASE_URL}/{class_code}"),
+        )
         self.assertNotIn(admin_code, claimed_text)
 
         # The address is cleared once it has done its job.
