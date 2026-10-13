@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from synapse.api.errors import AuthError, InvalidClientTokenError
+
+from synapse_pangea_chat.set_course_plan import set_course_plan as module
 from synapse_pangea_chat.set_course_plan.set_course_plan import (
     MISMATCH,
     NOT_A_COURSE,
     UNCHANGED,
     UPDATE,
+    SetCoursePlan,
     parse_request,
     plan_update,
 )
@@ -98,6 +104,62 @@ class TestParseRequest(unittest.TestCase):
                 parsed, error = parse_request(body)
                 self.assertIsNone(parsed)
                 self.assertIsInstance(error, str)
+
+
+class TestEndpointFailures(unittest.IsolatedAsyncioTestCase):
+    """A refused write must not read as the operator's own auth failure."""
+
+    _BODY = {"room_id": "!space:test", "quest_id": "new", "expected_quest_id": "old"}
+
+    def _endpoint(self) -> tuple[SetCoursePlan, MagicMock]:
+        api = MagicMock()
+        api._hs.get_auth.return_value.get_user_by_req = AsyncMock(
+            return_value=SimpleNamespace(
+                user=SimpleNamespace(to_string=lambda: "@op:test")
+            )
+        )
+        api.is_user_admin = AsyncMock(return_value=True)
+        plan = SimpleNamespace(content={"uuid": "old", "l2": "es"})
+        api.get_room_state = AsyncMock(return_value={("pangea.course_plan", ""): plan})
+        api.create_and_send_event_into_room = AsyncMock()
+        config = SimpleNamespace(course_plan_state_event_type=None)
+        return SetCoursePlan(api, config), api  # type: ignore[arg-type]
+
+    async def _post(self, endpoint: SetCoursePlan) -> tuple[int, Dict[str, Any]]:
+        with patch.object(
+            module, "extract_body_json", AsyncMock(return_value=self._BODY)
+        ), patch.object(
+            module, "select_state_sender", AsyncMock(return_value="@teacher:test")
+        ), patch.object(
+            module, "respond_with_json"
+        ) as respond:
+            await endpoint._async_render_POST(MagicMock())
+        return respond.call_args.args[1], respond.call_args.args[2]
+
+    async def test_a_write_the_room_refuses_is_a_logged_conflict(self) -> None:
+        endpoint, api = self._endpoint()
+        api.create_and_send_event_into_room.side_effect = AuthError(
+            403, "User @teacher:test not in room !space:test"
+        )
+
+        with self.assertLogs(module.logger, level="ERROR") as logs:
+            status, body = await self._post(endpoint)
+
+        self.assertEqual(status, 409)
+        self.assertEqual(body["errcode"], "M_FORBIDDEN")
+        self.assertIn("@teacher:test", logs.output[0])
+
+    async def test_a_bad_operator_token_is_still_unauthorized(self) -> None:
+        endpoint, api = self._endpoint()
+        api._hs.get_auth.return_value.get_user_by_req.side_effect = (
+            InvalidClientTokenError()
+        )
+
+        status, body = await self._post(endpoint)
+
+        self.assertEqual(status, 401)
+        self.assertEqual(body["errcode"], "M_UNAUTHORIZED")
+        api.get_room_state.assert_not_awaited()
 
 
 if __name__ == "__main__":

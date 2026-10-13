@@ -132,6 +132,22 @@ class SetCoursePlan(Resource):
     async def _async_render_POST(self, request: SynapseRequest) -> None:
         try:
             requester = await self._auth.get_user_by_req(request)
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
+        except (
+            MissingClientTokenError,
+            InvalidClientTokenError,
+            InvalidClientCredentialsError,
+            AuthError,
+        ) as e:
+            logger.info("Authentication failed: %s", e)
+            respond_with_json(
+                request,
+                401,
+                {"error": "Unauthorized", "errcode": "M_UNAUTHORIZED"},
+                send_cors=True,
+            )
+            return
+        try:
             operator = requester.user.to_string()
 
             if not await self._api.is_user_admin(operator):
@@ -209,15 +225,37 @@ class SetCoursePlan(Resource):
                 return
 
             if not dry_run:
-                await self._api.create_and_send_event_into_room(
-                    {
-                        "type": self._event_type,
-                        "state_key": "",
-                        "room_id": room_id,
-                        "sender": sender,
-                        "content": update.content,
-                    }
-                )
+                try:
+                    await self._api.create_and_send_event_into_room(
+                        {
+                            "type": self._event_type,
+                            "state_key": "",
+                            "room_id": room_id,
+                            "sender": sender,
+                            "content": update.content,
+                        }
+                    )
+                except AuthError as e:
+                    # The room checks the sender again at send time: one who
+                    # left or lost power since they were chosen is refused
+                    # before anything is written.
+                    logger.error(
+                        "set_course_plan: %s refused %s sent as %s: %s",
+                        room_id,
+                        self._event_type,
+                        sender,
+                        e,
+                    )
+                    respond_with_json(
+                        request,
+                        409,
+                        {
+                            "error": "The room refused the course plan event",
+                            "errcode": e.errcode,
+                        },
+                        send_cors=True,
+                    )
+                    return
             logger.info(
                 "set_course_plan: operator=%s room=%s %s -> %s sent_as=%s dry_run=%s",
                 operator,
@@ -238,20 +276,6 @@ class SetCoursePlan(Resource):
                     "changed": not dry_run,
                     "dry_run": dry_run,
                 },
-                send_cors=True,
-            )
-        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
-        except (
-            MissingClientTokenError,
-            InvalidClientTokenError,
-            InvalidClientCredentialsError,
-            AuthError,
-        ) as e:
-            logger.info("Authentication failed: %s", e)
-            respond_with_json(
-                request,
-                401,
-                {"error": "Unauthorized", "errcode": "M_UNAUTHORIZED"},
                 send_cors=True,
             )
         except Exception:
