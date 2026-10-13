@@ -1,0 +1,446 @@
+"""Course default chats: the hook keeps Announcements and Introductions in
+line with their space, and the repair endpoint does the same on demand.
+
+Design: .github/instructions/course-default-chats.instructions.md
+"""
+
+import time
+from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote
+
+import requests
+
+from .base_e2e import SERVER_NAME, BaseSynapseE2ETest
+
+ANNOUNCEMENTS = "announcementsChat"
+INTRODUCTIONS = "introductionChat"
+
+# The client's restricted preset for Announcements: members read, power 50
+# posts, power 100 changes power levels.
+ANNOUNCEMENTS_POWER_LEVELS = {
+    "ban": 50,
+    "kick": 50,
+    "invite": 50,
+    "redact": 50,
+    "events": {"m.room.power_levels": 100, "m.room.pinned_events": 50},
+    "events_default": 50,
+    "state_default": 50,
+    "users_default": 0,
+}
+
+
+class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
+    _alias_counter = 0
+
+    # -- request helpers -------------------------------------------------
+
+    def _headers(self, token: str) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    def _room_url(self, room_id: str, suffix: str) -> str:
+        return f"{self.server_url}/_matrix/client/v3/rooms/{quote(room_id, safe='')}{suffix}"
+
+    def _state_url(self, room_id: str, event_type: str, state_key: str = "") -> str:
+        return self._room_url(
+            room_id, f"/state/{quote(event_type, safe='')}/{quote(state_key, safe='')}"
+        )
+
+    def _endpoint(self) -> str:
+        return f"{self.server_url}/_synapse/client/pangea/v1/sync_course_default_chats"
+
+    async def _create_space(self, token: str) -> str:
+        response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/createRoom",
+            headers=self._headers(token),
+            json={
+                "visibility": "private",
+                "preset": "public_chat",
+                "creation_content": {"type": "m.space"},
+                "name": "Test Course",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["room_id"]
+
+    async def _create_child(
+        self,
+        token: str,
+        space_id: str,
+        *,
+        alias_prefix: Optional[str],
+        power_levels: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """A child chat as the client creates it: restricted to the space's
+        members, and for a default chat an alias carrying the client's prefix."""
+        type(self)._alias_counter += 1
+        body: Dict[str, Any] = {
+            "visibility": "private",
+            "preset": "public_chat",
+            "initial_state": [
+                {
+                    "type": "m.room.join_rules",
+                    "state_key": "",
+                    "content": {
+                        "join_rule": "knock_restricted",
+                        "allow": [{"type": "m.room_membership", "room_id": space_id}],
+                    },
+                }
+            ],
+        }
+        if alias_prefix is not None:
+            space_localpart = space_id.split(":", 1)[0][1:]
+            body[
+                "room_alias_name"
+            ] = f"{alias_prefix}_{space_localpart}_{self.tag}_{self._alias_counter}"
+        if power_levels is not None:
+            body["power_level_content_override"] = power_levels
+        response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/createRoom",
+            headers=self._headers(token),
+            json=body,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["room_id"]
+
+    async def _create_announcements(self, token: str, space_id: str) -> str:
+        return await self._create_child(
+            token,
+            space_id,
+            alias_prefix=ANNOUNCEMENTS,
+            power_levels=ANNOUNCEMENTS_POWER_LEVELS,
+        )
+
+    async def _link_child(self, token: str, space_id: str, child_id: str) -> None:
+        response = requests.put(
+            self._state_url(space_id, "m.space.child", child_id),
+            headers=self._headers(token),
+            json={"via": [SERVER_NAME]},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    async def _join(self, room_id: str, token: str) -> None:
+        """Join as a client would, waiting out the per-room join limit
+        (burst ten, then one a second) when a test joins a whole class."""
+        for _ in range(30):
+            response = requests.post(
+                f"{self.server_url}/_matrix/client/v3/join/{quote(room_id, safe='')}",
+                headers=self._headers(token),
+            )
+            if response.status_code != 429:
+                break
+            time.sleep(response.json().get("retry_after_ms", 1000) / 1000)
+        self.assertEqual(response.status_code, 200, response.text)
+
+    async def _membership(
+        self, room_id: str, user_id: str, token: str
+    ) -> Optional[str]:
+        response = requests.get(
+            self._state_url(room_id, "m.room.member", user_id),
+            headers=self._headers(token),
+        )
+        if response.status_code != 200:
+            return None
+        return response.json().get("membership")
+
+    async def _power_users(self, room_id: str, token: str) -> Dict[str, int]:
+        response = requests.get(
+            self._state_url(room_id, "m.room.power_levels"),
+            headers=self._headers(token),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return dict(response.json().get("users", {}))
+
+    async def _set_power(
+        self, room_id: str, user_id: str, level: int, admin_token: str
+    ) -> None:
+        response = requests.get(
+            self._state_url(room_id, "m.room.power_levels"),
+            headers=self._headers(admin_token),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        content = response.json()
+        users = dict(content.get("users", {}))
+        users[user_id] = level
+        content["users"] = users
+        response = requests.put(
+            self._state_url(room_id, "m.room.power_levels"),
+            headers=self._headers(admin_token),
+            json=content,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    async def _membership_action(
+        self, action: str, room_id: str, user_id: str, token: str
+    ) -> None:
+        response = requests.post(
+            self._room_url(room_id, f"/{action}"),
+            headers=self._headers(token),
+            json={"user_id": user_id},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    async def _send_message_status(self, room_id: str, token: str) -> int:
+        response = requests.put(
+            self._room_url(room_id, f"/send/m.room.message/{time.time_ns()}"),
+            headers=self._headers(token),
+            json={"msgtype": "m.text", "body": "hello"},
+        )
+        return response.status_code
+
+    async def _wait_joined(self, room_id: str, user_ids: List[str], token: str) -> None:
+        async def joined() -> bool:
+            for user_id in user_ids:
+                if await self._membership(room_id, user_id, token) != "join":
+                    return False
+            return True
+
+        await self._wait_until_async(joined, f"{user_ids} joined to {room_id}")
+
+    async def _wait_until_async(
+        self, condition: Callable[[], Any], what: str, timeout: float = 20.0
+    ) -> None:
+        """The hook does its work in the background, so state is eventual."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if await condition():
+                return
+            if time.monotonic() > deadline:
+                self.fail(f"Timed out waiting for {what}")
+            time.sleep(0.25)
+
+    # -- the hook ----------------------------------------------------------
+
+    async def test_linking_a_default_chat_joins_members_and_mirrors_admins(self):
+        await self.homeserver()
+        teacher_id, teacher = await self.new_user("teacher")
+        co_id, co = await self.new_user("co")
+        s1_id, s1 = await self.new_user("s1")
+        s2_id, s2 = await self.new_user("s2")
+
+        space_id = await self._create_space(teacher)
+        for token in (co, s1, s2):
+            await self._join(space_id, token)
+        await self._set_power(space_id, co_id, 100, teacher)
+
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+
+        await self._wait_joined(chat_id, [co_id, s1_id, s2_id], teacher)
+        users = await self._power_users(chat_id, teacher)
+        self.assertEqual(users.get(teacher_id), 100)
+        self.assertEqual(users.get(co_id), 100)
+        self.assertNotIn(s1_id, users)
+        self.assertNotIn(s2_id, users)
+        # What the issue was about: the co-instructor can post, a student can't.
+        self.assertEqual(await self._send_message_status(chat_id, co), 200)
+        self.assertEqual(await self._send_message_status(chat_id, s1), 403)
+
+    async def test_joining_the_space_later_lands_in_both_chats(self):
+        await self.homeserver()
+        _, teacher = await self.new_user("teacher")
+        s3_id, s3 = await self.new_user("s3")
+
+        space_id = await self._create_space(teacher)
+        announcements_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, announcements_id)
+        introductions_id = await self._create_child(
+            teacher, space_id, alias_prefix=INTRODUCTIONS
+        )
+        await self._link_child(teacher, space_id, introductions_id)
+
+        await self._join(space_id, s3)
+
+        await self._wait_joined(announcements_id, [s3_id], teacher)
+        await self._wait_joined(introductions_id, [s3_id], teacher)
+
+    async def test_promotion_and_demotion_follow_the_space(self):
+        await self.homeserver()
+        teacher_id, teacher = await self.new_user("teacher")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        await self._join(space_id, s1)
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        await self._wait_joined(chat_id, [s1_id], teacher)
+
+        await self._set_power(space_id, s1_id, 100, teacher)
+
+        async def promoted() -> bool:
+            return (await self._power_users(chat_id, teacher)).get(s1_id) == 100
+
+        await self._wait_until_async(promoted, "s1 promoted in the chat")
+        self.assertEqual(await self._send_message_status(chat_id, s1), 200)
+
+        # Matrix lets an admin lower only their own level, so an admin who
+        # stops being one steps down themselves.
+        await self._set_power(space_id, s1_id, 0, s1)
+
+        async def demoted() -> bool:
+            return (await self._power_users(chat_id, teacher)).get(s1_id, 0) < 100
+
+        await self._wait_until_async(demoted, "s1 demoted in the chat")
+        users = await self._power_users(chat_id, teacher)
+        self.assertEqual(users.get(teacher_id), 100)
+        self.assertEqual(await self._send_message_status(chat_id, s1), 403)
+
+    async def test_bots_and_banned_members_are_skipped(self):
+        await self.homeserver()
+        _, teacher = await self.new_user("teacher")
+        banned_id, banned = await self.new_user("banned")
+        s2_id, s2 = await self.new_user("s2")
+        bot_localpart = f"bot-{self.tag}"
+        await self.register_user("", "", bot_localpart, "pw", False)
+        bot_id, bot = await self.login_user(bot_localpart, "pw")
+
+        space_id = await self._create_space(teacher)
+        for token in (banned, s2, bot):
+            await self._join(space_id, token)
+        await self._set_power(space_id, bot_id, 100, teacher)
+
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._membership_action("ban", chat_id, banned_id, teacher)
+        await self._link_child(teacher, space_id, chat_id)
+
+        await self._wait_joined(chat_id, [s2_id], teacher)
+        self.assertEqual(await self._membership(chat_id, banned_id, teacher), "ban")
+        self.assertIsNone(await self._membership(chat_id, bot_id, teacher))
+        self.assertNotIn(bot_id, await self._power_users(chat_id, teacher))
+
+    async def test_other_children_and_other_rooms_are_ignored(self):
+        await self.homeserver()
+        _, teacher = await self.new_user("teacher")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        await self._join(space_id, s1)
+        plain_child_id = await self._create_child(teacher, space_id, alias_prefix=None)
+        await self._link_child(teacher, space_id, plain_child_id)
+        # A plain room (not a space) with a default-chat-looking child
+        # linked to it: the rule applies to spaces only.
+        plain_room_id = await self.create_private_room(teacher)
+        chat_of_plain_room = await self._create_child(
+            teacher, plain_room_id, alias_prefix=ANNOUNCEMENTS
+        )
+        await self._link_child(teacher, plain_room_id, chat_of_plain_room)
+
+        # The positive control: a real default chat of the space syncs.
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        await self._wait_joined(chat_id, [s1_id], teacher)
+
+        self.assertIsNone(await self._membership(plain_child_id, s1_id, teacher))
+        self.assertIsNone(await self._membership(chat_of_plain_room, s1_id, teacher))
+
+    async def test_a_class_larger_than_the_join_burst_is_joined(self):
+        """Synapse's per-room join limit allows a burst of ten; the sync
+        waits the limiter out for the rest instead of dropping them."""
+        await self.homeserver()
+        _, teacher = await self.new_user("teacher")
+        students = [await self.new_user(f"s{i}") for i in range(12)]
+
+        space_id = await self._create_space(teacher)
+        for _, token in students:
+            await self._join(space_id, token)
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+
+        await self._wait_joined(chat_id, [user_id for user_id, _ in students], teacher)
+        # The limiter did fire and was waited out, not bypassed.
+        self.assertTrue(
+            any("course_default_chats waiting" in line for line in self.server_log()),
+            "expected the sync to wait out the per-room join limit",
+        )
+
+    # -- the repair endpoint -------------------------------------------------
+
+    async def test_repair_endpoint_brings_a_space_back_in_line(self):
+        await self.homeserver()
+        _, operator = await self.new_user("operator", admin=True)
+        teacher_id, teacher = await self.new_user("teacher")
+        co_id, co = await self.new_user("co")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        await self._join(space_id, co)
+        await self._join(space_id, s1)
+        await self._set_power(space_id, co_id, 100, teacher)
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        await self._wait_joined(chat_id, [co_id, s1_id], teacher)
+
+        # Put the chat out of line without touching the space: a kick, and
+        # the co-teacher stepping down inside the chat (the chat is not a
+        # space, so neither triggers the hook).
+        await self._membership_action("kick", chat_id, s1_id, teacher)
+        await self._set_power(chat_id, co_id, 0, co)
+        self.assertIsNotNone(await self._membership(chat_id, s1_id, teacher))
+        self.assertNotEqual(await self._membership(chat_id, s1_id, teacher), "join")
+
+        response = requests.post(
+            self._endpoint(),
+            headers=self._headers(operator),
+            json={"room_id": space_id},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        report = response.json()
+        self.assertEqual(report["room_id"], space_id)
+        self.assertEqual(len(report["chats"]), 1)
+        chat = report["chats"][0]
+        self.assertEqual(chat["chat_id"], chat_id)
+        self.assertEqual(chat["promoted"], [co_id])
+        self.assertEqual(chat["joined"], [s1_id])
+        self.assertEqual(chat["failed"], [])
+        self.assertEqual(await self._membership(chat_id, s1_id, teacher), "join")
+        self.assertEqual((await self._power_users(chat_id, teacher)).get(co_id), 100)
+
+    async def test_repair_endpoint_refuses_non_admins_and_non_spaces(self):
+        await self.homeserver()
+        _, operator = await self.new_user("operator", admin=True)
+        _, teacher = await self.new_user("teacher")
+        plain_room_id = await self.create_private_room(teacher)
+
+        response = requests.post(
+            self._endpoint(),
+            headers=self._headers(teacher),
+            json={"room_id": plain_room_id},
+        )
+        self.assertEqual(response.status_code, 403, response.text)
+
+        response = requests.post(
+            self._endpoint(),
+            headers=self._headers(operator),
+            json={"room_id": plain_room_id},
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+
+        response = requests.post(
+            self._endpoint(), headers=self._headers(operator), json={"room_id": "nope"}
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+
+    async def test_repair_endpoint_schedules_every_space(self):
+        await self.homeserver()
+        _, operator = await self.new_user("operator", admin=True)
+        teacher_id, teacher = await self.new_user("teacher")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        await self._join(space_id, s1)
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        await self._wait_joined(chat_id, [s1_id], teacher)
+        await self._membership_action("kick", chat_id, s1_id, teacher)
+
+        response = requests.post(
+            self._endpoint(), headers=self._headers(operator), json={}
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertGreaterEqual(response.json()["scheduled"], 1)
+
+        await self._wait_joined(chat_id, [s1_id], teacher)
+        self.assertTrue(
+            any(
+                "course_default_chats repair done" in line for line in self.server_log()
+            )
+        )

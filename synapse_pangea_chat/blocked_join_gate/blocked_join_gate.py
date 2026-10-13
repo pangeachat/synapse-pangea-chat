@@ -16,6 +16,7 @@ from synapse.module_api import NOT_SPAM, ModuleApi
 from synapse_pangea_chat.blocked_join_gate.constants import (
     EVENT_TYPE_M_ROOM_MEMBER,
     MEMBERSHIP_CONTENT_KEY,
+    MEMBERSHIP_JOIN,
     MEMBERSHIP_KNOCK,
 )
 from synapse_pangea_chat.blocked_join_gate.is_blocked_by_room_admin import (
@@ -49,6 +50,23 @@ def server_initiated_entry() -> Iterator[None]:
         yield
     finally:
         _server_initiated.reset(token)
+
+
+async def server_initiated_join(api: ModuleApi, room_id: str, user_id: str) -> None:
+    """Join ``user_id`` to ``room_id`` as themselves, on the server's behalf.
+
+    An orchestrated join rather than a membership request, so it is exempt
+    from the gate; the room's own join rules still apply (a restricted room
+    admits the user through its allow list, an invited user through the
+    invite). Shared by every flow that joins a user without their client.
+    """
+    with server_initiated_entry():
+        await api.update_room_membership(
+            sender=user_id,
+            target=user_id,
+            room_id=room_id,
+            new_membership=MEMBERSHIP_JOIN,
+        )
 
 
 class BlockedJoinGate:

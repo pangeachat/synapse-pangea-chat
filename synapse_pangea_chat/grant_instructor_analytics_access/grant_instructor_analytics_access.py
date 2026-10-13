@@ -23,7 +23,7 @@ from synapse_pangea_chat.analytics_push_suppression import (
     ANALYTICS_ROOM_TYPE,
     ensure_analytics_invite_push_rule,
 )
-from synapse_pangea_chat.blocked_join_gate import server_initiated_entry
+from synapse_pangea_chat.blocked_join_gate import server_initiated_join
 from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 
@@ -386,15 +386,7 @@ class GrantInstructorAnalyticsAccess(Resource):
                 content={"reason": ANALYTICS_INVITE_REASON},
             )
 
-        # Orchestrated join, not a membership request — exempt from the
-        # blocked join gate (blocked-join-gate.instructions.md).
-        with server_initiated_entry():
-            await self._api.update_room_membership(
-                sender=instructor_id,
-                target=instructor_id,
-                room_id=mx_analytics_room_id,
-                new_membership=MEMBERSHIP_JOIN,
-            )
+        await server_initiated_join(self._api, mx_analytics_room_id, instructor_id)
         return "joined"
 
     def _coerce_int(self, value: Any, default: int) -> int:

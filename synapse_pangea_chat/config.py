@@ -187,6 +187,12 @@ class PangeaChatConfig:
     # only; the rule itself is fixed by design.
     blocked_join_gate_enabled: bool = True
 
+    # --- course_default_chats config ---
+    # Keeps a space's default chats complete (every member joined, space
+    # admins as chat admins) and serves the repair endpoint. The off switch
+    # exists so a bad rollout can be stopped from Ansible without a deploy.
+    course_default_chats_enabled: bool = True
+
     # --- moderation config (server-side, trust-and-safety) ---
     # Both tiers ship dark: nothing runs until an operator enables a tier.
     moderation_tier1_enabled: bool = False

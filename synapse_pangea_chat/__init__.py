@@ -14,6 +14,10 @@ from synapse_pangea_chat.config import (
     DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS,
     PangeaChatConfig,
 )
+from synapse_pangea_chat.course_default_chats import (
+    CourseDefaultChats,
+    SyncCourseDefaultChats,
+)
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
 from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
@@ -547,6 +551,16 @@ class PangeaChat:
         # --- Blocked Join Gate ---
         if config.blocked_join_gate_enabled:
             self.blocked_join_gate = BlockedJoinGate(config, api)
+
+        # --- Course Default Chats ---
+        # Registered only when enabled, so the hook does not fire and the
+        # repair path does not exist otherwise.
+        if config.course_default_chats_enabled:
+            self.course_default_chats = CourseDefaultChats(api)
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/sync_course_default_chats",
+                resource=SyncCourseDefaultChats(api, self.course_default_chats),
+            )
 
         # --- Direct Push ---
         self.direct_push_resource = DirectPush(api, config)
@@ -1114,6 +1128,10 @@ class PangeaChat:
         if not isinstance(blocked_join_gate_enabled, bool):
             raise ValueError('Config "blocked_join_gate_enabled" must be a boolean')
 
+        course_default_chats_enabled = config.get("course_default_chats_enabled", True)
+        if not isinstance(course_default_chats_enabled, bool):
+            raise ValueError('Config "course_default_chats_enabled" must be a boolean')
+
         # --- delayed_push config ---
         delayed_push = config.get("delayed_push", {})
         if delayed_push is None:
@@ -1481,6 +1499,7 @@ class PangeaChat:
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,
             delayed_push_require_synapse_version=delayed_push_require_synapse_version,
             blocked_join_gate_enabled=blocked_join_gate_enabled,
+            course_default_chats_enabled=course_default_chats_enabled,
             moderation_tier1_enabled=moderation_tier1_enabled,
             moderation_tier1_phone_regions=moderation_tier1_phone_regions,
             moderation_tier2_enabled=moderation_tier2_enabled,
