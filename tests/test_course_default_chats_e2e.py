@@ -371,6 +371,31 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         await self._wait_joined(chat_id, [s1_id], teacher)
         self.assertIsNone(await self._membership(fake_id, teacher_id, s1))
 
+    async def test_a_space_whose_admins_all_left_is_reported_as_such(self):
+        await self.homeserver()
+        _, operator = await self.new_user("operator", admin=True)
+        _, teacher = await self.new_user("teacher")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        await self._join(space_id, s1)
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        await self._wait_joined(chat_id, [s1_id], teacher)
+        response = requests.post(
+            self._room_url(space_id, "/leave"), headers=self._headers(teacher)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = requests.post(
+            self._endpoint(),
+            headers=self._headers(operator),
+            json={"room_id": space_id, "dry_run": True},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        chat = response.json()["chats"][0]
+        self.assertEqual(chat["ignored"], "the space has no joined admin")
+
     async def test_a_class_larger_than_the_join_burst_is_joined(self):
         """Synapse's per-room join limit allows a burst of ten; the sync
         waits the limiter out for the rest instead of dropping them."""
