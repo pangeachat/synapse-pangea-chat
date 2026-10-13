@@ -79,13 +79,20 @@ def _request_json(
 
 
 def walk_spaces(homeserver: str, token: str) -> Iterator[str]:
-    """Every room on the homeserver whose type is m.space, by the Admin API."""
+    """Every room on the homeserver whose type is m.space and that still has a
+    local member, by the Admin API."""
     start = 0
     for _ in range(MAX_PAGES):
         query = urllib.parse.urlencode({"from": start, "limit": PAGE_SIZE})
         page = _request_json(f"{homeserver}{ADMIN_ROOMS_PATH}?{query}", token)
         for room in page.get("rooms", []):
-            if room.get("room_type") == SPACE_ROOM_TYPE:
+            # A space with no local member left holds no current state on
+            # the server: there is nobody to join and nothing to own, and the
+            # endpoint would refuse it as not a space.
+            if (
+                room.get("room_type") == SPACE_ROOM_TYPE
+                and room.get("joined_local_members", 1) > 0
+            ):
                 yield room["room_id"]
         if "next_batch" not in page:
             return

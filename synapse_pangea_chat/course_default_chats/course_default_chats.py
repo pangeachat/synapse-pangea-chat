@@ -493,7 +493,9 @@ class CourseDefaultChats:
                 chat, roster.admins
             ):
                 report.ignored = (
-                    "neither created by a space admin nor holding one at admin power"
+                    "the space has no joined admin"
+                    if not roster.admins
+                    else "neither created by a space admin nor holding one at admin power"
                 )
                 logger.info(
                     "course_default_chats ignoring %s in %s: %s",
