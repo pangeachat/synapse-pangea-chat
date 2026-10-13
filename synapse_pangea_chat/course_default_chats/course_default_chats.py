@@ -252,13 +252,18 @@ class CourseDefaultChats:
     # Sync entry points (each returns None when the room is not a space)
     # ------------------------------------------------------------------
 
-    async def sync_space(self, space_id: str) -> Optional[List[ChatSyncReport]]:
-        """Bring every default chat of the space in line with the space."""
+    async def sync_space(
+        self, space_id: str, *, apply: bool = True
+    ) -> Optional[List[ChatSyncReport]]:
+        """Bring every default chat of the space in line with the space.
+        With ``apply`` false, report what would change and change nothing."""
         roster = await self._space_roster(space_id)
         if roster is None:
             return None
         return [
-            await self._sync_chat(space_id, chat_id, roster, only_user=None)
+            await self._sync_chat(
+                space_id, chat_id, roster, only_user=None, apply=apply
+            )
             for chat_id in await self._default_chat_ids(space_id)
         ]
 
@@ -267,7 +272,9 @@ class CourseDefaultChats:
         roster = await self._space_roster(space_id)
         if roster is None or not await self._is_default_chat(chat_id):
             return None
-        return await self._sync_chat(space_id, chat_id, roster, only_user=None)
+        return await self._sync_chat(
+            space_id, chat_id, roster, only_user=None, apply=True
+        )
 
     async def sync_member(
         self, space_id: str, user_id: str
@@ -277,39 +284,11 @@ class CourseDefaultChats:
         if roster is None or user_id not in roster.members:
             return None
         return [
-            await self._sync_chat(space_id, chat_id, roster, only_user=user_id)
+            await self._sync_chat(
+                space_id, chat_id, roster, only_user=user_id, apply=True
+            )
             for chat_id in await self._default_chat_ids(space_id)
         ]
-
-    async def sync_spaces(self, space_ids: List[str]) -> None:
-        """The repair run over many spaces, one at a time, outcomes in the log."""
-        synced = failed = 0
-        for space_id in space_ids:
-            try:
-                reports = await self.sync_space(space_id)
-            except Exception as e:
-                failed += 1
-                logger.warning(
-                    "course_default_chats repair failed for %s: %s", space_id, e
-                )
-                _capture_exception(e)
-                continue
-            if reports:
-                synced += 1
-        logger.info(
-            "course_default_chats repair done: %d spaces, %d with default chats, %d failed",
-            len(space_ids),
-            synced,
-            failed,
-        )
-
-    async def all_space_ids(self) -> List[str]:
-        return await self._store.db_pool.simple_select_onecol(
-            table="room_stats_state",
-            keyvalues={"room_type": SPACE_ROOM_TYPE},
-            retcol="room_id",
-            desc="course_default_chats_all_spaces",
-        )
 
     # ------------------------------------------------------------------
     # Reads
@@ -404,20 +383,25 @@ class CourseDefaultChats:
         chat_id: str,
         roster: SpaceRoster,
         only_user: Optional[str],
+        apply: bool,
     ) -> ChatSyncReport:
         report = ChatSyncReport(chat_id=chat_id)
         async with self._chat_locks.queue(chat_id):
-            await self._mirror_admins(chat_id, roster, report)
+            await self._mirror_admins(chat_id, roster, report, apply)
             targets = [only_user] if only_user else sorted(roster.members)
             for user_id in targets:
-                await self._join_member(chat_id, user_id, report)
+                await self._join_member(chat_id, user_id, report, apply)
         logger.info(
-            "course_default_chats synced %s in %s: %s", chat_id, space_id, report
+            "course_default_chats %s %s in %s: %s",
+            "synced" if apply else "dry run of",
+            chat_id,
+            space_id,
+            report,
         )
         return report
 
     async def _mirror_admins(
-        self, chat_id: str, roster: SpaceRoster, report: ChatSyncReport
+        self, chat_id: str, roster: SpaceRoster, report: ChatSyncReport, apply: bool
     ) -> None:
         chat = await self._chat_state(chat_id)
         promote = admins_to_promote(
@@ -431,11 +415,15 @@ class CourseDefaultChats:
             )
             if sender is None:
                 report.admin_sender_missing = True
-                error = NoChatAdminError(
-                    f"No joined admin can mirror {len(promote)} space admins into {chat_id}"
-                )
-                logger.warning("%s", error)
-                _capture_exception(error)
+                if apply:
+                    error = NoChatAdminError(
+                        f"No joined admin can mirror {len(promote)} space admins"
+                        f" into {chat_id}"
+                    )
+                    logger.warning("%s", error)
+                    _capture_exception(error)
+            elif not apply:
+                report.promoted = promote
             else:
                 users = chat.users
                 for user_id in promote:
@@ -456,6 +444,9 @@ class CourseDefaultChats:
             roster.admins,
             chat.immutable,
         ):
+            if not apply:
+                report.demoted.append(user_id)
+                continue
             users = chat.users
             users.pop(user_id, None)
             try:
@@ -483,7 +474,7 @@ class CourseDefaultChats:
         )
 
     async def _join_member(
-        self, chat_id: str, user_id: str, report: ChatSyncReport
+        self, chat_id: str, user_id: str, report: ChatSyncReport, apply: bool
     ) -> None:
         membership, _ = await self._store.get_local_current_membership_for_user_in_room(
             user_id, chat_id
@@ -493,6 +484,9 @@ class CourseDefaultChats:
             return
         if membership == MEMBERSHIP_BAN:
             report.skipped_banned.append(user_id)
+            return
+        if not apply:
+            report.joined.append(user_id)
             return
         try:
             await self._join(chat_id, user_id, invited=membership == MEMBERSHIP_INVITE)
@@ -567,9 +561,13 @@ class CourseDefaultChats:
 
 class SyncCourseDefaultChats(Resource):
     """``POST /_synapse/client/pangea/v1/sync_course_default_chats``: the
-    repair endpoint. Server admins only. ``{"room_id": ...}`` syncs one
-    space and answers with its per-chat report; an empty body schedules every
-    space in the background and answers 202 with the count."""
+    repair endpoint. Server admins only. ``{"room_id": ...}`` syncs that one
+    space and answers with its per-chat report; ``"dry_run": true`` answers
+    the report of what would change and changes nothing.
+
+    Exactly one space per call, on purpose: which spaces to touch is decided
+    by the operator running ``scripts/repair_course_default_chats.py``, not
+    by an endpoint that could sweep the homeserver in one request."""
 
     isLeaf = True
 
@@ -594,16 +592,15 @@ class SyncCourseDefaultChats(Resource):
 
             body = await extract_body_json(request)
             room_id = body.get("room_id") if isinstance(body, dict) else None
-            if room_id is None:
-                space_ids = await self._syncer.all_space_ids()
-                self._api.run_as_background_process(
-                    "course_default_chats_repair", self._syncer.sync_spaces, space_ids
-                )
+            dry_run = body.get("dry_run", False) if isinstance(body, dict) else False
+            if not isinstance(dry_run, bool):
                 respond_with_json(
-                    request, 202, {"scheduled": len(space_ids)}, send_cors=True
+                    request,
+                    400,
+                    {"error": "'dry_run' must be a boolean"},
+                    send_cors=True,
                 )
                 return
-
             if not isinstance(room_id, str) or not _is_valid_room_id(room_id):
                 respond_with_json(
                     request,
@@ -613,7 +610,7 @@ class SyncCourseDefaultChats(Resource):
                 )
                 return
 
-            reports = await self._syncer.sync_space(room_id)
+            reports = await self._syncer.sync_space(room_id, apply=not dry_run)
             if reports is None:
                 respond_with_json(
                     request, 400, {"error": "'room_id' must be a space"}, send_cors=True
@@ -622,7 +619,11 @@ class SyncCourseDefaultChats(Resource):
             respond_with_json(
                 request,
                 200,
-                {"room_id": room_id, "chats": [r.as_json() for r in reports]},
+                {
+                    "room_id": room_id,
+                    "dry_run": dry_run,
+                    "chats": [r.as_json() for r in reports],
+                },
                 send_cors=True,
             )
         # silent-ok: the caller's auth failure, answered 401 (logged at INFO)

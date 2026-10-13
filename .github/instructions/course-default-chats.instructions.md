@@ -37,7 +37,7 @@ A promotion in a chat is sent by a joined admin of that chat: at creation its cr
 
 ## Repairing existing spaces
 
-A server-admin endpoint, `POST /_synapse/client/pangea/v1/sync_course_default_chats`, applies the rule to one space by `room_id`, or with no room id to every space, in the background. It is how spaces created before this module are brought in line after deploy, and the support tool when a teacher reports a co-instructor who cannot post. It reports per chat what it did, and one member's failure never stops the rest.
+A server-admin endpoint, `POST /_synapse/client/pangea/v1/sync_course_default_chats`, applies the rule to one space, named by `room_id`, and answers with a report per chat of who was joined, promoted or demoted. With `dry_run` it answers the report of what would change and changes nothing. It takes exactly one space per call: an endpoint that could sweep the whole homeserver is too large a change to leave open behind one request, so the decision of which spaces to touch is made by an operator, in the open. The operator script `scripts/repair_course_default_chats.py` walks every space on the homeserver, dry-runs each, prints the spaces where something would change, and only with `--apply` repairs exactly those, one call per space. That is how spaces created before this module are brought in line after deploy; with a single room id it is the support tool when a teacher reports a co-instructor who cannot post. One member's failure never stops the rest.
 
 ## Off switch
 

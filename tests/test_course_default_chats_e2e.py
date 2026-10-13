@@ -4,7 +4,9 @@ line with their space, and the repair endpoint does the same on demand.
 Design: .github/instructions/course-default-chats.instructions.md
 """
 
+import importlib.util
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
 
@@ -394,35 +396,30 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         self.assertEqual(await self._membership(chat_id, s1_id, teacher), "join")
         self.assertEqual((await self._power_users(chat_id, teacher)).get(co_id), 100)
 
-    async def test_repair_endpoint_refuses_non_admins_and_non_spaces(self):
+    async def test_repair_endpoint_refuses_non_admins_and_bad_input(self):
         await self.homeserver()
         _, operator = await self.new_user("operator", admin=True)
         _, teacher = await self.new_user("teacher")
         plain_room_id = await self.create_private_room(teacher)
+        space_id = await self._create_space(teacher)
 
-        response = requests.post(
-            self._endpoint(),
-            headers=self._headers(teacher),
-            json={"room_id": plain_room_id},
-        )
-        self.assertEqual(response.status_code, 403, response.text)
+        for token, body, status in (
+            (teacher, {"room_id": space_id}, 403),
+            (operator, {"room_id": plain_room_id}, 400),
+            (operator, {"room_id": "nope"}, 400),
+            # One space per call: no room id is not "every space".
+            (operator, {}, 400),
+            (operator, {"room_id": space_id, "dry_run": "yes"}, 400),
+        ):
+            response = requests.post(
+                self._endpoint(), headers=self._headers(token), json=body
+            )
+            self.assertEqual(response.status_code, status, (body, response.text))
 
-        response = requests.post(
-            self._endpoint(),
-            headers=self._headers(operator),
-            json={"room_id": plain_room_id},
-        )
-        self.assertEqual(response.status_code, 400, response.text)
-
-        response = requests.post(
-            self._endpoint(), headers=self._headers(operator), json={"room_id": "nope"}
-        )
-        self.assertEqual(response.status_code, 400, response.text)
-
-    async def test_repair_endpoint_schedules_every_space(self):
+    async def test_repair_endpoint_dry_run_reports_without_changing(self):
         await self.homeserver()
         _, operator = await self.new_user("operator", admin=True)
-        teacher_id, teacher = await self.new_user("teacher")
+        _, teacher = await self.new_user("teacher")
         s1_id, s1 = await self.new_user("s1")
 
         space_id = await self._create_space(teacher)
@@ -433,14 +430,56 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         await self._membership_action("kick", chat_id, s1_id, teacher)
 
         response = requests.post(
-            self._endpoint(), headers=self._headers(operator), json={}
+            self._endpoint(),
+            headers=self._headers(operator),
+            json={"room_id": space_id, "dry_run": True},
         )
-        self.assertEqual(response.status_code, 202, response.text)
-        self.assertGreaterEqual(response.json()["scheduled"], 1)
+        self.assertEqual(response.status_code, 200, response.text)
+        report = response.json()
+        self.assertTrue(report["dry_run"])
+        self.assertEqual(report["chats"][0]["joined"], [s1_id])
+        self.assertEqual(await self._membership(chat_id, s1_id, teacher), "leave")
 
+    async def test_repair_script_lists_then_repairs(self):
+        """The operator script: the dry-run walk finds the space, and
+        --apply repairs exactly the spaces it listed."""
+        await self.homeserver()
+        _, operator = await self.new_user("operator", admin=True)
+        _, teacher = await self.new_user("teacher")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        await self._join(space_id, s1)
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
         await self._wait_joined(chat_id, [s1_id], teacher)
-        self.assertTrue(
-            any(
-                "course_default_chats repair done" in line for line in self.server_log()
+        await self._membership_action("kick", chat_id, s1_id, teacher)
+
+        script = _load_repair_script()
+        self.assertIn(space_id, list(script.walk_spaces(self.server_url, operator)))
+        dry = script.sync_space(self.server_url, operator, space_id, apply=False)
+        self.assertTrue(script.needs_repair(dry))
+        self.assertEqual(await self._membership(chat_id, s1_id, teacher), "leave")
+
+        applied = script.sync_space(self.server_url, operator, space_id, apply=True)
+        self.assertEqual(applied["chats"][0]["joined"], [s1_id])
+        self.assertEqual(await self._membership(chat_id, s1_id, teacher), "join")
+        self.assertFalse(
+            script.needs_repair(
+                script.sync_space(self.server_url, operator, space_id, apply=False)
             )
         )
+
+
+def _load_repair_script() -> Any:
+    """scripts/ is not a package; the script is loaded by path."""
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "scripts"
+        / "repair_course_default_chats.py"
+    )
+    spec = importlib.util.spec_from_file_location("repair_course_default_chats", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
