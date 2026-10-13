@@ -113,7 +113,7 @@ def needs_attention(report: Dict[str, Any]) -> bool:
     """Whether a report shows anything to change, or anything the sync cannot
     fix on its own (a chat nobody can act for, a failed step)."""
     return remaining_work(report) or any(
-        chat["admin_sender_missing"] or chat["failed"]
+        chat["admin_sender_missing"] or chat["failed"] or chat.get("ignored")
         for chat in report.get("chats", [])
     )
 
@@ -138,6 +138,9 @@ def repair(
 def describe(report: Dict[str, Any]) -> str:
     parts = []
     for chat in report.get("chats", []):
+        if chat.get("ignored"):
+            parts.append(f"{chat['chat_id']}: IGNORED, {chat['ignored']}")
+            continue
         detail = (
             f"{chat['chat_id']}: promote {len(chat['promoted'])},"
             f" demote {len(chat['demoted'])}, join {len(chat['joined'])}"

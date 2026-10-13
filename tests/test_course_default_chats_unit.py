@@ -5,6 +5,7 @@ from synapse_pangea_chat.course_default_chats.course_default_chats import (
     admins_to_demote,
     admins_to_promote,
     is_default_chat_alias,
+    owned_by_space_admin,
 )
 
 TEACHER = "@teacher:example.com"
@@ -91,3 +92,29 @@ class TestChatState(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOwnedBySpaceAdmin(unittest.TestCase):
+    def _chat(self, creator, users):
+        return ChatState(
+            power_content={"users": users},
+            memberships={},
+            immutable=frozenset(),
+            creator=creator,
+        )
+
+    def test_a_chat_a_space_admin_created_is_theirs(self):
+        chat = self._chat(TEACHER, {TEACHER: 100})
+        self.assertTrue(owned_by_space_admin(chat, frozenset({TEACHER})))
+
+    def test_a_chat_a_space_admin_already_runs_is_theirs(self):
+        chat = self._chat(STUDENT, {STUDENT: 100, CO_TEACHER: 100})
+        self.assertTrue(owned_by_space_admin(chat, frozenset({CO_TEACHER})))
+
+    def test_a_students_prefixed_room_is_not(self):
+        chat = self._chat(STUDENT, {STUDENT: 100})
+        self.assertFalse(owned_by_space_admin(chat, frozenset({TEACHER})))
+
+    def test_a_creator_who_stopped_being_an_admin_does_not_count(self):
+        chat = self._chat(CO_TEACHER, {CO_TEACHER: 100})
+        self.assertFalse(owned_by_space_admin(chat, frozenset({TEACHER})))

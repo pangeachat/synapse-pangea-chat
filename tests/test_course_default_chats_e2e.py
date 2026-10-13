@@ -50,16 +50,21 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
     def _endpoint(self) -> str:
         return f"{self.server_url}/_synapse/client/pangea/v1/sync_course_default_chats"
 
-    async def _create_space(self, token: str) -> str:
+    async def _create_space(self, token: str, *, members_can_link: bool = False) -> str:
+        body: Dict[str, Any] = {
+            "visibility": "private",
+            "preset": "public_chat",
+            "creation_content": {"type": "m.space"},
+            "name": "Test Course",
+        }
+        if members_can_link:
+            # As production spaces are: any member may attach a child, so
+            # learners' activity sessions can fan out into their courses.
+            body["power_level_content_override"] = {"events": {"m.space.child": 0}}
         response = requests.post(
             f"{self.server_url}/_matrix/client/v3/createRoom",
             headers=self._headers(token),
-            json={
-                "visibility": "private",
-                "preset": "public_chat",
-                "creation_content": {"type": "m.space"},
-                "name": "Test Course",
-            },
+            json=body,
         )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["room_id"]
@@ -334,6 +339,38 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         self.assertIsNone(await self._membership(plain_child_id, s1_id, teacher))
         self.assertIsNone(await self._membership(chat_of_plain_room, s1_id, teacher))
 
+    async def test_a_prefixed_room_from_a_student_is_not_a_default_chat(self):
+        """Any member can link a child. A student's room wearing the alias
+        prefix is left alone and named in the report; the teacher's is synced."""
+        await self.homeserver()
+        _, operator = await self.new_user("operator", admin=True)
+        teacher_id, teacher = await self.new_user("teacher")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher, members_can_link=True)
+        await self._join(space_id, s1)
+        fake_id = await self._create_child(s1, space_id, alias_prefix=ANNOUNCEMENTS)
+        await self._link_child(s1, space_id, fake_id)
+        time.sleep(3)
+        self.assertIsNone(await self._membership(fake_id, teacher_id, s1))
+        self.assertEqual((await self._power_users(fake_id, s1)).get(s1_id), 100)
+
+        response = requests.post(
+            self._endpoint(),
+            headers=self._headers(operator),
+            json={"room_id": space_id, "dry_run": True},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        chats = {c["chat_id"]: c for c in response.json()["chats"]}
+        self.assertTrue(chats[fake_id]["ignored"])
+        self.assertEqual(chats[fake_id]["joined"], [])
+
+        # The positive control: the teacher's own default chat still syncs.
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        await self._wait_joined(chat_id, [s1_id], teacher)
+        self.assertIsNone(await self._membership(fake_id, teacher_id, s1))
+
     async def test_a_class_larger_than_the_join_burst_is_joined(self):
         """Synapse's per-room join limit allows a burst of ten; the sync
         waits the limiter out for the rest instead of dropping them."""
@@ -383,8 +420,8 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         await self._wait_joined(chat_id, [s1_id], teacher)
 
     async def test_demotion_never_strands_the_chat(self):
-        """A co-teacher creates Announcements, steps down in the space, and
-        the teacher links it: the teacher is promoted and joined before the
+        """The teacher has left Announcements and the co-teacher who created
+        it steps down in the space. The teacher is joined again before the
         co-teacher is demoted, so someone can still let members in."""
         await self.homeserver()
         teacher_id, teacher = await self.new_user("teacher")
@@ -395,17 +432,23 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         await self._join(space_id, co)
         await self._set_power(space_id, co_id, 100, teacher)
         chat_id = await self._create_announcements(co, space_id)
-        await self._set_power(space_id, co_id, 0, co)
-        await self._link_child(teacher, space_id, chat_id)
-
+        await self._link_child(co, space_id, chat_id)
         await self._wait_joined(chat_id, [teacher_id], teacher)
+        response = requests.post(
+            self._room_url(chat_id, "/leave"), headers=self._headers(teacher)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        await self._set_power(space_id, co_id, 0, co)
+
+        await self._wait_joined(chat_id, [teacher_id], co)
 
         async def settled() -> bool:
-            users = await self._power_users(chat_id, teacher)
+            users = await self._power_users(chat_id, co)
             return users.get(teacher_id) == 100 and users.get(co_id, 0) < 100
 
-        await self._wait_until_async(settled, "teacher promoted, co-teacher demoted")
-        self.assertEqual(await self._membership(chat_id, co_id, teacher), "join")
+        await self._wait_until_async(settled, "co-teacher demoted after the rejoin")
+        self.assertEqual(await self._membership(chat_id, co_id, co), "join")
         self.assertEqual(await self._send_message_status(chat_id, teacher), 200)
         # Not stranded: a student joining the space still lands in the chat.
         await self._join(space_id, s1)

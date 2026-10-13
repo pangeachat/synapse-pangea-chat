@@ -148,6 +148,7 @@ class ChatState:
     power_content: Dict[str, Any]
     memberships: Dict[str, str]
     immutable: FrozenSet[str]
+    creator: Optional[str] = None
 
     @property
     def users(self) -> Dict[str, Any]:
@@ -185,6 +186,17 @@ class ChatState:
         )
 
 
+def owned_by_space_admin(chat: ChatState, space_admins: FrozenSet[str]) -> bool:
+    """Whether the chat is the space admins' own: its creator is one, or one
+    already holds admin power in it. Any member can link a child to a space
+    (activity sessions fan out into courses that way), so on the alias
+    prefix alone a student could create a room and have the server put the
+    whole class in it."""
+    if chat.creator is not None and chat.creator in space_admins:
+        return True
+    return any(chat.power(admin) >= ADMIN_POWER_LEVEL for admin in space_admins)
+
+
 def _coerce_int(value: Any, default: int = 0) -> int:
     """A power level as an int. Room versions before v10 let a non-integer
     through; it is read as the default and said so, never raised on."""
@@ -209,6 +221,9 @@ class ChatSyncReport:
     already_joined: int = 0
     skipped_banned: List[str] = attr.Factory(list)
     failed: List[Dict[str, str]] = attr.Factory(list)
+    # Set, with the reason, when the chat carries the mark but is not the
+    # space admins' own; nothing else in the report is then filled in.
+    ignored: Optional[str] = None
 
     def as_json(self) -> Dict[str, Any]:
         return attr.asdict(self)
@@ -451,6 +466,7 @@ class CourseDefaultChats:
             power_content=dict(power.content) if power is not None else {},
             memberships=memberships,
             immutable=immutable,
+            creator=create.sender if create is not None else None,
         )
 
     # ------------------------------------------------------------------
@@ -470,7 +486,23 @@ class CourseDefaultChats:
         could still let the others in."""
         report = ChatSyncReport(chat_id=chat_id)
         async with self._chat_locks.queue(chat_id):
-            chat = await self._promote_admins(chat_id, roster, report, apply)
+            chat = await self._chat_state(chat_id)
+            # A chat with no current state (every local member left) has no
+            # creator to judge by; it falls through to the no-admin report.
+            if chat.creator is not None and not owned_by_space_admin(
+                chat, roster.admins
+            ):
+                report.ignored = (
+                    "neither created by a space admin nor holding one at admin power"
+                )
+                logger.info(
+                    "course_default_chats ignoring %s in %s: %s",
+                    chat_id,
+                    space_id,
+                    report.ignored,
+                )
+                return report
+            chat = await self._promote_admins(chat_id, roster, report, apply, chat)
             targets = [only_user] if only_user else sorted(roster.members)
             if not chat.can_admit_members():
                 self._report_no_admin(
@@ -492,9 +524,13 @@ class CourseDefaultChats:
         return report
 
     async def _promote_admins(
-        self, chat_id: str, roster: SpaceRoster, report: ChatSyncReport, apply: bool
+        self,
+        chat_id: str,
+        roster: SpaceRoster,
+        report: ChatSyncReport,
+        apply: bool,
+        chat: ChatState,
     ) -> ChatState:
-        chat = await self._chat_state(chat_id)
         promote = admins_to_promote(
             chat.users, chat.users_default, roster.admins, chat.immutable
         )
