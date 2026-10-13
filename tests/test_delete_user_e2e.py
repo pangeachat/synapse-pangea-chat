@@ -1,25 +1,22 @@
 import asyncio
 
 import requests
-import yaml
 from psycopg2 import connect
 
-from .base_e2e import BaseSynapseE2ETest
+from .base_e2e import SERVER_NAME, BaseSynapseE2ETest
 
 
-class TestDeleteUserE2E(BaseSynapseE2ETest):
+class _DeleteUserHelpers:
     _SCHEDULE_TABLE = "pangea_delete_user_schedule"
 
-    def _db_args_from_config(self, config_path: str) -> dict:
-        with open(config_path, "r", encoding="utf-8") as config_file:
-            config = yaml.safe_load(config_file)
-        database = config.get("database", {})
-        args = database.get("args", {})
-        return args
+    def _delete_user_url(self) -> str:
+        return f"{self.server_url}/_synapse/client/pangea/v1/delete_user"
 
-    def _insert_threepid(self, config_path: str, user_id: str, address: str) -> None:
-        db_args = self._db_args_from_config(config_path)
-        conn = connect(**db_args)
+    def _login_url(self) -> str:
+        return f"{self.server_url}/_matrix/client/v3/login"
+
+    def _insert_threepid(self, user_id: str, address: str) -> None:
+        conn = connect(self.database_url)
         try:
             conn.autocommit = True
             cursor = conn.cursor()
@@ -34,9 +31,8 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
         finally:
             conn.close()
 
-    def _count_threepids(self, config_path: str, user_id: str) -> int:
-        db_args = self._db_args_from_config(config_path)
-        conn = connect(**db_args)
+    def _count_threepids(self, user_id: str) -> int:
+        conn = connect(self.database_url)
         try:
             cursor = conn.cursor()
             cursor.execute(
@@ -51,13 +47,11 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
 
     def _insert_external_id(
         self,
-        config_path: str,
         user_id: str,
         auth_provider: str,
         external_id: str,
     ) -> None:
-        db_args = self._db_args_from_config(config_path)
-        conn = connect(**db_args)
+        conn = connect(self.database_url)
         try:
             conn.autocommit = True
             cursor = conn.cursor()
@@ -72,9 +66,8 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
         finally:
             conn.close()
 
-    def _count_external_ids(self, config_path: str, user_id: str) -> int:
-        db_args = self._db_args_from_config(config_path)
-        conn = connect(**db_args)
+    def _count_external_ids(self, user_id: str) -> int:
+        conn = connect(self.database_url)
         try:
             cursor = conn.cursor()
             cursor.execute(
@@ -87,11 +80,8 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
         finally:
             conn.close()
 
-    def _insert_schedule(
-        self, config_path: str, user_id: str, execute_at_ms: int
-    ) -> None:
-        db_args = self._db_args_from_config(config_path)
-        conn = connect(**db_args)
+    def _insert_schedule(self, user_id: str, execute_at_ms: int) -> None:
+        conn = connect(self.database_url)
         try:
             conn.autocommit = True
             cursor = conn.cursor()
@@ -107,9 +97,8 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
         finally:
             conn.close()
 
-    def _schedule_table_exists(self, config_path: str) -> bool:
-        db_args = self._db_args_from_config(config_path)
-        conn = connect(**db_args)
+    def _schedule_table_exists(self) -> bool:
+        conn = connect(self.database_url)
         try:
             cursor = conn.cursor()
             cursor.execute(
@@ -122,9 +111,8 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
         finally:
             conn.close()
 
-    def _count_schedules(self, config_path: str, user_id: str) -> int:
-        db_args = self._db_args_from_config(config_path)
-        conn = connect(**db_args)
+    def _count_schedules(self, user_id: str) -> int:
+        conn = connect(self.database_url)
         try:
             cursor = conn.cursor()
             cursor.execute(
@@ -137,394 +125,259 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
         finally:
             conn.close()
 
+
+class TestDeleteUserE2E(_DeleteUserHelpers, BaseSynapseE2ETest):
+    """The endpoint's contract, with the default 7-day delay and a dead CMS.
+
+    No schedule made here comes due while the class runs, so the background
+    processor never touches one; a test's schedule moves only when it acts.
+    """
+
+    _MODULE_CONFIG = {
+        "cms_base_url": "http://127.0.0.1:9",
+        "cms_service_api_key": "test-key",
+    }
+
     async def test_delete_user_self_schedule_then_force(self):
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(module_config=self._MODULE_CONFIG)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        user_id, access_token = await self.new_user("selfdelete", password="pw1")
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="selfdelete",
-                password="pw1",
-                admin=False,
-            )
-            _, access_token = await self.login_user("selfdelete", "pw1")
-            user_id = "@selfdelete:my.domain.name"
+        self._insert_threepid(user_id, f"selfdelete_{self.tag}@example.com")
+        self._insert_external_id(
+            user_id,
+            "oidc",
+            f"selfdelete-external-id-{self.tag}",
+        )
+        self.assertEqual(self._count_threepids(user_id), 1)
+        self.assertEqual(self._count_external_ids(user_id), 1)
 
-            self._insert_threepid(config_path, user_id, "selfdelete@example.com")
-            self._insert_external_id(
-                config_path,
-                user_id,
-                "oidc",
-                "selfdelete-external-id",
-            )
-            self.assertEqual(self._count_threepids(config_path, user_id), 1)
-            self.assertEqual(self._count_external_ids(config_path, user_id), 1)
+        response = requests.post(
+            self._delete_user_url(),
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
 
-            delete_user_url = (
-                "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
-            )
-            response = requests.post(
-                delete_user_url,
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message"], "Delete scheduled")
+        self.assertEqual(response.json()["action"], "schedule")
+        self.assertEqual(response.json()["user_id"], user_id)
+        self.assertEqual(self._count_schedules(user_id), 1)
 
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json()["message"], "Delete scheduled")
-            self.assertEqual(response.json()["action"], "schedule")
-            self.assertEqual(response.json()["user_id"], user_id)
-            self.assertEqual(self._count_schedules(config_path, user_id), 1)
+        login_response = requests.post(
+            self._login_url(),
+            json={
+                "type": "m.login.password",
+                "user": self.localpart("selfdelete"),
+                "password": "pw1",
+            },
+        )
+        self.assertEqual(login_response.status_code, 200)
 
-            login_url = "http://localhost:8008/_matrix/client/v3/login"
-            login_response = requests.post(
-                login_url,
-                json={
-                    "type": "m.login.password",
-                    "user": "selfdelete",
-                    "password": "pw1",
-                },
-            )
-            self.assertEqual(login_response.status_code, 200)
+        force_response = requests.post(
+            self._delete_user_url(),
+            json={"action": "force"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(force_response.status_code, 200)
+        self.assertEqual(force_response.json()["message"], "Deleted")
+        self.assertEqual(force_response.json()["action"], "force")
+        self.assertEqual(force_response.json()["deleted_threepids"], 1)
+        self.assertEqual(force_response.json()["deleted_external_ids"], 1)
+        self.assertEqual(self._count_threepids(user_id), 0)
+        self.assertEqual(self._count_external_ids(user_id), 0)
+        self.assertEqual(self._count_schedules(user_id), 0)
 
-            force_response = requests.post(
-                delete_user_url,
-                json={"action": "force"},
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-            self.assertEqual(force_response.status_code, 200)
-            self.assertEqual(force_response.json()["message"], "Deleted")
-            self.assertEqual(force_response.json()["action"], "force")
-            self.assertEqual(force_response.json()["deleted_threepids"], 1)
-            self.assertEqual(force_response.json()["deleted_external_ids"], 1)
-            self.assertEqual(self._count_threepids(config_path, user_id), 0)
-            self.assertEqual(self._count_external_ids(config_path, user_id), 0)
-            self.assertEqual(self._count_schedules(config_path, user_id), 0)
-
-            login_response = requests.post(
-                login_url,
-                json={
-                    "type": "m.login.password",
-                    "user": "selfdelete",
-                    "password": "pw1",
-                },
-            )
-            self.assertNotEqual(login_response.status_code, 200)
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        login_response = requests.post(
+            self._login_url(),
+            json={
+                "type": "m.login.password",
+                "user": self.localpart("selfdelete"),
+                "password": "pw1",
+            },
+        )
+        self.assertNotEqual(login_response.status_code, 200)
 
     async def test_delete_user_admin_can_cancel_and_force_target_schedule(self):
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(module_config=self._MODULE_CONFIG)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        _, admin_token = await self.new_user("admin", admin=True, password="pw1")
+        target_user_id, _ = await self.new_user("target", password="pw2")
+        self._insert_threepid(target_user_id, f"target_{self.tag}@example.com")
+        self._insert_external_id(
+            target_user_id,
+            "oidc",
+            f"target-external-id-{self.tag}",
+        )
+        self.assertEqual(self._count_threepids(target_user_id), 1)
+        self.assertEqual(self._count_external_ids(target_user_id), 1)
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="admin",
-                password="pw1",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="target",
-                password="pw2",
-                admin=False,
-            )
-            target_user_id = "@target:my.domain.name"
-            self._insert_threepid(config_path, target_user_id, "target@example.com")
-            self._insert_external_id(
-                config_path,
-                target_user_id,
-                "oidc",
-                "target-external-id",
-            )
-            self.assertEqual(self._count_threepids(config_path, target_user_id), 1)
-            self.assertEqual(self._count_external_ids(config_path, target_user_id), 1)
+        response = requests.post(
+            self._delete_user_url(),
+            json={"user_id": target_user_id},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
 
-            _, admin_token = await self.login_user("admin", "pw1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message"], "Delete scheduled")
+        self.assertEqual(response.json()["action"], "schedule")
+        self.assertEqual(response.json()["user_id"], target_user_id)
+        self.assertEqual(self._count_schedules(target_user_id), 1)
 
-            delete_user_url = (
-                "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
-            )
-            response = requests.post(
-                delete_user_url,
-                json={"user_id": "@target:my.domain.name"},
-                headers={"Authorization": f"Bearer {admin_token}"},
-            )
+        cancel_response = requests.post(
+            self._delete_user_url(),
+            json={"action": "cancel", "user_id": target_user_id},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        self.assertEqual(cancel_response.status_code, 200)
+        self.assertEqual(cancel_response.json()["action"], "cancel")
+        self.assertTrue(cancel_response.json()["canceled"])
+        self.assertEqual(self._count_schedules(target_user_id), 0)
 
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json()["message"], "Delete scheduled")
-            self.assertEqual(response.json()["action"], "schedule")
-            self.assertEqual(response.json()["user_id"], target_user_id)
-            self.assertEqual(self._count_schedules(config_path, target_user_id), 1)
+        force_without_schedule_response = requests.post(
+            self._delete_user_url(),
+            json={"action": "force", "user_id": target_user_id},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        self.assertEqual(force_without_schedule_response.status_code, 400)
 
-            cancel_response = requests.post(
-                delete_user_url,
-                json={"action": "cancel", "user_id": target_user_id},
-                headers={"Authorization": f"Bearer {admin_token}"},
-            )
-            self.assertEqual(cancel_response.status_code, 200)
-            self.assertEqual(cancel_response.json()["action"], "cancel")
-            self.assertTrue(cancel_response.json()["canceled"])
-            self.assertEqual(self._count_schedules(config_path, target_user_id), 0)
+        reschedule_response = requests.post(
+            self._delete_user_url(),
+            json={"user_id": target_user_id},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        self.assertEqual(reschedule_response.status_code, 200)
+        self.assertEqual(self._count_schedules(target_user_id), 1)
 
-            force_without_schedule_response = requests.post(
-                delete_user_url,
-                json={"action": "force", "user_id": target_user_id},
-                headers={"Authorization": f"Bearer {admin_token}"},
-            )
-            self.assertEqual(force_without_schedule_response.status_code, 400)
+        force_response = requests.post(
+            self._delete_user_url(),
+            json={"action": "force", "user_id": target_user_id},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        self.assertEqual(force_response.status_code, 200)
+        self.assertEqual(force_response.json()["action"], "force")
+        self.assertEqual(force_response.json()["deleted_threepids"], 1)
+        self.assertEqual(force_response.json()["deleted_external_ids"], 1)
+        self.assertEqual(self._count_threepids(target_user_id), 0)
+        self.assertEqual(self._count_external_ids(target_user_id), 0)
+        self.assertEqual(self._count_schedules(target_user_id), 0)
 
-            reschedule_response = requests.post(
-                delete_user_url,
-                json={"user_id": target_user_id},
-                headers={"Authorization": f"Bearer {admin_token}"},
-            )
-            self.assertEqual(reschedule_response.status_code, 200)
-            self.assertEqual(self._count_schedules(config_path, target_user_id), 1)
-
-            force_response = requests.post(
-                delete_user_url,
-                json={"action": "force", "user_id": target_user_id},
-                headers={"Authorization": f"Bearer {admin_token}"},
-            )
-            self.assertEqual(force_response.status_code, 200)
-            self.assertEqual(force_response.json()["action"], "force")
-            self.assertEqual(force_response.json()["deleted_threepids"], 1)
-            self.assertEqual(force_response.json()["deleted_external_ids"], 1)
-            self.assertEqual(self._count_threepids(config_path, target_user_id), 0)
-            self.assertEqual(self._count_external_ids(config_path, target_user_id), 0)
-            self.assertEqual(self._count_schedules(config_path, target_user_id), 0)
-
-            login_url = "http://localhost:8008/_matrix/client/v3/login"
-            login_response = requests.post(
-                login_url,
-                json={
-                    "type": "m.login.password",
-                    "user": "target",
-                    "password": "pw2",
-                },
-            )
-            self.assertNotEqual(login_response.status_code, 200)
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        login_response = requests.post(
+            self._login_url(),
+            json={
+                "type": "m.login.password",
+                "user": self.localpart("target"),
+                "password": "pw2",
+            },
+        )
+        self.assertNotEqual(login_response.status_code, 200)
 
     async def test_delete_user_rejects_non_local_target(self):
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(module_config=self._MODULE_CONFIG)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        _, admin_token = await self.new_user("admin2", admin=True, password="pw1")
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="admin2",
-                password="pw1",
-                admin=True,
-            )
+        response = requests.post(
+            self._delete_user_url(),
+            json={"user_id": "@remote:other.domain"},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
 
-            _, admin_token = await self.login_user("admin2", "pw1")
-
-            delete_user_url = (
-                "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
-            )
-            response = requests.post(
-                delete_user_url,
-                json={"user_id": "@remote:other.domain"},
-                headers={"Authorization": f"Bearer {admin_token}"},
-            )
-
-            self.assertEqual(response.status_code, 400)
-            self.assertIn("local users", response.json().get("error", ""))
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("local users", response.json().get("error", ""))
 
     async def test_delete_user_non_admin_cannot_target_another_user(self):
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(module_config=self._MODULE_CONFIG)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        _, user1_token = await self.new_user("user1", password="pw1")
+        user2_id, _ = await self.new_user("user2", password="pw2")
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="user1",
-                password="pw1",
-                admin=False,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="user2",
-                password="pw2",
-                admin=False,
-            )
+        response = requests.post(
+            self._delete_user_url(),
+            json={"user_id": user2_id},
+            headers={"Authorization": f"Bearer {user1_token}"},
+        )
 
-            _, user1_token = await self.login_user("user1", "pw1")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("server admin required", response.json().get("error", ""))
 
-            delete_user_url = (
-                "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
-            )
-            response = requests.post(
-                delete_user_url,
-                json={"user_id": "@user2:my.domain.name"},
-                headers={"Authorization": f"Bearer {user1_token}"},
-            )
+    async def test_delete_user_succeeds_when_cms_unavailable(self):
+        """Dead CMS URL → account still deactivated."""
+        await self.homeserver(module_config=self._MODULE_CONFIG)
 
-            self.assertEqual(response.status_code, 403)
-            self.assertIn("server admin required", response.json().get("error", ""))
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        _, access_token = await self.new_user("deadcms", password="pw1")
+
+        requests.post(
+            self._delete_user_url(),
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        force = requests.post(
+            self._delete_user_url(),
+            json={"action": "force"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(force.status_code, 200)
+
+        login_response = requests.post(
+            self._login_url(),
+            json={
+                "type": "m.login.password",
+                "user": self.localpart("deadcms"),
+                "password": "pw1",
+            },
+        )
+        self.assertNotEqual(login_response.status_code, 200)
+
+
+class TestDeleteUserProcessor(_DeleteUserHelpers, BaseSynapseE2ETest):
+    """The background processor, running every second over a 3-second delay.
+
+    It acts on every due schedule on the server, so each test asserts only on
+    the schedule it made, and a schedule another test left behind changes
+    nothing it checks.
+    """
+
+    _MODULE_CONFIG = {
+        "delete_user_schedule_delay_seconds": 3,
+        "delete_user_processor_interval_seconds": 1,
+    }
 
     async def test_scheduled_delete_executes_with_short_config_delay(self):
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(module_config=self._MODULE_CONFIG)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "delete_user_schedule_delay_seconds": 3,
-                    "delete_user_processor_interval_seconds": 1,
-                }
-            )
+        user_id, access_token = await self.new_user("scheduleduser", password="pw1")
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="scheduleduser",
-                password="pw1",
-                admin=False,
-            )
-            user_id = "@scheduleduser:my.domain.name"
-            _, access_token = await self.login_user("scheduleduser", "pw1")
+        self._insert_threepid(user_id, f"scheduled_{self.tag}@example.com")
+        self._insert_external_id(
+            user_id,
+            "oidc",
+            f"scheduled-external-id-{self.tag}",
+        )
+        self.assertEqual(self._count_threepids(user_id), 1)
+        self.assertEqual(self._count_external_ids(user_id), 1)
 
-            self._insert_threepid(config_path, user_id, "scheduled@example.com")
-            self._insert_external_id(
-                config_path,
-                user_id,
-                "oidc",
-                "scheduled-external-id",
-            )
-            self.assertEqual(self._count_threepids(config_path, user_id), 1)
-            self.assertEqual(self._count_external_ids(config_path, user_id), 1)
+        schedule_response = requests.post(
+            self._delete_user_url(),
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(schedule_response.status_code, 200)
+        self.assertEqual(schedule_response.json()["action"], "schedule")
+        self.assertEqual(self._count_schedules(user_id), 1)
 
-            delete_user_url = (
-                "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
-            )
-            schedule_response = requests.post(
-                delete_user_url,
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-            self.assertEqual(schedule_response.status_code, 200)
-            self.assertEqual(schedule_response.json()["action"], "schedule")
-            self.assertEqual(self._count_schedules(config_path, user_id), 1)
+        await asyncio.sleep(6)
 
-            await asyncio.sleep(6)
+        self.assertEqual(self._count_threepids(user_id), 0)
+        self.assertEqual(self._count_external_ids(user_id), 0)
+        self.assertEqual(self._count_schedules(user_id), 0)
 
-            self.assertEqual(self._count_threepids(config_path, user_id), 0)
-            self.assertEqual(self._count_external_ids(config_path, user_id), 0)
-            self.assertEqual(self._count_schedules(config_path, user_id), 0)
-
-            login_url = "http://localhost:8008/_matrix/client/v3/login"
-            login_response = requests.post(
-                login_url,
-                json={
-                    "type": "m.login.password",
-                    "user": "scheduleduser",
-                    "password": "pw1",
-                },
-            )
-            self.assertNotEqual(login_response.status_code, 200)
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        login_response = requests.post(
+            self._login_url(),
+            json={
+                "type": "m.login.password",
+                "user": self.localpart("scheduleduser"),
+                "password": "pw1",
+            },
+        )
+        self.assertNotEqual(login_response.status_code, 200)
 
     async def test_scheduled_delete_for_missing_user_stops_retrying(self):
         """Schedule for an already-deleted user must fail terminally, not retry forever.
@@ -533,120 +386,31 @@ class TestDeleteUserE2E(BaseSynapseE2ETest):
         whose row was already gone retried every processor interval for days
         with "404: No row found (users)".
         """
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(module_config=self._MODULE_CONFIG)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "delete_user_processor_interval_seconds": 1,
-                }
-            )
+        # Wait for the background processor loop to create the schedule
+        # table, then plant a due schedule for a user that does not exist.
+        for _ in range(30):
+            if self._schedule_table_exists():
+                break
+            await asyncio.sleep(1)
+        else:
+            self.fail("Schedule table was never created")
 
-            # Wait for the background processor loop to create the schedule
-            # table, then plant a due schedule for a user that does not exist.
-            for _ in range(30):
-                if self._schedule_table_exists(config_path):
-                    break
-                await asyncio.sleep(1)
-            else:
-                self.fail("Schedule table was never created")
+        ghost_user_id = f"@{self.localpart('ghostuser')}:{SERVER_NAME}"
+        self._insert_schedule(ghost_user_id, execute_at_ms=1)
+        self.assertEqual(self._count_schedules(ghost_user_id), 1)
 
-            ghost_user_id = "@ghostuser:my.domain.name"
-            self._insert_schedule(config_path, ghost_user_id, execute_at_ms=1)
-            self.assertEqual(self._count_schedules(config_path, ghost_user_id), 1)
+        # The schedule must be dropped as terminally failed. Without
+        # bounded retries the row is re-inserted every cycle forever.
+        for _ in range(30):
+            if self._count_schedules(ghost_user_id) == 0:
+                break
+            await asyncio.sleep(1)
+        else:
+            self.fail("Schedule for missing user was still being retried")
 
-            # The schedule must be dropped as terminally failed. Without
-            # bounded retries the row is re-inserted every cycle forever.
-            for _ in range(30):
-                if self._count_schedules(config_path, ghost_user_id) == 0:
-                    break
-                await asyncio.sleep(1)
-            else:
-                self.fail("Schedule for missing user was still being retried")
-
-            # It must stay gone across further processor cycles (i.e. it was
-            # not re-inserted by another retry).
-            await asyncio.sleep(3)
-            self.assertEqual(self._count_schedules(config_path, ghost_user_id), 0)
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
-
-    async def test_delete_user_succeeds_when_cms_unavailable(self):
-        """Dead CMS URL → account still deactivated."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "cms_base_url": "http://127.0.0.1:9",
-                    "cms_service_api_key": "test-key",
-                }
-            )
-
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="deadcms",
-                password="pw1",
-                admin=False,
-            )
-            _, access_token = await self.login_user("deadcms", "pw1")
-
-            delete_url = "http://localhost:8008/_synapse/client/pangea/v1/delete_user"
-            requests.post(
-                delete_url,
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-            force = requests.post(
-                delete_url,
-                json={"action": "force"},
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-            self.assertEqual(force.status_code, 200)
-
-            login_url = "http://localhost:8008/_matrix/client/v3/login"
-            login_response = requests.post(
-                login_url,
-                json={
-                    "type": "m.login.password",
-                    "user": "deadcms",
-                    "password": "pw1",
-                },
-            )
-            self.assertNotEqual(login_response.status_code, 200)
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # It must stay gone across further processor cycles (i.e. it was
+        # not re-inserted by another retry).
+        await asyncio.sleep(3)
+        self.assertEqual(self._count_schedules(ghost_user_id), 0)

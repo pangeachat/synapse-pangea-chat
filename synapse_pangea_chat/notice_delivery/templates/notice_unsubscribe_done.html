@@ -10,5 +10,5 @@
         {% else %}
         <p>You won’t receive {{ category_label }} anymore.</p>
         {% endif %}
-        <p class="note">You’ll still receive chat messages, course invitations, and account emails.</p>
+        <p class="note">{% if missed_message_refused %}You’ll still receive course invitations and account emails.{% else %}You’ll still receive chat messages, course invitations, and account emails.{% endif %}</p>
 {% endblock %}

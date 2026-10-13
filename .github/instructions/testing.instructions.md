@@ -19,6 +19,18 @@ This repo uses a different model than the other Python repos — no `.txt` regis
 - `tests/` — Integration tests that spin up a local Synapse + PostgreSQL instance via `testing.postgresql`. Each test class extends `tests.base_e2e.BaseSynapseE2ETest`. These are integration-tier (local internal infrastructure, no paid APIs) despite the `e2e` naming in the base class.
 - `tests/staging_tests/` — Staging smoke-tests against a live deployed Synapse. Non-destructive, uses `aiohttp`
 
+## Writing an E2E test
+
+The tests of one class share one homeserver, because booting Synapse is most of what an E2E test costs. The class, not the test, is the unit of isolation:
+
+- Get the server with `await self.homeserver(...)`. Every test in a class asks for the same configuration. A test that needs a different one belongs in its own class; otherwise the server restarts at every change.
+- Register users with `new_user(name)`, which gives each test its own localpart. Suffix `self.tag` onto anything else that must be unique on the server: email addresses, aliases, codes.
+- Assert only on what the test created. Earlier tests' users, rooms, rows, log lines and in-process state (caches, per-address rate limiters, background processors) are still on the server. Scope listings and queries to this test's IDs, and read logs through `server_log()`.
+- Start anything the configuration points at (an SMTP sink, a mock CMS, a Sygnal stub) in `setUpClass`, so the configuration stays the same for the whole class.
+- `start_test_synapse` boots a server for one test alone; it is only for tests of the boot and teardown cycle.
+
+Each server listens on a free port, so the suite runs alongside a local-stack Synapse.
+
 ## Commands
 
 ```bash
@@ -60,7 +72,7 @@ Why each piece:
 
 ## CI
 
-CI runs three jobs on every push to main and every PR: code style (`tox -e check_codestyle`), types (`tox -e check_types`), and the full unit & integration suite (`run-tests`) — the same `unittest discover` command as local runs, against the runner's preinstalled PostgreSQL. Staging smoke-tests still run only locally/manually.
+CI runs on every push to main and every PR: code style (`tox -e check_codestyle`), types (`tox -e check_types`), the unit tests in one job, and the end-to-end classes (those that boot a homeserver through `BaseSynapseE2ETest`) spread over parallel jobs against the runner's preinstalled PostgreSQL. `scripts/select_tests.py` takes the classes from the same discovery a local `unittest discover` runs and decides which each job runs, so between them every test runs exactly once. It balances the shards on each class's cost: one boot plus a little per test, or a measured time for the few classes that wait on purpose. The `Unit & integration tests` check passes only when the unit job and every shard passed. Staging smoke-tests still run only locally/manually.
 
 ## Manual Testing
 

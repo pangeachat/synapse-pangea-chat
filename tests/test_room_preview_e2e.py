@@ -5,9 +5,7 @@ from typing import Any, Dict, List, cast
 from urllib.parse import quote
 
 import psycopg2
-import psycopg2.extensions
 import requests
-from psycopg2.extensions import parse_dsn
 
 from synapse_pangea_chat.public_courses import _cache
 from synapse_pangea_chat.public_courses import request_log as rate_limit_log
@@ -29,6 +27,28 @@ ROOM_PREVIEW_MODULE_CONFIG = {
     ]
 }
 
+ACTIVITY_SUMMARY_MODULE_CONFIG = {
+    "room_preview_state_event_types": [
+        "pangea.activity_plan",
+        "pangea.activity_roles",
+        "pangea.activity_summary",
+    ]
+}
+
+ACTIVITY_PLAN_ONLY_MODULE_CONFIG = {
+    "room_preview_state_event_types": ["pangea.activity_plan"]
+}
+
+JOIN_RULES_MODULE_CONFIG = {
+    "room_preview_state_event_types": [
+        "pangea.activity_plan",
+        "pangea.activity_roles",
+        "m.room.join_rules",
+    ]
+}
+
+COURSE_PLAN_MODULE_CONFIG = {"room_preview_state_event_types": ["pangea.course_plan"]}
+
 ROOMDIRECTORY_CONFIG = {
     "roomdirectory": {
         "enable_room_list_search": True,
@@ -44,63 +64,32 @@ ROOMDIRECTORY_CONFIG = {
 }
 
 
-class TestE2E(BaseSynapseE2ETest):
+class RoomPreviewEndpointMixin:
+    server_url: str
+
+    def _room_preview_url(self) -> str:
+        return f"{self.server_url}/_synapse/client/unstable/org.pangea/room_preview"
+
+
+class TestRoomPreview(RoomPreviewEndpointMixin, BaseSynapseE2ETest):
     async def test_room_preview(self):
         """Setup test environment and run basic room preview tests."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=ROOM_PREVIEW_MODULE_CONFIG,
-            )
+        await self.homeserver(module_config=ROOM_PREVIEW_MODULE_CONFIG)
 
-            # Register a user
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="user1",
-                password="pw1",
-                admin=False,
-            )
+        _, token = await self.new_user("user1")
 
-            # Login user
-            _, token = await self.login_user("user1", "pw1")
+        # Create a private room
+        room_id = await self.create_private_room_knock_allowed_room(token)
 
-            # Create a private room
-            room_id = await self.create_private_room_knock_allowed_room(token)
+        # Test the room_preview endpoint
+        room_preview_url = self._room_preview_url()
+        headers = {"Authorization": f"Bearer {token}"}
 
-            # Test the room_preview endpoint
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
-            headers = {"Authorization": f"Bearer {token}"}
-
-            # Run the individual test methods
-            await self._test_basic_room_preview_functionality(
-                room_preview_url, headers, room_id
-            )
-            await self._test_room_preview_data_structure(
-                room_preview_url, headers, room_id
-            )
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Run the individual test methods
+        await self._test_basic_room_preview_functionality(
+            room_preview_url, headers, room_id
+        )
+        await self._test_room_preview_data_structure(room_preview_url, headers, room_id)
 
     async def _test_basic_room_preview_functionality(
         self, room_preview_url: str, headers: dict, room_id: str
@@ -211,60 +200,24 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def test_room_preview_with_room_state_events(self):
         """Setup test environment and run room state events tests."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=ROOM_PREVIEW_MODULE_CONFIG,
-            )
+        await self.homeserver(module_config=ROOM_PREVIEW_MODULE_CONFIG)
 
-            # Register a user
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="admin_user",
-                password="admin_pw",
-                admin=True,
-            )
+        _, admin_token = await self.new_user("admin_user", admin=True)
 
-            # Login admin user
-            _, admin_token = await self.login_user("admin_user", "admin_pw")
+        # Create a room with specific state events
+        room_id = await self.create_room_with_state_events(admin_token)
 
-            # Create a room with specific state events
-            room_id = await self.create_room_with_state_events(admin_token)
+        # Test the room_preview endpoint
+        room_preview_url = self._room_preview_url()
+        headers = {"Authorization": f"Bearer {admin_token}"}
 
-            # Test the room_preview endpoint
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
-            headers = {"Authorization": f"Bearer {admin_token}"}
-
-            # Run the individual test methods
-            await self._test_room_with_state_events_functionality(
-                room_preview_url, headers, room_id
-            )
-            await self._test_multiple_rooms_with_mixed_existence(
-                room_preview_url, headers, room_id
-            )
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Run the individual test methods
+        await self._test_room_with_state_events_functionality(
+            room_preview_url, headers, room_id
+        )
+        await self._test_multiple_rooms_with_mixed_existence(
+            room_preview_url, headers, room_id
+        )
 
     async def _test_room_with_state_events_functionality(
         self, room_preview_url: str, headers: dict, room_id: str
@@ -317,7 +270,7 @@ class TestE2E(BaseSynapseE2ETest):
     async def create_room_with_state_events(self, access_token: str) -> str:
         """Create a room with specific state events for testing."""
         headers = {"Authorization": f"Bearer {access_token}"}
-        create_room_url = "http://localhost:8008/_matrix/client/v3/createRoom"
+        create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
 
         # Create room with name, topic, and avatar
         create_room_data = {
@@ -348,7 +301,7 @@ class TestE2E(BaseSynapseE2ETest):
         room_id = response.json()["room_id"]
 
         # Add additional state events
-        state_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state"
+        state_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state"
 
         # Add pangea.activity_plan state event. This simulates a legacy room
         # that embeds the full plan body alongside the reference keys; the
@@ -529,53 +482,17 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def test_room_preview_empty_cases(self):
         """Setup test environment and run empty/edge case tests."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=ROOM_PREVIEW_MODULE_CONFIG,
-            )
+        await self.homeserver(module_config=ROOM_PREVIEW_MODULE_CONFIG)
 
-            # Register a user
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test_user",
-                password="test_pw",
-                admin=False,
-            )
+        _, token = await self.new_user("test_user")
 
-            # Login user
-            _, token = await self.login_user("test_user", "test_pw")
+        room_preview_url = self._room_preview_url()
+        headers = {"Authorization": f"Bearer {token}"}
 
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
-            headers = {"Authorization": f"Bearer {token}"}
-
-            # Run the individual test methods
-            await self._test_empty_rooms_parameter(room_preview_url, headers)
-            await self._test_whitespace_rooms_parameter(room_preview_url, headers)
-            await self._test_mixed_valid_invalid_room_ids(room_preview_url, headers)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Run the individual test methods
+        await self._test_empty_rooms_parameter(room_preview_url, headers)
+        await self._test_whitespace_rooms_parameter(room_preview_url, headers)
+        await self._test_mixed_valid_invalid_room_ids(room_preview_url, headers)
 
     async def _test_empty_rooms_parameter(self, room_preview_url: str, headers: dict):
         """Test with empty rooms parameter."""
@@ -624,54 +541,18 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def test_room_preview_cache_performance(self):
         """Test that cache hits are faster than cache misses."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=ROOM_PREVIEW_MODULE_CONFIG,
-            )
+        await self.homeserver(module_config=ROOM_PREVIEW_MODULE_CONFIG)
 
-            # Register a user
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="perf_user",
-                password="perf_pw",
-                admin=True,
-            )
+        _, token = await self.new_user("perf_user", admin=True)
 
-            # Login user
-            _, token = await self.login_user("perf_user", "perf_pw")
+        # Create a room with state events for testing
+        room_id = await self.create_room_with_state_events(token)
 
-            # Create a room with state events for testing
-            room_id = await self.create_room_with_state_events(token)
+        room_preview_url = self._room_preview_url()
+        headers = {"Authorization": f"Bearer {token}"}
 
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
-            headers = {"Authorization": f"Bearer {token}"}
-
-            # Run cache performance test
-            await self._test_cache_hit_performance(room_preview_url, headers, room_id)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Run cache performance test
+        await self._test_cache_hit_performance(room_preview_url, headers, room_id)
 
     async def _test_cache_hit_performance(
         self, room_preview_url: str, headers: dict, room_id: str
@@ -783,542 +664,155 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def test_room_preview_authentication_error(self):
         """Test that unauthenticated requests return 401 error."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=ROOM_PREVIEW_MODULE_CONFIG,
-            )
+        await self.homeserver(module_config=ROOM_PREVIEW_MODULE_CONFIG)
 
-            # Test the room_preview endpoint without authentication
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
+        # Test the room_preview endpoint without authentication
+        room_preview_url = self._room_preview_url()
 
-            # Test with no authorization header
-            response = requests.get(
-                room_preview_url,
-                params={"rooms": "!test:example.com"},
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 401)
-            response_data = response.json()
-            self.assertIn("error", response_data)
-            self.assertEqual(response_data["error"], "Unauthorized")
-            self.assertIn("errcode", response_data)
-            self.assertEqual(response_data["errcode"], "M_UNAUTHORIZED")
+        # Test with no authorization header
+        response = requests.get(
+            room_preview_url,
+            params={"rooms": "!test:example.com"},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 401)
+        response_data = response.json()
+        self.assertIn("error", response_data)
+        self.assertEqual(response_data["error"], "Unauthorized")
+        self.assertIn("errcode", response_data)
+        self.assertEqual(response_data["errcode"], "M_UNAUTHORIZED")
 
-            # Test with invalid authorization header
-            invalid_headers = {"Authorization": "Bearer invalid_token_12345"}
-            response = requests.get(
-                room_preview_url,
-                headers=invalid_headers,
-                params={"rooms": "!test:example.com"},
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 401)
-            response_data = response.json()
-            self.assertIn("error", response_data)
-            self.assertEqual(response_data["error"], "Unauthorized")
-            self.assertIn("errcode", response_data)
-            self.assertEqual(response_data["errcode"], "M_UNAUTHORIZED")
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Test with invalid authorization header
+        invalid_headers = {"Authorization": "Bearer invalid_token_12345"}
+        response = requests.get(
+            room_preview_url,
+            headers=invalid_headers,
+            params={"rooms": "!test:example.com"},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 401)
+        response_data = response.json()
+        self.assertIn("error", response_data)
+        self.assertEqual(response_data["error"], "Unauthorized")
+        self.assertIn("errcode", response_data)
+        self.assertEqual(response_data["errcode"], "M_UNAUTHORIZED")
 
     async def test_activity_roles_filtering(self):
         """Test that activity roles include all users with membership summary."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=ROOM_PREVIEW_MODULE_CONFIG,
-            )
+        await self.homeserver(module_config=ROOM_PREVIEW_MODULE_CONFIG)
 
-            # Register admin user
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="admin_user",
-                password="admin_pw",
-                admin=True,
-            )
+        admin_user_id, admin_token = await self.new_user("admin_user", admin=True)
+        user1_id, user1_token = await self.new_user("user1")
+        user2_id, user2_token = await self.new_user("user2")
 
-            # Register two test users
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="user1",
-                password="pw1",
-                admin=False,
-            )
+        # Create a room with activity roles
+        room_id = await self.create_room_with_activity_roles(
+            admin_user_id, admin_token, user1_id, user1_token, user2_id, user2_token
+        )
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="user2",
-                password="pw2",
-                admin=False,
-            )
+        # Initially all users should be in the activity roles with join membership
+        room_preview_url = self._room_preview_url()
+        headers = {"Authorization": f"Bearer {admin_token}"}
 
-            # Login users
-            _, admin_token = await self.login_user("admin_user", "admin_pw")
-            _, user1_token = await self.login_user("user1", "pw1")
-            _, user2_token = await self.login_user("user2", "pw2")
+        response = requests.get(
+            room_preview_url,
+            params={"rooms": room_id},
+            headers=headers,
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
 
-            # Create a room with activity roles
-            room_id = await self.create_room_with_activity_roles(
-                admin_token, user1_token, user2_token
-            )
+        # Verify all users are in activity roles
+        self.assertIn("rooms", data)
+        self.assertIn(room_id, data["rooms"])
+        room_data = data["rooms"][room_id]
+        self.assertIn("pangea.activity_roles", room_data)
 
-            # Initially all users should be in the activity roles with join membership
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
-            headers = {"Authorization": f"Bearer {admin_token}"}
+        activity_roles = room_data["pangea.activity_roles"]["default"]["content"][
+            "roles"
+        ]
+        self.assertEqual(len(activity_roles), 3)  # admin + user1 + user2
 
-            response = requests.get(
-                room_preview_url,
-                params={"rooms": room_id},
-                headers=headers,
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
+        # Verify all users are present in roles
+        user_ids_in_roles = {role["user_id"] for role in activity_roles.values()}
+        expected_users = {admin_user_id, user1_id, user2_id}
+        self.assertEqual(user_ids_in_roles, expected_users)
 
-            # Verify all users are in activity roles
-            self.assertIn("rooms", data)
-            self.assertIn(room_id, data["rooms"])
-            room_data = data["rooms"][room_id]
-            self.assertIn("pangea.activity_roles", room_data)
+        # Verify membership_summary is present and all users are "join"
+        self.assertIn("membership_summary", room_data)
+        membership_summary = room_data["membership_summary"]
+        self.assertEqual(membership_summary.get(admin_user_id), "join")
+        self.assertEqual(membership_summary.get(user1_id), "join")
+        self.assertEqual(membership_summary.get(user2_id), "join")
 
-            activity_roles = room_data["pangea.activity_roles"]["default"]["content"][
-                "roles"
-            ]
-            self.assertEqual(len(activity_roles), 3)  # admin + user1 + user2
+        # Remove user2 from the room (kick them)
+        kick_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/kick"
+        kick_data = {
+            "user_id": user2_id,
+            "reason": "Test kick for membership summary",
+        }
+        kick_response = requests.post(
+            kick_url,
+            json=kick_data,
+            headers=headers,
+        )
+        self.assertEqual(kick_response.status_code, 200)
 
-            # Verify all users are present in roles
-            user_ids_in_roles = {role["user_id"] for role in activity_roles.values()}
-            expected_users = {
-                "@admin_user:my.domain.name",
-                "@user1:my.domain.name",
-                "@user2:my.domain.name",
-            }
-            self.assertEqual(user_ids_in_roles, expected_users)
+        # Wait a moment for the kick to be processed
+        await asyncio.sleep(0.5)
 
-            # Verify membership_summary is present and all users are "join"
-            self.assertIn("membership_summary", room_data)
-            membership_summary = room_data["membership_summary"]
-            self.assertEqual(
-                membership_summary.get("@admin_user:my.domain.name"), "join"
-            )
-            self.assertEqual(membership_summary.get("@user1:my.domain.name"), "join")
-            self.assertEqual(membership_summary.get("@user2:my.domain.name"), "join")
+        # Request room preview again - user2's role should still be present
+        # but membership_summary should show user2 as "leave"
+        response = requests.get(
+            room_preview_url,
+            params={"rooms": room_id},
+            headers=headers,
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
 
-            # Remove user2 from the room (kick them)
-            kick_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/kick"
-            kick_data = {
-                "user_id": "@user2:my.domain.name",
-                "reason": "Test kick for membership summary",
-            }
-            kick_response = requests.post(
-                kick_url,
-                json=kick_data,
-                headers=headers,
-            )
-            self.assertEqual(kick_response.status_code, 200)
+        # Verify all users are still in activity roles (no filtering)
+        room_data = data["rooms"][room_id]
+        activity_roles = room_data["pangea.activity_roles"]["default"]["content"][
+            "roles"
+        ]
 
-            # Wait a moment for the kick to be processed
-            await asyncio.sleep(0.5)
+        # All three users should still be present in roles
+        self.assertEqual(len(activity_roles), 3)
 
-            # Request room preview again - user2's role should still be present
-            # but membership_summary should show user2 as "leave"
-            response = requests.get(
-                room_preview_url,
-                params={"rooms": room_id},
-                headers=headers,
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
+        user_ids_in_roles = {role["user_id"] for role in activity_roles.values()}
+        expected_users = {admin_user_id, user1_id, user2_id}
+        self.assertEqual(user_ids_in_roles, expected_users)
 
-            # Verify all users are still in activity roles (no filtering)
-            room_data = data["rooms"][room_id]
-            activity_roles = room_data["pangea.activity_roles"]["default"]["content"][
-                "roles"
-            ]
-
-            # All three users should still be present in roles
-            self.assertEqual(len(activity_roles), 3)
-
-            user_ids_in_roles = {role["user_id"] for role in activity_roles.values()}
-            expected_users = {
-                "@admin_user:my.domain.name",
-                "@user1:my.domain.name",
-                "@user2:my.domain.name",
-            }
-            self.assertEqual(user_ids_in_roles, expected_users)
-
-            # Verify membership_summary shows correct membership states
-            self.assertIn("membership_summary", room_data)
-            membership_summary = room_data["membership_summary"]
-            self.assertEqual(
-                membership_summary.get("@admin_user:my.domain.name"), "join"
-            )
-            self.assertEqual(membership_summary.get("@user1:my.domain.name"), "join")
-            # user2 should now be "leave" in membership_summary
-            self.assertEqual(membership_summary.get("@user2:my.domain.name"), "leave")
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
-
-    async def test_room_preview_activity_summary_current_keys_for_course_admin(self):
-        """Activity summaries expose all current state keys to course admins."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "room_preview_state_event_types": [
-                        "pangea.activity_plan",
-                        "pangea.activity_roles",
-                        "pangea.activity_summary",
-                    ]
-                },
-            )
-            dsn_params = parse_dsn(postgres.url())
-            dsn_params["dbname"] = "testdb"
-            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
-
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="course_admin",
-                password="admin_pw",
-                admin=False,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="learner",
-                password="learner_pw",
-                admin=False,
-            )
-
-            admin_user_id, admin_token = await self.login_user(
-                "course_admin", "admin_pw"
-            )
-            learner_user_id, learner_token = await self.login_user(
-                "learner", "learner_pw"
-            )
-            admin_headers = {"Authorization": f"Bearer {admin_token}"}
-            learner_headers = {"Authorization": f"Bearer {learner_token}"}
-            create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
-
-            course_response = requests.post(
-                create_room_url,
-                json={
-                    "visibility": "public",
-                    "preset": "public_chat",
-                    "creation_content": {"type": "m.space"},
-                    "initial_state": [
-                        {
-                            "type": "pangea.course_plan",
-                            "state_key": "",
-                            "content": {"uuid": "course-for-summary-preview"},
-                        }
-                    ],
-                    "name": "Summary Preview Course",
-                },
-                headers=admin_headers,
-                timeout=30,
-            )
-            self.assertEqual(course_response.status_code, 200)
-            course_room_id = course_response.json()["room_id"]
-            course_room_id_path = quote(course_room_id, safe="")
-
-            power_levels_response = requests.get(
-                f"{self.server_url}/_matrix/client/v3/rooms/"
-                f"{course_room_id_path}/state/m.room.power_levels",
-                headers=admin_headers,
-                timeout=30,
-            )
-            self.assertEqual(power_levels_response.status_code, 200)
-            power_levels = power_levels_response.json()
-            power_levels.setdefault("users", {})[admin_user_id] = 100
-            power_levels_update = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/"
-                f"{course_room_id_path}/state/m.room.power_levels",
-                json=power_levels,
-                headers=admin_headers,
-                timeout=30,
-            )
-            self.assertEqual(power_levels_update.status_code, 200)
-
-            join_response = requests.post(
-                f"{self.server_url}/_matrix/client/v3/join/{course_room_id_path}",
-                headers=learner_headers,
-                timeout=30,
-            )
-            self.assertEqual(join_response.status_code, 200)
-
-            activity_response = requests.post(
-                create_room_url,
-                json={
-                    "visibility": "private",
-                    "preset": "private_chat",
-                    "initial_state": [
-                        {
-                            "type": "pangea.activity_plan",
-                            "state_key": "",
-                            "content": {"activity_id": "summary-activity"},
-                        },
-                        {
-                            "type": "pangea.activity_roles",
-                            "state_key": "",
-                            "content": {
-                                "roles": {
-                                    "role-learner": {
-                                        "id": "role-learner",
-                                        "role": "participant",
-                                        "user_id": learner_user_id,
-                                    }
-                                }
-                            },
-                        },
-                        {
-                            "type": "m.space.parent",
-                            "state_key": course_room_id,
-                            "content": {"via": ["my.domain.name"]},
-                        },
-                    ],
-                    "name": "Summary Preview Activity",
-                },
-                headers=learner_headers,
-                timeout=30,
-            )
-            self.assertEqual(activity_response.status_code, 200)
-            activity_room_id = activity_response.json()["room_id"]
-            activity_room_id_path = quote(activity_room_id, safe="")
-
-            def put_summary(state_key: str, text: str) -> str:
-                response = requests.put(
-                    f"{self.server_url}/_matrix/client/v3/rooms/"
-                    f"{activity_room_id_path}/state/pangea.activity_summary/"
-                    f"{quote(state_key, safe='')}",
-                    json={
-                        "summary": {"participants": [], "summary": text},
-                        "analytics": {"total_xp": 7},
-                    },
-                    headers=learner_headers,
-                    timeout=30,
-                )
-                self.assertEqual(response.status_code, 200)
-                return response.json()["event_id"]
-
-            old_en_event_id = put_summary("en", "old English summary")
-            current_en_event_id = put_summary("en", "current English summary")
-            put_summary("vi", "current Vietnamese summary")
-
-            conn = psycopg2.connect(postgres_url)
-            try:
-                with conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute(
-                            "SELECT origin_server_ts FROM events WHERE event_id = %s",
-                            (current_en_event_id,),
-                        )
-                        current_timestamp_row = cursor.fetchone()
-                        self.assertIsNotNone(current_timestamp_row)
-                        cursor.execute(
-                            "UPDATE events SET origin_server_ts = %s "
-                            "WHERE event_id = %s",
-                            (current_timestamp_row[0] + 100000, old_en_event_id),
-                        )
-            finally:
-                conn.close()
-
-            room_preview_url = (
-                f"{self.server_url}/_synapse/client/unstable/org.pangea/room_preview"
-            )
-            previews = []
-            for headers in (admin_headers, learner_headers):
-                response = requests.get(
-                    room_preview_url,
-                    params={"rooms": activity_room_id},
-                    headers=headers,
-                    timeout=30,
-                )
-                self.assertEqual(response.status_code, 200)
-                previews.append(response.json()["rooms"][activity_room_id])
-
-            self.assertEqual(previews[0], previews[1])
-            for room_data in previews:
-                summaries = room_data["pangea.activity_summary"]
-                self.assertIn("en", summaries)
-                self.assertIn("vi", summaries)
-                self.assertNotIn("default", summaries)
-                self.assertEqual(
-                    summaries["en"]["content"]["summary"]["summary"],
-                    "current English summary",
-                )
-                self.assertEqual(
-                    summaries["vi"]["content"]["summary"]["summary"],
-                    "current Vietnamese summary",
-                )
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
-
-    async def test_room_preview_activity_summary_respects_config(self):
-        """Activity summaries are omitted unless configured for room_preview."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "room_preview_state_event_types": ["pangea.activity_plan"]
-                },
-            )
-
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="summary_writer",
-                password="writer_pw",
-                admin=False,
-            )
-            _, token = await self.login_user("summary_writer", "writer_pw")
-            headers = {"Authorization": f"Bearer {token}"}
-            create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
-
-            room_response = requests.post(
-                create_room_url,
-                json={
-                    "visibility": "private",
-                    "preset": "private_chat",
-                    "initial_state": [
-                        {
-                            "type": "pangea.activity_plan",
-                            "state_key": "",
-                            "content": {"activity_id": "config-gated-summary"},
-                        }
-                    ],
-                    "name": "Config Gated Summary Activity",
-                },
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(room_response.status_code, 200)
-            room_id = room_response.json()["room_id"]
-            room_id_path = quote(room_id, safe="")
-
-            summary_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/"
-                f"{room_id_path}/state/pangea.activity_summary/en",
-                json={
-                    "summary": {
-                        "participants": [],
-                        "summary": "configured-out summary",
-                    }
-                },
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(summary_response.status_code, 200)
-
-            preview_response = requests.get(
-                f"{self.server_url}/_synapse/client/unstable/org.pangea/room_preview",
-                params={"rooms": room_id},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(preview_response.status_code, 200)
-            room_data = preview_response.json()["rooms"][room_id]
-
-            self.assertIn("pangea.activity_plan", room_data)
-            self.assertNotIn("pangea.activity_summary", room_data)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Verify membership_summary shows correct membership states
+        self.assertIn("membership_summary", room_data)
+        membership_summary = room_data["membership_summary"]
+        self.assertEqual(membership_summary.get(admin_user_id), "join")
+        self.assertEqual(membership_summary.get(user1_id), "join")
+        # user2 should now be "leave" in membership_summary
+        self.assertEqual(membership_summary.get(user2_id), "leave")
 
     async def create_room_with_activity_roles(
-        self, admin_token: str, user1_token: str, user2_token: str
+        self,
+        admin_user_id: str,
+        admin_token: str,
+        user1_id: str,
+        user1_token: str,
+        user2_id: str,
+        user2_token: str,
     ) -> str:
         """Create a room with both users invited and add activity roles for all."""
         headers = {"Authorization": f"Bearer {admin_token}"}
-        create_room_url = "http://localhost:8008/_matrix/client/v3/createRoom"
+        create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
 
         # Create room
         create_room_data = {
             "visibility": "private",
             "preset": "private_chat",
             "name": "Test Room for Activity Roles Filtering",
-            "invite": ["@user1:my.domain.name", "@user2:my.domain.name"],
+            "invite": [user1_id, user2_id],
         }
 
         response = requests.post(
@@ -1330,7 +824,7 @@ class TestE2E(BaseSynapseE2ETest):
         room_id = response.json()["room_id"]
 
         # Accept invitations for both users
-        join_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/join"
+        join_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/join"
 
         user1_headers = {"Authorization": f"Bearer {user1_token}"}
         join_response1 = requests.post(join_url, headers=user1_headers)
@@ -1341,7 +835,7 @@ class TestE2E(BaseSynapseE2ETest):
         self.assertEqual(join_response2.status_code, 200)
 
         # Add activity roles state event with all three users
-        state_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state"
+        state_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state"
         activity_roles_data = {
             "roles": {
                 "role-admin-123": {
@@ -1349,21 +843,21 @@ class TestE2E(BaseSynapseE2ETest):
                     "finished_at": None,
                     "id": "role-admin-123",
                     "role": "facilitator",
-                    "user_id": "@admin_user:my.domain.name",
+                    "user_id": admin_user_id,
                 },
                 "role-user1-456": {
                     "archived_at": None,
                     "finished_at": None,
                     "id": "role-user1-456",
                     "role": "participant",
-                    "user_id": "@user1:my.domain.name",
+                    "user_id": user1_id,
                 },
                 "role-user2-789": {
                     "archived_at": None,
                     "finished_at": None,
                     "id": "role-user2-789",
                     "role": "observer",
-                    "user_id": "@user2:my.domain.name",
+                    "user_id": user2_id,
                 },
             }
         }
@@ -1379,76 +873,41 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def test_activity_roles_filtering_no_roles(self):
         """Test that room preview works correctly when there are no activity roles."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=ROOM_PREVIEW_MODULE_CONFIG,
-            )
+        await self.homeserver(module_config=ROOM_PREVIEW_MODULE_CONFIG)
 
-            # Register admin user
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="admin_user",
-                password="admin_pw",
-                admin=True,
-            )
+        _, admin_token = await self.new_user("admin_user", admin=True)
 
-            _, admin_token = await self.login_user("admin_user", "admin_pw")
+        # Create a room without activity roles
+        room_id = await self.create_private_room_knock_allowed_room(admin_token)
 
-            # Create a room without activity roles
-            room_id = await self.create_private_room_knock_allowed_room(admin_token)
+        # Request room preview - should work fine without activity roles
+        room_preview_url = self._room_preview_url()
+        headers = {"Authorization": f"Bearer {admin_token}"}
 
-            # Request room preview - should work fine without activity roles
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
-            headers = {"Authorization": f"Bearer {admin_token}"}
+        response = requests.get(
+            room_preview_url,
+            params={"rooms": room_id},
+            headers=headers,
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
 
-            response = requests.get(
-                room_preview_url,
-                params={"rooms": room_id},
-                headers=headers,
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
+        # Should have room data but no activity roles
+        self.assertIn("rooms", data)
+        self.assertIn(room_id, data["rooms"])
+        room_data = data["rooms"][room_id]
 
-            # Should have room data but no activity roles
-            self.assertIn("rooms", data)
-            self.assertIn(room_id, data["rooms"])
-            room_data = data["rooms"][room_id]
+        # Activity roles should not be present (since we didn't create any)
+        # But the request should still succeed
+        if "pangea.activity_roles" in room_data:
+            # If present, should be empty or properly structured
+            activity_roles_data = room_data["pangea.activity_roles"]
+            self.assertIsInstance(activity_roles_data, dict)
 
-            # Activity roles should not be present (since we didn't create any)
-            # But the request should still succeed
-            if "pangea.activity_roles" in room_data:
-                # If present, should be empty or properly structured
-                activity_roles_data = room_data["pangea.activity_roles"]
-                self.assertIsInstance(activity_roles_data, dict)
-
-            # membership_summary should not be present if no activity roles
-            if "pangea.activity_roles" not in room_data:
-                self.assertNotIn("membership_summary", room_data)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # membership_summary should not be present if no activity roles
+        if "pangea.activity_roles" not in room_data:
+            self.assertNotIn("membership_summary", room_data)
 
     async def test_left_users_in_activity_roles(self):
         """Test that left users are preserved in activity roles for completed activities.
@@ -1458,317 +917,424 @@ class TestE2E(BaseSynapseE2ETest):
         - A membership summary should be returned so clients can display info about
           completed activities while knowing who has left
         """
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config=ROOM_PREVIEW_MODULE_CONFIG,
+        await self.homeserver(module_config=ROOM_PREVIEW_MODULE_CONFIG)
+
+        facilitator_id, facilitator_token = await self.new_user(
+            "facilitator", admin=True
+        )
+        p1_id, p1_token = await self.new_user("participant1")
+        p2_id, p2_token = await self.new_user("participant2")
+        p3_id, p3_token = await self.new_user("participant3")
+
+        # Create room and add users
+        headers = {"Authorization": f"Bearer {facilitator_token}"}
+        create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
+
+        create_room_data = {
+            "visibility": "private",
+            "preset": "private_chat",
+            "name": "Completed Activity Room",
+            "invite": [p1_id, p2_id, p3_id],
+        }
+
+        response = requests.post(
+            create_room_url,
+            json=cast(Any, create_room_data),
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        room_id = response.json()["room_id"]
+
+        # All participants join
+        join_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/join"
+
+        for token in [p1_token, p2_token, p3_token]:
+            join_response = requests.post(
+                join_url, headers={"Authorization": f"Bearer {token}"}
             )
+            self.assertEqual(join_response.status_code, 200)
 
-            # Register users
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="facilitator",
-                password="fac_pw",
-                admin=True,
-            )
+        # Add activity roles - simulating a completed activity
+        state_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state"
+        activity_roles_data = {
+            "roles": {
+                "role-fac": {
+                    "archived_at": "2024-01-01T10:00:00Z",
+                    "finished_at": "2024-01-01T09:30:00Z",
+                    "id": "role-fac",
+                    "role": "facilitator",
+                    "user_id": facilitator_id,
+                },
+                "role-p1": {
+                    "archived_at": "2024-01-01T10:00:00Z",
+                    "finished_at": "2024-01-01T09:30:00Z",
+                    "id": "role-p1",
+                    "role": "presenter",
+                    "user_id": p1_id,
+                },
+                "role-p2": {
+                    "archived_at": "2024-01-01T10:00:00Z",
+                    "finished_at": "2024-01-01T09:30:00Z",
+                    "id": "role-p2",
+                    "role": "participant",
+                    "user_id": p2_id,
+                },
+                "role-p3": {
+                    "archived_at": "2024-01-01T10:00:00Z",
+                    "finished_at": "2024-01-01T09:30:00Z",
+                    "id": "role-p3",
+                    "role": "participant",
+                    "user_id": p3_id,
+                },
+            }
+        }
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="participant1",
-                password="p1_pw",
-                admin=False,
-            )
+        roles_response = requests.put(
+            f"{state_url}/pangea.activity_roles/",
+            json=activity_roles_data,
+            headers=headers,
+        )
+        self.assertEqual(roles_response.status_code, 200)
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="participant2",
-                password="p2_pw",
-                admin=False,
-            )
+        # participant2 and participant3 leave the room after the activity
+        leave_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/leave"
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="participant3",
-                password="p3_pw",
-                admin=False,
-            )
+        p2_leave = requests.post(
+            leave_url, headers={"Authorization": f"Bearer {p2_token}"}
+        )
+        self.assertEqual(p2_leave.status_code, 200)
 
-            # Login users
-            _, facilitator_token = await self.login_user("facilitator", "fac_pw")
-            _, p1_token = await self.login_user("participant1", "p1_pw")
-            _, p2_token = await self.login_user("participant2", "p2_pw")
-            _, p3_token = await self.login_user("participant3", "p3_pw")
+        p3_leave = requests.post(
+            leave_url, headers={"Authorization": f"Bearer {p3_token}"}
+        )
+        self.assertEqual(p3_leave.status_code, 200)
 
-            # Create room and add users
-            headers = {"Authorization": f"Bearer {facilitator_token}"}
-            create_room_url = "http://localhost:8008/_matrix/client/v3/createRoom"
+        # Wait for the leave events to be processed
+        await asyncio.sleep(0.5)
 
-            create_room_data = {
+        # Request room preview - should return full roles with membership summary
+        room_preview_url = self._room_preview_url()
+
+        response = requests.get(
+            room_preview_url,
+            params={"rooms": room_id},
+            headers=headers,
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        room_data = data["rooms"][room_id]
+
+        # Verify ALL roles are returned (not filtered)
+        self.assertIn("pangea.activity_roles", room_data)
+        activity_roles = room_data["pangea.activity_roles"]["default"]["content"][
+            "roles"
+        ]
+
+        # All 4 users should be in roles (even though 2 have left)
+        self.assertEqual(len(activity_roles), 4)
+
+        user_ids_in_roles = {role["user_id"] for role in activity_roles.values()}
+        expected_users = {facilitator_id, p1_id, p2_id, p3_id}
+        self.assertEqual(user_ids_in_roles, expected_users)
+
+        # Verify membership_summary is present and correct
+        self.assertIn("membership_summary", room_data)
+        membership_summary = room_data["membership_summary"]
+
+        # Facilitator and participant1 should be "join"
+        self.assertEqual(membership_summary.get(facilitator_id), "join")
+        self.assertEqual(membership_summary.get(p1_id), "join")
+
+        # participant2 and participant3 should be "leave"
+        self.assertEqual(membership_summary.get(p2_id), "leave")
+        self.assertEqual(membership_summary.get(p3_id), "leave")
+
+        # Only users in activity roles should be in membership_summary
+        self.assertEqual(len(membership_summary), 4)
+
+
+class TestRoomPreviewWithActivitySummary(RoomPreviewEndpointMixin, BaseSynapseE2ETest):
+    async def test_room_preview_activity_summary_current_keys_for_course_admin(self):
+        """Activity summaries expose all current state keys to course admins."""
+        await self.homeserver(module_config=ACTIVITY_SUMMARY_MODULE_CONFIG)
+
+        admin_user_id, admin_token = await self.new_user("course_admin")
+        learner_user_id, learner_token = await self.new_user("learner")
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+        learner_headers = {"Authorization": f"Bearer {learner_token}"}
+        create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
+
+        course_response = requests.post(
+            create_room_url,
+            json={
+                "visibility": "public",
+                "preset": "public_chat",
+                "creation_content": {"type": "m.space"},
+                "initial_state": [
+                    {
+                        "type": "pangea.course_plan",
+                        "state_key": "",
+                        "content": {"uuid": "course-for-summary-preview"},
+                    }
+                ],
+                "name": "Summary Preview Course",
+            },
+            headers=admin_headers,
+            timeout=30,
+        )
+        self.assertEqual(course_response.status_code, 200)
+        course_room_id = course_response.json()["room_id"]
+        course_room_id_path = quote(course_room_id, safe="")
+
+        power_levels_response = requests.get(
+            f"{self.server_url}/_matrix/client/v3/rooms/"
+            f"{course_room_id_path}/state/m.room.power_levels",
+            headers=admin_headers,
+            timeout=30,
+        )
+        self.assertEqual(power_levels_response.status_code, 200)
+        power_levels = power_levels_response.json()
+        power_levels.setdefault("users", {})[admin_user_id] = 100
+        power_levels_update = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/"
+            f"{course_room_id_path}/state/m.room.power_levels",
+            json=power_levels,
+            headers=admin_headers,
+            timeout=30,
+        )
+        self.assertEqual(power_levels_update.status_code, 200)
+
+        join_response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/join/{course_room_id_path}",
+            headers=learner_headers,
+            timeout=30,
+        )
+        self.assertEqual(join_response.status_code, 200)
+
+        activity_response = requests.post(
+            create_room_url,
+            json={
                 "visibility": "private",
                 "preset": "private_chat",
-                "name": "Completed Activity Room",
-                "invite": [
-                    "@participant1:my.domain.name",
-                    "@participant2:my.domain.name",
-                    "@participant3:my.domain.name",
+                "initial_state": [
+                    {
+                        "type": "pangea.activity_plan",
+                        "state_key": "",
+                        "content": {"activity_id": "summary-activity"},
+                    },
+                    {
+                        "type": "pangea.activity_roles",
+                        "state_key": "",
+                        "content": {
+                            "roles": {
+                                "role-learner": {
+                                    "id": "role-learner",
+                                    "role": "participant",
+                                    "user_id": learner_user_id,
+                                }
+                            }
+                        },
+                    },
+                    {
+                        "type": "m.space.parent",
+                        "state_key": course_room_id,
+                        "content": {"via": ["my.domain.name"]},
+                    },
                 ],
-            }
+                "name": "Summary Preview Activity",
+            },
+            headers=learner_headers,
+            timeout=30,
+        )
+        self.assertEqual(activity_response.status_code, 200)
+        activity_room_id = activity_response.json()["room_id"]
+        activity_room_id_path = quote(activity_room_id, safe="")
 
-            response = requests.post(
-                create_room_url,
-                json=cast(Any, create_room_data),
-                headers=headers,
+        def put_summary(state_key: str, text: str) -> str:
+            response = requests.put(
+                f"{self.server_url}/_matrix/client/v3/rooms/"
+                f"{activity_room_id_path}/state/pangea.activity_summary/"
+                f"{quote(state_key, safe='')}",
+                json={
+                    "summary": {"participants": [], "summary": text},
+                    "analytics": {"total_xp": 7},
+                },
+                headers=learner_headers,
+                timeout=30,
             )
             self.assertEqual(response.status_code, 200)
-            room_id = response.json()["room_id"]
+            return response.json()["event_id"]
 
-            # All participants join
-            join_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/join"
+        old_en_event_id = put_summary("en", "old English summary")
+        current_en_event_id = put_summary("en", "current English summary")
+        put_summary("vi", "current Vietnamese summary")
 
-            for token in [p1_token, p2_token, p3_token]:
-                join_response = requests.post(
-                    join_url, headers={"Authorization": f"Bearer {token}"}
-                )
-                self.assertEqual(join_response.status_code, 200)
+        conn = psycopg2.connect(self.database_url)
+        try:
+            with conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT origin_server_ts FROM events WHERE event_id = %s",
+                        (current_en_event_id,),
+                    )
+                    current_timestamp_row = cursor.fetchone()
+                    self.assertIsNotNone(current_timestamp_row)
+                    cursor.execute(
+                        "UPDATE events SET origin_server_ts = %s "
+                        "WHERE event_id = %s",
+                        (current_timestamp_row[0] + 100000, old_en_event_id),
+                    )
+        finally:
+            conn.close()
 
-            # Add activity roles - simulating a completed activity
-            state_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state"
-            activity_roles_data = {
-                "roles": {
-                    "role-fac": {
-                        "archived_at": "2024-01-01T10:00:00Z",
-                        "finished_at": "2024-01-01T09:30:00Z",
-                        "id": "role-fac",
-                        "role": "facilitator",
-                        "user_id": "@facilitator:my.domain.name",
-                    },
-                    "role-p1": {
-                        "archived_at": "2024-01-01T10:00:00Z",
-                        "finished_at": "2024-01-01T09:30:00Z",
-                        "id": "role-p1",
-                        "role": "presenter",
-                        "user_id": "@participant1:my.domain.name",
-                    },
-                    "role-p2": {
-                        "archived_at": "2024-01-01T10:00:00Z",
-                        "finished_at": "2024-01-01T09:30:00Z",
-                        "id": "role-p2",
-                        "role": "participant",
-                        "user_id": "@participant2:my.domain.name",
-                    },
-                    "role-p3": {
-                        "archived_at": "2024-01-01T10:00:00Z",
-                        "finished_at": "2024-01-01T09:30:00Z",
-                        "id": "role-p3",
-                        "role": "participant",
-                        "user_id": "@participant3:my.domain.name",
-                    },
-                }
-            }
-
-            roles_response = requests.put(
-                f"{state_url}/pangea.activity_roles/",
-                json=activity_roles_data,
-                headers=headers,
-            )
-            self.assertEqual(roles_response.status_code, 200)
-
-            # participant2 and participant3 leave the room after the activity
-            leave_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/leave"
-
-            p2_leave = requests.post(
-                leave_url, headers={"Authorization": f"Bearer {p2_token}"}
-            )
-            self.assertEqual(p2_leave.status_code, 200)
-
-            p3_leave = requests.post(
-                leave_url, headers={"Authorization": f"Bearer {p3_token}"}
-            )
-            self.assertEqual(p3_leave.status_code, 200)
-
-            # Wait for the leave events to be processed
-            await asyncio.sleep(0.5)
-
-            # Request room preview - should return full roles with membership summary
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
-
+        room_preview_url = self._room_preview_url()
+        previews = []
+        for headers in (admin_headers, learner_headers):
             response = requests.get(
                 room_preview_url,
-                params={"rooms": room_id},
+                params={"rooms": activity_room_id},
                 headers=headers,
-                timeout=10,
+                timeout=30,
             )
             self.assertEqual(response.status_code, 200)
-            data = response.json()
+            previews.append(response.json()["rooms"][activity_room_id])
 
-            room_data = data["rooms"][room_id]
-
-            # Verify ALL roles are returned (not filtered)
-            self.assertIn("pangea.activity_roles", room_data)
-            activity_roles = room_data["pangea.activity_roles"]["default"]["content"][
-                "roles"
-            ]
-
-            # All 4 users should be in roles (even though 2 have left)
-            self.assertEqual(len(activity_roles), 4)
-
-            user_ids_in_roles = {role["user_id"] for role in activity_roles.values()}
-            expected_users = {
-                "@facilitator:my.domain.name",
-                "@participant1:my.domain.name",
-                "@participant2:my.domain.name",
-                "@participant3:my.domain.name",
-            }
-            self.assertEqual(user_ids_in_roles, expected_users)
-
-            # Verify membership_summary is present and correct
-            self.assertIn("membership_summary", room_data)
-            membership_summary = room_data["membership_summary"]
-
-            # Facilitator and participant1 should be "join"
+        self.assertEqual(previews[0], previews[1])
+        for room_data in previews:
+            summaries = room_data["pangea.activity_summary"]
+            self.assertIn("en", summaries)
+            self.assertIn("vi", summaries)
+            self.assertNotIn("default", summaries)
             self.assertEqual(
-                membership_summary.get("@facilitator:my.domain.name"), "join"
+                summaries["en"]["content"]["summary"]["summary"],
+                "current English summary",
             )
             self.assertEqual(
-                membership_summary.get("@participant1:my.domain.name"), "join"
+                summaries["vi"]["content"]["summary"]["summary"],
+                "current Vietnamese summary",
             )
 
-            # participant2 and participant3 should be "leave"
-            self.assertEqual(
-                membership_summary.get("@participant2:my.domain.name"), "leave"
-            )
-            self.assertEqual(
-                membership_summary.get("@participant3:my.domain.name"), "leave"
-            )
 
-            # Only users in activity roles should be in membership_summary
-            self.assertEqual(len(membership_summary), 4)
+class TestRoomPreviewWithoutActivitySummary(
+    RoomPreviewEndpointMixin, BaseSynapseE2ETest
+):
+    async def test_room_preview_activity_summary_respects_config(self):
+        """Activity summaries are omitted unless configured for room_preview."""
+        await self.homeserver(module_config=ACTIVITY_PLAN_ONLY_MODULE_CONFIG)
 
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        _, token = await self.new_user("summary_writer")
+        headers = {"Authorization": f"Bearer {token}"}
+        create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
 
+        room_response = requests.post(
+            create_room_url,
+            json={
+                "visibility": "private",
+                "preset": "private_chat",
+                "initial_state": [
+                    {
+                        "type": "pangea.activity_plan",
+                        "state_key": "",
+                        "content": {"activity_id": "config-gated-summary"},
+                    }
+                ],
+                "name": "Config Gated Summary Activity",
+            },
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(room_response.status_code, 200)
+        room_id = room_response.json()["room_id"]
+        room_id_path = quote(room_id, safe="")
+
+        summary_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/"
+            f"{room_id_path}/state/pangea.activity_summary/en",
+            json={
+                "summary": {
+                    "participants": [],
+                    "summary": "configured-out summary",
+                }
+            },
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(summary_response.status_code, 200)
+
+        preview_response = requests.get(
+            self._room_preview_url(),
+            params={"rooms": room_id},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(preview_response.status_code, 200)
+        room_data = preview_response.json()["rooms"][room_id]
+
+        self.assertIn("pangea.activity_plan", room_data)
+        self.assertNotIn("pangea.activity_summary", room_data)
+
+
+class TestRoomPreviewWithJoinRules(RoomPreviewEndpointMixin, BaseSynapseE2ETest):
     async def test_join_rules_filtering(self):
         """Test that m.room.join_rules content only exposes the join_rule key."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "room_preview_state_event_types": [
-                        "pangea.activity_plan",
-                        "pangea.activity_roles",
-                        "m.room.join_rules",
-                    ]
-                },
-            )
+        await self.homeserver(module_config=JOIN_RULES_MODULE_CONFIG)
 
-            # Register admin user
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="admin_user",
-                password="admin_pw",
-                admin=True,
-            )
+        _, admin_token = await self.new_user("admin_user", admin=True)
 
-            _, admin_token = await self.login_user("admin_user", "admin_pw")
+        # Create a room with join_rules that has additional content
+        room_id = await self._create_room_with_complex_join_rules(admin_token)
 
-            # Create a room with join_rules that has additional content
-            room_id = await self._create_room_with_complex_join_rules(admin_token)
+        # Request room preview
+        room_preview_url = self._room_preview_url()
+        headers = {"Authorization": f"Bearer {admin_token}"}
 
-            # Request room preview
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
-            headers = {"Authorization": f"Bearer {admin_token}"}
+        response = requests.get(
+            room_preview_url,
+            params={"rooms": room_id},
+            headers=headers,
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
 
-            response = requests.get(
-                room_preview_url,
-                params={"rooms": room_id},
-                headers=headers,
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
+        # Verify the response structure
+        self.assertIn("rooms", data)
+        self.assertIn(room_id, data["rooms"])
+        room_data = data["rooms"][room_id]
 
-            # Verify the response structure
-            self.assertIn("rooms", data)
-            self.assertIn(room_id, data["rooms"])
-            room_data = data["rooms"][room_id]
+        # Verify m.room.join_rules is present
+        self.assertIn("m.room.join_rules", room_data)
+        join_rules_data = room_data["m.room.join_rules"]
+        self.assertIn("default", join_rules_data)
 
-            # Verify m.room.join_rules is present
-            self.assertIn("m.room.join_rules", room_data)
-            join_rules_data = room_data["m.room.join_rules"]
-            self.assertIn("default", join_rules_data)
+        # Get the join_rules event content
+        join_rules_event = join_rules_data["default"]
+        self.assertIn("content", join_rules_event)
+        join_rules_content = join_rules_event["content"]
 
-            # Get the join_rules event content
-            join_rules_event = join_rules_data["default"]
-            self.assertIn("content", join_rules_event)
-            join_rules_content = join_rules_event["content"]
+        # Verify ONLY join_rule key is present in content
+        self.assertIn("join_rule", join_rules_content)
+        self.assertEqual(join_rules_content["join_rule"], "knock")
 
-            # Verify ONLY join_rule key is present in content
-            self.assertIn("join_rule", join_rules_content)
-            self.assertEqual(join_rules_content["join_rule"], "knock")
-
-            # Verify other keys are NOT present (they should be filtered out)
-            # The room was created with additional content that should be stripped
-            self.assertEqual(
-                len(join_rules_content),
-                1,
-                f"join_rules content should only have 1 key (join_rule), but has: {list(join_rules_content.keys())}",
-            )
-            self.assertNotIn(
-                "allow",
-                join_rules_content,
-                "allow key should be filtered out from join_rules content",
-            )
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Verify other keys are NOT present (they should be filtered out)
+        # The room was created with additional content that should be stripped
+        self.assertEqual(
+            len(join_rules_content),
+            1,
+            f"join_rules content should only have 1 key (join_rule), but has: {list(join_rules_content.keys())}",
+        )
+        self.assertNotIn(
+            "allow",
+            join_rules_content,
+            "allow key should be filtered out from join_rules content",
+        )
 
     async def _create_room_with_complex_join_rules(self, access_token: str) -> str:
         """Create a room with join_rules that contain additional content beyond join_rule."""
         headers = {"Authorization": f"Bearer {access_token}"}
-        create_room_url = "http://localhost:8008/_matrix/client/v3/createRoom"
+        create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
 
         # Create room with knock join rule
         create_room_data = {
@@ -1803,246 +1369,154 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def test_join_rules_only_join_rule_key(self):
         """Test m.room.join_rules filtering when content only has join_rule key."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "room_preview_state_event_types": [
-                        "pangea.activity_plan",
-                        "pangea.activity_roles",
-                        "m.room.join_rules",
-                    ]
+        await self.homeserver(module_config=JOIN_RULES_MODULE_CONFIG)
+
+        _, admin_token = await self.new_user("admin_user", admin=True)
+
+        # Create a room with simple join_rules (only join_rule key)
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
+
+        create_room_data = {
+            "visibility": "private",
+            "preset": "private_chat",
+            "name": "Test Room Simple Join Rules",
+            "initial_state": [
+                {
+                    "type": "m.room.join_rules",
+                    "state_key": "",
+                    "content": {"join_rule": "invite"},
                 },
-            )
+            ],
+        }
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="admin_user",
-                password="admin_pw",
-                admin=True,
-            )
+        response = requests.post(
+            create_room_url,
+            json=cast(Any, create_room_data),
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        room_id = response.json()["room_id"]
 
-            _, admin_token = await self.login_user("admin_user", "admin_pw")
+        # Request room preview
+        room_preview_url = self._room_preview_url()
 
-            # Create a room with simple join_rules (only join_rule key)
-            headers = {"Authorization": f"Bearer {admin_token}"}
-            create_room_url = "http://localhost:8008/_matrix/client/v3/createRoom"
+        preview_response = requests.get(
+            room_preview_url,
+            params={"rooms": room_id},
+            headers=headers,
+            timeout=10,
+        )
+        self.assertEqual(preview_response.status_code, 200)
+        data = preview_response.json()
 
-            create_room_data = {
-                "visibility": "private",
-                "preset": "private_chat",
-                "name": "Test Room Simple Join Rules",
-                "initial_state": [
-                    {
-                        "type": "m.room.join_rules",
-                        "state_key": "",
-                        "content": {"join_rule": "invite"},
-                    },
-                ],
-            }
+        room_data = data["rooms"][room_id]
+        self.assertIn("m.room.join_rules", room_data)
 
-            response = requests.post(
-                create_room_url,
-                json=cast(Any, create_room_data),
-                headers=headers,
-            )
-            self.assertEqual(response.status_code, 200)
-            room_id = response.json()["room_id"]
+        join_rules_content = room_data["m.room.join_rules"]["default"]["content"]
+        self.assertEqual(join_rules_content, {"join_rule": "invite"})
 
-            # Request room preview
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
 
-            preview_response = requests.get(
-                room_preview_url,
-                params={"rooms": room_id},
-                headers=headers,
-                timeout=10,
-            )
-            self.assertEqual(preview_response.status_code, 200)
-            data = preview_response.json()
-
-            room_data = data["rooms"][room_id]
-            self.assertIn("m.room.join_rules", room_data)
-
-            join_rules_content = room_data["m.room.join_rules"]["default"]["content"]
-            self.assertEqual(join_rules_content, {"join_rule": "invite"})
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
-
+class TestRoomPreviewWithCoursePlan(RoomPreviewEndpointMixin, BaseSynapseE2ETest):
     async def test_course_plan_with_membership_summary(self):
         """Test that rooms with pangea.course_plan include membership_summary."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "room_preview_state_event_types": ["pangea.course_plan"]
-                },
-            )
+        await self.homeserver(module_config=COURSE_PLAN_MODULE_CONFIG)
 
-            # Register admin user
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="admin_user",
-                password="admin_pw",
-                admin=True,
-            )
+        admin_user_id, admin_token = await self.new_user("admin_user", admin=True)
+        user1_id, user1_token = await self.new_user("user1")
+        user2_id, user2_token = await self.new_user("user2")
 
-            # Register two test users
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="user1",
-                password="pw1",
-                admin=False,
-            )
+        # Create a room with course_plan (not activity_roles)
+        room_id = await self.create_room_with_course_plan(
+            admin_token, user1_id, user1_token, user2_id, user2_token
+        )
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="user2",
-                password="pw2",
-                admin=False,
-            )
+        # Request room preview - should include membership_summary for course rooms
+        room_preview_url = self._room_preview_url()
+        headers = {"Authorization": f"Bearer {admin_token}"}
 
-            # Login users
-            _, admin_token = await self.login_user("admin_user", "admin_pw")
-            _, user1_token = await self.login_user("user1", "pw1")
-            _, user2_token = await self.login_user("user2", "pw2")
+        response = requests.get(
+            room_preview_url,
+            params={"rooms": room_id},
+            headers=headers,
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
 
-            # Create a room with course_plan (not activity_roles)
-            room_id = await self.create_room_with_course_plan(
-                admin_token, user1_token, user2_token
-            )
+        # Verify room data includes course_plan
+        self.assertIn("rooms", data)
+        self.assertIn(room_id, data["rooms"])
+        room_data = data["rooms"][room_id]
+        self.assertIn("pangea.course_plan", room_data)
 
-            # Request room preview - should include membership_summary for course rooms
-            room_preview_url = (
-                "http://localhost:8008/_synapse/client/unstable/org.pangea/room_preview"
-            )
-            headers = {"Authorization": f"Bearer {admin_token}"}
+        # Verify course_plan content
+        course_plan = room_data["pangea.course_plan"]["default"]["content"]
+        self.assertIn("uuid", course_plan)
 
-            response = requests.get(
-                room_preview_url,
-                params={"rooms": room_id},
-                headers=headers,
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
+        # Verify membership_summary is present for course rooms
+        self.assertIn("membership_summary", room_data)
+        membership_summary = room_data["membership_summary"]
 
-            # Verify room data includes course_plan
-            self.assertIn("rooms", data)
-            self.assertIn(room_id, data["rooms"])
-            room_data = data["rooms"][room_id]
-            self.assertIn("pangea.course_plan", room_data)
+        # All joined users should be in membership_summary
+        self.assertEqual(membership_summary.get(admin_user_id), "join")
+        self.assertEqual(membership_summary.get(user1_id), "join")
+        self.assertEqual(membership_summary.get(user2_id), "join")
 
-            # Verify course_plan content
-            course_plan = room_data["pangea.course_plan"]["default"]["content"]
-            self.assertIn("uuid", course_plan)
+        # Kick user2 from the room
+        kick_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/kick"
+        kick_data = {
+            "user_id": user2_id,
+            "reason": "Test kick for course plan membership summary",
+        }
+        kick_response = requests.post(
+            kick_url,
+            json=kick_data,
+            headers=headers,
+        )
+        self.assertEqual(kick_response.status_code, 200)
 
-            # Verify membership_summary is present for course rooms
-            self.assertIn("membership_summary", room_data)
-            membership_summary = room_data["membership_summary"]
+        # Wait a moment for the kick to be processed
+        await asyncio.sleep(0.5)
 
-            # All joined users should be in membership_summary
-            self.assertEqual(
-                membership_summary.get("@admin_user:my.domain.name"), "join"
-            )
-            self.assertEqual(membership_summary.get("@user1:my.domain.name"), "join")
-            self.assertEqual(membership_summary.get("@user2:my.domain.name"), "join")
+        # Request room preview again - user2 should be "leave"
+        response = requests.get(
+            room_preview_url,
+            params={"rooms": room_id},
+            headers=headers,
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
 
-            # Kick user2 from the room
-            kick_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/kick"
-            kick_data = {
-                "user_id": "@user2:my.domain.name",
-                "reason": "Test kick for course plan membership summary",
-            }
-            kick_response = requests.post(
-                kick_url,
-                json=kick_data,
-                headers=headers,
-            )
-            self.assertEqual(kick_response.status_code, 200)
+        room_data = data["rooms"][room_id]
 
-            # Wait a moment for the kick to be processed
-            await asyncio.sleep(0.5)
-
-            # Request room preview again - user2 should be "leave"
-            response = requests.get(
-                room_preview_url,
-                params={"rooms": room_id},
-                headers=headers,
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
-
-            room_data = data["rooms"][room_id]
-
-            # Verify membership_summary shows correct membership states
-            self.assertIn("membership_summary", room_data)
-            membership_summary = room_data["membership_summary"]
-            self.assertEqual(
-                membership_summary.get("@admin_user:my.domain.name"), "join"
-            )
-            self.assertEqual(membership_summary.get("@user1:my.domain.name"), "join")
-            # user2 should now be "leave" in membership_summary
-            self.assertEqual(membership_summary.get("@user2:my.domain.name"), "leave")
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Verify membership_summary shows correct membership states
+        self.assertIn("membership_summary", room_data)
+        membership_summary = room_data["membership_summary"]
+        self.assertEqual(membership_summary.get(admin_user_id), "join")
+        self.assertEqual(membership_summary.get(user1_id), "join")
+        # user2 should now be "leave" in membership_summary
+        self.assertEqual(membership_summary.get(user2_id), "leave")
 
     async def create_room_with_course_plan(
-        self, admin_token: str, user1_token: str, user2_token: str
+        self,
+        admin_token: str,
+        user1_id: str,
+        user1_token: str,
+        user2_id: str,
+        user2_token: str,
     ) -> str:
         """Create a room with users and add pangea.course_plan state event."""
         headers = {"Authorization": f"Bearer {admin_token}"}
-        create_room_url = "http://localhost:8008/_matrix/client/v3/createRoom"
+        create_room_url = f"{self.server_url}/_matrix/client/v3/createRoom"
 
         # Create room
         create_room_data = {
             "visibility": "private",
             "preset": "private_chat",
             "name": "Test Room for Course Plan",
-            "invite": ["@user1:my.domain.name", "@user2:my.domain.name"],
+            "invite": [user1_id, user2_id],
         }
 
         response = requests.post(
@@ -2054,7 +1528,7 @@ class TestE2E(BaseSynapseE2ETest):
         room_id = response.json()["room_id"]
 
         # Accept invitations for both users
-        join_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/join"
+        join_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/join"
 
         user1_headers = {"Authorization": f"Bearer {user1_token}"}
         response = requests.post(join_url, headers=user1_headers)
@@ -2065,7 +1539,7 @@ class TestE2E(BaseSynapseE2ETest):
         self.assertEqual(response.status_code, 200)
 
         # Add pangea.course_plan state event
-        state_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/pangea.course_plan"
+        state_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state/pangea.course_plan"
         course_plan_content = {"uuid": "b6989779-a498-4463-aac8-2ac06b2a0406"}
 
         response = requests.put(
@@ -2077,360 +1551,279 @@ class TestE2E(BaseSynapseE2ETest):
 
         return room_id
 
-    # ── public courses tests ──────────────────────────────────────────
 
+class TestPublicCourses(BaseSynapseE2ETest):
     async def test_public_courses_endpoint_returns_public_course(self):
         _cache.clear()
         rate_limit_log.clear()
 
-        postgres = None
-        synapse_dir = None
-        config_path = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(synapse_config_overrides=ROOMDIRECTORY_CONFIG)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                synapse_config_overrides=ROOMDIRECTORY_CONFIG,
-            )
+        _, admin_token = await self.new_user("admin", admin=True)
+        await self.new_user("student")
 
-            dsn_params = parse_dsn(postgres.url())
-            dsn_params["dbname"] = "testdb"
-            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
+        headers = {"Authorization": f"Bearer {admin_token}"}
 
-            await self.register_user(
-                config_path, synapse_dir, user="admin", password="adminpass", admin=True
-            )
-            await self.register_user(
-                config_path,
-                synapse_dir,
-                user="student",
-                password="studentpass",
-                admin=False,
-            )
+        alias_suffix = int(time.time())
+        create_room_payload = {
+            "name": "Course Alpha",
+            "preset": "public_chat",
+            "visibility": "public",
+            "room_alias_name": f"course-alpha-{alias_suffix}",
+        }
+        create_response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/createRoom",
+            json=create_room_payload,
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(
+            create_response.status_code,
+            200,
+            msg=f"Failed to create room: {create_response.text}",
+        )
+        room_id = create_response.json()["room_id"]
+        room_id_path = quote(room_id, safe="")
 
-            _, admin_token = await self.login_user("admin", "adminpass")
-
-            headers = {"Authorization": f"Bearer {admin_token}"}
-
-            alias_suffix = int(time.time())
-            create_room_payload = {
-                "name": "Course Alpha",
-                "preset": "public_chat",
-                "visibility": "public",
-                "room_alias_name": f"course-alpha-{alias_suffix}",
-            }
-            create_response = requests.post(
-                f"{self.server_url}/_matrix/client/v3/createRoom",
-                json=create_room_payload,
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(
-                create_response.status_code,
-                200,
-                msg=f"Failed to create room: {create_response.text}",
-            )
-            room_id = create_response.json()["room_id"]
-            room_id_path = quote(room_id, safe="")
-
-            directory_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
-                json={"visibility": "public"},
-                headers=headers,
-                timeout=30,
-            )
-            if directory_response.status_code not in (200, 202):
-                if directory_response.status_code == 403:
-                    logger.debug(
-                        "Falling back to manual directory publish due to 403: %s",
-                        directory_response.text,
-                    )
-                    conn = psycopg2.connect(postgres_url)
-                    try:
-                        with conn:
-                            with conn.cursor() as cursor:
-                                cursor.execute(
-                                    "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
-                                    (room_id,),
-                                )
-                    finally:
-                        conn.close()
-                else:
-                    self.fail(
-                        f"Failed to update directory visibility: {directory_response.text}"
-                    )
-
-            name_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
-                json={"name": "Course Alpha"},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(name_response.status_code, 200)
-
-            topic_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.topic",
-                json={"topic": "Intro to Testing"},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(topic_response.status_code, 200)
-
-            join_rule_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.join_rules",
-                json={"join_rule": "public"},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(join_rule_response.status_code, 200)
-
-            plan_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
-                json={
-                    "plan_id": "course-alpha",
-                    "modules": ["intro"],
-                    "uuid": "test-course-uuid-123",
-                },
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(plan_response.status_code, 200)
-
-            payload = None
-            matching_courses: List[Dict[str, Any]] = []
-            for _ in range(10):
-                public_courses_response = requests.get(
-                    f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
-                    headers=headers,
-                    timeout=30,
+        directory_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+            json={"visibility": "public"},
+            headers=headers,
+            timeout=30,
+        )
+        if directory_response.status_code not in (200, 202):
+            if directory_response.status_code == 403:
+                logger.debug(
+                    "Falling back to manual directory publish due to 403: %s",
+                    directory_response.text,
                 )
-                if public_courses_response.status_code == 200:
-                    payload = public_courses_response.json()
-                    chunk = payload.get("chunk", [])
-                    matching_courses = [
-                        course for course in chunk if course["room_id"] == room_id
-                    ]
-                    if matching_courses:
-                        break
-                await asyncio.sleep(1)
-
-            if not matching_courses:
-                conn = psycopg2.connect(postgres_url)
+                conn = psycopg2.connect(self.database_url)
                 try:
-                    with conn.cursor() as cursor:
-                        cursor.execute(
-                            "SELECT room_id, is_public FROM rooms WHERE room_id = %s",
-                            (room_id,),
-                        )
-                        room_state = cursor.fetchall()
-                        cursor.execute(
-                            "SELECT type, state_key FROM state_events WHERE room_id = %s",
-                            (room_id,),
-                        )
-                        state_types = cursor.fetchall()
+                    with conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute(
+                                "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
+                                (room_id,),
+                            )
                 finally:
                     conn.close()
+            else:
                 self.fail(
-                    f"Expected room {room_id} in public courses response, got {payload}. "
-                    f"rooms table: {room_state}, state events: {state_types}"
+                    f"Failed to update directory visibility: {directory_response.text}"
                 )
 
-            course = matching_courses[0]
-            self.assertEqual(course["name"], "Course Alpha")
-            self.assertEqual(course["topic"], "Intro to Testing")
+        name_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
+            json={"name": "Course Alpha"},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(name_response.status_code, 200)
 
-            # Verify that course_id is included and matches the uuid from pangea.course_plan
-            self.assertIn(
-                "course_id", course, "course_id should be present in course response"
+        topic_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.topic",
+            json={"topic": "Intro to Testing"},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(topic_response.status_code, 200)
+
+        join_rule_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.join_rules",
+            json={"join_rule": "public"},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(join_rule_response.status_code, 200)
+
+        plan_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+            json={
+                "plan_id": "course-alpha",
+                "modules": ["intro"],
+                "uuid": "test-course-uuid-123",
+            },
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(plan_response.status_code, 200)
+
+        payload = None
+        matching_courses: List[Dict[str, Any]] = []
+        for _ in range(10):
+            public_courses_response = requests.get(
+                f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
+                headers=headers,
+                timeout=30,
             )
-            expected_course_id = "test-course-uuid-123"
-            self.assertEqual(
-                course["course_id"],
-                expected_course_id,
-                f"course_id should match uuid from pangea.course_plan content. Expected: {expected_course_id}, Got: {course.get('course_id')}",
+            if public_courses_response.status_code == 200:
+                payload = public_courses_response.json()
+                chunk = payload.get("chunk", [])
+                matching_courses = [
+                    course for course in chunk if course["room_id"] == room_id
+                ]
+                if matching_courses:
+                    break
+            await asyncio.sleep(1)
+
+        if not matching_courses:
+            conn = psycopg2.connect(self.database_url)
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT room_id, is_public FROM rooms WHERE room_id = %s",
+                        (room_id,),
+                    )
+                    room_state = cursor.fetchall()
+                    cursor.execute(
+                        "SELECT type, state_key FROM state_events WHERE room_id = %s",
+                        (room_id,),
+                    )
+                    state_types = cursor.fetchall()
+            finally:
+                conn.close()
+            self.fail(
+                f"Expected room {room_id} in public courses response, got {payload}. "
+                f"rooms table: {room_state}, state events: {state_types}"
             )
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+
+        course = matching_courses[0]
+        self.assertEqual(course["name"], "Course Alpha")
+        self.assertEqual(course["topic"], "Intro to Testing")
+
+        # Verify that course_id is included and matches the uuid from pangea.course_plan
+        self.assertIn(
+            "course_id", course, "course_id should be present in course response"
+        )
+        expected_course_id = "test-course-uuid-123"
+        self.assertEqual(
+            course["course_id"],
+            expected_course_id,
+            f"course_id should match uuid from pangea.course_plan content. Expected: {expected_course_id}, Got: {course.get('course_id')}",
+        )
 
     async def test_public_courses_endpoint_includes_course_id(self):
         """Test that the public courses endpoint includes course_id from pangea.course_plan content.uuid"""
         _cache.clear()
         rate_limit_log.clear()
 
-        postgres = None
-        synapse_dir = None
-        config_path = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(synapse_config_overrides=ROOMDIRECTORY_CONFIG)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                synapse_config_overrides=ROOMDIRECTORY_CONFIG,
-            )
+        _, admin_token = await self.new_user("admin", admin=True)
 
-            dsn_params = parse_dsn(postgres.url())
-            dsn_params["dbname"] = "testdb"
-            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
+        headers = {"Authorization": f"Bearer {admin_token}"}
 
-            dsn_params = parse_dsn(postgres.url())
-            dsn_params["dbname"] = "testdb"
-            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
+        alias_suffix = int(time.time())
+        create_room_payload = {
+            "name": "Course Beta",
+            "preset": "public_chat",
+            "visibility": "public",
+            "room_alias_name": f"course-beta-{alias_suffix}",
+        }
+        create_response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/createRoom",
+            json=create_room_payload,
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(
+            create_response.status_code,
+            200,
+            msg=f"Failed to create room: {create_response.text}",
+        )
+        room_id = create_response.json()["room_id"]
+        room_id_path = quote(room_id, safe="")
 
-            dsn_params = parse_dsn(postgres.url())
-            dsn_params["dbname"] = "testdb"
-            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
-
-            await self.register_user(
-                config_path, synapse_dir, user="admin", password="adminpass", admin=True
-            )
-
-            _, admin_token = await self.login_user("admin", "adminpass")
-
-            headers = {"Authorization": f"Bearer {admin_token}"}
-
-            alias_suffix = int(time.time())
-            create_room_payload = {
-                "name": "Course Beta",
-                "preset": "public_chat",
-                "visibility": "public",
-                "room_alias_name": f"course-beta-{alias_suffix}",
-            }
-            create_response = requests.post(
-                f"{self.server_url}/_matrix/client/v3/createRoom",
-                json=create_room_payload,
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(
-                create_response.status_code,
-                200,
-                msg=f"Failed to create room: {create_response.text}",
-            )
-            room_id = create_response.json()["room_id"]
-            room_id_path = quote(room_id, safe="")
-
-            # Set room as public
-            directory_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
-                json={"visibility": "public"},
-                headers=headers,
-                timeout=30,
-            )
-            if directory_response.status_code not in (200, 202):
-                if directory_response.status_code == 403:
-                    logger.debug(
-                        "Falling back to manual directory publish due to 403: %s",
-                        directory_response.text,
-                    )
-                    conn = psycopg2.connect(postgres_url)
-                    try:
-                        with conn:
-                            with conn.cursor() as cursor:
-                                cursor.execute(
-                                    "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
-                                    (room_id,),
-                                )
-                    finally:
-                        conn.close()
-                else:
-                    self.fail(
-                        f"Failed to update directory visibility: {directory_response.text}"
-                    )
-
-            # Set room name
-            name_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
-                json={"name": "Course Beta"},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(name_response.status_code, 200)
-
-            # Create pangea.course_plan state event with uuid
-            expected_course_id = "beta-course-uuid-12345"
-            plan_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
-                json={
-                    "plan_id": "course-beta",
-                    "uuid": expected_course_id,
-                    "modules": ["intro", "advanced"],
-                },
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(plan_response.status_code, 200)
-
-            # Wait for the course to appear in public courses
-            payload = None
-            matching_courses: List[Dict[str, Any]] = []
-            for _ in range(10):
-                public_courses_response = requests.get(
-                    f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
-                    headers=headers,
-                    timeout=30,
+        # Set room as public
+        directory_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+            json={"visibility": "public"},
+            headers=headers,
+            timeout=30,
+        )
+        if directory_response.status_code not in (200, 202):
+            if directory_response.status_code == 403:
+                logger.debug(
+                    "Falling back to manual directory publish due to 403: %s",
+                    directory_response.text,
                 )
-                if public_courses_response.status_code == 200:
-                    payload = public_courses_response.json()
-                    chunk = payload.get("chunk", [])
-                    matching_courses = [
-                        course for course in chunk if course["room_id"] == room_id
-                    ]
-                    if matching_courses:
-                        break
-                await asyncio.sleep(1)
-
-            if not matching_courses:
+                conn = psycopg2.connect(self.database_url)
+                try:
+                    with conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute(
+                                "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
+                                (room_id,),
+                            )
+                finally:
+                    conn.close()
+            else:
                 self.fail(
-                    f"Expected room {room_id} in public courses response, got {payload}"
+                    f"Failed to update directory visibility: {directory_response.text}"
                 )
 
-            course = matching_courses[0]
+        # Set room name
+        name_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
+            json={"name": "Course Beta"},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(name_response.status_code, 200)
 
-            # Verify that course_id is included and matches the uuid from pangea.course_plan
-            self.assertIn(
-                "course_id", course, "course_id should be present in course response"
+        # Create pangea.course_plan state event with uuid
+        expected_course_id = "beta-course-uuid-12345"
+        plan_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+            json={
+                "plan_id": "course-beta",
+                "uuid": expected_course_id,
+                "modules": ["intro", "advanced"],
+            },
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(plan_response.status_code, 200)
+
+        # Wait for the course to appear in public courses
+        payload = None
+        matching_courses: List[Dict[str, Any]] = []
+        for _ in range(10):
+            public_courses_response = requests.get(
+                f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
+                headers=headers,
+                timeout=30,
             )
-            self.assertEqual(
-                course["course_id"],
-                expected_course_id,
-                f"course_id should match uuid from pangea.course_plan content. Expected: {expected_course_id}, Got: {course.get('course_id')}",
+            if public_courses_response.status_code == 200:
+                payload = public_courses_response.json()
+                chunk = payload.get("chunk", [])
+                matching_courses = [
+                    course for course in chunk if course["room_id"] == room_id
+                ]
+                if matching_courses:
+                    break
+            await asyncio.sleep(1)
+
+        if not matching_courses:
+            self.fail(
+                f"Expected room {room_id} in public courses response, got {payload}"
             )
 
-            # Also verify other fields are still working
-            self.assertEqual(course["name"], "Course Beta")
-            self.assertEqual(course["room_id"], room_id)
+        course = matching_courses[0]
 
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Verify that course_id is included and matches the uuid from pangea.course_plan
+        self.assertIn(
+            "course_id", course, "course_id should be present in course response"
+        )
+        self.assertEqual(
+            course["course_id"],
+            expected_course_id,
+            f"course_id should match uuid from pangea.course_plan content. Expected: {expected_course_id}, Got: {course.get('course_id')}",
+        )
+
+        # Also verify other fields are still working
+        self.assertEqual(course["name"], "Course Beta")
+        self.assertEqual(course["room_id"], room_id)
 
     async def test_public_courses_language_filter_excludes_course_without_l2(self):
         """E2E: no fall-back path — a course with no l2 is dropped when filtered.
@@ -2442,135 +1835,100 @@ class TestE2E(BaseSynapseE2ETest):
         _cache.clear()
         rate_limit_log.clear()
 
-        postgres = None
-        synapse_dir = None
-        config_path = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(synapse_config_overrides=ROOMDIRECTORY_CONFIG)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                synapse_config_overrides=ROOMDIRECTORY_CONFIG,
-            )
+        _, admin_token = await self.new_user("admin", admin=True)
+        headers = {"Authorization": f"Bearer {admin_token}"}
 
-            dsn_params = parse_dsn(postgres.url())
-            dsn_params["dbname"] = "testdb"
-            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
+        alias_suffix = int(time.time())
+        create_response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/createRoom",
+            json={
+                "name": "Course Without L2",
+                "preset": "public_chat",
+                "visibility": "public",
+                "room_alias_name": f"course-no-l2-{alias_suffix}",
+            },
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(create_response.status_code, 200)
+        room_id = create_response.json()["room_id"]
+        room_id_path = quote(room_id, safe="")
 
-            await self.register_user(
-                config_path, synapse_dir, user="admin", password="adminpass", admin=True
-            )
-
-            _, admin_token = await self.login_user("admin", "adminpass")
-            headers = {"Authorization": f"Bearer {admin_token}"}
-
-            alias_suffix = int(time.time())
-            create_response = requests.post(
-                f"{self.server_url}/_matrix/client/v3/createRoom",
-                json={
-                    "name": "Course Without L2",
-                    "preset": "public_chat",
-                    "visibility": "public",
-                    "room_alias_name": f"course-no-l2-{alias_suffix}",
-                },
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(create_response.status_code, 200)
-            room_id = create_response.json()["room_id"]
-            room_id_path = quote(room_id, safe="")
-
-            directory_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
-                json={"visibility": "public"},
-                headers=headers,
-                timeout=30,
-            )
-            if directory_response.status_code not in (200, 202):
-                if directory_response.status_code == 403:
-                    conn = psycopg2.connect(postgres_url)
-                    try:
-                        with conn:
-                            with conn.cursor() as cursor:
-                                cursor.execute(
-                                    "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
-                                    (room_id,),
-                                )
-                    finally:
-                        conn.close()
-                else:
-                    self.fail(
-                        f"Failed to update directory visibility: {directory_response.text}"
-                    )
-
-            plan_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
-                json={"uuid": "no-l2-uuid"},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(plan_response.status_code, 200)
-
-            payload = None
-            for _ in range(10):
-                response = requests.get(
-                    f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
-                    headers=headers,
-                    timeout=30,
+        directory_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+            json={"visibility": "public"},
+            headers=headers,
+            timeout=30,
+        )
+        if directory_response.status_code not in (200, 202):
+            if directory_response.status_code == 403:
+                conn = psycopg2.connect(self.database_url)
+                try:
+                    with conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute(
+                                "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
+                                (room_id,),
+                            )
+                finally:
+                    conn.close()
+            else:
+                self.fail(
+                    f"Failed to update directory visibility: {directory_response.text}"
                 )
-                if response.status_code == 200:
-                    payload = response.json()
-                    if any(
-                        course.get("room_id") == room_id
-                        for course in payload.get("chunk", [])
-                    ):
-                        break
-                await asyncio.sleep(1)
 
-            self.assertIsNotNone(payload)
-            self.assertNotIn("filtering_warning", payload)
-            self.assertTrue(
-                any(
+        plan_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+            json={"uuid": "no-l2-uuid"},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(plan_response.status_code, 200)
+
+        payload = None
+        for _ in range(10):
+            response = requests.get(
+                f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
+                headers=headers,
+                timeout=30,
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                if any(
                     course.get("room_id") == room_id
                     for course in payload.get("chunk", [])
-                ),
-                msg=f"Course with no l2 must appear unfiltered; got {payload}",
-            )
+                ):
+                    break
+            await asyncio.sleep(1)
 
-            filtered = requests.get(
-                f"{self.server_url}/_synapse/client/pangea/v1/public_courses"
-                f"?target_language=es",
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(filtered.status_code, 200)
-            filtered_payload = filtered.json()
-            self.assertNotIn("filtering_warning", filtered_payload)
-            self.assertFalse(
-                any(
-                    course.get("room_id") == room_id
-                    for course in filtered_payload.get("chunk", [])
-                ),
-                msg=f"Course with no l2 must be excluded when filtered; got "
-                f"{filtered_payload}",
-            )
+        self.assertIsNotNone(payload)
+        self.assertNotIn("filtering_warning", payload)
+        self.assertTrue(
+            any(
+                course.get("room_id") == room_id for course in payload.get("chunk", [])
+            ),
+            msg=f"Course with no l2 must appear unfiltered; got {payload}",
+        )
 
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        filtered = requests.get(
+            f"{self.server_url}/_synapse/client/pangea/v1/public_courses"
+            f"?target_language=es",
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(filtered.status_code, 200)
+        filtered_payload = filtered.json()
+        self.assertNotIn("filtering_warning", filtered_payload)
+        self.assertFalse(
+            any(
+                course.get("room_id") == room_id
+                for course in filtered_payload.get("chunk", [])
+            ),
+            msg=f"Course with no l2 must be excluded when filtered; got "
+            f"{filtered_payload}",
+        )
 
     async def test_public_courses_returns_room_stats_attributes(self):
         """Test that the public courses endpoint returns room stats attributes correctly.
@@ -2582,280 +1940,232 @@ class TestE2E(BaseSynapseE2ETest):
         _cache.clear()
         rate_limit_log.clear()
 
-        postgres = None
-        synapse_dir = None
-        config_path = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        await self.homeserver(synapse_config_overrides=ROOMDIRECTORY_CONFIG)
 
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                synapse_config_overrides=ROOMDIRECTORY_CONFIG,
-            )
+        _, admin_token = await self.new_user("admin", admin=True)
+        _, student1_token = await self.new_user("student1")
+        _, student2_token = await self.new_user("student2")
 
-            dsn_params = parse_dsn(postgres.url())
-            dsn_params["dbname"] = "testdb"
-            postgres_url = psycopg2.extensions.make_dsn(**dsn_params)
+        headers = {"Authorization": f"Bearer {admin_token}"}
 
-            await self.register_user(
-                config_path, synapse_dir, user="admin", password="adminpass", admin=True
-            )
-            await self.register_user(
-                config_path,
-                synapse_dir,
-                user="student1",
-                password="studentpass",
-                admin=False,
-            )
-            await self.register_user(
-                config_path,
-                synapse_dir,
-                user="student2",
-                password="studentpass",
-                admin=False,
-            )
+        alias_suffix = int(time.time())
+        create_room_payload = {
+            "name": "Course Gamma",
+            "preset": "public_chat",
+            "visibility": "public",
+            "room_alias_name": f"course-gamma-{alias_suffix}",
+        }
+        create_response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/createRoom",
+            json=create_room_payload,
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(
+            create_response.status_code,
+            200,
+            msg=f"Failed to create room: {create_response.text}",
+        )
+        room_id = create_response.json()["room_id"]
+        room_id_path = quote(room_id, safe="")
 
-            _, admin_token = await self.login_user("admin", "adminpass")
-            _, student1_token = await self.login_user("student1", "studentpass")
-            _, student2_token = await self.login_user("student2", "studentpass")
-
-            headers = {"Authorization": f"Bearer {admin_token}"}
-
-            alias_suffix = int(time.time())
-            create_room_payload = {
-                "name": "Course Gamma",
-                "preset": "public_chat",
-                "visibility": "public",
-                "room_alias_name": f"course-gamma-{alias_suffix}",
-            }
-            create_response = requests.post(
-                f"{self.server_url}/_matrix/client/v3/createRoom",
-                json=create_room_payload,
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(
-                create_response.status_code,
-                200,
-                msg=f"Failed to create room: {create_response.text}",
-            )
-            room_id = create_response.json()["room_id"]
-            room_id_path = quote(room_id, safe="")
-
-            # Set room as public
-            directory_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
-                json={"visibility": "public"},
-                headers=headers,
-                timeout=30,
-            )
-            if directory_response.status_code not in (200, 202):
-                if directory_response.status_code == 403:
-                    logger.debug(
-                        "Falling back to manual directory publish due to 403: %s",
-                        directory_response.text,
-                    )
-                    conn = psycopg2.connect(postgres_url)
-                    try:
-                        with conn:
-                            with conn.cursor() as cursor:
-                                cursor.execute(
-                                    "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
-                                    (room_id,),
-                                )
-                    finally:
-                        conn.close()
-                else:
-                    self.fail(
-                        f"Failed to update directory visibility: {directory_response.text}"
-                    )
-
-            # Set room name
-            name_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
-                json={"name": "Course Gamma"},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(name_response.status_code, 200)
-
-            # Set room topic
-            topic_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.topic",
-                json={"topic": "Testing Room Stats"},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(topic_response.status_code, 200)
-
-            # Set join rules to public
-            join_rule_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.join_rules",
-                json={"join_rule": "public"},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(join_rule_response.status_code, 200)
-
-            # Set guest access
-            guest_access_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.guest_access",
-                json={"guest_access": "can_join"},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(guest_access_response.status_code, 200)
-
-            # Set history visibility to world_readable
-            history_visibility_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.history_visibility",
-                json={"history_visibility": "world_readable"},
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(history_visibility_response.status_code, 200)
-
-            # Create pangea.course_plan state event
-            expected_course_id = "gamma-course-uuid-999"
-            plan_response = requests.put(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
-                json={
-                    "plan_id": "course-gamma",
-                    "uuid": expected_course_id,
-                    "modules": ["stats-testing"],
-                },
-                headers=headers,
-                timeout=30,
-            )
-            self.assertEqual(plan_response.status_code, 200)
-
-            # Have students join the room to increase member count
-            student1_headers = {"Authorization": f"Bearer {student1_token}"}
-            join_response1 = requests.post(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/join",
-                headers=student1_headers,
-                timeout=30,
-            )
-            self.assertEqual(join_response1.status_code, 200)
-
-            student2_headers = {"Authorization": f"Bearer {student2_token}"}
-            join_response2 = requests.post(
-                f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/join",
-                headers=student2_headers,
-                timeout=30,
-            )
-            self.assertEqual(join_response2.status_code, 200)
-
-            # Wait a bit for room stats to update
-            await asyncio.sleep(2)
-
-            # Wait for the course to appear in public courses
-            payload = None
-            matching_courses: List[Dict[str, Any]] = []
-            for _ in range(10):
-                public_courses_response = requests.get(
-                    f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
-                    headers=headers,
-                    timeout=30,
+        # Set room as public
+        directory_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/directory/list/room/{room_id_path}",
+            json={"visibility": "public"},
+            headers=headers,
+            timeout=30,
+        )
+        if directory_response.status_code not in (200, 202):
+            if directory_response.status_code == 403:
+                logger.debug(
+                    "Falling back to manual directory publish due to 403: %s",
+                    directory_response.text,
                 )
-                if public_courses_response.status_code == 200:
-                    payload = public_courses_response.json()
-                    chunk = payload.get("chunk", [])
-                    matching_courses = [
-                        course for course in chunk if course["room_id"] == room_id
-                    ]
-                    if matching_courses:
-                        break
-                await asyncio.sleep(1)
-
-            if not matching_courses:
+                conn = psycopg2.connect(self.database_url)
+                try:
+                    with conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute(
+                                "UPDATE rooms SET is_public = TRUE WHERE room_id = %s",
+                                (room_id,),
+                            )
+                finally:
+                    conn.close()
+            else:
                 self.fail(
-                    f"Expected room {room_id} in public courses response, got {payload}"
+                    f"Failed to update directory visibility: {directory_response.text}"
                 )
 
-            course = matching_courses[0]
+        # Set room name
+        name_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.name",
+            json={"name": "Course Gamma"},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(name_response.status_code, 200)
 
-            # Verify OLD attributes still work
-            self.assertEqual(
-                course["name"], "Course Gamma", "Old attribute 'name' should still work"
+        # Set room topic
+        topic_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.topic",
+            json={"topic": "Testing Room Stats"},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(topic_response.status_code, 200)
+
+        # Set join rules to public
+        join_rule_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.join_rules",
+            json={"join_rule": "public"},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(join_rule_response.status_code, 200)
+
+        # Set guest access
+        guest_access_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.guest_access",
+            json={"guest_access": "can_join"},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(guest_access_response.status_code, 200)
+
+        # Set history visibility to world_readable
+        history_visibility_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/m.room.history_visibility",
+            json={"history_visibility": "world_readable"},
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(history_visibility_response.status_code, 200)
+
+        # Create pangea.course_plan state event
+        expected_course_id = "gamma-course-uuid-999"
+        plan_response = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/state/pangea.course_plan",
+            json={
+                "plan_id": "course-gamma",
+                "uuid": expected_course_id,
+                "modules": ["stats-testing"],
+            },
+            headers=headers,
+            timeout=30,
+        )
+        self.assertEqual(plan_response.status_code, 200)
+
+        # Have students join the room to increase member count
+        student1_headers = {"Authorization": f"Bearer {student1_token}"}
+        join_response1 = requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/join",
+            headers=student1_headers,
+            timeout=30,
+        )
+        self.assertEqual(join_response1.status_code, 200)
+
+        student2_headers = {"Authorization": f"Bearer {student2_token}"}
+        join_response2 = requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id_path}/join",
+            headers=student2_headers,
+            timeout=30,
+        )
+        self.assertEqual(join_response2.status_code, 200)
+
+        # Wait a bit for room stats to update
+        await asyncio.sleep(2)
+
+        # Wait for the course to appear in public courses
+        payload = None
+        matching_courses: List[Dict[str, Any]] = []
+        for _ in range(10):
+            public_courses_response = requests.get(
+                f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
+                headers=headers,
+                timeout=30,
             )
-            self.assertEqual(
-                course["topic"],
-                "Testing Room Stats",
-                "Old attribute 'topic' should still work",
-            )
-            self.assertEqual(
-                course["room_id"], room_id, "Old attribute 'room_id' should still work"
-            )
-            self.assertEqual(
-                course["course_id"],
-                expected_course_id,
-                "Old attribute 'course_id' should still work",
+            if public_courses_response.status_code == 200:
+                payload = public_courses_response.json()
+                chunk = payload.get("chunk", [])
+                matching_courses = [
+                    course for course in chunk if course["room_id"] == room_id
+                ]
+                if matching_courses:
+                    break
+            await asyncio.sleep(1)
+
+        if not matching_courses:
+            self.fail(
+                f"Expected room {room_id} in public courses response, got {payload}"
             )
 
-            # Verify NEW room stats attributes are present and correct
-            self.assertIn(
-                "world_readable",
-                course,
-                "New attribute 'world_readable' should be present",
-            )
-            self.assertTrue(
-                course["world_readable"],
-                "world_readable should be True when history_visibility is 'world_readable'",
-            )
+        course = matching_courses[0]
 
-            self.assertIn(
-                "guest_can_join",
-                course,
-                "New attribute 'guest_can_join' should be present",
-            )
-            self.assertTrue(
-                course["guest_can_join"],
-                "guest_can_join should be True when guest_access is 'can_join'",
-            )
+        # Verify OLD attributes still work
+        self.assertEqual(
+            course["name"], "Course Gamma", "Old attribute 'name' should still work"
+        )
+        self.assertEqual(
+            course["topic"],
+            "Testing Room Stats",
+            "Old attribute 'topic' should still work",
+        )
+        self.assertEqual(
+            course["room_id"], room_id, "Old attribute 'room_id' should still work"
+        )
+        self.assertEqual(
+            course["course_id"],
+            expected_course_id,
+            "Old attribute 'course_id' should still work",
+        )
 
-            self.assertIn(
-                "join_rule", course, "New attribute 'join_rule' should be present"
-            )
-            self.assertEqual(
-                course["join_rule"],
-                "public",
-                "join_rule should match the room's join rules",
-            )
+        # Verify NEW room stats attributes are present and correct
+        self.assertIn(
+            "world_readable",
+            course,
+            "New attribute 'world_readable' should be present",
+        )
+        self.assertTrue(
+            course["world_readable"],
+            "world_readable should be True when history_visibility is 'world_readable'",
+        )
 
-            self.assertIn(
-                "room_type", course, "New attribute 'room_type' should be present"
-            )
-            # room_type can be None for regular rooms
-            self.assertIsNone(
-                course["room_type"], "room_type should be None for regular rooms"
-            )
+        self.assertIn(
+            "guest_can_join",
+            course,
+            "New attribute 'guest_can_join' should be present",
+        )
+        self.assertTrue(
+            course["guest_can_join"],
+            "guest_can_join should be True when guest_access is 'can_join'",
+        )
 
-            self.assertIn(
-                "num_joined_members",
-                course,
-                "New attribute 'num_joined_members' should be present",
-            )
-            # Should be at least 3 (admin + 2 students), but allow for timing variations
-            self.assertGreaterEqual(
-                course["num_joined_members"],
-                3,
-                f"num_joined_members should be at least 3 (admin + 2 students), got {course['num_joined_members']}",
-            )
+        self.assertIn(
+            "join_rule", course, "New attribute 'join_rule' should be present"
+        )
+        self.assertEqual(
+            course["join_rule"],
+            "public",
+            "join_rule should match the room's join rules",
+        )
 
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        self.assertIn(
+            "room_type", course, "New attribute 'room_type' should be present"
+        )
+        # room_type can be None for regular rooms
+        self.assertIsNone(
+            course["room_type"], "room_type should be None for regular rooms"
+        )
+
+        self.assertIn(
+            "num_joined_members",
+            course,
+            "New attribute 'num_joined_members' should be present",
+        )
+        # Should be at least 3 (admin + 2 students), but allow for timing variations
+        self.assertGreaterEqual(
+            course["num_joined_members"],
+            3,
+            f"num_joined_members should be at least 3 (admin + 2 students), got {course['num_joined_members']}",
+        )

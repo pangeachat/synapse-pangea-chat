@@ -3,4 +3,4 @@
 {% endfor %}{{ cta_label }}:
 {{ claim_url }}
 
-{% include "_claim_code.txt" %}
+Installed the app first? Tap the link again after you sign in.

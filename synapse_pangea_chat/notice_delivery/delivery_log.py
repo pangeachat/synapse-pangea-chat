@@ -13,7 +13,7 @@ from synapse.module_api import ModuleApi
 from twisted.web.http_headers import Headers
 
 from synapse_pangea_chat.config import PangeaChatConfig
-from synapse_pangea_chat.notice_delivery.request import NoticeRequest
+from synapse_pangea_chat.notice_delivery.request import DecisionContext, NoticeRequest
 
 
 class DeliveryLogError(Exception):
@@ -39,11 +39,22 @@ class DeliveryLog:
         )
 
     async def _request(
-        self, method: str, suffix: str = "", body: Optional[Dict[str, Any]] = None
+        self,
+        method: str,
+        suffix: str = "",
+        body: Optional[Dict[str, Any]] = None,
+        *,
+        collection: str = "notification-log",
     ):
+        if collection not in {
+            "notification-log",
+            "activities-v2",
+            "activities-v2/versions",
+        }:
+            raise ValueError("Unsupported notice CMS collection")
         response = await self._http.request(
             method,
-            self._url + suffix,
+            self._url.removesuffix("notification-log") + collection + suffix,
             data=json.dumps(body).encode() if body is not None else None,
             headers=self._headers,
         )
@@ -63,12 +74,23 @@ class DeliveryLog:
         return response.code, payload
 
     @staticmethod
+    def _context(req: NoticeRequest) -> DecisionContext:
+        # Reservation and finish run only for requests the module records itself;
+        # a caller-owned record never reaches here (deliver.py).
+        if req.log is None:
+            raise DeliveryLogError(
+                "Decision context is required unless the caller owns the record"
+            )
+        return req.log
+
+    @staticmethod
     def _decision(req: NoticeRequest) -> Dict[str, Any]:
+        log = DeliveryLog._context(req)
         return {
             "outcome": "send",
             "category": req.category,
             "variant": req.variant,
-            "copy_key": req.log.copy_key,
+            "copy_key": log.copy_key,
             "channel": "none",
             "notice_event_id": req.notice_event_id,
             "notice_room_id": req.notice_room_id,
@@ -76,14 +98,15 @@ class DeliveryLog:
         }
 
     async def reserve(self, req: NoticeRequest) -> tuple[str, Optional[Dict[str, Any]]]:
+        log = self._context(req)
         row = {
-            "run": req.log.run,
+            "run": log.run,
             "subject": {
                 "kind": "account",
                 "subject_id": req.user_id,
                 "matrix_user_id": req.user_id,
             },
-            "state": req.log.state,
+            "state": log.state,
             "decision": self._decision(req),
         }
         status, payload = await self._request("POST", body=row)
@@ -97,7 +120,7 @@ class DeliveryLog:
         # Read after any conflict-shaped response. A failed create must never be
         # retried here: a timeout could have committed the reservation already.
         key = json.dumps(
-            [req.log.run["run_id"], req.user_id],
+            [log.run["run_id"], req.user_id],
             separators=(",", ":"),
             ensure_ascii=False,
         )
@@ -154,7 +177,7 @@ class DeliveryLog:
             outcome="send" if sent else "skip",
             channel=result["channel"] if sent else "none",
             no_send_reason=None if sent else result["reason"],
-            delivery={"status": "complete", "response": safe},
+            delivery={"status": result.get("log_status", "complete"), "response": safe},
         )
         status, _ = await self._request(
             "PATCH", "/" + quote(record_id, safe=""), {"decision": decision}

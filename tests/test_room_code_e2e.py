@@ -27,6 +27,14 @@ logging.basicConfig(
 
 
 class TestE2E(BaseSynapseE2ETest):
+    def unique_code(self, stem: str) -> str:
+        """A well-formed code (7 alphanumeric characters, at least one digit)
+        that no other test in the class sets: codes are looked up across every
+        room on the server, and earlier tests' rooms keep theirs."""
+        code = f"{stem}{self.tag}".ljust(7, "x")
+        self.assertEqual(len(code), 7, code)
+        return code
+
     async def set_room_knockable_with_code(
         self,
         room_id: str,
@@ -34,7 +42,7 @@ class TestE2E(BaseSynapseE2ETest):
         access_code: Union[str, None] = None,
     ):
         headers = {"Authorization": f"Bearer {access_token}"}
-        set_join_rules_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/m.room.join_rules"
+        set_join_rules_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state/m.room.join_rules"
         state_event_content = {
             JOIN_RULE_CONTENT_KEY: KNOCK_JOIN_RULE_VALUE,
             ACCESS_CODE_JOIN_RULE_CONTENT_KEY: access_code,
@@ -51,7 +59,7 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def knock_with_code(self, access_code: str, access_token: str):
         knock_with_code_url = (
-            "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code"
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code"
         )
         response = requests.post(
             knock_with_code_url,
@@ -62,7 +70,7 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def knock_without_access_token(self):
         knock_with_code_url = (
-            "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code"
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code"
         )
         response = requests.post(
             knock_with_code_url,
@@ -72,7 +80,7 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def knock_with_invalid_code(self, access_token: str):
         knock_with_code_url = (
-            "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code"
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code"
         )
         response = requests.post(
             knock_with_code_url,
@@ -85,7 +93,7 @@ class TestE2E(BaseSynapseE2ETest):
     async def wait_for_room_invitation(
         self, room_id: str, user_id: str, access_token: str
     ) -> bool:
-        room_state_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{user_id}"
+        room_state_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{user_id}"
         total_wait_time = 0
         max_wait_time = 3
         wait_interval = 1
@@ -112,7 +120,7 @@ class TestE2E(BaseSynapseE2ETest):
         self, room_id: str, access_token: str, user_power_levels: dict
     ):
         headers = {"Authorization": f"Bearer {access_token}"}
-        set_power_levels_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/m.room.power_levels"
+        set_power_levels_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state/m.room.power_levels"
         power_levels_content = {
             "users": user_power_levels,
             "users_default": 0,
@@ -136,7 +144,7 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def join_room(self, room_id: str, access_token: str):
         headers = {"Authorization": f"Bearer {access_token}"}
-        join_room_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/join"
+        join_room_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/join"
         response = requests.post(join_room_url, json={}, headers=headers)
         self.assertEqual(response.status_code, 200)
         room_id_response = response.json()["room_id"]
@@ -145,565 +153,291 @@ class TestE2E(BaseSynapseE2ETest):
 
     async def leave_room(self, room_id: str, access_token: str):
         headers = {"Authorization": f"Bearer {access_token}"}
-        leave_room_url = (
-            f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/leave"
-        )
+        leave_room_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/leave"
         response = requests.post(leave_room_url, json={}, headers=headers)
         self.assertEqual(response.status_code, 200)
 
     async def test_e2e_knock_with_code_admin_left(self) -> None:
         """Without a joined administrator, refuse entry and preserve student power."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        access_code = self.unique_code("vld")
 
-        try:
-            access_code = "vldcde1"
+        await self.homeserver()
 
-            # Start Synapse server
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        # Register test users
+        user_1_id, user_1_access_token = await self.new_user("test1", admin=True)
+        user_2_id, user_2_access_token = await self.new_user("test2", admin=True)
+        user_3_id, user_3_access_token = await self.new_user("test3", admin=True)
 
-            # Register test users
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test1",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test2",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test3",
-                password="123123123",
-                admin=True,
-            )
+        # Create room - User1 is the creator with power level 100
+        room_id = await self.create_private_room(user_1_access_token)
 
-            # Login to obtain access tokens
-            user_1_id, user_1_access_token = await self.login_user(
-                user="test1", password="123123123"
-            )
-            user_2_id, user_2_access_token = await self.login_user(
-                user="test2", password="123123123"
-            )
-            user_3_id, user_3_access_token = await self.login_user(
-                user="test3", password="123123123"
-            )
+        # Invite User2 to the room (they will have default power level 0)
+        await self.invite_user_to_room(
+            room_id=room_id, user_id=user_2_id, access_token=user_1_access_token
+        )
+        await self.join_room(room_id=room_id, access_token=user_2_access_token)
 
-            # Create room - User1 is the creator with power level 100
-            room_id = await self.create_private_room(user_1_access_token)
+        # Set power levels explicitly:
+        # - user1 = 100 (admin, can invite since invite power is 50)
+        # - user2 = 0 (non-admin, cannot invite)
+        # This ensures user2 has power level 0 which is below invite power (50)
+        await self.set_room_power_levels(
+            room_id=room_id,
+            access_token=user_1_access_token,
+            user_power_levels={
+                user_1_id: 100,
+                user_2_id: 0,
+            },
+        )
 
-            # Invite User2 to the room (they will have default power level 0)
-            await self.invite_user_to_room(
-                room_id=room_id, user_id=user_2_id, access_token=user_1_access_token
-            )
-            await self.join_room(room_id=room_id, access_token=user_2_access_token)
+        # Set room to be knockable with access code BEFORE user1 leaves
+        # (only user1 has power to change room state)
+        await self.set_room_knockable_with_code(
+            room_id=room_id,
+            access_token=user_1_access_token,
+            access_code=access_code,
+        )
 
-            # Set power levels explicitly:
-            # - user1 = 100 (admin, can invite since invite power is 50)
-            # - user2 = 0 (non-admin, cannot invite)
-            # This ensures user2 has power level 0 which is below invite power (50)
-            await self.set_room_power_levels(
-                room_id=room_id,
-                access_token=user_1_access_token,
-                user_power_levels={
-                    user_1_id: 100,
-                    user_2_id: 0,
-                },
-            )
+        # User1 (the only admin with invite power) leaves the room
+        # Now only User2 remains, with power level 0 (below invite power of 50)
+        await self.leave_room(room_id=room_id, access_token=user_1_access_token)
 
-            # Set room to be knockable with access code BEFORE user1 leaves
-            # (only user1 has power to change room state)
-            await self.set_room_knockable_with_code(
-                room_id=room_id,
-                access_token=user_1_access_token,
-                access_code=access_code,
-            )
-
-            # User1 (the only admin with invite power) leaves the room
-            # Now only User2 remains, with power level 0 (below invite power of 50)
-            await self.leave_room(room_id=room_id, access_token=user_1_access_token)
-
-            # A valid code cannot manufacture an administrator from a student.
-            response = requests.post(
-                f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
-                headers={"Authorization": f"Bearer {user_3_access_token}"},
-                json={"access_code": access_code},
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 500, response.text)
-            self.assertEqual(response.json()["errcode"], "ORG.PANGEA.INVITE_FAILED")
-            levels = await self.get_room_power_levels(room_id, user_2_access_token)
-            self.assertEqual(
-                levels.get("users", {}).get(user_2_id, levels.get("users_default", 0)),
-                0,
-            )
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # A valid code cannot manufacture an administrator from a student.
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+            headers={"Authorization": f"Bearer {user_3_access_token}"},
+            json={"access_code": access_code},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(response.json()["errcode"], "ORG.PANGEA.INVITE_FAILED")
+        levels = await self.get_room_power_levels(room_id, user_2_access_token)
+        self.assertEqual(
+            levels.get("users", {}).get(user_2_id, levels.get("users_default", 0)),
+            0,
+        )
 
     async def test_e2e_knock_with_code_admin_left_default_power(self) -> None:
         """Without a joined administrator, refuse entry and preserve student power."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        access_code = self.unique_code("vld")
 
-        try:
-            access_code = "vldcde1"
+        await self.homeserver()
 
-            # Start Synapse server
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        # Register test users
+        user_1_id, user_1_access_token = await self.new_user("test1", admin=True)
+        user_2_id, user_2_access_token = await self.new_user("test2", admin=True)
+        user_3_id, user_3_access_token = await self.new_user("test3", admin=True)
 
-            # Register test users
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test1",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test2",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test3",
-                password="123123123",
-                admin=True,
-            )
+        # Create room - User1 is the creator with power level 100
+        room_id = await self.create_private_room(user_1_access_token)
 
-            # Login to obtain access tokens
-            user_1_id, user_1_access_token = await self.login_user(
-                user="test1", password="123123123"
-            )
-            user_2_id, user_2_access_token = await self.login_user(
-                user="test2", password="123123123"
-            )
-            user_3_id, user_3_access_token = await self.login_user(
-                user="test3", password="123123123"
-            )
+        # Invite User2 to the room (they will have default power level)
+        await self.invite_user_to_room(
+            room_id=room_id, user_id=user_2_id, access_token=user_1_access_token
+        )
+        await self.join_room(room_id=room_id, access_token=user_2_access_token)
 
-            # Create room - User1 is the creator with power level 100
-            room_id = await self.create_private_room(user_1_access_token)
+        # Set power levels with ONLY user1 explicitly set
+        # User2 is NOT in the users dict, so they have default power level (0)
+        await self.set_room_power_levels(
+            room_id=room_id,
+            access_token=user_1_access_token,
+            user_power_levels={
+                user_1_id: 100,
+                # user_2_id is NOT set - they have default power level
+            },
+        )
 
-            # Invite User2 to the room (they will have default power level)
-            await self.invite_user_to_room(
-                room_id=room_id, user_id=user_2_id, access_token=user_1_access_token
-            )
-            await self.join_room(room_id=room_id, access_token=user_2_access_token)
+        # Set room to be knockable with access code BEFORE user1 leaves
+        await self.set_room_knockable_with_code(
+            room_id=room_id,
+            access_token=user_1_access_token,
+            access_code=access_code,
+        )
 
-            # Set power levels with ONLY user1 explicitly set
-            # User2 is NOT in the users dict, so they have default power level (0)
-            await self.set_room_power_levels(
-                room_id=room_id,
-                access_token=user_1_access_token,
-                user_power_levels={
-                    user_1_id: 100,
-                    # user_2_id is NOT set - they have default power level
-                },
-            )
+        # User1 (the only admin) leaves the room
+        # Now only User2 remains, with DEFAULT power level (not in users dict)
+        await self.leave_room(room_id=room_id, access_token=user_1_access_token)
 
-            # Set room to be knockable with access code BEFORE user1 leaves
-            await self.set_room_knockable_with_code(
-                room_id=room_id,
-                access_token=user_1_access_token,
-                access_code=access_code,
-            )
-
-            # User1 (the only admin) leaves the room
-            # Now only User2 remains, with DEFAULT power level (not in users dict)
-            await self.leave_room(room_id=room_id, access_token=user_1_access_token)
-
-            # A valid code cannot manufacture an administrator from a student.
-            response = requests.post(
-                f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
-                headers={"Authorization": f"Bearer {user_3_access_token}"},
-                json={"access_code": access_code},
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 500, response.text)
-            self.assertEqual(response.json()["errcode"], "ORG.PANGEA.INVITE_FAILED")
-            levels = await self.get_room_power_levels(room_id, user_2_access_token)
-            self.assertEqual(
-                levels.get("users", {}).get(user_2_id, levels.get("users_default", 0)),
-                0,
-            )
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # A valid code cannot manufacture an administrator from a student.
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+            headers={"Authorization": f"Bearer {user_3_access_token}"},
+            json={"access_code": access_code},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(response.json()["errcode"], "ORG.PANGEA.INVITE_FAILED")
+        levels = await self.get_room_power_levels(room_id, user_2_access_token)
+        self.assertEqual(
+            levels.get("users", {}).get(user_2_id, levels.get("users_default", 0)),
+            0,
+        )
 
     async def test_e2e_knock_with_code(self) -> None:
-        postgres = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        synapse_dir = None
-        try:
-            # Create a temporary directory for the Synapse server
-            access_code = "vldcde1"
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test1",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test2",
-                password="123123123",
-                admin=True,
-            )
+        access_code = self.unique_code("vld")
+        await self.homeserver()
 
-            # Login to obtain access token of both users
-            user_1_id, user_1_access_token = await self.login_user(
-                user="test1", password="123123123"
-            )
-            user_2_id, user_2_access_token = await self.login_user(
-                user="test2", password="123123123"
-            )
+        # Register both users
+        user_1_id, user_1_access_token = await self.new_user("test1", admin=True)
+        user_2_id, user_2_access_token = await self.new_user("test2", admin=True)
 
-            room_id = await self.create_private_room(user_1_access_token)
+        room_id = await self.create_private_room(user_1_access_token)
 
-            await self.set_room_knockable_with_code(
-                room_id=room_id,
-                access_token=user_1_access_token,
-                access_code=access_code,
-            )
+        await self.set_room_knockable_with_code(
+            room_id=room_id,
+            access_token=user_1_access_token,
+            access_code=access_code,
+        )
 
-            # Invoke knock with code endpoint
-            await self.knock_with_invalid_code(user_2_access_token)
-            await self.knock_with_code(access_code, user_2_access_token)
+        # Invoke knock with code endpoint
+        await self.knock_with_invalid_code(user_2_access_token)
+        await self.knock_with_code(access_code, user_2_access_token)
 
-            # Wait for the invite
-            received_invitation = await self.wait_for_room_invitation(
-                room_id=room_id,
-                user_id=user_2_id,
-                access_token=user_1_access_token,
-            )
-            if not received_invitation:
-                self.fail("User 2 was not invited to the room")
-            else:
-                print("User 2 was invited to the room")
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Wait for the invite
+        received_invitation = await self.wait_for_room_invitation(
+            room_id=room_id,
+            user_id=user_2_id,
+            access_token=user_1_access_token,
+        )
+        if not received_invitation:
+            self.fail("User 2 was not invited to the room")
+        else:
+            print("User 2 was invited to the room")
 
     async def test_e2e_knock_with_code_banned_user_gets_distinct_error(self) -> None:
         """A banned user presenting a valid code must get a ban-specific
         403 (ORG.PANGEA.BANNED_FROM_ROOM), not a response indistinguishable
         from a nonexistent code (issue #127 / client#6820)."""
-        postgres = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        synapse_dir = None
-        try:
-            access_code = "bandcd1"
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
-            for user in ("test1", "test2"):
-                await self.register_user(
-                    config_path=config_path,
-                    dir=synapse_dir,
-                    user=user,
-                    password="123123123",
-                    admin=True,
-                )
-            _, user_1_access_token = await self.login_user(
-                user="test1", password="123123123"
-            )
-            user_2_id, user_2_access_token = await self.login_user(
-                user="test2", password="123123123"
-            )
+        access_code = self.unique_code("ban")
+        await self.homeserver()
+        _, user_1_access_token = await self.new_user("test1", admin=True)
+        user_2_id, user_2_access_token = await self.new_user("test2", admin=True)
 
-            room_id = await self.create_private_room(user_1_access_token)
-            await self.set_room_knockable_with_code(
-                room_id=room_id,
-                access_token=user_1_access_token,
-                access_code=access_code,
-            )
+        room_id = await self.create_private_room(user_1_access_token)
+        await self.set_room_knockable_with_code(
+            room_id=room_id,
+            access_token=user_1_access_token,
+            access_code=access_code,
+        )
 
-            # Ban user 2 from the room
-            ban_response = requests.post(
-                f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/ban",
-                json={"user_id": user_2_id, "reason": "test ban"},
-                headers={"Authorization": f"Bearer {user_1_access_token}"},
-                timeout=10,
-            )
-            self.assertEqual(ban_response.status_code, 200)
+        # Ban user 2 from the room
+        ban_response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/ban",
+            json={"user_id": user_2_id, "reason": "test ban"},
+            headers={"Authorization": f"Bearer {user_1_access_token}"},
+            timeout=10,
+        )
+        self.assertEqual(ban_response.status_code, 200)
 
-            # Banned user presents the (valid) code
-            response = requests.post(
-                "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code",
-                json={"access_code": access_code},
-                headers={"Authorization": f"Bearer {user_2_access_token}"},
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 403)
-            body = response.json()
-            self.assertEqual(body["errcode"], "ORG.PANGEA.BANNED_FROM_ROOM")
-            self.assertEqual(body["banned"], [room_id])
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Banned user presents the (valid) code
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+            json={"access_code": access_code},
+            headers={"Authorization": f"Bearer {user_2_access_token}"},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 403)
+        body = response.json()
+        self.assertEqual(body["errcode"], "ORG.PANGEA.BANNED_FROM_ROOM")
+        self.assertEqual(body["banned"], [room_id])
 
     async def test_e2e_knock_with_code_already_invited_user_gets_room(self) -> None:
         """A user already invited to the room (a re-clicked link, a second
         device, a knock racing the client's join) must get the room back in
         `rooms` so their own /join proceeds — not a second invite whose
         failure hid the room from every list (issue #148)."""
-        postgres = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        synapse_dir = None
-        try:
-            access_code = "invcde1"
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
-            for user in ("test1", "test2"):
-                await self.register_user(
-                    config_path=config_path,
-                    dir=synapse_dir,
-                    user=user,
-                    password="123123123",
-                    admin=True,
-                )
-            _, user_1_access_token = await self.login_user(
-                user="test1", password="123123123"
-            )
-            user_2_id, user_2_access_token = await self.login_user(
-                user="test2", password="123123123"
-            )
+        access_code = self.unique_code("inv")
+        await self.homeserver()
+        _, user_1_access_token = await self.new_user("test1", admin=True)
+        user_2_id, user_2_access_token = await self.new_user("test2", admin=True)
 
-            room_id = await self.create_private_room(user_1_access_token)
-            await self.set_room_knockable_with_code(
+        room_id = await self.create_private_room(user_1_access_token)
+        await self.set_room_knockable_with_code(
+            room_id=room_id,
+            access_token=user_1_access_token,
+            access_code=access_code,
+        )
+
+        # User 1 invites user 2 directly; user 2 then presents the code
+        # while that invite is still pending.
+        self.assertTrue(
+            await self.invite_user_to_room(
                 room_id=room_id,
+                user_id=user_2_id,
                 access_token=user_1_access_token,
-                access_code=access_code,
             )
+        )
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+            json={"access_code": access_code},
+            headers={"Authorization": f"Bearer {user_2_access_token}"},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["rooms"], [room_id])
+        self.assertEqual(body["already_joined"], [])
 
-            # User 1 invites user 2 directly; user 2 then presents the code
-            # while that invite is still pending.
-            self.assertTrue(
-                await self.invite_user_to_room(
-                    room_id=room_id,
-                    user_id=user_2_id,
-                    access_token=user_1_access_token,
-                )
+        # The client's own join succeeds for an invited user.
+        self.assertTrue(
+            await self.accept_room_invitation(
+                room_id=room_id, access_token=user_2_access_token
             )
-            response = requests.post(
-                "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code",
-                json={"access_code": access_code},
-                headers={"Authorization": f"Bearer {user_2_access_token}"},
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 200)
-            body = response.json()
-            self.assertEqual(body["rooms"], [room_id])
-            self.assertEqual(body["already_joined"], [])
-
-            # The client's own join succeeds for an invited user.
-            self.assertTrue(
-                await self.accept_room_invitation(
-                    room_id=room_id, access_token=user_2_access_token
-                )
-            )
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        )
 
     async def test_e2e_knock_with_unmatched_code_returns_404(self) -> None:
         """A well-formed code that matches no room must answer 404 with
         ORG.PANGEA.CODE_NOT_FOUND — not a bare 400, which clients cannot
         tell from a malformed request (issue #197 / client#8693)."""
-        postgres = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        synapse_dir = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test1",
-                password="123123123",
-                admin=True,
-            )
-            _, user_1_access_token = await self.login_user(
-                user="test1", password="123123123"
-            )
+        await self.homeserver()
+        _, user_1_access_token = await self.new_user("test1", admin=True)
 
-            response = requests.post(
-                "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code",
-                json={"access_code": "zzz9zzz"},
-                headers={"Authorization": f"Bearer {user_1_access_token}"},
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 404)
-            body = response.json()
-            self.assertEqual(body["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+            json={"access_code": "zzz9zzz"},
+            headers={"Authorization": f"Bearer {user_1_access_token}"},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 404)
+        body = response.json()
+        self.assertEqual(body["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
 
-            # A malformed code (no digit) still answers 400, unchanged.
-            await self.knock_with_invalid_code(user_1_access_token)
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # A malformed code (no digit) still answers 400, unchanged.
+        await self.knock_with_invalid_code(user_1_access_token)
 
     async def test_e2e_code_index_follows_new_and_rotated_codes(self) -> None:
         """After the first lookup loads the code index, a course created later
         resolves on the first try, and a rotated code stops working while its
         replacement works (knock-with-code.instructions.md, "Code Lookup")."""
-        postgres = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        synapse_dir = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
-            tokens = {}
-            for user in ("test1", "test2", "test3"):
-                await self.register_user(
-                    config_path=config_path,
-                    dir=synapse_dir,
-                    user=user,
-                    password="123123123",
-                    admin=user == "test1",
-                )
-                _, tokens[user] = await self.login_user(user=user, password="123123123")
+        await self.homeserver()
+        old_code = self.unique_code("old")
+        new_code = self.unique_code("new")
+        rotated_code = self.unique_code("rot")
+        tokens = {}
+        for user in ("test1", "test2", "test3"):
+            _, tokens[user] = await self.new_user(user, admin=user == "test1")
 
-            first_room = await self.create_private_room(tokens["test1"])
-            await self.set_room_knockable_with_code(
-                first_room, tokens["test1"], "old1abc"
-            )
-            await self.knock_with_code("old1abc", tokens["test2"])
+        first_room = await self.create_private_room(tokens["test1"])
+        await self.set_room_knockable_with_code(first_room, tokens["test1"], old_code)
+        await self.knock_with_code(old_code, tokens["test2"])
 
-            second_room = await self.create_private_room(tokens["test1"])
-            await self.set_room_knockable_with_code(
-                second_room, tokens["test1"], "new2abc"
-            )
-            await self.knock_with_code("new2abc", tokens["test3"])
+        second_room = await self.create_private_room(tokens["test1"])
+        await self.set_room_knockable_with_code(second_room, tokens["test1"], new_code)
+        await self.knock_with_code(new_code, tokens["test3"])
 
-            await self.set_room_knockable_with_code(
-                first_room, tokens["test1"], "rot3abc"
-            )
-            response = requests.post(
-                "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code",
-                json={"access_code": "old1abc"},
-                headers={"Authorization": f"Bearer {tokens['test3']}"},
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 404)
-            self.assertEqual(response.json()["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
-            await self.knock_with_code("ROT3ABC", tokens["test3"])
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        await self.set_room_knockable_with_code(
+            first_room, tokens["test1"], rotated_code
+        )
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+            json={"access_code": old_code},
+            headers={"Authorization": f"Bearer {tokens['test3']}"},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
+        await self.knock_with_code(rotated_code.upper(), tokens["test3"])
 
     async def test_e2e_code_of_fully_left_room_answers_404(self) -> None:
         """When every local member has left a coded room, Synapse drops the
@@ -713,66 +447,33 @@ class TestE2E(BaseSynapseE2ETest):
         future change to the match query doesn't silently turn this into the
         all-invites-failed 500 path (issue #197); that path is unit-tested in
         test_knock_with_code_unit.py."""
-        postgres = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        synapse_dir = None
-        try:
-            access_code = "empty9r"
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
-            for user in ("test1", "test2"):
-                await self.register_user(
-                    config_path=config_path,
-                    dir=synapse_dir,
-                    user=user,
-                    password="123123123",
-                    admin=True,
-                )
-            _, user_1_access_token = await self.login_user(
-                user="test1", password="123123123"
-            )
-            _, user_2_access_token = await self.login_user(
-                user="test2", password="123123123"
-            )
+        access_code = self.unique_code("emp")
+        await self.homeserver()
+        _, user_1_access_token = await self.new_user("test1", admin=True)
+        _, user_2_access_token = await self.new_user("test2", admin=True)
 
-            room_id = await self.create_private_room(user_1_access_token)
-            await self.set_room_knockable_with_code(
-                room_id=room_id,
-                access_token=user_1_access_token,
-                access_code=access_code,
-            )
-            # The creator leaves: the room keeps its code but has no joined
-            # member left to issue invites on behalf of.
-            await self.leave_room(room_id, user_1_access_token)
+        room_id = await self.create_private_room(user_1_access_token)
+        await self.set_room_knockable_with_code(
+            room_id=room_id,
+            access_token=user_1_access_token,
+            access_code=access_code,
+        )
+        # The creator leaves: the room keeps its code but has no joined
+        # member left to issue invites on behalf of.
+        await self.leave_room(room_id, user_1_access_token)
 
-            response = requests.post(
-                "http://localhost:8008/_synapse/client/pangea/v1/knock_with_code",
-                json={"access_code": access_code},
-                headers={"Authorization": f"Bearer {user_2_access_token}"},
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 404, response.text)
-            self.assertEqual(response.json()["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+            json={"access_code": access_code},
+            headers={"Authorization": f"Bearer {user_2_access_token}"},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertEqual(response.json()["errcode"], "ORG.PANGEA.CODE_NOT_FOUND")
 
     async def get_access_token_without_access_code(self):
         get_access_token_url = (
-            "http://localhost:8008/_synapse/client/pangea/v1/request_room_code"
+            f"{self.server_url}/_synapse/client/pangea/v1/request_room_code"
         )
         response = requests.get(url=get_access_token_url)
         self.assertEqual(response.status_code, 403)
@@ -780,7 +481,7 @@ class TestE2E(BaseSynapseE2ETest):
     async def get_access_token(self, access_token: str):
         t0 = perf_counter()
         get_access_token_url = (
-            "http://localhost:8008/_synapse/client/pangea/v1/request_room_code"
+            f"{self.server_url}/_synapse/client/pangea/v1/request_room_code"
         )
         response = requests.get(
             url=get_access_token_url,
@@ -793,45 +494,14 @@ class TestE2E(BaseSynapseE2ETest):
         self.assertIsInstance(access_code, str)
 
     async def test_e2e_get_access_code(self) -> None:
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        await self.homeserver()
 
-            # Register and login
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="test1",
-                password="123123123",
-                admin=True,
-            )
-            user_1_id, user_access_token = await self.login_user(
-                user="test1", password="123123123"
-            )
+        # Register a user
+        user_1_id, user_access_token = await self.new_user("test1", admin=True)
 
-            # Get access code
-            await self.get_access_token_without_access_code()
-            await self.get_access_token(user_access_token)
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Get access code
+        await self.get_access_token_without_access_code()
+        await self.get_access_token(user_access_token)
 
     async def test_rate_limit(self) -> None:
         user_id = "foobar"
@@ -849,123 +519,79 @@ class TestE2E(BaseSynapseE2ETest):
     async def get_room_power_levels(self, room_id: str, access_token: str) -> dict:
         """Get the current power levels state for a room."""
         headers = {"Authorization": f"Bearer {access_token}"}
-        power_levels_url = f"http://localhost:8008/_matrix/client/v3/rooms/{room_id}/state/m.room.power_levels"
+        power_levels_url = f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/state/m.room.power_levels"
         response = requests.get(power_levels_url, headers=headers)
         self.assertEqual(response.status_code, 200)
         return response.json()
 
     async def test_e2e_knock_with_code_does_not_promote_remaining_student(self) -> None:
         """Without a joined administrator, refuse entry and preserve student power."""
-        postgres = None
-        synapse_dir = None
-        server_process = None
-        stdout_thread = None
-        stderr_thread = None
+        access_code = self.unique_code("pro")
 
-        try:
-            access_code = "promo1t"  # 7 chars, alphanumeric with at least 1 digit
+        await self.homeserver()
 
-            # Start Synapse server
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        # Register test users
+        user_a_id, user_a_access_token = await self.new_user("userA", admin=True)
+        user_b_id, user_b_access_token = await self.new_user("userB", admin=True)
 
-            # Register test users
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="userA",
-                password="123123123",
-                admin=True,
-            )
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="userB",
-                password="123123123",
-                admin=True,
-            )
+        # Step 1: User A creates a room
+        room_id = await self.create_private_room(user_a_access_token)
 
-            # Login to obtain access tokens
-            user_a_id, user_a_access_token = await self.login_user(
-                user="userA", password="123123123"
-            )
-            user_b_id, user_b_access_token = await self.login_user(
-                user="userB", password="123123123"
-            )
+        # Step 2: User A invites User B and User B joins
+        await self.invite_user_to_room(
+            room_id=room_id, user_id=user_b_id, access_token=user_a_access_token
+        )
+        await self.join_room(room_id=room_id, access_token=user_b_access_token)
 
-            # Step 1: User A creates a room
-            room_id = await self.create_private_room(user_a_access_token)
+        # Set power levels explicitly: User A = 100 (admin), User B = 0 (no invite power)
+        # invite power required = 50 (default for private rooms)
+        await self.set_room_power_levels(
+            room_id=room_id,
+            access_token=user_a_access_token,
+            user_power_levels={
+                user_a_id: 100,
+                user_b_id: 0,
+            },
+        )
 
-            # Step 2: User A invites User B and User B joins
-            await self.invite_user_to_room(
-                room_id=room_id, user_id=user_b_id, access_token=user_a_access_token
-            )
-            await self.join_room(room_id=room_id, access_token=user_b_access_token)
+        # Verify initial power levels: User A should be admin, User B should have low power
+        power_levels = await self.get_room_power_levels(
+            room_id=room_id, access_token=user_a_access_token
+        )
+        user_a_power = power_levels.get("users", {}).get(user_a_id, 0)
+        user_b_power = power_levels.get("users", {}).get(user_b_id, 0)
+        invite_power_required = power_levels.get("invite", 0)
 
-            # Set power levels explicitly: User A = 100 (admin), User B = 0 (no invite power)
-            # invite power required = 50 (default for private rooms)
-            await self.set_room_power_levels(
-                room_id=room_id,
-                access_token=user_a_access_token,
-                user_power_levels={
-                    user_a_id: 100,
-                    user_b_id: 0,
-                },
-            )
+        # User A should have admin power (100)
+        self.assertGreaterEqual(user_a_power, invite_power_required)
+        # User B should NOT have invite power initially (0 < 50)
+        self.assertLess(user_b_power, invite_power_required)
+        logger.info(
+            f"Initial power levels - User A: {user_a_power}, User B: {user_b_power}, "
+            f"Invite required: {invite_power_required}"
+        )
 
-            # Verify initial power levels: User A should be admin, User B should have low power
-            power_levels = await self.get_room_power_levels(
-                room_id=room_id, access_token=user_a_access_token
-            )
-            user_a_power = power_levels.get("users", {}).get(user_a_id, 0)
-            user_b_power = power_levels.get("users", {}).get(user_b_id, 0)
-            invite_power_required = power_levels.get("invite", 0)
+        # Set room to be knockable with access code (before User A leaves)
+        await self.set_room_knockable_with_code(
+            room_id=room_id,
+            access_token=user_a_access_token,
+            access_code=access_code,
+        )
 
-            # User A should have admin power (100)
-            self.assertGreaterEqual(user_a_power, invite_power_required)
-            # User B should NOT have invite power initially (0 < 50)
-            self.assertLess(user_b_power, invite_power_required)
-            logger.info(
-                f"Initial power levels - User A: {user_a_power}, User B: {user_b_power}, "
-                f"Invite required: {invite_power_required}"
-            )
+        # Step 3: User A leaves the room
+        await self.leave_room(room_id=room_id, access_token=user_a_access_token)
 
-            # Set room to be knockable with access code (before User A leaves)
-            await self.set_room_knockable_with_code(
-                room_id=room_id,
-                access_token=user_a_access_token,
-                access_code=access_code,
-            )
-
-            # Step 3: User A leaves the room
-            await self.leave_room(room_id=room_id, access_token=user_a_access_token)
-
-            # A valid code cannot manufacture an administrator from a student.
-            response = requests.post(
-                f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
-                headers={"Authorization": f"Bearer {user_a_access_token}"},
-                json={"access_code": access_code},
-                timeout=10,
-            )
-            self.assertEqual(response.status_code, 500, response.text)
-            self.assertEqual(response.json()["errcode"], "ORG.PANGEA.INVITE_FAILED")
-            levels = await self.get_room_power_levels(room_id, user_b_access_token)
-            self.assertEqual(
-                levels.get("users", {}).get(user_b_id, levels.get("users_default", 0)),
-                0,
-            )
-
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # A valid code cannot manufacture an administrator from a student.
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+            headers={"Authorization": f"Bearer {user_a_access_token}"},
+            json={"access_code": access_code},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(response.json()["errcode"], "ORG.PANGEA.INVITE_FAILED")
+        levels = await self.get_room_power_levels(room_id, user_b_access_token)
+        self.assertEqual(
+            levels.get("users", {}).get(user_b_id, levels.get("users_default", 0)),
+            0,
+        )

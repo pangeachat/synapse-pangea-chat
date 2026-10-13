@@ -17,11 +17,18 @@ from synapse_pangea_chat.notice_delivery.deliver import (
     CHANNEL_REFUSED,
     DeliverNotice,
 )
+from synapse_pangea_chat.notice_delivery.missed_message_unsubscribe import (
+    MissedMessageUnsubscribe,
+)
 from synapse_pangea_chat.notice_delivery.push_rule import (
     ensure_bot_notice_push_rule,
     reset_confirmed_users_for_tests,
 )
-from synapse_pangea_chat.notice_delivery.unsubscribe import NoticeUnsubscribe
+from synapse_pangea_chat.notice_delivery.refusal_store import RefusalStore
+from synapse_pangea_chat.notice_delivery.unsubscribe import (
+    NoticeUnsubscribe,
+    parse_preference_form,
+)
 
 SECRET = b"unit-test-secret"
 NOW_MS = 1_700_000_000_000
@@ -41,6 +48,8 @@ def _config(**overrides):
     config.notice_admin_burst = 100
     config.app_base_url = "https://app.example.test"
     config.send_push_sygnal_url = "https://sygnal.example.test"
+    config.notice_external_link_hosts = ["calendar.app.google", "admin.pangea.chat"]
+
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
@@ -415,7 +424,7 @@ def _capture_html(monkey_target, request_holder):
 
 class TestUnsubscribe(unittest.IsolatedAsyncioTestCase):
     def _handler(self, api):
-        return NoticeUnsubscribe(api, _config())
+        return NoticeUnsubscribe(api, _config(), RefusalStore(api))
 
     def _token(self, category="activity_nudges", kind="unsub"):
         return tokens.sign_token(
@@ -618,6 +627,27 @@ class TestClick(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(redirects, [b"https://app.example.test/"])
         api.create_and_send_event_into_room.assert_not_awaited()
 
+    async def test_a_valid_link_always_reaches_its_destination_from_one_address(self):
+        # A class opening the same email on one school network shares an address
+        # (found by the engagement load harness: the 31st click a minute landed on
+        # the app home); a valid link is never throttled, and its open is recorded
+        # once per link per minute so a refetched link cannot flood the DM.
+        api = _api()
+        handler = NoticeClick(api, _config())
+        redirects = []
+        with patch(
+            "synapse_pangea_chat.notice_delivery.click.respond_with_redirect",
+            new=lambda request, url, *a, **k: redirects.append(url),
+        ):
+            for _ in range(40):
+                await handler._async_render_GET(
+                    _FakeRequest(args={b"t": [self._token().encode()]})
+                )
+        self.assertEqual(
+            redirects, [b"https://app.example.test/act-1?roomid=%21s%3Ax"] * 40
+        )
+        self.assertEqual(api.create_and_send_event_into_room.await_count, 1)
+
     async def test_record_failure_still_redirects(self):
         api = _api()
         api.create_and_send_event_into_room = AsyncMock(
@@ -750,3 +780,191 @@ class TestReviewRoundThree(unittest.TestCase):
             }
         )
         self.assertTrue(config.notice_email_enabled)
+
+
+def _with_pushers(api, pushers):
+    """Give the fake homeserver a pusher store and a pusher pool."""
+    store = api._hs.get_datastores.return_value.main
+    store.get_pushers_by_user_id = AsyncMock(return_value=list(pushers))
+    api._hs.get_pusherpool.return_value.remove_pusher = AsyncMock()
+    return api._hs.get_pusherpool.return_value.remove_pusher
+
+
+def _pusher(app_id, pushkey):
+    return SimpleNamespace(app_id=app_id, pushkey=pushkey)
+
+
+class TestPreferenceForm(unittest.TestCase):
+    def _args(self, **fields):
+        return {
+            key.encode(): [
+                v.encode() for v in (value if isinstance(value, list) else [value])
+            ]
+            for key, value in fields.items()
+        }
+
+    def test_an_unticked_missed_message_switch_refuses_missed_message(self):
+        choice = parse_preference_form(
+            self._args(
+                scope="preferences",
+                reminders_enabled="yes",
+                enabled=sorted(categories.GLOBAL_OFF_CATEGORIES),
+                missed_message_shown="yes",
+            )
+        )
+        self.assertEqual(choice.categories, {"missed_message"})
+        self.assertFalse(choice.all_off)
+
+    def test_a_ticked_missed_message_switch_refuses_nothing(self):
+        choice = parse_preference_form(
+            self._args(
+                reminders_enabled="yes",
+                enabled=sorted(categories.GLOBAL_OFF_CATEGORIES),
+                missed_message_shown="yes",
+                missed_message_enabled="yes",
+            )
+        )
+        self.assertEqual(choice.categories, frozenset())
+
+    def test_a_form_without_the_switch_never_refuses_missed_message(self):
+        choice = parse_preference_form(
+            self._args(
+                reminders_enabled="yes",
+                enabled=sorted(categories.GLOBAL_OFF_CATEGORIES),
+            )
+        )
+        self.assertEqual(choice.categories, frozenset())
+
+    def test_an_unknown_category_is_malformed(self):
+        self.assertIsNone(parse_preference_form(self._args(enabled="missed_message")))
+
+
+class TestRefusalStore(unittest.IsolatedAsyncioTestCase):
+    async def test_a_missed_message_refusal_removes_only_email_pushers(self):
+        api = _api()
+        remove_pusher = _with_pushers(
+            api,
+            [_pusher("m.email", "alice@example.test"), _pusher("com.app", "token")],
+        )
+
+        updated = await RefusalStore(api).add_refusals(
+            USER, categories={"missed_message"}
+        )
+
+        self.assertEqual(updated["refused"], ["missed_message"])
+        self.assertEqual(updated["source"], "unsubscribe_link")
+        remove_pusher.assert_awaited_once_with("m.email", "alice@example.test", USER)
+        api._hs.get_notifier.return_value.on_new_replication_data.assert_called_once()
+
+    async def test_other_refusals_leave_pushers_alone(self):
+        api = _api()
+        remove_pusher = _with_pushers(api, [_pusher("m.email", "alice@example.test")])
+
+        await RefusalStore(api).add_refusals(USER, categories={"activity_nudges"})
+
+        remove_pusher.assert_not_awaited()
+
+    async def test_the_global_off_does_not_touch_missed_message(self):
+        api = _api(account_data={"refused": ["suggestions"]})
+        remove_pusher = _with_pushers(api, [_pusher("m.email", "alice@example.test")])
+
+        updated = await RefusalStore(api).add_refusals(
+            USER, categories=(), all_off=True
+        )
+
+        self.assertEqual(updated["refused"], ["suggestions"])
+        self.assertTrue(updated["all_off"])
+        remove_pusher.assert_not_awaited()
+
+
+class TestMissedMessageUnsubscribe(unittest.IsolatedAsyncioTestCase):
+    ADDRESS = "alice@example.test"
+    TARGET = (
+        "synapse_pangea_chat.notice_delivery.missed_message_unsubscribe"
+        ".respond_with_html"
+    )
+
+    def setUp(self):
+        from synapse.util.macaroons import MacaroonGenerator
+
+        clock = MagicMock()
+        clock.time_msec.return_value = NOW_MS
+        self.macaroons = MacaroonGenerator(clock, "my.domain.name", b"macaroon")
+
+    def _api(self, **kwargs):
+        api = _api(**kwargs)
+        api._hs.get_macaroon_generator.return_value = self.macaroons
+        return api
+
+    def _link_args(self, token=None):
+        token = token or self.macaroons.generate_delete_pusher_token(
+            USER, "m.email", self.ADDRESS
+        )
+        return {
+            b"access_token": [token.encode()],
+            b"app_id": [b"m.email"],
+            b"pushkey": [self.ADDRESS.encode()],
+        }
+
+    def _handler(self, api):
+        return MissedMessageUnsubscribe(api, _config(), RefusalStore(api))
+
+    async def test_opening_the_link_only_shows_the_confirmation(self):
+        api = self._api()
+        remove_pusher = _with_pushers(api, [_pusher("m.email", self.ADDRESS)])
+        captured = []
+        with _capture_html(self.TARGET, captured):
+            await self._handler(api)._async_render_GET(
+                _FakeRequest(args=self._link_args())
+            )
+        self.assertEqual(captured[0][0], 200)
+        self.assertIn("notice_unsubscribe_confirm.html", captured[0][1])
+        api.account_data_manager.put_global.assert_not_awaited()
+        remove_pusher.assert_not_awaited()
+
+    async def test_a_tampered_link_is_invalid(self):
+        api = self._api()
+        args = self._link_args()
+        args[b"pushkey"] = [b"someone-else@example.test"]
+        captured = []
+        with _capture_html(self.TARGET, captured):
+            await self._handler(api)._async_render_GET(_FakeRequest(args=args))
+        self.assertEqual(captured[0][0], 400)
+
+    async def test_a_garbage_token_is_invalid(self):
+        api = self._api()
+        captured = []
+        with _capture_html(self.TARGET, captured):
+            await self._handler(api)._async_render_POST(
+                _FakeRequest(
+                    args=self._link_args(token="not-a-macaroon"),
+                    body=b"List-Unsubscribe=One-Click",
+                )
+            )
+        self.assertEqual(captured[0][0], 400)
+        api.account_data_manager.put_global.assert_not_awaited()
+
+    async def test_one_click_records_the_refusal_and_removes_the_pusher(self):
+        api = self._api(account_data={"refused": ["campaigns"]})
+        remove_pusher = _with_pushers(api, [_pusher("m.email", self.ADDRESS)])
+        captured = []
+        with _capture_html(self.TARGET, captured):
+            await self._handler(api)._async_render_POST(
+                _FakeRequest(args=self._link_args(), body=b"List-Unsubscribe=One-Click")
+            )
+        self.assertEqual(captured[0][0], 200)
+        user_id, _, content = api.account_data_manager.put_global.await_args.args
+        self.assertEqual(user_id, USER)
+        self.assertEqual(content["refused"], ["campaigns", "missed_message"])
+        self.assertEqual(content["source"], "unsubscribe_link")
+        remove_pusher.assert_awaited_once_with("m.email", self.ADDRESS, USER)
+
+    async def test_a_post_that_is_neither_one_click_nor_the_form_is_rejected(self):
+        api = self._api()
+        captured = []
+        with _capture_html(self.TARGET, captured):
+            await self._handler(api)._async_render_POST(
+                _FakeRequest(args=self._link_args())
+            )
+        self.assertEqual(captured[0][0], 400)
+        api.account_data_manager.put_global.assert_not_awaited()

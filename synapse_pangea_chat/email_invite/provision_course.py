@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from copy import deepcopy
 
 from synapse.types import create_requester
 
+from synapse_pangea_chat.blocked_join_gate.is_blocked_by_room_admin import (
+    is_blocked_by_room_admin,
+)
 from synapse_pangea_chat.email_invite.course_invitations import (
+    invitation_kind,
     recovery_required,
     unavailable,
 )
@@ -14,17 +19,35 @@ from synapse_pangea_chat.email_invite.create_course_space import (
     DEFAULT_SPACE_POWER_LEVELS,
 )
 from synapse_pangea_chat.room_code.code_lookup import new_unique_code
-from synapse_pangea_chat.room_code.instructor_access import is_joined_instructor
+from synapse_pangea_chat.room_code.get_inviter_user import was_previously_admin
+from synapse_pangea_chat.room_code.instructor_access import (
+    is_joined_instructor,
+    joined_local_instructors,
+)
 
 MARKER = "org.pangea.course_invitation"
 
 
+def _plain(value):
+    """A plain-dict copy of a (possibly frozen) JSON-like structure."""
+    if isinstance(value, Mapping):
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value
+
+
 class CourseProvisioner:
-    def __init__(self, api, invitations, claims, notifier):
+    def __init__(
+        self, api, invitations, claims, notifier, blocked_join_gate_enabled=True
+    ):
         self.api = api
         self.invitations = invitations
         self.claims = claims
         self.notifier = notifier
+        # The same off switch knock_with_code honours (blocked-join-gate).
+        self.blocked_join_gate_enabled = blocked_join_gate_enabled
+
         self.store = api._hs.get_datastores().main
 
     async def authorized(self, invitation, user):
@@ -77,7 +100,10 @@ class CourseProvisioner:
             user,
         ):
             raise unavailable()
+        if invitation_kind(invitation) == "instructor":
+            return await self.claim_instructor(invitation, user, defer_to_concurrent)
         class_code = None
+
         read_as_prepared = invitation["status"] == "prepared"
         if read_as_prepared:
             class_code = await new_unique_code(self.store, self.claims)
@@ -183,4 +209,89 @@ class CourseProvisioner:
         from synapse.logging.context import run_in_background
 
         run_in_background(self.notifier.notify, room, user)
+        return room
+
+    async def claim_instructor(self, invitation, user, defer_to_concurrent=False):
+        """An additional-instructor invitation: grant instructor rights in the
+        existing course and nothing more. No room is provisioned, no class
+        code minted, no join rule touched, no ownership transferred and no
+        share kit owed (knock-with-code.instructions.md, "Codes, share kit and
+        existing courses")."""
+        room = invitation["room_id"]
+        if not room:
+            # Every instructor invitation names its room when prepared; a row
+            # without one is a server fault, not a nonexistent code.
+            raise recovery_required()
+        state = await self.api.get_room_state(room)
+        member = state.get(("m.room.member", user))
+        membership = member.content.get("membership") if member else None
+        # Bans and blocks are preserved, and a block is never revealed: the
+        # same answer as a code that does not exist (blocked-join-gate).
+        if membership == "ban" or (
+            self.blocked_join_gate_enabled
+            and await is_blocked_by_room_admin(self.api, room, user)
+        ):
+            raise unavailable()
+
+        read_as_prepared = invitation["status"] == "prepared"
+        invitation, create = await self.invitations.reserve_creation(
+            invitation["invitation_id"], user
+        )
+        if invitation["status"] == "completed":
+            if not await self.authorized(invitation, user):
+                raise unavailable()
+            return room
+        if defer_to_concurrent and read_as_prepared and not create:
+            return None
+        if (
+            not create
+            and not is_joined_instructor(state, user)
+            and await was_previously_admin(self.api, room, user)
+        ):
+            # Resuming a partial grant whose rights were since withdrawn: a
+            # demotion or removal wins, and is never undone by the old code.
+            raise recovery_required()
+        if not is_joined_instructor(state, user):
+            senders = joined_local_instructors(self.api, state)
+            if not senders:
+                raise recovery_required()
+            inviter = senders[0]
+            if membership != "join":
+                if membership != "invite":
+                    await self.api.update_room_membership(
+                        sender=inviter,
+                        target=user,
+                        room_id=room,
+                        new_membership="invite",
+                    )
+                await self.api.update_room_membership(
+                    sender=user, target=user, room_id=room, new_membership="join"
+                )
+                state = await self.api.get_room_state(room)
+            power = state.get(("m.room.power_levels", ""))
+            # Event content arrives as Synapse's immutable mapping, which cannot be
+            # deep-copied (pickle refuses it); rebuild it as plain dicts instead.
+            content = _plain(power.content) if power else {}
+            users = dict(content.get("users", {}))
+            if users.get(user, content.get("users_default", 0)) < 100:
+                users[user] = 100
+                content["users"] = users
+                await self.api.create_and_send_event_into_room(
+                    {
+                        "type": "m.room.power_levels",
+                        "room_id": room,
+                        "sender": inviter,
+                        "state_key": "",
+                        "content": content,
+                    }
+                )
+            state = await self.api.get_room_state(room)
+            if not is_joined_instructor(state, user):
+                raise recovery_required()
+        await self.invitations.complete_instructor(
+            invitation["invitation_id"],
+            user,
+            room,
+            self.api._hs.get_clock().time_msec(),
+        )
         return room

@@ -8,9 +8,12 @@ import copy
 import json
 import os
 import socket
+import subprocess
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -47,6 +50,7 @@ class TestNoticeDeliveryCMS(BaseSynapseE2ETest):
                 "app_base_url": "http://127.0.0.1/app",
             },
             synapse_config_overrides={
+                "rc_presence": {"per_user": {"per_second": 10, "burst_count": 10}},
                 "public_baseurl": self.server_url,
                 "listeners": [
                     {
@@ -247,6 +251,419 @@ class TestNoticeDeliveryCMS(BaseSynapseE2ETest):
             self.assertEqual(len(smtp.received_emails), 1)
             print(
                 f"100 local in-app decisions and CMS records, concurrency 5: {time.monotonic() - begin:.2f}s"
+            )
+
+            # Refill the configured admin burst after the bounded batch above.
+            time.sleep(2)
+            scheduled = request_body("email-only")
+            del scheduled["notice_event_id"]
+            scheduled.update(
+                user_id=uid,
+                notice_room_id=room,
+                sender_id="@admin:my.domain.name",
+                notice_content={
+                    "body": "Scheduled activity",
+                    "check_in_type": "do_activity",
+                },
+                scheduled_at=datetime.fromtimestamp(
+                    time.time() + 20, timezone.utc
+                ).isoformat(),
+            )
+            scheduled["log"]["run"]["run_id"] = (
+                "notice-228-integration-scheduled-" + uuid.uuid4().hex
+            )
+            image_url = "https://content.pangea.chat/media/example-activity.jpg"
+            scheduled["email"]["html"] = env.get_template("notice_email.html").render(
+                title="Scheduled activity",
+                body="A course and activity for you",
+                images=[{"url": image_url, "alt": "Activity cover"}],
+                cta_label="Open activity",
+                cta_url="{{cta_url}}",
+                unsubscribe_url="{{unsubscribe_url}}",
+                postal_address="{{postal_address}}",
+                receiving_reason="{{receiving_reason}}",
+            )
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                accepted = list(
+                    pool.map(
+                        lambda _: requests.post(
+                            url, headers=headers, json=scheduled, timeout=20
+                        ),
+                        range(5),
+                    )
+                )
+            self.assertTrue(
+                all(r.status_code == 202 for r in accepted), [r.text for r in accepted]
+            )
+            self.assertEqual(len({r.json()["schedule_id"] for r in accepted}), 1)
+            schedule_id = accepted[0].json()["schedule_id"]
+
+            def notice_events():
+                response = requests.get(
+                    f"{self.server_url}/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=100",
+                    headers=headers,
+                    timeout=20,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                return [
+                    e for e in response.json()["chunk"] if e["type"] == "p.room.notice"
+                ]
+
+            self.assertEqual(len(notice_events()), 1)
+            self.assertEqual(len(smtp.received_emails), 1)
+            status_url = url + "?schedule_id=" + schedule_id
+            self.assertEqual(
+                requests.get(
+                    status_url,
+                    headers={"Authorization": f"Bearer {alice_token}"},
+                    timeout=20,
+                ).status_code,
+                403,
+            )
+
+            # Restart the actual Synapse process with the same PostgreSQL DB.
+            args = process.args
+            process.terminate()
+            process.wait(timeout=20)
+            stdout.join(timeout=5)
+            stderr.join(timeout=5)
+            restart_log = tempfile.TemporaryFile(mode="w+")
+            self.addCleanup(restart_log.close)
+            process = subprocess.Popen(
+                args,
+                cwd=directory,
+                stdout=restart_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            deadline = time.monotonic() + 40
+            final = None
+            while time.monotonic() < deadline:
+                try:
+                    response = requests.get(status_url, headers=headers, timeout=2)
+                # silent-ok: connection refusal is expected during restart;
+                # the bounded poll fails its final assertion if startup fails.
+                except requests.ConnectionError:
+                    time.sleep(0.2)
+                    continue
+                self.assertEqual(response.status_code, 200, response.text)
+                final = response.json()
+                if final["status"] == "complete":
+                    break
+                time.sleep(0.2)
+            self.assertIsNotNone(final)
+            self.assertEqual(final["status"], "complete", final)
+            self.assertEqual(final["result"]["channel"], "email", final)
+            self.assertEqual(final["result"]["log_status"], "complete", final)
+            self.assertEqual(len(notice_events()), 2)
+            self.assertEqual(len(smtp.received_emails), 2)
+            delivered_event = next(
+                e
+                for e in notice_events()
+                if e["event_id"] == final["result"]["notice_event_id"]
+            )
+            self.assertGreaterEqual(
+                delivered_event["origin_server_ts"],
+                accepted[0].json()["scheduled_at_ms"],
+            )
+            self.assertEqual(
+                delivered_event["content"]["pangea.schedule_id"], schedule_id
+            )
+            persisted = requests.get(
+                f'{cms["url"]}/api/notification-log/{final["result"]["notification_log_id"]}',
+                headers=cms_headers,
+                timeout=20,
+            )
+            self.assertEqual(persisted.status_code, 200, persisted.text)
+            self.assertEqual(
+                persisted.json()["decision"]["notice_event_id"],
+                final["result"]["notice_event_id"],
+            )
+            message = BytesParser(policy=policy.default).parsebytes(
+                smtp.received_emails[1]["data"].removesuffix(".\r\n").encode()
+            )
+            html = message.get_body(preferencelist=("html",)).get_content()
+            self.assertIn(image_url, html)
+            self.assertIn('alt="Activity cover"', html)
+            self.assertIn("NSF.png", html)
+            links = Links()
+            links.feed(html)
+            scheduled_cta = next(link for link in links.urls if "/pangea/v1/n?" in link)
+            clicked = requests.get(scheduled_cta, allow_redirects=False, timeout=20)
+            self.assertEqual(clicked.status_code, 302)
+            self.assertTrue(clicked.headers["Location"].endswith("/app/activity-1"))
+            opened = requests.get(
+                f"{self.server_url}/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=100",
+                headers=headers,
+                timeout=20,
+            ).json()["chunk"]
+            self.assertTrue(
+                any(
+                    e["type"] == "p.room.notice.opened"
+                    and e["content"]["notification_event_id"]
+                    == final["result"]["notice_event_id"]
+                    for e in opened
+                )
+            )
+            self.assertIn(
+                "Open http://",
+                message.get_body(preferencelist=("plain",)).get_content(),
+            )
+            retry = requests.post(url, headers=headers, json=scheduled, timeout=20)
+            self.assertEqual(retry.status_code, 202, retry.text)
+            self.assertTrue(retry.json()["duplicate"])
+            self.assertEqual(len(notice_events()), 2)
+            self.assertEqual(len(smtp.received_emails), 2)
+
+            # Change eligibility after enqueue against real account data and
+            # room membership, rather than only mocking the final read.
+            def scheduled_case(
+                name,
+                change,
+                expected_channel,
+                expected_reason=None,
+                method="use-available",
+            ):
+                payload = copy.deepcopy(scheduled)
+                payload["delivery_method"] = method
+                payload["log"]["run"]["run_id"] = (
+                    "notice-228-integration-" + name + "-" + uuid.uuid4().hex
+                )
+                payload["scheduled_at"] = datetime.fromtimestamp(
+                    time.time() + 8, timezone.utc
+                ).isoformat()
+                before_events = len(notice_events())
+                before_emails = len(smtp.received_emails)
+                queued = requests.post(url, headers=headers, json=payload, timeout=20)
+                self.assertEqual(queued.status_code, 202, queued.text)
+                change()
+                deadline = time.monotonic() + 25
+                while time.monotonic() < deadline:
+                    checked = requests.get(
+                        url + "?schedule_id=" + queued.json()["schedule_id"],
+                        headers=headers,
+                        timeout=20,
+                    )
+                    self.assertEqual(checked.status_code, 200, checked.text)
+                    if checked.json()["status"] == "complete":
+                        break
+                    time.sleep(0.3)
+                self.assertEqual(checked.json()["status"], "complete", checked.text)
+                outcome = checked.json()["result"]
+                self.assertEqual(outcome["channel"], expected_channel, outcome)
+                if expected_reason:
+                    self.assertEqual(outcome["reason"], expected_reason)
+                self.assertEqual(len(smtp.received_emails), before_emails)
+                self.assertEqual(
+                    len(notice_events()),
+                    before_events + (1 if expected_channel == "in_app" else 0),
+                )
+                print(f"Scheduled {name}: {expected_channel}; no email")
+
+            alice_headers = {"Authorization": f"Bearer {alice_token}"}
+
+            def put_alice(path, value):
+                response = requests.put(
+                    self.server_url + path,
+                    headers=alice_headers,
+                    json=value,
+                    timeout=20,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+
+            preferences_path = f"/_matrix/client/v3/user/{uid}/account_data/pangea.communication_preferences"
+            scheduled_case(
+                "preference-change",
+                lambda: put_alice(preferences_path, {"all_off": True}),
+                "refused",
+            )
+            put_alice(preferences_path, {})
+            scheduled_case(
+                "active-at-send",
+                lambda: put_alice(
+                    f"/_matrix/client/v3/presence/{uid}/status", {"presence": "online"}
+                ),
+                "in_app",
+            )
+
+            scheduled["eligibility"] = {"recipient_not_returned": True}
+            scheduled_case(
+                "returned-at-send",
+                lambda: put_alice(
+                    f"/_matrix/client/v3/presence/{uid}/status", {"presence": "online"}
+                ),
+                "none",
+                "recipient_returned",
+            )
+            scheduled["eligibility"] = {"min_contact_spacing_ms": 86400000}
+            scheduled_case("recent-contact", lambda: None, "none", "contact_spacing")
+
+            def put_state(kind, value):
+                response = requests.put(
+                    f"{self.server_url}/_matrix/client/v3/rooms/{room}/state/{kind}",
+                    headers=headers,
+                    json=value,
+                    timeout=20,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+
+            put_state(
+                "pangea.activity_plan",
+                {"activity_id": "activity-1", "roles": [{"role_id": "one"}]},
+            )
+            scheduled["eligibility"] = {"activity_not_started": True}
+            scheduled_case(
+                "activity-started",
+                lambda: put_state(
+                    "pangea.activity_roles", {"roles": {"one": {"user_id": uid}}}
+                ),
+                "none",
+                "activity_already_started",
+            )
+            scheduled["eligibility"] = {"session_available": True}
+            scheduled["session_room_id"] = room
+            scheduled_case("full-session", lambda: None, "none", "session_full")
+            scheduled_case(
+                "unknown-plan",
+                lambda: put_state(
+                    "pangea.activity_plan",
+                    {
+                        "activity_id": "activity-1",
+                        "version_id": "00000000-0000-0000-0000-000000000000",
+                    },
+                ),
+                "none",
+                "eligibility_unavailable",
+            )
+            put_state(
+                "pangea.activity_plan",
+                {"activity_id": "activity-1", "roles": [{"role_id": "one"}]},
+            )
+            put_state("pangea.activity_roles", {"roles": {}})
+            # Use a real canonical plan in the seeded local CMS. Verify both
+            # reference forms through the real REST boundary, not a mock.
+            page = 1
+            plan_doc = None
+            while plan_doc is None:
+                plans = requests.get(
+                    cms["url"] + "/api/activities-v2",
+                    headers=cms_headers,
+                    params={
+                        "where[req.source_request_hash][exists]": "false",
+                        "limit": 20,
+                        "page": page,
+                        "depth": 0,
+                    },
+                    timeout=20,
+                )
+                self.assertEqual(plans.status_code, 200, plans.text)
+                plan_doc = next(
+                    (
+                        d
+                        for d in plans.json()["docs"]
+                        if d.get("res", {}).get("plan", {}).get("roles")
+                    ),
+                    None,
+                )
+                if plan_doc is not None or not plans.json()["hasNextPage"]:
+                    break
+                page += 1
+            self.assertIsNotNone(
+                plan_doc, "Seed local CMS with a role-bearing canonical activity"
+            )
+            plan_id = plan_doc["res"]["plan"]["activity_id"]
+            versions = requests.get(
+                cms["url"] + "/api/activities-v2/versions",
+                headers=cms_headers,
+                params={
+                    "where[parent][equals]": plan_doc["id"],
+                    "limit": 1,
+                    "depth": 0,
+                },
+                timeout=20,
+            )
+            self.assertEqual(versions.status_code, 200, versions.text)
+            self.assertTrue(versions.json()["docs"])
+            scheduled["activity_id"] = plan_id
+            for reference in (
+                {"activity_id": plan_id},
+                {
+                    "activity_id": plan_id,
+                    "version_id": versions.json()["docs"][0]["id"],
+                },
+            ):
+                scheduled_case(
+                    "cms-plan-reference",
+                    lambda: put_state("pangea.activity_plan", reference),
+                    "in_app",
+                    method="in-app-only",
+                )
+            scheduled["activity_id"] = "activity-1"
+            put_state(
+                "pangea.activity_plan",
+                {"activity_id": "activity-1", "roles": [{"role_id": "one"}]},
+            )
+            del scheduled["session_room_id"]
+            saved_room = requests.post(
+                f"{self.server_url}/_matrix/client/v3/createRoom",
+                headers=alice_headers,
+                json={
+                    "preset": "private_chat",
+                    "initial_state": [
+                        {
+                            "type": "pangea.activity_room_ids",
+                            "state_key": "",
+                            "content": {"room_ids": [room]},
+                        }
+                    ],
+                },
+                timeout=20,
+            )
+            self.assertEqual(saved_room.status_code, 200, saved_room.text)
+            scheduled["eligibility"] = {"activity_not_started": True}
+            scheduled_case(
+                "saved-completion", lambda: None, "none", "activity_already_completed"
+            )
+            del scheduled["eligibility"]
+
+            cancelled_body = copy.deepcopy(scheduled)
+            cancelled_body["log"]["run"]["run_id"] += "-cancelled"
+            cancelled_body["scheduled_at"] = datetime.fromtimestamp(
+                time.time() + 8, timezone.utc
+            ).isoformat()
+            queued = requests.post(
+                url, headers=headers, json=cancelled_body, timeout=20
+            )
+            self.assertEqual(queued.status_code, 202, queued.text)
+            cancel_url = url + "?schedule_id=" + queued.json()["schedule_id"]
+            self.assertEqual(
+                requests.delete(
+                    cancel_url, headers=alice_headers, timeout=20
+                ).status_code,
+                403,
+            )
+            for _ in range(2):
+                cancelled = requests.delete(cancel_url, headers=headers, timeout=20)
+                self.assertEqual(cancelled.status_code, 200, cancelled.text)
+                self.assertEqual(cancelled.json()["status"], "cancelled")
+            before_cancel_events = len(notice_events())
+
+            def leave():
+                response = requests.post(
+                    f"{self.server_url}/_matrix/client/v3/rooms/{room}/leave",
+                    headers=alice_headers,
+                    json={},
+                    timeout=20,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+
+            scheduled_case(
+                "membership-change", leave, "none", "scheduled_target_ineligible"
+            )
+            self.assertEqual(len(notice_events()), before_cancel_events)
+            self.assertEqual(
+                requests.get(cancel_url, headers=headers, timeout=20).json()["status"],
+                "cancelled",
             )
         finally:
             self.stop_synapse(

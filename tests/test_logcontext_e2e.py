@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from .base_e2e import BaseSynapseE2ETest
+from .base_e2e import BaseSynapseE2ETest, Homeserver
 from .mock_moderation_server import FLAG_MARKER, MockModerationServer
 
 # `Background process re-entered without a proc` is added to the two markers
@@ -64,64 +64,56 @@ LEAK_MARKERS = (
 )
 
 
+def _leaks(homeserver: Homeserver) -> List[str]:
+    """Every leak-marker line the homeserver has written, its boot included.
+
+    Not `server_log()`, which starts once the server is up: the module
+    starts work with Synapse that runs before then (the safety-incident
+    startup run fires on the first reactor turn and finishes inside the
+    boot), and a context leaked there is reported there. Each class here
+    holds one test, which boots the class's homeserver, so all of its output
+    is that test's.
+    """
+    return [
+        line
+        for line in homeserver.stdout_lines + homeserver.stderr_lines
+        if any(marker in line for marker in LEAK_MARKERS)
+    ]
+
+
 class TestLogcontextLeak(BaseSynapseE2ETest):
     async def test_module_endpoints_do_not_leak_logcontext(self):
-        postgres = synapse_dir = config_path = None
-        server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse()
+        homeserver = await self.homeserver()
 
-            await self.register_user(
-                config_path, synapse_dir, "leakuser", "leakpass", admin=False
-            )
-            _, access_token = await self.login_user("leakuser", "leakpass")
-            headers = {"Authorization": f"Bearer {access_token}"}
+        _, access_token = await self.new_user("leakuser")
+        headers = {"Authorization": f"Bearer {access_token}"}
 
-            # One GET and one POST module endpoint, plus an auth-rejected
-            # request — pre-fix, all three leaked (the leak sits in the shared
-            # render plumbing, not any one handler).
-            requests.get(
-                f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
-                headers=headers,
-            )
-            requests.post(
-                f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
-                json={"access_code": "no-such-code"},
-                headers=headers,
-            )
-            requests.get(
-                f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
-            )
+        # One GET and one POST module endpoint, plus an auth-rejected
+        # request — pre-fix, all three leaked (the leak sits in the shared
+        # render plumbing, not any one handler).
+        requests.get(
+            f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
+            headers=headers,
+        )
+        requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/knock_with_code",
+            json={"access_code": "no-such-code"},
+            headers=headers,
+        )
+        requests.get(
+            f"{self.server_url}/_synapse/client/pangea/v1/public_courses",
+        )
 
-            # Let the server flush its log output through the reader threads.
-            await asyncio.sleep(2)
+        # Let the server flush its log output through the reader threads.
+        await asyncio.sleep(2)
 
-            leaked = [
-                line
-                for line in self.server_stdout_lines + self.server_stderr_lines
-                if any(marker in line for marker in LEAK_MARKERS)
-            ]
-            self.assertEqual(
-                leaked,
-                [],
-                "module requests leaked their logcontext to the reactor:\n"
-                + "\n".join(leaked),
-            )
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        leaked = _leaks(homeserver)
+        self.assertEqual(
+            leaked,
+            [],
+            "module requests leaked their logcontext to the reactor:\n"
+            + "\n".join(leaked),
+        )
 
 
 class _SlowSygnal:
@@ -172,82 +164,66 @@ class TestOutboundCallLogcontext(BaseSynapseE2ETest):
     which leaves the request's context on the reactor until Sygnal answers.
     """
 
+    sygnal: _SlowSygnal
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        # The homeserver's config points at it, so it lives as long as the
+        # class's homeserver.
+        cls.sygnal = _SlowSygnal(hold_seconds=1.5).start()
+        cls.addClassCleanup(cls.sygnal.stop)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sygnal.notifies = 0
+
     async def test_send_push_to_sygnal_does_not_leak_logcontext(self) -> None:
-        postgres = synapse_dir = config_path = None
-        server_process = stdout_thread = stderr_thread = None
-        sygnal = _SlowSygnal(hold_seconds=1.5).start()
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={"send_push_sygnal_url": sygnal.url}
-            )
+        homeserver = await self.homeserver(
+            module_config={"send_push_sygnal_url": self.sygnal.url}
+        )
 
-            await self.register_user(
-                config_path, synapse_dir, "alice", "pw", admin=False
-            )
-            await self.register_user(
-                config_path, synapse_dir, "admin", "pw", admin=True
-            )
-            _, alice_token = await self.login_user("alice", "pw")
-            _, admin_token = await self.login_user("admin", "pw")
+        alice_user_id, alice_token = await self.new_user("alice")
+        _, admin_token = await self.new_user("admin", admin=True)
 
-            pusher = requests.post(
-                f"{self.server_url}/_matrix/client/v3/pushers/set",
-                json={
-                    "kind": "http",
-                    "app_id": "com.talktolearn.chat",
-                    "app_display_name": "Pangea Chat",
-                    "device_display_name": "Test iPhone",
-                    "pushkey": "pushkey-1",
-                    "lang": "en",
-                    "data": {"url": sygnal.url},
-                },
-                headers={"Authorization": f"Bearer {alice_token}"},
-            )
-            self.assertEqual(pusher.status_code, 200, pusher.text)
+        pusher = requests.post(
+            f"{self.server_url}/_matrix/client/v3/pushers/set",
+            json={
+                "kind": "http",
+                "app_id": "com.talktolearn.chat",
+                "app_display_name": "Pangea Chat",
+                "device_display_name": "Test iPhone",
+                "pushkey": "pushkey-1",
+                "lang": "en",
+                "data": {"url": self.sygnal.url},
+            },
+            headers={"Authorization": f"Bearer {alice_token}"},
+        )
+        self.assertEqual(pusher.status_code, 200, pusher.text)
 
-            # Several held pushes, so the leaked windows add up to longer than
-            # Synapse's 5-second timers (client IPs, typing timeouts), which
-            # therefore fire inside one if the leak is there.
-            for _ in range(6):
-                response = requests.post(
-                    f"{self.server_url}/_synapse/client/pangea/v1/send_push",
-                    json={"user_id": "@alice:my.domain.name", "body": "Test"},
-                    headers={"Authorization": f"Bearer {admin_token}"},
-                )
-                self.assertEqual(response.status_code, 200, response.text)
-
-            # The outbound call ACTUALLY RAN; a push that never reached Sygnal
-            # has no leak window to test.
-            self.assertEqual(sygnal.notifies, 6)
-
-            await asyncio.sleep(2)
-            leaked = [
-                line
-                for line in self.server_stdout_lines + self.server_stderr_lines
-                if any(marker in line for marker in LEAK_MARKERS)
-            ]
-            self.assertEqual(
-                leaked,
-                [],
-                "send_push leaked its logcontext while awaiting Sygnal:\n"
-                + "\n".join(leaked),
+        # Several held pushes, so the leaked windows add up to longer than
+        # Synapse's 5-second timers (client IPs, typing timeouts), which
+        # therefore fire inside one if the leak is there.
+        for _ in range(6):
+            response = requests.post(
+                f"{self.server_url}/_synapse/client/pangea/v1/send_push",
+                json={"user_id": alice_user_id, "body": "Test"},
+                headers={"Authorization": f"Bearer {admin_token}"},
             )
-        finally:
-            sygnal.stop()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        # The outbound call ACTUALLY RAN; a push that never reached Sygnal
+        # has no leak window to test.
+        self.assertEqual(self.sygnal.notifies, 6)
+
+        await asyncio.sleep(2)
+        leaked = _leaks(homeserver)
+        self.assertEqual(
+            leaked,
+            [],
+            "send_push leaked its logcontext while awaiting Sygnal:\n"
+            + "\n".join(leaked),
+        )
 
 
 class TestModerationLogcontext(BaseSynapseE2ETest):
@@ -288,151 +264,116 @@ class TestModerationLogcontext(BaseSynapseE2ETest):
             time.sleep(0.5)
         self.fail(f"event {event_id} was never redacted")
 
-    def _leaks(self) -> List[str]:
-        return [
-            line
-            for line in self.server_stdout_lines + self.server_stderr_lines
-            if any(marker in line for marker in LEAK_MARKERS)
-        ]
-
     async def test_tier2_traffic_and_shutdown_do_not_leak_logcontext(self) -> None:
-        postgres = synapse_dir = config_path = None
-        server_process = stdout_thread = stderr_thread = None
+        # Per test rather than per class: the test stops the homeserver
+        # itself, so the server never outlives it, and it leaves the mock
+        # holding every answer.
         mock_moderation = MockModerationServer().start()
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "moderation": {
-                        "tier1_enabled": True,
-                        "tier2_enabled": True,
-                        "choreo_base_url": mock_moderation.base_url,
-                        "choreo_access_token": "syt_mock_service_token",
-                        # More messages than workers, so the queue is really
-                        # used and a worker really parks and is really woken -
-                        # a pool big enough to never park would test nothing.
-                        "tier2_workers": 2,
-                        "tier2_queue_size": 8,
-                        # Short, so the supervisor fires several times during
-                        # the run rather than never.
-                        "tier2_supervisor_interval_seconds": 1.0,
-                    },
+        self.addCleanup(mock_moderation.stop)
+        homeserver = await self.homeserver(
+            module_config={
+                "moderation": {
+                    "tier1_enabled": True,
+                    "tier2_enabled": True,
+                    "choreo_base_url": mock_moderation.base_url,
+                    "choreo_access_token": "syt_mock_service_token",
+                    # More messages than workers, so the queue is really
+                    # used and a worker really parks and is really woken -
+                    # a pool big enough to never park would test nothing.
+                    "tier2_workers": 2,
+                    "tier2_queue_size": 8,
+                    # Short, so the supervisor fires several times during
+                    # the run rather than never.
+                    "tier2_supervisor_interval_seconds": 1.0,
                 },
-                # Synapse's own per-user message limiter, relaxed so the
-                # burst below reaches the moderation queue instead of being
-                # turned away at the door. It is the moderation queue's
-                # backpressure this test is about, not Synapse's.
-                synapse_config_overrides={
-                    "rc_message": {"per_second": 1000, "burst_count": 1000}
-                },
-            )
+            },
+            # Synapse's own per-user message limiter, relaxed so the
+            # burst below reaches the moderation queue instead of being
+            # turned away at the door. It is the moderation queue's
+            # backpressure this test is about, not Synapse's.
+            synapse_config_overrides={
+                "rc_message": {"per_second": 1000, "burst_count": 1000}
+            },
+        )
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="leaklearner",
-                password="p4ssword!",
-                admin=False,
-            )
-            _user_id, token = await self.login_user("leaklearner", "p4ssword!")
-            room_id = await self.create_private_room(token)
+        _user_id, token = await self.new_user("leaklearner")
+        room_id = await self.create_private_room(token)
 
-            # Enough traffic to fill the queue, park workers, wake them, and
-            # overflow - all four are paths with their own handoff.
-            flagged_event_id = None
-            for index in range(25):
-                body = (
-                    "buenos dias, como estas" if index % 5 else f"awful {FLAG_MARKER}"
-                )
-                response = self._send(room_id, token, body, f"txn-leak-{index}")
-                self.assertEqual(response.status_code, 200, response.text)
-                if index % 5 == 0:
-                    flagged_event_id = response.json()["event_id"]
+        # Enough traffic to fill the queue, park workers, wake them, and
+        # overflow - all four are paths with their own handoff.
+        flagged_event_id = None
+        for index in range(25):
+            body = "buenos dias, como estas" if index % 5 else f"awful {FLAG_MARKER}"
+            response = self._send(room_id, token, body, f"txn-leak-{index}")
+            self.assertEqual(response.status_code, 200, response.text)
+            if index % 5 == 0:
+                flagged_event_id = response.json()["event_id"]
 
-            assert flagged_event_id is not None
-            # Moderation ACTUALLY RAN. Without this the leak assertion below
-            # passes just as well against a pool of dead workers.
-            self._wait_for_redaction(room_id, flagged_event_id, token)
-            self.assertTrue(
-                mock_moderation.seen_texts,
-                "the moderation endpoint was never called",
-            )
-            flagged_count = len(mock_moderation.seen_texts)
+        assert flagged_event_id is not None
+        # Moderation ACTUALLY RAN. Without this the leak assertion below
+        # passes just as well against a pool of dead workers.
+        self._wait_for_redaction(room_id, flagged_event_id, token)
+        self.assertTrue(
+            mock_moderation.seen_texts,
+            "the moderation endpoint was never called",
+        )
+        flagged_count = len(mock_moderation.seen_texts)
 
-            await asyncio.sleep(2)
-            self.assertEqual(
-                self._leaks(),
-                [],
-                "tier 2 traffic leaked a logcontext:\n" + "\n".join(self._leaks()),
-            )
+        await asyncio.sleep(2)
+        self.assertEqual(
+            _leaks(homeserver),
+            [],
+            "tier 2 traffic leaked a logcontext:\n" + "\n".join(_leaks(homeserver)),
+        )
 
-            # Now put work GENUINELY in flight and stop the server underneath
-            # it. Without this the mock answers instantly, the pool is idle by
-            # the time the server stops, and the drain - the thing this half of
-            # the test claims to cover - never runs at all.
-            mock_moderation.hold_responses_for(20.0)
-            for index in range(20):
-                response = self._send(
-                    room_id, token, f"awful {FLAG_MARKER}", f"txn-drain-{index}"
-                )
-                self.assertEqual(response.status_code, 200, response.text)
-            await asyncio.sleep(1)
-            self.assertGreater(
-                len(mock_moderation.seen_texts),
-                flagged_count,
-                "no check was in flight, so the drain is not being exercised",
+        # Now put work GENUINELY in flight and stop the server underneath
+        # it. Without this the mock answers instantly, the pool is idle by
+        # the time the server stops, and the drain - the thing this half of
+        # the test claims to cover - never runs at all.
+        mock_moderation.hold_responses_for(20.0)
+        for index in range(20):
+            response = self._send(
+                room_id, token, f"awful {FLAG_MARKER}", f"txn-drain-{index}"
             )
+            self.assertEqual(response.status_code, 200, response.text)
+        await asyncio.sleep(1)
+        self.assertGreater(
+            len(mock_moderation.seen_texts),
+            flagged_count,
+            "no check was in flight, so the drain is not being exercised",
+        )
 
-            # Shutdown wakes parked workers, fires the drain's waiter and
-            # cancels its deadline, which is three more handoffs - and this is
-            # the window in which the 1.159 clock refuses new calls and
-            # cancels the ones it is tracking, so it is where a supervisor or
-            # a drain that scheduled work unconditionally would produce
-            # "Looping call died".
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-            )
-            server_process = stdout_thread = stderr_thread = None
-            self.assertEqual(
-                self._leaks(),
-                [],
-                "shutdown leaked a logcontext:\n" + "\n".join(self._leaks()),
-            )
-            # And the drain RAN. Leak strings are an absence assertion: they
-            # are satisfied just as well by a shutdown handler that was never
-            # registered, or one that returned immediately - in which case
-            # this half of the test proves nothing about the code it names.
-            # The dispatcher says what it did on the way down, so that line is
-            # the evidence.
-            log = "\n".join(self.server_stdout_lines + self.server_stderr_lines)
-            self.assertIn(
-                "tier2 moderation shutting down with",
-                log,
-                "the shutdown handler never ran, so the drain is untested",
-            )
-            # And it RAN TO THE END. The line above proves only that the
-            # handler was entered; a `shutdown` that returned immediately -
-            # registering no waiter, arming no deadline, abandoning nothing -
-            # would satisfy it while removing everything the drain does.
-            self.assertIn(
-                "tier2 moderation drain finished",
-                log,
-                "the drain was entered but never completed",
-            )
-        finally:
-            mock_moderation.stop()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Shutdown wakes parked workers, fires the drain's waiter and
+        # cancels its deadline, which is three more handoffs - and this is
+        # the window in which the 1.159 clock refuses new calls and
+        # cancels the ones it is tracking, so it is where a supervisor or
+        # a drain that scheduled work unconditionally would produce
+        # "Looping call died". Stopping the class's homeserver (SIGTERM,
+        # then waiting for it and its output) is the shutdown under test.
+        self.stop_homeserver()
+        self.assertEqual(
+            _leaks(homeserver),
+            [],
+            "shutdown leaked a logcontext:\n" + "\n".join(_leaks(homeserver)),
+        )
+        # And the drain RAN. Leak strings are an absence assertion: they
+        # are satisfied just as well by a shutdown handler that was never
+        # registered, or one that returned immediately - in which case
+        # this half of the test proves nothing about the code it names.
+        # The dispatcher says what it did on the way down, so that line is
+        # the evidence.
+        log = "\n".join(self.server_log())
+        self.assertIn(
+            "tier2 moderation shutting down with",
+            log,
+            "the shutdown handler never ran, so the drain is untested",
+        )
+        # And it RAN TO THE END. The line above proves only that the
+        # handler was entered; a `shutdown` that returned immediately -
+        # registering no waiter, arming no deadline, abandoning nothing -
+        # would satisfy it while removing everything the drain does.
+        self.assertIn(
+            "tier2 moderation drain finished",
+            log,
+            "the drain was entered but never completed",
+        )

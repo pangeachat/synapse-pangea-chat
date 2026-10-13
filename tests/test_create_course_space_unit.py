@@ -228,9 +228,12 @@ class TestClaimEmailTemplates(unittest.TestCase):
                 self.assertIn("Spanish 1", out)
                 self.assertNotIn("class code", out.lower())
 
-    def test_only_a_prepared_invitation_says_signing_in_claims_it(self) -> None:
-        """A room-backed course is claimed only by its link, so its email must
-        not promise that signing in with the address claims it."""
+    def test_course_ready_carries_only_the_link_and_says_the_tap_leads_to_sign_in(
+        self,
+    ) -> None:
+        """No printed code and no store badges (decided 2026-10-09): the link is
+        the only claim path in mail, and the email says the tap leads to
+        sign-up or log-in so an app-less teacher is not surprised."""
         env = self._env()
         for name in ("course_ready.html", "course_ready.txt"):
             for claims_by_address in (True, False):
@@ -245,23 +248,51 @@ class TestClaimEmailTemplates(unittest.TestCase):
                         claims_by_address=claims_by_address,
                     )
                     words = " ".join(out.split())
-                    self.assertEqual(
-                        "sign in with this address" in words, claims_by_address
-                    )
-                    # Signing in claims the course, so the code is only for
-                    # a different address; without that, every app-first
-                    # teacher needs it.
-                    self.assertEqual(
-                        "Signing in with a different address?" in words,
-                        claims_by_address,
-                    )
-                    self.assertEqual(
-                        "If you install the app before you open your course" in words,
-                        not claims_by_address,
-                    )
-                    self.assertIn(
-                        "adm1nab", out.replace("https://app.pangea.chat/adm1nab", "")
-                    )
+                    self.assertIn("sign up or log in", words)
+                    without_link = out.replace("https://app.pangea.chat/adm1nab", "")
+                    self.assertNotIn("adm1nab", without_link)
+                    self.assertNotIn("course code", words.lower())
+                    self.assertNotIn("apps.apple.com", out)
+                    self.assertNotIn("play.google.com", out)
+
+    def test_course_ready_is_the_canonical_quest_card(self) -> None:
+        """Parity with notices/course_invite/teacher_invite.md in the engagement
+        repo: the cover when the request carried one, the title and the
+        "Start my quest" button inside the card, one medium per email, and the
+        re-tap line for a teacher who installed the app first."""
+        env = self._env()
+        for image in ("https://cdn.example/cover.jpg", ""):
+            with self.subTest(image=bool(image)):
+                html = env.get_template("course_ready.html").render(
+                    app_name="Pangea Chat",
+                    course_title="Spanish 1",
+                    course_description="Lessons 1 to 6",
+                    request_summary=None,
+                    claim_url="https://app.pangea.chat/adm1nab",
+                    course_image_url=image,
+                )
+                flat = " ".join(html.split())
+                self.assertIn("Your quest is ready", flat)
+                self.assertEqual(
+                    ('<img src="https://cdn.example/cover.jpg"' in html), bool(image)
+                )
+                self.assertNotIn("<video", html)
+                self.assertNotIn("youtube", html.lower())
+                card = html[html.index("<table") : html.index("</table>")]
+                self.assertIn("Spanish 1", card)
+                self.assertIn(">Start my quest</a>", card)
+                self.assertIn("Tap the button again after you sign in", flat)
+                self.assertNotIn("Open your course", flat)
+                text = env.get_template("course_ready.txt").render(
+                    app_name="Pangea Chat",
+                    course_title="Spanish 1",
+                    course_description="",
+                    request_summary=None,
+                    claim_url="https://app.pangea.chat/adm1nab",
+                    course_image_url=image,
+                )
+                self.assertIn("Start my quest:", text)
+                self.assertIn("Tap the link again after you sign in", text)
 
     def test_course_claimed_carries_class_link_and_claimer(self) -> None:
         env = self._env()
@@ -272,10 +303,15 @@ class TestClaimEmailTemplates(unittest.TestCase):
                     course_title="Spanish 1",
                     class_url="https://app.pangea.chat/cls4abc",
                     class_code="cls4abc",
+                    class_qr_src="cid:class-qr.1@host",
                 )
                 self.assertIn("https://app.pangea.chat/cls4abc", out)
                 self.assertIn("cls4abc", out)
                 self.assertNotIn("Apple Inc.", out)
+                if name.endswith(".html"):
+                    self.assertIn('src="cid:class-qr.1@host"', out)
+                else:
+                    self.assertNotIn("cid:", out)
 
     def test_html_escapes_request_text(self) -> None:
         out = (
@@ -294,13 +330,12 @@ class TestClaimEmailTemplates(unittest.TestCase):
         self.assertNotIn("<b>x</b>", out)
 
 
-class TestClaimEmailsPrintTheCode(unittest.IsolatedAsyncioTestCase):
-    """The first email and a reminder both print the claim code and link to
-    the stores: a store install does not carry the link, so a teacher who
-    installs the app first types the code (create-course-space.instructions.md).
-    """
+class TestClaimEmailsCarryOnlyTheLink(unittest.IsolatedAsyncioTestCase):
+    """The first email and a reminder carry the claim link and nothing else
+    that claims: no printed code, no store links, no badge trademark line
+    (decided 2026-10-09; create-course-space.instructions.md)."""
 
-    async def test_ready_and_reminder_print_the_code_and_store_links(self) -> None:
+    async def test_ready_and_reminder_print_no_code_and_no_store_links(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
 
         from synapse_pangea_chat.email_invite import course_claim_emails
@@ -317,7 +352,7 @@ class TestClaimEmailsPrintTheCode(unittest.IsolatedAsyncioTestCase):
         claim_url = "https://app.pangea.chat/adm1nab"
         claim_code = "adm1nab"
 
-        for claims_by_address in (False, True):
+        for image in ("", "https://cdn.example/cover.jpg"):
             await mailer.send_course_ready(
                 email_address="teacher@school.example",
                 course_title="Spanish 1",
@@ -325,7 +360,7 @@ class TestClaimEmailsPrintTheCode(unittest.IsolatedAsyncioTestCase):
                 request_summary=None,
                 claim_url=claim_url,
                 claim_code=claim_code,
-                claims_by_address=claims_by_address,
+                course_image_url=image,
             )
         await mailer.send_course_reminder(
             email_address="teacher@school.example",
@@ -337,33 +372,22 @@ class TestClaimEmailsPrintTheCode(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(send.await_count, 3)
+        self.assertEqual(
+            send.await_args_list[0].kwargs["subject"], "Your quest is ready: Spanish 1"
+        )
+        self.assertIn("cdn.example/cover.jpg", send.await_args_list[1].kwargs["html"])
+        self.assertNotIn("cdn.example", send.await_args_list[0].kwargs["html"])
         for sent in send.await_args_list:
             for part in ("html", "text"):
                 out = sent.kwargs[part]
-                with self.subTest(
-                    subject=sent.kwargs["subject"],
-                    part=part,
-                    sign_in_wording="sign in with this address" in out,
-                ):
+                with self.subTest(subject=sent.kwargs["subject"], part=part):
+                    self.assertIn(claim_url, out)
                     without_link = out.replace(claim_url, "")
-                    self.assertIn(claim_code, without_link)
-                    self.assertIn("course code", without_link)
-                    self.assertIn(course_claim_emails.APP_STORE_URL, out)
-                    self.assertIn(course_claim_emails.GOOGLE_PLAY_URL, out)
-                    if part == "html":
-                        self.assertIn(course_claim_emails.APP_STORE_BADGE_URL, out)
-                        self.assertIn(course_claim_emails.GOOGLE_PLAY_BADGE_URL, out)
-                        flat = " ".join(out.split())
-                        self.assertIn(
-                            "App Store is a trademark of Apple Inc., registered"
-                            " in the U.S. and other countries.",
-                            flat,
-                        )
-                        self.assertIn(
-                            "Google Play and the Google Play logo are"
-                            " trademarks of Google LLC.",
-                            flat,
-                        )
+                    self.assertNotIn(claim_code, without_link)
+                    self.assertNotIn("course code", without_link.lower())
+                    self.assertNotIn("apps.apple.com", out)
+                    self.assertNotIn("play.google.com", out)
+                    self.assertNotIn("trademark of Apple", out)
 
 
 class TestMailerBound(unittest.IsolatedAsyncioTestCase):
@@ -400,3 +424,149 @@ class TestMailerBound(unittest.IsolatedAsyncioTestCase):
             bounded.call_args.kwargs["timeout"],
             course_claim_emails.SEND_TIMEOUT_SECONDS,
         )
+
+
+class TestShareKitQrCode(unittest.IsolatedAsyncioTestCase):
+    """The share kit carries the class link's QR code as an inline image
+    (create-course-space.instructions.md): attached where the HTML asks for it,
+    and sent through Synapse's own mailer, whose internals are checked here
+    against the Synapse version the tests run."""
+
+    CLASS_URL = "https://app.pangea.chat/cls4abc"
+
+    def _mailer(self) -> tuple[Any, Any]:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from synapse.handlers.send_email import SendEmailHandler
+
+        from synapse_pangea_chat.email_invite import course_claim_emails
+
+        hs = MagicMock()
+        email_config = hs.config.email
+        email_config.email_notif_from = "%(app)s <noreply@pangea.example>"
+        email_config.email_smtp_host = "smtp.example"
+        email_config.email_smtp_port = 25
+        email_config.email_smtp_user = None
+        email_config.email_smtp_pass = None
+        email_config.require_transport_security = False
+        email_config.enable_smtp_tls = True
+        email_config.force_tls = False
+        email_config.email_tlsname = None
+        handler = SendEmailHandler(hs)
+        sendmail = AsyncMock()
+        handler._sendmail = sendmail  # type: ignore[method-assign]
+
+        env = TestClaimEmailTemplates._env()
+        api = MagicMock()
+        api._hs.config.email.email_app_name = "Pangea Chat"
+        api._hs.get_send_email_handler.return_value = handler
+        api.read_templates.side_effect = lambda names, custom_template_directory: [
+            env.get_template(name) for name in names
+        ]
+        return course_claim_emails.CourseClaimMailer(api), sendmail
+
+    async def _send_claimed(self, rendered: dict[str, str] | None) -> Any:
+        import email
+        from unittest.mock import patch
+
+        from synapse_pangea_chat.email_invite import course_claim_emails
+
+        mailer, sendmail = self._mailer()
+        with patch.object(
+            course_claim_emails,
+            "timeout_deferred",
+            side_effect=lambda deferred, timeout, clock: deferred,
+        ):
+            await mailer.send_course_claimed(
+                email_address="teacher@school.example",
+                course_title="Spanish 1",
+                class_url=self.CLASS_URL,
+                class_code="cls4abc",
+                rendered=rendered,
+            )
+        sendmail.assert_awaited_once()
+        args = sendmail.await_args.args
+        self.assertEqual(
+            args[1:5],
+            ("smtp.example", 25, "noreply@pangea.example", "teacher@school.example"),
+        )
+        return email.message_from_bytes(args[5])
+
+    def _assert_qr_attached(self, message: Any) -> None:
+        from synapse_pangea_chat.email_invite.course_claim_emails import class_qr_png
+
+        self.assertEqual(message.get_content_type(), "multipart/alternative")
+        plain, related = message.get_payload()
+        self.assertEqual(plain.get_content_type(), "text/plain")
+        self.assertEqual(related.get_content_type(), "multipart/related")
+        html_part, image = related.get_payload()
+        self.assertEqual(html_part.get_content_type(), "text/html")
+        self.assertEqual(image.get_content_type(), "image/png")
+        self.assertTrue(image["Content-Disposition"].startswith("inline"))
+        content_id = image["Content-ID"].strip("<>")
+        html = html_part.get_payload(decode=True).decode()
+        self.assertIn(f'src="cid:{content_id}"', html)
+        self.assertNotIn("{{class_qr}}", html)
+        # The image is the QR code of the link the email prints.
+        self.assertEqual(image.get_payload(decode=True), class_qr_png(self.CLASS_URL))
+        self.assertNotIn("cid:", plain.get_payload(decode=True).decode())
+        # The headers Synapse's own mailer sets.
+        self.assertEqual(message["From"], "Pangea Chat <noreply@pangea.example>")
+        self.assertEqual(message["To"], "teacher@school.example")
+        self.assertEqual(message["Auto-Submitted"], "auto-generated")
+        self.assertEqual(message["X-Auto-Response-Suppress"], "All")
+        self.assertIsNotNone(message["Message-ID"])
+        self.assertIsNotNone(message["Date"])
+
+    async def test_a_caller_kit_with_the_slot_carries_the_qr_code(self) -> None:
+        message = await self._send_claimed(
+            {
+                "subject": "Invite your students to Spanish 1",
+                "html": '<p><a href="{{class_url}}">{{class_code}}</a></p>'
+                '<img src="{{class_qr}}" width="200" height="200" alt="QR code">',
+                "text": "{{class_url}} {{class_code}}",
+            }
+        )
+        self.assertEqual(message["Subject"], "Invite your students to Spanish 1")
+        self._assert_qr_attached(message)
+
+    async def test_a_caller_kit_without_the_slot_sends_with_no_image(self) -> None:
+        """A kit stored before the slot existed still sends, through Synapse's
+        own mailer, with no image part."""
+        message = await self._send_claimed(
+            {
+                "subject": "Invite your students to Spanish 1",
+                "html": '<p><a href="{{class_url}}">{{class_code}}</a></p>',
+                "text": "{{class_url}} {{class_code}}",
+            }
+        )
+        self.assertEqual(message.get_content_type(), "multipart/alternative")
+        types = [part.get_content_type() for part in message.walk()]
+        self.assertEqual(types, ["multipart/alternative", "text/plain", "text/html"])
+        self.assertIn(
+            self.CLASS_URL, message.get_payload()[1].get_payload(decode=True).decode()
+        )
+
+    async def test_the_module_template_carries_the_qr_code(self) -> None:
+        message = await self._send_claimed(None)
+        self.assertEqual(message["Subject"], "Invite your students to Spanish 1")
+        self._assert_qr_attached(message)
+
+    def test_the_transport_the_mailer_borrows_takes_what_it_passes(self) -> None:
+        """``_sendmail`` is Synapse-internal: a rename or a changed keyword
+        fails here rather than in a claimed teacher's inbox."""
+        import inspect
+
+        from synapse.handlers import send_email
+
+        params = inspect.signature(send_email._sendmail).parameters
+        for name in (
+            "username",
+            "password",
+            "require_auth",
+            "require_tls",
+            "enable_tls",
+            "force_tls",
+            "tlsname",
+        ):
+            self.assertIn(name, params)
