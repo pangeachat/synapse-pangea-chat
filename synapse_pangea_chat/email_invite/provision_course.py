@@ -15,6 +15,10 @@ from synapse_pangea_chat.email_invite.course_invitations import (
     recovery_required,
     unavailable,
 )
+from synapse_pangea_chat.email_invite.course_missions import (
+    COURSE_MISSIONS_STATE_EVENT_TYPE,
+    CourseMissionsReader,
+)
 from synapse_pangea_chat.email_invite.create_course_space import (
     DEFAULT_SPACE_POWER_LEVELS,
 )
@@ -39,9 +43,18 @@ def _plain(value):
 
 class CourseProvisioner:
     def __init__(
-        self, api, invitations, claims, notifier, blocked_join_gate_enabled=True
+        self,
+        api,
+        invitations,
+        claims,
+        notifier,
+        *,
+        course_missions: CourseMissionsReader,
+        blocked_join_gate_enabled=True,
     ):
         self.api = api
+        # Builds the course copy, as for v1 create_course_space.
+        self.course_missions = course_missions
         self.invitations = invitations
         self.claims = claims
         self.notifier = notifier
@@ -143,6 +156,17 @@ class CourseProvisioner:
                     "content": {"require_analytics_access": True},
                 },
             ]
+            # The course copy. Optional: a failed read is logged and the
+            # course is created without it (create-course-space.instructions.md).
+            course_missions = await self.course_missions.read(spec["course_plan_id"])
+            if course_missions is not None:
+                initial.append(
+                    {
+                        "type": COURSE_MISSIONS_STATE_EVENT_TYPE,
+                        "state_key": "",
+                        "content": course_missions,
+                    }
+                )
             if spec.get("image_url"):
                 initial.append(
                     {
