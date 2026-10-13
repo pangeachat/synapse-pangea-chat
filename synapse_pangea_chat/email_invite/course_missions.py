@@ -28,9 +28,10 @@ from twisted.web.http_headers import Headers
 
 COURSE_MISSIONS_STATE_EVENT_TYPE = "pangea.course_missions"
 
-# The whole read is bounded: the caller waits on course creation, and a caller
-# that times out and retries would create a second course.
-FETCH_TIMEOUT_SECONDS = 10
+# The whole read (both CMS requests) is bounded: course creation and a claim
+# wait on it, and a caller that times out and retries a creation would make a
+# second course. A hung CMS costs at most this much.
+FETCH_TIMEOUT_SECONDS = 3
 # The course listing's own page size (choreo list_activity_plans_for_los).
 ACTIVITY_LIMIT = 200
 MAX_BODY_BYTES = 16_000_000
