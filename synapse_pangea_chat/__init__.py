@@ -1040,6 +1040,15 @@ class PangeaChat:
             if not send_push_sygnal_url.strip():
                 raise ValueError('Config "send_push_sygnal_url" must not be empty')
 
+        send_push_allowed_sygnal_urls = config.get("send_push_allowed_sygnal_urls", [])
+        if not isinstance(send_push_allowed_sygnal_urls, list) or not all(
+            isinstance(url, str) and url.strip()
+            for url in send_push_allowed_sygnal_urls
+        ):
+            raise ValueError(
+                'Config "send_push_allowed_sygnal_urls" must be a list of URLs'
+            )
+
         # --- notice_delivery config ---
         notice_email_enabled = config.get("notice_email_enabled", False)
         if not isinstance(notice_email_enabled, bool):
@@ -1481,6 +1490,7 @@ class PangeaChat:
             send_push_requests_per_burst=send_push_requests_per_burst,
             send_push_burst_duration_seconds=send_push_burst_duration_seconds,
             send_push_sygnal_url=send_push_sygnal_url,
+            send_push_allowed_sygnal_urls=send_push_allowed_sygnal_urls,
             notice_email_enabled=notice_email_enabled,
             notice_missed_message_unsubscribe_enabled=notice_missed_message_unsubscribe_enabled,
             notice_suppress_notice_push_rules=notice_suppress_notice_push_rules,

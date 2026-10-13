@@ -147,6 +147,8 @@ class PangeaChatConfig:
     send_push_requests_per_burst: int = 10
     send_push_burst_duration_seconds: int = 1
     send_push_sygnal_url: Optional[str] = None
+    # Other Sygnal URLs a device's pusher may name and be pushed through.
+    send_push_allowed_sygnal_urls: List[str] = attr.Factory(list)
 
     # --- notice_delivery config ---
     # Email is the fallback channel for notices when a person has no push
