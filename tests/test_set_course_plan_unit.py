@@ -15,9 +15,13 @@ from synapse_pangea_chat.set_course_plan.set_course_plan import (
     NOT_A_COURSE,
     UNCHANGED,
     UPDATE,
+    PlanUpdate,
     SetCoursePlan,
+    SetCoursePlanRequest,
     parse_request,
     plan_update,
+    planned_writes,
+    topic_content,
 )
 
 
@@ -69,25 +73,82 @@ class TestPlanUpdate(unittest.TestCase):
         self.assertEqual(update.content, {"uuid": "new", "l2": "es"})
 
 
+class TestPlannedWrites(unittest.TestCase):
+    _MOVE = PlanUpdate(UPDATE, "old", {"uuid": "new", "l2": "es"})
+
+    def test_a_move_writes_the_plan_then_name_then_topic(self) -> None:
+        writes = planned_writes(
+            self._MOVE, "pangea.course_plan", "Old title", "Old text", "New", "Text"
+        )
+
+        self.assertEqual(
+            writes,
+            [
+                ("pangea.course_plan", {"uuid": "new", "l2": "es"}),
+                ("m.room.name", {"name": "New"}),
+                ("m.room.topic", topic_content("Text")),
+            ],
+        )
+
+    def test_a_matching_name_or_topic_is_not_rewritten(self) -> None:
+        writes = planned_writes(
+            self._MOVE, "pangea.course_plan", "Teacher's name", "", "Teacher's name", ""
+        )
+
+        self.assertEqual([t for t, _ in writes], ["pangea.course_plan"])
+
+    def test_a_space_already_on_the_quest_can_still_be_renamed(self) -> None:
+        writes = planned_writes(
+            PlanUpdate(UNCHANGED, "new"), "pangea.course_plan", "Old", None, "New", ""
+        )
+
+        self.assertEqual(writes, [("m.room.name", {"name": "New"})])
+
+    def test_nothing_differs_nothing_written(self) -> None:
+        writes = planned_writes(
+            PlanUpdate(UNCHANGED, "new"),
+            "pangea.course_plan",
+            "New",
+            "Text",
+            "New",
+            "Text",
+        )
+
+        self.assertEqual(writes, [])
+
+    def test_topic_matches_synapse_create_room_shape(self) -> None:
+        self.assertEqual(
+            topic_content("Text"),
+            {"topic": "Text", "m.topic": {"m.text": [{"body": "Text"}]}},
+        )
+
+
 class TestParseRequest(unittest.TestCase):
     _VALID = {
         "room_id": "!space:pangea.chat",
         "quest_id": "new",
         "expected_quest_id": "old",
+        "title": "New title",
+        "description": "",
     }
 
     def test_valid_body(self) -> None:
         parsed, error = parse_request({**self._VALID, "dry_run": True})
 
         self.assertIsNone(error)
-        self.assertEqual(parsed, ("!space:pangea.chat", "new", "old", True))
+        self.assertEqual(
+            parsed,
+            SetCoursePlanRequest(
+                "!space:pangea.chat", "new", "old", "New title", "", True
+            ),
+        )
 
     def test_dry_run_defaults_to_false(self) -> None:
         parsed, error = parse_request(self._VALID)
 
         self.assertIsNone(error)
         assert parsed is not None
-        self.assertFalse(parsed[3])
+        self.assertFalse(parsed.dry_run)
 
     def test_invalid_bodies_are_refused(self) -> None:
         bad = [
@@ -98,6 +159,12 @@ class TestParseRequest(unittest.TestCase):
             {**self._VALID, "quest_id": "x" * 256},
             {k: v for k, v in self._VALID.items() if k != "expected_quest_id"},
             {**self._VALID, "dry_run": "yes"},
+            {k: v for k, v in self._VALID.items() if k != "title"},
+            {**self._VALID, "title": ""},
+            {**self._VALID, "title": "x" * 256},
+            {k: v for k, v in self._VALID.items() if k != "description"},
+            {**self._VALID, "description": None},
+            {**self._VALID, "description": "x" * 4097},
         ]
         for body in bad:
             with self.subTest(body=body):
@@ -109,7 +176,13 @@ class TestParseRequest(unittest.TestCase):
 class TestEndpointFailures(unittest.IsolatedAsyncioTestCase):
     """A refused write must not read as the operator's own auth failure."""
 
-    _BODY = {"room_id": "!space:test", "quest_id": "new", "expected_quest_id": "old"}
+    _BODY = {
+        "room_id": "!space:test",
+        "quest_id": "new",
+        "expected_quest_id": "old",
+        "title": "New title",
+        "description": "New text",
+    }
 
     def _endpoint(self) -> tuple[SetCoursePlan, MagicMock]:
         api = MagicMock()
@@ -119,8 +192,14 @@ class TestEndpointFailures(unittest.IsolatedAsyncioTestCase):
             )
         )
         api.is_user_admin = AsyncMock(return_value=True)
-        plan = SimpleNamespace(content={"uuid": "old", "l2": "es"})
-        api.get_room_state = AsyncMock(return_value={("pangea.course_plan", ""): plan})
+        api.get_room_state = AsyncMock(
+            return_value={
+                ("pangea.course_plan", ""): SimpleNamespace(
+                    content={"uuid": "old", "l2": "es"}
+                ),
+                ("m.room.name", ""): SimpleNamespace(content={"name": "Old title"}),
+            }
+        )
         api.create_and_send_event_into_room = AsyncMock()
         config = SimpleNamespace(course_plan_state_event_type=None)
         return SetCoursePlan(api, config), api  # type: ignore[arg-type]
@@ -147,7 +226,38 @@ class TestEndpointFailures(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, 409)
         self.assertEqual(body["errcode"], "M_FORBIDDEN")
+        self.assertEqual(body["written"], [])
         self.assertIn("@teacher:test", logs.output[0])
+
+    async def test_a_refusal_after_the_plan_landed_says_what_landed(self) -> None:
+        endpoint, api = self._endpoint()
+        api.create_and_send_event_into_room.side_effect = [
+            None,
+            AuthError(403, "You don't have permission to post that to the room"),
+        ]
+
+        with self.assertLogs(module.logger, level="ERROR"):
+            status, body = await self._post(endpoint)
+
+        self.assertEqual(status, 409)
+        self.assertEqual(body["written"], ["pangea.course_plan"])
+        self.assertEqual(body["refused"], "m.room.name")
+        self.assertEqual(api.create_and_send_event_into_room.await_count, 2)
+
+    async def test_a_full_move_writes_three_events_as_one_sender(self) -> None:
+        endpoint, api = self._endpoint()
+
+        status, body = await self._post(endpoint)
+
+        self.assertEqual(status, 200, body)
+        sent = [c.args[0] for c in api.create_and_send_event_into_room.await_args_list]
+        self.assertEqual(
+            [e["type"] for e in sent],
+            ["pangea.course_plan", "m.room.name", "m.room.topic"],
+        )
+        self.assertEqual({e["sender"] for e in sent}, {"@teacher:test"})
+        self.assertEqual(body["previous_name"], "Old title")
+        self.assertIsNone(body["previous_topic"])
 
     async def test_a_bad_operator_token_is_still_unauthorized(self) -> None:
         endpoint, api = self._endpoint()

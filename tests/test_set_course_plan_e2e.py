@@ -33,12 +33,20 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
             headers=headers,
         )
 
-    def _create_course_space(self, access_token: str, plan: Dict[str, Any]) -> str:
+    def _create_course_space(
+        self,
+        access_token: str,
+        plan: Dict[str, Any],
+        name: str = "Old course",
+        topic: str = "Old text",
+    ) -> str:
         resp = requests.post(
             f"{self.server_url}/_matrix/client/v3/createRoom",
             json={
                 "visibility": "private",
                 "preset": "private_chat",
+                "name": name,
+                "topic": topic,
                 "creation_content": {"type": "m.space"},
                 "initial_state": [
                     {"type": _COURSE_PLAN, "state_key": "", "content": plan}
@@ -72,6 +80,8 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
             "room_id": space,
             "quest_id": "quest-new",
             "expected_quest_id": "quest-old",
+            "title": "New course",
+            "description": "New text",
         }
 
         # Only server admins may call it.
@@ -90,15 +100,22 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         self.assertEqual(resp.status_code, 409, resp.text)
         self.assertEqual(resp.json()["current_quest_id"], "quest-old")
 
-        # A dry run names the sender and writes nothing.
+        # A dry run names the sender, reports the current name and topic,
+        # and writes nothing.
+        all_three = [_COURSE_PLAN, "m.room.name", "m.room.topic"]
         resp = self._call({**switch, "dry_run": True}, admin_token)
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(resp.json()["sender"], teacher_id)
+        self.assertEqual(resp.json()["previous_name"], "Old course")
+        self.assertEqual(resp.json()["previous_topic"], "Old text")
+        self.assertEqual(resp.json()["changes"], all_three)
         self.assertFalse(resp.json()["changed"])
         state = self._admin_state(admin_token, space)
         self.assertEqual(state[(_COURSE_PLAN, "")]["content"]["uuid"], "quest-old")
+        self.assertEqual(state[("m.room.name", "")]["content"]["name"], "Old course")
 
-        # The real write: new quest, same language, sent as the teacher.
+        # The real write: new quest, same language, the quest's title and
+        # description, all sent as the teacher.
         resp = self._call(switch, admin_token)
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(
@@ -107,6 +124,9 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
                 "room_id": space,
                 "previous_quest_id": "quest-old",
                 "quest_id": "quest-new",
+                "previous_name": "Old course",
+                "previous_topic": "Old text",
+                "changes": all_three,
                 "sender": teacher_id,
                 "changed": True,
                 "dry_run": False,
@@ -116,6 +136,12 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         plan = after[(_COURSE_PLAN, "")]
         self.assertEqual(plan["content"], {"uuid": "quest-new", "l2": "es"})
         self.assertEqual(plan["sender"], teacher_id)
+        name = after[("m.room.name", "")]
+        self.assertEqual(name["content"], {"name": "New course"})
+        self.assertEqual(name["sender"], teacher_id)
+        topic = after[("m.room.topic", "")]["content"]
+        self.assertEqual(topic["topic"], "New text")
+        self.assertEqual(topic["m.topic"], {"m.text": [{"body": "New text"}]})
 
         # Nobody joined and nobody's power changed.
         self.assertNotIn(("m.room.member", operator_id), after)
@@ -128,22 +154,34 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         resp = self._call({**switch, "expected_quest_id": "quest-new"}, admin_token)
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertFalse(resp.json()["changed"])
+        self.assertEqual(resp.json()["changes"], [])
 
-        # The legacy plan-id spelling is read, then normalised to uuid.
+        # The legacy plan-id spelling is read, then normalised to uuid. Passing
+        # the teacher's own name back as the title keeps it.
         legacy = self._create_course_space(
-            teacher_token, {"course_plan_id": "legacy-old", "l2": "fr"}
+            teacher_token,
+            {"course_plan_id": "legacy-old", "l2": "fr"},
+            name="Period 3",
         )
         resp = self._call(
             {
+                **switch,
                 "room_id": legacy,
-                "quest_id": "quest-new",
                 "expected_quest_id": "legacy-old",
+                "title": "Period 3",
             },
             admin_token,
         )
         self.assertEqual(resp.status_code, 200, resp.text)
-        content = self._admin_state(admin_token, legacy)[(_COURSE_PLAN, "")]
-        self.assertEqual(content["content"], {"uuid": "quest-new", "l2": "fr"})
+        self.assertEqual(resp.json()["changes"], [_COURSE_PLAN, "m.room.topic"])
+        legacy_state = self._admin_state(admin_token, legacy)
+        self.assertEqual(
+            legacy_state[(_COURSE_PLAN, "")]["content"],
+            {"uuid": "quest-new", "l2": "fr"},
+        )
+        self.assertEqual(
+            legacy_state[("m.room.name", "")]["content"]["name"], "Period 3"
+        )
 
         # With only a student left, nobody can send the event: refused,
         # and nobody is promoted to make it writable. (A room every local
@@ -171,6 +209,9 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         orphan_after = self._admin_state(admin_token, orphan)
         self.assertEqual(
             orphan_after[(_COURSE_PLAN, "")]["content"]["uuid"], "quest-old"
+        )
+        self.assertEqual(
+            orphan_after[("m.room.name", "")]["content"]["name"], "Old course"
         )
         self.assertEqual(
             orphan_after[("m.room.power_levels", "")]["content"],

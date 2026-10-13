@@ -1,8 +1,9 @@
-"""Server-admin endpoint: point an existing course space at a different quest.
+"""Server-admin endpoint: point an existing course space at a different quest
+and rename it to match.
 
 ``POST /_synapse/client/pangea/v1/set_course_plan``
 
-Design: set-course-plan.instructions.md. The event is sent as the space's own
+Design: set-course-plan.instructions.md. The events are sent as the space's own
 highest-powered local member (``select_state_sender``), so nobody joins and
 nobody's power level changes; the operator is recorded in the log line instead.
 """
@@ -10,8 +11,9 @@ nobody's power level changes; the operator is recorded in the log line instead.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Mapping, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
+from synapse.api.constants import EventTypes
 from synapse.api.errors import (
     AuthError,
     InvalidClientCredentialsError,
@@ -44,6 +46,8 @@ logger = logging.getLogger(
 )
 
 MAX_ID_LENGTH = 255
+MAX_TITLE_LENGTH = 255
+MAX_DESCRIPTION_LENGTH = 4096
 
 NOT_A_COURSE = "not_a_course"
 MISMATCH = "mismatch"
@@ -85,6 +89,39 @@ def plan_update(
     return PlanUpdate(UPDATE, current, new_content)
 
 
+def topic_content(text: str) -> Dict[str, Any]:
+    """Topic content in the shape Synapse's own createRoom writes."""
+    return {"topic": text, "m.topic": {"m.text": [{"body": text}]}}
+
+
+def planned_writes(
+    update: PlanUpdate,
+    plan_event_type: str,
+    current_name: Optional[str],
+    current_topic: Optional[str],
+    title: str,
+    description: str,
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """The state events to send, in order: the course plan, then the name,
+    then the topic, each only when it differs from what the space has."""
+    writes: List[Tuple[str, Dict[str, Any]]] = []
+    if update.outcome == UPDATE and update.content is not None:
+        writes.append((plan_event_type, update.content))
+    if current_name != title:
+        writes.append((EventTypes.Name, {"name": title}))
+    if (current_topic or "") != description:
+        writes.append((EventTypes.Topic, topic_content(description)))
+    return writes
+
+
+def _state_text(event: Any, key: str) -> Optional[str]:
+    """A string field of a state event's content, or None."""
+    if event is None or not isinstance(event.content, Mapping):
+        return None
+    value = event.content.get(key)
+    return value if isinstance(value, str) else None
+
+
 def _valid_id(value: Any) -> Optional[str]:
     """The value when it is a usable id, else None."""
     if isinstance(value, str) and 0 < len(value) <= MAX_ID_LENGTH:
@@ -92,10 +129,19 @@ def _valid_id(value: Any) -> Optional[str]:
     return None
 
 
+class SetCoursePlanRequest(NamedTuple):
+    room_id: str
+    quest_id: str
+    expected_quest_id: str
+    title: str
+    description: str
+    dry_run: bool
+
+
 def parse_request(
     body: Any,
-) -> Tuple[Optional[Tuple[str, str, str, bool]], Optional[str]]:
-    """``((room_id, quest_id, expected_quest_id, dry_run), None)`` or ``(None, error)``."""
+) -> Tuple[Optional[SetCoursePlanRequest], Optional[str]]:
+    """``(request, None)`` or ``(None, error)``."""
     if not isinstance(body, dict):
         return None, "Request body must be a JSON object"
     room_id = _valid_id(body.get("room_id"))
@@ -107,10 +153,21 @@ def parse_request(
     expected_quest_id = _valid_id(body.get("expected_quest_id"))
     if expected_quest_id is None:
         return None, "'expected_quest_id' must be a non-empty string"
+    title = body.get("title")
+    if not isinstance(title, str) or not 0 < len(title) <= MAX_TITLE_LENGTH:
+        return None, "'title' must be a non-empty string"
+    description = body.get("description")
+    if not isinstance(description, str) or len(description) > MAX_DESCRIPTION_LENGTH:
+        return None, "'description' must be a string"
     dry_run = body.get("dry_run", False)
     if not isinstance(dry_run, bool):
         return None, "'dry_run' must be a boolean"
-    return (room_id, quest_id, expected_quest_id, dry_run), None
+    return (
+        SetCoursePlanRequest(
+            room_id, quest_id, expected_quest_id, title, description, dry_run
+        ),
+        None,
+    )
 
 
 class SetCoursePlan(Resource):
@@ -159,18 +216,25 @@ class SetCoursePlan(Resource):
                 )
                 return
 
-            parsed, error = parse_request(await extract_body_json(request))
-            if parsed is None:
+            req, error = parse_request(await extract_body_json(request))
+            if req is None:
                 respond_with_json(request, 400, {"error": error}, send_cors=True)
                 return
-            room_id, quest_id, expected_quest_id, dry_run = parsed
+            room_id = req.room_id
 
-            state = await self._api.get_room_state(room_id, [(self._event_type, "")])
+            state = await self._api.get_room_state(
+                room_id,
+                [
+                    (self._event_type, ""),
+                    (EventTypes.Name, ""),
+                    (EventTypes.Topic, ""),
+                ],
+            )
             event = state.get((self._event_type, ""))
             update = plan_update(
                 dict(event.content) if event is not None else None,
-                expected_quest_id,
-                quest_id,
+                req.expected_quest_id,
+                req.quest_id,
             )
 
             if update.outcome == NOT_A_COURSE:
@@ -192,90 +256,127 @@ class SetCoursePlan(Resource):
                     send_cors=True,
                 )
                 return
-            if update.outcome == UNCHANGED:
+
+            current_name = _state_text(state.get((EventTypes.Name, "")), "name")
+            current_topic = _state_text(state.get((EventTypes.Topic, "")), "topic")
+            writes = planned_writes(
+                update,
+                self._event_type,
+                current_name,
+                current_topic,
+                req.title,
+                req.description,
+            )
+            answer = {
+                "room_id": room_id,
+                "previous_quest_id": update.current_quest_id,
+                "quest_id": req.quest_id,
+                "previous_name": current_name,
+                "previous_topic": current_topic,
+                "changes": [event_type for event_type, _ in writes],
+                "dry_run": req.dry_run,
+            }
+            if not writes:
                 respond_with_json(
                     request,
                     200,
-                    {
-                        "room_id": room_id,
-                        "previous_quest_id": update.current_quest_id,
-                        "quest_id": quest_id,
-                        "sender": None,
-                        "changed": False,
-                        "dry_run": dry_run,
-                    },
+                    {**answer, "sender": None, "changed": False},
                     send_cors=True,
                 )
                 return
 
-            sender = await select_state_sender(self._api, room_id, self._event_type)
+            # One member sends every write. select_state_sender always picks
+            # the room's strongest local member, so the answers agree unless
+            # that member falls short for one of the event types.
+            senders = {
+                await select_state_sender(self._api, room_id, event_type)
+                for event_type, _ in writes
+            }
+            sender = senders.pop() if len(senders) == 1 else None
             if sender is None:
                 logger.warning(
                     "set_course_plan: no local member can send %s in %s; "
                     "refused, nothing written",
-                    self._event_type,
+                    answer["changes"],
                     room_id,
                 )
                 respond_with_json(
                     request,
                     409,
-                    {"error": "No local member can send the course plan event"},
+                    {"error": "No local member can send the course plan events"},
                     send_cors=True,
                 )
                 return
 
-            if not dry_run:
-                try:
-                    await self._api.create_and_send_event_into_room(
-                        {
-                            "type": self._event_type,
-                            "state_key": "",
-                            "room_id": room_id,
-                            "sender": sender,
-                            "content": update.content,
-                        }
-                    )
-                except AuthError as e:
-                    # The room checks the sender again at send time: one who
-                    # left or lost power since they were chosen is refused
-                    # before anything is written.
-                    logger.error(
-                        "set_course_plan: %s refused %s sent as %s: %s",
-                        room_id,
-                        self._event_type,
-                        sender,
-                        e,
-                    )
-                    respond_with_json(
-                        request,
-                        409,
-                        {
-                            "error": "The room refused the course plan event",
-                            "errcode": e.errcode,
-                        },
-                        send_cors=True,
-                    )
-                    return
+            written: List[str] = []
+            if not req.dry_run:
+                for event_type, content in writes:
+                    try:
+                        await self._api.create_and_send_event_into_room(
+                            {
+                                "type": event_type,
+                                "state_key": "",
+                                "room_id": room_id,
+                                "sender": sender,
+                                "content": content,
+                            }
+                        )
+                    except AuthError as e:
+                        # The room checks the sender again at send time: one
+                        # who left or lost power since they were chosen is
+                        # refused before this event is written.
+                        logger.error(
+                            "set_course_plan: %s refused %s sent as %s; "
+                            "already written: %s: %s",
+                            room_id,
+                            event_type,
+                            sender,
+                            written,
+                            e,
+                        )
+                        respond_with_json(
+                            request,
+                            409,
+                            {
+                                "error": "The room refused a write",
+                                "errcode": e.errcode,
+                                "refused": event_type,
+                                "written": written,
+                            },
+                            send_cors=True,
+                        )
+                        return
+                    except Exception:
+                        logger.exception(
+                            "set_course_plan: writing %s to %s failed; "
+                            "already written: %s",
+                            event_type,
+                            room_id,
+                            written,
+                        )
+                        respond_with_json(
+                            request,
+                            500,
+                            {"error": "Internal server error", "written": written},
+                            send_cors=True,
+                        )
+                        return
+                    written.append(event_type)
             logger.info(
-                "set_course_plan: operator=%s room=%s %s -> %s sent_as=%s dry_run=%s",
+                "set_course_plan: operator=%s room=%s %s -> %s changes=%s "
+                "sent_as=%s dry_run=%s",
                 operator,
                 room_id,
                 update.current_quest_id,
-                quest_id,
+                req.quest_id,
+                answer["changes"],
                 sender,
-                dry_run,
+                req.dry_run,
             )
             respond_with_json(
                 request,
                 200,
-                {
-                    "room_id": room_id,
-                    "previous_quest_id": update.current_quest_id,
-                    "quest_id": quest_id,
-                    "sender": sender,
-                    "changed": not dry_run,
-                    "dry_run": dry_run,
-                },
+                {**answer, "sender": sender, "changed": not req.dry_run},
                 send_cors=True,
             )
         except Exception:
