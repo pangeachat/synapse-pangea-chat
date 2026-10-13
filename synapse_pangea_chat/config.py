@@ -147,6 +147,8 @@ class PangeaChatConfig:
     send_push_requests_per_burst: int = 10
     send_push_burst_duration_seconds: int = 1
     send_push_sygnal_url: Optional[str] = None
+    # Other Sygnal URLs a device's pusher may name and be pushed through.
+    send_push_allowed_sygnal_urls: List[str] = attr.Factory(list)
 
     # --- notice_delivery config ---
     # Email is the fallback channel for notices when a person has no push
@@ -186,6 +188,12 @@ class PangeaChatConfig:
     # Refuse knocks/joins from users every room admin has blocked. Off switch
     # only; the rule itself is fixed by design.
     blocked_join_gate_enabled: bool = True
+
+    # --- course_default_chats config ---
+    # Keeps a space's default chats complete (every member joined, space
+    # admins as chat admins) and serves the repair endpoint. The off switch
+    # exists so a bad rollout can be stopped from Ansible without a deploy.
+    course_default_chats_enabled: bool = True
 
     # --- moderation config (server-side, trust-and-safety) ---
     # Both tiers ship dark: nothing runs until an operator enables a tier.

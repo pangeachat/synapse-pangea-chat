@@ -3,12 +3,10 @@ path between them, none of which the unit tests' fake pusher can exercise —
 the queued-ring lookup reads Synapse's own tables."""
 
 import asyncio
-import json
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, List, Tuple
+from typing import List, Tuple
 from urllib.parse import quote
 
 import requests
@@ -19,64 +17,13 @@ from synapse_pangea_chat.delayed_push.delayed_push import (
 )
 
 from .base_e2e import BaseSynapseE2ETest
+from .recording_sygnal import RecordingSygnal
 
 # Long enough that a push arriving inside a test phase can only be one the hold
 # let through.
 _HOLD_MS = 60_000
 _QUIET_SECONDS = 3.0
 _ARRIVAL_SECONDS = 10.0
-
-
-class _RecordingSygnal:
-    """A push gateway that records, per pushkey, the event id of every event
-    push it gets."""
-
-    def __init__(self) -> None:
-        stub = self
-        self.pushes: List[Tuple[str, str]] = []
-        self._lock = threading.Lock()
-
-        class _Handler(BaseHTTPRequestHandler):
-            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-                pass
-
-            def do_POST(self) -> None:
-                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                notification = json.loads(body)["notification"]
-                # Badge-only updates carry no event.
-                if notification.get("event_id"):
-                    with stub._lock:
-                        for device in notification["devices"]:
-                            stub.pushes.append(
-                                (device["pushkey"], notification["event_id"])
-                            )
-                payload = b'{"rejected": []}'
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-        self.url = f"http://127.0.0.1:{self._server.server_port}/_matrix/push/v1/notify"
-
-    def received(self, pushkey: str) -> List[str]:
-        with self._lock:
-            return [event_id for key, event_id in self.pushes if key == pushkey]
-
-    def wait_for(self, pushkey: str, count: int, timeout: float) -> List[str]:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and len(self.received(pushkey)) < count:
-            time.sleep(0.1)
-        return self.received(pushkey)
-
-    def start(self) -> "_RecordingSygnal":
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
-        return self
-
-    def stop(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
 
 
 class _OpenWebTab:
@@ -110,12 +57,12 @@ class _OpenWebTab:
 
 
 class TestDelayedPushRingE2E(BaseSynapseE2ETest):
-    sygnal: _RecordingSygnal
+    sygnal: RecordingSygnal
 
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.sygnal = _RecordingSygnal().start()
+        cls.sygnal = RecordingSygnal().start()
         cls.addClassCleanup(cls.sygnal.stop)
 
     def setUp(self) -> None:

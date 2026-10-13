@@ -176,7 +176,9 @@ class DirectPush(Resource):
 
             try:
                 payload = self._build_payload(event_id, req_body, pusher)
-                success = await self._post_to_sygnal(payload)
+                success = await self._post_to_sygnal(
+                    self._sygnal_url_for(pusher), payload
+                )
 
                 if success:
                     status["sent"] = True
@@ -286,10 +288,19 @@ class DirectPush(Resource):
             return False
         return True
 
-    async def _post_to_sygnal(self, payload: Dict[str, Any]) -> bool:
+    def _sygnal_url_for(self, pusher: Dict[str, Any]) -> Optional[str]:
+        """The Sygnal the device registered when it is an allowed one, else the
+        configured default (notice-delivery.instructions.md, "Which Sygnal")."""
+        registered_url = (pusher.get("data") or {}).get("url")
+        if registered_url in self._config.send_push_allowed_sygnal_urls:
+            return registered_url
+        return self._config.send_push_sygnal_url
+
+    async def _post_to_sygnal(
+        self, sygnal_url: Optional[str], payload: Dict[str, Any]
+    ) -> bool:
         try:
             agent = Agent(reactor)
-            sygnal_url = self._config.send_push_sygnal_url
             if sygnal_url is None:
                 return False
             url = sygnal_url.encode("utf-8")

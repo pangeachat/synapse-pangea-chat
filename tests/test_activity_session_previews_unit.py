@@ -8,9 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from synapse_pangea_chat.activity_session_previews.get_activity_session_previews import (
     _activity_session_ids,
     _child_room_ids,
-    _has_valid_via,
     _member_space_ids,
     get_activity_session_previews,
+    has_valid_via,
 )
 
 USER = "@learner:my.domain.name"
@@ -46,22 +46,22 @@ def _plan_row(room_id: str, content: Any) -> Tuple[str, str]:
 
 class TestHasValidVia(unittest.TestCase):
     def test_valid_via_list(self) -> None:
-        self.assertTrue(_has_valid_via({"via": ["my.domain.name"]}))
+        self.assertTrue(has_valid_via({"via": ["my.domain.name"]}))
 
     def test_removed_child_empty_content(self) -> None:
-        self.assertFalse(_has_valid_via({}))
+        self.assertFalse(has_valid_via({}))
 
     def test_non_dict_content(self) -> None:
-        self.assertFalse(_has_valid_via(None))
+        self.assertFalse(has_valid_via(None))
 
     def test_empty_via(self) -> None:
-        self.assertFalse(_has_valid_via({"via": []}))
+        self.assertFalse(has_valid_via({"via": []}))
 
     def test_via_not_a_list(self) -> None:
-        self.assertFalse(_has_valid_via({"via": "my.domain.name"}))
+        self.assertFalse(has_valid_via({"via": "my.domain.name"}))
 
     def test_via_with_non_string_entry(self) -> None:
-        self.assertFalse(_has_valid_via({"via": ["my.domain.name", 42]}))
+        self.assertFalse(has_valid_via({"via": ["my.domain.name", 42]}))
 
 
 class TestChildRoomIds(unittest.IsolatedAsyncioTestCase):

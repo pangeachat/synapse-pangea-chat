@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 from synapse.module_api import ModuleApi
 from synapse.storage.databases.main.room import RoomStore
@@ -29,14 +29,17 @@ def _placeholders(room_store: RoomStore, count: int) -> str:
     return ",".join(["?" if "sqlite" in database_engine else "%s"] * count)
 
 
-def _has_valid_via(content: Any) -> bool:
+def has_valid_via(content: Any) -> bool:
     """A live m.space.child link carries a non-empty list of server names in
     content.via; a removed child's event has empty content (or an invalid via)
-    and must not resurface — mirrors synapse's own hierarchy filtering."""
-    if not isinstance(content, dict):
+    and must not resurface — mirrors synapse's own hierarchy filtering.
+
+    Takes a decoded JSON dict or an event's content, which Synapse >= 1.159
+    exposes as a non-dict Mapping."""
+    if not isinstance(content, Mapping):
         return False
     via = content.get("via")
-    if not via or not isinstance(via, list):
+    if not via or not isinstance(via, (list, tuple)):
         return False
     return all(isinstance(v, str) for v in via)
 
@@ -99,7 +102,7 @@ async def _child_room_ids(
             continue
         event_data = json.loads(json_data) if isinstance(json_data, str) else json_data
         content = event_data.get("content") if isinstance(event_data, dict) else None
-        if not _has_valid_via(content):
+        if not has_valid_via(content):
             continue
         seen.add(state_key)
         child_ids.append(state_key)

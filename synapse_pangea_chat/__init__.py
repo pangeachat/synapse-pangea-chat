@@ -14,6 +14,10 @@ from synapse_pangea_chat.config import (
     DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS,
     PangeaChatConfig,
 )
+from synapse_pangea_chat.course_default_chats import (
+    CourseDefaultChats,
+    SyncCourseDefaultChats,
+)
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
 from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
@@ -552,6 +556,16 @@ class PangeaChat:
         if config.blocked_join_gate_enabled:
             self.blocked_join_gate = BlockedJoinGate(config, api)
 
+        # --- Course Default Chats ---
+        # Registered only when enabled, so the hook does not fire and the
+        # repair path does not exist otherwise.
+        if config.course_default_chats_enabled:
+            self.course_default_chats = CourseDefaultChats(api)
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/sync_course_default_chats",
+                resource=SyncCourseDefaultChats(api, self.course_default_chats),
+            )
+
         # --- Direct Push ---
         self.direct_push_resource = DirectPush(api, config)
         self._api.register_web_resource(
@@ -1030,6 +1044,15 @@ class PangeaChat:
             if not send_push_sygnal_url.strip():
                 raise ValueError('Config "send_push_sygnal_url" must not be empty')
 
+        send_push_allowed_sygnal_urls = config.get("send_push_allowed_sygnal_urls", [])
+        if not isinstance(send_push_allowed_sygnal_urls, list) or not all(
+            isinstance(url, str) and url.strip()
+            for url in send_push_allowed_sygnal_urls
+        ):
+            raise ValueError(
+                'Config "send_push_allowed_sygnal_urls" must be a list of URLs'
+            )
+
         # --- notice_delivery config ---
         notice_email_enabled = config.get("notice_email_enabled", False)
         if not isinstance(notice_email_enabled, bool):
@@ -1117,6 +1140,10 @@ class PangeaChat:
         blocked_join_gate_enabled = config.get("blocked_join_gate_enabled", True)
         if not isinstance(blocked_join_gate_enabled, bool):
             raise ValueError('Config "blocked_join_gate_enabled" must be a boolean')
+
+        course_default_chats_enabled = config.get("course_default_chats_enabled", True)
+        if not isinstance(course_default_chats_enabled, bool):
+            raise ValueError('Config "course_default_chats_enabled" must be a boolean')
 
         # --- delayed_push config ---
         delayed_push = config.get("delayed_push", {})
@@ -1467,6 +1494,7 @@ class PangeaChat:
             send_push_requests_per_burst=send_push_requests_per_burst,
             send_push_burst_duration_seconds=send_push_burst_duration_seconds,
             send_push_sygnal_url=send_push_sygnal_url,
+            send_push_allowed_sygnal_urls=send_push_allowed_sygnal_urls,
             notice_email_enabled=notice_email_enabled,
             notice_missed_message_unsubscribe_enabled=notice_missed_message_unsubscribe_enabled,
             notice_suppress_notice_push_rules=notice_suppress_notice_push_rules,
@@ -1485,6 +1513,7 @@ class PangeaChat:
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,
             delayed_push_require_synapse_version=delayed_push_require_synapse_version,
             blocked_join_gate_enabled=blocked_join_gate_enabled,
+            course_default_chats_enabled=course_default_chats_enabled,
             moderation_tier1_enabled=moderation_tier1_enabled,
             moderation_tier1_phone_regions=moderation_tier1_phone_regions,
             moderation_tier2_enabled=moderation_tier2_enabled,
