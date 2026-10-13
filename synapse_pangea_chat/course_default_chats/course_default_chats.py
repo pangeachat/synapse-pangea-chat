@@ -8,7 +8,19 @@ default chat, a member and an admin: course-default-chats.instructions.md.
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    cast,
+)
 
 import attr
 from synapse.api.constants import EventTypes
@@ -66,6 +78,10 @@ DEFAULT_CHAT_ALIAS_PREFIXES = (INTRODUCTIONS_ALIAS_PREFIX, ANNOUNCEMENTS_ALIAS_P
 # limiter asks for; this bounds how long one member can hold up the rest.
 MAX_RATE_LIMIT_WAITS = 60
 
+# The per-process memo of each space's default chat ids is small, but a
+# server with many spaces should not grow it without bound.
+MAX_CACHED_SPACES = 20000
+
 
 def is_default_chat_alias(alias: Any) -> bool:
     """Whether a canonical alias such as ``#announcementsChat_x_1:server``
@@ -122,9 +138,9 @@ def admins_to_demote(
 
 
 class NoChatAdminError(Exception):
-    """No joined member of the chat can send its power levels, so the
-    space's admins cannot be mirrored into it. Nobody is promoted to fix
-    that; it is reported for an operator."""
+    """No joined member of the chat can do what the sync needs: send its power
+    levels, or let a member in through its join rule. Nobody is promoted to
+    fix that; it is reported for an operator."""
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -154,6 +170,24 @@ class ChatState:
             user_id
             for user_id, membership in self.memberships.items()
             if membership == MEMBERSHIP_JOIN
+        )
+
+    def power(self, user_id: str) -> int:
+        if user_id in self.immutable:
+            return ADMIN_POWER_LEVEL
+        return _power_of(self.users, user_id, self.users_default)
+
+    def can_admit_members(self) -> bool:
+        """Whether a restricted join can be authorised: Synapse needs a joined
+        local member at or above the chat's invite level to vouch for it."""
+        invite_level = _coerce_int(self.power_content.get("invite"))
+        return any(self.power(user_id) >= invite_level for user_id in self.joined)
+
+    def joined_admins(self) -> FrozenSet[str]:
+        return frozenset(
+            user_id
+            for user_id in self.joined
+            if self.power(user_id) >= ADMIN_POWER_LEVEL
         )
 
 
@@ -197,10 +231,19 @@ class CourseDefaultChats:
         self._state = api._hs.get_storage_controllers().state
         self._store = api._hs.get_datastores().main
         self._clock = api._hs.get_clock()
-        # One sync per chat at a time: the admin mirror is a read-modify-write
-        # of the chat's power levels, and two triggers on one space (a link
-        # and a join, say) can land together.
+        # One sync per chat at a time in this process: the admin mirror is a
+        # read-modify-write of the chat's power levels, and two triggers on
+        # one space (a link and a join, say) can land together. Across
+        # workers the sync is idempotent and converges on the next trigger.
         self._chat_locks = Linearizer("course_default_chats", clock=self._clock)
+        # Each space's default chat ids, so a member join does not re-read
+        # every child of a busy course (activity sessions are children too).
+        # Invalidated by the m.space.child events this process's hook sees;
+        # the repair endpoint bypasses it.
+        self._default_chats: Dict[str, List[str]] = {}
+        # A chat nobody can act for is reported once per process, not on
+        # every join and profile change in its space.
+        self._reported_no_admin: Set[str] = set()
         api.register_third_party_rules_callbacks(on_new_event=self.on_new_event)
 
     # ------------------------------------------------------------------
@@ -217,6 +260,7 @@ class CourseDefaultChats:
             if not event.is_state():
                 return
             if event.type == EventTypes.SpaceChild:
+                self._default_chats.pop(event.room_id, None)
                 if event.state_key and has_valid_via(event.content):
                     self._in_background(
                         "link", self.sync_chat, event.room_id, event.state_key
@@ -230,7 +274,11 @@ class CourseDefaultChats:
                     and not is_probable_bot_user_id(user_id)
                 ):
                     self._in_background(
-                        "member", self.sync_member, event.room_id, user_id
+                        "member",
+                        self.sync_member,
+                        event.room_id,
+                        user_id,
+                        event.unsigned.get("replaces_state"),
                     )
             elif event.type == EventTypes.PowerLevels:
                 self._in_background("power", self.sync_space, event.room_id)
@@ -246,14 +294,30 @@ class CourseDefaultChats:
     def _in_background(
         self, what: str, func: Callable[..., Awaitable[Any]], *args: Any
     ) -> None:
-        self._api.run_as_background_process(f"course_default_chats_{what}", func, *args)
+        # Through the reactor rather than from the notifier's own logcontext,
+        # so the background process starts from the sentinel context and the
+        # notifier's is never re-entered after it finishes (the pattern the
+        # moderation dispatcher documents).
+        self._clock.call_later(
+            Duration(milliseconds=0),
+            self._api.run_as_background_process,
+            f"course_default_chats_{what}",
+            func,
+            *args,
+        )
 
     # ------------------------------------------------------------------
     # Sync entry points (each returns None when the room is not a space)
     # ------------------------------------------------------------------
 
+    async def is_space(self, room_id: str) -> bool:
+        create = await self._state.get_current_state_event(
+            room_id, EventTypes.Create, ""
+        )
+        return create is not None and create.content.get("type") == SPACE_ROOM_TYPE
+
     async def sync_space(
-        self, space_id: str, *, apply: bool = True
+        self, space_id: str, *, apply: bool = True, use_cache: bool = True
     ) -> Optional[List[ChatSyncReport]]:
         """Bring every default chat of the space in line with the space.
         With ``apply`` false, report what would change and change nothing."""
@@ -264,7 +328,7 @@ class CourseDefaultChats:
             await self._sync_chat(
                 space_id, chat_id, roster, only_user=None, apply=apply
             )
-            for chat_id in await self._default_chat_ids(space_id)
+            for chat_id in await self._default_chat_ids(space_id, use_cache)
         ]
 
     async def sync_chat(self, space_id: str, chat_id: str) -> Optional[ChatSyncReport]:
@@ -277,9 +341,21 @@ class CourseDefaultChats:
         )
 
     async def sync_member(
-        self, space_id: str, user_id: str
+        self, space_id: str, user_id: str, replaces_state: Optional[str]
     ) -> Optional[List[ChatSyncReport]]:
-        """A user joined the space: join them to its default chats."""
+        """A user joined the space: join them to its default chats.
+
+        A profile change is also a join event (Synapse re-sends a member's
+        join into every room on a displayname or avatar change). That is not
+        a join, so a member who was removed from a chat is not put back by
+        it; the previous member event tells the two apart."""
+        if replaces_state is not None:
+            previous = await self._store.get_event(replaces_state, allow_none=True)
+            if (
+                previous is not None
+                and previous.content.get("membership") == MEMBERSHIP_JOIN
+            ):
+                return None
         roster = await self._space_roster(space_id)
         if roster is None or user_id not in roster.members:
             return None
@@ -287,7 +363,7 @@ class CourseDefaultChats:
             await self._sync_chat(
                 space_id, chat_id, roster, only_user=user_id, apply=True
             )
-            for chat_id in await self._default_chat_ids(space_id)
+            for chat_id in await self._default_chat_ids(space_id, use_cache=True)
         ]
 
     # ------------------------------------------------------------------
@@ -295,10 +371,7 @@ class CourseDefaultChats:
     # ------------------------------------------------------------------
 
     async def _space_roster(self, room_id: str) -> Optional[SpaceRoster]:
-        create = await self._state.get_current_state_event(
-            room_id, EventTypes.Create, ""
-        )
-        if create is None or create.content.get("type") != SPACE_ROOM_TYPE:
+        if not await self.is_space(room_id):
             return None
         state = await self._api.get_room_state(
             room_id,
@@ -322,7 +395,9 @@ class CourseDefaultChats:
         )
         return SpaceRoster(members=members, admins=admins)
 
-    async def _default_chat_ids(self, space_id: str) -> List[str]:
+    async def _default_chat_ids(self, space_id: str, use_cache: bool) -> List[str]:
+        if use_cache and space_id in self._default_chats:
+            return self._default_chats[space_id]
         state = await self._api.get_room_state(
             space_id, event_filter=[(EventTypes.SpaceChild, None)]
         )
@@ -332,15 +407,21 @@ class CourseDefaultChats:
                 continue
             if await self._is_default_chat(child_id):
                 chat_ids.append(child_id)
-        return sorted(chat_ids)
+        chat_ids.sort()
+        if len(self._default_chats) >= MAX_CACHED_SPACES:
+            self._default_chats.clear()
+        self._default_chats[space_id] = chat_ids
+        return chat_ids
 
     async def _is_default_chat(self, room_id: str) -> bool:
-        alias_event = await self._state.get_current_state_event(
-            room_id, EventTypes.CanonicalAlias, ""
+        # The directory's aliases, not the canonical-alias state event: Synapse
+        # drops a room's current state once every local member has left, and
+        # a chat everyone left must still be seen, so it can be reported.
+        # cast: mypy reads Synapse's @cached descriptor as the unbound function.
+        aliases: Sequence[str] = await cast(Any, self._store).get_aliases_for_room(
+            room_id
         )
-        return alias_event is not None and is_default_chat_alias(
-            alias_event.content.get("alias")
-        )
+        return any(is_default_chat_alias(alias) for alias in aliases)
 
     async def _chat_state(self, chat_id: str) -> ChatState:
         state = await self._api.get_room_state(
@@ -385,12 +466,23 @@ class CourseDefaultChats:
         only_user: Optional[str],
         apply: bool,
     ) -> ChatSyncReport:
+        """Promote, then join, then demote. The order matters: a demotion can
+        only ever follow the joins, so it never removes the one member who
+        could still let the others in."""
         report = ChatSyncReport(chat_id=chat_id)
         async with self._chat_locks.queue(chat_id):
-            await self._mirror_admins(chat_id, roster, report, apply)
+            chat = await self._promote_admins(chat_id, roster, report, apply)
             targets = [only_user] if only_user else sorted(roster.members)
+            if not chat.can_admit_members():
+                self._report_no_admin(
+                    chat_id, "no joined member can let members in", apply
+                )
+                report.admin_sender_missing = True
             for user_id in targets:
-                await self._join_member(chat_id, user_id, report, apply)
+                await self._join_member(chat_id, user_id, chat, report, apply)
+            if apply and targets:
+                chat = await self._chat_state(chat_id)
+            await self._demote_admins(chat_id, roster, chat, report, apply)
         logger.info(
             "course_default_chats %s %s in %s: %s",
             "synced" if apply else "dry run of",
@@ -400,50 +492,76 @@ class CourseDefaultChats:
         )
         return report
 
-    async def _mirror_admins(
+    async def _promote_admins(
         self, chat_id: str, roster: SpaceRoster, report: ChatSyncReport, apply: bool
-    ) -> None:
+    ) -> ChatState:
         chat = await self._chat_state(chat_id)
         promote = admins_to_promote(
             chat.users, chat.users_default, roster.admins, chat.immutable
         )
-        if promote:
-            # One event for every promotion: an admin may set others to their
-            # own level, so any joined chat admin can send it.
-            sender = await select_state_sender(
-                self._api, chat_id, EventTypes.PowerLevels
+        if not promote:
+            return chat
+        # One event for every promotion: an admin may set others to their
+        # own level, so any joined chat admin can send it.
+        sender = await select_state_sender(self._api, chat_id, EventTypes.PowerLevels)
+        if sender is None:
+            report.admin_sender_missing = True
+            self._report_no_admin(
+                chat_id,
+                f"no joined admin can mirror {len(promote)} space admins",
+                apply,
             )
-            if sender is None:
-                report.admin_sender_missing = True
-                if apply:
-                    error = NoChatAdminError(
-                        f"No joined admin can mirror {len(promote)} space admins"
-                        f" into {chat_id}"
-                    )
-                    logger.warning("%s", error)
-                    _capture_exception(error)
-            elif not apply:
-                report.promoted = promote
-            else:
-                users = chat.users
-                for user_id in promote:
-                    users[user_id] = ADMIN_POWER_LEVEL
-                try:
-                    await self._send_power_levels(chat_id, sender, chat, users)
-                    report.promoted = promote
-                    chat = await self._chat_state(chat_id)
-                except Exception as e:
-                    self._record_failure(report, sender, e, "promote")
-        # Matrix lets an admin lower only their own level, never another
-        # admin's, so each demotion is sent by the member being demoted.
-        for user_id in admins_to_demote(
+            return chat
+        if not apply:
+            report.promoted = promote
+            return chat
+        users = chat.users
+        for user_id in promote:
+            users[user_id] = ADMIN_POWER_LEVEL
+        try:
+            await self._send_power_levels(chat_id, sender, chat, users)
+            report.promoted = promote
+            return await self._chat_state(chat_id)
+        except Exception as e:
+            self._record_failure(report, sender, e, "promote")
+            return chat
+
+    async def _demote_admins(
+        self,
+        chat_id: str,
+        roster: SpaceRoster,
+        chat: ChatState,
+        report: ChatSyncReport,
+        apply: bool,
+    ) -> None:
+        demote = admins_to_demote(
             chat.users,
             chat.users_default,
             chat.joined,
             roster.members,
             roster.admins,
             chat.immutable,
-        ):
+        )
+        if not demote:
+            return
+        # Never leave the chat without a joined space admin at admin power:
+        # that is who promotes the next instructor and lets members in.
+        if not (chat.joined_admins() & roster.admins):
+            self._report_no_admin(
+                chat_id, "no joined space admin would remain after a demotion", apply
+            )
+            for user_id in demote:
+                report.failed.append(
+                    {
+                        "user_id": user_id,
+                        "step": "demote",
+                        "error": "NoChatAdminError: no joined space admin would remain",
+                    }
+                )
+            return
+        # Matrix lets an admin lower only their own level, never another
+        # admin's, so each demotion is sent by the member being demoted.
+        for user_id in demote:
             if not apply:
                 report.demoted.append(user_id)
                 continue
@@ -474,7 +592,12 @@ class CourseDefaultChats:
         )
 
     async def _join_member(
-        self, chat_id: str, user_id: str, report: ChatSyncReport, apply: bool
+        self,
+        chat_id: str,
+        user_id: str,
+        chat: ChatState,
+        report: ChatSyncReport,
+        apply: bool,
     ) -> None:
         membership, _ = await self._store.get_local_current_membership_for_user_in_room(
             user_id, chat_id
@@ -484,6 +607,17 @@ class CourseDefaultChats:
             return
         if membership == MEMBERSHIP_BAN:
             report.skipped_banned.append(user_id)
+            return
+        if not chat.can_admit_members():
+            # Reported once for the chat above; the dry run and the real run
+            # agree on what this means for each member.
+            report.failed.append(
+                {
+                    "user_id": user_id,
+                    "step": "join",
+                    "error": "NoChatAdminError: no joined member can let members in",
+                }
+            )
             return
         if not apply:
             report.joined.append(user_id)
@@ -543,6 +677,16 @@ class CourseDefaultChats:
             limiter_name="course_default_chats", retry_after_ms=None
         )
 
+    def _report_no_admin(self, chat_id: str, reason: str, apply: bool) -> None:
+        """A chat nobody can act for: logged every time, captured to Sentry
+        once per process, and only when the sync would have changed something
+        (a dry run reports it, it does not raise an alarm)."""
+        logger.warning("course_default_chats %s: %s", chat_id, reason)
+        key = f"{chat_id}:{reason}"
+        if apply and key not in self._reported_no_admin:
+            self._reported_no_admin.add(key)
+            _capture_exception(NoChatAdminError(f"{chat_id}: {reason}"))
+
     def _record_failure(
         self, report: ChatSyncReport, user_id: str, e: Exception, step: str
     ) -> None:
@@ -561,13 +705,17 @@ class CourseDefaultChats:
 
 class SyncCourseDefaultChats(Resource):
     """``POST /_synapse/client/pangea/v1/sync_course_default_chats``: the
-    repair endpoint. Server admins only. ``{"room_id": ...}`` syncs that one
-    space and answers with its per-chat report; ``"dry_run": true`` answers
-    the report of what would change and changes nothing.
+    repair endpoint. Server admins only, exactly one space per call.
 
-    Exactly one space per call, on purpose: which spaces to touch is decided
-    by the operator running ``scripts/repair_course_default_chats.py``, not
-    by an endpoint that could sweep the homeserver in one request."""
+    ``{"room_id": ..., "dry_run": true}`` answers the per-chat report of what
+    would change and changes nothing. ``{"room_id": ...}`` answers 202 at once
+    and does the work in the background: joining a large class is paced by
+    Synapse's per-room join limit and outlasts what the reverse proxy allows
+    a request, so the dry run before and after is the report.
+
+    One space per call, on purpose: which spaces to touch is decided by the
+    operator running ``scripts/repair_course_default_chats.py``, not by an
+    endpoint that could sweep the homeserver in one request."""
 
     isLeaf = True
 
@@ -609,21 +757,39 @@ class SyncCourseDefaultChats(Resource):
                     send_cors=True,
                 )
                 return
-
-            reports = await self._syncer.sync_space(room_id, apply=not dry_run)
-            if reports is None:
+            if not await self._syncer.is_space(room_id):
                 respond_with_json(
                     request, 400, {"error": "'room_id' must be a space"}, send_cors=True
                 )
                 return
+
+            if dry_run:
+                reports = await self._syncer.sync_space(
+                    room_id, apply=False, use_cache=False
+                )
+                respond_with_json(
+                    request,
+                    200,
+                    {
+                        "room_id": room_id,
+                        "dry_run": True,
+                        "chats": [r.as_json() for r in reports or []],
+                    },
+                    send_cors=True,
+                )
+                return
+
+            self._api.run_as_background_process(
+                "course_default_chats_repair",
+                self._syncer.sync_space,
+                room_id,
+                apply=True,
+                use_cache=False,
+            )
             respond_with_json(
                 request,
-                200,
-                {
-                    "room_id": room_id,
-                    "dry_run": dry_run,
-                    "chats": [r.as_json() for r in reports],
-                },
+                202,
+                {"room_id": room_id, "dry_run": False, "scheduled": True},
                 send_cors=True,
             )
         # silent-ok: the caller's auth failure, answered 401 (logged at INFO)

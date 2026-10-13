@@ -354,6 +354,102 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
             "expected the sync to wait out the per-room join limit",
         )
 
+    async def test_profile_change_does_not_rejoin_a_removed_member(self):
+        """Matrix sends a member's join again on a displayname change; that
+        is not a join, so a kicked member stays out until a full sync."""
+        await self.homeserver()
+        _, teacher = await self.new_user("teacher")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        await self._join(space_id, s1)
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        await self._wait_joined(chat_id, [s1_id], teacher)
+        await self._membership_action("kick", chat_id, s1_id, teacher)
+
+        response = requests.put(
+            self._state_url(space_id, "m.room.member", s1_id),
+            headers=self._headers(s1),
+            json={"membership": "join", "displayname": "Renamed"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        time.sleep(3)
+        self.assertEqual(await self._membership(chat_id, s1_id, teacher), "leave")
+
+        # The positive control: a full sync (any power change on the space)
+        # does put a removed member back, as the design says.
+        await self._set_power(space_id, s1_id, 50, teacher)
+        await self._wait_joined(chat_id, [s1_id], teacher)
+
+    async def test_demotion_never_strands_the_chat(self):
+        """A co-teacher creates Announcements, steps down in the space, and
+        the teacher links it: the teacher is promoted and joined before the
+        co-teacher is demoted, so someone can still let members in."""
+        await self.homeserver()
+        teacher_id, teacher = await self.new_user("teacher")
+        co_id, co = await self.new_user("co")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        await self._join(space_id, co)
+        await self._set_power(space_id, co_id, 100, teacher)
+        chat_id = await self._create_announcements(co, space_id)
+        await self._set_power(space_id, co_id, 0, co)
+        await self._link_child(teacher, space_id, chat_id)
+
+        await self._wait_joined(chat_id, [teacher_id], teacher)
+
+        async def settled() -> bool:
+            users = await self._power_users(chat_id, teacher)
+            return users.get(teacher_id) == 100 and users.get(co_id, 0) < 100
+
+        await self._wait_until_async(settled, "teacher promoted, co-teacher demoted")
+        self.assertEqual(await self._membership(chat_id, co_id, teacher), "join")
+        self.assertEqual(await self._send_message_status(chat_id, teacher), 200)
+        # Not stranded: a student joining the space still lands in the chat.
+        await self._join(space_id, s1)
+        await self._wait_joined(chat_id, [s1_id], teacher)
+
+    async def test_a_chat_nobody_can_act_for_is_reported_not_repaired(self):
+        await self.homeserver()
+        _, operator = await self.new_user("operator", admin=True)
+        teacher_id, teacher = await self.new_user("teacher")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        response = requests.post(
+            self._room_url(chat_id, "/leave"), headers=self._headers(teacher)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        await self._join(space_id, s1)
+
+        response = requests.post(
+            self._endpoint(),
+            headers=self._headers(operator),
+            json={"room_id": space_id, "dry_run": True},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        chat = response.json()["chats"][0]
+        self.assertTrue(chat["admin_sender_missing"])
+        self.assertEqual(chat["joined"], [])
+        # Both space members are outside the chat now, and nobody can let
+        # either in: the teacher who left it, and the student who never was.
+        self.assertCountEqual(
+            [(f["user_id"], f["step"]) for f in chat["failed"]],
+            [(s1_id, "join"), (teacher_id, "join")],
+        )
+        self.assertTrue(all("NoChatAdminError" in f["error"] for f in chat["failed"]))
+        self.assertIsNone(await self._membership(chat_id, s1_id, teacher))
+        self.assertTrue(
+            any(
+                "no joined member can let members in" in line
+                for line in self.server_log()
+            )
+        )
+
     # -- the repair endpoint -------------------------------------------------
 
     async def test_repair_endpoint_brings_a_space_back_in_line(self):
@@ -376,25 +472,35 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         # space, so neither triggers the hook).
         await self._membership_action("kick", chat_id, s1_id, teacher)
         await self._set_power(chat_id, co_id, 0, co)
-        self.assertIsNotNone(await self._membership(chat_id, s1_id, teacher))
-        self.assertNotEqual(await self._membership(chat_id, s1_id, teacher), "join")
+        self.assertEqual(await self._membership(chat_id, s1_id, teacher), "leave")
 
         response = requests.post(
             self._endpoint(),
             headers=self._headers(operator),
             json={"room_id": space_id},
         )
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(
+            response.json(), {"room_id": space_id, "dry_run": False, "scheduled": True}
+        )
+        await self._wait_joined(chat_id, [s1_id], teacher)
+
+        async def promoted() -> bool:
+            return (await self._power_users(chat_id, teacher)).get(co_id) == 100
+
+        await self._wait_until_async(promoted, "co-teacher promoted by the repair")
+        response = requests.post(
+            self._endpoint(),
+            headers=self._headers(operator),
+            json={"room_id": space_id, "dry_run": True},
+        )
         self.assertEqual(response.status_code, 200, response.text)
-        report = response.json()
-        self.assertEqual(report["room_id"], space_id)
-        self.assertEqual(len(report["chats"]), 1)
-        chat = report["chats"][0]
+        chat = response.json()["chats"][0]
         self.assertEqual(chat["chat_id"], chat_id)
-        self.assertEqual(chat["promoted"], [co_id])
-        self.assertEqual(chat["joined"], [s1_id])
+        self.assertEqual(
+            (chat["promoted"], chat["demoted"], chat["joined"]), ([], [], [])
+        )
         self.assertEqual(chat["failed"], [])
-        self.assertEqual(await self._membership(chat_id, s1_id, teacher), "join")
-        self.assertEqual((await self._power_users(chat_id, teacher)).get(co_id), 100)
 
     async def test_repair_endpoint_refuses_non_admins_and_bad_input(self):
         await self.homeserver()
@@ -442,7 +548,8 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
 
     async def test_repair_script_lists_then_repairs(self):
         """The operator script: the dry-run walk finds the space, and
-        --apply repairs exactly the spaces it listed."""
+        --apply repairs exactly the spaces it listed, waiting for the
+        background work to finish."""
         await self.homeserver()
         _, operator = await self.new_user("operator", admin=True)
         _, teacher = await self.new_user("teacher")
@@ -457,18 +564,13 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
 
         script = _load_repair_script()
         self.assertIn(space_id, list(script.walk_spaces(self.server_url, operator)))
-        dry = script.sync_space(self.server_url, operator, space_id, apply=False)
-        self.assertTrue(script.needs_repair(dry))
+        before = script.dry_run(self.server_url, operator, space_id)
+        self.assertTrue(script.needs_attention(before))
         self.assertEqual(await self._membership(chat_id, s1_id, teacher), "leave")
 
-        applied = script.sync_space(self.server_url, operator, space_id, apply=True)
-        self.assertEqual(applied["chats"][0]["joined"], [s1_id])
+        after = script.repair(self.server_url, operator, space_id, wait_seconds=30)
+        self.assertFalse(script.needs_attention(after))
         self.assertEqual(await self._membership(chat_id, s1_id, teacher), "join")
-        self.assertFalse(
-            script.needs_repair(
-                script.sync_space(self.server_url, operator, space_id, apply=False)
-            )
-        )
 
 
 def _load_repair_script() -> Any:

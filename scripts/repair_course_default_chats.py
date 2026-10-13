@@ -10,8 +10,10 @@ and not by an endpoint that could sweep the whole homeserver.
 Without ``--apply`` the script is READ-ONLY: it walks every space on the
 homeserver (or only the ``--room-id`` ones given), asks the endpoint for a dry
 run of each, and prints the ones where something would change. With
-``--apply`` it then repairs exactly those, one call per space, and prints each
-space's report. Run it without ``--apply`` first and read the list.
+``--apply`` it then repairs exactly those, one call per space: the endpoint
+answers at once and works in the background, and the script re-checks each
+space with dry runs until nothing is left to change, then prints the outcome.
+Run it without ``--apply`` first and read the list.
 
 Usage:
     MATRIX_ADMIN_TOKEN=... python scripts/repair_course_default_chats.py \
@@ -43,18 +45,37 @@ SPACE_ROOM_TYPE = "m.space"
 PAGE_SIZE = 100
 PAGE_PAUSE_SECONDS = 0.2
 MAX_PAGES = 1000
+POLL_SECONDS = 3.0
+# Joins are paced by Synapse's per-room join limit, about one a second after
+# a burst of ten, so a large class takes minutes.
+DEFAULT_WAIT_SECONDS = 900
+
+
+class RequestFailed(Exception):
+    """One HTTP request to the homeserver failed; the message says how."""
 
 
 def _request_json(
-    url: str, token: str, body: Optional[Dict[str, Any]] = None, timeout: int = 300
+    url: str, token: str, body: Optional[Dict[str, Any]] = None, timeout: int = 120
 ) -> Any:
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(url, data=data, method="POST" if body else "GET")
     request.add_header("Authorization", f"Bearer {token}")
     if data is not None:
         request.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise RequestFailed(
+            f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
+        ) from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise RequestFailed(f"{type(e).__name__}: {e}") from e
+    try:
+        return json.loads(raw)
+    except ValueError as e:
+        raise RequestFailed(f"non-JSON response: {raw[:300]}") from e
 
 
 def walk_spaces(homeserver: str, token: str) -> Iterator[str]:
@@ -73,26 +94,45 @@ def walk_spaces(homeserver: str, token: str) -> Iterator[str]:
     raise RuntimeError(f"More than {MAX_PAGES} pages of rooms; refusing to continue")
 
 
-def sync_space(
-    homeserver: str, token: str, room_id: str, *, apply: bool
-) -> Dict[str, Any]:
-    """The endpoint's report for one space: what would change, or what did."""
+def dry_run(homeserver: str, token: str, room_id: str) -> Dict[str, Any]:
+    """The endpoint's report of what would change in one space."""
     return _request_json(
-        f"{homeserver}{REPAIR_PATH}",
-        token,
-        body={"room_id": room_id, "dry_run": not apply},
+        f"{homeserver}{REPAIR_PATH}", token, body={"room_id": room_id, "dry_run": True}
     )
 
 
-def needs_repair(report: Dict[str, Any]) -> bool:
-    """Whether a dry-run report shows anything to change in any chat."""
+def remaining_work(report: Dict[str, Any]) -> bool:
+    """Whether a dry-run report shows anything the sync could still change."""
     return any(
-        chat["promoted"]
-        or chat["demoted"]
-        or chat["joined"]
-        or chat["admin_sender_missing"]
+        chat["promoted"] or chat["demoted"] or chat["joined"]
         for chat in report.get("chats", [])
     )
+
+
+def needs_attention(report: Dict[str, Any]) -> bool:
+    """Whether a report shows anything to change, or anything the sync cannot
+    fix on its own (a chat nobody can act for, a failed step)."""
+    return remaining_work(report) or any(
+        chat["admin_sender_missing"] or chat["failed"]
+        for chat in report.get("chats", [])
+    )
+
+
+def repair(
+    homeserver: str, token: str, room_id: str, *, wait_seconds: float
+) -> Dict[str, Any]:
+    """Repair one space and return the dry-run report once nothing is left to
+    change, or once the sync has reported what it could not do. Raises when
+    the wait runs out with work still pending."""
+    _request_json(f"{homeserver}{REPAIR_PATH}", token, body={"room_id": room_id})
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        time.sleep(POLL_SECONDS)
+        report = dry_run(homeserver, token, room_id)
+        if not remaining_work(report):
+            return report
+        if time.monotonic() > deadline:
+            raise RequestFailed(f"still {describe(report)} after {int(wait_seconds)} s")
 
 
 def describe(report: Dict[str, Any]) -> str:
@@ -124,6 +164,12 @@ def main() -> int:
     parser.add_argument(
         "--apply", action="store_true", help="Repair the spaces that need it."
     )
+    parser.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=DEFAULT_WAIT_SECONDS,
+        help="How long to wait for one space's repair to finish.",
+    )
     args = parser.parse_args()
 
     token = os.environ.get("MATRIX_ADMIN_TOKEN")
@@ -132,42 +178,46 @@ def main() -> int:
         return 2
     homeserver = args.homeserver.rstrip("/")
 
-    spaces: List[str] = args.room_id or list(walk_spaces(homeserver, token))
+    try:
+        spaces: List[str] = args.room_id or list(walk_spaces(homeserver, token))
+    except (RequestFailed, RuntimeError) as e:
+        print(f"Could not list spaces: {e}", file=sys.stderr)
+        return 1
     print(f"Checking {len(spaces)} spaces")
+
     to_repair: List[str] = []
+    check_failures = 0
     for room_id in spaces:
         try:
-            report = sync_space(homeserver, token, room_id, apply=False)
-        except urllib.error.HTTPError as e:
-            print(
-                f"{room_id}: dry run failed with HTTP {e.code}: {e.read().decode('utf-8', 'replace')}"
-            )
+            report = dry_run(homeserver, token, room_id)
+        except RequestFailed as e:
+            check_failures += 1
+            print(f"{room_id}: dry run failed: {e}")
             continue
-        if needs_repair(report):
+        if needs_attention(report):
             to_repair.append(room_id)
             print(f"{room_id}: {describe(report)}")
-    print(f"{len(to_repair)} of {len(spaces)} spaces need repair")
+    print(
+        f"{len(to_repair)} of {len(spaces)} spaces need attention,"
+        f" {check_failures} could not be checked"
+    )
 
     if not args.apply or not to_repair:
-        return 0
+        return 1 if check_failures else 0
 
-    failures = 0
+    repair_failures = 0
     for room_id in to_repair:
         try:
-            report = sync_space(homeserver, token, room_id, apply=True)
-        except urllib.error.HTTPError as e:
-            failures += 1
-            print(
-                f"{room_id}: repair failed with HTTP {e.code}: {e.read().decode('utf-8', 'replace')}"
-            )
+            report = repair(homeserver, token, room_id, wait_seconds=args.wait_seconds)
+        except RequestFailed as e:
+            repair_failures += 1
+            print(f"{room_id}: repair failed: {e}")
             continue
-        if any(
-            chat["failed"] or chat["admin_sender_missing"] for chat in report["chats"]
-        ):
-            failures += 1
-        print(f"{room_id}: repaired: {describe(report)}")
-    print(f"Repaired {len(to_repair)} spaces, {failures} with failures")
-    return 1 if failures else 0
+        if needs_attention(report):
+            repair_failures += 1
+        print(f"{room_id}: after repair: {describe(report)}")
+    print(f"Repaired {len(to_repair)} spaces, {repair_failures} still need attention")
+    return 1 if (repair_failures or check_failures) else 0
 
 
 if __name__ == "__main__":

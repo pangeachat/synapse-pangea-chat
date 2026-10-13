@@ -14,9 +14,19 @@ def user_power(state, user_id):
     power = state.get((EventTypes.PowerLevels, ""))
     if power is None:
         return 0
-    return power.content.get("users", {}).get(
-        user_id, power.content.get("users_default", 0)
-    )
+    users_default = _level(power.content.get("users_default"), 0)
+    return _level(power.content.get("users", {}).get(user_id), users_default)
+
+
+def _level(value, default):
+    """A power level as an int. Old room versions let a string through, and a
+    comparison against it would raise instead of answering."""
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def is_joined_instructor(state, user_id):
