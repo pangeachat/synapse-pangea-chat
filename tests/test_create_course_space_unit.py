@@ -570,3 +570,89 @@ class TestShareKitQrCode(unittest.IsolatedAsyncioTestCase):
             "tlsname",
         ):
             self.assertIn(name, params)
+
+
+class TestCourseCopyAtCreation(unittest.IsolatedAsyncioTestCase):
+    """The course copy rides in the space's initial state, sent by the
+    requester at power level 100; without one the course is created as before
+    (create-course-space.instructions.md, Content Studio CONTRACT)."""
+
+    COPY = {
+        "version": 1,
+        "revision": 1,
+        "missions": [{"lo_id": "lo-a", "activity_ids": ["act-1"]}],
+    }
+
+    async def _create(self, copy: Any) -> tuple[Any, Any, Any]:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from synapse_pangea_chat.config import PangeaChatConfig
+        from synapse_pangea_chat.email_invite.create_course_space import (
+            CreateCourseSpace,
+        )
+
+        api = MagicMock()
+        api.server_name = "x"
+        requester = MagicMock()
+        requester.user.to_string.return_value = "@bot:x"
+        api._hs.get_auth.return_value.get_user_by_req = AsyncMock(
+            return_value=requester
+        )
+        create_room = AsyncMock(return_value=("!room:x", None, None))
+        api._hs.get_room_creation_handler.return_value.create_room = create_room
+        claim_store = MagicMock()
+        claim_store.record = AsyncMock()
+        resource = CreateCourseSpace(
+            api,
+            PangeaChatConfig(cms_base_url="http://cms", cms_service_api_key="k"),
+            claim_store,
+            MagicMock(),
+        )
+        read = AsyncMock(return_value=copy)
+        prefix = "synapse_pangea_chat.email_invite.create_course_space."
+        with (
+            patch(
+                prefix + "extract_body_json",
+                AsyncMock(return_value={"title": "Spanish 1", "course_plan_id": "q1"}),
+            ),
+            patch(prefix + "new_unique_code", AsyncMock(side_effect=["c1", "c2"])),
+            patch(prefix + "respond_with_json") as respond,
+            patch.object(resource._course_missions, "read", read),
+        ):
+            await resource._async_render_POST(MagicMock())
+        return create_room, respond, read
+
+    @staticmethod
+    def _state(create_room: Any) -> dict[str, Any]:
+        config = create_room.await_args.kwargs["config"]
+        return {event["type"]: event for event in config["initial_state"]}
+
+    async def test_copy_is_written_in_initial_state(self) -> None:
+        create_room, respond, read = await self._create(self.COPY)
+
+        read.assert_awaited_once_with("q1")
+        state = self._state(create_room)
+        event = state["pangea.course_missions"]
+        self.assertEqual(event["state_key"], "")
+        self.assertEqual(event["content"], self.COPY)
+        # Sent by the room creator, who holds 100 in the initial power levels,
+        # and only that level may write the copy.
+        self.assertEqual(
+            create_room.await_args.kwargs["requester"].user.to_string(), "@bot:x"
+        )
+        power = state["m.room.power_levels"]["content"]
+        self.assertEqual(power["users"], {"@bot:x": 100})
+        self.assertEqual(power["events"]["pangea.course_missions"], 100)
+        self.assertEqual(respond.call_args.args[1], 200)
+
+    async def test_no_copy_still_creates_the_course(self) -> None:
+        create_room, respond, _ = await self._create(None)
+
+        state = self._state(create_room)
+        self.assertNotIn("pangea.course_missions", state)
+        self.assertEqual(
+            state["m.room.power_levels"]["content"]["events"]["pangea.course_missions"],
+            100,
+        )
+        self.assertEqual(respond.call_args.args[1], 200)
+        self.assertEqual(respond.call_args.args[2]["room_id"], "!room:x")
