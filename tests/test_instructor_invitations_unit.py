@@ -125,7 +125,11 @@ class _Base(unittest.IsolatedAsyncioTestCase):
         self.notifier = MagicMock()
         self.notifier.notify = AsyncMock()
         self.provisioner = CourseProvisioner(
-            self.api, self.invitations, self.claims, self.notifier
+            self.api,
+            self.invitations,
+            self.claims,
+            self.notifier,
+            course_missions=MagicMock(read=AsyncMock(return_value=None)),
         )
 
     async def _call(self, method: str, body: Any = None, args: dict | None = None):

@@ -30,6 +30,7 @@ from synapse_pangea_chat.email_invite.course_claim_reminder import (
 )
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.email_invite.course_invitation_api import CourseInvitationAPI
+from synapse_pangea_chat.email_invite.course_missions import CourseMissionsReader
 from synapse_pangea_chat.email_invite.instructor_invitations import (
     InstructorInvitationAPI,
 )
@@ -357,6 +358,9 @@ class PangeaChat:
             course_claim_store.invitations,
             course_claim_store,
             course_claim_notifier,
+            course_missions=CourseMissionsReader(
+                api, config.cms_base_url, config.cms_service_api_key
+            ),
             blocked_join_gate_enabled=config.blocked_join_gate_enabled,
         )
 
