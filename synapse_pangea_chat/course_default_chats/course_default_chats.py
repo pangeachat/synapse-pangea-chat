@@ -93,13 +93,7 @@ def is_default_chat_alias(alias: Any) -> bool:
 
 
 def _power_of(users: Mapping[str, Any], user_id: str, users_default: int) -> int:
-    value = users.get(user_id, users_default)
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        return users_default
-    try:
-        return int(value)
-    except ValueError:
-        return users_default
+    return _coerce_int(users.get(user_id, users_default), users_default)
 
 
 def admins_to_promote(
@@ -191,13 +185,18 @@ class ChatState:
         )
 
 
-def _coerce_int(value: Any) -> int:
-    if isinstance(value, bool) or value is None:
-        return 0
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """A power level as an int. Room versions before v10 let a non-integer
+    through; it is read as the default and said so, never raised on."""
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    logger.warning("Non-integer power level %r; using %d", value, default)
+    return default
 
 
 @attr.s(auto_attribs=True)

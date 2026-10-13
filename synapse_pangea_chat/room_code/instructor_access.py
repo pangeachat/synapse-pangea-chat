@@ -1,5 +1,11 @@
 """Current instructor authority, including creator power in newer rooms."""
+import logging
+
 from synapse.api.constants import EventTypes
+
+logger = logging.getLogger(
+    "synapse.module.synapse_pangea_chat.room_code.instructor_access"
+)
 
 
 def user_power(state, user_id):
@@ -21,12 +27,15 @@ def user_power(state, user_id):
 def _level(value, default):
     """A power level as an int. Old room versions let a string through, and a
     comparison against it would raise instead of answering."""
-    if isinstance(value, bool) or value is None:
+    if value is None:
         return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+    if not isinstance(value, bool):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    logger.warning("Non-integer power level %r; using %d", value, default)
+    return default
 
 
 def is_joined_instructor(state, user_id):
