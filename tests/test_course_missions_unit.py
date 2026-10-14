@@ -151,6 +151,20 @@ class TestBuildCourseMissionsContent(unittest.TestCase):
             ],
         )
 
+    def test_a_mission_listed_twice_keeps_its_first_place(self) -> None:
+        # Readers reject a copy that names the same Mission twice.
+        content = build_course_missions_content(
+            _quest(["lo-a", "lo-b", "lo-a"]), [_activity("act-1", ["lo-a"])]
+        )
+
+        self.assertEqual(
+            content["missions"],
+            [
+                {"lo_id": "lo-a", "activity_ids": ["act-1"]},
+                {"lo_id": "lo-b", "activity_ids": []},
+            ],
+        )
+
     def test_populated_relationships_are_read_by_id(self) -> None:
         content = build_course_missions_content(
             _quest([{"id": "lo-a", "text": "x"}]),
