@@ -33,6 +33,10 @@ from twisted.web.resource import Resource
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
+from synapse_pangea_chat.email_invite.course_missions import (
+    COURSE_MISSIONS_STATE_EVENT_TYPE,
+    CourseMissionsReader,
+)
 from synapse_pangea_chat.grant_instructor_analytics_access.grant_instructor_analytics_access import (
     COURSE_SETTINGS_STATE_EVENT_TYPE,
     REQUIRE_ANALYTICS_ACCESS_KEY,
@@ -82,6 +86,8 @@ DEFAULT_SPACE_POWER_LEVELS: Dict[str, Any] = {
         "m.room.power_levels": 100,
         "m.room.join_rules": 100,
         "m.space.child": 0,
+        # The course copy (Content Studio): only a course admin may write it.
+        COURSE_MISSIONS_STATE_EVENT_TYPE: 100,
     },
     "events_default": 0,
     "state_default": 50,
@@ -104,8 +110,8 @@ def build_course_plan_content(
     it is published (see public-courses.instructions.md).
 
     ``target_language`` is optional and taken from the request body, never
-    fetched: this endpoint does not call the CMS, and all details arrive in the
-    request (see create-course-space.instructions.md). A caller that omits it
+    fetched: the course details arrive in the request; the endpoint's one CMS
+    read is the course copy (see create-course-space.instructions.md). A caller that omits it
     still gets a valid course space; the one-time ``l2`` backfill repairs it
     later. ``l2`` is omitted entirely rather than written empty, because the
     catalog treats an empty value as absent and a key that is sometimes null
@@ -134,6 +140,9 @@ class CreateCourseSpace(Resource):
         self._datastores = self._api._hs.get_datastores()
         self._claim_store = claim_store
         self._mailer = mailer
+        self._course_missions = CourseMissionsReader(
+            api, config.cms_base_url, config.cms_service_api_key
+        )
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -242,6 +251,20 @@ class CreateCourseSpace(Resource):
                     "content": {REQUIRE_ANALYTICS_ACCESS_KEY: True},
                 },
             ]
+
+            # The course copy, built from the CMS. Optional: without it the
+            # course reads the shared quest order, and the read logs why.
+            course_missions = await self._course_missions.read(
+                course_plan_id if isinstance(course_plan_id, str) else ""
+            )
+            if course_missions is not None:
+                initial_state.append(
+                    {
+                        "type": COURSE_MISSIONS_STATE_EVENT_TYPE,
+                        "state_key": "",
+                        "content": course_missions,
+                    }
+                )
 
             # Power levels with creator as admin
             power_levels = dict(DEFAULT_SPACE_POWER_LEVELS)

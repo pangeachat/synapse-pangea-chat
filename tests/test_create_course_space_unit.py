@@ -570,3 +570,165 @@ class TestShareKitQrCode(unittest.IsolatedAsyncioTestCase):
             "tlsname",
         ):
             self.assertIn(name, params)
+
+
+class TestCourseCopyAtCreation(unittest.IsolatedAsyncioTestCase):
+    """The course copy rides in the space's initial state, sent by the
+    requester at power level 100; without one the course is created as before
+    (create-course-space.instructions.md, Content Studio CONTRACT)."""
+
+    COPY = {
+        "version": 1,
+        "revision": 1,
+        "missions": [{"lo_id": "lo-a", "activity_ids": ["act-1"]}],
+    }
+
+    async def _create(self, copy: Any) -> tuple[Any, Any, Any]:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from synapse_pangea_chat.config import PangeaChatConfig
+        from synapse_pangea_chat.email_invite.create_course_space import (
+            CreateCourseSpace,
+        )
+
+        api = MagicMock()
+        api.server_name = "x"
+        requester = MagicMock()
+        requester.user.to_string.return_value = "@bot:x"
+        api._hs.get_auth.return_value.get_user_by_req = AsyncMock(
+            return_value=requester
+        )
+        create_room = AsyncMock(return_value=("!room:x", None, None))
+        api._hs.get_room_creation_handler.return_value.create_room = create_room
+        claim_store = MagicMock()
+        claim_store.record = AsyncMock()
+        resource = CreateCourseSpace(
+            api,
+            PangeaChatConfig(cms_base_url="http://cms", cms_service_api_key="k"),
+            claim_store,
+            MagicMock(),
+        )
+        read = AsyncMock(return_value=copy)
+        prefix = "synapse_pangea_chat.email_invite.create_course_space."
+        with (
+            patch(
+                prefix + "extract_body_json",
+                AsyncMock(return_value={"title": "Spanish 1", "course_plan_id": "q1"}),
+            ),
+            patch(prefix + "new_unique_code", AsyncMock(side_effect=["c1", "c2"])),
+            patch(prefix + "respond_with_json") as respond,
+            patch.object(resource._course_missions, "read", read),
+        ):
+            await resource._async_render_POST(MagicMock())
+        return create_room, respond, read
+
+    @staticmethod
+    def _state(create_room: Any) -> dict[str, Any]:
+        config = create_room.await_args.kwargs["config"]
+        return {event["type"]: event for event in config["initial_state"]}
+
+    async def test_copy_is_written_in_initial_state(self) -> None:
+        create_room, respond, read = await self._create(self.COPY)
+
+        read.assert_awaited_once_with("q1")
+        state = self._state(create_room)
+        event = state["pangea.course_missions"]
+        self.assertEqual(event["state_key"], "")
+        self.assertEqual(event["content"], self.COPY)
+        # Sent by the room creator, who holds 100 in the initial power levels,
+        # and only that level may write the copy.
+        self.assertEqual(
+            create_room.await_args.kwargs["requester"].user.to_string(), "@bot:x"
+        )
+        power = state["m.room.power_levels"]["content"]
+        self.assertEqual(power["users"], {"@bot:x": 100})
+        self.assertEqual(power["events"]["pangea.course_missions"], 100)
+        self.assertEqual(respond.call_args.args[1], 200)
+
+    async def test_no_copy_still_creates_the_course(self) -> None:
+        create_room, respond, _ = await self._create(None)
+
+        state = self._state(create_room)
+        self.assertNotIn("pangea.course_missions", state)
+        self.assertEqual(
+            state["m.room.power_levels"]["content"]["events"]["pangea.course_missions"],
+            100,
+        )
+        self.assertEqual(respond.call_args.args[1], 200)
+        self.assertEqual(respond.call_args.args[2]["room_id"], "!room:x")
+
+
+class TestHungCmsStillCreatesTheCourse(unittest.TestCase):
+    """A CMS that never answers costs course creation at most 3 s: the copy
+    read gives up and the course is created without it. Driven on a fake
+    reactor clock, so the test takes no real time."""
+
+    def test_course_created_within_the_cap(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from synapse.util.clock import Clock
+        from twisted.internet import defer
+        from twisted.internet.testing import MemoryReactorClock
+
+        from synapse_pangea_chat.config import PangeaChatConfig
+        from synapse_pangea_chat.email_invite.create_course_space import (
+            CreateCourseSpace,
+        )
+
+        reactor = MemoryReactorClock()
+        api = MagicMock()
+        api.server_name = "x"
+        api._hs.get_clock.return_value = Clock(reactor, server_name="x")  # type: ignore[arg-type]
+        requester = MagicMock()
+        requester.user.to_string.return_value = "@bot:x"
+        api._hs.get_auth.return_value.get_user_by_req = AsyncMock(
+            return_value=requester
+        )
+        hung: list[defer.Deferred] = []
+
+        async def request(*_args: Any, **_kwargs: Any) -> Any:
+            d: defer.Deferred = defer.Deferred()
+            hung.append(d)
+            return await d
+
+        api.http_client.request = request
+        create_room = AsyncMock(return_value=("!room:x", None, None))
+        api._hs.get_room_creation_handler.return_value.create_room = create_room
+        claim_store = MagicMock()
+        claim_store.record = AsyncMock()
+        resource = CreateCourseSpace(
+            api,
+            PangeaChatConfig(cms_base_url="http://cms", cms_service_api_key="k"),
+            claim_store,
+            MagicMock(),
+        )
+        prefix = "synapse_pangea_chat.email_invite.create_course_space."
+        with (
+            patch(
+                prefix + "extract_body_json",
+                AsyncMock(return_value={"title": "Spanish 1", "course_plan_id": "q1"}),
+            ),
+            patch(prefix + "new_unique_code", AsyncMock(side_effect=["c1", "c2"])),
+            patch(prefix + "respond_with_json") as respond,
+            self.assertLogs(
+                "synapse.module.synapse_pangea_chat.email_invite.course_missions",
+                "WARNING",
+            ),
+        ):
+            done = defer.ensureDeferred(resource._async_render_POST(MagicMock()))
+            self.assertEqual(len(hung), 1)
+            # Exact binary fractions: the clock lands on 3.0 s, not near it.
+            reactor.advance(2.75)
+            self.assertFalse(done.called)
+            create_room.assert_not_awaited()
+            reactor.advance(0.25)
+            self.assertTrue(done.called)
+
+        self.assertTrue(hung[0].called)  # the hung request was cancelled
+        create_room.assert_awaited_once()
+        assert create_room.await_args is not None
+        config = create_room.await_args.kwargs["config"]
+        self.assertNotIn(
+            "pangea.course_missions", {e["type"] for e in config["initial_state"]}
+        )
+        self.assertEqual(respond.call_args.args[1], 200)
