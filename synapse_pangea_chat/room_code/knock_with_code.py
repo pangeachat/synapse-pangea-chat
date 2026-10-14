@@ -6,7 +6,7 @@ if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 from synapse.api.errors import (
     AuthError,
@@ -179,6 +179,7 @@ class KnockWithCode(Resource):
             # A student invitation's own code opens its course like the class code and
             # records which invitation the join came from; it is never spent.
             student = await self._claim_store.students.for_code(access_code)
+            found: Optional[Tuple[List[RoomCodeMatch], Set[str]]]
             if student is not None:
                 found = (
                     [RoomCodeMatch(room_id=student["room_id"], is_admin_code=False)],
