@@ -232,8 +232,10 @@ class CourseClaimStore:
         self._db_pool = homeserver.get_datastores().main.db_pool
         self._table_ready = False
         from .course_invitations import CourseInvitationStore
+        from .student_invitations import StudentInvitationStore
 
         self.invitations = CourseInvitationStore(homeserver)
+        self.students = StudentInvitationStore(homeserver)
 
     async def _ensure_table(self) -> None:
         if self._table_ready:

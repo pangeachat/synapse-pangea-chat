@@ -51,7 +51,17 @@ async def code_is_taken(
     )
     if matches is None or len(matches) > 0:
         return True
-    return await claim_store.code_in_use(access_code)
+    if await claim_store.code_in_use(access_code):
+        return True
+    # Student invitation codes open a course like a class code, so they share the namespace.
+    from synapse_pangea_chat.email_invite.student_invitations import (
+        StudentInvitationStore,
+    )
+
+    students = getattr(claim_store, "students", None)
+    if isinstance(students, StudentInvitationStore):
+        return await students.code_in_use(access_code)
+    return False
 
 
 #: Attempts before giving up on finding a free code.

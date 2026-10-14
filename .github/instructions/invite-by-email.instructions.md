@@ -12,11 +12,19 @@ Cross-repo design: [conference-course-invite.instructions.md](../../../.github/.
 
 - **Auth**: Matrix access token. Caller must be admin (power level 100) in the room → 403 otherwise.
 - **Request**: `{ room_id, emails, message? }`
-- **Response**: `{ emailed, errors }`
+- **Response**: `{ emailed, errors, invitations }`, where `invitations` is `[{ email, invitation_id }]`, one per address emailed.
 
 ## Behavior
 
-For each email, send a branded Jinja2 email with join link.
+For each email, send a branded Jinja2 email with a join link.
+
+**One invitation per address, with its own code** (pangeachat/.github#718; Will, 2026-10-14). Each address gets a student invitation: a fresh seven-character code from the shared generator, free in join rules, among claim codes and among other student invitations, stored as a digest with the room, the address, the inviter and the time (`pangea_student_invitation`). The email's link is that code, `<app>/<code>` ([build_join_url](../../synapse_pangea_chat/email_invite/build_join_url.py)), so a join names the invitation it came from. The share kit and the QR keep the class code; a student who types a code still joins with the class code.
+
+**The code is never spent.** It opens the course like the class link for as long as the class link does, so a student who opens the email twice, or a forwarded link, still joins; `knock_with_code` resolves it before the class-code lookup and records each join against the invitation, the first as the invitee's (`first_used_by`, `first_used_at_ms`) and every one in `uses`. Attribution is evidence, never a gate: nothing about the join depends on the code being the invitee's.
+
+**The address stays with the invitation**, as a requested course's requesting address does, so a reminder to an invited student who has not joined can be sent by invitation id without the caller holding the address, and the dashboard marks who joined by id rather than guessing from an address. It is never returned by a read. Retention follows the dashboard's roster (admin-dash-api roster-invites); there is no purge yet.
+
+**Reading a course's invitations**: `GET /_synapse/client/pangea/v1/student_invitations?room_id=` for the course's admins (power level 100) and server admins (the engagement runner): each invitation's id, when and by whom it was sent, first use and use count. No addresses.
 
 Room name, description, avatar, access code, and inviter identity are all read from room state — nothing is passed in the request. Inviter identity = all human users at the highest power level in the room.
 
@@ -35,4 +43,5 @@ Uses Synapse's built-in email sending (SMTP via Exim → SES). Templates live in
 ## Future Work
 
 - Rate limiting / batch size limits — no issue yet
-- Invite delivery tracking — no issue yet
+- A reminder to an invited student who has not joined, sent by invitation id with the caller's rendered copy, as the claim reminder is (pangeachat/.github#718)
+- A purge of invitations whose roster rows are gone

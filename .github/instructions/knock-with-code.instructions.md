@@ -76,7 +76,9 @@ A missing prepared specification, failed provisioning or failed rights verificat
 
 ## Codes, share kit and existing courses
 
-Store only private fingerprints of claim codes; do not log raw codes or access tokens. Earlier reminder links work for the same invitation until completion or explicit revocation. The class code is created with the room and grants only ordinary membership. The initial email carries the claim CTA; the class link follows after ownership is established.
+Store only private fingerprints of claim codes; do not log raw codes or access tokens.
+
+A student invitation's code ([invite-by-email](invite-by-email.instructions.md), one per invited address) is resolved before the join-rules lookup: it opens that invitation's course exactly as its class code would, is never spent, and each join through it is recorded against the invitation. It shares the code namespace with class codes and claim codes, so every new code is checked against all three. Earlier reminder links work for the same invitation until completion or explicit revocation. The class code is created with the room and grants only ordinary membership. The initial email carries the claim CTA; the class link follows after ownership is established.
 
 Completion durably records that the share-kit email is owed to the original requesting address, even when another account accepted a forwarded link. The share kit is the email the caller stored with the invitation ([create-course-space](create-course-space.instructions.md), `claimed_email`), with the class link filled in, or the module's own template when none was stored; a failed read of the stored email leaves the share kit owed and retried, never sent from the template in its place. It does not name that account. Sending uses exclusive reservation and independent retries; an ambiguous mail timeout may duplicate a share kit but must not recreate a course. Clear the requesting address after successful delivery while retaining claim and room references for audit and authorized replay.
 

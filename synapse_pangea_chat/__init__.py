@@ -39,6 +39,7 @@ from synapse_pangea_chat.email_invite.instructor_invitations import (
     InstructorInvitationAPI,
 )
 from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
+from synapse_pangea_chat.email_invite.student_invitation_api import StudentInvitationAPI
 from synapse_pangea_chat.email_policy import EmailPolicy
 from synapse_pangea_chat.export_user_data import ExportUserData
 from synapse_pangea_chat.find_user_by_email import FindUserByEmail
@@ -439,10 +440,15 @@ class PangeaChat:
         )
 
         # --- Invite By Email ---
-        self.invite_by_email_resource = InviteByEmail(api, config)
+        self.invite_by_email_resource = InviteByEmail(api, config, course_claim_store)
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/invite_by_email",
             resource=self.invite_by_email_resource,
+        )
+        # Which invitations a course's students joined through (the dashboard and the runner read it).
+        api.register_web_resource(
+            path="/_synapse/client/pangea/v1/student_invitations",
+            resource=StudentInvitationAPI(api, course_claim_store),
         )
 
         # --- Delete Room ---
