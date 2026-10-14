@@ -4,8 +4,11 @@ and rename it to match.
 ``POST /_synapse/client/pangea/v1/set_course_plan``
 
 Design: set-course-plan.instructions.md. The space's own copy of its Can-Do
-list (``pangea.course_missions``) is replaced for the new quest first, so the
-course never lists the old quest's Can-Dos. The events are sent as the space's
+list (``pangea.course_missions``), when it has one, is cleared first, so the
+course falls back to the new quest's list instead of the old quest's Can-Dos;
+the teacher's next Content Studio publish writes the new copy. The module does
+not build the copy itself: its CMS read cannot see the quest owner's private
+activities. The events are sent as the space's
 own strongest local instructor (``joined_local_instructors``, power level 100,
 which readers require of the copy's sender), so nobody joins and nobody's power
 level changes; the operator is recorded in the log line instead.
@@ -32,7 +35,6 @@ from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_invite.course_missions import (
     COURSE_MISSIONS_STATE_EVENT_TYPE,
-    CourseMissionsReader,
 )
 from synapse_pangea_chat.public_courses.backfill_l2 import (
     CANONICAL_PLAN_ID_KEY,
@@ -104,18 +106,6 @@ def copy_revision(content: Optional[Mapping[str, Any]]) -> Optional[int]:
     return None
 
 
-def course_copy_content(
-    built: Optional[Dict[str, Any]], current: Optional[Mapping[str, Any]]
-) -> Dict[str, Any]:
-    """The course copy to write for the new quest: the copy built from the CMS
-    at one revision above the current copy's (1 when there is none), so an open
-    Studio refuses a stale publish. Empty content when it could not be built,
-    so readers fall back to the new shared quest rather than the old Can-Dos."""
-    if built is None:
-        return {}
-    return {**built, "revision": (copy_revision(current) or 0) + 1}
-
-
 def topic_content(text: str) -> Dict[str, Any]:
     """Topic content in the shape Synapse's own createRoom writes."""
     return {"topic": text, "m.topic": {"m.text": [{"body": text}]}}
@@ -124,23 +114,24 @@ def topic_content(text: str) -> Dict[str, Any]:
 def planned_writes(
     update: PlanUpdate,
     plan_event_type: str,
-    copy: Dict[str, Any],
+    has_copy: bool,
     current_name: Optional[str],
     current_topic: Optional[str],
     title: str,
     description: str,
 ) -> List[Tuple[str, Dict[str, Any]]]:
-    """The state events to send, in order: when the plan changes, the course
-    copy and then the course plan; then the name, then the topic, each only
-    when it differs from what the space has.
+    """The state events to send, in order: when the plan changes, the cleared
+    course copy (only if the space has one) and then the course plan; then the
+    name, then the topic, each only when it differs from what the space has.
 
-    The copy goes first so a refusal part-way leaves the plan on the old quest,
-    and sending the same request again finishes the job. Once the plan points
-    at the new quest the copy is never rewritten, so a re-run cannot wipe the
-    teacher's later edits."""
+    The copy is cleared first so a refusal part-way leaves the plan on the old
+    quest, and sending the same request again finishes the job. Once the plan
+    points at the new quest the copy is not touched again, so a re-run does not
+    wipe a copy the teacher has published since."""
     writes: List[Tuple[str, Dict[str, Any]]] = []
     if update.outcome == UPDATE and update.content is not None:
-        writes.append((COURSE_MISSIONS_STATE_EVENT_TYPE, copy))
+        if has_copy:
+            writes.append((COURSE_MISSIONS_STATE_EVENT_TYPE, {}))
         writes.append((plan_event_type, update.content))
     if current_name != title:
         writes.append((EventTypes.Name, {"name": title}))
@@ -216,9 +207,6 @@ class SetCoursePlan(Resource):
             config.course_plan_state_event_type
             or DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE
         )
-        self._course_missions = CourseMissionsReader(
-            api, config.cms_base_url, config.cms_service_api_key
-        )
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -292,35 +280,18 @@ class SetCoursePlan(Resource):
 
             current_name = _state_text(state.get((EventTypes.Name, "")), "name")
             current_topic = _state_text(state.get((EventTypes.Topic, "")), "topic")
-            copy: Dict[str, Any] = {}
-            copy_report: Optional[Dict[str, Any]] = None
-            if update.outcome == UPDATE:
-                current_copy = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
-                current_copy_content = (
-                    dict(current_copy.content)
-                    if current_copy is not None
-                    and isinstance(current_copy.content, Mapping)
-                    else None
-                )
-                built = await self._course_missions.read(req.quest_id)
-                if built is None:
-                    logger.warning(
-                        "set_course_plan: no course copy built for quest %s in %s; "
-                        "an empty copy is written so readers use the shared quest",
-                        req.quest_id,
-                        room_id,
-                    )
-                copy = course_copy_content(built, current_copy_content)
-                copy_report = {
-                    "built": built is not None,
-                    "previous_revision": copy_revision(current_copy_content),
-                    "revision": copy_revision(copy),
-                    "missions": len(copy.get("missions") or []),
-                }
+            # An empty copy already reads as none, so it is not cleared again.
+            current_copy = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
+            copy_content = (
+                dict(current_copy.content)
+                if current_copy is not None
+                and isinstance(current_copy.content, Mapping)
+                else {}
+            )
             writes = planned_writes(
                 update,
                 self._event_type,
-                copy,
+                bool(copy_content),
                 current_name,
                 current_topic,
                 req.title,
@@ -333,7 +304,11 @@ class SetCoursePlan(Resource):
                 "previous_name": current_name,
                 "previous_topic": current_topic,
                 "changes": [event_type for event_type, _ in writes],
-                "course_copy": copy_report,
+                "cleared_copy_revision": (
+                    copy_revision(copy_content)
+                    if any(t == COURSE_MISSIONS_STATE_EVENT_TYPE for t, _ in writes)
+                    else None
+                ),
                 "dry_run": req.dry_run,
             }
             if not writes:
