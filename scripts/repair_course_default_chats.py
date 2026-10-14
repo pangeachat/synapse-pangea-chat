@@ -135,11 +135,25 @@ def repair(
     deadline = time.monotonic() + wait_seconds
     while True:
         time.sleep(POLL_SECONDS)
-        report = dry_run(homeserver, token, room_id)
+        try:
+            report = dry_run(homeserver, token, room_id)
+        except RequestFailed as e:
+            # The sync is running on the server regardless of what the proxy
+            # made of one poll; a gateway error or timeout is "not done yet".
+            if not _transient(e) or time.monotonic() > deadline:
+                raise
+            continue
         if not remaining_work(report):
             return report
         if time.monotonic() > deadline:
             raise RequestFailed(f"still {describe(report)} after {int(wait_seconds)} s")
+
+
+def _transient(e: RequestFailed) -> bool:
+    text = str(e)
+    return (
+        text.startswith(("HTTP 502", "HTTP 503", "HTTP 504")) or "TimeoutError" in text
+    )
 
 
 def describe(report: Dict[str, Any]) -> str:

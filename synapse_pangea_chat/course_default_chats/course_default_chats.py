@@ -485,37 +485,19 @@ class CourseDefaultChats:
         only ever follow the joins, so it never removes the one member who
         could still let the others in."""
         report = ChatSyncReport(chat_id=chat_id)
-        async with self._chat_locks.queue(chat_id):
-            chat = await self._chat_state(chat_id)
-            # A chat with no current state (every local member left) has no
-            # creator to judge by; it falls through to the no-admin report.
-            if chat.creator is not None and not owned_by_space_admin(
-                chat, roster.admins
-            ):
-                report.ignored = (
-                    "the space has no joined admin"
-                    if not roster.admins
-                    else "neither created by a space admin nor holding one at admin power"
+        if apply:
+            async with self._chat_locks.queue(chat_id):
+                await self._sync_chat_steps(
+                    space_id, chat_id, roster, only_user, apply, report
                 )
-                logger.info(
-                    "course_default_chats ignoring %s in %s: %s",
-                    chat_id,
-                    space_id,
-                    report.ignored,
-                )
-                return report
-            chat = await self._promote_admins(chat_id, roster, report, apply, chat)
-            targets = [only_user] if only_user else sorted(roster.members)
-            if not chat.can_admit_members():
-                self._report_no_admin(
-                    chat_id, "no joined member can let members in", apply
-                )
-                report.admin_sender_missing = True
-            for user_id in targets:
-                await self._join_member(chat_id, user_id, chat, report, apply)
-            if apply and targets:
-                chat = await self._chat_state(chat_id)
-            await self._demote_admins(chat_id, roster, chat, report, apply)
+        else:
+            # A dry run only reads, so it never waits behind a running sync of
+            # the same chat: an operator polling a large class's repair would
+            # otherwise sit on the lock longer than the reverse proxy allows a
+            # request. Reporting a sync in progress is what the poll is for.
+            await self._sync_chat_steps(
+                space_id, chat_id, roster, only_user, apply, report
+            )
         logger.info(
             "course_default_chats %s %s in %s: %s",
             "synced" if apply else "dry run of",
@@ -524,6 +506,42 @@ class CourseDefaultChats:
             report,
         )
         return report
+
+    async def _sync_chat_steps(
+        self,
+        space_id: str,
+        chat_id: str,
+        roster: SpaceRoster,
+        only_user: Optional[str],
+        apply: bool,
+        report: ChatSyncReport,
+    ) -> None:
+        chat = await self._chat_state(chat_id)
+        # A chat with no current state (every local member left) has no
+        # creator to judge by; it falls through to the no-admin report.
+        if chat.creator is not None and not owned_by_space_admin(chat, roster.admins):
+            report.ignored = (
+                "the space has no joined admin"
+                if not roster.admins
+                else "neither created by a space admin nor holding one at admin power"
+            )
+            logger.info(
+                "course_default_chats ignoring %s in %s: %s",
+                chat_id,
+                space_id,
+                report.ignored,
+            )
+            return
+        chat = await self._promote_admins(chat_id, roster, report, apply, chat)
+        targets = [only_user] if only_user else sorted(roster.members)
+        if not chat.can_admit_members():
+            self._report_no_admin(chat_id, "no joined member can let members in", apply)
+            report.admin_sender_missing = True
+        for user_id in targets:
+            await self._join_member(chat_id, user_id, chat, report, apply)
+        if apply and targets:
+            chat = await self._chat_state(chat_id)
+        await self._demote_admins(chat_id, roster, chat, report, apply)
 
     async def _promote_admins(
         self,
