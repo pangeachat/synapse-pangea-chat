@@ -26,6 +26,7 @@ from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
+from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 from synapse_pangea_chat.room_code.constants import (
     ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
     EVENT_TYPE_M_ROOM_JOIN_RULES,
@@ -53,10 +54,13 @@ REQUIRED_POWER_LEVEL = 50
 class InviteByEmail(Resource):
     isLeaf = True
 
-    def __init__(self, api: ModuleApi, config: PangeaChatConfig):
+    def __init__(self, api: ModuleApi, config: PangeaChatConfig, claim_store=None):
         super().__init__()
         self._api = api
         self._config = config
+        # The claim store carries the student invitation store and the collision check a new
+        # code passes (knock-with-code.instructions.md); None only in tests of the old path.
+        self._claim_store = claim_store
         self._auth = self._api._hs.get_auth()
         self._send_email_handler = self._api._hs.get_send_email_handler()
         self._app_name = self._api._hs.config.email.email_app_name
@@ -151,15 +155,19 @@ class InviteByEmail(Resource):
                 )
                 return
 
-            join_url = build_join_url(self._config.app_base_url, access_code)
-
             # Send emails
             emailed: List[str] = []
             errors: List[Dict[str, str]] = []
+            invitations: List[Dict[str, str]] = []
 
             for email in emails:
                 email = email.strip()
                 try:
+                    # Each address gets its own invitation code as the link, so a join
+                    # names the invitation it came from (invite-by-email.instructions.md).
+                    invitation_id, join_url = await self._invitation_link(
+                        room_id, email, requester_id, access_code
+                    )
                     template_vars = {
                         "course_title": room_name or "a course",
                         "course_description": room_topic or "",
@@ -182,6 +190,10 @@ class InviteByEmail(Resource):
                         text=text,
                     )
                     emailed.append(email)
+                    if invitation_id:
+                        invitations.append(
+                            {"email": email, "invitation_id": invitation_id}
+                        )
                 except Exception as e:
                     logger.warning("Failed to send invite to %s: %s", email, e)
                     errors.append({"email": email, "error": str(e)})
@@ -189,7 +201,7 @@ class InviteByEmail(Resource):
             respond_with_json(
                 request,
                 200,
-                {"emailed": emailed, "errors": errors},
+                {"emailed": emailed, "errors": errors, "invitations": invitations},
                 send_cors=True,
             )
 
@@ -214,6 +226,23 @@ class InviteByEmail(Resource):
                 {"error": "Internal server error"},
                 send_cors=True,
             )
+
+    async def _invitation_link(
+        self, room_id: str, email: str, inviter_id: str, class_code: str
+    ) -> "tuple[Optional[str], str]":
+        """The invitation's id and the link the email carries: a fresh code of its own,
+        stored against the address, or the class link when no store is wired."""
+        if self._claim_store is None:
+            return None, build_join_url(self._config.app_base_url, class_code)
+        code = await new_unique_code(
+            self._api._hs.get_datastores().main, self._claim_store
+        )
+        if code is None:
+            raise RuntimeError("could not mint an invitation code")
+        invitation_id = await self._claim_store.students.create(
+            room_id, email, code, inviter_id, self._api._hs.get_clock().time_msec()
+        )
+        return invitation_id, build_join_url(self._config.app_base_url, code)
 
     async def _get_user_power_level(self, room_id: str, user_id: str) -> int:
         """Get a user's power level in a room."""
