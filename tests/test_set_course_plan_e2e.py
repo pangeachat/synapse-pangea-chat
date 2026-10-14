@@ -26,7 +26,10 @@ _NEW_COPY_MISSIONS = [
 
 class _QuestCmsHandler(BaseHTTPRequestHandler):
     """Answers the two reads the new quest's course copy is built from; any
-    other quest is unknown, so its copy cannot be built."""
+    other quest is unknown, so its copy cannot be built. While ``down`` is
+    set, every read fails, as an unavailable CMS would."""
+
+    down = False
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass
@@ -35,7 +38,9 @@ class _QuestCmsHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         code: int
         body: Dict[str, Any]
-        if (
+        if _QuestCmsHandler.down:
+            code, body = 503, {"errors": [{"message": "unavailable"}]}
+        elif (
             self.headers.get("Authorization")
             != "service-users API-Key test-cms-api-key"
         ):
@@ -185,7 +190,12 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         # A dry run names the sender, reports the current name and topic and
         # the copy it would write, and writes nothing.
         all_four = [_COURSE_COPY, _COURSE_PLAN, "m.room.name", "m.room.topic"]
-        first_copy = {"previous_revision": None, "revision": 1, "missions": 2}
+        first_copy = {
+            "built": True,
+            "previous_revision": None,
+            "revision": 1,
+            "missions": 2,
+        }
         resp = self._call({**switch, "dry_run": True}, admin_token)
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(resp.json()["sender"], teacher_id)
@@ -283,23 +293,39 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
             legacy_state[("m.room.name", "")]["content"]["name"], "Period 3"
         )
 
-        # A quest the CMS does not know: no copy can be built, so the switch is
-        # refused and nothing is written.
-        unknown = self._create_course_space(
+        # With the CMS down, the switch still lands and the copy is written
+        # empty, so readers fall back to the shared quest. Sending the request
+        # again with the new quest as the expected one rebuilds the copy.
+        unbuilt = self._create_course_space(
             teacher_token,
             {"uuid": "quest-old", "l2": "es"},
             copy={"version": 1, "revision": 2, "missions": []},
         )
-        unknown_before = self._admin_state(admin_token, unknown)
-        resp = self._call(
-            {**switch, "room_id": unknown, "quest_id": "quest-missing"}, admin_token
+        _QuestCmsHandler.down = True
+        try:
+            resp = self._call({**switch, "room_id": unbuilt}, admin_token)
+        finally:
+            _QuestCmsHandler.down = False
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            resp.json()["course_copy"],
+            {"built": False, "previous_revision": 2, "revision": None, "missions": 0},
         )
-        self.assertEqual(resp.status_code, 503, resp.text)
-        unknown_after = self._admin_state(admin_token, unknown)
-        for key in ((_COURSE_COPY, ""), (_COURSE_PLAN, ""), ("m.room.name", "")):
-            self.assertEqual(
-                unknown_after[key]["content"], unknown_before[key]["content"]
-            )
+        unbuilt_state = self._admin_state(admin_token, unbuilt)
+        self.assertEqual(unbuilt_state[(_COURSE_COPY, "")]["content"], {})
+        self.assertEqual(
+            unbuilt_state[(_COURSE_PLAN, "")]["content"]["uuid"], "quest-new"
+        )
+        resp = self._call(
+            {**switch, "room_id": unbuilt, "expected_quest_id": "quest-new"},
+            admin_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["changes"], [_COURSE_COPY])
+        self.assertEqual(
+            self._admin_state(admin_token, unbuilt)[(_COURSE_COPY, "")]["content"],
+            {"version": 1, "revision": 1, "missions": _NEW_COPY_MISSIONS},
+        )
 
         # With only a student left, nobody can send the event: refused,
         # and nobody is promoted to make it writable. (A room every local

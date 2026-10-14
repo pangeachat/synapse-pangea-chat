@@ -6,8 +6,10 @@ give it the new quest's Can-Do copy, and rename it to match.
 Design: set-course-plan.instructions.md. The space ends up as a course created
 from the new quest would be: its own copy of the Can-Do list
 (``pangea.course_missions``) is built by the same CMS read creation uses and
-written first, then the course plan, name and topic. A read that fails refuses
-the whole switch. The events are sent as the space's own strongest local
+written first, then the course plan, name and topic. A read that fails writes
+an empty copy, as create-course-space requires; sending the request again once
+the plan has landed rebuilds it. The events are sent as the space's own
+strongest local
 instructor (``joined_local_instructors``, power level 100, which readers
 require of the copy's sender), so nobody joins and nobody's power level
 changes; the operator is recorded in the log line instead.
@@ -107,10 +109,14 @@ def copy_revision(content: Optional[Mapping[str, Any]]) -> Optional[int]:
 
 
 def course_copy_content(
-    built: Mapping[str, Any], current: Optional[Mapping[str, Any]]
+    built: Optional[Mapping[str, Any]], current: Optional[Mapping[str, Any]]
 ) -> Dict[str, Any]:
     """The new quest's copy at one revision above the current copy's (1 when
-    there is none), so a Studio opened on the old copy refuses its publish."""
+    there is none), so a Studio opened on the old copy refuses its publish.
+    Empty content when it could not be built, so readers fall back to the new
+    shared quest rather than the old quest's Can-Dos."""
+    if built is None:
+        return {}
     return {**built, "revision": (copy_revision(current) or 0) + 1}
 
 
@@ -134,19 +140,21 @@ def planned_writes(
     title: str,
     description: str,
 ) -> List[Tuple[str, Dict[str, Any]]]:
-    """The state events to send, in order: when the plan changes, the new
-    quest's course copy and then the course plan; then the name, then the
-    topic, each only when it differs from what the space has.
+    """The state events to send, in order: the course copy when one is given,
+    the course plan when it changes, then the name, then the topic, each only
+    when it differs from what the space has.
 
-    The copy goes first so a refusal part-way leaves the plan on the old quest,
-    and sending the same request again finishes the job. Once the plan points
-    at the new quest the copy is not touched again, so a re-run does not wipe
-    edits the teacher has published since."""
+    ``copy`` is the copy to write, or None to leave the space's copy alone. A
+    plan change always carries one. Once the plan points at the new quest, only
+    an empty copy (left by a failed read) is given, so a re-run does not wipe
+    edits the teacher has published since. The copy goes first so a refusal
+    part-way leaves the plan on the old quest."""
     writes: List[Tuple[str, Dict[str, Any]]] = []
-    if update.outcome == UPDATE and update.content is not None:
-        if copy is None:
-            raise ValueError("a plan change needs the new quest's course copy")
+    if update.outcome == UPDATE and copy is None:
+        raise ValueError("a plan change needs the new quest's course copy")
+    if copy is not None:
         writes.append((COURSE_MISSIONS_STATE_EVENT_TYPE, copy))
+    if update.outcome == UPDATE and update.content is not None:
         writes.append((plan_event_type, update.content))
     if current_name != title:
         writes.append((EventTypes.Name, {"name": title}))
@@ -300,22 +308,23 @@ class SetCoursePlan(Resource):
             current_topic = _state_text(state.get((EventTypes.Topic, "")), "topic")
             current_copy = _content(state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
             copy: Optional[Dict[str, Any]] = None
-            if update.outcome == UPDATE:
+            built: Optional[Dict[str, Any]] = None
+            # A switch builds the new quest's copy; a space already on the
+            # quest whose copy is empty (a failed read) gets it rebuilt.
+            if update.outcome == UPDATE or current_copy == {}:
                 built = await self._course_missions.read(req.quest_id)
                 if built is None:
                     logger.error(
                         "set_course_plan: no course copy could be built for quest "
-                        "%s; switch of %s refused, nothing written",
+                        "%s in %s; %s",
                         req.quest_id,
                         room_id,
+                        (
+                            "an empty copy is written, so readers use the shared quest"
+                            if update.outcome == UPDATE
+                            else "its empty copy stays"
+                        ),
                     )
-                    respond_with_json(
-                        request,
-                        503,
-                        {"error": "The new quest's course copy could not be built"},
-                        send_cors=True,
-                    )
-                    return
                 # The read can take seconds; a teacher who changed course or
                 # published a copy in the meantime wins.
                 again = await self._api.get_room_state(
@@ -342,7 +351,8 @@ class SetCoursePlan(Resource):
                         send_cors=True,
                     )
                     return
-                copy = course_copy_content(built, current_copy)
+                if update.outcome == UPDATE or built is not None:
+                    copy = course_copy_content(built, current_copy)
             writes = planned_writes(
                 update,
                 self._event_type,
@@ -359,13 +369,16 @@ class SetCoursePlan(Resource):
                 "previous_name": current_name,
                 "previous_topic": current_topic,
                 "changes": [event_type for event_type, _ in writes],
+                # Reported whenever a copy was built or tried, so a failed
+                # rebuild of an empty copy is visible too.
                 "course_copy": (
                     {
+                        "built": built is not None,
                         "previous_revision": copy_revision(current_copy),
                         "revision": copy_revision(copy),
-                        "missions": len(copy.get("missions") or []),
+                        "missions": len((copy or {}).get("missions") or []),
                     }
-                    if copy is not None
+                    if update.outcome == UPDATE or current_copy == {}
                     else None
                 ),
                 "dry_run": req.dry_run,

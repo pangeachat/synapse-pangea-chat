@@ -92,6 +92,9 @@ class TestCourseCopy(unittest.TestCase):
 
         self.assertEqual(course_copy_content(self._BUILT, old)["revision"], 4)
 
+    def test_a_copy_that_could_not_be_built_is_empty(self) -> None:
+        self.assertEqual(course_copy_content(None, {"revision": 3}), {})
+
     def test_an_unreadable_old_revision_counts_as_none(self) -> None:
         olds: List[Optional[Dict[str, Any]]] = [
             None,
@@ -163,6 +166,19 @@ class TestPlannedWrites(unittest.TestCase):
         )
 
         self.assertEqual(writes, [("m.room.name", {"name": "New"})])
+
+    def test_an_empty_copy_on_the_quest_is_rebuilt_alone(self) -> None:
+        writes = planned_writes(
+            PlanUpdate(UNCHANGED, "new"),
+            "pangea.course_plan",
+            _COPY,
+            "New",
+            "Text",
+            "New",
+            "Text",
+        )
+
+        self.assertEqual(writes, [("pangea.course_missions", _COPY)])
 
     def test_nothing_differs_nothing_written(self) -> None:
         writes = planned_writes(
@@ -255,6 +271,7 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         self,
         copy: Optional[Dict[str, Any]] = _OLD_COPY,
         built: Optional[Dict[str, Any]] = _BUILT,
+        on: str = "old",
     ) -> tuple[SetCoursePlan, MagicMock]:
         api = MagicMock()
         api._hs.get_auth.return_value.get_user_by_req = AsyncMock(
@@ -265,7 +282,7 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         api.is_user_admin = AsyncMock(return_value=True)
         state: Dict[Any, Any] = {
             ("pangea.course_plan", ""): SimpleNamespace(
-                content={"uuid": "old", "l2": "es"}
+                content={"uuid": on, "l2": "es"}
             ),
             ("m.room.name", ""): SimpleNamespace(content={"name": "Old title"}),
         }
@@ -285,12 +302,16 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         return endpoint, api
 
     async def _post(
-        self, endpoint: SetCoursePlan, instructors: Optional[List[str]] = None
+        self,
+        endpoint: SetCoursePlan,
+        instructors: Optional[List[str]] = None,
+        expected: str = "old",
     ) -> tuple[int, Dict[str, Any]]:
         if instructors is None:
             instructors = ["@teacher:test"]
+        body = {**self._BODY, "expected_quest_id": expected}
         with patch.object(
-            module, "extract_body_json", AsyncMock(return_value=self._BODY)
+            module, "extract_body_json", AsyncMock(return_value=body)
         ), patch.object(
             module, "joined_local_instructors", return_value=instructors
         ), patch.object(
@@ -323,7 +344,7 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent[0]["content"]["revision"], 4)
         self.assertEqual(
             body["course_copy"],
-            {"previous_revision": 3, "revision": 4, "missions": 1},
+            {"built": True, "previous_revision": 3, "revision": 4, "missions": 1},
         )
         self.assertEqual(body["previous_name"], "Old title")
         self.assertIsNone(body["previous_topic"])
@@ -337,14 +358,55 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._sent(api)[0]["content"]["revision"], 1)
         self.assertIsNone(body["course_copy"]["previous_revision"])
 
-    async def test_a_copy_that_cannot_be_built_refuses_the_switch(self) -> None:
+    async def test_a_copy_that_cannot_be_built_is_written_empty(self) -> None:
         endpoint, api = self._endpoint(built=None)
 
         with self.assertLogs(module.logger, level="ERROR"):
             status, body = await self._post(endpoint)
 
-        self.assertEqual(status, 503, body)
-        api.create_and_send_event_into_room.assert_not_awaited()
+        self.assertEqual(status, 200, body)
+        sent = self._sent(api)
+        self.assertEqual(sent[0]["type"], "pangea.course_missions")
+        self.assertEqual(sent[0]["content"], {})
+        self.assertEqual(sent[1]["type"], "pangea.course_plan")
+        self.assertEqual(
+            body["course_copy"],
+            {"built": False, "previous_revision": 3, "revision": None, "missions": 0},
+        )
+
+    async def test_an_empty_copy_on_the_new_quest_is_rebuilt(self) -> None:
+        endpoint, api = self._endpoint(copy={}, on="new")
+
+        status, body = await self._post(endpoint, expected="new")
+
+        self.assertEqual(status, 200, body)
+        sent = self._sent(api)
+        self.assertEqual(
+            [e["type"] for e in sent],
+            ["pangea.course_missions", "m.room.name", "m.room.topic"],
+        )
+        self.assertEqual(sent[0]["content"]["revision"], 1)
+        self.assertTrue(body["course_copy"]["built"])
+
+    async def test_a_failed_rebuild_leaves_the_empty_copy(self) -> None:
+        endpoint, api = self._endpoint(copy={}, built=None, on="new")
+
+        with self.assertLogs(module.logger, level="ERROR"):
+            status, body = await self._post(endpoint, expected="new")
+
+        self.assertEqual(status, 200, body)
+        self.assertNotIn("pangea.course_missions", [e["type"] for e in self._sent(api)])
+        self.assertFalse(body["course_copy"]["built"])
+
+    async def test_a_copy_with_content_on_the_new_quest_is_left_alone(self) -> None:
+        endpoint, api = self._endpoint(on="new")
+
+        status, body = await self._post(endpoint, expected="new")
+
+        self.assertEqual(status, 200, body)
+        self.assertNotIn("pangea.course_missions", [e["type"] for e in self._sent(api)])
+        self.assertIsNone(body["course_copy"])
+        endpoint._course_missions.read.assert_not_awaited()  # type: ignore[attr-defined]
 
     async def test_a_space_that_changed_during_the_read_is_refused(self) -> None:
         endpoint, api = self._endpoint()
