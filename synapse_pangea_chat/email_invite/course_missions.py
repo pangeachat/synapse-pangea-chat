@@ -67,16 +67,18 @@ def quest_target_language(quest: Mapping[str, Any]) -> Optional[str]:
 
 
 def quest_lo_ids(quest: Mapping[str, Any]) -> List[str]:
-    """The quest's learning objectives, in its order."""
+    """The quest's learning objectives, in its order, each once."""
     res = quest.get("res")
     steps = res.get("learning_objective_sequence") if isinstance(res, Mapping) else None
     if not isinstance(steps, list):
         return []
-    ids = []
+    ids: List[str] = []
     for step in steps:
         if isinstance(step, Mapping):
             lo_id = _ref_id(step.get("learning_objective"))
-            if lo_id is not None:
+            # A Mission listed twice keeps its first place: readers reject a
+            # copy that names the same Mission twice.
+            if lo_id is not None and lo_id not in ids:
                 ids.append(lo_id)
     return ids
 
