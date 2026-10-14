@@ -3,9 +3,12 @@ and rename it to match.
 
 ``POST /_synapse/client/pangea/v1/set_course_plan``
 
-Design: set-course-plan.instructions.md. The events are sent as the space's own
-highest-powered local member (``select_state_sender``), so nobody joins and
-nobody's power level changes; the operator is recorded in the log line instead.
+Design: set-course-plan.instructions.md. The space's own copy of its Can-Do
+list (``pangea.course_missions``) is replaced for the new quest first, so the
+course never lists the old quest's Can-Dos. The events are sent as the space's
+own strongest local instructor (``joined_local_instructors``, power level 100,
+which readers require of the copy's sender), so nobody joins and nobody's power
+level changes; the operator is recorded in the log line instead.
 """
 
 from __future__ import annotations
@@ -27,6 +30,10 @@ from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.email_invite.course_missions import (
+    COURSE_MISSIONS_STATE_EVENT_TYPE,
+    CourseMissionsReader,
+)
 from synapse_pangea_chat.public_courses.backfill_l2 import (
     CANONICAL_PLAN_ID_KEY,
     LEGACY_PLAN_ID_KEYS,
@@ -35,8 +42,8 @@ from synapse_pangea_chat.public_courses.get_public_courses import (
     DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE,
     extract_plan_id,
 )
-from synapse_pangea_chat.public_courses.select_state_sender import select_state_sender
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
+from synapse_pangea_chat.room_code.instructor_access import joined_local_instructors
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -89,6 +96,26 @@ def plan_update(
     return PlanUpdate(UPDATE, current, new_content)
 
 
+def copy_revision(content: Optional[Mapping[str, Any]]) -> Optional[int]:
+    """A course copy's revision, or None when there is no readable copy."""
+    revision = content.get("revision") if content is not None else None
+    if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 1:
+        return revision
+    return None
+
+
+def course_copy_content(
+    built: Optional[Dict[str, Any]], current: Optional[Mapping[str, Any]]
+) -> Dict[str, Any]:
+    """The course copy to write for the new quest: the copy built from the CMS
+    at one revision above the current copy's (1 when there is none), so an open
+    Studio refuses a stale publish. Empty content when it could not be built,
+    so readers fall back to the new shared quest rather than the old Can-Dos."""
+    if built is None:
+        return {}
+    return {**built, "revision": (copy_revision(current) or 0) + 1}
+
+
 def topic_content(text: str) -> Dict[str, Any]:
     """Topic content in the shape Synapse's own createRoom writes."""
     return {"topic": text, "m.topic": {"m.text": [{"body": text}]}}
@@ -97,15 +124,23 @@ def topic_content(text: str) -> Dict[str, Any]:
 def planned_writes(
     update: PlanUpdate,
     plan_event_type: str,
+    copy: Dict[str, Any],
     current_name: Optional[str],
     current_topic: Optional[str],
     title: str,
     description: str,
 ) -> List[Tuple[str, Dict[str, Any]]]:
-    """The state events to send, in order: the course plan, then the name,
-    then the topic, each only when it differs from what the space has."""
+    """The state events to send, in order: when the plan changes, the course
+    copy and then the course plan; then the name, then the topic, each only
+    when it differs from what the space has.
+
+    The copy goes first so a refusal part-way leaves the plan on the old quest,
+    and sending the same request again finishes the job. Once the plan points
+    at the new quest the copy is never rewritten, so a re-run cannot wipe the
+    teacher's later edits."""
     writes: List[Tuple[str, Dict[str, Any]]] = []
     if update.outcome == UPDATE and update.content is not None:
+        writes.append((COURSE_MISSIONS_STATE_EVENT_TYPE, copy))
         writes.append((plan_event_type, update.content))
     if current_name != title:
         writes.append((EventTypes.Name, {"name": title}))
@@ -181,6 +216,9 @@ class SetCoursePlan(Resource):
             config.course_plan_state_event_type
             or DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE
         )
+        self._course_missions = CourseMissionsReader(
+            api, config.cms_base_url, config.cms_service_api_key
+        )
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -222,14 +260,9 @@ class SetCoursePlan(Resource):
                 return
             room_id = req.room_id
 
-            state = await self._api.get_room_state(
-                room_id,
-                [
-                    (self._event_type, ""),
-                    (EventTypes.Name, ""),
-                    (EventTypes.Topic, ""),
-                ],
-            )
+            # The whole state: choosing the sender needs every member and the
+            # power levels, beside the four events this endpoint reads.
+            state = await self._api.get_room_state(room_id)
             event = state.get((self._event_type, ""))
             update = plan_update(
                 dict(event.content) if event is not None else None,
@@ -259,9 +292,35 @@ class SetCoursePlan(Resource):
 
             current_name = _state_text(state.get((EventTypes.Name, "")), "name")
             current_topic = _state_text(state.get((EventTypes.Topic, "")), "topic")
+            copy: Dict[str, Any] = {}
+            copy_report: Optional[Dict[str, Any]] = None
+            if update.outcome == UPDATE:
+                current_copy = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
+                current_copy_content = (
+                    dict(current_copy.content)
+                    if current_copy is not None
+                    and isinstance(current_copy.content, Mapping)
+                    else None
+                )
+                built = await self._course_missions.read(req.quest_id)
+                if built is None:
+                    logger.warning(
+                        "set_course_plan: no course copy built for quest %s in %s; "
+                        "an empty copy is written so readers use the shared quest",
+                        req.quest_id,
+                        room_id,
+                    )
+                copy = course_copy_content(built, current_copy_content)
+                copy_report = {
+                    "built": built is not None,
+                    "previous_revision": copy_revision(current_copy_content),
+                    "revision": copy_revision(copy),
+                    "missions": len(copy.get("missions") or []),
+                }
             writes = planned_writes(
                 update,
                 self._event_type,
+                copy,
                 current_name,
                 current_topic,
                 req.title,
@@ -274,6 +333,7 @@ class SetCoursePlan(Resource):
                 "previous_name": current_name,
                 "previous_topic": current_topic,
                 "changes": [event_type for event_type, _ in writes],
+                "course_copy": copy_report,
                 "dry_run": req.dry_run,
             }
             if not writes:
@@ -285,28 +345,24 @@ class SetCoursePlan(Resource):
                 )
                 return
 
-            # One member sends every write. select_state_sender always picks
-            # the room's strongest local member, so the answers agree unless
-            # that member falls short for one of the event types.
-            senders = {
-                await select_state_sender(self._api, room_id, event_type)
-                for event_type, _ in writes
-            }
-            sender = senders.pop() if len(senders) == 1 else None
-            if sender is None:
+            # One instructor sends every write: readers ignore a course copy
+            # sent below power level 100, so a weaker sender is never used.
+            instructors = joined_local_instructors(self._api, state)
+            if not instructors:
                 logger.warning(
-                    "set_course_plan: no local member can send %s in %s; "
+                    "set_course_plan: no local instructor in %s can send %s; "
                     "refused, nothing written",
-                    answer["changes"],
                     room_id,
+                    answer["changes"],
                 )
                 respond_with_json(
                     request,
                     409,
-                    {"error": "No local member can send the course plan events"},
+                    {"error": "No local instructor can send the course events"},
                     send_cors=True,
                 )
                 return
+            sender = instructors[0]
 
             written: List[str] = []
             if not req.dry_run:
