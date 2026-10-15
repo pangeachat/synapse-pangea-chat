@@ -38,6 +38,7 @@ modules:
       public_courses_requests_per_burst: 120 # default: 120
       course_plan_state_event_type: "pangea.course_plan" # default: null (falls back to pangea.course_plan)
       public_courses_cms_cache_ttl_seconds: 5 # default: 5s — short burst cache; refreshes quickly
+      central_course_admin_user_ids: [] # default: [] (trusts @support:<server name>)
 
       # --- Room Preview ---
       room_preview_state_event_types: # additional state event types to expose
