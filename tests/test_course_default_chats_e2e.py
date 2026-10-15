@@ -179,11 +179,17 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
     async def _membership_action(
         self, action: str, room_id: str, user_id: str, token: str
     ) -> None:
-        response = requests.post(
-            self._room_url(room_id, f"/{action}"),
-            headers=self._headers(token),
-            json={"user_id": user_id},
-        )
+        """Kick or ban as a client would, waiting out the per-user action
+        limit when a test does it to a whole class."""
+        for _ in range(30):
+            response = requests.post(
+                self._room_url(room_id, f"/{action}"),
+                headers=self._headers(token),
+                json={"user_id": user_id},
+            )
+            if response.status_code != 429:
+                break
+            time.sleep(response.json().get("retry_after_ms", 1000) / 1000)
         self.assertEqual(response.status_code, 200, response.text)
 
     async def _send_message_status(self, room_id: str, token: str) -> int:
@@ -569,6 +575,44 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
             (chat["promoted"], chat["demoted"], chat["joined"]), ([], [], [])
         )
         self.assertEqual(chat["failed"], [])
+
+    async def test_dry_run_does_not_wait_for_a_running_sync(self):
+        """An operator polls a repair with dry runs. The repair holds the chat's
+        lock for as long as the paced joins take, so a dry run that waited for
+        it would sit longer than the reverse proxy allows a request."""
+        await self.homeserver()
+        _, operator = await self.new_user("operator", admin=True)
+        _, teacher = await self.new_user("teacher")
+        students = [await self.new_user(f"s{i}") for i in range(12)]
+
+        space_id = await self._create_space(teacher)
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        for _, token in students:
+            await self._join(space_id, token)
+        await self._wait_joined(chat_id, [user_id for user_id, _ in students], teacher)
+        for user_id, _ in students:
+            await self._membership_action("kick", chat_id, user_id, teacher)
+
+        response = requests.post(
+            self._endpoint(),
+            headers=self._headers(operator),
+            json={"room_id": space_id},
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        started = time.monotonic()
+        response = requests.post(
+            self._endpoint(),
+            headers=self._headers(operator),
+            json={"room_id": space_id, "dry_run": True},
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(response.status_code, 200, response.text)
+        # It answered while the paced joins were still running (the last two
+        # of twelve wait out the per-room limit), not after they finished.
+        self.assertGreater(len(response.json()["chats"][0]["joined"]), 0)
+        self.assertLess(elapsed, 1.5)
+        await self._wait_joined(chat_id, [user_id for user_id, _ in students], teacher)
 
     async def test_repair_endpoint_refuses_non_admins_and_bad_input(self):
         await self.homeserver()
