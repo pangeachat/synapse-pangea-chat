@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from synapse_pangea_chat.config import DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS
 from synapse_pangea_chat.notice_delivery.categories import DELIVERABLE_CATEGORIES
 from synapse_pangea_chat.notice_delivery.common import (
     DESTINATION_KINDS,
+    MAX_ITEM_LINKS,
     external_host_allowed,
+    item_slot,
     workspace_path_ok,
 )
 from synapse_pangea_chat.notice_delivery.eligibility import validate_eligibility
@@ -137,7 +139,9 @@ class EmailContent:
     receiving_reason: str
 
     @classmethod
-    def parse(cls, data: Dict[str, Any], secondary: bool = False) -> EmailContent:
+    def parse(
+        cls, data: Dict[str, Any], secondary: bool = False, items: int = 0
+    ) -> EmailContent:
         subject = string(data, "subject", 120)
         if "\r" in subject or "\n" in subject:
             raise ValueError("email subject must be one line")
@@ -155,6 +159,18 @@ class EmailContent:
             raise ValueError(
                 f"email contains {SECONDARY_SLOT} but the request has no secondary_destination"
             )
+        # Each item link has its slot in both bodies, and no slot is left without its
+        # link, so an item can be neither silently dropped nor left unrendered.
+        for i in range(1, MAX_ITEM_LINKS + 1):
+            slot = item_slot(i)
+            if i <= items and (slot not in html or slot not in text):
+                raise ValueError(
+                    f"email html and text must both contain {slot} for item_destinations[{i - 1}]"
+                )
+            if i > items and (slot in html or slot in text):
+                raise ValueError(
+                    f"email contains {slot} but the request has {items} item_destinations"
+                )
 
         reason = string(data, "receiving_reason", 2000)
         if "{{receiving_reason}}" not in html or "{{receiving_reason}}" not in text:
@@ -234,6 +250,8 @@ class NoticeRequest:
     reserves nothing, finishes nothing, and the caller writes the receipt onto its own row."""
     destination: Destination = field(default_factory=lambda: Destination("app"))
     secondary_destination: Optional[Destination] = None
+    item_destinations: Tuple[Destination, ...] = ()
+    """A list's own links, in order, each signed as ``item1`` … ``item5``."""
 
     @property
     def caller_owns_record(self) -> bool:
@@ -277,6 +295,21 @@ class NoticeRequest:
         if data.get("secondary_destination") is not None:
             secondary = Destination.parse(
                 data["secondary_destination"], hosts, "secondary_destination"
+            )
+        items: Tuple[Destination, ...] = ()
+        if data.get("item_destinations") is not None:
+            raw_items = data["item_destinations"]
+            if (
+                not isinstance(raw_items, list)
+                or not raw_items
+                or len(raw_items) > MAX_ITEM_LINKS
+            ):
+                raise ValueError(
+                    f"item_destinations must be a list of 1 to {MAX_ITEM_LINKS} destinations"
+                )
+            items = tuple(
+                Destination.parse(entry, hosts, f"item_destinations[{i}]")
+                for i, entry in enumerate(raw_items)
             )
 
         user = string(data, "user_id")
@@ -335,7 +368,9 @@ class NoticeRequest:
         if "email" in data:
             if not isinstance(data["email"], dict):
                 raise ValueError("email must be an object")
-            email = EmailContent.parse(data["email"], secondary=secondary is not None)
+            email = EmailContent.parse(
+                data["email"], secondary=secondary is not None, items=len(items)
+            )
 
         if method in {"use-available", "push-only"} and push is None:
             raise ValueError("push content is required for this delivery method")
@@ -367,6 +402,7 @@ class NoticeRequest:
             record_id,
             destination,
             secondary,
+            items,
         )
 
 

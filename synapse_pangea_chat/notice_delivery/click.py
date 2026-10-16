@@ -20,6 +20,7 @@ from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.notice_delivery.common import (
+    LINK_NAMES,
     TOKEN_KIND_CLICK,
     app_url,
     destination_url,
@@ -143,7 +144,7 @@ class NoticeClick(Resource):
                         "check_in_type": payload.get("v") or "default",
                         "opened_at_ts": now_ms(self._api),
                         "link": payload.get("l")
-                        if payload.get("l") in ("cta", "cta2")
+                        if payload.get("l") in LINK_NAMES
                         else "cta",
                         "destination_kind": token_destination(payload)["k"],
                     },

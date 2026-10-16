@@ -36,6 +36,21 @@ CLICK_PATH = "_synapse/client/pangea/v1/n"
 UNSUBSCRIBE_PATH = "_synapse/client/pangea/v1/unsubscribe"
 
 TOKEN_KIND_CLICK = "click"
+#: The most item links one email may carry: a list of up to five things, each its own
+#: signed link (the learner funnel's open-sessions roundup lists up to five sessions).
+MAX_ITEM_LINKS = 5
+#: Every name a click token may give its link: the call to action, the second one, and
+#: each item of a list. An open records which one was clicked.
+LINK_NAMES = frozenset(
+    {"cta", "cta2", *(f"item{i}" for i in range(1, MAX_ITEM_LINKS + 1))}
+)
+
+
+def item_slot(i: int) -> str:
+    """The slot the caller's copy carries for the ``i``th item link (1-based)."""
+    return "{{item%d_url}}" % i
+
+
 TOKEN_KIND_UNSUBSCRIBE = "unsub"
 
 CATEGORY_LABELS = {
