@@ -256,10 +256,11 @@ class TestClaimEmailTemplates(unittest.TestCase):
                     self.assertNotIn("play.google.com", out)
 
     def test_course_ready_is_the_canonical_quest_card(self) -> None:
-        """Parity with notices/course_invite/teacher_invite.md in the engagement
-        repo: the cover when the request carried one, the title and the
-        "Start my quest" button inside the card, one medium per email, and the
-        re-tap line for a teacher who installed the app first."""
+        """Parity with the course_invite/teacher_invite copy in the production
+        CMS's engagement copy collection: the cover when the request carried
+        one, the title and the "Start my quest" button inside the card, one
+        medium per email, and the re-tap line for a teacher who installed the
+        app first."""
         env = self._env()
         for image in ("https://cdn.example/cover.jpg", ""):
             with self.subTest(image=bool(image)):
