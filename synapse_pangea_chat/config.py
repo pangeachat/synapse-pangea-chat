@@ -41,6 +41,9 @@ class PangeaChatConfig:
     # the plan id key). Off by default: the operator turns it on, deploys,
     # watches the summary log, and turns it off again.
     public_courses_backfill_l2: bool = False
+    # Accounts whose `central` mark on pangea.course_settings the catalog
+    # trusts. Empty means `@support:<server name>`.
+    central_course_admin_user_ids: List[str] = attr.Factory(list)
 
     # --- room_preview config ---
     room_preview_state_event_types: List[str] = attr.Factory(list)
