@@ -50,6 +50,24 @@ def parse(body):
     return NoticeRequest.parse(body, external_link_hosts=HOSTS)
 
 
+def session(n):
+    return {
+        "kind": "activity",
+        "activity_id": f"activity-{n}",
+        "session_room_id": f"!s{n}:x",
+    }
+
+
+def body_with_items(n, destination=COURSE):
+    """A request listing ``n`` sessions, each with its own item slot in both bodies."""
+    body = body_with(destination)
+    body["item_destinations"] = [session(i) for i in range(1, n + 1)]
+    for i in range(1, n + 1):
+        body["email"]["html"] += f'<a href="{{{{item{i}_url}}}}">Join {i}</a>'
+        body["email"]["text"] += f"\nJoin{i} {{{{item{i}_url}}}}"
+    return body
+
+
 class TestDestinationParsing(unittest.TestCase):
     def test_top_level_ids_without_a_destination_mean_an_activity_or_the_app(self):
         req = NoticeRequest.parse(request_body())
@@ -156,6 +174,40 @@ class TestDestinationParsing(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no secondary_destination"):
             parse(body)
 
+    def test_a_list_of_up_to_five_links_each_needs_its_slot_and_no_slot_is_left_unfilled(
+        self,
+    ):
+        req = parse(body_with_items(5))
+        self.assertEqual(
+            [d.compact()["a"] for d in req.item_destinations],
+            [f"activity-{i}" for i in range(1, 6)],
+        )
+        self.assertEqual(parse(body_with(COURSE)).item_destinations, ())
+        for field in ("html", "text"):
+            body = body_with_items(3)
+            body["email"][field] = body["email"][field].replace("{{item2_url}}", "")
+            with self.subTest(missing=field), self.assertRaisesRegex(
+                ValueError, "item2_url"
+            ):
+                parse(body)
+        body = body_with_items(2)
+        body["email"]["html"] += "{{item3_url}}"
+        with self.assertRaisesRegex(ValueError, "item3_url.*2 item_destinations"):
+            parse(body)
+        for bad in ([], [session(i) for i in range(1, 7)], {"kind": "app"}):
+            body = body_with(COURSE)
+            body["item_destinations"] = bad
+            with self.subTest(bad=bad), self.assertRaisesRegex(
+                ValueError, "1 to 5 destinations"
+            ):
+                parse(body)
+        body = body_with_items(1)
+        body["item_destinations"] = [
+            {"kind": "external", "url": "https://evil.example/x"}
+        ]
+        with self.assertRaisesRegex(ValueError, r"item_destinations\[0\]"):
+            parse(body)
+
     def test_flat_bodies_accept_a_destination_but_not_a_second_link(self):
         flat = {
             "user_id": USER,
@@ -243,6 +295,25 @@ class TestClickResolution(unittest.IsolatedAsyncioTestCase):
             (content["link"], content["destination_kind"]), ("cta2", "course")
         )
 
+    async def test_an_item_link_records_which_item_was_opened(self):
+        api = _api()
+        await self._click(
+            api,
+            self._token(
+                d={"k": "activity", "a": "activity-3", "s": "!s3:x"}, l="item3"
+            ),
+        )
+        content = api.create_and_send_event_into_room.await_args.args[0]["content"]
+        self.assertEqual(
+            (content["link"], content["destination_kind"]), ("item3", "activity")
+        )
+        api = _api()
+        await self._click(api, self._token(d={"k": "app"}, l="item9"))
+        self.assertEqual(
+            api.create_and_send_event_into_room.await_args.args[0]["content"]["link"],
+            "cta",
+        )
+
     async def test_an_external_host_no_longer_allowed_falls_back_home(self):
         api = _api()
         with self.assertLogs(
@@ -323,6 +394,36 @@ class TestSendEmailLinks(unittest.IsolatedAsyncioTestCase):
         # Links are HTML-escaped in the html body, raw in the text body.
         self.assertIn(links[1].replace("&", "&amp;"), kwargs["html"])
         self.assertIn(links[1], text)
+
+    async def test_each_item_slot_gets_its_own_signed_link_to_its_own_session(self):
+        api = _api(
+            threepids=[SimpleNamespace(medium="email", address="a@example.test")]
+        )
+        body = body_with_items(3)
+        req = NoticeRequest.parse(body, external_link_hosts=HOSTS)
+        result = await self._handler(api)._send_email(
+            body, user_id=USER, category="activity_nudges", req=req
+        )
+        self.assertEqual(result, {"sent": True, "reason": None})
+        kwargs = (
+            api._hs.get_send_email_handler.return_value.send_email.await_args.kwargs
+        )
+        text = kwargs["text"]
+        for i in range(1, 4):
+            self.assertNotIn(f"{{{{item{i}_url}}}}", text)
+            self.assertNotIn(f"{{{{item{i}_url}}}}", kwargs["html"])
+        items = {
+            line.split(" ", 1)[0]: self._click_payload(line.split(" ", 1)[1])
+            for line in text.splitlines()
+            if line.startswith("Join")
+        }
+        self.assertEqual(
+            {k: (v["l"], v["d"]["a"], v["d"]["s"]) for k, v in items.items()},
+            {
+                f"Join{i}": (f"item{i}", f"activity-{i}", f"!s{i}:x")
+                for i in range(1, 4)
+            },
+        )
 
     async def test_the_activity_link_shape_is_unchanged_without_destinations(self):
         api = _api(

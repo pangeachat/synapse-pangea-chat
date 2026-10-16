@@ -37,6 +37,7 @@ from synapse_pangea_chat.notice_delivery.common import (
     TOKEN_KIND_UNSUBSCRIBE,
     category_label,
     click_url,
+    item_slot,
     now_ms,
     public_baseurl,
     token_secret,
@@ -249,6 +250,9 @@ class DeliverNotice(Resource):
             # The flat body renders the module's own template, which has one
             # call to action; a second link needs caller-rendered email.
             return "secondary_destination requires structured email content"
+        if body.get("item_destinations") is not None:
+            # A list's links are slots in caller-rendered copy, which the flat body has none of.
+            return "item_destinations requires structured email content"
         if body.get("destination") is not None:
             try:
                 Destination.parse(
@@ -629,8 +633,10 @@ class DeliverNotice(Resource):
         now = now_ms(self._api)
         ttl_ms = self._config.notice_token_ttl_days * MILLISECONDS_PER_DAY
         variant = _optional_str(body.get("variant"))
+        items: tuple = ()
         if req is not None:
             primary, secondary = req.destination, req.secondary_destination
+            items = req.item_destinations
         else:
             primary = (
                 Destination.parse(
@@ -671,6 +677,11 @@ class DeliverNotice(Resource):
         cta2_url = (
             click_url(base, click_token(secondary, "cta2")) if secondary else None
         )
+        # Each item of a list is its own signed link, named by its place (item1 …).
+        item_urls = {
+            item_slot(i): click_url(base, click_token(dest, f"item{i}"))
+            for i, dest in enumerate(items, start=1)
+        }
         unsub_url = unsubscribe_url(base, unsubscribe_token)
 
         email_content = req.email if req else None
@@ -707,6 +718,7 @@ class DeliverNotice(Resource):
             }
             if cta2_url is not None:
                 replacements[SECONDARY_SLOT] = cta2_url
+            replacements.update(item_urls)
             rendered_html, rendered_text = email_content.html, email_content.text
 
             for slot, value in replacements.items():
