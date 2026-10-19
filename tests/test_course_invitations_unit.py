@@ -185,3 +185,241 @@ class TestInvitations(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("teacher@school.example", str(capture.call_args))
         self.assertIsNotNone(await self.store.for_code("abc2def"))
+
+
+class TestCoursePlanReplacement(unittest.IsolatedAsyncioTestCase):
+    """create-course-space.instructions.md, "Replacing the course plan"."""
+
+    NEW = {"course_plan_id": "quest-2", "title": "Tailored", "description": "Text"}
+
+    async def asyncSetUp(self):
+        self.hs = MagicMock()
+        self.hs.get_clock.return_value.time_msec.return_value = 7
+        self.pool = DbPoolDouble()
+        self.hs.get_datastores.return_value.main.db_pool = self.pool
+        self.claims = CourseClaimStore(self.hs)
+        await self.claims._ensure_table()
+        self.store = self.claims.invitations
+        self.spec = {
+            "title": "Starter",
+            "course_plan_id": "quest",
+            "target_language": "es",
+            "description": "",
+        }
+        self.ident, _ = await self.store.prepare(
+            "@operator:x",
+            "request-1",
+            self.spec,
+            "teacher@school.example",
+            "abc2def",
+            1,
+        )
+        api = MagicMock()
+        api._hs = self.hs
+        self.room_plan = MagicMock()
+        self.room_plan.apply = AsyncMock()
+        self.resource = CourseInvitationAPI(
+            api,
+            MagicMock(),
+            self.claims,
+            self.store,
+            MagicMock(),
+            "status",
+            self.ident,
+            self.room_plan,
+        )
+
+    def body(self, **changes):
+        return {**self.NEW, "expected_course_plan_id": "quest", **changes}
+
+    async def claimed(self):
+        await self.store.reserve_creation(self.ident, "@teacher:x")
+        await self.store.associate(self.ident, "@teacher:x", "!room:x")
+        await self.store.complete(self.ident, "@teacher:x", "!room:x", 3)
+
+    async def test_the_claim_provisions_the_replaced_preparation(self):
+        result = await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(
+            result["replacement"]["changes"], ["course_plan_id", "title", "description"]
+        )
+        self.assertEqual(result["course_plan_id"], "quest-2")
+        self.assertEqual(
+            result["replacements"],
+            [
+                {
+                    "replaced_at_ms": 7,
+                    "previous_course_plan_id": "quest",
+                    "course_plan_id": "quest-2",
+                }
+            ],
+        )
+        row, created = await self.store.reserve_creation(self.ident, "@teacher:x")
+        self.assertTrue(created)
+        self.assertEqual(
+            row["specification"], {**self.spec, **self.NEW}, "the claim reads it"
+        )
+        # The invitation and its claim code are the same ones.
+        self.assertEqual(
+            (await self.store.for_code("abc2def"))["invitation_id"], self.ident
+        )
+
+    async def test_repeating_the_original_preparation_still_finds_the_invitation(self):
+        await self.resource.replace("@operator:x", self.body())
+        ident, created = await self.store.prepare(
+            "@operator:x", "request-1", self.spec, "teacher@school.example", "x", 9
+        )
+        self.assertEqual((ident, created), (self.ident, False))
+
+    async def test_a_different_quest_than_expected_is_refused(self):
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace(
+                "@operator:x", self.body(expected_course_plan_id="other")
+            )
+        self.assertEqual(error.exception.code, 409)
+        self.assertEqual(
+            error.exception.error_dict(None)["current_course_plan_id"], "quest"
+        )
+        self.assertEqual(
+            (await self.store.status(self.ident))["course_plan_id"], "quest"
+        )
+
+    async def test_a_dry_run_writes_nothing(self):
+        result = await self.resource.replace("@operator:x", self.body(dry_run=True))
+        self.assertTrue(result["replacement"]["dry_run"])
+        self.assertEqual(len(result["replacement"]["changes"]), 3)
+        self.assertEqual(result["course_plan_id"], "quest")
+        self.assertEqual(result["replacements"], [])
+
+    async def test_a_new_title_alone_is_no_course_plan_replacement(self):
+        result = await self.resource.replace(
+            "@operator:x", self.body(course_plan_id="quest")
+        )
+        self.assertEqual(result["replacement"]["changes"], ["title", "description"])
+        self.assertEqual(result["replacements"], [])
+        self.assertEqual(
+            (await self.store.get(self.ident))["specification"]["title"], "Tailored"
+        )
+
+    async def test_refused_while_provisioning_and_once_revoked(self):
+        await self.store.reserve_creation(self.ident, "@teacher:x")
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(error.exception.code, 409)
+        self.assertEqual(error.exception.error_dict(None)["status"], "provisioning")
+        await self.store.revoke(self.ident)
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(error.exception.error_dict(None)["status"], "revoked")
+        self.assertEqual((await self.store.get(self.ident))["specification"], self.spec)
+
+    async def test_a_claim_that_lands_mid_replacement_wins(self):
+        def claim_first(sql, args):
+            if sql.lstrip().startswith(
+                "UPDATE pangea_course_invitation SET specification"
+            ):
+                self.pool.on_statement = None
+                self.pool.connection.execute(
+                    "UPDATE pangea_course_invitation SET status = 'provisioning' WHERE invitation_id = ?",
+                    (self.ident,),
+                )
+
+        self.pool.on_statement = claim_first
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(error.exception.code, 409)
+        self.assertEqual((await self.store.get(self.ident))["specification"], self.spec)
+        self.assertEqual((await self.store.status(self.ident))["replacements"], [])
+
+    async def test_an_instructor_invitation_is_refused(self):
+        ident, _ = await self.store.prepare(
+            "@operator:x",
+            "instructor-1",
+            {"kind": "instructor", "course_plan_id": "quest", "title": "Course"},
+            "co@school.example",
+            "jkm4npq",
+            2,
+            room_id="!room:x",
+        )
+        self.resource.invitation_id = ident
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(error.exception.code, 409)
+        self.room_plan.apply.assert_not_awaited()
+
+    async def test_a_legacy_room_reference_is_refused(self):
+        self.resource.invitation_id = "!room:x"
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(error.exception.code, 400)
+
+    async def test_the_expected_quest_is_required(self):
+        body = self.body()
+        del body["expected_course_plan_id"]
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", body)
+        self.assertEqual(error.exception.code, 400)
+
+    async def test_a_claimed_course_is_replaced_in_its_room_then_recorded(self):
+        await self.claimed()
+        self.room_plan.apply.return_value = (
+            200,
+            {"previous_quest_id": "quest", "quest_id": "quest-2", "changed": True},
+        )
+        result = await self.resource.replace("@operator:x", self.body())
+        request, operator = self.room_plan.apply.await_args.args
+        self.assertEqual(
+            tuple(request), ("!room:x", "quest-2", "quest", "Tailored", "Text", False)
+        )
+        self.assertEqual(operator, "@operator:x")
+        self.assertEqual(result["course_plan_id"], "quest-2")
+        self.assertEqual(result["replacements"][0]["previous_course_plan_id"], "quest")
+        self.assertEqual(result["replacement"]["room"]["changed"], True)
+
+    async def test_a_room_refusal_is_returned_and_nothing_recorded(self):
+        await self.claimed()
+        self.room_plan.apply.return_value = (
+            409,
+            {
+                "error": "Room points at a different quest than expected",
+                "current_quest_id": "teacher-pick",
+            },
+        )
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(error.exception.code, 409)
+        self.assertEqual(
+            error.exception.error_dict(None)["current_quest_id"], "teacher-pick"
+        )
+        status = await self.store.status(self.ident)
+        self.assertEqual(
+            (status["course_plan_id"], status["replacements"]), ("quest", [])
+        )
+
+    async def test_a_claimed_dry_run_records_nothing(self):
+        await self.claimed()
+        self.room_plan.apply.return_value = (
+            200,
+            {"previous_quest_id": "quest", "quest_id": "quest-2", "changed": False},
+        )
+        result = await self.resource.replace("@operator:x", self.body(dry_run=True))
+        self.assertTrue(self.room_plan.apply.await_args.args[0].dry_run)
+        self.assertEqual(result["replacements"], [])
+
+    async def test_a_room_already_on_the_quest_records_a_missed_replacement(self):
+        # The room write landed but its record did not; sent again with the
+        # new quest expected, the room is unchanged and the record is made.
+        await self.claimed()
+        self.room_plan.apply.return_value = (
+            200,
+            {"previous_quest_id": "quest-2", "quest_id": "quest-2", "changed": False},
+        )
+        result = await self.resource.replace(
+            "@operator:x", self.body(expected_course_plan_id="quest-2")
+        )
+        self.assertEqual(
+            [
+                (r["previous_course_plan_id"], r["course_plan_id"])
+                for r in result["replacements"]
+            ],
+            [("quest", "quest-2")],
+        )

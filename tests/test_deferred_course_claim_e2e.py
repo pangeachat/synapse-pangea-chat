@@ -311,3 +311,109 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
         self.assertEqual(race_status.json()["status"], "completed")
         self.assertNotEqual(race_status.json()["room_id"], room)
         self.assertNotIn(email, json.dumps(self.state(student, room, "m.room.create")))
+
+    async def test_course_plan_replacement_before_and_after_the_claim(self):
+        """create-course-space.instructions.md, "Replacing the course plan"."""
+        email = f"replace+{self.tag}@school.example"
+        await self.homeserver(
+            module_config={"app_base_url": APP},
+            synapse_config_overrides={"email": self.sink.synapse_email_config()},
+        )
+        users, tokens = {}, {}
+        for name in ("operator", "teacher"):
+            users[name], tokens[name] = await self.new_user(
+                name, admin=name == "operator"
+            )
+        op, teacher = tokens["operator"], tokens["teacher"]
+        prepared = self.post(
+            "v2/create_course_space",
+            op,
+            {
+                "request_key": f"replace-{self.tag}",
+                "teacher_email": email,
+                "course_plan_id": "quest-starter",
+                "title": "Starter course",
+                "description": "Starter text",
+                "target_language": "es",
+            },
+        )
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        ident = prepared.json()["invitation_id"]
+        self.assertEqual(prepared.json()["course_plan_id"], "quest-starter")
+        ready = self.sink.wait_for(email, "Your quest is ready")
+        code = re.search(re.escape(APP) + r"/([a-zA-Z0-9]{7})", body_text(ready)).group(
+            1
+        )
+        path = "v2/course_invitations/" + ident
+
+        def replacement(quest, expected, title, **extra):
+            return {
+                "course_plan_id": quest,
+                "expected_course_plan_id": expected,
+                "title": title,
+                "description": title + " text",
+                **extra,
+            }
+
+        tailored = replacement("quest-tailored", "quest-starter", "Tailored course")
+        self.assertEqual(self.post(path, teacher, tailored).status_code, 403)
+        wrong = self.post(
+            path, op, {**tailored, "expected_course_plan_id": "quest-other"}
+        )
+        self.assertEqual(wrong.status_code, 409, wrong.text)
+        self.assertEqual(wrong.json()["current_course_plan_id"], "quest-starter")
+        dry = self.post(path, op, {**tailored, "dry_run": True})
+        self.assertEqual(dry.status_code, 200, dry.text)
+        self.assertEqual(dry.json()["course_plan_id"], "quest-starter")
+
+        before = self.post(path, op, tailored)
+        self.assertEqual(before.status_code, 200, before.text)
+        self.assertEqual(before.json()["course_plan_id"], "quest-tailored")
+        self.assertEqual(before.json()["status"], "prepared")
+
+        # The link already in the teacher's inbox claims the replaced course.
+        claimed = self.post("v1/knock_with_code", teacher, {"access_code": code})
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+        room = claimed.json()["already_joined"][0]
+        self.assertEqual(
+            self.state(teacher, room, "pangea.course_plan"),
+            {"uuid": "quest-tailored", "l2": "es"},
+        )
+        self.assertEqual(
+            self.state(teacher, room, "m.room.name")["name"], "Tailored course"
+        )
+        self.assertEqual(
+            self.state(teacher, room, "m.room.topic")["topic"], "Tailored course text"
+        )
+
+        # After the claim the room is rewritten, sent as its instructor.
+        after = self.post(
+            path, op, replacement("quest-final", "quest-tailored", "Final course")
+        )
+        self.assertEqual(after.status_code, 200, after.text)
+        self.assertEqual(
+            after.json()["replacement"]["room"]["sender"], users["teacher"]
+        )
+        self.assertEqual(
+            self.state(teacher, room, "pangea.course_plan")["uuid"], "quest-final"
+        )
+        self.assertEqual(
+            self.state(teacher, room, "m.room.name")["name"], "Final course"
+        )
+
+        # A stale expectation is refused by the room, and nothing is recorded.
+        stale = self.post(
+            path, op, replacement("quest-x", "quest-tailored", "Stale course")
+        )
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(stale.json()["current_quest_id"], "quest-final")
+        status = self.request("GET", PREFIX + path, op).json()
+        self.assertEqual(status["course_plan_id"], "quest-final")
+        self.assertEqual(
+            [
+                (r["previous_course_plan_id"], r["course_plan_id"])
+                for r in status["replacements"]
+            ],
+            [("quest-starter", "quest-tailored"), ("quest-tailored", "quest-final")],
+        )
+        self.assertNotIn(email, json.dumps(status))

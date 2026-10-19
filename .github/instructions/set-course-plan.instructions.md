@@ -37,5 +37,5 @@ The space's new name and description in the app. The course plan change itself s
 ## Not in scope
 
 - **Checking the quest.** The module's one CMS read is the course copy's. Confirming that the new quest exists, matches the space's language, and has the title and description passed in is the caller's job.
-- **Unclaimed invitations.** Replacing an unclaimed invitation's quest is the invitation side of [create-course-space](create-course-space.instructions.md)'s replacement and isn't built here.
+- **Invitations.** An invitation's quest is replaced on the invitation ([create-course-space](create-course-space.instructions.md), "Replacing the course plan"). For a claimed invitation, that replacement runs this endpoint's steps on its room.
 - **Batches.** One space per call, and the operator script loops over spaces.
