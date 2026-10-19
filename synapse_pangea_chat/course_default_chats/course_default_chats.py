@@ -38,7 +38,7 @@ from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
-from synapse.types import RoomID
+from synapse.types import RoomID, UserID
 from synapse.util.async_helpers import Linearizer
 from synapse.util.duration import Duration
 from twisted.web.resource import Resource
@@ -52,7 +52,10 @@ from synapse_pangea_chat.public_courses.select_state_sender import (
     select_state_sender,
 )
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
-from synapse_pangea_chat.room_code.get_inviter_user import get_inviter_user
+from synapse_pangea_chat.room_code.get_inviter_user import (
+    get_inviter_user,
+    persist_without_auth_checks,
+)
 from synapse_pangea_chat.room_code.instructor_access import is_joined_instructor
 
 try:
@@ -229,6 +232,63 @@ class ChatSyncReport:
         return attr.asdict(self)
 
 
+class RecoveryRefused(Exception):
+    """The recovery's preconditions do not hold; ``reason`` is the code the
+    endpoint answers with."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class ChatRecoveryPlan:
+    """What a recovery writes: a join if the admin is not in the chat, then a
+    power change if they hold less than admin power."""
+
+    join: bool
+    promote: bool
+
+
+def plan_recovery(
+    chat: ChatState,
+    roster: SpaceRoster,
+    user_id: str,
+    is_local: Callable[[str], bool],
+) -> ChatRecoveryPlan:
+    """What recovering ``chat`` for the space admin ``user_id`` would write,
+    or RecoveryRefused naming the first precondition that fails, in the
+    order course-default-chats.instructions.md lists them."""
+    # Synapse drops a room's current state once every local member has left;
+    # with nothing to build on, there is nothing to write into.
+    if chat.creator is None:
+        raise RecoveryRefused(
+            "no_current_state", "the chat has no current state on this server"
+        )
+    if not owned_by_space_admin(chat, roster.admins):
+        raise RecoveryRefused(
+            "not_a_default_chat", "the chat is not a default chat of this space"
+        )
+    if chat.can_admit_members():
+        raise RecoveryRefused(
+            "chat_has_admin",
+            "a member of the chat can already let others in; use the repair endpoint",
+        )
+    if user_id not in roster.admins:
+        raise RecoveryRefused("not_space_admin", "the user is not a space admin")
+    membership = chat.memberships.get(user_id)
+    if membership == MEMBERSHIP_BAN:
+        raise RecoveryRefused("banned", "the user is banned from the chat")
+    if any(not is_local(member) for member in chat.joined):
+        raise RecoveryRefused(
+            "remote_members", "the chat has members on another server"
+        )
+    return ChatRecoveryPlan(
+        join=membership != MEMBERSHIP_JOIN,
+        promote=chat.power(user_id) < ADMIN_POWER_LEVEL,
+    )
+
+
 def _capture_exception(e: Exception) -> None:
     # Background tasks and respond_with_json paths never reach Synapse's
     # request-level Sentry capture, so a failure absorbed here is invisible
@@ -379,6 +439,91 @@ class CourseDefaultChats:
             )
             for chat_id in await self._default_chat_ids(space_id, use_cache=True)
         ]
+
+    # ------------------------------------------------------------------
+    # Recovery of a chat with no admin (operator-run, one chat per call)
+    # ------------------------------------------------------------------
+
+    async def recover_chat(
+        self,
+        space_id: str,
+        chat_id: str,
+        user_id: str,
+        *,
+        apply: bool,
+        caller: str,
+    ) -> ChatRecoveryPlan:
+        """Put one space admin back in charge of a default chat nobody in it
+        can act for, by writing their join and admin power without the
+        chat's auth rules. Raises RecoveryRefused when any precondition in
+        course-default-chats.instructions.md fails; with ``apply`` false it
+        only answers what it would write."""
+        roster = await self._space_roster(space_id)
+        if roster is None:
+            raise RecoveryRefused("not_a_space", "space_id is not a space")
+        if chat_id not in await self._default_chat_ids(space_id, use_cache=False):
+            raise RecoveryRefused(
+                "not_a_default_chat", "the chat is not a default chat of this space"
+            )
+        if not apply:
+            return plan_recovery(
+                await self._chat_state(chat_id), roster, user_id, self._api.is_mine
+            )
+        async with self._chat_locks.queue(chat_id):
+            chat = await self._chat_state(chat_id)
+            plan = plan_recovery(chat, roster, user_id, self._api.is_mine)
+            if plan.join:
+                profile = await self._api.get_profile_for_user(
+                    UserID.from_string(user_id).localpart
+                )
+                content: Dict[str, Any] = {"membership": MEMBERSHIP_JOIN}
+                if profile.display_name:
+                    content["displayname"] = profile.display_name
+                if profile.avatar_url:
+                    content["avatar_url"] = profile.avatar_url
+                await persist_without_auth_checks(
+                    self._api,
+                    {
+                        "type": EventTypes.Member,
+                        "room_id": chat_id,
+                        "sender": user_id,
+                        "state_key": user_id,
+                        "content": content,
+                    },
+                )
+                chat = await self._chat_state(chat_id)
+            if plan.promote:
+                power = dict(chat.power_content)
+                power["users"] = {**chat.users, user_id: ADMIN_POWER_LEVEL}
+                await persist_without_auth_checks(
+                    self._api,
+                    {
+                        "type": EventTypes.PowerLevels,
+                        "room_id": chat_id,
+                        "sender": user_id,
+                        "state_key": "",
+                        "content": power,
+                    },
+                )
+                chat = await self._chat_state(chat_id)
+            if not (
+                user_id in chat.joined
+                and chat.power(user_id) >= ADMIN_POWER_LEVEL
+                and chat.can_admit_members()
+            ):
+                raise RuntimeError(
+                    f"Recovery of {chat_id} wrote {plan} but {user_id} is not a "
+                    "joined admin of the chat afterwards"
+                )
+        logger.info(
+            "course_default_chats recovered %s in %s: %s restored by %s (%s)",
+            chat_id,
+            space_id,
+            user_id,
+            caller,
+            plan,
+        )
+        return plan
 
     # ------------------------------------------------------------------
     # Reads
@@ -867,6 +1012,130 @@ class SyncCourseDefaultChats(Resource):
             respond_with_json(
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
+
+
+class RecoverCourseDefaultChat(Resource):
+    """``POST /_synapse/client/pangea/v1/recover_course_default_chat``: puts
+    one named space admin back in charge of one default chat that nobody in
+    it can act for. Server admins only.
+
+    Body: ``room_id`` (the chat), ``space_id``, ``user_id`` (the space admin)
+    and optional ``dry_run``. A refusal answers 409
+    ``ORG.PANGEA.RECOVERY_REFUSED`` with a ``reason``; a dry run answers what
+    would be written; a real run answers what was written. The chat is then
+    brought in line by the repair endpoint, a separate call."""
+
+    isLeaf = True
+
+    def __init__(self, api: ModuleApi, syncer: CourseDefaultChats):
+        super().__init__()
+        self._api = api
+        self._auth = api._hs.get_auth()
+        self._syncer = syncer
+
+    def render_POST(self, request: SynapseRequest) -> int:
+        run_in_background(self._async_render_POST, request)
+        return server.NOT_DONE_YET
+
+    async def _async_render_POST(self, request: SynapseRequest) -> None:
+        try:
+            requester = await self._auth.get_user_by_req(request)
+            caller = requester.user.to_string()
+            if not await self._api.is_user_admin(caller):
+                respond_with_json(
+                    request, 403, {"error": "Admin access required"}, send_cors=True
+                )
+                return
+
+            body = await extract_body_json(request)
+            body = body if isinstance(body, dict) else {}
+            chat_id = body.get("room_id")
+            space_id = body.get("space_id")
+            user_id = body.get("user_id")
+            dry_run = body.get("dry_run", False)
+            error = None
+            if not isinstance(dry_run, bool):
+                error = "'dry_run' must be a boolean"
+            elif not isinstance(chat_id, str) or not _is_valid_room_id(chat_id):
+                error = "'room_id' must be a valid room ID"
+            elif not isinstance(space_id, str) or not _is_valid_room_id(space_id):
+                error = "'space_id' must be a valid room ID"
+            elif not isinstance(user_id, str) or not _is_local_user_id(
+                self._api, user_id
+            ):
+                error = "'user_id' must be a valid user ID on this server"
+            elif not await self._syncer.is_space(space_id):
+                error = "'space_id' must be a space"
+            if error is not None:
+                respond_with_json(request, 400, {"error": error}, send_cors=True)
+                return
+            assert isinstance(chat_id, str)
+            assert isinstance(space_id, str)
+            assert isinstance(user_id, str)
+
+            try:
+                plan = await self._syncer.recover_chat(
+                    space_id, chat_id, user_id, apply=not dry_run, caller=caller
+                )
+            except RecoveryRefused as refused:
+                logger.info(
+                    "course_default_chats recovery of %s refused (%s), asked by %s",
+                    chat_id,
+                    refused.reason,
+                    caller,
+                )
+                respond_with_json(
+                    request,
+                    409,
+                    {
+                        "errcode": "ORG.PANGEA.RECOVERY_REFUSED",
+                        "error": str(refused),
+                        "reason": refused.reason,
+                    },
+                    send_cors=True,
+                )
+                return
+
+            answer: Dict[str, Any] = {
+                "room_id": chat_id,
+                "space_id": space_id,
+                "user_id": user_id,
+                "dry_run": dry_run,
+            }
+            if dry_run:
+                answer.update(join=plan.join, promote=plan.promote)
+            else:
+                answer.update(joined=plan.join, promoted=plan.promote)
+            respond_with_json(request, 200, answer, send_cors=True)
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
+        except (
+            MissingClientTokenError,
+            InvalidClientTokenError,
+            InvalidClientCredentialsError,
+            AuthError,
+        ) as e:
+            logger.info("Authentication failed: %s", e)
+            respond_with_json(
+                request,
+                401,
+                {"error": "Unauthorized", "errcode": "M_UNAUTHORIZED"},
+                send_cors=True,
+            )
+        except Exception as e:
+            logger.exception("Error recovering a course default chat")
+            _capture_exception(e)
+            respond_with_json(
+                request, 500, {"error": "Internal server error"}, send_cors=True
+            )
+
+
+def _is_local_user_id(api: ModuleApi, user_id: str) -> bool:
+    try:
+        UserID.from_string(user_id)
+    # silent-ok: validation only - the caller answers 400 for an invalid id
+    except Exception:
+        return False
+    return api.is_mine(user_id)
 
 
 def _is_valid_room_id(room_id: str) -> bool:

@@ -1,7 +1,8 @@
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from synapse.api.constants import EventTypes
+from synapse.events import EventBase
 from synapse.module_api import ModuleApi
 from synapse.types import UserID, create_requester
 
@@ -17,6 +18,39 @@ from synapse_pangea_chat.room_code.instructor_access import (
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.room_code.get_inviter_user"
 )
+
+
+async def persist_without_auth_checks(
+    api: ModuleApi, event_dict: Dict[str, Any]
+) -> EventBase:
+    """Write an event into a local room without the room's auth rules.
+
+    Synapse checks those rules in ``handle_new_client_event``; building the
+    event with no requester and persisting it directly skips them. Only for
+    writes the module has already decided are legitimate even though the
+    room's own rules refuse them (instructor grants, a default chat's
+    recovery). Internal Synapse APIs: re-check on every Synapse upgrade.
+    """
+    hs = api._hs
+    event_creation_handler = hs.get_event_creation_handler()
+    room_version = await hs.get_datastores().main.get_room_version(
+        event_dict["room_id"]
+    )
+    builder = hs.get_event_builder_factory().for_room_version(room_version, event_dict)
+    event, unpersisted_context = await event_creation_handler.create_new_client_event(
+        builder=builder,
+        requester=None,
+    )
+    context = await unpersisted_context.persist(event)
+    await event_creation_handler._persist_events(
+        requester=create_requester(
+            event_dict["sender"], authenticated_entity=api.server_name
+        ),
+        events_and_context=[(event, context)],
+        ratelimit=False,
+        extra_users=[],
+    )
+    return event
 
 
 async def promote_user_to_admin(
@@ -52,16 +86,8 @@ async def promote_user_to_admin(
         users_power_levels[user_to_promote] = invite_power
         current_power_levels[USERS_POWER_LEVEL_KEY] = users_power_levels
 
-        # Access internal Synapse handlers to bypass auth checks
-        # WARNING: This uses internal APIs and may break with Synapse updates
-        hs = api._hs
-        event_creation_handler = hs.get_event_creation_handler()
-        store = hs.get_datastores().main
-
-        # Build the event - get room version from the main store
-        room_version = await store.get_room_version(room_id)
-        builder = hs.get_event_builder_factory().for_room_version(
-            room_version,
+        await persist_without_auth_checks(
+            api,
             {
                 "type": EVENT_TYPE_M_ROOM_POWER_LEVELS,
                 "room_id": room_id,
@@ -69,35 +95,6 @@ async def promote_user_to_admin(
                 "state_key": "",
                 "content": current_power_levels,
             },
-        )
-
-        # Create a requester for persistence (needed for _persist_events)
-        # We use create_requester which is used by ModuleApi internally
-
-        requester = create_requester(
-            user_to_promote,
-            authenticated_entity=api.server_name,
-        )
-
-        # Create the event without auth checks (requester=None bypasses auth)
-        (
-            event,
-            unpersisted_context,
-        ) = await event_creation_handler.create_new_client_event(
-            builder=builder,
-            requester=None,  # No requester means no auth checks
-        )
-
-        # Persist the event context
-        context = await unpersisted_context.persist(event)
-
-        # Use _persist_events directly which handles worker routing
-        # but does not check auth rules (unlike handle_new_client_event)
-        await event_creation_handler._persist_events(
-            requester=requester,
-            events_and_context=[(event, context)],
-            ratelimit=False,
-            extra_users=[],
         )
 
         logger.info(
