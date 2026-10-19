@@ -444,8 +444,9 @@ class CourseInvitationStore:
                 )
             changes = [f for f in REPLACED_FIELDS if spec.get(f) != replacement[f]]
             if changes and not dry_run:
-                # The stored text is the guard: a claim or another replacement
-                # that committed since the read leaves nothing to update.
+                # Guarded by status and by the stored text, so a claim or another
+                # replacement that committed since the read is never overwritten:
+                # the update finds no row, or fails to serialize and is retried.
                 txn.execute(
                     """UPDATE pangea_course_invitation SET specification = ?
                     WHERE invitation_id = ? AND status = 'prepared' AND specification = ?""",
@@ -471,7 +472,9 @@ class CourseInvitationStore:
         self, invitation_id, previous, replacement, operator, now
     ):
         """Record a replacement the claimed course's room accepted, and keep the
-        preparation in step with it."""
+        preparation's quest in step with it. One already recorded is not recorded
+        again, so two requests that both passed the room check make one record.
+        True when this call recorded it."""
         await self.ensure()
 
         def update(txn):
@@ -484,14 +487,20 @@ class CourseInvitationStore:
                 raise SynapseError(
                     409, "Invitation changed while its course was replaced"
                 )
-            spec = {**json.loads(found[0]), **replacement}
+            spec = json.loads(found[0])
+            if spec.get("course_plan_id") == replacement["course_plan_id"]:
+                return False
+            spec.update(replacement)
             txn.execute(
                 "UPDATE pangea_course_invitation SET specification = ? WHERE invitation_id = ?",
                 (json.dumps(spec), invitation_id),
             )
             self._record(txn, invitation_id, previous, replacement, operator, now)
+            return True
 
-        await self.db.runInteraction("pangea_invitation_record_replacement", update)
+        return await self.db.runInteraction(
+            "pangea_invitation_record_replacement", update
+        )
 
     @staticmethod
     def _record(txn, invitation_id, previous, replacement, operator, now):
@@ -550,7 +559,12 @@ class CourseInvitationStore:
             ]
 
         result["kind"] = invitation_kind(row)
-        result["course_plan_id"] = row["specification"].get("course_plan_id")
+        # An instructor invitation joins an existing course; its quest is the room's.
+        result["course_plan_id"] = (
+            row["specification"].get("course_plan_id")
+            if result["kind"] == "course"
+            else None
+        )
         result["replacements"] = await self.db.runInteraction(
             "pangea_invitation_replacements", replacements
         )

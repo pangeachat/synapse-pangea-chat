@@ -1,4 +1,5 @@
 """Persistence contracts across retries and reconstructed module instances."""
+import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -423,3 +424,108 @@ class TestCoursePlanReplacement(unittest.IsolatedAsyncioTestCase):
             ],
             [("quest", "quest-2")],
         )
+
+    async def test_another_replacement_that_lands_mid_replacement_wins(self):
+        def replaced_first(sql, args):
+            if sql.lstrip().startswith(
+                "UPDATE pangea_course_invitation SET specification"
+            ):
+                self.pool.on_statement = None
+                self.pool.connection.execute(
+                    "UPDATE pangea_course_invitation SET specification = ? WHERE invitation_id = ?",
+                    (
+                        json.dumps({**self.spec, "course_plan_id": "quest-b"}),
+                        self.ident,
+                    ),
+                )
+
+        self.pool.on_statement = replaced_first
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(error.exception.code, 409)
+        self.assertEqual(
+            (await self.store.get(self.ident))["specification"]["course_plan_id"],
+            "quest-b",
+        )
+
+    async def test_a_revoke_between_the_room_write_and_its_record_is_reported(self):
+        await self.claimed()
+
+        async def revoked_meanwhile(request, operator):
+            await self.store.revoke(self.ident)
+            return 200, {"previous_quest_id": "quest", "quest_id": "quest-2"}
+
+        self.room_plan.apply.side_effect = revoked_meanwhile
+        with self.assertLogs(
+            "synapse_pangea_chat.email_invite.course_invitation_api", "ERROR"
+        ):
+            with self.assertRaises(SynapseError) as error:
+                await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(error.exception.code, 500)
+        self.assertEqual(
+            error.exception.error_dict(None)["room"]["quest_id"], "quest-2"
+        )
+        self.assertEqual((await self.store.status(self.ident))["replacements"], [])
+
+    async def test_two_requests_that_pass_the_room_check_record_once(self):
+        await self.claimed()
+        self.room_plan.apply.return_value = (
+            200,
+            {"previous_quest_id": "quest", "quest_id": "quest-2"},
+        )
+        await self.resource.replace("@operator:x", self.body())
+        # The second read the invitation before the first recorded it.
+        self.store.get = AsyncMock(
+            return_value={
+                **await self.store.get(self.ident),
+                "specification": self.spec,
+            }
+        )
+        result = await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(len(result["replacements"]), 1)
+
+    async def test_the_description_is_required(self):
+        body = self.body()
+        del body["description"]
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", body)
+        self.assertEqual(error.exception.code, 400)
+
+    async def test_a_claimed_course_keeps_set_course_plans_limits(self):
+        await self.claimed()
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace(
+                "@operator:x", self.body(description="x" * 5000)
+            )
+        self.assertEqual(error.exception.code, 400)
+        self.room_plan.apply.assert_not_awaited()
+
+    async def test_a_room_mismatch_names_the_current_quest_as_before_the_claim(self):
+        await self.claimed()
+        self.room_plan.apply.return_value = (
+            409,
+            {"error": "Room points at a different quest", "current_quest_id": "q3"},
+        )
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(
+            error.exception.error_dict(None)["current_course_plan_id"], "q3"
+        )
+
+    async def test_a_post_without_an_invitation_is_not_allowed(self):
+        self.resource.invitation_id = None
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(error.exception.code, 405)
+
+    async def test_an_instructor_invitation_reports_no_quest_of_its_own(self):
+        ident, _ = await self.store.prepare(
+            "@operator:x",
+            "instructor-2",
+            {"kind": "instructor", "course_plan_id": "quest", "title": "Course"},
+            "co@school.example",
+            "npq5rst",
+            2,
+            room_id="!room:x",
+        )
+        self.assertIsNone((await self.store.status(ident))["course_plan_id"])
