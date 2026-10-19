@@ -116,7 +116,7 @@ Each Synapse process instead keeps a [`CodeIndex`](../../synapse_pangea_chat/roo
 
 ## Invite Mechanics
 
-The server needs a real user with invite power to issue the invite (Synapse's `update_room_membership` requires a sender). [`get_inviter_user`](../../synapse_pangea_chat/room_code/get_inviter_user.py) finds a local joined administrator whose power level meets the room's invite threshold. It never promotes a remaining member to manufacture an inviter; an empty room or one without an eligible administrator requires explicit recovery. If no such user exists, the room counts as failed (`NoInviterAvailableError`) and follows the failed-room handling above — it is never reported as invited.
+The server needs a real user with invite power to issue the invite (Synapse's `update_room_membership` requires a sender). [`get_inviter_user`](../../synapse_pangea_chat/room_code/get_inviter_user.py) finds a local joined administrator whose power level meets the room's invite threshold. It never promotes a remaining member to manufacture an inviter; an empty room or one without an eligible administrator requires explicit recovery by an operator. For a course's default chat that is the [recovery endpoint](course-default-chats.instructions.md#recovering-a-chat-with-no-admin). A course space itself has no such endpoint, and an operator investigates each case. If no such user exists, the room counts as failed (`NoInviterAvailableError`) and follows the failed-room handling above — it is never reported as invited.
 
 ---
 

@@ -16,6 +16,7 @@ from synapse_pangea_chat.config import (
 )
 from synapse_pangea_chat.course_default_chats import (
     CourseDefaultChats,
+    RecoverCourseDefaultChat,
     SyncCourseDefaultChats,
 )
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
@@ -581,6 +582,10 @@ class PangeaChat:
             self._api.register_web_resource(
                 path="/_synapse/client/pangea/v1/sync_course_default_chats",
                 resource=SyncCourseDefaultChats(api, self.course_default_chats),
+            )
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/recover_course_default_chat",
+                resource=RecoverCourseDefaultChat(api, self.course_default_chats),
             )
 
         # --- Direct Push ---
