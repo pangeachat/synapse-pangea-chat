@@ -374,6 +374,9 @@ class PangeaChat:
         self.claim_by_email = ClaimByEmail(
             api, course_claim_store.invitations, provisioner
         )
+        # Set Course Plan's room rewrite, shared with the invitation-side
+        # replacement of a claimed course (registered under its own path below).
+        self.set_course_plan_resource = SetCoursePlan(api, config)
         for endpoint, mode in (
             ("create_course_space", "prepare"),
             ("send_course_claim_reminder", "reminder"),
@@ -388,6 +391,7 @@ class PangeaChat:
                     course_claim_store.invitations,
                     course_claim_mailer,
                     mode,
+                    room_plan=self.set_course_plan_resource,
                 ),
             )
         # Additional-instructor invitations into an existing course: prepared
@@ -481,7 +485,6 @@ class PangeaChat:
         )
 
         # --- Set Course Plan ---
-        self.set_course_plan_resource = SetCoursePlan(api, config)
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/set_course_plan",
             resource=self.set_course_plan_resource,

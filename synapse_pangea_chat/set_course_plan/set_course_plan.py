@@ -272,218 +272,186 @@ class SetCoursePlan(Resource):
             if req is None:
                 respond_with_json(request, 400, {"error": error}, send_cors=True)
                 return
-            room_id = req.room_id
-
-            # The whole state: choosing the sender needs every member and the
-            # power levels, beside the four events this endpoint reads.
-            state = await self._api.get_room_state(room_id)
-            event = state.get((self._event_type, ""))
-            update = plan_update(
-                dict(event.content) if event is not None else None,
-                req.expected_quest_id,
-                req.quest_id,
-            )
-
-            if update.outcome == NOT_A_COURSE:
-                respond_with_json(
-                    request,
-                    404,
-                    {"error": "Room has no course plan"},
-                    send_cors=True,
-                )
-                return
-            if update.outcome == MISMATCH:
-                respond_with_json(
-                    request,
-                    409,
-                    {
-                        "error": "Room points at a different quest than expected",
-                        "current_quest_id": update.current_quest_id,
-                    },
-                    send_cors=True,
-                )
-                return
-
-            current_name = _state_text(state.get((EventTypes.Name, "")), "name")
-            current_topic = _state_text(state.get((EventTypes.Topic, "")), "topic")
-            current_copy = _content(state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
-            copy: Optional[Dict[str, Any]] = None
-            built: Optional[Dict[str, Any]] = None
-            # A switch builds the new quest's copy; a space already on the
-            # quest whose copy is empty (a failed read) gets it rebuilt.
-            if update.outcome == UPDATE or current_copy == {}:
-                built = await self._course_missions.read(req.quest_id)
-                if built is None:
-                    logger.error(
-                        "set_course_plan: no course copy could be built for quest "
-                        "%s in %s; %s",
-                        req.quest_id,
-                        room_id,
-                        (
-                            "an empty copy is written, so readers use the shared quest"
-                            if update.outcome == UPDATE
-                            else "its empty copy stays"
-                        ),
-                    )
-                # The read can take seconds; a teacher who changed course or
-                # published a copy in the meantime wins.
-                again = await self._api.get_room_state(
-                    room_id,
-                    [
-                        (self._event_type, ""),
-                        (COURSE_MISSIONS_STATE_EVENT_TYPE, ""),
-                    ],
-                )
-                if (
-                    _content(again.get((self._event_type, ""))) != _content(event)
-                    or _content(again.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
-                    != current_copy
-                ):
-                    logger.warning(
-                        "set_course_plan: %s changed while its course copy was "
-                        "built; refused, nothing written",
-                        room_id,
-                    )
-                    respond_with_json(
-                        request,
-                        409,
-                        {"error": "The space changed while its copy was built"},
-                        send_cors=True,
-                    )
-                    return
-                if update.outcome == UPDATE or built is not None:
-                    copy = course_copy_content(built, current_copy)
-            writes = planned_writes(
-                update,
-                self._event_type,
-                copy,
-                current_name,
-                current_topic,
-                req.title,
-                req.description,
-            )
-            answer = {
-                "room_id": room_id,
-                "previous_quest_id": update.current_quest_id,
-                "quest_id": req.quest_id,
-                "previous_name": current_name,
-                "previous_topic": current_topic,
-                "changes": [event_type for event_type, _ in writes],
-                # Reported whenever a copy was built or tried, so a failed
-                # rebuild of an empty copy is visible too.
-                "course_copy": (
-                    {
-                        "built": built is not None,
-                        "previous_revision": copy_revision(current_copy),
-                        "revision": copy_revision(copy),
-                        "missions": len((copy or {}).get("missions") or []),
-                    }
-                    if update.outcome == UPDATE or current_copy == {}
-                    else None
-                ),
-                "dry_run": req.dry_run,
-            }
-            if not writes:
-                respond_with_json(
-                    request,
-                    200,
-                    {**answer, "sender": None, "changed": False},
-                    send_cors=True,
-                )
-                return
-
-            # One instructor sends every write: readers ignore a course copy
-            # sent below power level 100, so a weaker sender is never used.
-            instructors = joined_local_instructors(self._api, state)
-            if not instructors:
-                logger.warning(
-                    "set_course_plan: no local instructor in %s can send %s; "
-                    "refused, nothing written",
-                    room_id,
-                    answer["changes"],
-                )
-                respond_with_json(
-                    request,
-                    409,
-                    {"error": "No local instructor can send the course events"},
-                    send_cors=True,
-                )
-                return
-            sender = instructors[0]
-
-            written: List[str] = []
-            if not req.dry_run:
-                for event_type, content in writes:
-                    try:
-                        await self._api.create_and_send_event_into_room(
-                            {
-                                "type": event_type,
-                                "state_key": "",
-                                "room_id": room_id,
-                                "sender": sender,
-                                "content": content,
-                            }
-                        )
-                    except AuthError as e:
-                        # The room checks the sender again at send time: one
-                        # who left or lost power since they were chosen is
-                        # refused before this event is written.
-                        logger.error(
-                            "set_course_plan: %s refused %s sent as %s; "
-                            "already written: %s: %s",
-                            room_id,
-                            event_type,
-                            sender,
-                            written,
-                            e,
-                        )
-                        respond_with_json(
-                            request,
-                            409,
-                            {
-                                "error": "The room refused a write",
-                                "errcode": e.errcode,
-                                "refused": event_type,
-                                "written": written,
-                            },
-                            send_cors=True,
-                        )
-                        return
-                    except Exception:
-                        logger.exception(
-                            "set_course_plan: writing %s to %s failed; "
-                            "already written: %s",
-                            event_type,
-                            room_id,
-                            written,
-                        )
-                        respond_with_json(
-                            request,
-                            500,
-                            {"error": "Internal server error", "written": written},
-                            send_cors=True,
-                        )
-                        return
-                    written.append(event_type)
-            logger.info(
-                "set_course_plan: operator=%s room=%s %s -> %s changes=%s "
-                "sent_as=%s dry_run=%s",
-                operator,
-                room_id,
-                update.current_quest_id,
-                req.quest_id,
-                answer["changes"],
-                sender,
-                req.dry_run,
-            )
-            respond_with_json(
-                request,
-                200,
-                {**answer, "sender": sender, "changed": not req.dry_run},
-                send_cors=True,
-            )
+            code, answer = await self.apply(req, operator)
+            respond_with_json(request, code, answer, send_cors=True)
         except Exception:
             logger.exception("Error setting a course plan")
             respond_with_json(
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
+
+    async def apply(
+        self, req: SetCoursePlanRequest, operator: str
+    ) -> Tuple[int, Dict[str, Any]]:
+        """The response for an authorized, parsed request: its HTTP status and
+        body. Shared with the invitation-side replacement of a claimed course
+        (create-course-space.instructions.md, "Replacing the course plan")."""
+        room_id = req.room_id
+
+        # The whole state: choosing the sender needs every member and the
+        # power levels, beside the four events this endpoint reads.
+        state = await self._api.get_room_state(room_id)
+        event = state.get((self._event_type, ""))
+        update = plan_update(
+            dict(event.content) if event is not None else None,
+            req.expected_quest_id,
+            req.quest_id,
+        )
+
+        if update.outcome == NOT_A_COURSE:
+            return (404, {"error": "Room has no course plan"})
+        if update.outcome == MISMATCH:
+            return (
+                409,
+                {
+                    "error": "Room points at a different quest than expected",
+                    "current_quest_id": update.current_quest_id,
+                },
+            )
+
+        current_name = _state_text(state.get((EventTypes.Name, "")), "name")
+        current_topic = _state_text(state.get((EventTypes.Topic, "")), "topic")
+        current_copy = _content(state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
+        copy: Optional[Dict[str, Any]] = None
+        built: Optional[Dict[str, Any]] = None
+        # A switch builds the new quest's copy; a space already on the
+        # quest whose copy is empty (a failed read) gets it rebuilt.
+        if update.outcome == UPDATE or current_copy == {}:
+            built = await self._course_missions.read(req.quest_id)
+            if built is None:
+                logger.error(
+                    "set_course_plan: no course copy could be built for quest "
+                    "%s in %s; %s",
+                    req.quest_id,
+                    room_id,
+                    (
+                        "an empty copy is written, so readers use the shared quest"
+                        if update.outcome == UPDATE
+                        else "its empty copy stays"
+                    ),
+                )
+            # The read can take seconds; a teacher who changed course or
+            # published a copy in the meantime wins.
+            again = await self._api.get_room_state(
+                room_id,
+                [
+                    (self._event_type, ""),
+                    (COURSE_MISSIONS_STATE_EVENT_TYPE, ""),
+                ],
+            )
+            if (
+                _content(again.get((self._event_type, ""))) != _content(event)
+                or _content(again.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
+                != current_copy
+            ):
+                logger.warning(
+                    "set_course_plan: %s changed while its course copy was "
+                    "built; refused, nothing written",
+                    room_id,
+                )
+                return (409, {"error": "The space changed while its copy was built"})
+            if update.outcome == UPDATE or built is not None:
+                copy = course_copy_content(built, current_copy)
+        writes = planned_writes(
+            update,
+            self._event_type,
+            copy,
+            current_name,
+            current_topic,
+            req.title,
+            req.description,
+        )
+        answer = {
+            "room_id": room_id,
+            "previous_quest_id": update.current_quest_id,
+            "quest_id": req.quest_id,
+            "previous_name": current_name,
+            "previous_topic": current_topic,
+            "changes": [event_type for event_type, _ in writes],
+            # Reported whenever a copy was built or tried, so a failed
+            # rebuild of an empty copy is visible too.
+            "course_copy": (
+                {
+                    "built": built is not None,
+                    "previous_revision": copy_revision(current_copy),
+                    "revision": copy_revision(copy),
+                    "missions": len((copy or {}).get("missions") or []),
+                }
+                if update.outcome == UPDATE or current_copy == {}
+                else None
+            ),
+            "dry_run": req.dry_run,
+        }
+        if not writes:
+            return (200, {**answer, "sender": None, "changed": False})
+
+        # One instructor sends every write: readers ignore a course copy
+        # sent below power level 100, so a weaker sender is never used.
+        instructors = joined_local_instructors(self._api, state)
+        if not instructors:
+            logger.warning(
+                "set_course_plan: no local instructor in %s can send %s; "
+                "refused, nothing written",
+                room_id,
+                answer["changes"],
+            )
+            return (409, {"error": "No local instructor can send the course events"})
+        sender = instructors[0]
+
+        written: List[str] = []
+        if not req.dry_run:
+            for event_type, content in writes:
+                try:
+                    await self._api.create_and_send_event_into_room(
+                        {
+                            "type": event_type,
+                            "state_key": "",
+                            "room_id": room_id,
+                            "sender": sender,
+                            "content": content,
+                        }
+                    )
+                except AuthError as e:
+                    # The room checks the sender again at send time: one
+                    # who left or lost power since they were chosen is
+                    # refused before this event is written.
+                    logger.error(
+                        "set_course_plan: %s refused %s sent as %s; "
+                        "already written: %s: %s",
+                        room_id,
+                        event_type,
+                        sender,
+                        written,
+                        e,
+                    )
+                    return (
+                        409,
+                        {
+                            "error": "The room refused a write",
+                            "errcode": e.errcode,
+                            "refused": event_type,
+                            "written": written,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "set_course_plan: writing %s to %s failed; "
+                        "already written: %s",
+                        event_type,
+                        room_id,
+                        written,
+                    )
+                    return (500, {"error": "Internal server error", "written": written})
+                written.append(event_type)
+        logger.info(
+            "set_course_plan: operator=%s room=%s %s -> %s changes=%s "
+            "sent_as=%s dry_run=%s",
+            operator,
+            room_id,
+            update.current_quest_id,
+            req.quest_id,
+            answer["changes"],
+            sender,
+            req.dry_run,
+        )
+        return (200, {**answer, "sender": sender, "changed": not req.dry_run})

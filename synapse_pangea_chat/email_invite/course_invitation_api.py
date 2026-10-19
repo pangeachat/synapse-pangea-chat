@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import re
 
-from synapse.api.errors import SynapseError
+from synapse.api.errors import Codes, SynapseError
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.logging.context import run_in_background
@@ -20,20 +20,32 @@ from synapse_pangea_chat.email_invite.course_claim_reminder import (
     _capture_exception,
     _text_field,
 )
+from synapse_pangea_chat.email_invite.course_invitations import invitation_kind
 from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
+from synapse_pangea_chat.set_course_plan.set_course_plan import parse_request
 
 logger = logging.getLogger(__name__)
 
 
 class CourseInvitationAPI(Resource):
     def __init__(
-        self, api, config, claims, invitations, mailer, mode, invitation_id=None
+        self,
+        api,
+        config,
+        claims,
+        invitations,
+        mailer,
+        mode,
+        invitation_id=None,
+        room_plan=None,
     ):
         super().__init__()
         self.api, self.config, self.claims = api, config, claims
         self.invitations, self.mailer, self.mode = invitations, mailer, mode
         self.invitation_id = invitation_id
+        # set_course_plan's room rewrite, for replacing a claimed course's plan.
+        self.room_plan = room_plan
         self.isLeaf = mode != "status" or invitation_id is not None
 
     def getChild(self, path, request):
@@ -45,6 +57,7 @@ class CourseInvitationAPI(Resource):
             self.mailer,
             "status",
             path.decode("ascii", errors="replace"),
+            self.room_plan,
         )
 
     def render_GET(self, request):
@@ -65,7 +78,12 @@ class CourseInvitationAPI(Resource):
             operator = requester.user.to_string()
             if not await self.api.is_user_admin(operator):
                 raise SynapseError(403, "Admin access required")
-            if self.mode == "status":
+            if self.mode == "status" and method == "POST":
+                body = await extract_body_json(request)
+                if not isinstance(body, dict):
+                    raise SynapseError(400, "Expected a JSON object")
+                result = await self.replace(operator, body)
+            elif self.mode == "status":
                 if method == "DELETE":
                     await self.invitations.revoke(self.invitation_id)
                 elif method != "GET":
@@ -151,6 +169,132 @@ class CourseInvitationAPI(Resource):
         if created and send_email:
             await self.send(ident, code, email, spec=spec)
         return await self.invitations.status(ident)
+
+    async def replace(self, operator, body):
+        """Replace the invitation's course plan (create-course-space.instructions.md,
+        "Replacing the course plan"): the preparation before the claim, the room
+        after it."""
+        if not self.invitation_id:
+            raise SynapseError(405, "Method not allowed")
+        if self.invitation_id.startswith("!"):
+            raise SynapseError(
+                400, "A legacy course is changed by room, with set_course_plan"
+            )
+        fields = {}
+        for field, limit in (
+            ("course_plan_id", 200),
+            ("expected_course_plan_id", 200),
+            ("title", 255),
+        ):
+            value = _text_field(body, field, limit)
+            if value is None:
+                raise SynapseError(400, "Missing or invalid " + field)
+            fields[field] = value
+        expected = fields.pop("expected_course_plan_id")
+        # Required, as set_course_plan requires it: a missing one would clear the topic.
+        description = body.get("description")
+        if not isinstance(description, str) or len(description) > 10000:
+            raise SynapseError(400, "Missing or invalid description")
+        fields["description"] = description.strip()
+        dry_run = body.get("dry_run", False)
+        if not isinstance(dry_run, bool):
+            raise SynapseError(400, "dry_run must be a boolean")
+        invitation = await self.invitations.get(self.invitation_id)
+        if invitation is None:
+            raise SynapseError(404, "Invitation not found")
+        if (
+            invitation["status"] == "completed"
+            and invitation_kind(invitation) == "course"
+        ):
+            replacement = await self.replace_in_room(
+                operator, invitation, expected, fields, dry_run
+            )
+        else:
+            replacement = await self.invitations.replace_preparation(
+                self.invitation_id,
+                expected,
+                fields,
+                operator,
+                self.api._hs.get_clock().time_msec(),
+                dry_run,
+            )
+        logger.info(
+            "Invitation %s course plan %s -> %s by %s (status %s, dry_run %s)",
+            self.invitation_id,
+            replacement["previous_course_plan_id"],
+            fields["course_plan_id"],
+            operator,
+            invitation["status"],
+            dry_run,
+        )
+        return {
+            **await self.invitations.status(self.invitation_id),
+            "replacement": {**replacement, "dry_run": dry_run},
+        }
+
+    async def replace_in_room(self, operator, invitation, expected, fields, dry_run):
+        """A claimed course: set_course_plan's steps and refusals on its room, then
+        the replacement is recorded, once the room holds the new quest."""
+        # set_course_plan's own request rules, so its refusals are this route's too.
+        request, error = parse_request(
+            {
+                "room_id": invitation["room_id"],
+                "quest_id": fields["course_plan_id"],
+                "expected_quest_id": expected,
+                "title": fields["title"],
+                "description": fields["description"],
+                "dry_run": dry_run,
+            }
+        )
+        if request is None:
+            raise SynapseError(400, error)
+        code, answer = await self.room_plan.apply(request, operator)
+        if code != 200:
+            extra = {k: v for k, v in answer.items() if k not in ("error", "errcode")}
+            if "current_quest_id" in extra:
+                # The name the preparation's refusal uses, so callers read one field.
+                extra["current_course_plan_id"] = extra["current_quest_id"]
+            raise SynapseError(
+                code,
+                answer.get("error", "Course plan replacement failed"),
+                answer.get("errcode", Codes.UNKNOWN),
+                additional_fields=extra,
+            )
+        quest = fields["course_plan_id"]
+        held = invitation["specification"].get("course_plan_id")
+        previous = answer["previous_quest_id"]
+        # Also when the room already held the quest: a replacement whose record
+        # failed after the room write is recorded when it is sent again, expecting
+        # the new quest.
+        if not dry_run and held != quest:
+            try:
+                await self.invitations.record_replacement(
+                    invitation["invitation_id"],
+                    previous if previous != quest else held,
+                    fields,
+                    operator,
+                    self.api._hs.get_clock().time_msec(),
+                )
+            except Exception as error:
+                logger.error(
+                    "Invitation %s: room %s took course plan %s, but the replacement "
+                    "was not recorded: %s",
+                    invitation["invitation_id"],
+                    invitation["room_id"],
+                    quest,
+                    type(error).__name__,
+                )
+                raise SynapseError(
+                    500,
+                    "The course took the new quest, but the replacement was not "
+                    "recorded; send it again expecting the new quest",
+                    additional_fields={"room": answer},
+                ) from error
+        return {
+            "previous_course_plan_id": previous,
+            "course_plan_id": quest,
+            "room": answer,
+        }
 
     async def remind(self, body):
         ident = _text_field(body, "invitation_id", 100)

@@ -35,7 +35,14 @@ SCHEMA = (
         invitation_id TEXT PRIMARY KEY, subject TEXT NOT NULL, html TEXT NOT NULL,
         text TEXT NOT NULL, receiving_reason TEXT NOT NULL,
         stored_at_ms BIGINT NOT NULL)""",
+    # Each course plan replacement, for status reads (create-course-space,
+    # "Replacing the course plan").
+    """CREATE TABLE IF NOT EXISTS pangea_course_invitation_replacement (
+        invitation_id TEXT NOT NULL, replaced_at_ms BIGINT NOT NULL,
+        previous_course_plan_id TEXT, course_plan_id TEXT NOT NULL,
+        operator_id TEXT NOT NULL)""",
 )
+REPLACED_FIELDS = ("course_plan_id", "title", "description")
 COLUMNS = (
     "invitation_id",
     "status",
@@ -60,6 +67,26 @@ def invitation_kind(invitation) -> str:
     course, else ``course`` (the first claim, which creates the room)."""
     spec = invitation.get("specification") or {}
     return "instructor" if spec.get("kind") == "instructor" else "course"
+
+
+def replacement_refusal(invitation) -> SynapseError | None:
+    """Why this invitation's course plan cannot be replaced, or None. A
+    completed course invitation is replaced in its room, not here."""
+    if invitation["status"] == "revoked":
+        reason = "A revoked invitation cannot be replaced"
+    elif invitation_kind(invitation) == "instructor":
+        reason = (
+            "An additional-instructor invitation has no course plan of its own; "
+            "change its course by room"
+        )
+    elif invitation["status"] == "provisioning":
+        # Provisioning checks the room against the preparation it started from.
+        reason = "A claim is creating this course; send the replacement again once it completes"
+    elif invitation["status"] != "prepared":
+        reason = "Only a prepared invitation's preparation can be replaced"
+    else:
+        return None
+    return SynapseError(409, reason, additional_fields={"status": invitation["status"]})
 
 
 def recovery_required() -> SynapseError:
@@ -385,6 +412,105 @@ class CourseInvitationStore:
 
         return await self.db.runInteraction("pangea_claimed_email_for_room", read)
 
+    async def replace_preparation(
+        self, invitation_id, expected, replacement, operator, now, dry_run=False
+    ):
+        """Replace a prepared invitation's quest, title and description, so the
+        claim provisions from them. Checked and written in one transaction: it
+        lands before a claim reserves the invitation, or it is refused.
+        ``replacement`` holds the new ``REPLACED_FIELDS``."""
+        await self.ensure()
+
+        def update(txn):
+            txn.execute(
+                SELECT.replace("SELECT ", "SELECT specification AS raw, ", 1)
+                + "WHERE invitation_id = ?",
+                (invitation_id,),
+            )
+            found = txn.fetchone()
+            if found is None:
+                raise SynapseError(404, "Invitation not found")
+            raw, row = found[0], self.row(found[1:])
+            refusal = replacement_refusal(row)
+            if refusal:
+                raise refusal
+            spec = row["specification"]
+            current = spec.get("course_plan_id")
+            if current != expected:
+                raise SynapseError(
+                    409,
+                    "Invitation holds a different quest than expected",
+                    additional_fields={"current_course_plan_id": current},
+                )
+            changes = [f for f in REPLACED_FIELDS if spec.get(f) != replacement[f]]
+            if changes and not dry_run:
+                # Guarded by status and by the stored text, so a claim or another
+                # replacement that committed since the read is never overwritten:
+                # the update finds no row, or fails to serialize and is retried.
+                txn.execute(
+                    """UPDATE pangea_course_invitation SET specification = ?
+                    WHERE invitation_id = ? AND status = 'prepared' AND specification = ?""",
+                    (json.dumps({**spec, **replacement}), invitation_id, raw),
+                )
+                if txn.rowcount != 1:
+                    raise SynapseError(
+                        409, "Invitation changed while it was replaced; read it again"
+                    )
+                if current != replacement["course_plan_id"]:
+                    self._record(
+                        txn, invitation_id, current, replacement, operator, now
+                    )
+            return {
+                "previous_course_plan_id": current,
+                "course_plan_id": replacement["course_plan_id"],
+                "changes": changes,
+            }
+
+        return await self.db.runInteraction("pangea_invitation_replace", update)
+
+    async def record_replacement(
+        self, invitation_id, previous, replacement, operator, now
+    ):
+        """Record a replacement the claimed course's room accepted, and keep the
+        preparation's quest in step with it. One already recorded is not recorded
+        again, so two requests that both passed the room check make one record.
+        True when this call recorded it."""
+        await self.ensure()
+
+        def update(txn):
+            txn.execute(
+                "SELECT specification FROM pangea_course_invitation WHERE invitation_id = ? AND status = 'completed'",
+                (invitation_id,),
+            )
+            found = txn.fetchone()
+            if found is None:
+                raise SynapseError(
+                    409, "Invitation changed while its course was replaced"
+                )
+            spec = json.loads(found[0])
+            if spec.get("course_plan_id") == replacement["course_plan_id"]:
+                return False
+            spec.update(replacement)
+            txn.execute(
+                "UPDATE pangea_course_invitation SET specification = ? WHERE invitation_id = ?",
+                (json.dumps(spec), invitation_id),
+            )
+            self._record(txn, invitation_id, previous, replacement, operator, now)
+            return True
+
+        return await self.db.runInteraction(
+            "pangea_invitation_record_replacement", update
+        )
+
+    @staticmethod
+    def _record(txn, invitation_id, previous, replacement, operator, now):
+        txn.execute(
+            """INSERT INTO pangea_course_invitation_replacement
+            (invitation_id, replaced_at_ms, previous_course_plan_id, course_plan_id, operator_id)
+            VALUES (?, ?, ?, ?, ?)""",
+            (invitation_id, now, previous, replacement["course_plan_id"], operator),
+        )
+
     async def status(self, invitation_id):
         row = await self.get(invitation_id)
         if row is None:
@@ -414,7 +540,34 @@ class CourseInvitationStore:
                 "completed_at_ms",
             )
         }
+
+        def replacements(txn):
+            txn.execute(
+                """SELECT replaced_at_ms, previous_course_plan_id, course_plan_id
+                FROM pangea_course_invitation_replacement WHERE invitation_id = ?
+                ORDER BY replaced_at_ms""",
+                (invitation_id,),
+            )
+            return [
+                dict(
+                    zip(
+                        ("replaced_at_ms", "previous_course_plan_id", "course_plan_id"),
+                        r,
+                    )
+                )
+                for r in txn.fetchall()
+            ]
+
         result["kind"] = invitation_kind(row)
+        # An instructor invitation joins an existing course; its quest is the room's.
+        result["course_plan_id"] = (
+            row["specification"].get("course_plan_id")
+            if result["kind"] == "course"
+            else None
+        )
+        result["replacements"] = await self.db.runInteraction(
+            "pangea_invitation_replacements", replacements
+        )
         result["deliveries"] = await self.db.runInteraction(
             "pangea_invitation_deliveries", deliveries
         )
