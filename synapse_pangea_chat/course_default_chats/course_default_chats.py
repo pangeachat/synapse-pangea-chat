@@ -472,6 +472,16 @@ class CourseDefaultChats:
         async with self._chat_locks.queue(chat_id):
             chat = await self._chat_state(chat_id)
             plan = plan_recovery(chat, roster, user_id, self._api.is_mine)
+            # Before any write, so a recovery that fails part-way still leaves
+            # a record of who asked for which writes in which chat.
+            logger.info(
+                "course_default_chats recovering %s in %s: restoring %s for %s (%s)",
+                chat_id,
+                space_id,
+                user_id,
+                caller,
+                plan,
+            )
             if plan.join:
                 profile = await self._api.get_profile_for_user(
                     UserID.from_string(user_id).localpart

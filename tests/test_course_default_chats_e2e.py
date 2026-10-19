@@ -165,6 +165,17 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
             return None
         return response.json().get("membership")
 
+    async def _assert_never_joined(
+        self, room_id: str, user_id: str, token: str
+    ) -> None:
+        """No member event for ``user_id``, read by a joined member: a 404,
+        not any failure to read, which would also make _membership None."""
+        response = requests.get(
+            self._state_url(room_id, "m.room.member", user_id),
+            headers=self._headers(token),
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+
     async def _power_users(self, room_id: str, token: str) -> Dict[str, int]:
         response = requests.get(
             self._state_url(room_id, "m.room.power_levels"),
@@ -723,7 +734,7 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         teacher created it, the co-teacher was mirrored in as an admin, both
         then left the chat, and the student still in it holds no power."""
         await self.homeserver()
-        _, operator = await self.new_user("operator", admin=True)
+        operator_id, operator = await self.new_user("operator", admin=True)
         teacher_id, teacher = await self.new_user("teacher")
         co_id, co = await self.new_user("co")
         s1_id, s1 = await self.new_user("s1")
@@ -744,6 +755,7 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         await self._leave(chat_id, teacher)
         return {
             "operator": operator,
+            "operator_id": operator_id,
             "teacher": (teacher_id, teacher),
             "co": (co_id, co),
             "s1": (s1_id, s1),
@@ -769,9 +781,25 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         await self._join(space_id, s2)
         await self._join(space_id, new)
         await self._set_power(space_id, new_id, 100, teacher)
-        time.sleep(2)
-        self.assertIsNone(await self._membership(chat_id, s2_id, s1))
-        self.assertIsNone(await self._membership(chat_id, new_id, s1))
+
+        # Wait until the module has tried both and reported the chat, so the
+        # checks below see its failure rather than an attempt not yet made.
+        def reported(reason: str) -> Callable[[], Any]:
+            async def seen() -> bool:
+                return any(
+                    chat_id in line and reason in line for line in self.server_log()
+                )
+
+            return seen
+
+        await self._wait_until_async(
+            reported("no joined member can let members in"), "the join reported"
+        )
+        await self._wait_until_async(
+            reported("no joined admin can mirror"), "the promotion reported"
+        )
+        await self._assert_never_joined(chat_id, s2_id, s1)
+        await self._assert_never_joined(chat_id, new_id, s1)
 
         # The teacher who left still holds admin power there: only the join.
         response = self._recover(
@@ -795,7 +823,7 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
             (response.json()["join"], response.json()["promote"]), (True, True)
         )
         # A dry run writes nothing.
-        self.assertIsNone(await self._membership(chat_id, new_id, s1))
+        await self._assert_never_joined(chat_id, new_id, s1)
 
         response = self._recover(operator, body)
         self.assertEqual(response.status_code, 200, response.text)
@@ -813,12 +841,17 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         ).json()["joined_rooms"]
         self.assertIn(chat_id, joined_rooms)
         await self._set_power(chat_id, s2_id, 0, new)
-        self.assertTrue(
-            any(
-                "course_default_chats recovered" in line and new_id in line
-                for line in self.server_log()
+        # Logged before the writes (with who asked) and after them.
+        for step in ("recovering", "recovered"):
+            self.assertTrue(
+                any(
+                    f"course_default_chats {step} {chat_id}" in line
+                    and new_id in line
+                    and course["operator_id"] in line
+                    for line in self.server_log()
+                ),
+                step,
             )
-        )
 
         # Recovery done: the chat is an ordinary default chat, so a second
         # recovery is refused and the repair lets the class in, including the
