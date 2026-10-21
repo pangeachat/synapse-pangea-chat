@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, overload
 
 logger = logging.getLogger("synapse_pangea_chat.user_activity.activity_cache")
 
@@ -173,6 +173,14 @@ class UserActivityCache:
         return upserted, chunks
 
     # -- watermarks ---------------------------------------------------------------------------
+
+    @overload
+    async def _watermark(self, name: str, *, default: int) -> int:
+        ...
+
+    @overload
+    async def _watermark(self, name: str, *, default: None) -> Optional[int]:
+        ...
 
     async def _watermark(self, name: str, *, default: Optional[int]) -> Optional[int]:
         rows = await self.db.execute(
