@@ -82,6 +82,8 @@ from synapse_pangea_chat.set_course_plan import SetCoursePlan
 from synapse_pangea_chat.user_activity import (
     CourseActivities,
     UserActivity,
+    UserActivityCache,
+    UserActivityRefresh,
     UserCourses,
 )
 from synapse_pangea_chat.user_directory_search import UserDirectorySearch
@@ -513,11 +515,34 @@ class PangeaChat:
         register_safety_incidents(api, config)
 
         # --- User Activity ---
-        self.user_activity_resource = UserActivity(api, config)
+        # The route reads a table the module keeps (user-activity.instructions.md, "DB query strategy"):
+        # brought up to date on a loop, on demand through the refresh route, and in full when asked.
+        self.user_activity_cache = UserActivityCache(
+            api._hs.get_datastores().main.db_pool
+        )
+        self.user_activity_resource = UserActivity(
+            api, config, self.user_activity_cache
+        )
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/user_activity",
             resource=self.user_activity_resource,
         )
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/user_activity_refresh",
+            resource=UserActivityRefresh(api, config, self.user_activity_cache),
+        )
+        if config.user_activity_refresh_interval_seconds > 0:
+            # The first refresh soon after start (a rebuild when the table is new), then the loop.
+            self._api.delayed_background_call(
+                15_000,
+                self._refresh_user_activity,
+                desc="pangea_user_activity_first_refresh",
+            )
+            self._api.looping_background_call(
+                self._refresh_user_activity,
+                config.user_activity_refresh_interval_seconds * 1000,
+                desc="pangea_user_activity_refresh",
+            )
 
         # --- Course Activities ---
         self.course_activities_resource = CourseActivities(api, config)
@@ -685,6 +710,15 @@ class PangeaChat:
         room_id = event.room_id
         invalidate_room_cache(room_id)
 
+    async def _refresh_user_activity(self) -> None:
+        """One turn of the kept activity table's refresh (``UserActivityCache.refresh``)."""
+        try:
+            await self.user_activity_cache.refresh()
+        except (
+            Exception
+        ):  # noqa: BLE001  # silent-ok: logged with its traceback; the loop's next turn tries again, and the route's activity_refreshed_at shows the table's age
+            logger.exception("user activity refresh failed")
+
     @staticmethod
     def parse_config(config: Dict[str, Any]) -> PangeaChatConfig:
         config = dict(config)
@@ -829,6 +863,22 @@ class PangeaChat:
                 raise ValueError(
                     'Config "user_activity_notification_bot_user_id" must not be empty'
                 )
+        user_activity_refresh_interval_seconds = config.get(
+            "user_activity_refresh_interval_seconds", 300
+        )
+        if (
+            isinstance(user_activity_refresh_interval_seconds, bool)
+            or not isinstance(user_activity_refresh_interval_seconds, int)
+            or user_activity_refresh_interval_seconds < 0
+        ):
+            raise ValueError(
+                'Config "user_activity_refresh_interval_seconds" must be an integer >= 0 (0 turns the loop off)'
+            )
+        user_activity_refresh_on_read = config.get(
+            "user_activity_refresh_on_read", False
+        )
+        if not isinstance(user_activity_refresh_on_read, bool):
+            raise ValueError('Config "user_activity_refresh_on_read" must be a boolean')
 
         # --- delete_user config ---
         delete_user_requests_per_burst = config.get("delete_user_requests_per_burst", 5)
@@ -1467,6 +1517,8 @@ class PangeaChat:
             user_activity_requests_per_burst=user_activity_requests_per_burst,
             user_activity_burst_duration_seconds=user_activity_burst_duration_seconds,
             user_activity_notification_bot_user_id=user_activity_notification_bot_user_id,
+            user_activity_refresh_interval_seconds=user_activity_refresh_interval_seconds,
+            user_activity_refresh_on_read=user_activity_refresh_on_read,
             delete_user_requests_per_burst=delete_user_requests_per_burst,
             delete_user_burst_duration_seconds=delete_user_burst_duration_seconds,
             delete_user_schedule_delay_seconds=delete_user_schedule_delay_seconds,

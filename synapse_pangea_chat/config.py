@@ -75,6 +75,10 @@ class PangeaChatConfig:
     # Bot user ID used by the notification_cooldown_ms filter to identify bot DM rooms.
     # Required when using the notification_cooldown_ms query param.
     user_activity_notification_bot_user_id: Optional[str] = None
+    # How often the kept activity table is brought up to date (seconds); 0 turns the loop off, leaving
+    # the refresh route. refresh_on_read rebuilds the table on every read: for a small server only.
+    user_activity_refresh_interval_seconds: int = 300
+    user_activity_refresh_on_read: bool = False
 
     # --- delete_user config ---
     delete_user_requests_per_burst: int = 5

@@ -38,6 +38,10 @@ async def get_users(
 ) -> Dict[str, Any]:
     """Return paginated list of local users with basic activity metadata.
 
+    The activity times come from ``pangea_user_activity``, the table the module keeps up to date
+    (``activity_cache``): no call aggregates ``user_ips`` or scans ``events``. A user with no row
+    there has no recorded activity (0).
+
     Filter params (all optional, composable):
       user_ids               - restrict to these user IDs
       course_ids             - restrict to members of these course rooms
@@ -125,7 +129,7 @@ async def get_users(
         )
 
     # ------------------------------------------------------------------
-    # Step 3 — build shared WHERE clause and CTE fragments
+    # Step 3 — build the shared WHERE clause
     # ------------------------------------------------------------------
     # inactive_days threshold: epoch-ms before which last activity must fall
     inactivity_threshold_ms: Optional[int] = None
@@ -152,8 +156,8 @@ async def get_users(
 
         if inactivity_threshold_ms is not None:
             clauses.append(
-                "COALESCE(ll.last_login_ts, 0) < ?"
-                " AND COALESCE(lm.last_message_ts, 0) < ?"
+                "COALESCE(a.last_login_ts, 0) < ?"
+                " AND COALESCE(a.last_message_ts, 0) < ?"
             )
             args.extend([inactivity_threshold_ms, inactivity_threshold_ms])
 
@@ -166,53 +170,17 @@ async def get_users(
             return " AND " + " AND ".join(clauses), args
         return "", args
 
-    needs_inactive_ctes = inactivity_threshold_ms is not None
-
-    def _activity_ctes() -> str:
-        return """
-    WITH last_logins AS (
-        SELECT user_id, MAX(last_seen) AS last_login_ts
-        FROM user_ips
-        GROUP BY user_id
-    ),
-    last_messages AS (
-        SELECT sender, MAX(origin_server_ts) AS last_message_ts
-        FROM events
-        WHERE type = 'm.room.message'
-        GROUP BY sender
-    )
-    """
-
-    def _login_cte() -> str:
-        return """
-    WITH last_logins AS (
-        SELECT user_id, MAX(last_seen) AS last_login_ts
-        FROM user_ips
-        GROUP BY user_id
-    )
-    """
-
     # ------------------------------------------------------------------
-    # Step 4 — count + page entirely in SQL
+    # Step 4 — count + page entirely in SQL, over the kept activity table
     # ------------------------------------------------------------------
     extra_where, filter_args = _build_extra_where()
 
-    if needs_inactive_ctes:
-        count_query = f"""
-        {_activity_ctes()}
-        SELECT COUNT(*)
-        FROM users u
-        LEFT JOIN last_logins ll ON ll.user_id = u.name
-        LEFT JOIN last_messages lm ON lm.sender = u.name
-        WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
-        """
-    else:
-        count_query = f"""
-        SELECT COUNT(*)
-        FROM users u
-        WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
-        """
-
+    count_query = f"""
+    SELECT COUNT(*)
+    FROM users u
+    LEFT JOIN pangea_user_activity a ON a.user_id = u.name
+    WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
+    """
     count_rows = await room_store.db_pool.execute(
         "get_users_count", count_query, *filter_args
     )
@@ -225,54 +193,27 @@ async def get_users(
         page = max_page
     offset = (page - 1) * limit
 
-    needs_message_before_pagination = needs_inactive_ctes or sort_by in {
-        "last_message_ts",
-        "latest_activity",
-    }
-
-    if needs_message_before_pagination:
-        users_query = f"""
-        {_activity_ctes()}
-        SELECT
-            u.name AS user_id,
-            p.displayname AS display_name,
-            COALESCE(ll.last_login_ts, 0) AS last_login_ts,
-            COALESCE(lm.last_message_ts, 0) AS last_message_ts,
-            GREATEST(
-                COALESCE(ll.last_login_ts, 0),
-                COALESCE(lm.last_message_ts, 0)
-            ) AS latest_activity_ts
-        FROM users u
-        LEFT JOIN profiles p ON p.full_user_id = u.name
-        LEFT JOIN last_logins ll ON ll.user_id = u.name
-        LEFT JOIN last_messages lm ON lm.sender = u.name
-        WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
-        ORDER BY {_sql_order_by(sort_by, sort_order)}
-        LIMIT ? OFFSET ?
-        """
-        user_rows = await room_store.db_pool.execute(
-            "get_users_page", users_query, *filter_args, limit, offset
-        )
-        users = [_user_from_activity_row(row) for row in user_rows]
-    else:
-        users_query = f"""
-        {_login_cte()}
-        SELECT
-            u.name AS user_id,
-            p.displayname AS display_name,
-            COALESCE(ll.last_login_ts, 0) AS last_login_ts
-        FROM users u
-        LEFT JOIN profiles p ON p.full_user_id = u.name
-        LEFT JOIN last_logins ll ON ll.user_id = u.name
-        WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
-        ORDER BY {_sql_login_only_order_by(sort_by, sort_order)}
-        LIMIT ? OFFSET ?
-        """
-        user_rows = await room_store.db_pool.execute(
-            "get_users_page", users_query, *filter_args, limit, offset
-        )
-        users = [_user_from_login_row(row) for row in user_rows]
-        await _attach_page_last_messages(room_store, users)
+    users_query = f"""
+    SELECT
+        u.name AS user_id,
+        p.displayname AS display_name,
+        COALESCE(a.last_login_ts, 0) AS last_login_ts,
+        COALESCE(a.last_message_ts, 0) AS last_message_ts,
+        GREATEST(
+            COALESCE(a.last_login_ts, 0),
+            COALESCE(a.last_message_ts, 0)
+        ) AS latest_activity_ts
+    FROM users u
+    LEFT JOIN profiles p ON p.full_user_id = u.name
+    LEFT JOIN pangea_user_activity a ON a.user_id = u.name
+    WHERE u.deactivated = 0 AND u.is_guest = 0{extra_where}
+    ORDER BY {_sql_order_by(sort_by, sort_order)}
+    LIMIT ? OFFSET ?
+    """
+    user_rows = await room_store.db_pool.execute(
+        "get_users_page", users_query, *filter_args, limit, offset
+    )
+    users = [_user_from_activity_row(row) for row in user_rows]
 
     return {
         "docs": users,
@@ -374,24 +315,15 @@ def _sql_order_by(sort_by: str, sort_order: str) -> str:
     if sort_by == "user_id":
         return f"u.name {direction}"
     if sort_by == "last_login_ts":
-        return f"COALESCE(ll.last_login_ts, 0) {direction}, u.name ASC"
+        return f"COALESCE(a.last_login_ts, 0) {direction}, u.name ASC"
     if sort_by == "last_message_ts":
-        return f"COALESCE(lm.last_message_ts, 0) {direction}, u.name ASC"
+        return f"COALESCE(a.last_message_ts, 0) {direction}, u.name ASC"
     if sort_by == "latest_activity":
         return (
-            "GREATEST(COALESCE(ll.last_login_ts, 0), "
-            f"COALESCE(lm.last_message_ts, 0)) {direction}, u.name ASC"
+            "GREATEST(COALESCE(a.last_login_ts, 0), "
+            f"COALESCE(a.last_message_ts, 0)) {direction}, u.name ASC"
         )
     raise ValueError(f"Unsupported user_activity sort_by: {sort_by}")
-
-
-def _sql_login_only_order_by(sort_by: str, sort_order: str) -> str:
-    direction = _sql_direction(sort_order)
-    if sort_by == "user_id":
-        return f"u.name {direction}"
-    if sort_by == "last_login_ts":
-        return f"COALESCE(ll.last_login_ts, 0) {direction}, u.name ASC"
-    raise ValueError(f"Unsupported login-only user_activity sort_by: {sort_by}")
 
 
 def _sql_direction(sort_order: str) -> str:
@@ -411,46 +343,3 @@ def _user_from_activity_row(row: Any) -> Dict[str, Any]:
         "last_message_ts": last_message_ts or 0,
         "latest_activity_ts": latest_activity_ts or 0,
     }
-
-
-def _user_from_login_row(row: Any) -> Dict[str, Any]:
-    uid, display_name, last_login_ts = row
-    return {
-        "user_id": uid,
-        "display_name": display_name,
-        "last_login_ts": last_login_ts or 0,
-        "last_message_ts": 0,
-        "latest_activity_ts": last_login_ts or 0,
-    }
-
-
-async def _attach_page_last_messages(
-    room_store: RoomStore,
-    users: List[Dict[str, Any]],
-) -> None:
-    if not users:
-        return
-
-    page_user_ids = [user["user_id"] for user in users]
-    user_placeholders = ",".join(["?" for _ in page_user_ids])
-    last_message_query = f"""
-    SELECT e.sender, MAX(e.origin_server_ts) AS last_message_ts
-    FROM events e
-    WHERE e.type = 'm.room.message'
-      AND e.sender IN ({user_placeholders})
-    GROUP BY e.sender
-    """
-    message_rows = await room_store.db_pool.execute(
-        "get_users_last_message", last_message_query, *page_user_ids
-    )
-    users_by_id = {u["user_id"]: u for u in users}
-    for row in message_rows:
-        sender, last_message_ts = row
-        if sender in users_by_id:
-            users_by_id[sender]["last_message_ts"] = last_message_ts or 0
-
-    for user in users:
-        user["latest_activity_ts"] = max(
-            int(user.get("last_login_ts") or 0),
-            int(user.get("last_message_ts") or 0),
-        )
