@@ -209,7 +209,7 @@ class TestDirectPushSygnalChoiceE2E(BaseSynapseE2ETest):
             }
         )
         alice_id, alice_token = await self.new_user("alice")
-        _, admin_token = await self.new_user("admin", admin=True)
+        admin_id, admin_token = await self.new_user("admin", admin=True)
         switched_key = f"switched-{self.tag}"
         unlisted_key = f"unlisted-{self.tag}"
 
@@ -244,3 +244,8 @@ class TestDirectPushSygnalChoiceE2E(BaseSynapseE2ETest):
         self.assertEqual(len(self.default_sygnal.wait_for(unlisted_key, 1, 5)), 1)
         self.assertEqual(self.default_sygnal.received(switched_key), [])
         self.assertEqual(self.other_sygnal.received(unlisted_key), [])
+        # The push is sent as the admin that asked for it, which the client
+        # checks against its environment's bot before following a notice path.
+        self.assertEqual(
+            self.other_sygnal.notifications(switched_key)[0]["sender"], admin_id
+        )

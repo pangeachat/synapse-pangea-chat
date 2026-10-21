@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from twisted.internet import defer
 
@@ -227,6 +227,7 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
             "event-1",
             {
                 "room_id": "!room:test",
+                "sender": "@bot:example.test",
                 "body": "hello",
                 "title": "A new activity",
                 "content": {"format": "org.matrix.custom.html"},
@@ -242,6 +243,7 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(payload["notification"]["event_id"], "event-1")
+        self.assertEqual(payload["notification"]["sender"], "@bot:example.test")
         self.assertEqual(
             payload["notification"]["sender_display_name"], "A new activity"
         )
@@ -252,6 +254,35 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
             "org.matrix.custom.html",
         )
         self.assertEqual(payload["notification"]["devices"][0]["pushkey"], "push-a")
+
+    async def test_post_stamps_the_caller_as_the_push_sender(self):
+        # The client follows a notice's app path only when the push's sender is
+        # its environment's bot, so the sender must be the account that asked,
+        # not a constant and not whatever the body claims.
+        handler = _make_handler()
+        handler._config.send_push_requests_per_burst = 100
+        handler._config.send_push_burst_duration_seconds = 60
+        handler._auth.get_user_by_req = AsyncMock(
+            return_value=SimpleNamespace(
+                user=SimpleNamespace(to_string=lambda: "@bot:example.test")
+            )
+        )
+        handler._api.is_user_admin = AsyncMock(return_value=True)
+        handler._send_push = AsyncMock(return_value={"sent": 1})
+        request = SimpleNamespace(
+            content=BytesIO(
+                b'{"user_id": "@alice:example.test", "body": "hi", "sender": "@mallory:example.test"}'
+            )
+        )
+        with patch(
+            "synapse_pangea_chat.direct_push.direct_push.respond_with_json"
+        ) as respond:
+            await handler._async_render_POST(request)
+
+        respond.assert_called_once()
+        self.assertEqual(respond.call_args.args[1], 200)
+        sent_body = handler._send_push.await_args.args[2]
+        self.assertEqual(sent_body["sender"], "@bot:example.test")
 
     def test_build_payload_sets_room_id_null_when_omitted(self):
         handler = _make_handler()

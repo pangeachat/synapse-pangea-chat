@@ -355,6 +355,18 @@ class TestDeliverNotice(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["pusher_kinds"], ("http",))
         api._hs.get_send_email_handler.return_value.send_email.assert_not_awaited()
 
+    async def test_push_names_the_requesting_admin_as_sender(self):
+        # A flat notice has no event to take the sender from, so the push is
+        # sent as the admin that asked for it.
+        handler = self._handler(_api(), sent=1)
+        with patch(
+            "synapse_pangea_chat.notice_delivery.deliver.ensure_bot_notice_push_rule",
+            new=AsyncMock(return_value=False),
+        ):
+            await handler.deliver(self._body(), requested_by="@bot:my.domain.name")
+        push_request = handler._direct_push._send_push.await_args.args[2]
+        self.assertEqual(push_request["sender"], "@bot:my.domain.name")
+
     async def test_no_pusher_falls_back_to_email_with_unsubscribe_headers(self):
         api = _api(
             threepids=[SimpleNamespace(medium="email", address="alice@example.test")]
