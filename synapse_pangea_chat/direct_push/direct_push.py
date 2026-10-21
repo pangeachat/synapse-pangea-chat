@@ -105,6 +105,10 @@ class DirectPush(Resource):
                 )
                 return
 
+            # The push names its sender: the admin that asked for it, never a
+            # caller-supplied or hardcoded account. The client follows a notice's
+            # app path only when this is its environment's bot.
+            body["sender"] = requester_id
             response = await self._send_push(target_user_id, device_id, body)
             respond_with_json(request, 200, response, send_cors=True)
 
@@ -242,7 +246,7 @@ class DirectPush(Resource):
                 "event_id": event_id,
                 "room_id": req_body.get("room_id"),
                 "type": req_body.get("type", "m.room.message"),
-                "sender": "@bot:pangea.chat",
+                "sender": req_body.get("sender"),
                 "sender_display_name": req_body.get("title") or "Pangea Bot",
                 "room_name": "",
                 "room_avatar_url": None,

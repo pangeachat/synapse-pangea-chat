@@ -181,6 +181,18 @@ class TestScheduledDelivery(unittest.IsolatedAsyncioTestCase):
         api._hs.get_send_email_handler.return_value.send_email.assert_not_awaited()
         handler._delivery_log.reserve.assert_not_awaited()
 
+    async def test_scheduled_push_is_sent_as_the_notice_sender(self):
+        # The event is created at send time as sender_id, and the push that
+        # stands in for it carries the same sender.
+        handler, api = self.handler()
+        handler._direct_push._send_push.return_value["sent"] = 1
+        body = scheduled_body()
+        body["delivery_method"] = "push-only"
+        result = await handler._deliver_scheduled(body)
+        self.assertEqual(result["channel"], "push")
+        push_request = handler._direct_push._send_push.await_args.args[2]
+        self.assertEqual(push_request["sender"], "@admin:test")
+
     async def test_preferences_changed_since_enqueue_suppress_entire_notice(self):
         handler, api = self.handler()
         api.account_data_manager.get_global.return_value = {"all_off": True}

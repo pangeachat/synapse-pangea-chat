@@ -171,6 +171,17 @@ class TestStructuredDelivery(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/_synapse/client/pangea/v1/n?t=", kwargs["text"])
         handler._delivery_log.finish.assert_awaited_once()
 
+    async def test_push_names_the_notice_event_sender(self):
+        # The push stands in for the notice event, so it carries that event's
+        # sender (the bot), not the operator that asked for the delivery.
+        handler, api = self.handler(sent=1)
+        result = await handler.deliver(
+            request_body("push-only"), requested_by="@operator:test"
+        )
+        self.assertEqual(result["channel"], "push")
+        push_request = handler._direct_push._send_push.await_args.args[2]
+        self.assertEqual(push_request["sender"], "@admin:test")
+
     async def test_availability_prefers_in_app(self):
         handler, api = self.handler(active=True, sent=1)
         self.assertEqual((await handler.deliver(request_body()))["channel"], "in_app")
