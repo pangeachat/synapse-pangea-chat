@@ -19,7 +19,71 @@ logging.basicConfig(
 NOTIFICATION_BOT_USER_ID = f"@bot:{SERVER_NAME}"
 
 
-class TestUserActivityE2E(BaseSynapseE2ETest):
+class _RefreshOnRead:
+    """These classes' servers rebuild the kept activity table on every read, so the listing's tests
+    need no refresh call between seeding and reading; the refresh itself is TestUserActivityRefreshE2E's.
+    """
+
+    async def homeserver(self, *, module_config=None, synapse_config_overrides=None):  # type: ignore[override]
+        merged = {"user_activity_refresh_on_read": True, **(module_config or {})}
+        return await super().homeserver(  # type: ignore[misc]
+            module_config=merged, synapse_config_overrides=synapse_config_overrides
+        )
+
+
+class _ActivitySeeds:
+    """Deterministic activity facts written straight to the database, so a test never waits on
+    Synapse's periodic user_ips flush."""
+
+    def _db_args_from_config(self, config_path: str) -> dict:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file)
+        return config["database"]["args"]
+
+    def _replace_last_login_ts(
+        self,
+        config_path: str,
+        user_id: str,
+        timestamp_ms: int | None,
+    ) -> None:
+        db_args = self._db_args_from_config(config_path)
+        with psycopg2.connect(**db_args) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM user_ips WHERE user_id = %s", (user_id,))
+                if timestamp_ms is not None:
+                    cursor.execute(
+                        """
+                        INSERT INTO user_ips (
+                            user_id, access_token, device_id, ip, user_agent, last_seen
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            user_id,
+                            f"test-access-token:{user_id}",
+                            None,
+                            "127.0.0.1",
+                            "test-user-activity-sort",
+                            timestamp_ms,
+                        ),
+                    )
+
+    def _set_event_origin_server_ts(
+        self,
+        config_path: str,
+        event_id: str,
+        timestamp_ms: int,
+    ) -> None:
+        db_args = self._db_args_from_config(config_path)
+        with psycopg2.connect(**db_args) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE events SET origin_server_ts = %s WHERE event_id = %s",
+                    (timestamp_ms, event_id),
+                )
+                self.assertEqual(cursor.rowcount, 1)  # type: ignore[attr-defined]
+
+
+class TestUserActivityE2E(_RefreshOnRead, BaseSynapseE2ETest):
     def _every_user_activity_doc(self, admin_token: str) -> list[dict]:
         """The unfiltered listing, every page of it.
 
@@ -484,60 +548,13 @@ class TestUserActivityE2E(BaseSynapseE2ETest):
         )
 
 
-class TestUserActivityGlobalSortE2E(BaseSynapseE2ETest):
+class TestUserActivityGlobalSortE2E(_RefreshOnRead, _ActivitySeeds, BaseSynapseE2ETest):
     """Sorting across the server's whole user list, before pagination.
 
     Its unfiltered pages assert exactly which users the server holds and in
     what order, so it needs a homeserver holding only its own users: this
     class holds this one test, and gets a server of its own.
     """
-
-    def _db_args_from_config(self, config_path: str) -> dict:
-        with open(config_path, "r", encoding="utf-8") as config_file:
-            config = yaml.safe_load(config_file)
-        return config["database"]["args"]
-
-    def _replace_last_login_ts(
-        self,
-        config_path: str,
-        user_id: str,
-        timestamp_ms: int | None,
-    ) -> None:
-        db_args = self._db_args_from_config(config_path)
-        with psycopg2.connect(**db_args) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("DELETE FROM user_ips WHERE user_id = %s", (user_id,))
-                if timestamp_ms is not None:
-                    cursor.execute(
-                        """
-                        INSERT INTO user_ips (
-                            user_id, access_token, device_id, ip, user_agent, last_seen
-                        ) VALUES (%s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            user_id,
-                            f"test-access-token:{user_id}",
-                            None,
-                            "127.0.0.1",
-                            "test-user-activity-sort",
-                            timestamp_ms,
-                        ),
-                    )
-
-    def _set_event_origin_server_ts(
-        self,
-        config_path: str,
-        event_id: str,
-        timestamp_ms: int,
-    ) -> None:
-        db_args = self._db_args_from_config(config_path)
-        with psycopg2.connect(**db_args) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE events SET origin_server_ts = %s WHERE event_id = %s",
-                    (timestamp_ms, event_id),
-                )
-                self.assertEqual(cursor.rowcount, 1)
 
     def _user_activity_docs(
         self,
@@ -918,3 +935,119 @@ class TestUserActivityNotificationCooldownE2E(BaseSynapseE2ETest):
         returned_ids = {u["user_id"] for u in data["docs"]}
         self.assertIn(learner_id, returned_ids)
         self.assertEqual(data["totalDocs"], 1)
+
+
+class TestUserActivityRefreshE2E(_ActivitySeeds, BaseSynapseE2ETest):
+    """The kept activity table and its refresh (user-activity.instructions.md, "DB query strategy").
+
+    This server's loop is off, so every refresh here is the test's own call.
+    """
+
+    def _refresh(self, token: str, *, full: bool = False) -> requests.Response:
+        return requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/user_activity_refresh",
+            params={"full": "true"} if full else None,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=60,
+        )
+
+    def _doc(self, admin_token: str, user_id: str) -> tuple[dict, dict]:
+        response = requests.get(
+            f"{self.server_url}/_synapse/client/pangea/v1/user_activity",
+            params={"user_ids": user_id},
+            headers={"Authorization": f"Bearer {admin_token}"},
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(len(data["docs"]), 1, data)
+        return data["docs"][0], data
+
+    async def test_the_table_is_filled_by_a_refresh_not_by_the_read(self):
+        """Before any refresh the read answers zeros and no refresh time; an incremental refresh folds in
+        a message sent since; only an admin may refresh."""
+        await self.homeserver(
+            module_config={"user_activity_refresh_interval_seconds": 0}
+        )
+        _, admin_token = await self.new_user("admin", admin=True)
+        learner_id, learner_token = await self.new_user("learner")
+
+        self.assertEqual(self._refresh(learner_token).status_code, 403)
+
+        # A new user has no row until a refresh folds one in, whatever earlier tests refreshed.
+        doc, data = self._doc(admin_token, learner_id)
+        self.assertEqual(
+            (doc["last_login_ts"], doc["last_message_ts"], doc["latest_activity_ts"]),
+            (0, 0, 0),
+        )
+
+        room_id = await self.create_private_room(learner_token)
+        sent = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn-refresh-1",
+            json={"msgtype": "m.text", "body": "hello"},
+            headers={"Authorization": f"Bearer {learner_token}"},
+            timeout=30,
+        )
+        self.assertEqual(sent.status_code, 200, sent.text)
+
+        first = self._refresh(admin_token)
+        self.assertEqual(first.status_code, 200, first.text)
+        out = first.json()
+        self.assertFalse(out["full"])
+        self.assertGreaterEqual(out["messages_upserted"], 1)
+        self.assertGreaterEqual(out["event_chunks"], 1)
+
+        doc, data = self._doc(admin_token, learner_id)
+        self.assertGreater(doc["last_message_ts"], 0)
+        self.assertEqual(
+            doc["latest_activity_ts"], max(doc["last_login_ts"], doc["last_message_ts"])
+        )
+        self.assertEqual(data["activity_refreshed_at"], out["refreshed_at"])
+
+        # Nothing new: the next incremental refresh folds nothing in and the table stands.
+        again = self._refresh(admin_token).json()
+        self.assertEqual((again["messages_upserted"], again["event_chunks"]), (0, 0))
+        self.assertEqual(
+            self._doc(admin_token, learner_id)[0]["last_message_ts"],
+            doc["last_message_ts"],
+        )
+
+    async def test_a_full_refresh_rebuilds_from_the_facts_as_they_are_now(self):
+        """A fact changed behind the watermarks (a seeded login, an event's time moved) is not seen by an
+        incremental refresh and is by a full one."""
+        config_path = (
+            await self.homeserver(
+                module_config={"user_activity_refresh_interval_seconds": 0}
+            )
+        ).config_path
+        _, admin_token = await self.new_user("admin", admin=True)
+        learner_id, learner_token = await self.new_user("rebuilt")
+        room_id = await self.create_private_room(learner_token)
+        sent = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn-refresh-2",
+            json={"msgtype": "m.text", "body": "before"},
+            headers={"Authorization": f"Bearer {learner_token}"},
+            timeout=30,
+        )
+        self.assertEqual(sent.status_code, 200, sent.text)
+        self.assertEqual(self._refresh(admin_token).status_code, 200)
+        before = self._doc(admin_token, learner_id)[0]
+        self.assertGreater(before["last_message_ts"], 0)
+
+        self._replace_last_login_ts(config_path, learner_id, 5_000)
+        self._set_event_origin_server_ts(config_path, sent.json()["event_id"], 7_000)
+
+        incremental = self._refresh(admin_token).json()
+        self.assertEqual(incremental["event_chunks"], 0)
+        self.assertEqual(
+            self._doc(admin_token, learner_id)[0]["last_message_ts"],
+            before["last_message_ts"],
+        )
+
+        full = self._refresh(admin_token, full=True).json()
+        self.assertTrue(full["full"])
+        doc = self._doc(admin_token, learner_id)[0]
+        self.assertEqual(
+            (doc["last_login_ts"], doc["last_message_ts"], doc["latest_activity_ts"]),
+            (5_000, 7_000, 7_000),
+        )

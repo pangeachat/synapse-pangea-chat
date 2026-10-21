@@ -15,6 +15,7 @@ from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.user_activity.activity_cache import UserActivityCache
 from synapse_pangea_chat.user_activity.get_course_activities import (
     get_course_activities,
 )
@@ -72,7 +73,17 @@ class UserActivity(_AdminResourceBase):
     NOTE: notification_cooldown_ms performs O(N candidates) account-data
     lookups server-side. Use user_ids or course_ids to narrow the candidate
     set when possible.
+
+    The activity times are read from the table the module keeps
+    (``activity_cache``), and ``activity_refreshed_at`` in the answer says when
+    it was last brought up to date (null before the first refresh).
     """
+
+    def __init__(
+        self, api: ModuleApi, config: PangeaChatConfig, cache: UserActivityCache
+    ):
+        super().__init__(api, config)
+        self._cache = cache
 
     def render_GET(self, request: SynapseRequest):
         run_in_background(self._async_render_GET, request)
@@ -151,6 +162,11 @@ class UserActivity(_AdminResourceBase):
                 )
                 return
 
+            if self._config.user_activity_refresh_on_read:
+                # A small server (the local stack, the test suite) rebuilds the table on every read.
+                await self._cache.refresh(full=True)
+            else:
+                await self._cache.ensure()
             data = await get_users(
                 self._datastores.main,
                 page=page,
@@ -164,6 +180,7 @@ class UserActivity(_AdminResourceBase):
                 sort_by=sort_by,
                 sort_order=sort_order,
             )
+            data["activity_refreshed_at"] = await self._cache.refreshed_at()
 
             respond_with_json(request, 200, data, send_cors=True)
 
@@ -178,6 +195,56 @@ class UserActivity(_AdminResourceBase):
             )
         except Exception:  # noqa: BLE001
             logger.exception("Error processing user_activity request")
+            respond_with_json(
+                request, 500, {"error": "Internal server error"}, send_cors=True
+            )
+
+
+class UserActivityRefresh(_AdminResourceBase):
+    """POST /_synapse/client/pangea/v1/user_activity_refresh
+
+    Bring the kept activity table up to date now, incrementally, or from scratch
+    with ``full=true`` (a rebuild: every ``user_ips`` row and every message event
+    read once more, in bounded chunks). Admin only. Answers with what moved and
+    how long it took. The loop does the same on its interval; this is for an
+    operator or a caller about to read many people.
+    """
+
+    def __init__(
+        self, api: ModuleApi, config: PangeaChatConfig, cache: UserActivityCache
+    ):
+        super().__init__(api, config)
+        self._cache = cache
+
+    def render_POST(self, request: SynapseRequest):
+        run_in_background(self._async_render_POST, request)
+        return server.NOT_DONE_YET
+
+    async def _async_render_POST(self, request: SynapseRequest):
+        try:
+            requester = await self._auth.get_user_by_req(request)
+            if not await self._api.is_user_admin(requester.user.to_string()):
+                respond_with_json(
+                    request,
+                    403,
+                    {"error": "Forbidden: server admin required"},
+                    send_cors=True,
+                )
+                return
+            full = _bool_param(request, b"full")
+            out = await self._cache.refresh(full=full)
+            respond_with_json(request, 200, out, send_cors=True)
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
+        except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
+            logger.info("Authentication failed: %s", e)
+            respond_with_json(
+                request,
+                401,
+                {"error": "Unauthorized", "errcode": "M_UNAUTHORIZED"},
+                send_cors=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Error refreshing user activity")
             respond_with_json(
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
@@ -395,6 +462,14 @@ def _enum_param(
     if value in allowed:
         return value
     return None
+
+
+def _bool_param(request: SynapseRequest, name: bytes) -> bool:
+    """A boolean query param: true, 1, yes or on (any case); absent or anything else is False."""
+    raw = request.args.get(name, [None])[0]  # type: ignore[arg-type]
+    if raw is None:
+        return False
+    return raw.decode("utf-8", "replace").strip().lower() in ("true", "1", "yes", "on")
 
 
 def _optional_int_param(
