@@ -531,8 +531,15 @@ class PangeaChat:
             path="/_synapse/client/pangea/v1/user_activity_refresh",
             resource=UserActivityRefresh(api, config, self.user_activity_cache),
         )
-        if config.user_activity_refresh_interval_seconds > 0:
-            # The first refresh soon after start (a rebuild when the table is new), then the loop.
+        if (
+            config.user_activity_refresh_interval_seconds > 0
+            and self._api.should_run_background_tasks()
+        ):
+            # The first refresh soon after start (a rebuild when the table is new), then the loop: on the
+            # one instance that runs background tasks and never on the other workers. The looping call
+            # already keeps to that instance; the delayed first call did not, and on 2026-10-21 every
+            # process of a 17-process deployment rebuilt the table at once at each restart, colliding on
+            # the watermarks (user-activity doc, "DB query strategy").
             self._api.delayed_background_call(
                 15_000,
                 self._refresh_user_activity,
