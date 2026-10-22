@@ -16,6 +16,7 @@ from synapse_pangea_chat.config import (
 )
 from synapse_pangea_chat.course_default_chats import (
     CourseDefaultChats,
+    RecoverCourseDefaultChat,
     SyncCourseDefaultChats,
 )
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
@@ -81,6 +82,8 @@ from synapse_pangea_chat.set_course_plan import SetCoursePlan
 from synapse_pangea_chat.user_activity import (
     CourseActivities,
     UserActivity,
+    UserActivityCache,
+    UserActivityRefresh,
     UserCourses,
 )
 from synapse_pangea_chat.user_directory_search import UserDirectorySearch
@@ -374,6 +377,9 @@ class PangeaChat:
         self.claim_by_email = ClaimByEmail(
             api, course_claim_store.invitations, provisioner
         )
+        # Set Course Plan's room rewrite, shared with the invitation-side
+        # replacement of a claimed course (registered under its own path below).
+        self.set_course_plan_resource = SetCoursePlan(api, config)
         for endpoint, mode in (
             ("create_course_space", "prepare"),
             ("send_course_claim_reminder", "reminder"),
@@ -388,6 +394,7 @@ class PangeaChat:
                     course_claim_store.invitations,
                     course_claim_mailer,
                     mode,
+                    room_plan=self.set_course_plan_resource,
                 ),
             )
         # Additional-instructor invitations into an existing course: prepared
@@ -481,7 +488,6 @@ class PangeaChat:
         )
 
         # --- Set Course Plan ---
-        self.set_course_plan_resource = SetCoursePlan(api, config)
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/set_course_plan",
             resource=self.set_course_plan_resource,
@@ -509,11 +515,41 @@ class PangeaChat:
         register_safety_incidents(api, config)
 
         # --- User Activity ---
-        self.user_activity_resource = UserActivity(api, config)
+        # The route reads a table the module keeps (user-activity.instructions.md, "DB query strategy"):
+        # brought up to date on a loop, on demand through the refresh route, and in full when asked.
+        self.user_activity_cache = UserActivityCache(
+            api._hs.get_datastores().main.db_pool
+        )
+        self.user_activity_resource = UserActivity(
+            api, config, self.user_activity_cache
+        )
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/user_activity",
             resource=self.user_activity_resource,
         )
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/user_activity_refresh",
+            resource=UserActivityRefresh(api, config, self.user_activity_cache),
+        )
+        if (
+            config.user_activity_refresh_interval_seconds > 0
+            and self._api.should_run_background_tasks()
+        ):
+            # The first refresh soon after start (a rebuild when the table is new), then the loop: on the
+            # one instance that runs background tasks and never on the other workers. The looping call
+            # already keeps to that instance; the delayed first call did not, and on 2026-10-21 every
+            # process of a 17-process deployment rebuilt the table at once at each restart, colliding on
+            # the watermarks (user-activity doc, "DB query strategy").
+            self._api.delayed_background_call(
+                15_000,
+                self._refresh_user_activity,
+                desc="pangea_user_activity_first_refresh",
+            )
+            self._api.looping_background_call(
+                self._refresh_user_activity,
+                config.user_activity_refresh_interval_seconds * 1000,
+                desc="pangea_user_activity_refresh",
+            )
 
         # --- Course Activities ---
         self.course_activities_resource = CourseActivities(api, config)
@@ -578,6 +614,10 @@ class PangeaChat:
             self._api.register_web_resource(
                 path="/_synapse/client/pangea/v1/sync_course_default_chats",
                 resource=SyncCourseDefaultChats(api, self.course_default_chats),
+            )
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/recover_course_default_chat",
+                resource=RecoverCourseDefaultChat(api, self.course_default_chats),
             )
 
         # --- Direct Push ---
@@ -676,6 +716,15 @@ class PangeaChat:
 
         room_id = event.room_id
         invalidate_room_cache(room_id)
+
+    async def _refresh_user_activity(self) -> None:
+        """One turn of the kept activity table's refresh (``UserActivityCache.refresh``)."""
+        try:
+            await self.user_activity_cache.refresh()
+        except (
+            Exception
+        ):  # noqa: BLE001  # silent-ok: logged with its traceback; the loop's next turn tries again, and the route's activity_refreshed_at shows the table's age
+            logger.exception("user activity refresh failed")
 
     @staticmethod
     def parse_config(config: Dict[str, Any]) -> PangeaChatConfig:
@@ -821,6 +870,22 @@ class PangeaChat:
                 raise ValueError(
                     'Config "user_activity_notification_bot_user_id" must not be empty'
                 )
+        user_activity_refresh_interval_seconds = config.get(
+            "user_activity_refresh_interval_seconds", 300
+        )
+        if (
+            isinstance(user_activity_refresh_interval_seconds, bool)
+            or not isinstance(user_activity_refresh_interval_seconds, int)
+            or user_activity_refresh_interval_seconds < 0
+        ):
+            raise ValueError(
+                'Config "user_activity_refresh_interval_seconds" must be an integer >= 0 (0 turns the loop off)'
+            )
+        user_activity_refresh_on_read = config.get(
+            "user_activity_refresh_on_read", False
+        )
+        if not isinstance(user_activity_refresh_on_read, bool):
+            raise ValueError('Config "user_activity_refresh_on_read" must be a boolean')
 
         # --- delete_user config ---
         delete_user_requests_per_burst = config.get("delete_user_requests_per_burst", 5)
@@ -1459,6 +1524,8 @@ class PangeaChat:
             user_activity_requests_per_burst=user_activity_requests_per_burst,
             user_activity_burst_duration_seconds=user_activity_burst_duration_seconds,
             user_activity_notification_bot_user_id=user_activity_notification_bot_user_id,
+            user_activity_refresh_interval_seconds=user_activity_refresh_interval_seconds,
+            user_activity_refresh_on_read=user_activity_refresh_on_read,
             delete_user_requests_per_burst=delete_user_requests_per_burst,
             delete_user_burst_duration_seconds=delete_user_burst_duration_seconds,
             delete_user_schedule_delay_seconds=delete_user_schedule_delay_seconds,

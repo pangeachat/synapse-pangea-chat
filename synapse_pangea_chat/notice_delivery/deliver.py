@@ -277,8 +277,8 @@ class DeliverNotice(Resource):
         error = self._validate(body, self._config.notice_external_link_hosts)
         if error:
             raise ValueError(error)
+        body = {**body, "_requested_by": requested_by or body.get("sender_id")}
         if "scheduled_at" in body:
-            body = {**body, "_requested_by": requested_by or body["sender_id"]}
             req = self._parse(body)
             await self._validate_scheduled_target(body, req)
             return await self.schedule.enqueue(body)
@@ -316,10 +316,14 @@ class DeliverNotice(Resource):
         body = dict(body)
         req = self._parse(body) if is_structured(body) else None
         record_id = None
+        # The push stands in for the notice event, so it is sent as that event's
+        # sender: a scheduled notice's sender_id, or the admin that asked when
+        # there is no event to read (notice-delivery.instructions.md, Direct push).
+        body["_push_sender"] = body.get("sender_id") or body.get("_requested_by")
 
         if req is not None:
             if req.notice_event_id is not None:
-                await self._validate_notice(req)
+                body["_push_sender"] = await self._validate_notice(req)
             if req.caller_owns_record:
                 # The caller wrote the Notification_Log row and will write the receipt onto
                 # it; this module touches the record not at all (engagement-system doc).
@@ -429,7 +433,8 @@ class DeliverNotice(Resource):
                 )
             raise
 
-    async def _validate_notice(self, req: NoticeRequest) -> None:
+    async def _validate_notice(self, req: NoticeRequest) -> str:
+        """Checks the referenced notice and returns its sender."""
         assert req.notice_event_id is not None
         event = await self._store.get_event(req.notice_event_id, allow_none=True)
         if (
@@ -449,6 +454,7 @@ class DeliverNotice(Resource):
             raise ValueError(
                 "Recipient must be a joined local member of the notice room"
             )
+        return event.sender
 
     async def _deliver_once(
         self, body: Dict[str, Any], req: Optional[NoticeRequest]
@@ -534,6 +540,7 @@ class DeliverNotice(Resource):
 
         push_request: Dict[str, Any] = {
             "user_id": user_id,
+            "sender": body.get("_push_sender"),
             "body": req.push.body if req and req.push else body["body"],
             "title": req.push.title if req and req.push else body.get("title"),
             "room_id": _optional_str(body.get("notice_room_id")),

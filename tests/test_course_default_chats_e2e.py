@@ -30,6 +30,14 @@ ANNOUNCEMENTS_POWER_LEVELS = {
     "users_default": 0,
 }
 
+# The client's preset for Introductions: anyone posts, power 50 invites (so
+# a member at the default level cannot let anyone in), power 100 changes
+# power levels.
+INTRODUCTIONS_POWER_LEVELS = {
+    **ANNOUNCEMENTS_POWER_LEVELS,
+    "events_default": 0,
+}
+
 
 class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
     _alias_counter = 0
@@ -117,6 +125,14 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
             power_levels=ANNOUNCEMENTS_POWER_LEVELS,
         )
 
+    async def _create_introductions(self, token: str, space_id: str) -> str:
+        return await self._create_child(
+            token,
+            space_id,
+            alias_prefix=INTRODUCTIONS,
+            power_levels=INTRODUCTIONS_POWER_LEVELS,
+        )
+
     async def _link_child(self, token: str, space_id: str, child_id: str) -> None:
         response = requests.put(
             self._state_url(space_id, "m.space.child", child_id),
@@ -148,6 +164,17 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         if response.status_code != 200:
             return None
         return response.json().get("membership")
+
+    async def _assert_never_joined(
+        self, room_id: str, user_id: str, token: str
+    ) -> None:
+        """No member event for ``user_id``, read by a joined member: a 404,
+        not any failure to read, which would also make _membership None."""
+        response = requests.get(
+            self._state_url(room_id, "m.room.member", user_id),
+            headers=self._headers(token),
+        )
+        self.assertEqual(response.status_code, 404, response.text)
 
     async def _power_users(self, room_id: str, token: str) -> Dict[str, int]:
         response = requests.get(
@@ -683,6 +710,246 @@ class TestCourseDefaultChatsE2E(BaseSynapseE2ETest):
         after = script.repair(self.server_url, operator, space_id, wait_seconds=30)
         self.assertFalse(script.needs_attention(after))
         self.assertEqual(await self._membership(chat_id, s1_id, teacher), "join")
+
+    # -- the recovery endpoint -----------------------------------------------
+
+    def _recover_endpoint(self) -> str:
+        return (
+            f"{self.server_url}/_synapse/client/pangea/v1/recover_course_default_chat"
+        )
+
+    def _recover(self, token: str, body: Dict[str, Any]) -> requests.Response:
+        return requests.post(
+            self._recover_endpoint(), headers=self._headers(token), json=body
+        )
+
+    async def _leave(self, room_id: str, token: str) -> None:
+        response = requests.post(
+            self._room_url(room_id, "/leave"), headers=self._headers(token)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    async def _dead_introductions(self) -> Dict[str, Any]:
+        """A course whose Introductions chat nobody in it can act for: the
+        teacher created it, the co-teacher was mirrored in as an admin, both
+        then left the chat, and the student still in it holds no power."""
+        await self.homeserver()
+        operator_id, operator = await self.new_user("operator", admin=True)
+        teacher_id, teacher = await self.new_user("teacher")
+        co_id, co = await self.new_user("co")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        await self._join(space_id, co)
+        await self._join(space_id, s1)
+        await self._set_power(space_id, co_id, 100, teacher)
+        chat_id = await self._create_introductions(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        await self._wait_joined(chat_id, [co_id, s1_id], teacher)
+
+        async def co_mirrored() -> bool:
+            return (await self._power_users(chat_id, teacher)).get(co_id) == 100
+
+        await self._wait_until_async(co_mirrored, "co-teacher mirrored as admin")
+        await self._leave(chat_id, co)
+        await self._leave(chat_id, teacher)
+        return {
+            "operator": operator,
+            "operator_id": operator_id,
+            "teacher": (teacher_id, teacher),
+            "co": (co_id, co),
+            "s1": (s1_id, s1),
+            "space_id": space_id,
+            "chat_id": chat_id,
+        }
+
+    async def test_recovery_restores_a_space_admin_and_the_repair_lets_the_class_in(
+        self,
+    ):
+        course = await self._dead_introductions()
+        operator, space_id, chat_id = (
+            course["operator"],
+            course["space_id"],
+            course["chat_id"],
+        )
+        teacher_id, teacher = course["teacher"]
+        _, s1 = course["s1"]
+        # A student who joins the course now cannot get into the chat, and a
+        # new space admin cannot be mirrored into it.
+        s2_id, s2 = await self.new_user("s2")
+        new_id, new = await self.new_user("new")
+        await self._join(space_id, s2)
+        await self._join(space_id, new)
+        await self._set_power(space_id, new_id, 100, teacher)
+
+        # Wait until the module has tried both and reported the chat, so the
+        # checks below see its failure rather than an attempt not yet made.
+        def reported(reason: str) -> Callable[[], Any]:
+            async def seen() -> bool:
+                return any(
+                    chat_id in line and reason in line for line in self.server_log()
+                )
+
+            return seen
+
+        await self._wait_until_async(
+            reported("no joined member can let members in"), "the join reported"
+        )
+        await self._wait_until_async(
+            reported("no joined admin can mirror"), "the promotion reported"
+        )
+        await self._assert_never_joined(chat_id, s2_id, s1)
+        await self._assert_never_joined(chat_id, new_id, s1)
+
+        # The teacher who left still holds admin power there: only the join.
+        response = self._recover(
+            operator,
+            {
+                "room_id": chat_id,
+                "space_id": space_id,
+                "user_id": teacher_id,
+                "dry_run": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            (response.json()["join"], response.json()["promote"]), (True, False)
+        )
+        # A space admin who was never in the chat: the join and the promotion.
+        body = {"room_id": chat_id, "space_id": space_id, "user_id": new_id}
+        response = self._recover(operator, {**body, "dry_run": True})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            (response.json()["join"], response.json()["promote"]), (True, True)
+        )
+        # A dry run writes nothing.
+        await self._assert_never_joined(chat_id, new_id, s1)
+
+        response = self._recover(operator, body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json(),
+            {**body, "dry_run": False, "joined": True, "promoted": True},
+        )
+        self.assertEqual(await self._membership(chat_id, new_id, s1), "join")
+        self.assertEqual((await self._power_users(chat_id, s1)).get(new_id), 100)
+        # The restored admin really holds the room: the server lists it among
+        # their rooms, and they can do what only an admin can.
+        joined_rooms = requests.get(
+            f"{self.server_url}/_matrix/client/v3/joined_rooms",
+            headers=self._headers(new),
+        ).json()["joined_rooms"]
+        self.assertIn(chat_id, joined_rooms)
+        await self._set_power(chat_id, s2_id, 0, new)
+        # Logged before the writes (with who asked) and after them.
+        for step in ("recovering", "recovered"):
+            self.assertTrue(
+                any(
+                    f"course_default_chats {step} {chat_id}" in line
+                    and new_id in line
+                    and course["operator_id"] in line
+                    for line in self.server_log()
+                ),
+                step,
+            )
+
+        # Recovery done: the chat is an ordinary default chat, so a second
+        # recovery is refused and the repair lets the class in, including the
+        # teacher who had left.
+        response = self._recover(operator, body)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["reason"], "chat_has_admin")
+        response = requests.post(
+            self._endpoint(),
+            headers=self._headers(operator),
+            json={"room_id": space_id},
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        await self._wait_joined(chat_id, [s2_id, teacher_id], new)
+
+    async def test_recovery_refuses_to_restore_a_student(self):
+        course = await self._dead_introductions()
+        operator, space_id, chat_id = (
+            course["operator"],
+            course["space_id"],
+            course["chat_id"],
+        )
+        s1_id, s1 = course["s1"]
+        co_id, _ = course["co"]
+
+        response = self._recover(
+            operator, {"room_id": chat_id, "space_id": space_id, "user_id": s1_id}
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["errcode"], "ORG.PANGEA.RECOVERY_REFUSED")
+        self.assertEqual(response.json()["reason"], "not_space_admin")
+        self.assertEqual((await self._power_users(chat_id, s1)).get(s1_id, 0), 0)
+        # The positive control: the co-teacher, a space admin, is accepted.
+        response = self._recover(
+            operator,
+            {
+                "room_id": chat_id,
+                "space_id": space_id,
+                "user_id": co_id,
+                "dry_run": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    async def test_recovery_refuses_a_space_admin_banned_from_the_chat(self):
+        await self.homeserver()
+        _, operator = await self.new_user("operator", admin=True)
+        teacher_id, teacher = await self.new_user("teacher")
+        banned_id, banned = await self.new_user("banned")
+        s1_id, s1 = await self.new_user("s1")
+
+        space_id = await self._create_space(teacher)
+        await self._join(space_id, s1)
+        chat_id = await self._create_introductions(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        await self._wait_joined(chat_id, [s1_id], teacher)
+        await self._membership_action("ban", chat_id, banned_id, teacher)
+        await self._join(space_id, banned)
+        await self._set_power(space_id, banned_id, 100, teacher)
+        await self._leave(chat_id, teacher)
+
+        body = {"room_id": chat_id, "space_id": space_id, "user_id": banned_id}
+        response = self._recover(operator, body)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["reason"], "banned")
+        self.assertEqual(await self._membership(chat_id, banned_id, s1), "ban")
+        # The positive control: the teacher, not banned, is accepted.
+        response = self._recover(
+            operator, {**body, "user_id": teacher_id, "dry_run": True}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    async def test_recovery_refuses_a_healthy_chat_non_admins_and_bad_input(self):
+        await self.homeserver()
+        _, operator = await self.new_user("operator", admin=True)
+        teacher_id, teacher = await self.new_user("teacher")
+        space_id = await self._create_space(teacher)
+        chat_id = await self._create_announcements(teacher, space_id)
+        await self._link_child(teacher, space_id, chat_id)
+        plain_child_id = await self._create_child(teacher, space_id, alias_prefix=None)
+        await self._link_child(teacher, space_id, plain_child_id)
+        good = {"room_id": chat_id, "space_id": space_id, "user_id": teacher_id}
+
+        for token, body, status, reason in (
+            (teacher, good, 403, None),
+            (operator, {**good, "dry_run": "yes"}, 400, None),
+            (operator, {**good, "user_id": "nope"}, 400, None),
+            (operator, {**good, "user_id": "@someone:elsewhere.org"}, 400, None),
+            (operator, {**good, "space_id": chat_id}, 400, None),
+            (operator, {**good, "room_id": "nope"}, 400, None),
+            # The teacher is still in the chat: the repair is the tool.
+            (operator, good, 409, "chat_has_admin"),
+            (operator, {**good, "room_id": plain_child_id}, 409, "not_a_default_chat"),
+        ):
+            response = self._recover(token, body)
+            self.assertEqual(response.status_code, status, (body, response.text))
+            if reason is not None:
+                self.assertEqual(response.json()["reason"], reason, body)
 
 
 def _load_repair_script() -> Any:

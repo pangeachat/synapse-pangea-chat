@@ -4,16 +4,15 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 class RecordingSygnal:
-    """A push gateway that records, per pushkey, the event id of every event
-    push it gets."""
+    """A push gateway that records, per pushkey, every event push it gets."""
 
     def __init__(self) -> None:
         stub = self
-        self.pushes: List[Tuple[str, str]] = []
+        self.pushes: List[Tuple[str, Dict[str, Any]]] = []
         self._lock = threading.Lock()
 
         class _Handler(BaseHTTPRequestHandler):
@@ -27,9 +26,7 @@ class RecordingSygnal:
                 if notification.get("event_id"):
                     with stub._lock:
                         for device in notification["devices"]:
-                            stub.pushes.append(
-                                (device["pushkey"], notification["event_id"])
-                            )
+                            stub.pushes.append((device["pushkey"], notification))
                 payload = b'{"rejected": []}'
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -41,8 +38,11 @@ class RecordingSygnal:
         self.url = f"http://127.0.0.1:{self._server.server_port}/_matrix/push/v1/notify"
 
     def received(self, pushkey: str) -> List[str]:
+        return [n["event_id"] for n in self.notifications(pushkey)]
+
+    def notifications(self, pushkey: str) -> List[Dict[str, Any]]:
         with self._lock:
-            return [event_id for key, event_id in self.pushes if key == pushkey]
+            return [n for key, n in self.pushes if key == pushkey]
 
     def wait_for(self, pushkey: str, count: int, timeout: float) -> List[str]:
         deadline = time.monotonic() + timeout

@@ -1,11 +1,15 @@
 import unittest
 
 from synapse_pangea_chat.course_default_chats.course_default_chats import (
+    ChatRecoveryPlan,
     ChatState,
+    RecoveryRefused,
+    SpaceRoster,
     admins_to_demote,
     admins_to_promote,
     is_default_chat_alias,
     owned_by_space_admin,
+    plan_recovery,
 )
 
 TEACHER = "@teacher:example.com"
@@ -118,3 +122,73 @@ class TestOwnedBySpaceAdmin(unittest.TestCase):
     def test_a_creator_who_stopped_being_an_admin_does_not_count(self):
         chat = self._chat(CO_TEACHER, {CO_TEACHER: 100})
         self.assertFalse(owned_by_space_admin(chat, frozenset({TEACHER})))
+
+
+def _is_local(user_id):
+    return user_id.endswith(":example.com")
+
+
+class TestPlanRecovery(unittest.TestCase):
+    """The dead chat: its creator (a space admin) left, and the members still
+    in it hold no power, so nobody can let anyone in."""
+
+    def _dead_chat(self, memberships=None, users=None, creator=TEACHER):
+        return ChatState(
+            power_content={
+                "users": {TEACHER: 100} if users is None else users,
+                "invite": 50,
+            },
+            memberships=(
+                {TEACHER: "leave", STUDENT: "join"}
+                if memberships is None
+                else memberships
+            ),
+            immutable=frozenset(),
+            creator=creator,
+        )
+
+    def _roster(self, admins=frozenset({TEACHER, CO_TEACHER})):
+        return SpaceRoster(members=admins | {STUDENT}, admins=admins)
+
+    def _refusal(self, chat, user_id, roster=None):
+        with self.assertRaises(RecoveryRefused) as raised:
+            plan_recovery(chat, roster or self._roster(), user_id, _is_local)
+        return raised.exception.reason
+
+    def test_an_admin_who_left_but_still_holds_power_needs_only_the_join(self):
+        plan = plan_recovery(self._dead_chat(), self._roster(), TEACHER, _is_local)
+        self.assertEqual(plan, ChatRecoveryPlan(join=True, promote=False))
+
+    def test_another_space_admin_needs_the_join_and_the_promotion(self):
+        plan = plan_recovery(self._dead_chat(), self._roster(), CO_TEACHER, _is_local)
+        self.assertEqual(plan, ChatRecoveryPlan(join=True, promote=True))
+
+    def test_a_space_admin_already_in_the_chat_without_power_is_only_promoted(self):
+        chat = self._dead_chat(memberships={CO_TEACHER: "join", STUDENT: "join"})
+        plan = plan_recovery(chat, self._roster(), CO_TEACHER, _is_local)
+        self.assertEqual(plan, ChatRecoveryPlan(join=False, promote=True))
+
+    def test_a_chat_someone_can_still_let_members_in_goes_to_the_repair(self):
+        chat = self._dead_chat(users={TEACHER: 100, STUDENT: 50})
+        self.assertEqual(self._refusal(chat, CO_TEACHER), "chat_has_admin")
+
+    def test_only_a_space_admin_can_be_restored(self):
+        self.assertEqual(self._refusal(self._dead_chat(), STUDENT), "not_space_admin")
+
+    def test_a_banned_space_admin_is_not_let_back_in(self):
+        chat = self._dead_chat(memberships={CO_TEACHER: "ban", STUDENT: "join"})
+        self.assertEqual(self._refusal(chat, CO_TEACHER), "banned")
+
+    def test_a_chat_with_members_on_another_server_is_refused(self):
+        chat = self._dead_chat(
+            memberships={STUDENT: "join", "@guest:elsewhere.org": "join"}
+        )
+        self.assertEqual(self._refusal(chat, TEACHER), "remote_members")
+
+    def test_a_room_that_is_not_the_space_admins_own_is_refused(self):
+        chat = self._dead_chat(users={}, creator=STUDENT)
+        self.assertEqual(self._refusal(chat, TEACHER), "not_a_default_chat")
+
+    def test_a_chat_with_no_current_state_is_refused(self):
+        chat = ChatState(power_content={}, memberships={}, immutable=frozenset())
+        self.assertEqual(self._refusal(chat, TEACHER), "no_current_state")
