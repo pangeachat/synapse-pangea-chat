@@ -767,6 +767,15 @@ class PangeaChat:
         if not isinstance(public_courses_backfill_l2, bool):
             raise ValueError('Config "public_courses_backfill_l2" must be a boolean')
 
+        central_course_admin_user_ids = config.get("central_course_admin_user_ids", [])
+        if not isinstance(central_course_admin_user_ids, list) or not all(
+            isinstance(u, str) and u.startswith("@") and ":" in u
+            for u in central_course_admin_user_ids
+        ):
+            raise ValueError(
+                "central_course_admin_user_ids must be a list of full Matrix user IDs"
+            )
+
         public_courses_cms_cache_ttl_seconds = config.get(
             "public_courses_cms_cache_ttl_seconds", 5
         )
@@ -1510,6 +1519,7 @@ class PangeaChat:
             course_plan_state_event_type=course_plan_state_event_type,
             public_courses_cms_cache_ttl_seconds=public_courses_cms_cache_ttl_seconds,
             public_courses_backfill_l2=public_courses_backfill_l2,
+            central_course_admin_user_ids=central_course_admin_user_ids,
             room_preview_state_event_types=all_event_types,
             room_preview_burst_duration_seconds=room_preview_burst_duration_seconds,
             room_preview_requests_per_burst=room_preview_requests_per_burst,

@@ -60,6 +60,15 @@ There are no `language_of_instructions` or `cefr_level` filters. They had no cal
 and serving them would put a CMS lookup back on the read path. A client that wants a
 course's L1 or level reads them from the plan it already fetches to render the card.
 
+## Central courses
+
+A central course is the one Pangea-run course per language for learners who aren't in a teacher's course ([central courses](../../../.github/.github/instructions/central-courses.instructions.md)). The catalog marks which courses are central, so the client can send a learner to one without a second lookup.
+
+- **The mark.** A course is central when its current `pangea.course_settings` state event carries `"central": true`. Every course in the response has a `central` field, which is `false` for all other courses.
+- **Only a Pangea admin can make a course central.** The mark counts only when the `pangea.course_settings` event was sent by an account listed in `central_course_admin_user_ids`, which defaults to `@support:<server name>`. Any course admin can write that event in their own course. Without this check, a teacher could mark their course central and receive every learner the client sends there. A mark from anyone else is ignored rather than refused: the event is ordinary course state, and the catalog reports the course as not central.
+- **The catalog doesn't enforce one central course per language.** If two courses in the same language are marked, both are reported as central. Only Pangea admins can set the mark, so a second one is an operations mistake to fix in room state, and the server doesn't guess which course was meant.
+- **Whether a course appears doesn't change.** The mark only adds a field. A central course appears in the catalog by the same rule as every other course: published in the room directory, with a current `pangea.course_plan` that carries a plan id.
+
 ## Pagination
 
 Filtering happens before pagination, so a page is full unless the catalog is

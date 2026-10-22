@@ -40,9 +40,12 @@ class FakeCatalog:
         self,
         rooms: List[Tuple[str, Optional[str], Optional[str]]],
         unpublished: Optional[Set[str]] = None,
+        state: Optional[Dict[str, List[Tuple[str, str, Dict[str, Any]]]]] = None,
     ) -> None:
         self.rooms = sorted(rooms, key=lambda r: r[0])
         self.unpublished = set(unpublished or ())
+        # room_id -> [(event type, state key, event json)]
+        self.state = state or {}
         self.calls: List[Tuple[str, Tuple[Any, ...]]] = []
 
     def _eligible(self, base_language: Optional[str], published_only: bool = True):
@@ -79,7 +82,14 @@ class FakeCatalog:
                 rows = [r for r in rows if r[0] > after_room_id]
             return [tuple(r) for r in rows[offset : offset + limit]]
         if name == "get_public_courses_state_events":
-            return []
+            # args: *room_ids, *event_types — neither overlaps the other
+            return [
+                (room_id, event_type, state_key, event)
+                for room_id, events in self.state.items()
+                if room_id in args
+                for event_type, state_key, event in events
+                if event_type in args
+            ]
         if name == "get_public_courses_room_stats":
             return []
         raise AssertionError(f"Unexpected query name: {name}")
@@ -322,3 +332,119 @@ class TestGetPublicCourses(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SUPPORT = "@support:test"
+
+
+def course_settings(sender: str, content: Dict[str, Any]) -> Tuple[str, str, Any]:
+    return (
+        "pangea.course_settings",
+        "",
+        {"type": "pangea.course_settings", "sender": sender, "content": content},
+    )
+
+
+class TestCentralMark(unittest.IsolatedAsyncioTestCase):
+    """A course is central when a Pangea admin set ``central`` on its settings."""
+
+    def setUp(self) -> None:
+        mod.reset_caches()
+
+    async def _central(self, catalog: FakeCatalog) -> Dict[str, bool]:
+        result = await mod.get_public_courses(
+            room_store=make_room_store(catalog),
+            config=PangeaChatConfig(),
+            limit=10,
+            since=None,
+            central_course_admins=frozenset({SUPPORT}),
+        )
+        return {c["room_id"]: c["central"] for c in result["chunk"]}
+
+    async def test_mark_set_by_a_central_admin_is_reported(self) -> None:
+        catalog = FakeCatalog(
+            [("!central:test", "plan-es", "es")],
+            state={"!central:test": [course_settings(SUPPORT, {"central": True})]},
+        )
+        self.assertEqual(await self._central(catalog), {"!central:test": True})
+
+    async def test_mark_set_by_anyone_else_is_ignored(self) -> None:
+        """A teacher can write their own course's settings; that is not enough."""
+        catalog = FakeCatalog(
+            [("!teacher:test", "plan-es", "es")],
+            state={
+                "!teacher:test": [course_settings("@teacher:test", {"central": True})]
+            },
+        )
+        self.assertEqual(await self._central(catalog), {"!teacher:test": False})
+
+    async def test_course_without_the_mark_is_not_central(self) -> None:
+        catalog = FakeCatalog(
+            [("!plain:test", "plan-es", "es"), ("!settings:test", "plan-fr", "fr")],
+            state={
+                "!settings:test": [
+                    course_settings(SUPPORT, {"require_analytics_access": False})
+                ]
+            },
+        )
+        self.assertEqual(
+            await self._central(catalog),
+            {"!plain:test": False, "!settings:test": False},
+        )
+
+    async def test_only_a_true_mark_counts(self) -> None:
+        catalog = FakeCatalog(
+            [("!string:test", "plan-es", "es")],
+            state={"!string:test": [course_settings(SUPPORT, {"central": "true"})]},
+        )
+        self.assertEqual(await self._central(catalog), {"!string:test": False})
+
+    async def test_two_central_courses_in_one_language_are_both_reported(
+        self,
+    ) -> None:
+        """The server does not guess which one was meant."""
+        catalog = FakeCatalog(
+            [("!a:test", "plan-es", "es"), ("!b:test", "plan-es-2", "es")],
+            state={
+                "!a:test": [course_settings(SUPPORT, {"central": True})],
+                "!b:test": [course_settings(SUPPORT, {"central": True})],
+            },
+        )
+        self.assertEqual(
+            await self._central(catalog), {"!a:test": True, "!b:test": True}
+        )
+
+
+class TestCentralCourseAdmins(unittest.TestCase):
+    def test_defaults_to_the_support_account(self) -> None:
+        self.assertEqual(
+            mod.central_course_admins([], "pangea.chat"),
+            frozenset({"@support:pangea.chat"}),
+        )
+
+    def test_configured_accounts_replace_the_default(self) -> None:
+        self.assertEqual(
+            mod.central_course_admins(["@ops:pangea.chat"], "pangea.chat"),
+            frozenset({"@ops:pangea.chat"}),
+        )
+
+    def test_config_must_list_full_user_ids(self) -> None:
+        from synapse_pangea_chat import PangeaChat
+
+        base = {
+            "cms_base_url": "http://cms.example.test",
+            "cms_service_api_key": "test-api-key",
+        }
+        config = PangeaChat.parse_config(
+            {**base, "central_course_admin_user_ids": ["@ops:pangea.chat"]}
+        )
+        self.assertEqual(config.central_course_admin_user_ids, ["@ops:pangea.chat"])
+        self.assertEqual(
+            PangeaChat.parse_config(base).central_course_admin_user_ids, []
+        )
+        for bad in ("@ops:pangea.chat", ["ops"], [7]):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    PangeaChat.parse_config(
+                        {**base, "central_course_admin_user_ids": bad}
+                    )

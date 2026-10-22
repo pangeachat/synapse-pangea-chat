@@ -18,6 +18,7 @@ from twisted.web.resource import Resource
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.public_courses.get_public_courses import (
     InvalidCatalogParamError,
+    central_course_admins,
     get_public_courses,
 )
 from synapse_pangea_chat.public_courses.is_rate_limited import (
@@ -38,6 +39,9 @@ class PublicCourses(Resource):
         self._config = config
         self._auth = self._api._hs.get_auth()
         self._datastores = self._api._hs.get_datastores()
+        self._central_course_admins = central_course_admins(
+            config.central_course_admin_user_ids, api.server_name
+        )
 
     def render_GET(self, request: SynapseRequest):
         run_in_background(self._async_render_GET, request)
@@ -110,6 +114,7 @@ class PublicCourses(Resource):
                 limit,
                 since_value,
                 filters=filters if filters else None,
+                central_course_admins=self._central_course_admins,
             )
 
             respond_with_json(
