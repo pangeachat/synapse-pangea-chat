@@ -10,11 +10,9 @@ from typing import List, Tuple
 from urllib.parse import quote
 
 import requests
+import synapse
 
-from synapse_pangea_chat.delayed_push.delayed_push import (
-    AUDITED_SYNAPSE_VERSION,
-    CALL_RING_EVENT_TYPE,
-)
+from synapse_pangea_chat.delayed_push.delayed_push import CALL_RING_EVENT_TYPE
 
 from .base_e2e import BaseSynapseE2ETest
 from .recording_sygnal import RecordingSygnal
@@ -157,7 +155,9 @@ class TestDelayedPushRingE2E(BaseSynapseE2ETest):
                     "enabled": True,
                     "delay_ms": _HOLD_MS,
                     "max_delay_ms": 10 * _HOLD_MS,
-                    "require_synapse_version": AUDITED_SYNAPSE_VERSION,
+                    # What an inventory claims: the Synapse it runs. The
+                    # module refuses to boot if that is not an audited one.
+                    "require_synapse_version": synapse.__version__.split(" ")[0],
                 }
             },
             synapse_config_overrides={

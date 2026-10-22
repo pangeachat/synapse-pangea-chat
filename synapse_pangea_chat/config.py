@@ -13,7 +13,9 @@ from typing import List, Mapping, Optional
 
 import attr
 
-from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
+from synapse_pangea_chat.delayed_push.delayed_push import (
+    DEFAULT_REQUIRED_SYNAPSE_VERSION,
+)
 
 #: Hosts a notice's external destination may point at. A notice link is a
 #: signed redirect, so an unlisted host would turn our mail into an open
@@ -186,7 +188,7 @@ class PangeaChatConfig:
     delayed_push_enabled: bool = False
     delayed_push_delay_ms: int = 60_000
     delayed_push_max_delay_ms: int = 600_000
-    delayed_push_require_synapse_version: str = AUDITED_SYNAPSE_VERSION
+    delayed_push_require_synapse_version: str = DEFAULT_REQUIRED_SYNAPSE_VERSION
 
     # --- blocked_join_gate config ---
     # Refuse knocks/joins from users every room admin has blocked. Off switch

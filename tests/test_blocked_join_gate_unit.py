@@ -160,7 +160,7 @@ class TestIsBlockedByRoomAdmin(unittest.IsolatedAsyncioTestCase):
         api = _make_api(
             ignored_by=set(crowd),
             power_users=crowd,
-            memberships={u: "join" for u in crowd},
+            memberships=dict.fromkeys(crowd, "join"),
         )
         self.assertFalse(await is_blocked_by_room_admin(api, ROOM, REQUESTER))
 

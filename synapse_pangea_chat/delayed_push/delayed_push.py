@@ -12,12 +12,23 @@ from twisted.internet.error import AlreadyCalled, AlreadyCancelled
 logger = logging.getLogger(__name__)
 
 
-AUDITED_SYNAPSE_VERSION = "1.159.0"
-"""The exact Synapse version whose private HttpPusher internals the patched
+AUDITED_SYNAPSE_VERSIONS = frozenset({"1.159.0", "1.163.0"})
+"""The exact Synapse versions whose private HttpPusher internals the patched
 body below mirrors. A property of this commit's code, not of configuration:
-the config's require_synapse_version can only confirm this value, never select
-a different one, so a stale inventory claim cannot boot the patch against
-internals it was not audited for."""
+the config's require_synapse_version must name the running Synapse and can
+only confirm one of these, never add another, so a stale inventory claim cannot
+boot the patch against internals it was not audited for.
+
+1.163.0 was audited against 1.159.0: synapse/push/httppusher.py is
+byte-identical (so _unsafe_process, _start_processing and cursor advancement
+are unchanged), as are the presence handler and
+get_unread_push_actions_for_user_in_range_for_http, and no schema delta
+touches event_push_actions or events. event_push_actions.py changed only in
+badge counting and receipt rotation, which this module neither mirrors nor
+reads."""
+
+DEFAULT_REQUIRED_SYNAPSE_VERSION = "1.159.0"
+"""require_synapse_version when the config leaves it out."""
 
 
 CALL_RING_EVENT_TYPE = "org.matrix.msc4075.rtc.notification"
@@ -86,23 +97,40 @@ def reset_delayed_push_patch_for_tests() -> None:
             delattr(HttpPusher, attr_name)
 
 
+def _audited_versions_text() -> str:
+    return ", ".join(
+        sorted(
+            AUDITED_SYNAPSE_VERSIONS,
+            key=lambda version: tuple(int(part) for part in version.split(".")),
+        )
+    )
+
+
 def _require_audited_synapse_version(required_version: str) -> None:
-    if required_version != AUDITED_SYNAPSE_VERSION:
+    if required_version not in AUDITED_SYNAPSE_VERSIONS:
         raise ValueError(
             "delayed_push is enabled with "
             f"require_synapse_version={required_version!r}, but this "
             "synapse-pangea-chat commit's patch body was audited for Synapse "
-            f"{AUDITED_SYNAPSE_VERSION}. Update the config to confirm the "
-            "audited version, or disable delayed_push"
+            f"{_audited_versions_text()}. Update the config to confirm the "
+            "running, audited version, or disable delayed_push"
         )
     # synapse.__version__ can carry a git suffix ("1.159.0 (b=main,abc1234)")
     # when the install sits inside a git checkout; compare the base version.
     actual_version = getattr(synapse, "__version__", "") or ""
-    if actual_version.split(" ")[0] != AUDITED_SYNAPSE_VERSION:
+    actual_base_version = actual_version.split(" ")[0]
+    if actual_base_version not in AUDITED_SYNAPSE_VERSIONS:
         raise ValueError(
             "delayed_push is enabled but this synapse-pangea-chat commit was "
-            f"audited for Synapse {AUDITED_SYNAPSE_VERSION}; running Synapse "
+            f"audited for Synapse {_audited_versions_text()}; running Synapse "
             f"{actual_version or 'unknown'}"
+        )
+    if actual_base_version != required_version:
+        raise ValueError(
+            "delayed_push is enabled with "
+            f"require_synapse_version={required_version!r}, but running "
+            f"Synapse {actual_version}. Update the config to confirm the "
+            "running version, or disable delayed_push"
         )
 
 
@@ -165,8 +193,9 @@ async def _pangea_delayed_push_unsafe_process(self: Any) -> None:
     """HttpPusher._unsafe_process with Pangea active-user deferral.
 
     This is a private Synapse API monkey patch. It intentionally mirrors Synapse
-    v1.159.0's HttpPusher._unsafe_process, adding one pre-_process_one decision
-    point that may reschedule the pusher without advancing last_stream_ordering.
+    v1.159.0's HttpPusher._unsafe_process (unchanged through v1.163.0), adding
+    one pre-_process_one decision point that may reschedule the pusher without
+    advancing last_stream_ordering.
     It also fetches again while a queued ring is still ahead of the cursor:
     Synapse fetches 20 push actions at a time, and a hold can queue more than
     that in front of a ring. Upstream's fetch ran once, so its ``break`` on a

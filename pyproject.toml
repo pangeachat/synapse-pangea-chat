@@ -76,6 +76,7 @@ strict = false
 [tool.ruff]
 line-length = 88
 
+[tool.ruff.lint]
 # See https://docs.astral.sh/ruff/rules/#error-e
 # for error codes. The ones we ignore are:
 #  E501: Line too long (black enforces this for us)

@@ -590,6 +590,12 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
             # 1.124, where Synapse ignores it.
             config["rc_room_creation"] = {"per_second": 1000, "burst_count": 1000}
 
+            # Synapse 1.162 raised the default room version to "12". Both
+            # inventories pin "11" (matrix_synapse_default_room_version in
+            # pangeachat/ansible), so the test homeserver does too and the
+            # suite tests the rooms deployment creates.
+            config["default_room_version"] = "11"
+
             # These limits are keyed by client address, and every test talks
             # from 127.0.0.1, so on a shared homeserver each test would inherit
             # the buckets earlier tests drained. A test's own override of one

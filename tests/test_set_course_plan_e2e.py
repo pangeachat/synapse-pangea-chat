@@ -119,6 +119,13 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         topic: str = "Old text",
         copy: Optional[Dict[str, Any]] = None,
     ) -> str:
+        initial_state: List[Dict[str, Any]] = [
+            {"type": _COURSE_PLAN, "state_key": "", "content": plan}
+        ]
+        if copy is not None:
+            initial_state.append(
+                {"type": _COURSE_COPY, "state_key": "", "content": copy}
+            )
         resp = requests.post(
             f"{self.server_url}/_matrix/client/v3/createRoom",
             json={
@@ -127,14 +134,7 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
                 "name": name,
                 "topic": topic,
                 "creation_content": {"type": "m.space"},
-                "initial_state": [
-                    {"type": _COURSE_PLAN, "state_key": "", "content": plan}
-                ]
-                + (
-                    [{"type": _COURSE_COPY, "state_key": "", "content": copy}]
-                    if copy is not None
-                    else []
-                ),
+                "initial_state": initial_state,
             },
             headers={"Authorization": f"Bearer {access_token}"},
         )
