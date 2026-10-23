@@ -168,13 +168,14 @@ class Forwarder:
                 metrics.CONSENT.labels(verdict="error").inc()
                 await self._sleep(self._poll_ms / 1000)
                 continue
+            metrics.CONSENT.labels(verdict=verdict).inc()
+            # Every join's position is fenced, even one whose invite is then
+            # proven again; fence first, then release (a batch reads both).
+            if position > self._fence:
+                self._fence = position
             if (room_id, user_id) in self._seen_again:
                 continue  # seen again meanwhile: prove the newer invite
             break
-        metrics.CONSENT.labels(verdict=verdict).inc()
-        # Fence first, then release: a batch reads both at once.
-        if position > self._fence:
-            self._fence = position
         self._owed.discard((room_id, user_id))
         self._rev += 1
         self.wake()

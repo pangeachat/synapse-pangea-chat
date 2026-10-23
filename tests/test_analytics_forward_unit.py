@@ -577,6 +577,32 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ingest.bodies[-1]["pending_accepts"], [])
         self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 9)
 
+    async def test_join_fence_kept_when_the_invite_is_proven_again(self) -> None:
+        store = FakeStore([self._invite(4)], head=4)
+        first: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
+        answers: List[Any] = []
+
+        class Consent:
+            async def accept_if_consented(self, room_id: str, user_id: str) -> Any:
+                answers.append(1)
+                if len(answers) == 1:
+                    return await first
+                return "not_invited", 0  # the teacher left meanwhile
+
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock(), consent=Consent())  # type: ignore[arg-type]
+        await fwd.start()
+        await fwd.step()
+        task = asyncio.ensure_future(fwd.answer(*self.INVITE))
+        await asyncio.sleep(0)
+        store.events.append(self._invite(6))
+        store.head_pos = 6
+        await fwd.step()
+        first.set_result(("accept", 9))  # the join was made
+        await asyncio.wait_for(task, 2)
+        await fwd.step()
+        self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 9)
+
     async def test_failing_join_retried_once_per_poll(self) -> None:
         store = FakeStore([self._invite()], head=4)
         consent = FakeConsent()
