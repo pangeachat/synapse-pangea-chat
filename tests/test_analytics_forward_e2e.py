@@ -355,13 +355,21 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
                 (analytics, teacher),
             )[0][0]
         )
-        await self._until(
-            lambda: any(
-                (b.get("accept_join_pos") or 0) >= join_pos
-                for b in self.ingest.acknowledged()
-            ),
-            "the fence on the delivered batch",
+        invite_event = self._sql(
+            "SELECT event_id FROM events WHERE room_id = %s "
+            "AND type = 'm.room.member' AND state_key = %s "
+            "ORDER BY stream_ordering LIMIT 1",
+            (analytics, teacher),
+        )[0][0]
+        # Every POST that carried the invite, acknowledged or not, was sent
+        # after the join and carries its position.
+        carrying = await self._until(
+            lambda: self._acked_with(invite_event), "the batch carrying the invite"
         )
+        for _status, body in self._attempted_with(invite_event):
+            self.assertGreaterEqual(body["accept_join_pos"] or 0, join_pos)
+        self.assertGreater(join_pos, self._pos(invite_event))
+        self.assertTrue(carrying)
 
         # Fact 3: a teacher the student approved inviting a colleague is not
         # the student's consent.

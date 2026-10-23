@@ -447,6 +447,41 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ingest.bodies), 3)
         self.assertIsNone(ingest.bodies[-1]["accept_join_pos"])
 
+    async def test_join_error_holds_the_invite_batch(self) -> None:
+        invite = FakeEvent(
+            4, "m.room.member", "@teacher:hs", {"membership": "invite"}, "!a:hs"
+        )
+        store = FakeStore([invite], head=4)
+        consent = FakeConsent()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock(), consent=consent)
+        await fwd.start()
+
+        async def broken(room_id: str, user_id: str) -> Any:
+            raise ConnectionError("join failed")
+
+        consent.accept_if_consented = broken  # type: ignore[method-assign]
+        with self.assertRaises(ConnectionError):
+            await fwd.step()
+        self.assertEqual(ingest.bodies, [])  # never sent without its join
+        self.assertEqual(store.cursor, 0)
+        consent.accept_if_consented = FakeConsent().accept_if_consented  # type: ignore[method-assign]
+        await fwd.step()
+        self.assertEqual(store.cursor, 4)
+
+    async def test_pending_scan_error_does_not_stop_the_start(self) -> None:
+        store = FakeStore([], head=0)
+        store.pending = [("!a:hs", "@t:hs")]
+        consent = FakeConsent()
+
+        async def broken(room_id: str, user_id: str) -> Any:
+            raise ConnectionError("join failed")
+
+        consent.accept_if_consented = broken  # type: ignore[method-assign]
+        fwd = _forwarder(store, Ingest(), Clock(), consent=consent)
+        await fwd.start()
+        self.assertEqual(fwd.cursor, 0)
+
     async def test_pending_invites_are_scanned_at_start(self) -> None:
         store = FakeStore([], head=0)
         store.pending = [("!a:hs", "@t:hs")]

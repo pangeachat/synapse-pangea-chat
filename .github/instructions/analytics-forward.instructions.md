@@ -34,7 +34,7 @@ A student who allows a teacher's analytics request invites the teacher into thei
 4. that student created the room;
 5. the room is an analytics room (`m.room.create` type `p.analytics`).
 
-A knock is never accepted. The course language is the course plan's `l2`; where a course plan names none, every room in the student's profile is a candidate (admin-dash-api's own unknown-language rule); facts 3–5 still have to hold. The join happens before the batch carrying the invite is sent, and that batch carries the join's position (`accept_join_pos`) so a Refresh cannot finish before the join is delivered. Invites already pending when the forwarder starts are checked at startup and then daily. A join that fails is logged and retried by the next scan; consent never fails open.
+A knock is never accepted. The course language is the course plan's `l2`; where a course plan names none, every room in the student's profile is a candidate (admin-dash-api's own unknown-language rule); facts 3–5 still have to hold. The join happens before the batch carrying the invite is sent, and that batch carries the join's position (`accept_join_pos`) so a Refresh cannot finish before the join is delivered. The proof is re-read before the join, so only the invite that was proven is accepted. A join that fails holds the batch carrying the invite, which is retried like any failed delivery. Invites already pending when the forwarder starts are checked at startup and then daily; a failure there is logged and the next scan retries. Consent never fails open.
 
 ## Endpoints (shared secret)
 

@@ -6,7 +6,8 @@ dropping any one of them turns an accept below into a bypass.
 """
 
 import unittest
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
+from unittest import mock
 
 from synapse_pangea_chat.analytics_forward.consent import (
     ACCEPT,
@@ -14,6 +15,7 @@ from synapse_pangea_chat.analytics_forward.consent import (
     REFUSED_NOT_INVITED,
     REFUSED_OWNER,
     REFUSED_ROOM_TYPE,
+    ConsentAcceptor,
     CourseFacts,
     InviteFacts,
     confirmed_below_course_admin,
@@ -193,3 +195,49 @@ class TestRoster(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAcceptorJoinsOnlyTheProvenInvite(unittest.IsolatedAsyncioTestCase):
+    """The proof awaits course reads; the invite it proved must still be the
+    one in place when the join is made."""
+
+    def _acceptor(self, facts_seq: List[InviteFacts]) -> Any:
+        acceptor = ConsentAcceptor.__new__(ConsentAcceptor)
+        acceptor._api = object()
+        reads = list(facts_seq)
+
+        async def invite_facts(room_id: str, invitee: str) -> InviteFacts:
+            return reads.pop(0) if len(reads) > 1 else reads[0]
+
+        async def course_facts(invitee: str, inviter: str) -> List[CourseFacts]:
+            return [_course()]
+
+        async def join_position(room_id: str, invitee: str) -> int:
+            return 9
+
+        acceptor.invite_facts = invite_facts  # type: ignore[method-assign]
+        acceptor.course_facts = course_facts  # type: ignore[method-assign]
+        acceptor._join_position = join_position  # type: ignore[method-assign]
+        return acceptor
+
+    async def test_unchanged_invite_is_joined(self) -> None:
+        with mock.patch(
+            "synapse_pangea_chat.blocked_join_gate.server_initiated_join",
+            new=mock.AsyncMock(),
+        ) as join:
+            verdict = await self._acceptor([_invite()]).accept_if_consented(
+                ROOM, TEACHER
+            )
+        self.assertEqual(verdict, (ACCEPT, 9))
+        join.assert_awaited_once()
+
+    async def test_replaced_invite_is_not_joined(self) -> None:
+        with mock.patch(
+            "synapse_pangea_chat.blocked_join_gate.server_initiated_join",
+            new=mock.AsyncMock(),
+        ) as join:
+            verdict = await self._acceptor(
+                [_invite(), _invite(inviter=COTEACHER)]
+            ).accept_if_consented(ROOM, TEACHER)
+        self.assertEqual(verdict, (REFUSED_NOT_INVITED, 0))
+        join.assert_not_awaited()

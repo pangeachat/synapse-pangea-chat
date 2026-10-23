@@ -329,6 +329,12 @@ class ConsentAcceptor:
         if verdict != ACCEPT:
             logger.info("consented-invite refused: %s", verdict)
             return verdict, 0
+        # The course reads awaited; the invite may have been replaced since
+        # (revoked, then re-sent by someone else). Join only on the invite
+        # that was proven.
+        if await self.invite_facts(room_id, invitee) != facts:
+            logger.info("consented-invite refused: the invite changed")
+            return REFUSED_NOT_INVITED, 0
         from synapse_pangea_chat.blocked_join_gate import server_initiated_join
 
         await server_initiated_join(self._api, room_id, invitee)

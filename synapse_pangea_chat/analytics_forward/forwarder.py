@@ -111,20 +111,22 @@ class Forwarder:
             logger.exception("analytics forwarder: pending invite scan failed")
             return
         for room_id, user_id in pending:
-            await self._accept(room_id, user_id)
+            try:
+                await self._accept(room_id, user_id)
+            except Exception:  # silent-ok: logged and counted; the next scan retries
+                logger.exception("analytics forwarder: consented-invite join failed")
 
     async def _accept(self, room_id: str, user_id: str) -> None:
+        """Run the proof and join; an error propagates. In the stream it fails
+        the step, so the batch carrying the invite is retried, never sent
+        without the join it owes."""
         try:
             verdict, position = await self._consent.accept_if_consented(
                 room_id, user_id
             )
-        except Exception:  # silent-ok: logged and counted; the daily scan retries
-            # Transport fails open, as in admin-dash-api: the teacher stays
-            # invited and the next scan tries again. Consent never fails open:
-            # nothing is joined without the whole proof.
-            logger.exception("analytics forwarder: consented-invite join failed")
+        except Exception:
             metrics.CONSENT.labels(verdict="error").inc()
-            return
+            raise
         metrics.CONSENT.labels(verdict=verdict).inc()
         if position > self._fence:
             self._fence = position
