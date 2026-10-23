@@ -547,6 +547,36 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         for task in tasks:
             task.cancel()
 
+    async def test_invite_seen_again_mid_proof_is_proven_again(self) -> None:
+        """A replacement invite arriving while an older proof runs must not be
+        released by that older proof's refusal."""
+        store = FakeStore([self._invite(4)], head=4)
+        first: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
+        calls: List[int] = []
+
+        class Consent:
+            async def accept_if_consented(self, room_id: str, user_id: str) -> Any:
+                calls.append(1)
+                if len(calls) == 1:
+                    return await first
+                return "accept", 9
+
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock(), consent=Consent())  # type: ignore[arg-type]
+        await fwd.start()
+        await fwd.step()
+        task = asyncio.ensure_future(fwd.answer(*self.INVITE))
+        await asyncio.sleep(0)
+        store.events.append(self._invite(6))  # revoked and re-sent meanwhile
+        store.head_pos = 6
+        await fwd.step()
+        first.set_result(("inviter_or_creator_not_student", 0))
+        await asyncio.wait_for(task, 2)
+        self.assertEqual(len(calls), 2)
+        await fwd.step()
+        self.assertEqual(ingest.bodies[-1]["pending_accepts"], [])
+        self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 9)
+
     async def test_failing_join_retried_once_per_poll(self) -> None:
         store = FakeStore([self._invite()], head=4)
         consent = FakeConsent()

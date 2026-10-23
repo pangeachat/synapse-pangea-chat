@@ -86,6 +86,9 @@ class Forwarder:
         #: invite is named in every batch (``pending_accepts``) so the ingest
         #: holds that teacher's Refresh. Delivery never waits on a join.
         self._owed: Set[Tuple[str, str]] = set()
+        #: Owed invites seen again while their proof was running: proven again
+        #: before release, so an older answer never clears a newer invite.
+        self._seen_again: Set[Tuple[str, str]] = set()
         #: Grows whenever the owed set changes, so the ingest keeps only the
         #: newest set even when an older request lands late. Stored before any
         #: batch carrying it is sent, and bumped past the stored value on
@@ -144,6 +147,7 @@ class Forwarder:
 
     def _owe(self, room_id: str, user_id: str) -> None:
         if (room_id, user_id) in self._owed:
+            self._seen_again.add((room_id, user_id))
             return
         self._owed.add((room_id, user_id))
         self._rev += 1
@@ -154,15 +158,19 @@ class Forwarder:
         """Run the proof and join for one owed invite, retrying failures once
         per poll until there is an answer. The stream never waits on this."""
         while True:
+            self._seen_again.discard((room_id, user_id))
             try:
                 verdict, position = await self._consent.accept_if_consented(
                     room_id, user_id
                 )
-                break
             except Exception:  # silent-ok: logged, counted, still owed and named
                 logger.exception("analytics forwarder: consented-invite join failed")
                 metrics.CONSENT.labels(verdict="error").inc()
                 await self._sleep(self._poll_ms / 1000)
+                continue
+            if (room_id, user_id) in self._seen_again:
+                continue  # seen again meanwhile: prove the newer invite
+            break
         metrics.CONSENT.labels(verdict=verdict).inc()
         # Fence first, then release: a batch reads both at once.
         if position > self._fence:
