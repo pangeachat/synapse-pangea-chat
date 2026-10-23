@@ -55,7 +55,11 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
     async def _start(self) -> None:
         self.ingest.set_status(200)
         self.ingest.set_on_post(None)
-        await self.homeserver(module_config=self._module_config())
+        await self.homeserver(
+            module_config=self._module_config(),
+            # Room statistics can be switched off; nothing here may rely on them.
+            synapse_config_overrides={"stats": {"enabled": False}},
+        )
 
     # -- helpers ------------------------------------------------------------
 

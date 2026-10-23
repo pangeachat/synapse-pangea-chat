@@ -120,8 +120,12 @@ _FORWARDED_TYPES = sorted(FORWARDED_TYPES)
 _SELECT_PENDING_INVITES_SQL = """
     SELECT lcm.room_id, lcm.user_id
     FROM local_current_membership AS lcm
-    JOIN room_stats_state AS rss ON rss.room_id = lcm.room_id
-    WHERE lcm.membership = 'invite' AND rss.room_type = 'p.analytics'
+    JOIN current_state_events AS cse
+        ON cse.room_id = lcm.room_id
+        AND cse.type = 'm.room.create' AND cse.state_key = ''
+    JOIN event_json AS ej ON ej.event_id = cse.event_id
+    WHERE lcm.membership = 'invite'
+        AND ej.json::jsonb -> 'content' ->> 'type' = 'p.analytics'
     ORDER BY lcm.room_id, lcm.user_id
 """
 
@@ -130,10 +134,13 @@ _SELECT_UNDELIVERED_JOIN_SQL = """
     SELECT COALESCE(MAX(e.stream_ordering), 0)
     FROM events AS e
     JOIN room_memberships AS m ON m.event_id = e.event_id
-    JOIN room_stats_state AS rss ON rss.room_id = e.room_id
+    JOIN current_state_events AS cse
+        ON cse.room_id = e.room_id
+        AND cse.type = 'm.room.create' AND cse.state_key = ''
+    JOIN event_json AS ej ON ej.event_id = cse.event_id
     WHERE e.stream_ordering > ? AND e.type = 'm.room.member'
         AND m.membership = 'join' AND m.sender = m.user_id
-        AND rss.room_type = 'p.analytics'
+        AND ej.json::jsonb -> 'content' ->> 'type' = 'p.analytics'
 """
 
 
