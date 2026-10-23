@@ -490,6 +490,56 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ingest.bodies[-1]["pending_accepts"], [])
         self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 9)
 
+    async def test_owed_join_is_not_retried_by_a_replayed_batch(self) -> None:
+        invite = FakeEvent(
+            4, "m.room.member", "@teacher:hs", {"membership": "invite"}, "!a:hs"
+        )
+        store = FakeStore([invite], head=4)
+        consent = FakeConsent()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock(), consent=consent)
+        await fwd.start()
+        attempts: List[Tuple[str, str]] = []
+
+        async def broken(room_id: str, user_id: str) -> Any:
+            attempts.append((room_id, user_id))
+            raise ConnectionError("join failed")
+
+        consent.accept_if_consented = broken  # type: ignore[method-assign]
+        ingest.fail_with = DeliveryError("http", "HTTP 503")
+        for _ in range(3):
+            with self.assertRaises(DeliveryError):
+                await fwd.step()
+        self.assertEqual(len(attempts), 1)
+
+    async def test_no_delivery_before_the_startup_scan_finishes(self) -> None:
+        store = FakeStore([], head=0)
+        store.pending = [("!a:hs", "@t:hs")]
+        launched: List[Any] = []
+        consent = FakeConsent()
+        fwd = Forwarder(
+            store=store,
+            post=Ingest(),
+            consent=consent,
+            clock_ms=Clock().now,
+            sleep=Clock().sleep,
+            run_in_background=launched.append,
+            batch_max=10,
+            poll_seconds=5,
+        )
+
+        launched_during_scan: List[int] = []
+
+        async def wake_during_scan(room_id: str, user_id: str) -> Any:
+            fwd.wake()  # an event arrives while the scan runs
+            launched_during_scan.append(len(launched))
+            return "not_invited", 0
+
+        consent.accept_if_consented = wake_during_scan  # type: ignore[method-assign]
+        await fwd.start()
+        self.assertEqual(launched_during_scan, [0])
+        self.assertEqual(len(launched), 1)  # started once, after the scan
+
     async def test_pending_scan_error_does_not_stop_the_start(self) -> None:
         store = FakeStore([], head=0)
         store.pending = [("!a:hs", "@t:hs")]

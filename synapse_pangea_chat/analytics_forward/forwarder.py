@@ -105,9 +105,12 @@ class Forwarder:
             initial = self._store.head()
         else:
             initial = int(self._start_position)
-        self._cursor = await self._store.load_cursor(initial)
-        logger.info("analytics forwarder starting at stream position %d", self._cursor)
+        cursor = await self._store.load_cursor(initial)
+        # The scan first: until the cursor is set, wake() starts nothing, so
+        # no batch is sent before every owed join is known.
         await self.scan_pending_invites()
+        self._cursor = cursor
+        logger.info("analytics forwarder starting at stream position %d", cursor)
         metrics.ACTIVE.set(1)
         self.wake()
 
@@ -214,9 +217,12 @@ class Forwarder:
             if not is_forwarded(event.type, state_key):
                 continue
             records.append(event_record(event))
-            if event.type == "m.room.member" and (
-                event.content.get("membership") == "invite"
+            if (
+                event.type == "m.room.member"
+                and event.content.get("membership") == "invite"
+                and (event.room_id, state_key) not in self._owed
             ):
+                # An owed join is retried only by _retry_owed, throttled.
                 # Joined before the batch is sent, so the batch carries the
                 # join's position as the fence; a failed join is owed instead.
                 await self._accept(event.room_id, state_key)
