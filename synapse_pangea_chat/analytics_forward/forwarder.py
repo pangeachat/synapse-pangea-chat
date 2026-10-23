@@ -86,7 +86,6 @@ class Forwarder:
         #: invite is named in every batch (``pending_accepts``) so the ingest
         #: holds that teacher's Refresh. Delivery never waits on a join.
         self._owed: Set[Tuple[str, str]] = set()
-        self._worker_running = False
         #: Grows whenever the owed set changes, so the ingest keeps only the
         #: newest set even when an older request lands late. Stored before any
         #: batch carrying it is sent, and bumped past the stored value on
@@ -144,42 +143,33 @@ class Forwarder:
             logger.exception("analytics forwarder: pending invite scan failed")
 
     def _owe(self, room_id: str, user_id: str) -> None:
-        if (room_id, user_id) not in self._owed:
-            self._owed.add((room_id, user_id))
-            self._rev += 1
-        if not self._worker_running:
-            self._worker_running = True
-            self._run_in_background(self.consent_worker)
+        if (room_id, user_id) in self._owed:
+            return
+        self._owed.add((room_id, user_id))
+        self._rev += 1
+        # One task per invite: a join that hangs holds only its own invite.
+        self._run_in_background(lambda: self.answer(room_id, user_id))
 
-    async def consent_worker(self) -> None:
-        """Answer every owed invite, retrying failures once per poll. A join
-        that hangs holds only its own invite; the stream never waits."""
-        try:
-            while self._owed:
-                for room_id, user_id in sorted(self._owed):
-                    try:
-                        verdict, position = await self._consent.accept_if_consented(
-                            room_id, user_id
-                        )
-                    except (
-                        Exception
-                    ):  # silent-ok: logged, counted, still owed and named in every batch
-                        logger.exception(
-                            "analytics forwarder: consented-invite join failed"
-                        )
-                        metrics.CONSENT.labels(verdict="error").inc()
-                        continue
-                    metrics.CONSENT.labels(verdict=verdict).inc()
-                    # Fence first, then release: a batch reads both at once.
-                    if position > self._fence:
-                        self._fence = position
-                    self._owed.discard((room_id, user_id))
-                    self._rev += 1
-                    self.wake()
-                if self._owed:
-                    await self._sleep(self._poll_ms / 1000)
-        finally:
-            self._worker_running = False
+    async def answer(self, room_id: str, user_id: str) -> None:
+        """Run the proof and join for one owed invite, retrying failures once
+        per poll until there is an answer. The stream never waits on this."""
+        while True:
+            try:
+                verdict, position = await self._consent.accept_if_consented(
+                    room_id, user_id
+                )
+                break
+            except Exception:  # silent-ok: logged, counted, still owed and named
+                logger.exception("analytics forwarder: consented-invite join failed")
+                metrics.CONSENT.labels(verdict="error").inc()
+                await self._sleep(self._poll_ms / 1000)
+        metrics.CONSENT.labels(verdict=verdict).inc()
+        # Fence first, then release: a batch reads both at once.
+        if position > self._fence:
+            self._fence = position
+        self._owed.discard((room_id, user_id))
+        self._rev += 1
+        self.wake()
 
     # -- the loop -----------------------------------------------------------
 

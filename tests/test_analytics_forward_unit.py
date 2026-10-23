@@ -460,7 +460,7 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ingest.bodies[-1]["pending_accepts"], self.OWED)
         self.assertIsNone(ingest.bodies[-1]["accept_join_pos"])
 
-        await fwd.consent_worker()
+        await fwd.answer(*self.INVITE)
         self.assertEqual(consent.calls, [self.INVITE])
         await fwd.step()  # a fence is news: sent without waiting for the poll
         self.assertEqual(ingest.bodies[-1]["pending_accepts"], [])
@@ -477,7 +477,7 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         fwd = _forwarder(store, ingest, Clock(), consent=consent)
         await fwd.start()
         await fwd.step()
-        await fwd.consent_worker()
+        await fwd.answer(*self.INVITE)
         ingest.fail_with = DeliveryError("http", "HTTP 503")
         with self.assertRaises(DeliveryError):
             await fwd.step()
@@ -500,7 +500,7 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         await fwd.start()
         # A bound, so a regression that waits on the join fails, not hangs.
         await asyncio.wait_for(fwd.step(), 2)
-        worker = asyncio.ensure_future(fwd.consent_worker())
+        worker = asyncio.ensure_future(fwd.answer(*self.INVITE))
         await asyncio.sleep(0)
         store.events.append(FakeEvent(8))
         store.head_pos = 8
@@ -508,6 +508,44 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.cursor, 8)
         self.assertEqual(ingest.bodies[-1]["pending_accepts"], self.OWED)
         worker.cancel()
+
+    async def test_hanging_join_never_holds_another_invite(self) -> None:
+        other = FakeEvent(
+            5, "m.room.member", "@other:hs", {"membership": "invite"}, "!b:hs"
+        )
+        store = FakeStore([self._invite(), other], head=5)
+        never: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
+
+        class Consent:
+            async def accept_if_consented(self, room_id: str, user_id: str) -> Any:
+                if room_id == "!a:hs":
+                    return await never
+                return "accept", 9
+
+        tasks: List[Any] = []
+        ingest = Ingest()
+        fwd = Forwarder(
+            store=store,
+            post=ingest,
+            consent=Consent(),
+            clock_ms=Clock().now,
+            sleep=Clock().sleep,
+            run_in_background=lambda f: (
+                None if f == fwd.drain else tasks.append(asyncio.ensure_future(f()))
+            ),
+            batch_max=10,
+            poll_seconds=5,
+            start_position=0,
+        )
+        await fwd.start()
+        await asyncio.wait_for(fwd.step(), 2)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await asyncio.wait_for(fwd.step(), 2)
+        self.assertEqual(ingest.bodies[-1]["pending_accepts"], self.OWED)
+        self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 9)
+        for task in tasks:
+            task.cancel()
 
     async def test_failing_join_retried_once_per_poll(self) -> None:
         store = FakeStore([self._invite()], head=4)
@@ -527,7 +565,7 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         fwd = _forwarder(store, ingest, clock, consent=consent)
         await fwd.start()
         await fwd.step()
-        await fwd.consent_worker()
+        await fwd.answer(*self.INVITE)
         self.assertEqual(consent.calls, [self.INVITE, self.INVITE])
         self.assertEqual(clock.slept, [5.0])
         await fwd.step()
@@ -551,7 +589,8 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         ingest = Ingest()
         fwd._post = ingest
         await fwd.start()
-        self.assertEqual(launched, [fwd.consent_worker, fwd.drain])
+        self.assertEqual(len(launched), 2)  # the invite's task, then delivery
+        self.assertEqual(launched[1], fwd.drain)
         await fwd.step()
         self.assertEqual(ingest.bodies[0]["pending_accepts"], self.OWED)
 
@@ -615,7 +654,7 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         await fwd.start()
         await fwd.step()  # the invite is owed: a new set
         owed_rev = ingest.bodies[-1]["pending_accepts_rev"]
-        await fwd.consent_worker()
+        await fwd.answer(*self.INVITE)
         await fwd.step()  # answered: a new set again
         answered_rev = ingest.bodies[-1]["pending_accepts_rev"]
         self.assertGreater(answered_rev, owed_rev)
