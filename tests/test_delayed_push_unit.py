@@ -12,7 +12,7 @@ from synapse.push.httppusher import HttpPusher
 
 from synapse_pangea_chat import PangeaChat
 from synapse_pangea_chat.delayed_push.delayed_push import (
-    AUDITED_SYNAPSE_VERSION,
+    AUDITED_SYNAPSE_VERSIONS,
     CALL_RING_EVENT_TYPE,
     _pangea_delayed_push_start_processing,
     _pangea_delayed_push_unsafe_process,
@@ -242,6 +242,9 @@ class TestDelayedPushPatch(unittest.TestCase):
     def tearDown(self):
         reset_delayed_push_patch_for_tests()
 
+    def test_audited_synapse_versions(self):
+        self.assertEqual(AUDITED_SYNAPSE_VERSIONS, {"1.159.0", "1.163.0"})
+
     def test_configure_delayed_push_requires_audited_synapse_version(self):
         config = PangeaChat.parse_config(_base_config(enabled=True))
 
@@ -249,8 +252,13 @@ class TestDelayedPushPatch(unittest.TestCase):
             "synapse_pangea_chat.delayed_push.delayed_push.synapse.__version__",
             "1.124.0",
         ):
-            with self.assertRaisesRegex(ValueError, "audited for Synapse 1.159.0"):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"audited for Synapse 1\.159\.0, 1\.163\.0; running Synapse 1\.124\.0",
+            ):
                 configure_delayed_push(config)
+
+        self.assertFalse(getattr(HttpPusher, "_pangea_delayed_push_patched", False))
 
     def test_configure_delayed_push_rejects_config_contradicting_code_audit(self):
         # The misdeploy scenario: a stale inventory claims an audit of an older
@@ -266,9 +274,38 @@ class TestDelayedPushPatch(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 ValueError,
-                "audited for Synapse " f"{AUDITED_SYNAPSE_VERSION}".replace(".", r"\."),
+                r"require_synapse_version='1\.124\.0', but this .* audited for "
+                r"Synapse 1\.159\.0, 1\.163\.0\.",
             ):
                 configure_delayed_push(config)
+
+        self.assertFalse(getattr(HttpPusher, "_pangea_delayed_push_patched", False))
+
+    def test_configure_delayed_push_rejects_config_naming_another_audited_version(
+        self,
+    ):
+        # An inventory that bumps Synapse but not require_synapse_version: both
+        # versions are audited, but the config no longer names what runs.
+        for required, running in (("1.159.0", "1.163.0"), ("1.163.0", "1.159.0")):
+            with self.subTest(required=required, running=running):
+                config = PangeaChat.parse_config(
+                    _base_config(enabled=True, require_synapse_version=required)
+                )
+
+                with patch(
+                    "synapse_pangea_chat.delayed_push.delayed_push.synapse.__version__",
+                    running,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        f"require_synapse_version={required!r}, but running "
+                        f"Synapse {running}".replace(".", r"\."),
+                    ):
+                        configure_delayed_push(config)
+
+                self.assertFalse(
+                    getattr(HttpPusher, "_pangea_delayed_push_patched", False)
+                )
 
     def test_configure_delayed_push_patches_when_version_matches(self):
         config = PangeaChat.parse_config(_base_config(enabled=True))
@@ -282,14 +319,31 @@ class TestDelayedPushPatch(unittest.TestCase):
         self.assertTrue(HttpPusher._pangea_delayed_push_patched)
         self.assertIs(HttpPusher._pangea_delayed_push_config, config)
 
+    def test_configure_delayed_push_patches_on_each_audited_version(self):
+        for version in sorted(AUDITED_SYNAPSE_VERSIONS):
+            with self.subTest(version=version):
+                config = PangeaChat.parse_config(
+                    _base_config(enabled=True, require_synapse_version=version)
+                )
+
+                with patch(
+                    "synapse_pangea_chat.delayed_push.delayed_push.synapse.__version__",
+                    f"{version} (b=main,abc1234)",
+                ):
+                    configure_delayed_push(config)
+
+                self.assertTrue(HttpPusher._pangea_delayed_push_patched)
+                self.assertIs(HttpPusher._pangea_delayed_push_config, config)
+                reset_delayed_push_patch_for_tests()
+
 
 @unittest.skipUnless(
     # base version: __version__ carries a git suffix inside a git checkout
-    synapse.__version__.split(" ")[0] == AUDITED_SYNAPSE_VERSION,
-    "the patched HttpPusher body mirrors Synapse "
-    f"{AUDITED_SYNAPSE_VERSION} internals; on any other version the module "
+    synapse.__version__.split(" ")[0] in AUDITED_SYNAPSE_VERSIONS,
+    "the patched HttpPusher body mirrors the internals of Synapse "
+    f"{sorted(AUDITED_SYNAPSE_VERSIONS)}; on any other version the module "
     "refuses to enable delayed_push (exact-version guard), so the body is "
-    "only testable on the audited version",
+    "only testable on an audited version",
 )
 class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
@@ -699,9 +753,9 @@ class TestDelayedPushHelpers(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(
-    synapse.__version__.split(" ")[0] == AUDITED_SYNAPSE_VERSION,
+    synapse.__version__.split(" ")[0] in AUDITED_SYNAPSE_VERSIONS,
     "drives Synapse's own HttpPusher scheduling, which the patch mirrors only on "
-    f"{AUDITED_SYNAPSE_VERSION}",
+    f"{sorted(AUDITED_SYNAPSE_VERSIONS)}",
 )
 class TestDelayedPushScheduling(unittest.IsolatedAsyncioTestCase):
     """The patch through Synapse's real _process and on_timer, where a wake can

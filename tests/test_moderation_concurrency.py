@@ -1594,7 +1594,7 @@ class CancellationRuleTestCase(unittest.TestCase):
 
         root = pathlib.Path(__file__).resolve().parent.parent
         unguarded: List[str] = []
-        examined: Dict[str, int] = {m: 0 for m in self.GUARDED_MODULES}
+        examined: Dict[str, int] = dict.fromkeys(self.GUARDED_MODULES, 0)
         for relative in self.GUARDED_MODULES:
             path = root / relative
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
