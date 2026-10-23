@@ -1,0 +1,147 @@
+{
+  "description": "The Synapse module's analytics forwarder -> admin-dash-api POST /api/internal/matrix-events. Auth: 'Authorization: Bearer <analytics_forward.secret>' (compared in constant time). The ingest commits the whole body in one transaction and answers 200 with the response body only AFTER that commit; the module moves its cursor and clears the delivered profiles only on that exact answer. Any other answer is retried, forever, with the same or a superset batch, so every write must be idempotent. A 401/403 is a configuration error. One bad record must not fail the batch: the ingest stores it as a reject, counts it in 'rejected', and still answers 200.",
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schema_version",
+      "events",
+      "profiles",
+      "delivered_through",
+      "profiles_clean_before",
+      "accept_join_pos"
+    ],
+    "properties": {
+      "schema_version": {"const": 1},
+      "events": {
+        "description": "Forwarded events above the previous cursor, oldest first, at most batch_max (200). State types arrive only as state (state_key a string); pangea.construct only as a timeline event (state_key null). Never outliers or rejected events. May be empty (heartbeat).",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stream_pos",
+            "event_id",
+            "room_id",
+            "type",
+            "state_key",
+            "sender",
+            "origin_server_ts",
+            "content"
+          ],
+          "properties": {
+            "stream_pos": {"type": "integer", "minimum": 1, "description": "Synapse stream_ordering; the ordering key for every upsert (state mirror: newer stream_pos wins)."},
+            "event_id": {"type": "string"},
+            "room_id": {"type": "string"},
+            "type": {"type": "string"},
+            "state_key": {"type": ["string", "null"]},
+            "sender": {"type": "string"},
+            "origin_server_ts": {"type": "integer"},
+            "content": {"type": "object", "description": "As stored; a redacted event arrives with its pruned content."}
+          }
+        }
+      },
+      "profiles": {
+        "description": "Users whose global profile changed and is not yet acknowledged, each with their WHOLE current profile. Apply only a revision newer than the stored one.",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["user_id", "revision", "profile"],
+          "properties": {
+            "user_id": {"type": "string"},
+            "revision": {"type": "integer", "minimum": 1},
+            "profile": {
+              "type": ["object", "null"],
+              "description": "displayname, avatar_url and every custom field (pangea.analytics_profile among them), as GET /profile returns it; null when the user has no profile (deleted)."
+            }
+          }
+        }
+      },
+      "delivered_through": {"type": "integer", "minimum": 0, "description": "Every forwarded event at or below this stream position is in this batch or an earlier acknowledged one. Store as ingest_state.delivered_through, raised never lowered, and ECHO it in the answer."},
+      "profiles_clean_before": {"type": "integer", "description": "Milliseconds (module clock). Every profile change older than this has been delivered once this batch commits. Raise ingest_state.profiles_clean_before to it, never lower. Very low (<= 0) after a module restart until every profile has been re-sent."},
+      "accept_join_pos": {"type": ["integer", "null"], "description": "The stream position of a join the module made for a consented analytics invite. Raise ingest_state.accept_fence to it in the same commit."}
+    }
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": ["delivered_through"],
+    "properties": {
+      "delivered_through": {"type": "integer", "description": "Echo of the request's delivered_through. Anything else is not an acknowledgement."},
+      "rejected": {"type": "integer", "minimum": 0, "description": "Records of this batch set aside in matrix_ingest_rejects. Optional, 0 when absent."}
+    }
+  },
+  "request_example": {
+    "schema_version": 1,
+    "events": [
+      {
+        "stream_pos": 812345,
+        "event_id": "$construct1",
+        "room_id": "!analytics:pangea.chat",
+        "type": "pangea.construct",
+        "state_key": null,
+        "sender": "@student:pangea.chat",
+        "origin_server_ts": 1761200000000,
+        "content": {"uses": []}
+      },
+      {
+        "stream_pos": 812350,
+        "event_id": "$member1",
+        "room_id": "!course:pangea.chat",
+        "type": "m.room.member",
+        "state_key": "@student:pangea.chat",
+        "sender": "@student:pangea.chat",
+        "origin_server_ts": 1761200001000,
+        "content": {"membership": "join", "displayname": "Student"}
+      }
+    ],
+    "profiles": [
+      {
+        "user_id": "@student:pangea.chat",
+        "revision": 3,
+        "profile": {
+          "displayname": "Student",
+          "avatar_url": null,
+          "pangea.analytics_profile": {"analytics": {"es": {"analytics_room_id": "!analytics:pangea.chat"}}}
+        }
+      },
+      {"user_id": "@deleted:pangea.chat", "revision": 7, "profile": null}
+    ],
+    "delivered_through": 812360,
+    "profiles_clean_before": 1761199998000,
+    "accept_join_pos": null
+  },
+  "response_example": {"delivered_through": 812360, "rejected": 0},
+  "head_endpoint": {
+    "request": "GET /_synapse/client/pangea/v1/analytics_forward/head with 'Authorization: Bearer <secret>'",
+    "response_example": {"stream_pos": 812360, "module_time_ms": 1761200002000}
+  },
+  "analytics_state_endpoint": {
+    "request_example": {"room_ids": ["!analytics:pangea.chat", "!unknown:pangea.chat"], "user_ids": ["@student:pangea.chat"]},
+    "response_example": {
+      "rooms": {
+        "!analytics:pangea.chat": {
+          "events": [
+            {
+              "stream_pos": 800001,
+              "event_id": "$create",
+              "room_id": "!analytics:pangea.chat",
+              "type": "m.room.create",
+              "state_key": "",
+              "sender": "@student:pangea.chat",
+              "origin_server_ts": 1760000000000,
+              "content": {"type": "p.analytics", "room_version": "10"}
+            }
+          ]
+        },
+        "!unknown:pangea.chat": null
+      },
+      "profiles": [
+        {"user_id": "@student:pangea.chat", "revision": 4, "profile": {"displayname": "Student", "avatar_url": null}}
+      ]
+    },
+    "notes": "Each known room's COMPLETE current state of the forwarded state types (an absent type is absent from the room, not unread); null for a room this homeserver does not know. Each profile carries a revision bumped by this read, so it is newer than anything pushed before it. At most 500 room ids and 500 user ids per request."
+  }
+}

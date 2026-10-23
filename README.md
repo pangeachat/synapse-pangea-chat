@@ -16,6 +16,7 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 | [Find User By Email](#find-user-by-email)     | `synapse_pangea_chat/find_user_by_email/`   | `POST /_synapse/client/pangea/v1/find_user_by_email`      | Server-admin lookup of the account holding an email |
 | [Course Member Emails](#course-member-emails) | `synapse_pangea_chat/course_member_emails/` | `POST /_synapse/client/pangea/v1/course_member_emails`    | A course admin reads their joined students' sign-in emails (off by default) |
 | [Direct Message](#direct-message)             | `synapse_pangea_chat/direct_message/`       | `POST /_synapse/client/pangea/v1/ensure_direct_message`   | Create or repair a 1:1 DM for two local users     |
+| [Analytics Forward](#analytics-forward)       | `synapse_pangea_chat/analytics_forward/`    | `GET /_synapse/client/pangea/v1/analytics_forward/head`, `POST /_synapse/client/pangea/v1/analytics_state` | Pushes the dashboard's Matrix inputs to admin-dash-api, losslessly (runs when configured) |
 | [Delayed Push](#delayed-push)                 | `synapse_pangea_chat/delayed_push/`         | _(HttpPusher monkey patch)_                               | Delay HTTP pushes while users are active          |
 | [Limit User Directory](#limit-user-directory) | `synapse_pangea_chat/limit_user_directory/` | _(spam checker)_                                          | Filter user directory by public profile attribute |
 
@@ -78,6 +79,14 @@ modules:
         - "^@admin:example.com$"
       limit_user_directory_whitelist_candidate_user_id_patterns:
         - "^@bot:example.com$"
+
+      # --- Analytics Forward (runs only when this block is present) ---
+      analytics_forward:
+        url: "https://admin-dash-api.example.com/api/internal/matrix-events"
+        secret: "<at least 32 characters, shared with admin-dash-api>"
+        batch_max: 200 # default: 200 (1-1000)
+        poll_seconds: 5 # default: 5 (1-60)
+        start_position: current # default: current; read only when no cursor is stored
 
       # --- Delayed Push (disabled by default) ---
       delayed_push:
@@ -419,6 +428,12 @@ A course admin reads the sign-in email of each student currently in their course
 ```
 
 Lists members whose current membership is `join`, excluding the caller, bots, and other course admins. A member with no bound email is omitted. Addresses are never logged.
+
+---
+
+## Analytics Forward
+
+Tails Synapse's event stream from a durable cursor and posts the event types the teacher dashboard reads, and changed profiles, to admin-dash-api's `POST /api/internal/matrix-events`. The cursor moves only after the ingest acknowledges a committed batch, so an outage delays delivery and loses nothing. It also completes a teacher's join into a student's analytics room when the student has consented. Runs whenever the `analytics_forward` block is configured, on the background-tasks instance only; deploy admin-dash-api's ingest first. Design: [analytics-forward.instructions.md](.github/instructions/analytics-forward.instructions.md). Contract: [ingest_contract.json](tests/fixtures/analytics_forward/ingest_contract.json).
 
 ---
 
