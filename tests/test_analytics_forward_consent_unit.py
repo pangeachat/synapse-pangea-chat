@@ -6,8 +6,10 @@ dropping any one of them turns an accept below into a bypass.
 """
 
 import unittest
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from unittest import mock
+
+from immutabledict import immutabledict
 
 from synapse_pangea_chat.analytics_forward.consent import (
     ACCEPT,
@@ -169,6 +171,27 @@ class TestProfileRooms(unittest.TestCase):
         for profile in malformed:
             self.assertEqual(profile_analytics_rooms(profile, ""), [])
 
+    def test_event_content_is_an_immutable_mapping(self) -> None:
+        # Synapse hands event content over as an immutabledict, not a dict.
+        from immutabledict import immutabledict
+
+        self.assertEqual(course_language(immutabledict({"l2": "es"})), "es")
+        frozen = immutabledict(
+            {
+                "pangea.analytics_profile": immutabledict(
+                    {
+                        "analytics": immutabledict(
+                            {"es": immutabledict({"analytics_room_id": "!es:hs"})}
+                        )
+                    }
+                )
+            }
+        )
+        self.assertEqual(profile_analytics_rooms(frozen, "es"), ["!es:hs"])
+        powers = immutabledict({"users": immutabledict({TEACHER: 100})})
+        self.assertFalse(confirmed_below_course_admin(powers, TEACHER))
+        self.assertTrue(confirmed_below_course_admin(powers, STUDENT))
+
     def test_course_language(self) -> None:
         self.assertEqual(course_language({"l2": "es"}), "es")
         self.assertEqual(course_language({}), "")
@@ -241,3 +264,98 @@ class TestAcceptorJoinsOnlyTheProvenInvite(unittest.IsolatedAsyncioTestCase):
             ).accept_if_consented(ROOM, TEACHER)
         self.assertEqual(verdict, (REFUSED_NOT_INVITED, 0))
         join.assert_not_awaited()
+
+
+class _Event:
+    def __init__(self, sender: str, content: Mapping[str, Any]) -> None:
+        self.sender = sender
+        self.content = content
+
+
+class TestCourseLanguageThroughTheFactReads(unittest.IsolatedAsyncioTestCase):
+    """The real ``invite_facts`` + ``course_facts`` over a fake homeserver: a
+    student with rooms in two languages consents only for the course's."""
+
+    ES_ROOM = "!es:hs"
+    FR_ROOM = "!fr:hs"
+
+    def _acceptor(self, l2: Optional[str]) -> Any:
+        test = self
+        plan: Dict[str, Any] = {"uuid": "plan"}
+        if l2 is not None:
+            plan["l2"] = l2
+
+        class Store:
+            async def get_local_current_membership_for_user_in_room(
+                self, user_id: str, room_id: str
+            ) -> Tuple[str, str]:
+                return "invite", f"$invite-{room_id}"
+
+            async def get_event(self, event_id: str, allow_none: bool = False) -> Any:
+                return _Event(STUDENT, {"membership": "invite"})
+
+            async def get_rooms_for_user(self, user_id: str) -> frozenset:
+                return frozenset({"!course:hs"})
+
+            async def get_users_in_room(self, room_id: str) -> List[str]:
+                return [TEACHER, STUDENT]
+
+            async def get_profile_data_for_users(self, users: Any) -> Dict[str, Any]:
+                return {
+                    STUDENT: {
+                        "pangea.analytics_profile": {
+                            "analytics": {
+                                "es": {"analytics_room_id": test.ES_ROOM},
+                                "fr": {"analytics_room_id": test.FR_ROOM},
+                            }
+                        }
+                    }
+                }
+
+        class State:
+            async def get_current_state_event(
+                self, room_id: str, etype: str, key: str
+            ) -> Any:
+                return _Event(STUDENT, {"type": "p.analytics"})
+
+            async def get_current_state(self, room_id: str, state_filter: Any) -> Any:
+                return {
+                    ("pangea.course_plan", ""): _Event(TEACHER, immutabledict(plan)),
+                    ("m.room.power_levels", ""): _Event(
+                        TEACHER, {"users": {TEACHER: 100}}
+                    ),
+                }
+
+        acceptor = ConsentAcceptor.__new__(ConsentAcceptor)
+        acceptor._api = object()
+        acceptor._store = Store()
+        acceptor._state = State()
+        acceptor._course_filter = mock.sentinel.state_filter
+
+        async def join_position(room_id: str, invitee: str) -> int:
+            return 9
+
+        acceptor._join_position = join_position  # type: ignore[method-assign]
+        return acceptor
+
+    async def _verdict(self, l2: Optional[str], room_id: str) -> Tuple[str, int]:
+        with mock.patch(
+            "synapse_pangea_chat.blocked_join_gate.server_initiated_join",
+            new=mock.AsyncMock(),
+        ):
+            return await self._acceptor(l2).accept_if_consented(room_id, TEACHER)
+
+    async def test_course_language_room_is_accepted(self) -> None:
+        self.assertEqual(await self._verdict("es", self.ES_ROOM), (ACCEPT, 9))
+
+    async def test_other_language_room_is_refused(self) -> None:
+        self.assertEqual(await self._verdict("es", self.FR_ROOM), (REFUSED_NO_CLAIM, 0))
+
+    async def test_regioned_course_language_matches(self) -> None:
+        self.assertEqual(await self._verdict("es-MX", self.ES_ROOM), (ACCEPT, 9))
+        self.assertEqual(
+            await self._verdict("es-MX", self.FR_ROOM), (REFUSED_NO_CLAIM, 0)
+        )
+
+    async def test_no_course_language_uses_every_room(self) -> None:
+        self.assertEqual(await self._verdict(None, self.FR_ROOM), (ACCEPT, 9))

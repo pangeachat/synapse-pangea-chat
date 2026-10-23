@@ -9,7 +9,7 @@ test against; a field changed here without changing that file fails
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 #: The one room-timeline (non-state) type forwarded: a student's construct uses.
 CONSTRUCT_TYPE = "pangea.construct"
@@ -77,7 +77,7 @@ def profile_record(user_id: str, revision: int, profile: Any) -> Dict[str, Any]:
     return {
         "user_id": user_id,
         "revision": int(revision),
-        "profile": dict(profile) if isinstance(profile, dict) else None,
+        "profile": dict(profile) if isinstance(profile, Mapping) else None,
     }
 
 
@@ -88,7 +88,12 @@ def ingest_body(
     delivered_through: int,
     profiles_clean_before: int,
     accept_join_pos: Optional[int],
+    pending_accepts: Sequence[Any] = (),
 ) -> Dict[str, Any]:
+    owed = [
+        {"room_id": item[0], "user_id": item[1]} if isinstance(item, tuple) else item
+        for item in pending_accepts
+    ]
     return {
         "schema_version": SCHEMA_VERSION,
         "events": list(events),
@@ -96,6 +101,7 @@ def ingest_body(
         "delivered_through": int(delivered_through),
         "profiles_clean_before": int(profiles_clean_before),
         "accept_join_pos": accept_join_pos,
+        "pending_accepts": owed,
     }
 
 

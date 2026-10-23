@@ -261,6 +261,9 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
             or "analytics_forward: profile outbox write failed" in line
             or "consented-invite join failed" in line
             or ("pangea_analytics_forward" in line and "threw an exception" in line)
+            # Logcontext rules: the loop's DB work must stay in its own context.
+            or ("pangea_analytics" in line and "from sentinel context" in line)
+            or "Expected logging context pangea_analytics_forward" in line
         ]
         self.assertEqual(failures, [])
 
@@ -385,6 +388,47 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
             lambda: self._cursor() >= invite_pos, "delivery of the invite"
         )
         self.assertEqual(self._membership(analytics, coteacher), "invite")
+        self._assert_no_forwarder_errors()
+
+    async def test_only_the_course_language_room_is_accepted(self) -> None:
+        await self._start()
+        teacher, t_token = await self.new_user("lteacher")
+        student, s_token = await self.new_user("lstudent")
+        course = self._course(t_token, teacher, teacher, "es")
+        self._join(s_token, course)
+        spanish = self._analytics_room(s_token)
+        french = self._create_room(
+            s_token,
+            preset="private_chat",
+            creation_content={"type": "p.analytics", "lang_code": "fr"},
+        )
+        self._set_profile_field(
+            student,
+            s_token,
+            PROFILE_FIELD,
+            {
+                "analytics": {
+                    "es": {"analytics_room_id": spanish},
+                    "fr": {"analytics_room_id": french},
+                }
+            },
+        )
+        self._room_action(s_token, french, "invite", user_id=teacher)
+        french_invite = self._pos(
+            self._sql(
+                "SELECT event_id FROM local_current_membership "
+                "WHERE room_id = %s AND user_id = %s",
+                (french, teacher),
+            )[0][0]
+        )
+        await self._until(lambda: self._cursor() >= french_invite, "the invite")
+        self.assertEqual(self._membership(french, teacher), "invite")
+
+        self._room_action(s_token, spanish, "invite", user_id=teacher)
+        await self._until(
+            lambda: self._membership(spanish, teacher) == "join", "the consent join"
+        )
+        self.assertEqual(self._membership(french, teacher), "invite")
         self._assert_no_forwarder_errors()
 
     async def test_head_and_state_need_the_secret(self) -> None:

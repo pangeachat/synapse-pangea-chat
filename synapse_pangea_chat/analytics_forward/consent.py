@@ -134,7 +134,7 @@ def _primary_subtag(lang: str) -> str:
 
 
 def _entry_room_id(entry: Any) -> Optional[str]:
-    if not isinstance(entry, dict):
+    if not isinstance(entry, Mapping):
         return None
     room_id = entry.get("analytics_room_id")
     return room_id if isinstance(room_id, str) and room_id else None
@@ -147,11 +147,11 @@ def profile_analytics_rooms(profile: Any, language: str) -> List[str]:
     subtag, the exact key winning over a legacy per-locale key. Without one:
     every room in the profile.
     """
-    if not isinstance(profile, dict):
+    if not isinstance(profile, Mapping):
         return []
     block = profile.get(PROFILE_KEY)
-    analytics = block.get("analytics") if isinstance(block, dict) else None
-    if not isinstance(analytics, dict):
+    analytics = block.get("analytics") if isinstance(block, Mapping) else None
+    if not isinstance(analytics, Mapping):
         return []
     if language:
         want = _primary_subtag(language)
@@ -178,7 +178,7 @@ def caller_power_level(powers: Mapping[str, Any], user_id: str) -> int:
     """Effective power for ADMISSION; a malformed entry is 0 (fails closed)."""
     if "users" in powers:
         users = powers["users"]
-        if not isinstance(users, dict):
+        if not isinstance(users, Mapping):
             return 0
         if user_id in users:
             explicit = users[user_id]
@@ -191,7 +191,7 @@ def confirmed_below_course_admin(powers: Mapping[str, Any], user_id: str) -> boo
     """Whether a member is POSITIVELY a student; malformed power is not."""
     if "users" in powers:
         users = powers["users"]
-        if not isinstance(users, dict):
+        if not isinstance(users, Mapping):
             return False
         if user_id in users:
             explicit = users[user_id]
@@ -210,7 +210,7 @@ def is_bot(user_id: str) -> bool:
 
 def course_language(course_plan_content: Any) -> str:
     """The course language the ``pangea.course_plan`` event names, or ``""``."""
-    if not isinstance(course_plan_content, dict):
+    if not isinstance(course_plan_content, Mapping):
         return ""
     l2 = course_plan_content.get("l2")
     return l2 if isinstance(l2, str) else ""

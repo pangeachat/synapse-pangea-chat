@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, List, Optional, Set, Tuple
 
 from synapse_pangea_chat.analytics_forward import metrics
 from synapse_pangea_chat.analytics_forward.config import START_AT_CURRENT
@@ -80,6 +80,11 @@ class Forwarder:
         #: The highest stream position of a join made for a consented invite
         #: that the ingest has not yet been told about.
         self._fence = 0
+        #: Consented invites whose join failed. Retried on their own, at most
+        #: once per poll, and named in every batch until they succeed, so the
+        #: ingest holds those courses' Refresh while the stream keeps moving.
+        self._owed: Set[Tuple[str, str]] = set()
+        self._owed_tried_ms: Optional[int] = None
         self._failures = 0
         self._running = False
         self._woken = False
@@ -114,25 +119,37 @@ class Forwarder:
             logger.exception("analytics forwarder: pending invite scan failed")
             return
         for room_id, user_id in pending:
-            try:
-                await self._accept(room_id, user_id)
-            except Exception:  # silent-ok: logged and counted; the next scan retries
-                logger.exception("analytics forwarder: consented-invite join failed")
+            await self._accept(room_id, user_id)
 
     async def _accept(self, room_id: str, user_id: str) -> None:
-        """Run the proof and join; an error propagates. In the stream it fails
-        the step, so the batch carrying the invite is retried, never sent
-        without the join it owes."""
+        """Run the proof and join. Never raises: a join that fails is owed and
+        retried on its own, so one room can never stall delivery."""
         try:
             verdict, position = await self._consent.accept_if_consented(
                 room_id, user_id
             )
-        except Exception:
+        except Exception:  # silent-ok: logged, counted, owed and named in every batch
+            logger.exception("analytics forwarder: consented-invite join failed")
             metrics.CONSENT.labels(verdict="error").inc()
-            raise
+            if not self._owed:
+                self._owed_tried_ms = self._clock_ms()
+            self._owed.add((room_id, user_id))
+            return
+        self._owed.discard((room_id, user_id))
         metrics.CONSENT.labels(verdict=verdict).inc()
         if position > self._fence:
             self._fence = position
+
+    async def _retry_owed(self) -> None:
+        now = self._clock_ms()
+        if not self._owed or (
+            self._owed_tried_ms is not None
+            and now - self._owed_tried_ms < self._poll_ms
+        ):
+            return
+        self._owed_tried_ms = now
+        for room_id, user_id in sorted(self._owed):
+            await self._accept(room_id, user_id)
 
     # -- the loop -----------------------------------------------------------
 
@@ -155,10 +172,9 @@ class Forwarder:
                     await self._sleep(self._backoff(exc))
                     continue
                 self._failures = 0
-                if more:
-                    continue
-                if not self._woken:
+                if not (more or self._woken):
                     return
+                # Paced in catch-up too, so a backlog is a few reads a second.
                 await self._sleep(BUSY_PAUSE_SECONDS)
         finally:
             self._running = False
@@ -187,6 +203,7 @@ class Forwarder:
     async def step(self) -> bool:
         """Read, send, and on acknowledgement advance. True when more is waiting."""
         assert self._cursor is not None
+        await self._retry_owed()
         head = self._store.head()
         events, reached = await self._store.read_events(
             self._cursor, head, self._batch_max
@@ -200,8 +217,8 @@ class Forwarder:
             if event.type == "m.room.member" and (
                 event.content.get("membership") == "invite"
             ):
-                # Joined BEFORE the batch is sent, so the batch carries the
-                # join's position as the fence.
+                # Joined before the batch is sent, so the batch carries the
+                # join's position as the fence; a failed join is owed instead.
                 await self._accept(event.room_id, state_key)
 
         read_ms = self._clock_ms()
@@ -226,6 +243,7 @@ class Forwarder:
             delivered_through=reached,
             profiles_clean_before=clean_before,
             accept_join_pos=fence or None,
+            pending_accepts=sorted(self._owed),
         )
         response = await self._post(body)
         try:
@@ -252,10 +270,9 @@ def make_http_poster(
     Only a 200 is an answer. Synapse's shared HTTP client bounds the wait for
     the response headers.
     """
-    from synapse.logging.context import make_deferred_yieldable
+    from synapse.logging.context import make_deferred_yieldable, run_in_background
     from synapse.util.async_helpers import timeout_deferred
     from synapse.util.json import json_encoder
-    from twisted.internet import defer
     from twisted.web.client import readBody
     from twisted.web.http_headers import Headers
 
@@ -280,7 +297,9 @@ def make_http_poster(
         try:
             response, content = await make_deferred_yieldable(
                 timeout_deferred(
-                    deferred=defer.ensureDeferred(exchange()),
+                    # run_in_background keeps the logcontext rules across the
+                    # timeout wrapper; ensureDeferred lost the context.
+                    deferred=run_in_background(exchange),
                     timeout=REQUEST_TIMEOUT_SECONDS,
                     clock=clock,
                 )

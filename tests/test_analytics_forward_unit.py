@@ -17,6 +17,7 @@ from synapse_pangea_chat.analytics_forward.config import (
     parse_analytics_forward_config,
 )
 from synapse_pangea_chat.analytics_forward.forwarder import (
+    BUSY_PAUSE_SECONDS,
     MAX_BACKOFF_SECONDS,
     PROFILE_CLOCK_GRACE_MS,
     DeliveryError,
@@ -447,27 +448,47 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ingest.bodies), 3)
         self.assertIsNone(ingest.bodies[-1]["accept_join_pos"])
 
-    async def test_join_error_holds_the_invite_batch(self) -> None:
+    async def test_failing_join_never_stalls_delivery(self) -> None:
+        """A join that keeps failing is retried on its own; the stream, the
+        profiles and the heartbeat keep moving, and every batch names the
+        join still owed so the ingest holds that course's Refresh."""
         invite = FakeEvent(
             4, "m.room.member", "@teacher:hs", {"membership": "invite"}, "!a:hs"
         )
-        store = FakeStore([invite], head=4)
+        store = FakeStore([invite, FakeEvent(6)], head=6)
         consent = FakeConsent()
         ingest = Ingest()
-        fwd = _forwarder(store, ingest, Clock(), consent=consent)
+        clock = Clock()
+        fwd = _forwarder(store, ingest, clock, consent=consent)
         await fwd.start()
+        attempts: List[Tuple[str, str]] = []
 
         async def broken(room_id: str, user_id: str) -> Any:
+            attempts.append((room_id, user_id))
             raise ConnectionError("join failed")
 
         consent.accept_if_consented = broken  # type: ignore[method-assign]
-        with self.assertRaises(ConnectionError):
-            await fwd.step()
-        self.assertEqual(ingest.bodies, [])  # never sent without its join
-        self.assertEqual(store.cursor, 0)
-        consent.accept_if_consented = FakeConsent().accept_if_consented  # type: ignore[method-assign]
         await fwd.step()
-        self.assertEqual(store.cursor, 4)
+        self.assertEqual(store.cursor, 6)  # the invite and what follows delivered
+        owed = [{"room_id": "!a:hs", "user_id": "@teacher:hs"}]
+        self.assertEqual(ingest.bodies[-1]["pending_accepts"], owed)
+        self.assertIsNone(ingest.bodies[-1]["accept_join_pos"])
+
+        store.events.append(FakeEvent(8))
+        store.head_pos = 8
+        await fwd.step()  # retried at most once per poll, still failing
+        self.assertEqual(store.cursor, 8)
+        self.assertEqual(ingest.bodies[-1]["pending_accepts"], owed)
+        self.assertEqual(len(attempts), 1)
+
+        working = FakeConsent()
+        working.position = 9
+        consent.accept_if_consented = working.accept_if_consented  # type: ignore[method-assign]
+        clock.ms += 5_000
+        await fwd.step()
+        self.assertEqual(working.calls, [("!a:hs", "@teacher:hs")])
+        self.assertEqual(ingest.bodies[-1]["pending_accepts"], [])
+        self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 9)
 
     async def test_pending_scan_error_does_not_stop_the_start(self) -> None:
         store = FakeStore([], head=0)
@@ -478,9 +499,15 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
             raise ConnectionError("join failed")
 
         consent.accept_if_consented = broken  # type: ignore[method-assign]
-        fwd = _forwarder(store, Ingest(), Clock(), consent=consent)
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock(), consent=consent)
         await fwd.start()
         self.assertEqual(fwd.cursor, 0)
+        await fwd.step()
+        self.assertEqual(
+            ingest.bodies[-1]["pending_accepts"],
+            [{"room_id": "!a:hs", "user_id": "@t:hs"}],
+        )
 
     async def test_pending_invites_are_scanned_at_start(self) -> None:
         store = FakeStore([], head=0)
@@ -532,6 +559,16 @@ class TestDrain(unittest.IsolatedAsyncioTestCase):
         delays = [fwd._backoff(DeliveryError("http", "HTTP 503")) for _ in range(2000)]
         self.assertEqual(delays[:7], [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0])
         self.assertEqual(delays[-1], MAX_BACKOFF_SECONDS)
+
+    async def test_catch_up_is_paced(self) -> None:
+        store = FakeStore(_events(1, 2, 3, 4, 5), head=5)
+        clock = Clock()
+        fwd = _forwarder(store, Ingest(), clock, batch_max=2)
+        await fwd.start()
+        await fwd.drain()
+        self.assertEqual(store.cursor, 5)
+        # Two full batches, each followed by the pause before the next read.
+        self.assertEqual(clock.slept, [BUSY_PAUSE_SECONDS, BUSY_PAUSE_SECONDS])
 
     async def test_auth_failure_waits_the_longest(self) -> None:
         store = FakeStore(_events(1), head=1)
@@ -608,6 +645,7 @@ class TestWire(unittest.TestCase):
             delivered_through=example["delivered_through"],
             profiles_clean_before=example["profiles_clean_before"],
             accept_join_pos=example["accept_join_pos"],
+            pending_accepts=example["pending_accepts"],
         )
         self.assertEqual(body, example)
         self.assertEqual(set(body), set(request_schema["required"]))
