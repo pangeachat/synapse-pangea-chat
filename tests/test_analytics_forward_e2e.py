@@ -76,7 +76,10 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
             conn.close()
 
     def _cursor(self) -> int:
-        rows = self._sql("SELECT stream_pos FROM pangea_analytics_forward_cursor")
+        rows = self._sql(
+            "SELECT stream_pos FROM pangea_analytics_forward_cursor "
+            "WHERE name = 'analytics_forward'"
+        )
         return int(rows[0][0]) if rows else -1
 
     def _pos(self, event_id: str) -> int:
@@ -364,15 +367,27 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
             "ORDER BY stream_ordering LIMIT 1",
             (analytics, teacher),
         )[0][0]
-        # Every POST that carried the invite, acknowledged or not, was sent
-        # after the join and carries its position.
-        carrying = await self._until(
+        # Every POST that carried the invite either names it as owed or, if
+        # the join was already made, carries the join's position; and a later
+        # acknowledged batch carries the fence with the invite no longer owed.
+        owed = {"room_id": analytics, "user_id": teacher}
+        await self._until(
             lambda: self._acked_with(invite_event), "the batch carrying the invite"
         )
         for _status, body in self._attempted_with(invite_event):
-            self.assertGreaterEqual(body["accept_join_pos"] or 0, join_pos)
+            self.assertTrue(
+                owed in body["pending_accepts"]
+                or (body["accept_join_pos"] or 0) >= join_pos
+            )
+        await self._until(
+            lambda: any(
+                (b["accept_join_pos"] or 0) >= join_pos
+                and owed not in b["pending_accepts"]
+                for b in self.ingest.acknowledged()
+            ),
+            "the fence after the join",
+        )
         self.assertGreater(join_pos, self._pos(invite_event))
-        self.assertTrue(carrying)
 
         # Fact 3: a teacher the student approved inviting a colleague is not
         # the student's consent.
@@ -503,6 +518,7 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
         await self._until(lambda: self._attempted_with(second), "an attempt")
         self.assertEqual(self._membership(analytics, teacher), "invite")
         before_crash = len(self.ingest.requests())
+        rev_before = max(b["pending_accepts_rev"] for _, b in self.ingest.requests())
 
         await self._crash_and_restart()
         self.ingest.set_status(200)
@@ -510,6 +526,7 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
         await self._until(lambda: self._cursor() >= self._pos(second), "the cursor")
 
         after = [b for s, b in self.ingest.requests()[before_crash:] if s == 200]
+        self.assertGreater(after[0]["pending_accepts_rev"], rev_before)
         delivered = [e["event_id"] for b in after for e in b["events"]]
         self.assertNotIn(first, delivered)  # acknowledged before: not re-sent
         self.assertEqual(delivered.count(second), 1)

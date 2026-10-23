@@ -7,6 +7,7 @@ stored cursor, a profile is cleared only for the revision that was sent, and
 the heartbeat reports profiles clean only once the startup re-send is in.
 """
 
+import asyncio
 import json
 import os
 import unittest
@@ -75,6 +76,7 @@ class FakeStore:
         self.profile_data: Dict[str, Any] = {}
         self.pending: List[Tuple[str, str]] = []
         self.undelivered_join = 0
+        self.pending_rev = 0
 
     def head(self) -> int:
         return self.head_pos
@@ -137,6 +139,12 @@ class FakeStore:
 
     async def pending_analytics_invites(self):
         return list(self.pending)
+
+    async def load_pending_rev(self) -> int:
+        return self.pending_rev
+
+    async def save_pending_rev(self, rev: int) -> None:
+        self.pending_rev = max(self.pending_rev, rev)
 
     async def undelivered_analytics_join(self, after: int) -> int:
         return self.undelivered_join if self.undelivered_join > after else 0
@@ -427,138 +435,231 @@ class TestStartupResend(unittest.IsolatedAsyncioTestCase):
 
 
 class TestConsentFence(unittest.IsolatedAsyncioTestCase):
-    async def test_invite_batch_carries_the_join_position(self) -> None:
-        invite = FakeEvent(
-            4, "m.room.member", "@teacher:hs", {"membership": "invite"}, "!a:hs"
+    """Consent joins run in their own worker. Delivery never waits on one; an
+    invite is named in every batch until the worker has answered it, and a
+    join's position is the fence on the batch after it."""
+
+    INVITE = ("!a:hs", "@teacher:hs")
+    OWED = [{"room_id": "!a:hs", "user_id": "@teacher:hs"}]
+
+    def _invite(self, pos: int = 4) -> FakeEvent:
+        return FakeEvent(
+            pos, "m.room.member", "@teacher:hs", {"membership": "invite"}, "!a:hs"
         )
-        store = FakeStore([invite], head=4)
+
+    async def test_invite_named_until_answered_then_fenced(self) -> None:
+        store = FakeStore([self._invite()], head=4)
         consent = FakeConsent()
         consent.position = 7
         ingest = Ingest()
         clock = Clock()
         fwd = _forwarder(store, ingest, clock, consent=consent)
         await fwd.start()
-        ingest.fail_with = DeliveryError("http", "HTTP 503")
-        with self.assertRaises(DeliveryError):
-            await fwd.step()
-        self.assertEqual(consent.calls, [("!a:hs", "@teacher:hs")])
-        self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 7)
-        ingest.fail_with = None
-        consent.position = 0  # the retry finds the teacher already joined
         await fwd.step()
+        self.assertEqual(store.cursor, 4)  # delivered without waiting
+        self.assertEqual(ingest.bodies[-1]["pending_accepts"], self.OWED)
+        self.assertIsNone(ingest.bodies[-1]["accept_join_pos"])
+
+        await fwd.consent_worker()
+        self.assertEqual(consent.calls, [self.INVITE])
+        await fwd.step()  # a fence is news: sent without waiting for the poll
+        self.assertEqual(ingest.bodies[-1]["pending_accepts"], [])
         self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 7)
         clock.ms += 5_000
         await fwd.step()
-        self.assertEqual(len(ingest.bodies), 3)
         self.assertIsNone(ingest.bodies[-1]["accept_join_pos"])
 
-    async def test_failing_join_never_stalls_delivery(self) -> None:
-        """A join that keeps failing is retried on its own; the stream, the
-        profiles and the heartbeat keep moving, and every batch names the
-        join still owed so the ingest holds that course's Refresh."""
-        invite = FakeEvent(
-            4, "m.room.member", "@teacher:hs", {"membership": "invite"}, "!a:hs"
-        )
-        store = FakeStore([invite, FakeEvent(6)], head=6)
+    async def test_fence_survives_a_failed_delivery(self) -> None:
+        store = FakeStore([self._invite()], head=4)
         consent = FakeConsent()
+        consent.position = 7
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock(), consent=consent)
+        await fwd.start()
+        await fwd.step()
+        await fwd.consent_worker()
+        ingest.fail_with = DeliveryError("http", "HTTP 503")
+        with self.assertRaises(DeliveryError):
+            await fwd.step()
+        ingest.fail_with = None
+        await fwd.step()
+        self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 7)
+
+    async def test_hanging_join_never_holds_delivery(self) -> None:
+        store = FakeStore([self._invite(), FakeEvent(6)], head=6)
+        consent = FakeConsent()
+        never: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
+
+        async def hangs(room_id: str, user_id: str) -> Any:
+            return await never
+
+        consent.accept_if_consented = hangs  # type: ignore[method-assign]
         ingest = Ingest()
         clock = Clock()
         fwd = _forwarder(store, ingest, clock, consent=consent)
         await fwd.start()
-        attempts: List[Tuple[str, str]] = []
-
-        async def broken(room_id: str, user_id: str) -> Any:
-            attempts.append((room_id, user_id))
-            raise ConnectionError("join failed")
-
-        consent.accept_if_consented = broken  # type: ignore[method-assign]
-        await fwd.step()
-        self.assertEqual(store.cursor, 6)  # the invite and what follows delivered
-        owed = [{"room_id": "!a:hs", "user_id": "@teacher:hs"}]
-        self.assertEqual(ingest.bodies[-1]["pending_accepts"], owed)
-        self.assertIsNone(ingest.bodies[-1]["accept_join_pos"])
-
+        # A bound, so a regression that waits on the join fails, not hangs.
+        await asyncio.wait_for(fwd.step(), 2)
+        worker = asyncio.ensure_future(fwd.consent_worker())
+        await asyncio.sleep(0)
         store.events.append(FakeEvent(8))
         store.head_pos = 8
-        await fwd.step()  # retried at most once per poll, still failing
+        await asyncio.wait_for(fwd.step(), 2)
         self.assertEqual(store.cursor, 8)
-        self.assertEqual(ingest.bodies[-1]["pending_accepts"], owed)
-        self.assertEqual(len(attempts), 1)
+        self.assertEqual(ingest.bodies[-1]["pending_accepts"], self.OWED)
+        worker.cancel()
 
-        working = FakeConsent()
-        working.position = 9
-        consent.accept_if_consented = working.accept_if_consented  # type: ignore[method-assign]
-        clock.ms += 5_000
+    async def test_failing_join_retried_once_per_poll(self) -> None:
+        store = FakeStore([self._invite()], head=4)
+        consent = FakeConsent()
+        results: List[Any] = [ConnectionError("join failed"), ("accept", 9)]
+
+        async def flaky(room_id: str, user_id: str) -> Any:
+            consent.calls.append((room_id, user_id))
+            result = results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        consent.accept_if_consented = flaky  # type: ignore[method-assign]
+        clock = Clock()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, clock, consent=consent)
+        await fwd.start()
         await fwd.step()
-        self.assertEqual(working.calls, [("!a:hs", "@teacher:hs")])
+        await fwd.consent_worker()
+        self.assertEqual(consent.calls, [self.INVITE, self.INVITE])
+        self.assertEqual(clock.slept, [5.0])
+        await fwd.step()
         self.assertEqual(ingest.bodies[-1]["pending_accepts"], [])
         self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 9)
 
-    async def test_owed_join_is_not_retried_by_a_replayed_batch(self) -> None:
-        invite = FakeEvent(
-            4, "m.room.member", "@teacher:hs", {"membership": "invite"}, "!a:hs"
-        )
-        store = FakeStore([invite], head=4)
-        consent = FakeConsent()
-        ingest = Ingest()
-        fwd = _forwarder(store, ingest, Clock(), consent=consent)
-        await fwd.start()
-        attempts: List[Tuple[str, str]] = []
-
-        async def broken(room_id: str, user_id: str) -> Any:
-            attempts.append((room_id, user_id))
-            raise ConnectionError("join failed")
-
-        consent.accept_if_consented = broken  # type: ignore[method-assign]
-        ingest.fail_with = DeliveryError("http", "HTTP 503")
-        for _ in range(3):
-            with self.assertRaises(DeliveryError):
-                await fwd.step()
-        self.assertEqual(len(attempts), 1)
-
-    async def test_no_delivery_before_the_startup_scan_finishes(self) -> None:
+    async def test_pending_invites_are_owed_before_anything_is_sent(self) -> None:
         store = FakeStore([], head=0)
-        store.pending = [("!a:hs", "@t:hs")]
+        store.pending = [self.INVITE]
         launched: List[Any] = []
-        consent = FakeConsent()
         fwd = Forwarder(
             store=store,
             post=Ingest(),
-            consent=consent,
+            consent=FakeConsent(),
             clock_ms=Clock().now,
             sleep=Clock().sleep,
             run_in_background=launched.append,
             batch_max=10,
             poll_seconds=5,
         )
-
-        launched_during_scan: List[int] = []
-
-        async def wake_during_scan(room_id: str, user_id: str) -> Any:
-            fwd.wake()  # an event arrives while the scan runs
-            launched_during_scan.append(len(launched))
-            return "not_invited", 0
-
-        consent.accept_if_consented = wake_during_scan  # type: ignore[method-assign]
-        await fwd.start()
-        self.assertEqual(launched_during_scan, [0])
-        self.assertEqual(len(launched), 1)  # started once, after the scan
-
-    async def test_daily_scan_runs_inside_the_loop(self) -> None:
-        """The scan never runs beside a step, so the fence and the owed set a
-        batch carries are always read together."""
-        store = FakeStore([], head=0)
-        consent = FakeConsent()
         ingest = Ingest()
-        fwd = _forwarder(store, ingest, Clock(), consent=consent)
+        fwd._post = ingest
         await fwd.start()
-        store.pending = [("!a:hs", "@t:hs")]
-        consent.position = 11
-        fwd.request_pending_scan()
-        self.assertEqual(consent.calls, [])  # only asked for, not run here
+        self.assertEqual(launched, [fwd.consent_worker, fwd.drain])
         await fwd.step()
-        self.assertEqual(consent.calls, [("!a:hs", "@t:hs")])
-        self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 11)
+        self.assertEqual(ingest.bodies[0]["pending_accepts"], self.OWED)
+
+    async def test_failed_startup_scan_fails_the_start(self) -> None:
+        store = FakeStore([], head=0)
+
+        async def unreadable() -> Any:
+            raise ConnectionError("db down")
+
+        store.pending_analytics_invites = unreadable  # type: ignore[method-assign]
+        launched: List[Any] = []
+        fwd = Forwarder(
+            store=store,
+            post=Ingest(),
+            consent=FakeConsent(),
+            clock_ms=Clock().now,
+            sleep=Clock().sleep,
+            run_in_background=launched.append,
+            batch_max=10,
+            poll_seconds=5,
+        )
+        with self.assertRaises(ConnectionError):
+            await fwd.start()
+        fwd.wake()
+        self.assertIsNone(fwd.cursor)
+        self.assertEqual(launched, [])  # nothing is sent until a scan succeeds
+
+    async def test_failed_daily_scan_keeps_what_is_owed(self) -> None:
+        store = FakeStore([self._invite()], head=4)
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+
+        async def unreadable() -> Any:
+            raise ConnectionError("db down")
+
+        store.pending_analytics_invites = unreadable  # type: ignore[method-assign]
+        await fwd.daily_scan()
+        await fwd.step()
+        self.assertEqual(ingest.bodies[-1]["pending_accepts"], self.OWED)
+
+    async def test_join_and_knock_are_not_owed(self) -> None:
+        events = [
+            FakeEvent(1, "m.room.member", "@t:hs", {"membership": "join"}),
+            FakeEvent(2, "m.room.member", "@t:hs", {"membership": "knock"}),
+        ]
+        store = FakeStore(events, head=2)
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+        self.assertEqual(ingest.bodies[-1]["pending_accepts"], [])
+
+    async def test_pending_accepts_rev_grows_with_every_change(self) -> None:
+        store = FakeStore([self._invite()], head=4)
+        consent = FakeConsent()
+        consent.position = 7
+        ingest = Ingest()
+        clock = Clock()
+        fwd = _forwarder(store, ingest, clock, consent=consent)
+        await fwd.start()
+        await fwd.step()  # the invite is owed: a new set
+        owed_rev = ingest.bodies[-1]["pending_accepts_rev"]
+        await fwd.consent_worker()
+        await fwd.step()  # answered: a new set again
+        answered_rev = ingest.bodies[-1]["pending_accepts_rev"]
+        self.assertGreater(answered_rev, owed_rev)
+        clock.ms += 5_000
+        await fwd.step()  # nothing changed: same rev
+        self.assertEqual(ingest.bodies[-1]["pending_accepts_rev"], answered_rev)
+
+    async def test_pending_accepts_rev_outgrows_a_crash(self) -> None:
+        """A rev sent but never acknowledged before a crash may still land at
+        the ingest; every rev after the restart must be newer."""
+        store = FakeStore([self._invite()], head=4)
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        ingest.fail_with = DeliveryError("http", "timeout")
+        with self.assertRaises(DeliveryError):
+            await fwd.step()
+        sent = ingest.bodies[-1]["pending_accepts_rev"]
+
+        after = Ingest()
+        restarted = _forwarder(store, after, Clock())
+        await restarted.start()
+        await restarted.step()
+        self.assertGreater(after.bodies[-1]["pending_accepts_rev"], sent)
+
+    async def test_restart_with_an_empty_set_still_sends_a_newer_rev(self) -> None:
+        """Delivered as owed, then a crash before the answer: after the
+        restart nothing is owed, and that empty set must replace the old."""
+        store = FakeStore([self._invite()], head=4)
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+        owed = ingest.bodies[-1]
+        self.assertEqual(owed["pending_accepts"], self.OWED)
+
+        after = Ingest()
+        restarted = _forwarder(store, after, Clock())
+        await restarted.start()
+        await restarted.step()
+        self.assertEqual(after.bodies[-1]["pending_accepts"], [])
+        self.assertGreater(
+            after.bodies[-1]["pending_accepts_rev"], owed["pending_accepts_rev"]
+        )
 
     async def test_restart_fences_an_undelivered_analytics_join(self) -> None:
         """A join made before a crash, whose fence was never delivered, is
@@ -571,72 +672,6 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         await fwd.start()
         await fwd.step()
         self.assertEqual(ingest.bodies[0]["accept_join_pos"], 15)
-
-    async def test_scan_leaves_owed_joins_to_the_throttled_retry(self) -> None:
-        invite = FakeEvent(
-            4, "m.room.member", "@teacher:hs", {"membership": "invite"}, "!a:hs"
-        )
-        store = FakeStore([invite], head=4)
-        consent = FakeConsent()
-        clock = Clock()
-        fwd = _forwarder(store, Ingest(), clock, consent=consent)
-        await fwd.start()
-        attempts: List[Tuple[str, str]] = []
-
-        async def broken(room_id: str, user_id: str) -> Any:
-            attempts.append((room_id, user_id))
-            raise ConnectionError("join failed")
-
-        consent.accept_if_consented = broken  # type: ignore[method-assign]
-        await fwd.step()  # owed now
-        store.pending = [("!a:hs", "@teacher:hs")]
-        clock.ms += 5_000  # the retry is due
-        fwd.request_pending_scan()
-        await fwd.step()
-        self.assertEqual(len(attempts), 2)  # one retry, not scan + retry
-
-    async def test_pending_scan_error_does_not_stop_the_start(self) -> None:
-        store = FakeStore([], head=0)
-        store.pending = [("!a:hs", "@t:hs")]
-        consent = FakeConsent()
-
-        async def broken(room_id: str, user_id: str) -> Any:
-            raise ConnectionError("join failed")
-
-        consent.accept_if_consented = broken  # type: ignore[method-assign]
-        ingest = Ingest()
-        fwd = _forwarder(store, ingest, Clock(), consent=consent)
-        await fwd.start()
-        self.assertEqual(fwd.cursor, 0)
-        await fwd.step()
-        self.assertEqual(
-            ingest.bodies[-1]["pending_accepts"],
-            [{"room_id": "!a:hs", "user_id": "@t:hs"}],
-        )
-
-    async def test_pending_invites_are_scanned_at_start(self) -> None:
-        store = FakeStore([], head=0)
-        store.pending = [("!a:hs", "@t:hs")]
-        consent = FakeConsent()
-        consent.position = 3
-        ingest = Ingest()
-        fwd = _forwarder(store, ingest, Clock(), consent=consent)
-        await fwd.start()
-        self.assertEqual(consent.calls, [("!a:hs", "@t:hs")])
-        await fwd.step()
-        self.assertEqual(ingest.bodies[0]["accept_join_pos"], 3)
-
-    async def test_join_and_knock_are_not_consent_checked(self) -> None:
-        events = [
-            FakeEvent(1, "m.room.member", "@t:hs", {"membership": "join"}),
-            FakeEvent(2, "m.room.member", "@t:hs", {"membership": "knock"}),
-        ]
-        store = FakeStore(events, head=2)
-        consent = FakeConsent()
-        fwd = _forwarder(store, Ingest(), Clock(), consent=consent)
-        await fwd.start()
-        await fwd.step()
-        self.assertEqual(consent.calls, [])
 
 
 class TestDrain(unittest.IsolatedAsyncioTestCase):
@@ -761,6 +796,7 @@ class TestWire(unittest.TestCase):
             profiles_clean_before=example["profiles_clean_before"],
             accept_join_pos=example["accept_join_pos"],
             pending_accepts=example["pending_accepts"],
+            pending_accepts_rev=example["pending_accepts_rev"],
         )
         self.assertEqual(body, example)
         self.assertEqual(set(body), set(request_schema["required"]))

@@ -89,6 +89,7 @@ def ingest_body(
     profiles_clean_before: int,
     accept_join_pos: Optional[int],
     pending_accepts: Sequence[Any] = (),
+    pending_accepts_rev: int = 0,
 ) -> Dict[str, Any]:
     owed = [
         {"room_id": item[0], "user_id": item[1]} if isinstance(item, tuple) else item
@@ -102,6 +103,7 @@ def ingest_body(
         "profiles_clean_before": int(profiles_clean_before),
         "accept_join_pos": accept_join_pos,
         "pending_accepts": owed,
+        "pending_accepts_rev": int(pending_accepts_rev),
     }
 
 

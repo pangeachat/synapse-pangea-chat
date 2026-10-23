@@ -21,6 +21,8 @@ from synapse_pangea_chat.analytics_forward.consent import PROFILE_KEY
 from synapse_pangea_chat.analytics_forward.wire import FORWARDED_TYPES
 
 _CURSOR_NAME = "analytics_forward"
+#: The pending_accepts revision, kept in the cursor table as a second row.
+_PENDING_REV_NAME = "pending_accepts_rev"
 
 _CREATE_CURSOR_SQL = """
     CREATE TABLE IF NOT EXISTS pangea_analytics_forward_cursor (
@@ -197,6 +199,20 @@ class ForwardStore:
         # Rejected events are dropped here too; a dropped one is never sent.
         events = await self._main.get_events_as_list([eid for _, eid in rows])
         return events, reached
+
+    async def load_pending_rev(self) -> int:
+        def _load(txn: Any) -> int:
+            txn.execute(_INSERT_CURSOR_SQL, (_PENDING_REV_NAME, 0))
+            txn.execute(_SELECT_CURSOR_SQL, (_PENDING_REV_NAME,))
+            return int(txn.fetchone()[0])
+
+        return await self._pool.runInteraction("pangea_analytics_pending_rev", _load)
+
+    async def save_pending_rev(self, rev: int) -> None:
+        await self._pool.runInteraction(
+            "pangea_analytics_pending_rev_save",
+            lambda txn: txn.execute(_ADVANCE_CURSOR_SQL, (rev, _PENDING_REV_NAME)),
+        )
 
     async def advance(self, cursor: int, acked: Sequence[Tuple[str, int]]) -> None:
         """After an acknowledgement: the new cursor and the delivered profiles,

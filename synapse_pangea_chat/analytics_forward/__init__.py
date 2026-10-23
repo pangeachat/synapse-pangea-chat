@@ -122,7 +122,7 @@ class AnalyticsForward:
 
     async def _daily_scan(self) -> None:
         if self._forwarder is not None:
-            self._forwarder.request_pending_scan()
+            await self._forwarder.daily_scan()
 
     async def _poll(self) -> None:
         # Async because the timer awaits what it calls.

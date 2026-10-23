@@ -11,7 +11,8 @@
       "delivered_through",
       "profiles_clean_before",
       "accept_join_pos",
-      "pending_accepts"
+      "pending_accepts",
+      "pending_accepts_rev"
     ],
     "properties": {
       "schema_version": {
@@ -113,7 +114,7 @@
         "description": "The stream position of a join the module made for a consented analytics invite before sending this batch. Raise ingest_state.accept_fence to it in the same commit."
       },
       "pending_accepts": {
-        "description": "Consented analytics invites whose join the module could not make yet (it retries them on its own, at most once per poll). The FULL current set on every batch, not a delta: replace the stored set with it. While a (room, teacher) pair is in it, a Refresh of any course that teacher administers must not be reported complete (ingest_lagging); delivery of everything else is not held back.",
+        "description": "Consented analytics invites whose join the module could not make yet (it retries them on its own, at most once per poll). The FULL current set on every batch, not a delta: replace the stored set with it ONLY when pending_accepts_rev is newer than the stored rev. While a (room, teacher) pair is in it, a Refresh of any course that teacher administers must not be reported complete (ingest_lagging); delivery of everything else is not held back.",
         "type": "array",
         "items": {
           "type": "object",
@@ -132,6 +133,11 @@
             }
           }
         }
+      },
+      "pending_accepts_rev": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Grows whenever the module's owed-join set changes; durable across module restarts (stored before any batch carrying it is sent, and moved past on start). Replace the stored pending_accepts only when this is greater than the stored rev, so an older request landing late (after a newer heartbeat with the same delivered_through) cannot overwrite a newer set."
       }
     }
   },
@@ -207,7 +213,8 @@
     "delivered_through": 812360,
     "profiles_clean_before": 1761199998000,
     "accept_join_pos": null,
-    "pending_accepts": []
+    "pending_accepts": [],
+    "pending_accepts_rev": 12
   },
   "response_example": {
     "delivered_through": 812360,

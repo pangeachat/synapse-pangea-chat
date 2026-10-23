@@ -80,14 +80,19 @@ class Forwarder:
         #: The highest stream position of a join made for a consented invite
         #: that the ingest has not yet been told about.
         self._fence = 0
-        #: Consented invites whose join failed. Retried on their own, at most
-        #: once per poll, and named in every batch until they succeed, so the
-        #: ingest holds those courses' Refresh while the stream keeps moving.
+        #: Consented invites whose join is owed: every invite into an analytics
+        #: room seen in the stream or found pending. A separate worker task
+        #: runs the proof and joins; until it has an answer for an invite, the
+        #: invite is named in every batch (``pending_accepts``) so the ingest
+        #: holds that teacher's Refresh. Delivery never waits on a join.
         self._owed: Set[Tuple[str, str]] = set()
-        self._owed_tried_ms: Optional[int] = None
-        #: Set by the daily timer; the scan itself runs inside the loop, so
-        #: consent work never interleaves with a step.
-        self._scan_due = False
+        self._worker_running = False
+        #: Grows whenever the owed set changes, so the ingest keeps only the
+        #: newest set even when an older request lands late. Stored before any
+        #: batch carrying it is sent, and bumped past the stored value on
+        #: start, so a rev after a restart is newer than any sent before it.
+        self._rev = 0
+        self._saved_rev = 0
         self._failures = 0
         self._running = False
         self._woken = False
@@ -115,8 +120,11 @@ class Forwarder:
         self._fence = max(
             self._fence, await self._store.undelivered_analytics_join(cursor)
         )
-        # The scan first: until the cursor is set, wake() starts nothing, so
-        # no batch is sent before every owed join is known.
+        # Every pending invite owed first, and a failed read fails the start
+        # (which is retried): until the cursor is set, wake() sends nothing,
+        # so no batch goes out without every owed join named in it.
+        self._saved_rev = await self._store.load_pending_rev()
+        self._rev = self._saved_rev + 1
         await self.scan_pending_invites()
         self._cursor = cursor
         logger.info("analytics forwarder starting at stream position %d", cursor)
@@ -124,50 +132,54 @@ class Forwarder:
         self.wake()
 
     async def scan_pending_invites(self) -> None:
-        """The proof over every current pending invite into an analytics room."""
+        """Owe the proof for every current pending invite into an analytics
+        room. Raises if the read fails."""
+        for room_id, user_id in await self._store.pending_analytics_invites():
+            self._owe(room_id, user_id)
+
+    async def daily_scan(self) -> None:
         try:
-            pending = await self._store.pending_analytics_invites()
-        except Exception:  # silent-ok: logged; the next daily scan retries
+            await self.scan_pending_invites()
+        except Exception:  # silent-ok: logged; what is already owed stays owed
             logger.exception("analytics forwarder: pending invite scan failed")
-            return
-        for room_id, user_id in pending:
-            if (room_id, user_id) not in self._owed:  # those retry on their own
-                await self._accept(room_id, user_id)
 
-    def request_pending_scan(self) -> None:
-        """The daily timer: the next step runs the scan. No I/O here."""
-        self._scan_due = True
-        self.wake()
-
-    async def _accept(self, room_id: str, user_id: str) -> None:
-        """Run the proof and join. Never raises: a join that fails is owed and
-        retried on its own, so one room can never stall delivery."""
-        try:
-            verdict, position = await self._consent.accept_if_consented(
-                room_id, user_id
-            )
-        except Exception:  # silent-ok: logged, counted, owed and named in every batch
-            logger.exception("analytics forwarder: consented-invite join failed")
-            metrics.CONSENT.labels(verdict="error").inc()
-            if not self._owed:
-                self._owed_tried_ms = self._clock_ms()
+    def _owe(self, room_id: str, user_id: str) -> None:
+        if (room_id, user_id) not in self._owed:
             self._owed.add((room_id, user_id))
-            return
-        self._owed.discard((room_id, user_id))
-        metrics.CONSENT.labels(verdict=verdict).inc()
-        if position > self._fence:
-            self._fence = position
+            self._rev += 1
+        if not self._worker_running:
+            self._worker_running = True
+            self._run_in_background(self.consent_worker)
 
-    async def _retry_owed(self) -> None:
-        now = self._clock_ms()
-        if not self._owed or (
-            self._owed_tried_ms is not None
-            and now - self._owed_tried_ms < self._poll_ms
-        ):
-            return
-        self._owed_tried_ms = now
-        for room_id, user_id in sorted(self._owed):
-            await self._accept(room_id, user_id)
+    async def consent_worker(self) -> None:
+        """Answer every owed invite, retrying failures once per poll. A join
+        that hangs holds only its own invite; the stream never waits."""
+        try:
+            while self._owed:
+                for room_id, user_id in sorted(self._owed):
+                    try:
+                        verdict, position = await self._consent.accept_if_consented(
+                            room_id, user_id
+                        )
+                    except (
+                        Exception
+                    ):  # silent-ok: logged, counted, still owed and named in every batch
+                        logger.exception(
+                            "analytics forwarder: consented-invite join failed"
+                        )
+                        metrics.CONSENT.labels(verdict="error").inc()
+                        continue
+                    metrics.CONSENT.labels(verdict=verdict).inc()
+                    # Fence first, then release: a batch reads both at once.
+                    if position > self._fence:
+                        self._fence = position
+                    self._owed.discard((room_id, user_id))
+                    self._rev += 1
+                    self.wake()
+                if self._owed:
+                    await self._sleep(self._poll_ms / 1000)
+        finally:
+            self._worker_running = False
 
     # -- the loop -----------------------------------------------------------
 
@@ -223,10 +235,6 @@ class Forwarder:
     async def step(self) -> bool:
         """Read, send, and on acknowledgement advance. True when more is waiting."""
         assert self._cursor is not None
-        if self._scan_due:
-            self._scan_due = False
-            await self.scan_pending_invites()
-        await self._retry_owed()
         head = self._store.head()
         events, reached = await self._store.read_events(
             self._cursor, head, self._batch_max
@@ -240,19 +248,18 @@ class Forwarder:
             if (
                 event.type == "m.room.member"
                 and event.content.get("membership") == "invite"
-                and (event.room_id, state_key) not in self._owed
+                and state_key is not None
             ):
-                # An owed join is retried only by _retry_owed, throttled.
-                # Joined before the batch is sent, so the batch carries the
-                # join's position as the fence; a failed join is owed instead.
-                await self._accept(event.room_id, state_key)
+                # Owed, not joined here: the worker answers it, and this batch
+                # already names it, so the ingest waits for the answer.
+                self._owe(event.room_id, state_key)
 
         read_ms = self._clock_ms()
         dirty, oldest = await self._store.dirty_profiles(self._batch_max)
         heartbeat_due = (
             self._last_post_ms is None or read_ms - self._last_post_ms >= self._poll_ms
         )
-        fence, owed = self._fence, sorted(self._owed)
+        fence, owed, rev = self._fence, sorted(self._owed), self._rev
         full = len(events) >= self._batch_max
         if not (records or dirty or fence or full or heartbeat_due):
             return False
@@ -270,7 +277,11 @@ class Forwarder:
             profiles_clean_before=clean_before,
             accept_join_pos=fence or None,
             pending_accepts=owed,
+            pending_accepts_rev=rev,
         )
+        if rev > self._saved_rev:
+            await self._store.save_pending_rev(rev)
+            self._saved_rev = rev
         response = await self._post(body)
         try:
             rejected = check_ack(response, reached)
