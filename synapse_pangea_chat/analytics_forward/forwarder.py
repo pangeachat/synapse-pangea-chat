@@ -109,6 +109,12 @@ class Forwarder:
         else:
             initial = int(self._start_position)
         cursor = await self._store.load_cursor(initial)
+        # A consented join made before a restart may never have had its fence
+        # delivered; any self-join into an analytics room still above the
+        # cursor is fenced again (over-fencing only delays a Refresh).
+        self._fence = max(
+            self._fence, await self._store.undelivered_analytics_join(cursor)
+        )
         # The scan first: until the cursor is set, wake() starts nothing, so
         # no batch is sent before every owed join is known.
         await self.scan_pending_invites()
@@ -125,7 +131,8 @@ class Forwarder:
             logger.exception("analytics forwarder: pending invite scan failed")
             return
         for room_id, user_id in pending:
-            await self._accept(room_id, user_id)
+            if (room_id, user_id) not in self._owed:  # those retry on their own
+                await self._accept(room_id, user_id)
 
     def request_pending_scan(self) -> None:
         """The daily timer: the next step runs the scan. No I/O here."""

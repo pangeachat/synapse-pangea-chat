@@ -124,6 +124,17 @@ _SELECT_PENDING_INVITES_SQL = """
 """
 
 
+_SELECT_UNDELIVERED_JOIN_SQL = """
+    SELECT COALESCE(MAX(e.stream_ordering), 0)
+    FROM events AS e
+    JOIN room_memberships AS m ON m.event_id = e.event_id
+    JOIN room_stats_state AS rss ON rss.room_id = e.room_id
+    WHERE e.stream_ordering > ? AND e.type = 'm.room.member'
+        AND m.membership = 'join' AND m.sender = m.user_id
+        AND rss.room_type = 'p.analytics'
+"""
+
+
 class ForwardStore:
     def __init__(self, homeserver: Any) -> None:
         self._hs = homeserver
@@ -250,6 +261,18 @@ class ForwardStore:
         return dict(await self._main.get_profile_data_for_users(list(user_ids)))
 
     # -- consent ------------------------------------------------------------
+
+    async def undelivered_analytics_join(self, after: int) -> int:
+        """The position of the newest self-join into an analytics room above
+        ``after``, or 0."""
+
+        def _select(txn: Any) -> int:
+            txn.execute(_SELECT_UNDELIVERED_JOIN_SQL, (after,))
+            return int(txn.fetchone()[0])
+
+        return await self._pool.runInteraction(
+            "pangea_analytics_undelivered_join", _select
+        )
 
     async def pending_analytics_invites(self) -> List[Tuple[str, str]]:
         """Every local user's current invite into an analytics room."""

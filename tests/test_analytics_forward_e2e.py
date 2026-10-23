@@ -533,3 +533,46 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
             "the startup consent join",
         )
         self._assert_no_forwarder_errors()
+
+    async def test_restart_fences_a_join_left_undelivered(self) -> None:
+        await self._start()
+        teacher, t_token = await self.new_user("fteacher")
+        student, s_token = await self.new_user("fstudent")
+        room = self._analytics_room(s_token)  # in no profile: never consented
+        self._room_action(s_token, room, "invite", user_id=teacher)
+        invite_pos = self._pos(
+            self._sql(
+                "SELECT event_id FROM local_current_membership "
+                "WHERE room_id = %s AND user_id = %s",
+                (room, teacher),
+            )[0][0]
+        )
+        await self._until(lambda: self._cursor() >= invite_pos, "the invite")
+
+        self.ingest.set_status(503)
+        self._join(t_token, room)  # a join whose delivery has not happened
+        join_pos = self._pos(
+            self._sql(
+                "SELECT event_id FROM local_current_membership "
+                "WHERE room_id = %s AND user_id = %s",
+                (room, teacher),
+            )[0][0]
+        )
+        await self._until(
+            lambda: any(
+                e["stream_pos"] == join_pos
+                for _, b in self.ingest.requests()
+                for e in b["events"]
+            ),
+            "an attempt carrying the join",
+        )
+        before_crash = len(self.ingest.requests())
+        await self._crash_and_restart()
+        self.ingest.set_status(200)
+        await self._until(
+            lambda: [s for s, _ in self.ingest.requests()[before_crash:] if s == 200],
+            "a delivery after restart",
+        )
+        first = next(b for s, b in self.ingest.requests()[before_crash:] if s == 200)
+        self.assertGreaterEqual(first["accept_join_pos"] or 0, join_pos)
+        self._assert_no_forwarder_errors()

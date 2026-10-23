@@ -74,6 +74,7 @@ class FakeStore:
         self.profiled_users: List[str] = []
         self.profile_data: Dict[str, Any] = {}
         self.pending: List[Tuple[str, str]] = []
+        self.undelivered_join = 0
 
     def head(self) -> int:
         return self.head_pos
@@ -136,6 +137,9 @@ class FakeStore:
 
     async def pending_analytics_invites(self):
         return list(self.pending)
+
+    async def undelivered_analytics_join(self, after: int) -> int:
+        return self.undelivered_join if self.undelivered_join > after else 0
 
 
 class FakeConsent:
@@ -555,6 +559,41 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         await fwd.step()
         self.assertEqual(consent.calls, [("!a:hs", "@t:hs")])
         self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 11)
+
+    async def test_restart_fences_an_undelivered_analytics_join(self) -> None:
+        """A join made before a crash, whose fence was never delivered, is
+        fenced again from the stream on start."""
+        store = FakeStore([], head=20)
+        store.cursor = 10
+        store.undelivered_join = 15
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+        self.assertEqual(ingest.bodies[0]["accept_join_pos"], 15)
+
+    async def test_scan_leaves_owed_joins_to_the_throttled_retry(self) -> None:
+        invite = FakeEvent(
+            4, "m.room.member", "@teacher:hs", {"membership": "invite"}, "!a:hs"
+        )
+        store = FakeStore([invite], head=4)
+        consent = FakeConsent()
+        clock = Clock()
+        fwd = _forwarder(store, Ingest(), clock, consent=consent)
+        await fwd.start()
+        attempts: List[Tuple[str, str]] = []
+
+        async def broken(room_id: str, user_id: str) -> Any:
+            attempts.append((room_id, user_id))
+            raise ConnectionError("join failed")
+
+        consent.accept_if_consented = broken  # type: ignore[method-assign]
+        await fwd.step()  # owed now
+        store.pending = [("!a:hs", "@teacher:hs")]
+        clock.ms += 5_000  # the retry is due
+        fwd.request_pending_scan()
+        await fwd.step()
+        self.assertEqual(len(attempts), 2)  # one retry, not scan + retry
 
     async def test_pending_scan_error_does_not_stop_the_start(self) -> None:
         store = FakeStore([], head=0)
