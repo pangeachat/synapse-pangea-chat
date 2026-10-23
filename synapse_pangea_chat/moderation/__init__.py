@@ -190,8 +190,8 @@ _BLOCK_LEVEL_TAGS = frozenset(
 # reads as one number, from being split by text nobody sees there.
 #
 # `href` is deliberately absent from both: clients show the link's TEXT, and a
-# URL full of digits is a plausible phone false positive. Recorded as a limit
-# in .github/instructions/moderation.instructions.md.
+# URL full of digits is a plausible phone false positive. A stated limit of
+# the extraction, beside the sanitiser one on `_DisplayedText`.
 _INLINE_ATTRIBUTES = frozenset({("img", "alt")})
 _OUT_OF_FLOW_ATTRIBUTES = frozenset(
     {
@@ -286,6 +286,11 @@ class _DisplayedText(HTMLParser):
     both, and fixes them in the order ADR-8a(ii) requires: the tag scanner runs
     over the raw text first, so `&lt;I will kill you&gt;` becomes the visible
     text `<I will kill you>` rather than being decoded into a tag and deleted.
+
+    Two limits, stated rather than claimed away: `href` is not read (see
+    `_OUT_OF_FLOW_ATTRIBUTES` for why), and text a client renders only after
+    running a sanitiser this extractor does not run may differ from what it
+    sees.
     """
 
     def __init__(self) -> None:
@@ -510,6 +515,23 @@ def _encryption_state(event: EventBase) -> Optional[str]:
     A state event is neither. `check_event_for_spam` is offered every event on
     the homeserver, and counting topic changes and membership as readable
     traffic would swamp the denominator and leave the ratio meaning nothing.
+
+    **On this product the expected reading is zero, and that was verified in
+    the client rather than assumed** (the limit itself is a decision in
+    .github/instructions/moderation.instructions.md). E2EE is not off by
+    default in the Flutter client, it is unreachable: `vod.init()` is commented
+    out on the main isolate behind a `#Pangea` marker, so
+    `client.encryptionEnabled` is false and the SDK builds no `Encryption`
+    object at all; every room-creation path - DMs, group chats, spaces and
+    course rooms, activity sessions, analytics rooms, and the report DM -
+    either passes `enableEncryption: false` or never sends
+    `m.room.encryption`; `Room.enableEncryption()` has no caller anywhere; and
+    the encryption route, settings page and chat menu entry that upstream
+    FluffyChat ships are deleted from the fork. The homeserver has no
+    `encryption_enabled_by_default_for_room_type` set either. A counter pinned
+    at zero is the point - it is the difference between knowing that and
+    assuming it, and it is the first thing that would move if any of the above
+    changed.
     """
     event_type = getattr(event, "type", None)
     if event_type == MESSAGE_EVENT_TYPE:
@@ -702,6 +724,33 @@ class ChatModeration:
         `sum(...) == 0` alerts on "Tier 2 is enabled and nothing is running
         it". A WARNING on every non-background worker would fire in a HEALTHY
         deployment and train operators to ignore it.
+
+        **Sharding is deferred, and its shape is recorded here so it can be
+        planned rather than rediscovered** (the triggers are a decision in
+        .github/instructions/moderation.instructions.md). Batching is what
+        makes one instance enough today; the caveats are the ones `config.py`
+        gives for the pool size - capacity falls with the flag rate, so a room
+        flagging a fifth of its messages is already near the limit - plus the
+        one this guard adds: one instance is a single point of failure whose
+        in-memory queue is lost on restart, counted as `shutdown` drops but
+        unmoderated. The hard part is already done: `pangea_moderation_disposition`
+        gives atomic cross-instance claims, so two instances deciding one
+        event already resolve to exactly one redaction with preserve winning.
+        What is missing is partitioning and its safety rails: a deterministic
+        stateless split (`hash(event_id) % N == index`, needing no coordination
+        and no new delivery plumbing, since `on_new_event` already fires on
+        every instance and this guard is all that suppresses it); config for
+        the shard count and this instance's index, refusing startup unless the
+        configured indices form a complete `0..N-1` set, because a missing
+        shard is a silent hole in moderation and that is precisely the class
+        of defect this module keeps finding; per-shard labels on the gauges;
+        and a replacement for the `tier2_active > 1` alert, which under
+        sharding has to mean "two instances claim the same shard" rather than
+        "more than one is active". A shard-count change during a rolling
+        deploy briefly lets two instances see one event, which the durable
+        claim already handles. Capacity then scales linearly with the shard
+        count. Estimated at one focused chunk of a few hundred lines including
+        tests, with the existing load test parameterised over shard count.
         """
         # Installed on every instance that has Tier 2 enabled, not only the
         # one that runs it: the guard protects a log, and the log belongs to
@@ -1269,7 +1318,12 @@ class ChatModeration:
         a verdict about that message alone and gets what it would have got:
         the durable preserve, started here so it is protected in memory at
         once, and a `preserved` row. A screen is never acted on, so a
-        screened self-harm flag is recorded and not preserved."""
+        screened self-harm flag is recorded and not preserved.
+
+        A drain that cancels a provider call still in flight loses whatever
+        answers that call had not yet handed back; nothing is enforced on
+        them, and it is the shutdown counterpart of the crash between a send
+        and its row's write (`_decide`)."""
         for job, result in pairs:
             if result is None or not result.get("flagged"):
                 continue
@@ -1595,6 +1649,16 @@ class ChatModeration:
         # which the notifier awaits once the event has persisted and is
         # visible. Everything in between - the queue wait, the provider call,
         # the disposition reads, the send - is inside the number.
+        #
+        # It is a LOWER BOUND on what a reader experiences: it starts at the
+        # notifier, so the client's round trip and the persist are outside
+        # it, as is the time a client takes to apply the redaction it
+        # receives. What was wrong before it existed is that the window's
+        # size was an anecdote - "about two seconds", one measurement on one
+        # machine against a warm provider - with nothing to say what the
+        # distribution looked like under load, during a provider slowdown or
+        # with a backed-up queue; that the window exists at all is a decision
+        # in .github/instructions/moderation.instructions.md.
         #
         # Only on the redaction path. A message left standing has no window,
         # and folding a preserve or a below-threshold verdict into this series

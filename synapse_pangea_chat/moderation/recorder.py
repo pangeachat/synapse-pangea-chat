@@ -212,7 +212,19 @@ class IncidentRecorder:
     def retry_verdict(self, incident: Incident) -> None:
         """Hand a captured verdict to the retry, with the outcome it carries.
         The write merges like any verdict: `removed` is final and `skipped`
-        fills an empty outcome only."""
+        fills an empty outcome only.
+
+        One owner-accepted limit (.github/instructions/moderation.instructions.md,
+        Decisions): a redaction's row is written after the send, detached, and
+        retried here if the write fails, so writes from two attempts on one
+        message are not ordered. If attempt A's send fails and its row write
+        fails too, and attempt B then records `unknown`, A's delayed retry can
+        overwrite it with `failed`. The row and the flag stay; only that label
+        differs, and both mean the removal was not confirmed - `removed` is
+        final and is never overwritten. It needs a failed send, a failed
+        incident write and a second attempt on the same message; revisit if
+        the Safety page ever acts on the difference between `failed` and
+        `unknown`."""
 
         self.retry("verdict", incident.incident_id, self._upsert_resolved(incident))
 
