@@ -115,10 +115,14 @@ class AnalyticsForward:
             desc="pangea_analytics_forward_poll",
         )
         self._api.looping_background_call(
-            self._forwarder.scan_pending_invites,
+            self._daily_scan,
             PENDING_INVITE_SCAN_SECONDS * 1000,
             desc="pangea_analytics_forward_pending_invites",
         )
+
+    async def _daily_scan(self) -> None:
+        if self._forwarder is not None:
+            self._forwarder.request_pending_scan()
 
     async def _poll(self) -> None:
         # Async because the timer awaits what it calls.

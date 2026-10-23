@@ -85,6 +85,9 @@ class Forwarder:
         #: ingest holds those courses' Refresh while the stream keeps moving.
         self._owed: Set[Tuple[str, str]] = set()
         self._owed_tried_ms: Optional[int] = None
+        #: Set by the daily timer; the scan itself runs inside the loop, so
+        #: consent work never interleaves with a step.
+        self._scan_due = False
         self._failures = 0
         self._running = False
         self._woken = False
@@ -123,6 +126,11 @@ class Forwarder:
             return
         for room_id, user_id in pending:
             await self._accept(room_id, user_id)
+
+    def request_pending_scan(self) -> None:
+        """The daily timer: the next step runs the scan. No I/O here."""
+        self._scan_due = True
+        self.wake()
 
     async def _accept(self, room_id: str, user_id: str) -> None:
         """Run the proof and join. Never raises: a join that fails is owed and
@@ -175,10 +183,12 @@ class Forwarder:
                     await self._sleep(self._backoff(exc))
                     continue
                 self._failures = 0
+                # Every read is followed by the pause, and a wake-up during it
+                # joins this run rather than starting another: at most a few
+                # reads a second, catch-up and live traffic alike.
+                await self._sleep(BUSY_PAUSE_SECONDS)
                 if not (more or self._woken):
                     return
-                # Paced in catch-up too, so a backlog is a few reads a second.
-                await self._sleep(BUSY_PAUSE_SECONDS)
         finally:
             self._running = False
 
@@ -206,6 +216,9 @@ class Forwarder:
     async def step(self) -> bool:
         """Read, send, and on acknowledgement advance. True when more is waiting."""
         assert self._cursor is not None
+        if self._scan_due:
+            self._scan_due = False
+            await self.scan_pending_invites()
         await self._retry_owed()
         head = self._store.head()
         events, reached = await self._store.read_events(
@@ -232,7 +245,7 @@ class Forwarder:
         heartbeat_due = (
             self._last_post_ms is None or read_ms - self._last_post_ms >= self._poll_ms
         )
-        fence = self._fence
+        fence, owed = self._fence, sorted(self._owed)
         full = len(events) >= self._batch_max
         if not (records or dirty or fence or full or heartbeat_due):
             return False
@@ -249,7 +262,7 @@ class Forwarder:
             delivered_through=reached,
             profiles_clean_before=clean_before,
             accept_join_pos=fence or None,
-            pending_accepts=sorted(self._owed),
+            pending_accepts=owed,
         )
         response = await self._post(body)
         try:

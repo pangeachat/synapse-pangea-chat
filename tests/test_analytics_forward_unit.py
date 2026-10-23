@@ -540,6 +540,22 @@ class TestConsentFence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(launched_during_scan, [0])
         self.assertEqual(len(launched), 1)  # started once, after the scan
 
+    async def test_daily_scan_runs_inside_the_loop(self) -> None:
+        """The scan never runs beside a step, so the fence and the owed set a
+        batch carries are always read together."""
+        store = FakeStore([], head=0)
+        consent = FakeConsent()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock(), consent=consent)
+        await fwd.start()
+        store.pending = [("!a:hs", "@t:hs")]
+        consent.position = 11
+        fwd.request_pending_scan()
+        self.assertEqual(consent.calls, [])  # only asked for, not run here
+        await fwd.step()
+        self.assertEqual(consent.calls, [("!a:hs", "@t:hs")])
+        self.assertEqual(ingest.bodies[-1]["accept_join_pos"], 11)
+
     async def test_pending_scan_error_does_not_stop_the_start(self) -> None:
         store = FakeStore([], head=0)
         store.pending = [("!a:hs", "@t:hs")]
@@ -601,7 +617,7 @@ class TestDrain(unittest.IsolatedAsyncioTestCase):
 
         fwd._post = flaky
         await fwd.drain()
-        self.assertEqual(clock.slept, [1.0, 2.0, 4.0])
+        self.assertEqual(clock.slept, [1.0, 2.0, 4.0, BUSY_PAUSE_SECONDS])
         self.assertEqual(store.cursor, 1)
 
     def test_backoff_is_capped_through_a_long_outage(self) -> None:
@@ -617,8 +633,18 @@ class TestDrain(unittest.IsolatedAsyncioTestCase):
         await fwd.start()
         await fwd.drain()
         self.assertEqual(store.cursor, 5)
-        # Two full batches, each followed by the pause before the next read.
-        self.assertEqual(clock.slept, [BUSY_PAUSE_SECONDS, BUSY_PAUSE_SECONDS])
+        # Every read is followed by the pause, the last one included.
+        self.assertEqual(clock.slept, [BUSY_PAUSE_SECONDS] * 3)
+
+    async def test_separate_wakes_are_paced_too(self) -> None:
+        store = FakeStore([], head=0)
+        clock = Clock()
+        fwd = _forwarder(store, Ingest(), clock)
+        await fwd.start()
+        for _ in range(5):
+            fwd.wake()
+            await fwd.drain()
+        self.assertEqual(clock.slept, [BUSY_PAUSE_SECONDS] * 5)
 
     async def test_auth_failure_waits_the_longest(self) -> None:
         store = FakeStore(_events(1), head=1)
@@ -636,7 +662,7 @@ class TestDrain(unittest.IsolatedAsyncioTestCase):
 
         fwd._post = refused_once
         await fwd.drain()
-        self.assertEqual(clock.slept, [MAX_BACKOFF_SECONDS])
+        self.assertEqual(clock.slept, [MAX_BACKOFF_SECONDS, BUSY_PAUSE_SECONDS])
         self.assertEqual(store.cursor, 1)
 
     async def test_wake_before_start_is_ignored(self) -> None:
