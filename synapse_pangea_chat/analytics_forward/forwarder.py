@@ -39,6 +39,9 @@ MAX_BACKOFF_SECONDS = 60.0
 #: The pause between reads while events keep arriving, so a busy homeserver
 #: costs a few indexed reads a second rather than one per event.
 BUSY_PAUSE_SECONDS = 0.25
+#: The whole exchange, body included. Synapse's client bounds only the wait
+#: for the response headers, and a body that never ends would stall the loop.
+REQUEST_TIMEOUT_SECONDS = 60.0
 
 
 class DeliveryError(Exception):
@@ -176,7 +179,10 @@ class Forwarder:
             logger.warning("analytics forwarder: delivery failed: %s", exc)
         else:
             logger.exception("analytics forwarder: step failed")
-        return min(MAX_BACKOFF_SECONDS, MIN_BACKOFF_SECONDS * 2 ** (self._failures - 1))
+        # The exponent is capped before it is used: a long outage counts
+        # thousands of failures, and 2.0 ** 1024 overflows.
+        doublings = min(self._failures - 1, 6)
+        return min(MAX_BACKOFF_SECONDS, MIN_BACKOFF_SECONDS * 2**doublings)
 
     async def step(self) -> bool:
         """Read, send, and on acknowledgement advance. True when more is waiting."""
@@ -239,7 +245,7 @@ class Forwarder:
 
 
 def make_http_poster(
-    http_client: Any, url: str, secret: str
+    http_client: Any, url: str, secret: str, clock: Any
 ) -> Callable[[dict], Awaitable[Any]]:
     """POST a body to the ingest; the parsed answer, or :class:`DeliveryError`.
 
@@ -247,7 +253,9 @@ def make_http_poster(
     the response headers.
     """
     from synapse.logging.context import make_deferred_yieldable
+    from synapse.util.async_helpers import timeout_deferred
     from synapse.util.json import json_encoder
+    from twisted.internet import defer
     from twisted.web.client import readBody
     from twisted.web.http_headers import Headers
 
@@ -261,11 +269,22 @@ def make_http_poster(
     async def post(body: dict) -> Any:
         # Synapse's encoder: event content may be an immutabledict.
         data = json_encoder.encode(body).encode("utf-8")
-        try:
+
+        async def exchange() -> Any:
             response = await http_client.request(
                 "POST", url, data=data, headers=headers
             )
             content = await make_deferred_yieldable(readBody(response))
+            return response, content
+
+        try:
+            response, content = await make_deferred_yieldable(
+                timeout_deferred(
+                    deferred=defer.ensureDeferred(exchange()),
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                    clock=clock,
+                )
+            )
         except Exception as exc:
             raise DeliveryError("http", type(exc).__name__) from exc
         if response.code in (401, 403):

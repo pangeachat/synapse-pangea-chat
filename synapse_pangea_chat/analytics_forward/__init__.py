@@ -81,7 +81,7 @@ class AnalyticsForward:
             return
         self._forwarder = Forwarder(
             store=self._store,
-            post=make_http_poster(api.http_client, config.url, config.secret),
+            post=make_http_poster(api.http_client, config.url, config.secret, clock),
             consent=ConsentAcceptor(api),
             clock_ms=clock_ms,
             sleep=api.sleep,

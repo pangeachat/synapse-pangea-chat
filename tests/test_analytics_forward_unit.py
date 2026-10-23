@@ -527,6 +527,12 @@ class TestDrain(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clock.slept, [1.0, 2.0, 4.0])
         self.assertEqual(store.cursor, 1)
 
+    def test_backoff_is_capped_through_a_long_outage(self) -> None:
+        fwd = _forwarder(FakeStore([], 0), Ingest(), Clock())
+        delays = [fwd._backoff(DeliveryError("http", "HTTP 503")) for _ in range(2000)]
+        self.assertEqual(delays[:7], [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0])
+        self.assertEqual(delays[-1], MAX_BACKOFF_SECONDS)
+
     async def test_auth_failure_waits_the_longest(self) -> None:
         store = FakeStore(_events(1), head=1)
         ingest = Ingest()
@@ -668,3 +674,53 @@ class TestConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRequestTimeout(unittest.TestCase):
+    """A response whose body never ends must not stall the loop."""
+
+    def test_a_stalled_body_times_out(self) -> None:
+        from synapse.util.clock import Clock as SynapseClock
+        from twisted.internet import defer
+        from twisted.internet.testing import MemoryReactorClock
+
+        from synapse_pangea_chat.analytics_forward.forwarder import (
+            REQUEST_TIMEOUT_SECONDS,
+            make_http_poster,
+        )
+
+        class Transport:
+            def stopProducing(self) -> None:  # noqa: N802
+                pass
+
+            def abortConnection(self) -> None:  # noqa: N802
+                pass
+
+        class StalledResponse:
+            code = 200
+            phrase = b"OK"
+            length = 10
+
+            def deliverBody(self, protocol: Any) -> None:  # noqa: N802
+                protocol.makeConnection(Transport())  # the body never ends
+
+        class Client:
+            async def request(self, *args: Any, **kwargs: Any) -> Any:
+                return StalledResponse()
+
+        reactor = MemoryReactorClock()
+        post = make_http_poster(
+            Client(), "http://ingest/x", SECRET, SynapseClock(reactor, "hs")  # type: ignore[arg-type]
+        )
+
+        async def call() -> Any:
+            return await post({"delivered_through": 1})
+
+        result: "defer.Deferred[Any]" = defer.ensureDeferred(call())
+        failures: List[Any] = []
+        result.addErrback(failures.append)
+        reactor.advance(REQUEST_TIMEOUT_SECONDS - 1)
+        self.assertEqual(failures, [])
+        reactor.advance(2)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0].value, DeliveryError)
