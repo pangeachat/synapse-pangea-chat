@@ -335,10 +335,24 @@ class ConsentAcceptor:
         if await self.invite_facts(room_id, invitee) != facts:
             logger.info("consented-invite refused: the invite changed")
             return REFUSED_NOT_INVITED, 0
-        from synapse_pangea_chat.blocked_join_gate import server_initiated_join
+        return ACCEPT, await self._join(room_id, invitee)
 
-        await server_initiated_join(self._api, room_id, invitee)
-        return ACCEPT, await self._join_position(room_id, invitee)
+    async def _join(self, room_id: str, invitee: str) -> int:
+        """Join the teacher as themselves; the join event's own position.
+
+        Read from the event the join made, not from current membership: the
+        teacher may have left again by then, and the join still needs its
+        fence."""
+        from synapse_pangea_chat.blocked_join_gate.blocked_join_gate import (
+            server_initiated_entry,
+        )
+
+        with server_initiated_entry():
+            event = await self._api.update_room_membership(
+                sender=invitee, target=invitee, room_id=room_id, new_membership="join"
+            )
+        position = event.internal_metadata.stream_ordering
+        return position if isinstance(position, int) and position > 0 else 0
 
     async def _join_position(self, room_id: str, invitee: str) -> int:
         (

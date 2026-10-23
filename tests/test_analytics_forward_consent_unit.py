@@ -244,26 +244,33 @@ class TestAcceptorJoinsOnlyTheProvenInvite(unittest.IsolatedAsyncioTestCase):
         return acceptor
 
     async def test_unchanged_invite_is_joined(self) -> None:
-        with mock.patch(
-            "synapse_pangea_chat.blocked_join_gate.server_initiated_join",
-            new=mock.AsyncMock(),
-        ) as join:
-            verdict = await self._acceptor([_invite()]).accept_if_consented(
-                ROOM, TEACHER
-            )
+        acceptor = self._acceptor([_invite()])
+        acceptor._join = mock.AsyncMock(return_value=9)
+        verdict = await acceptor.accept_if_consented(ROOM, TEACHER)
         self.assertEqual(verdict, (ACCEPT, 9))
-        join.assert_awaited_once()
+        acceptor._join.assert_awaited_once()
+
+    async def test_fence_is_the_join_just_made(self) -> None:
+        """The join's own position, even if the teacher has left again by the
+        time anything reads current membership."""
+        acceptor = self._acceptor([_invite()])
+
+        async def left_already(room_id: str, invitee: str) -> int:
+            return 0
+
+        acceptor._join_position = left_already
+        acceptor._join = mock.AsyncMock(return_value=10)
+        self.assertEqual(
+            await acceptor.accept_if_consented(ROOM, TEACHER), (ACCEPT, 10)
+        )
+        acceptor._join.assert_awaited_once_with(ROOM, TEACHER)
 
     async def test_replaced_invite_is_not_joined(self) -> None:
-        with mock.patch(
-            "synapse_pangea_chat.blocked_join_gate.server_initiated_join",
-            new=mock.AsyncMock(),
-        ) as join:
-            verdict = await self._acceptor(
-                [_invite(), _invite(inviter=COTEACHER)]
-            ).accept_if_consented(ROOM, TEACHER)
+        acceptor = self._acceptor([_invite(), _invite(inviter=COTEACHER)])
+        acceptor._join = mock.AsyncMock(return_value=9)
+        verdict = await acceptor.accept_if_consented(ROOM, TEACHER)
         self.assertEqual(verdict, (REFUSED_NOT_INVITED, 0))
-        join.assert_not_awaited()
+        acceptor._join.assert_not_awaited()
 
 
 class _Event:
@@ -339,11 +346,9 @@ class TestCourseLanguageThroughTheFactReads(unittest.IsolatedAsyncioTestCase):
         return acceptor
 
     async def _verdict(self, l2: Optional[str], room_id: str) -> Tuple[str, int]:
-        with mock.patch(
-            "synapse_pangea_chat.blocked_join_gate.server_initiated_join",
-            new=mock.AsyncMock(),
-        ):
-            return await self._acceptor(l2).accept_if_consented(room_id, TEACHER)
+        acceptor = self._acceptor(l2)
+        acceptor._join = mock.AsyncMock(return_value=9)
+        return await acceptor.accept_if_consented(room_id, TEACHER)
 
     async def test_course_language_room_is_accepted(self) -> None:
         self.assertEqual(await self._verdict("es", self.ES_ROOM), (ACCEPT, 9))

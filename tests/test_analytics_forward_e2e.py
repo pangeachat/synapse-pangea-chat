@@ -258,6 +258,18 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
             {"analytics": {"es": {"analytics_room_id": room_id}}},
         )
 
+    def _answered(self, room_id: str, user_id: str) -> bool:
+        """The consent worker has answered this invite: an acknowledged batch
+        named it as owed, and a later one no longer does."""
+        owed = {"room_id": room_id, "user_id": user_id}
+        named = False
+        for body in self.ingest.acknowledged():
+            if owed in body["pending_accepts"]:
+                named = True
+            elif named:
+                return True
+        return False
+
     def _assert_no_forwarder_errors(self) -> None:
         failures = [
             line
@@ -406,6 +418,9 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
         await self._until(
             lambda: self._cursor() >= invite_pos, "delivery of the invite"
         )
+        await self._until(
+            lambda: self._answered(analytics, coteacher), "the consent answer"
+        )
         self.assertEqual(self._membership(analytics, coteacher), "invite")
         self._assert_no_forwarder_errors()
 
@@ -441,6 +456,7 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
             )[0][0]
         )
         await self._until(lambda: self._cursor() >= french_invite, "the invite")
+        await self._until(lambda: self._answered(french, teacher), "the answer")
         self.assertEqual(self._membership(french, teacher), "invite")
 
         self._room_action(s_token, spanish, "invite", user_id=teacher)
