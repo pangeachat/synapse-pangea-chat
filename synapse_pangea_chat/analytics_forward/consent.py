@@ -332,8 +332,13 @@ class ConsentAcceptor:
         # The course reads awaited; the invite may have been replaced since
         # (revoked, then re-sent by someone else). Join only on the invite
         # that was proven.
-        if await self.invite_facts(room_id, invitee) != facts:
+        now_facts = await self.invite_facts(room_id, invitee)
+        if now_facts != facts:
             logger.info("consented-invite refused: the invite changed")
+            if now_facts.membership == "join":
+                # Joined meanwhile (by themselves or another path): that join
+                # still needs its fence.
+                return REFUSED_NOT_INVITED, await self._join_position(room_id, invitee)
             return REFUSED_NOT_INVITED, 0
         return ACCEPT, await self._join(room_id, invitee)
 

@@ -267,7 +267,11 @@ class Forwarder:
             return False
 
         profiles = await self._store.profiles([user_id for user_id, _ in dirty])
-        oldest_change = read_ms if oldest_rest is None else min(oldest_rest, read_ms)
+        # Every change at or before (clean_before + grace) is delivered once
+        # this batch is: an undelivered one at oldest_rest keeps it below.
+        oldest_change = (
+            read_ms if oldest_rest is None else min(oldest_rest - 1, read_ms)
+        )
         clean_before = oldest_change - PROFILE_CLOCK_GRACE_MS
         body = ingest_body(
             events=records,
@@ -315,14 +319,14 @@ def refresh_barrier(
 
     * ``barrier_pos`` is the newest FORWARDED event at or below the persisted
       head; events of other types move the head and never need a batch.
-    * With any profile change undelivered, ``barrier_time`` is one past what
-      a batch read at ``now_ms`` reports: only a batch read after now, with
-      every row dirty now delivered, passes it (a row dirty since the startup
-      re-send included, and a value acknowledged before a restart never
-      does). With none, it is what the ingest already holds.
+    * With any profile change undelivered, ``barrier_time`` is what a batch
+      read at ``now_ms`` with every row dirty now delivered reports: only a
+      batch read at or after now passes it (a row dirty since the startup
+      re-send included; a value acknowledged before a restart never does).
+      With none, it is what the ingest already holds.
     """
     if any_dirty:
-        return forwarded_head, now_ms - PROFILE_CLOCK_GRACE_MS + 1
+        return forwarded_head, now_ms - PROFILE_CLOCK_GRACE_MS
     if delivered_clean is not None:
         return forwarded_head, delivered_clean
     return forwarded_head, now_ms - PROFILE_CLOCK_GRACE_MS

@@ -88,12 +88,14 @@ class ForwardHead(_SecretResource):
         from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
 
         head = self._store.head()
+        forwarded_head = await self._store.forwarded_head(head)
+        any_dirty = await self._store.any_dirty()
+        delivered_clean = await self._store.delivered_clean_before()
+        # The clock after the outbox read: a batch passes a dirty barrier only
+        # if its own clock (taken before its outbox read) is no earlier.
         now = int(self._clock_ms())
         barrier_pos, barrier_time = refresh_barrier(
-            await self._store.forwarded_head(head),
-            await self._store.any_dirty(),
-            await self._store.delivered_clean_before(),
-            now,
+            forwarded_head, any_dirty, delivered_clean, now
         )
         if self._wake is not None:
             # Where the forwarder runs in this process, anything undelivered

@@ -1120,14 +1120,30 @@ class TestRefreshBarrier(unittest.IsolatedAsyncioTestCase):
         fwd = _forwarder(store, ingest, clock, batch_max=1)
         await fwd.start()
         await fwd.step()
-        store.change_profile("@a:hs", clock.now() - 2_000)
-        store.change_profile("@b:hs", clock.now() - 1_000)
+        clock.ms += 1  # the changes come after that heartbeat
+        store.change_profile("@a:hs", clock.now())
+        store.change_profile("@b:hs", clock.now())
         _, barrier_time = refresh_barrier(0, True, None, clock.now())
         clock.ms += 10
         await fwd.step()  # @a only
         self.assertFalse(await self._met(ingest, barrier_time))
         clock.ms += 10
         await fwd.step()  # @b: now everything dirty at the read is delivered
+        self.assertTrue(await self._met(ingest, barrier_time))
+
+    async def test_a_delivery_in_the_same_millisecond_meets_it(self) -> None:
+        from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
+
+        store = FakeStore([], head=0)
+        clock = Clock()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, clock)
+        await fwd.start()
+        await fwd.step()
+        clock.ms += 1
+        store.change_profile("@a:hs", clock.now())
+        _, barrier_time = refresh_barrier(0, True, None, clock.now())
+        await fwd.step()  # the same millisecond as the head read
         self.assertTrue(await self._met(ingest, barrier_time))
 
     async def test_a_restart_waits_for_the_resend(self) -> None:
@@ -1179,7 +1195,7 @@ class TestCleanBeforeCountsTheBatch(unittest.IsolatedAsyncioTestCase):
         store.change_profile("@b:hs", 200)
         await fwd.step()  # sends @a only
         self.assertEqual(
-            ingest.bodies[-1]["profiles_clean_before"], 200 - PROFILE_CLOCK_GRACE_MS
+            ingest.bodies[-1]["profiles_clean_before"], 199 - PROFILE_CLOCK_GRACE_MS
         )
 
 

@@ -265,6 +265,20 @@ class TestAcceptorJoinsOnlyTheProvenInvite(unittest.IsolatedAsyncioTestCase):
         )
         acceptor._join.assert_awaited_once_with(ROOM, TEACHER)
 
+    async def test_teacher_joined_meanwhile_is_fenced(self) -> None:
+        acceptor = self._acceptor([_invite(), _invite(membership="join")])
+
+        async def joined_at(room_id: str, invitee: str) -> int:
+            return 11
+
+        acceptor._join_position = joined_at
+        acceptor._join = mock.AsyncMock(return_value=9)
+        self.assertEqual(
+            await acceptor.accept_if_consented(ROOM, TEACHER),
+            (REFUSED_NOT_INVITED, 11),
+        )
+        acceptor._join.assert_not_awaited()
+
     async def test_replaced_invite_is_not_joined(self) -> None:
         acceptor = self._acceptor([_invite(), _invite(inviter=COTEACHER)])
         acceptor._join = mock.AsyncMock(return_value=9)
