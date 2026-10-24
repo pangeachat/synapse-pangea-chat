@@ -303,7 +303,7 @@ class Forwarder:
 
 def refresh_barrier(
     forwarded_head: int,
-    oldest_dirty: Optional[int],
+    any_dirty: bool,
     delivered_clean: Optional[int],
     now_ms: int,
 ) -> Tuple[int, int]:
@@ -315,12 +315,14 @@ def refresh_barrier(
 
     * ``barrier_pos`` is the newest FORWARDED event at or below the persisted
       head; events of other types move the head and never need a batch.
-    * ``barrier_time`` with a profile change still undelivered is one past
-      what a batch still holding it reports, so only a batch after its
-      delivery passes; with none, it is what was last acknowledged.
+    * With any profile change undelivered, ``barrier_time`` is one past what
+      a batch read at ``now_ms`` reports: only a batch read after now, with
+      every row dirty now delivered, passes it (a row dirty since the startup
+      re-send included, and a value acknowledged before a restart never
+      does). With none, it is what the ingest already holds.
     """
-    if oldest_dirty is not None:
-        return forwarded_head, min(oldest_dirty, now_ms) - PROFILE_CLOCK_GRACE_MS + 1
+    if any_dirty:
+        return forwarded_head, now_ms - PROFILE_CLOCK_GRACE_MS + 1
     if delivered_clean is not None:
         return forwarded_head, delivered_clean
     return forwarded_head, now_ms - PROFILE_CLOCK_GRACE_MS

@@ -93,9 +93,8 @@ _SELECT_DIRTY_SQL = """
     FROM pangea_analytics_profile_outbox
     WHERE dirty ORDER BY COALESCE(dirty_since, 0), user_id LIMIT ?
 """
-_SELECT_OLDEST_DIRTY_SQL = """
-    SELECT MIN(COALESCE(dirty_since, 0)) FROM pangea_analytics_profile_outbox
-    WHERE dirty
+_SELECT_ANY_DIRTY_SQL = """
+    SELECT 1 FROM pangea_analytics_profile_outbox WHERE dirty LIMIT 1
 """
 _ACK_PROFILE_SQL = """
     UPDATE pangea_analytics_profile_outbox
@@ -248,13 +247,12 @@ class ForwardStore:
             "pangea_analytics_forwarded_head", _select
         )
 
-    async def oldest_dirty(self) -> Optional[int]:
-        def _select(txn: Any) -> Optional[int]:
-            txn.execute(_SELECT_OLDEST_DIRTY_SQL)
-            value = txn.fetchone()[0]
-            return int(value) if value is not None else None
+    async def any_dirty(self) -> bool:
+        def _select(txn: Any) -> bool:
+            txn.execute(_SELECT_ANY_DIRTY_SQL)
+            return txn.fetchone() is not None
 
-        return await self._pool.runInteraction("pangea_analytics_oldest_dirty", _select)
+        return await self._pool.runInteraction("pangea_analytics_any_dirty", _select)
 
     async def delivered_clean_before(self) -> Optional[int]:
         def _select(txn: Any) -> Optional[int]:

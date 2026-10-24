@@ -695,6 +695,14 @@ class TestAnalyticsForwardBarrierE2E(_ForwardHelpers):
         head = self._head()
         await self._until(lambda: self._barrier_met(head), "the barrier", timeout=5)
         self.assertLess(time.monotonic() - started, 5)  # not the 60 s poll
+        # Met only by delivering the change, not by an older watermark.
+        delivered = [
+            p
+            for b in self.ingest.acknowledged()
+            for p in b["profiles"]
+            if p["user_id"] == user and PROFILE_FIELD in (p["profile"] or {})
+        ]
+        self.assertTrue(delivered)
         self._assert_no_forwarder_errors()
 
     async def test_every_post_on_its_own_connection_stale_retried(self) -> None:

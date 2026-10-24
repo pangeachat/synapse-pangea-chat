@@ -1091,32 +1091,62 @@ class TestIngestTransport(unittest.TestCase):
         )
 
 
-class TestRefreshBarrier(unittest.TestCase):
+class TestRefreshBarrier(unittest.IsolatedAsyncioTestCase):
     """What the head endpoint asks a Refresh to wait for: only what is not
     delivered yet, so an idle forwarder costs the Refresh no wait at all."""
 
     def test_nothing_dirty_is_already_met(self) -> None:
         from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
 
-        self.assertEqual(refresh_barrier(42, None, 5_000, 9_000), (42, 5_000))
-
-    def test_dirty_profile_waits_for_its_delivery(self) -> None:
-        from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
-
-        # A batch still holding the change reports exactly d - grace; the
-        # barrier is one past it, so only a batch after the change passes.
-        self.assertEqual(
-            refresh_barrier(42, 7_000, 5_000, 9_000),
-            (42, 7_000 - PROFILE_CLOCK_GRACE_MS + 1),
-        )
+        self.assertEqual(refresh_barrier(42, False, 5_000, 9_000), (42, 5_000))
 
     def test_nothing_delivered_yet_waits_for_a_batch(self) -> None:
         from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
 
         self.assertEqual(
-            refresh_barrier(42, None, None, 9_000),
+            refresh_barrier(42, False, None, 9_000),
             (42, 9_000 - PROFILE_CLOCK_GRACE_MS),
         )
+
+    async def _met(self, ingest: Ingest, barrier_time: int) -> bool:
+        return max(b["profiles_clean_before"] for b in ingest.bodies) >= barrier_time
+
+    async def test_every_dirty_profile_delivered_before_it_is_met(self) -> None:
+        from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
+
+        store = FakeStore([], head=0)
+        clock = Clock()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, clock, batch_max=1)
+        await fwd.start()
+        await fwd.step()
+        store.change_profile("@a:hs", clock.now() - 2_000)
+        store.change_profile("@b:hs", clock.now() - 1_000)
+        _, barrier_time = refresh_barrier(0, True, None, clock.now())
+        clock.ms += 10
+        await fwd.step()  # @a only
+        self.assertFalse(await self._met(ingest, barrier_time))
+        clock.ms += 10
+        await fwd.step()  # @b: now everything dirty at the read is delivered
+        self.assertTrue(await self._met(ingest, barrier_time))
+
+    async def test_a_restart_waits_for_the_resend(self) -> None:
+        """A value acknowledged before the restart must not meet a barrier
+        read while the startup re-send is undelivered."""
+        from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
+
+        store = FakeStore([], head=0)
+        store.profiled_users = ["@u:hs"]
+        clock = Clock()
+        before_restart = clock.now() - 60_000 - PROFILE_CLOCK_GRACE_MS
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, clock)
+        await fwd.start()  # marks @u dirty since always
+        _, barrier_time = refresh_barrier(0, True, before_restart, clock.now())
+        self.assertGreater(barrier_time, before_restart)
+        clock.ms += 10
+        await fwd.step()
+        self.assertTrue(await self._met(ingest, barrier_time))
 
 
 class TestCleanBeforeCountsTheBatch(unittest.IsolatedAsyncioTestCase):

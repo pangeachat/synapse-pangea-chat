@@ -91,7 +91,7 @@ class ForwardHead(_SecretResource):
         now = int(self._clock_ms())
         barrier_pos, barrier_time = refresh_barrier(
             await self._store.forwarded_head(head),
-            await self._store.oldest_dirty(),
+            await self._store.any_dirty(),
             await self._store.delivered_clean_before(),
             now,
         )
