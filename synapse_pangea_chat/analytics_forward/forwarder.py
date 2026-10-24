@@ -39,8 +39,8 @@ MAX_BACKOFF_SECONDS = 60.0
 #: The pause between reads while events keep arriving, so a busy homeserver
 #: costs a few indexed reads a second rather than one per event.
 BUSY_PAUSE_SECONDS = 0.25
-#: The whole exchange, body included. Synapse's client bounds only the wait
-#: for the response headers, and a body that never ends would stall the loop.
+#: The whole exchange, body included, both attempts together (half each).
+#: A last resort: a body that never ends must not stall the loop.
 REQUEST_TIMEOUT_SECONDS = 60.0
 #: Connecting to the ingest; well under the overall cap, so an unreachable
 #: ingest fails fast and the loop's backoff takes over.
@@ -377,7 +377,6 @@ def make_http_poster(
     from synapse.logging.context import make_deferred_yieldable, run_in_background
     from synapse.util.async_helpers import timeout_deferred
     from synapse.util.json import json_encoder
-    from twisted.internet import defer
     from twisted.web.client import FileBodyProducer, readBody
     from twisted.web.http_headers import Headers
 
@@ -400,27 +399,27 @@ def make_http_poster(
             content = await make_deferred_yieldable(readBody(response))
             return response.code, content
 
-        async def exchange() -> Any:
+        async def attempt() -> Any:
+            # Each attempt is bounded on its own and cancelled at its bound,
+            # so a re-send never outlives a cap that was meant for it.
+            return await make_deferred_yieldable(
+                timeout_deferred(
+                    # run_in_background keeps the logcontext rules across the
+                    # timeout wrapper; ensureDeferred lost the context.
+                    deferred=run_in_background(once),
+                    timeout=REQUEST_TIMEOUT_SECONDS / 2,
+                    clock=clock,
+                )
+            )
+
+        try:
             try:
-                return await once()
-            except defer.CancelledError:
-                raise  # the overall cap fired: stop, start nothing more
+                code, content = await attempt()
             except Exception:  # silent-ok: no answer came back; sent once more at once
                 logger.info(
                     "analytics forwarder: no answer; retrying on a new connection"
                 )
-                return await once()
-
-        try:
-            code, content = await make_deferred_yieldable(
-                timeout_deferred(
-                    # run_in_background keeps the logcontext rules across the
-                    # timeout wrapper; ensureDeferred lost the context.
-                    deferred=run_in_background(exchange),
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                    clock=clock,
-                )
-            )
+                code, content = await attempt()  # the last: its failure is final
         except Exception as exc:
             raise DeliveryError("http", type(exc).__name__) from exc
         if code in (401, 403):

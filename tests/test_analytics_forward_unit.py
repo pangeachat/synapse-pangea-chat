@@ -1067,18 +1067,24 @@ class TestIngestTransport(unittest.TestCase):
             REQUEST_TIMEOUT_SECONDS,
         )
 
-        reactor, post = self._post(_Agent([_Response(200, None)]))
+        reactor, post = self._post(_Agent([_Response(200, None), _Response(200, None)]))
         _, failures = self._run(post)
-        reactor.advance(REQUEST_TIMEOUT_SECONDS - 1)
-        self.assertEqual(failures, [])
-        reactor.advance(2)
+        reactor.advance(REQUEST_TIMEOUT_SECONDS / 2 + 0.5)
+        reactor.advance(REQUEST_TIMEOUT_SECONDS / 2 - 1)
+        self.assertEqual(failures, [])  # the re-send is still within its bound
+        reactor.advance(1)
         self.assertEqual(len(failures), 1)
         self.assertIsInstance(failures[0].value, DeliveryError)
 
     def test_the_cap_cancels_everything_and_starts_nothing_more(self) -> None:
-        """When the overall cap fires, the request in flight is cancelled and
-        no re-send is started: nothing is left open, nothing keeps a timer."""
+        """Each attempt is bounded and cancelled at its bound; the re-send is
+        the last, so nothing is left open, nothing keeps a timer.
+
+        A cancelled real request fails with ResponseNeverReceived wrapping
+        CancelledError, not a bare CancelledError; the fake does the same."""
         from twisted.internet import defer
+        from twisted.python.failure import Failure
+        from twisted.web._newclient import ResponseNeverReceived
 
         from synapse_pangea_chat.analytics_forward.forwarder import (
             REQUEST_TIMEOUT_SECONDS,
@@ -1086,22 +1092,30 @@ class TestIngestTransport(unittest.TestCase):
 
         cancelled: List[int] = []
 
+        def like_twisted(d: "defer.Deferred[Any]") -> None:
+            cancelled.append(1)
+            d.errback(ResponseNeverReceived([Failure(defer.CancelledError())]))
+
         class Hanging:
             calls = 0
 
             def request(self, *args: Any) -> Any:
                 self.calls += 1
-                return defer.Deferred(lambda d: cancelled.append(1))
+                return defer.Deferred(like_twisted)
 
         agent = Hanging()
         reactor, post = self._post(agent)
         _, failures = self._run(post)
-        reactor.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        reactor.advance(REQUEST_TIMEOUT_SECONDS / 2 + 0.5)  # the first is cut
+        self.assertEqual(failures, [])
+        reactor.advance(REQUEST_TIMEOUT_SECONDS / 2)  # and the re-send
         self.assertEqual(len(failures), 1)
         self.assertIsInstance(failures[0].value, DeliveryError)
-        self.assertEqual(agent.calls, 1)  # no orphan re-send after the cap
-        self.assertEqual(cancelled, [1])
+        self.assertEqual(agent.calls, 2)  # one re-send, then nothing more
+        self.assertEqual(cancelled, [1, 1])
         self.assertEqual(reactor.getDelayedCalls(), [])
+        reactor.advance(REQUEST_TIMEOUT_SECONDS * 3)
+        self.assertEqual(agent.calls, 2)
 
     def test_the_resend_is_bounded_by_the_same_cap(self) -> None:
         from twisted.internet import defer
@@ -1125,7 +1139,7 @@ class TestIngestTransport(unittest.TestCase):
         agent = FailsThenHangs()
         reactor, post = self._post(agent)
         _, failures = self._run(post)
-        reactor.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        reactor.advance(REQUEST_TIMEOUT_SECONDS / 2 + 1)
         self.assertEqual(len(failures), 1)
         self.assertEqual(agent.calls, 2)
         self.assertEqual(cancelled, [1])
