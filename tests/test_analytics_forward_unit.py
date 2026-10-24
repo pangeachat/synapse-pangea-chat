@@ -1075,6 +1075,62 @@ class TestIngestTransport(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIsInstance(failures[0].value, DeliveryError)
 
+    def test_the_cap_cancels_everything_and_starts_nothing_more(self) -> None:
+        """When the overall cap fires, the request in flight is cancelled and
+        no re-send is started: nothing is left open, nothing keeps a timer."""
+        from twisted.internet import defer
+
+        from synapse_pangea_chat.analytics_forward.forwarder import (
+            REQUEST_TIMEOUT_SECONDS,
+        )
+
+        cancelled: List[int] = []
+
+        class Hanging:
+            calls = 0
+
+            def request(self, *args: Any) -> Any:
+                self.calls += 1
+                return defer.Deferred(lambda d: cancelled.append(1))
+
+        agent = Hanging()
+        reactor, post = self._post(agent)
+        _, failures = self._run(post)
+        reactor.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0].value, DeliveryError)
+        self.assertEqual(agent.calls, 1)  # no orphan re-send after the cap
+        self.assertEqual(cancelled, [1])
+        self.assertEqual(reactor.getDelayedCalls(), [])
+
+    def test_the_resend_is_bounded_by_the_same_cap(self) -> None:
+        from twisted.internet import defer
+        from twisted.web._newclient import ResponseNeverReceived
+
+        from synapse_pangea_chat.analytics_forward.forwarder import (
+            REQUEST_TIMEOUT_SECONDS,
+        )
+
+        cancelled: List[int] = []
+
+        class FailsThenHangs:
+            calls = 0
+
+            def request(self, *args: Any) -> Any:
+                self.calls += 1
+                if self.calls == 1:
+                    return defer.fail(ResponseNeverReceived([]))
+                return defer.Deferred(lambda d: cancelled.append(1))
+
+        agent = FailsThenHangs()
+        reactor, post = self._post(agent)
+        _, failures = self._run(post)
+        reactor.advance(REQUEST_TIMEOUT_SECONDS + 1)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(agent.calls, 2)
+        self.assertEqual(cancelled, [1])
+        self.assertEqual(reactor.getDelayedCalls(), [])
+
     def test_the_agent_keeps_no_idle_connection(self) -> None:
         from twisted.internet.testing import MemoryReactorClock
 

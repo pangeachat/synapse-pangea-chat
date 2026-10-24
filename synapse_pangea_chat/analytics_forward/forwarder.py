@@ -377,6 +377,7 @@ def make_http_poster(
     from synapse.logging.context import make_deferred_yieldable, run_in_background
     from synapse.util.async_helpers import timeout_deferred
     from synapse.util.json import json_encoder
+    from twisted.internet import defer
     from twisted.web.client import FileBodyProducer, readBody
     from twisted.web.http_headers import Headers
 
@@ -402,6 +403,8 @@ def make_http_poster(
         async def exchange() -> Any:
             try:
                 return await once()
+            except defer.CancelledError:
+                raise  # the overall cap fired: stop, start nothing more
             except Exception:  # silent-ok: no answer came back; sent once more at once
                 logger.info(
                     "analytics forwarder: no answer; retrying on a new connection"
