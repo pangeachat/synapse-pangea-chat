@@ -32,7 +32,7 @@ SECRET = "analytics-forward-test-secret-0123456789"
 PROFILE_FIELD = "pangea.analytics_profile"
 
 
-class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
+class _ForwardHelpers(BaseSynapseE2ETest):
     ingest: MockIngest
 
     @classmethod
@@ -286,6 +286,8 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
         ]
         self.assertEqual(failures, [])
 
+
+class TestAnalyticsForwardE2E(_ForwardHelpers):
     # -- tests --------------------------------------------------------------
 
     async def test_cursor_moves_only_after_an_acknowledged_batch(self) -> None:
@@ -541,6 +543,18 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
         rev_before = max(b["pending_accepts_rev"] for _, b in self.ingest.requests())
 
         await self._crash_and_restart()
+
+        def resend_marked() -> bool:
+            rows = self._sql(
+                "SELECT dirty, dirty_since FROM pangea_analytics_profile_outbox "
+                "WHERE user_id = %s",
+                (student,),
+            )
+            return bool(rows) and rows[0] == (True, 0)
+
+        # Marked for re-send as dirty since always, so a heartbeat built while
+        # the re-send is undelivered reports nothing clean.
+        await self._until(resend_marked, "the startup re-send mark")
         self.ingest.set_status(200)
         await self._until(lambda: self._acked_with(second), "the batch after restart")
         await self._until(lambda: self._cursor() >= self._pos(second), "the cursor")
@@ -551,10 +565,16 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
         self.assertNotIn(first, delivered)  # acknowledged before: not re-sent
         self.assertEqual(delivered.count(second), 1)
 
-        # Every profile re-sent first; clean only afterwards.
-        self.assertLessEqual(after[0]["profiles_clean_before"], 0)
-        resent = {p["user_id"] for b in after for p in b["profiles"]}
-        self.assertIn(student, resent)
+        # Every profile re-sent first; clean only in or after the batch that
+        # completes the re-send (its own profiles are delivered on its ack).
+        resending = [
+            i
+            for i, b in enumerate(after)
+            if any(p["user_id"] == student for p in b["profiles"])
+        ]
+        self.assertTrue(resending)
+        for b in after[: resending[0]]:
+            self.assertLessEqual(b["profiles_clean_before"], 0)
         await self._until(
             lambda: [
                 b
@@ -612,4 +632,91 @@ class TestAnalyticsForwardE2E(BaseSynapseE2ETest):
         )
         first = next(b for s, b in self.ingest.requests()[before_crash:] if s == 200)
         self.assertGreaterEqual(first["accept_join_pos"] or 0, join_pos)
+        self._assert_no_forwarder_errors()
+
+
+class TestAnalyticsForwardBarrierE2E(_ForwardHelpers):
+    """A slow poll (60 s), so nothing here can pass on a heartbeat: the
+    Refresh barrier is met from what has been delivered, a profile change is
+    sent as soon as the head is read, and every POST is on its own
+    connection with a stale one retried at once."""
+
+    def _module_config(self) -> Dict[str, Any]:
+        config = super()._module_config()
+        config["analytics_forward"]["poll_seconds"] = 60
+        return config
+
+    def _head(self) -> Dict[str, Any]:
+        resp = requests.get(
+            f"{self.server_url}/_synapse/client/pangea/v1/analytics_forward/head",
+            headers=self._h(SECRET),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return resp.json()
+
+    def _barrier_met(self, head: Dict[str, Any]) -> bool:
+        acked = self.ingest.acknowledged()
+        return bool(acked) and (
+            max(b["delivered_through"] for b in acked) >= head["barrier_pos"]
+            and max(b["profiles_clean_before"] for b in acked) >= head["barrier_time"]
+        )
+
+    async def _settled(self) -> None:
+        """Startup re-send delivered, so profiles are clean."""
+        await self._until(
+            lambda: [
+                b
+                for b in self.ingest.acknowledged()
+                if b["profiles_clean_before"] > 1_600_000_000_000
+            ],
+            "profiles clean after start",
+        )
+
+    async def test_barrier_met_by_what_is_delivered(self) -> None:
+        await self._start()
+        await self._settled()
+        _, token = await self.new_user("bstudent")
+        room = self._create_room(token, preset="private_chat")
+        construct = self._send(token, room, "pangea.construct", {"n": 1})
+        await self._until(lambda: self._acked_with(construct), "the construct")
+        # Events the dashboard does not read move the head, not the barrier.
+        self._send(token, room, "m.room.message", {"msgtype": "m.text", "body": "x"})
+        head = self._head()
+        self.assertGreater(head["stream_pos"], head["barrier_pos"])
+        self.assertTrue(self._barrier_met(head))
+        self._assert_no_forwarder_errors()
+
+    async def test_head_sends_a_dirty_profile_at_once(self) -> None:
+        await self._start()
+        await self._settled()
+        user, token = await self.new_user("bprofile")
+        self._set_profile_field(user, token, PROFILE_FIELD, {"analytics": {}})
+        started = time.monotonic()
+        head = self._head()
+        await self._until(lambda: self._barrier_met(head), "the barrier", timeout=5)
+        self.assertLess(time.monotonic() - started, 5)  # not the 60 s poll
+        self._assert_no_forwarder_errors()
+
+    async def test_every_post_on_its_own_connection_stale_retried(self) -> None:
+        await self._start()
+        await self._settled()
+        _, token = await self.new_user("bconn")
+        room = self._create_room(token, preset="private_chat")
+        before = len(self.ingest.ports())
+        for n in range(3):
+            event = self._send(token, room, "pangea.construct", {"n": n})
+            await self._until(lambda: self._acked_with(event), "a delivery")
+            await asyncio.sleep(1.5)  # past the server's keep-alive timeout
+        ports = self.ingest.ports()[before:]
+        self.assertEqual(len(ports), len(set(ports)))
+
+        self.ingest.drop_next(1)  # the server closes under the request
+        event = self._send(token, room, "pangea.construct", {"n": 9})
+        started = time.monotonic()
+        await self._until(lambda: self._acked_with(event), "the retried delivery")
+        self.assertLess(time.monotonic() - started, 3)  # at once, no backoff
+        self.assertEqual(self.ingest.dropped(), 1)
+        self.assertFalse(
+            [line for line in self.server_log() if "delivery failed" in line]
+        )
         self._assert_no_forwarder_errors()

@@ -224,8 +224,11 @@
     "request": "GET /_synapse/client/pangea/v1/analytics_forward/head with 'Authorization: Bearer <secret>'",
     "response_example": {
       "stream_pos": 812360,
-      "module_time_ms": 1761200002000
-    }
+      "module_time_ms": 1761200002000,
+      "barrier_pos": 812351,
+      "barrier_time": 1761199998000
+    },
+    "notes": "A Refresh waits until the ingest holds delivered_through >= barrier_pos AND profiles_clean_before >= barrier_time (store them on the job as barrier_pos / barrier_time). barrier_pos is the newest FORWARDED event at or below the persisted head (other event types never need a batch); barrier_time names only profile changes not yet delivered (with none, it is what the ingest already holds). So an idle forwarder costs the Refresh no wait, and otherwise one delivery round trip: reading the head also wakes the forwarder when it runs in the same Synapse process. stream_pos and module_time_ms are informational."
   },
   "analytics_state_endpoint": {
     "request_example": {

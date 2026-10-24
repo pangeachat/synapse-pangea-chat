@@ -10,6 +10,7 @@ Pushes the Matrix inputs of the teacher dashboard to admin-dash-api, so a dashbo
 
 - **One loop, on the background-tasks instance only.** `on_new_event` fires on every worker; a loop on each would send everything N times. The `pangea_analytics_forward_active` gauge is 1 there and 0 elsewhere.
 - **The stream is the queue.** The loop reads Synapse's own `events` table above a durable cursor, oldest first, in batches of at most `batch_max`, of the forwarded types only, never outliers or rejected events. `on_new_event` only wakes it, and a timer wakes it every `poll_seconds` in case a wake-up is missed. Reads are paced (a quarter second apart), catch-up included, so a backlog costs Synapse's database a few reads a second.
+- **One connection per delivery.** No idle connection is kept: a pooled keep-alive connection the server closes just as a request is written on it can swallow that request. A request that gets no answer is sent once more at once on a new connection; the whole exchange is capped at a minute.
 - **The cursor moves only on an acknowledgement.** The ingest answers 200 only after committing the batch, echoing the batch's `delivered_through`. Anything else (an error, a timeout, a 200 that does not echo it) leaves the cursor where it was, and the loop retries the same events forever with a backoff of 1 s doubling to 60 s. A restart resumes from the stored cursor, so a re-sent batch is the only duplicate, and the ingest's writes are idempotent.
 - **A wrong shared secret (401/403) is a configuration error**, logged as one and retried at the longest backoff until it is fixed.
 - **The delivery watermark.** Every batch carries `delivered_through`, the position delivery reaches once it is committed. When idle the loop still sends an empty batch every `poll_seconds`, so the ingest always knows how far delivery has reached; a Refresh waits for it to pass the head it read.
@@ -40,7 +41,7 @@ A knock is never accepted. The course language is the course plan's `l2`; where 
 
 Both take `Authorization: Bearer <analytics_forward.secret>`, compared in constant time.
 
-- `GET /_synapse/client/pangea/v1/analytics_forward/head` returns the persisted stream position and the module's clock, which a Refresh waits for.
+- `GET /_synapse/client/pangea/v1/analytics_forward/head` returns what a Refresh waits for: the newest forwarded event at or below the persisted head, and a profile time naming only changes not yet delivered. An idle forwarder therefore costs a Refresh no wait. Reading the head also wakes the forwarder when it runs in the same process, so anything undelivered goes at once rather than at the next poll.
 - `POST /_synapse/client/pangea/v1/analytics_state` returns, for up to 500 rooms and 500 users, each room's complete current state of the forwarded types (null for an unknown room) and each user's profile with a revision raised by the read, so a snapshot always outranks earlier pushes.
 
 The request and response contract, shared with admin-dash-api, is `tests/fixtures/analytics_forward/ingest_contract.json`.

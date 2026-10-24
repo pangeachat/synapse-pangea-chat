@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import hmac
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from synapse.http import server
 from synapse.http.server import respond_with_json
@@ -69,18 +69,42 @@ class _SecretResource(Resource):
 
 
 class ForwardHead(_SecretResource):
-    def __init__(self, secret: str, store: Any, clock_ms: Any) -> None:
+    def __init__(
+        self,
+        secret: str,
+        store: Any,
+        clock_ms: Any,
+        wake: Optional[Callable[[], None]] = None,
+    ) -> None:
         super().__init__(secret)
         self._store = store
         self._clock_ms = clock_ms
+        self._wake = wake
 
     def render_GET(self, request: SynapseRequest) -> int:
         return self._run(request, self._head)
 
     async def _head(self, request: SynapseRequest) -> Any:
+        from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
+
+        head = self._store.head()
+        now = int(self._clock_ms())
+        barrier_pos, barrier_time = refresh_barrier(
+            await self._store.forwarded_head(head),
+            await self._store.oldest_dirty(),
+            await self._store.delivered_clean_before(),
+            now,
+        )
+        if self._wake is not None:
+            # Where the forwarder runs in this process, anything undelivered
+            # goes now rather than at the next poll. wake() coalesces: a burst
+            # of head reads is one run, and an idle run sends nothing.
+            self._wake()
         return 200, {
-            "stream_pos": self._store.head(),
-            "module_time_ms": int(self._clock_ms()),
+            "stream_pos": head,
+            "module_time_ms": now,
+            "barrier_pos": barrier_pos,
+            "barrier_time": barrier_time,
         }
 
 

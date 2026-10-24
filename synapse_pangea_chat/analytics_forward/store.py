@@ -23,6 +23,21 @@ from synapse_pangea_chat.analytics_forward.wire import FORWARDED_TYPES
 _CURSOR_NAME = "analytics_forward"
 #: The pending_accepts revision, kept in the cursor table as a second row.
 _PENDING_REV_NAME = "pending_accepts_rev"
+#: The profiles_clean_before of the last acknowledged batch, a third row: what
+#: the ingest holds, so the head can tell a Refresh it need not wait.
+_DELIVERED_CLEAN_NAME = "profiles_clean_before"
+_UPSERT_GREATEST_SQL = """
+    INSERT INTO pangea_analytics_forward_cursor (name, stream_pos) VALUES (?, ?)
+    ON CONFLICT (name) DO UPDATE SET stream_pos = GREATEST(
+        pangea_analytics_forward_cursor.stream_pos, EXCLUDED.stream_pos
+    )
+"""
+_SELECT_FORWARDED_HEAD_SQL = """
+    SELECT COALESCE(MAX(stream_ordering), 0) FROM events
+    WHERE stream_ordering > 0 AND stream_ordering <= ?
+        AND NOT outlier AND rejection_reason IS NULL
+        AND type = ANY(?)
+"""
 
 _CREATE_CURSOR_SQL = """
     CREATE TABLE IF NOT EXISTS pangea_analytics_forward_cursor (
@@ -74,8 +89,9 @@ _RESEND_PROFILED_SQL = """
 """
 
 _SELECT_DIRTY_SQL = """
-    SELECT user_id, revision FROM pangea_analytics_profile_outbox
-    WHERE dirty ORDER BY dirty_since, user_id LIMIT ?
+    SELECT user_id, revision, COALESCE(dirty_since, 0)
+    FROM pangea_analytics_profile_outbox
+    WHERE dirty ORDER BY COALESCE(dirty_since, 0), user_id LIMIT ?
 """
 _SELECT_OLDEST_DIRTY_SQL = """
     SELECT MIN(COALESCE(dirty_since, 0)) FROM pangea_analytics_profile_outbox
@@ -221,7 +237,41 @@ class ForwardStore:
             lambda txn: txn.execute(_ADVANCE_CURSOR_SQL, (rev, _PENDING_REV_NAME)),
         )
 
-    async def advance(self, cursor: int, acked: Sequence[Tuple[str, int]]) -> None:
+    async def forwarded_head(self, upto: int) -> int:
+        """The newest forwarded event at or below ``upto``, or 0."""
+
+        def _select(txn: Any) -> int:
+            txn.execute(_SELECT_FORWARDED_HEAD_SQL, (upto, _FORWARDED_TYPES))
+            return int(txn.fetchone()[0])
+
+        return await self._pool.runInteraction(
+            "pangea_analytics_forwarded_head", _select
+        )
+
+    async def oldest_dirty(self) -> Optional[int]:
+        def _select(txn: Any) -> Optional[int]:
+            txn.execute(_SELECT_OLDEST_DIRTY_SQL)
+            value = txn.fetchone()[0]
+            return int(value) if value is not None else None
+
+        return await self._pool.runInteraction("pangea_analytics_oldest_dirty", _select)
+
+    async def delivered_clean_before(self) -> Optional[int]:
+        def _select(txn: Any) -> Optional[int]:
+            txn.execute(_SELECT_CURSOR_SQL, (_DELIVERED_CLEAN_NAME,))
+            row = txn.fetchone()
+            return int(row[0]) if row is not None else None
+
+        return await self._pool.runInteraction(
+            "pangea_analytics_delivered_clean", _select
+        )
+
+    async def advance(
+        self,
+        cursor: int,
+        acked: Sequence[Tuple[str, int]],
+        clean_before: Optional[int] = None,
+    ) -> None:
         """After an acknowledgement: the new cursor and the delivered profiles,
         in one transaction."""
 
@@ -229,6 +279,8 @@ class ForwardStore:
             txn.execute(_ADVANCE_CURSOR_SQL, (cursor, _CURSOR_NAME))
             for user_id, revision in acked:
                 txn.execute(_ACK_PROFILE_SQL, (user_id, revision))
+            if clean_before is not None:
+                txn.execute(_UPSERT_GREATEST_SQL, (_DELIVERED_CLEAN_NAME, clean_before))
 
         await self._pool.runInteraction("pangea_analytics_forward_ack", _ack)
 
@@ -253,14 +305,21 @@ class ForwardStore:
     async def dirty_profiles(
         self, limit: int
     ) -> Tuple[List[Tuple[str, int]], Optional[int]]:
-        """Up to ``limit`` dirty rows, and the oldest ``dirty_since`` of ALL."""
+        """The ``limit`` oldest dirty rows, and the oldest ``dirty_since`` of
+        the dirty rows NOT among them (``None`` when there are none).
+
+        Once a batch carrying those rows is acknowledged they are delivered at
+        the revision read, and a change made since bumped the revision after
+        this read, so the rest is what holds ``profiles_clean_before`` back.
+        """
 
         def _select(txn: Any) -> Tuple[List[Tuple[str, int]], Optional[int]]:
-            txn.execute(_SELECT_DIRTY_SQL, (limit,))
-            rows = [(str(uid), int(rev)) for uid, rev in txn.fetchall()]
-            txn.execute(_SELECT_OLDEST_DIRTY_SQL)
-            oldest = txn.fetchone()[0]
-            return rows, (int(oldest) if oldest is not None else None)
+            txn.execute(_SELECT_DIRTY_SQL, (limit + 1,))
+            found = [
+                (str(uid), int(rev), int(since)) for uid, rev, since in txn.fetchall()
+            ]
+            rest = found[limit][2] if len(found) > limit else None
+            return [(uid, rev) for uid, rev, _ in found[:limit]], rest
 
         return await self._pool.runInteraction(
             "pangea_analytics_profile_dirty_read", _select

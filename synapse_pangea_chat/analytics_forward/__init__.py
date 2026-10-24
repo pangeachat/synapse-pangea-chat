@@ -22,6 +22,7 @@ from synapse_pangea_chat.analytics_forward.consent import ConsentAcceptor
 from synapse_pangea_chat.analytics_forward.forwarder import (
     Forwarder,
     make_http_poster,
+    make_ingest_agent,
 )
 from synapse_pangea_chat.analytics_forward.resources import (
     HEAD_PATH,
@@ -58,8 +59,10 @@ class AnalyticsForward:
         # Endpoints and the profile callback on every instance: a profile
         # change is handled wherever it lands, and any instance may serve the
         # endpoints.
+        # The head wakes the forwarder when it runs in this process.
         api.register_web_resource(
-            path=HEAD_PATH, resource=ForwardHead(config.secret, self._store, clock_ms)
+            path=HEAD_PATH,
+            resource=ForwardHead(config.secret, self._store, clock_ms, self._wake),
         )
         api.register_web_resource(
             path=STATE_PATH,
@@ -68,11 +71,11 @@ class AnalyticsForward:
             ),
         )
         self._clock_ms = clock_ms
+        self._forwarder: Optional[Forwarder] = None
         api.register_third_party_rules_callbacks(
             on_profile_update=self.on_profile_update
         )
 
-        self._forwarder: Optional[Forwarder] = None
         # The loop on the one instance that runs background tasks, as Tier-2
         # moderation does: on_new_event fires on every worker subscribed to
         # the events stream, and N loops would send everything N times.
@@ -81,7 +84,12 @@ class AnalyticsForward:
             return
         self._forwarder = Forwarder(
             store=self._store,
-            post=make_http_poster(api.http_client, config.url, config.secret, clock),
+            post=make_http_poster(
+                make_ingest_agent(homeserver.get_reactor()),
+                config.url,
+                config.secret,
+                clock,
+            ),
             consent=ConsentAcceptor(api),
             clock_ms=clock_ms,
             sleep=api.sleep,
@@ -119,6 +127,10 @@ class AnalyticsForward:
             PENDING_INVITE_SCAN_SECONDS * 1000,
             desc="pangea_analytics_forward_pending_invites",
         )
+
+    def _wake(self) -> None:
+        if self._forwarder is not None:
+            self._forwarder.wake()
 
     async def _daily_scan(self) -> None:
         if self._forwarder is not None:

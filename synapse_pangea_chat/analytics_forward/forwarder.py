@@ -42,6 +42,9 @@ BUSY_PAUSE_SECONDS = 0.25
 #: The whole exchange, body included. Synapse's client bounds only the wait
 #: for the response headers, and a body that never ends would stall the loop.
 REQUEST_TIMEOUT_SECONDS = 60.0
+#: Connecting to the ingest; well under the overall cap, so an unreachable
+#: ingest fails fast and the loop's backoff takes over.
+CONNECT_TIMEOUT_SECONDS = 5
 
 
 class DeliveryError(Exception):
@@ -254,7 +257,7 @@ class Forwarder:
                 self._owe(event.room_id, state_key)
 
         read_ms = self._clock_ms()
-        dirty, oldest = await self._store.dirty_profiles(self._batch_max)
+        dirty, oldest_rest = await self._store.dirty_profiles(self._batch_max)
         heartbeat_due = (
             self._last_post_ms is None or read_ms - self._last_post_ms >= self._poll_ms
         )
@@ -264,7 +267,7 @@ class Forwarder:
             return False
 
         profiles = await self._store.profiles([user_id for user_id, _ in dirty])
-        oldest_change = read_ms if oldest is None else min(oldest, read_ms)
+        oldest_change = read_ms if oldest_rest is None else min(oldest_rest, read_ms)
         clean_before = oldest_change - PROFILE_CLOCK_GRACE_MS
         body = ingest_body(
             events=records,
@@ -287,7 +290,7 @@ class Forwarder:
         except BadAck as exc:
             raise DeliveryError("bad_ack", str(exc)) from exc
 
-        await self._store.advance(reached, dirty)
+        await self._store.advance(reached, dirty, clean_before)
         self._cursor = max(self._cursor, reached)
         self._last_post_ms = read_ms
         if self._fence == fence:
@@ -298,20 +301,68 @@ class Forwarder:
         return full or len(dirty) >= self._batch_max
 
 
+def refresh_barrier(
+    forwarded_head: int,
+    oldest_dirty: Optional[int],
+    delivered_clean: Optional[int],
+    now_ms: int,
+) -> Tuple[int, int]:
+    """(barrier_pos, barrier_time) for a Refresh read at ``now_ms``.
+
+    A Refresh is ready once the ingest holds ``delivered_through >=
+    barrier_pos`` and ``profiles_clean_before >= barrier_time``. Both name
+    only what is not yet delivered, so an idle forwarder costs no wait:
+
+    * ``barrier_pos`` is the newest FORWARDED event at or below the persisted
+      head; events of other types move the head and never need a batch.
+    * ``barrier_time`` with a profile change still undelivered is one past
+      what a batch still holding it reports, so only a batch after its
+      delivery passes; with none, it is what was last acknowledged.
+    """
+    if oldest_dirty is not None:
+        return forwarded_head, min(oldest_dirty, now_ms) - PROFILE_CLOCK_GRACE_MS + 1
+    if delivered_clean is not None:
+        return forwarded_head, delivered_clean
+    return forwarded_head, now_ms - PROFILE_CLOCK_GRACE_MS
+
+
+def make_ingest_agent(reactor: Any) -> Any:
+    """The HTTP agent for the ingest: no idle connection is kept.
+
+    A pooled keep-alive connection that the server closes for idleness just
+    as a request is written on it can swallow that request until the overall
+    timeout (seen locally against uvicorn's 5 s keep-alive, with a 5 s poll).
+    At about one POST a second a fresh connection costs nothing, and there is
+    no idle connection left to go stale.
+    """
+    from twisted.web.client import Agent, HTTPConnectionPool
+
+    return Agent(
+        reactor,
+        connectTimeout=CONNECT_TIMEOUT_SECONDS,
+        pool=HTTPConnectionPool(reactor, persistent=False),
+    )
+
+
 def make_http_poster(
-    http_client: Any, url: str, secret: str, clock: Any
+    agent: Any, url: str, secret: str, clock: Any
 ) -> Callable[[dict], Awaitable[Any]]:
     """POST a body to the ingest; the parsed answer, or :class:`DeliveryError`.
 
-    Only a 200 is an answer. Synapse's shared HTTP client bounds the wait for
-    the response headers.
+    Only a 200 is an answer. A request that fails before any answer (a lost
+    or refused connection) is sent once more at once, on a new connection:
+    the ingest is idempotent. The whole exchange, body included, is capped at
+    ``REQUEST_TIMEOUT_SECONDS`` as a last resort.
     """
+    from io import BytesIO
+
     from synapse.logging.context import make_deferred_yieldable, run_in_background
     from synapse.util.async_helpers import timeout_deferred
     from synapse.util.json import json_encoder
-    from twisted.web.client import readBody
+    from twisted.web.client import FileBodyProducer, readBody
     from twisted.web.http_headers import Headers
 
+    uri = url.encode("ascii")
     headers = Headers(
         {
             b"Content-Type": [b"application/json"],
@@ -323,15 +374,24 @@ def make_http_poster(
         # Synapse's encoder: event content may be an immutabledict.
         data = json_encoder.encode(body).encode("utf-8")
 
-        async def exchange() -> Any:
-            response = await http_client.request(
-                "POST", url, data=data, headers=headers
+        async def once() -> Any:
+            response = await make_deferred_yieldable(
+                agent.request(b"POST", uri, headers, FileBodyProducer(BytesIO(data)))
             )
             content = await make_deferred_yieldable(readBody(response))
-            return response, content
+            return response.code, content
+
+        async def exchange() -> Any:
+            try:
+                return await once()
+            except Exception:  # silent-ok: no answer came back; sent once more at once
+                logger.info(
+                    "analytics forwarder: no answer; retrying on a new connection"
+                )
+                return await once()
 
         try:
-            response, content = await make_deferred_yieldable(
+            code, content = await make_deferred_yieldable(
                 timeout_deferred(
                     # run_in_background keeps the logcontext rules across the
                     # timeout wrapper; ensureDeferred lost the context.
@@ -342,10 +402,10 @@ def make_http_poster(
             )
         except Exception as exc:
             raise DeliveryError("http", type(exc).__name__) from exc
-        if response.code in (401, 403):
-            raise DeliveryError("auth", f"HTTP {response.code}")
-        if response.code != 200:
-            raise DeliveryError("http", f"HTTP {response.code}")
+        if code in (401, 403):
+            raise DeliveryError("auth", f"HTTP {code}")
+        if code != 200:
+            raise DeliveryError("http", f"HTTP {code}")
         try:
             return json.loads(content)
         except ValueError as exc:

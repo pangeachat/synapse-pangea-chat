@@ -77,6 +77,7 @@ class FakeStore:
         self.pending: List[Tuple[str, str]] = []
         self.undelivered_join = 0
         self.pending_rev = 0
+        self.delivered_clean: Optional[int] = None
 
     def head(self) -> int:
         return self.head_pos
@@ -99,7 +100,8 @@ class FakeStore:
         )
         return rows, reached
 
-    async def advance(self, cursor: int, acked) -> None:
+    async def advance(self, cursor: int, acked, clean_before: int = 0) -> None:
+        self.delivered_clean = max(self.delivered_clean or clean_before, clean_before)
         self.cursor = max(self.cursor or 0, cursor)
         for user_id, revision in acked:
             row = self.outbox[user_id]
@@ -131,8 +133,8 @@ class FakeStore:
             for uid, row in self.outbox.items()
             if row["dirty"]
         )
-        oldest = dirty[0][0] if dirty else None
-        return [(uid, rev) for _, uid, rev in dirty[:limit]], oldest
+        rest = dirty[limit][0] if len(dirty) > limit else None
+        return [(uid, rev) for _, uid, rev in dirty[:limit]], rest
 
     async def profiles(self, user_ids):
         return {u: self.profile_data[u] for u in user_ids if u in self.profile_data}
@@ -419,7 +421,8 @@ class TestStartupResend(unittest.IsolatedAsyncioTestCase):
 
         await fwd.step()
         second = ingest.bodies[-1]
-        self.assertLess(second["profiles_clean_before"], barrier_time)
+        # The last re-send's own batch reports clean once it is acknowledged.
+        self.assertGreater(second["profiles_clean_before"], barrier_time)
         sent = {
             p["user_id"]: p["revision"] for b in (first, second) for p in b["profiles"]
         }
@@ -960,51 +963,209 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestRequestTimeout(unittest.TestCase):
-    """A response whose body never ends must not stall the loop."""
+class _Transport:
+    def stopProducing(self) -> None:  # noqa: N802
+        pass
 
-    def test_a_stalled_body_times_out(self) -> None:
-        from synapse.util.clock import Clock as SynapseClock
+    def abortConnection(self) -> None:  # noqa: N802
+        pass
+
+
+class _Response:
+    """An HTTP response that delivers ``body`` (or never ends, when None)."""
+
+    phrase = b"OK"
+
+    def __init__(self, code: int, body: Optional[bytes]) -> None:
+        self.code = code
+        self.length = len(body) if body is not None else 10
+        self._body = body
+
+    def deliverBody(self, protocol: Any) -> None:  # noqa: N802
+        from twisted.python.failure import Failure
+        from twisted.web.client import ResponseDone
+
+        protocol.makeConnection(_Transport())
+        if self._body is None:
+            return  # the body never ends
+        protocol.dataReceived(self._body)
+        protocol.connectionLost(Failure(ResponseDone()))
+
+
+class _Agent:
+    def __init__(self, outcomes: List[Any]) -> None:
+        self.outcomes = outcomes
+        self.calls = 0
+
+    def request(self, method: bytes, uri: bytes, headers: Any, body: Any) -> Any:
         from twisted.internet import defer
+
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            return defer.fail(outcome)
+        return defer.succeed(outcome)
+
+
+class TestIngestTransport(unittest.TestCase):
+    """The POST to the ingest: its own connection each time, a stale one
+    retried at once, and a hard cap on the whole exchange."""
+
+    def _post(self, agent: Any) -> Any:
+        from synapse.util.clock import Clock as SynapseClock
         from twisted.internet.testing import MemoryReactorClock
 
-        from synapse_pangea_chat.analytics_forward.forwarder import (
-            REQUEST_TIMEOUT_SECONDS,
-            make_http_poster,
-        )
-
-        class Transport:
-            def stopProducing(self) -> None:  # noqa: N802
-                pass
-
-            def abortConnection(self) -> None:  # noqa: N802
-                pass
-
-        class StalledResponse:
-            code = 200
-            phrase = b"OK"
-            length = 10
-
-            def deliverBody(self, protocol: Any) -> None:  # noqa: N802
-                protocol.makeConnection(Transport())  # the body never ends
-
-        class Client:
-            async def request(self, *args: Any, **kwargs: Any) -> Any:
-                return StalledResponse()
+        from synapse_pangea_chat.analytics_forward.forwarder import make_http_poster
 
         reactor = MemoryReactorClock()
         post = make_http_poster(
-            Client(), "http://ingest/x", SECRET, SynapseClock(reactor, "hs")  # type: ignore[arg-type]
+            agent, "http://ingest/x", SECRET, SynapseClock(reactor, "hs")  # type: ignore[arg-type]
         )
+        return reactor, post
+
+    def _run(self, post: Any) -> Tuple[List[Any], List[Any]]:
+        from twisted.internet import defer
 
         async def call() -> Any:
             return await post({"delivered_through": 1})
 
-        result: "defer.Deferred[Any]" = defer.ensureDeferred(call())
+        results: List[Any] = []
         failures: List[Any] = []
-        result.addErrback(failures.append)
+        result: "defer.Deferred[Any]" = defer.ensureDeferred(call())
+        result.addCallbacks(results.append, failures.append)
+        return results, failures
+
+    def test_a_connection_lost_under_the_request_is_retried_at_once(self) -> None:
+        from twisted.web._newclient import ResponseNeverReceived
+
+        agent = _Agent(
+            [ResponseNeverReceived([]), _Response(200, b'{"delivered_through": 1}')]
+        )
+        _, post = self._post(agent)
+        results, failures = self._run(post)
+        self.assertEqual(failures, [])
+        self.assertEqual(results, [{"delivered_through": 1}])
+        self.assertEqual(agent.calls, 2)
+
+    def test_only_one_immediate_retry(self) -> None:
+        agent = _Agent([ConnectionRefusedError(), ConnectionRefusedError()])
+        _, post = self._post(agent)
+        _, failures = self._run(post)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0].value, DeliveryError)
+        self.assertEqual(agent.calls, 2)
+
+    def test_an_http_error_is_not_retried_here(self) -> None:
+        agent = _Agent([_Response(503, b"{}")])
+        _, post = self._post(agent)
+        _, failures = self._run(post)
+        self.assertEqual(agent.calls, 1)
+        self.assertEqual(failures[0].value.reason, "http")
+
+    def test_a_stalled_body_times_out(self) -> None:
+        from synapse_pangea_chat.analytics_forward.forwarder import (
+            REQUEST_TIMEOUT_SECONDS,
+        )
+
+        reactor, post = self._post(_Agent([_Response(200, None)]))
+        _, failures = self._run(post)
         reactor.advance(REQUEST_TIMEOUT_SECONDS - 1)
         self.assertEqual(failures, [])
         reactor.advance(2)
         self.assertEqual(len(failures), 1)
         self.assertIsInstance(failures[0].value, DeliveryError)
+
+    def test_the_agent_keeps_no_idle_connection(self) -> None:
+        from twisted.internet.testing import MemoryReactorClock
+
+        from synapse_pangea_chat.analytics_forward.forwarder import (
+            CONNECT_TIMEOUT_SECONDS,
+            make_ingest_agent,
+        )
+
+        agent = make_ingest_agent(MemoryReactorClock())
+        self.assertFalse(agent._pool.persistent)
+        self.assertLessEqual(CONNECT_TIMEOUT_SECONDS, 10)
+        self.assertEqual(
+            agent._endpointFactory._connectTimeout, CONNECT_TIMEOUT_SECONDS
+        )
+
+
+class TestRefreshBarrier(unittest.TestCase):
+    """What the head endpoint asks a Refresh to wait for: only what is not
+    delivered yet, so an idle forwarder costs the Refresh no wait at all."""
+
+    def test_nothing_dirty_is_already_met(self) -> None:
+        from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
+
+        self.assertEqual(refresh_barrier(42, None, 5_000, 9_000), (42, 5_000))
+
+    def test_dirty_profile_waits_for_its_delivery(self) -> None:
+        from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
+
+        # A batch still holding the change reports exactly d - grace; the
+        # barrier is one past it, so only a batch after the change passes.
+        self.assertEqual(
+            refresh_barrier(42, 7_000, 5_000, 9_000),
+            (42, 7_000 - PROFILE_CLOCK_GRACE_MS + 1),
+        )
+
+    def test_nothing_delivered_yet_waits_for_a_batch(self) -> None:
+        from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
+
+        self.assertEqual(
+            refresh_barrier(42, None, None, 9_000),
+            (42, 9_000 - PROFILE_CLOCK_GRACE_MS),
+        )
+
+
+class TestCleanBeforeCountsTheBatch(unittest.IsolatedAsyncioTestCase):
+    async def test_a_batch_delivering_the_only_change_reports_clean(self) -> None:
+        """Once acknowledged, the batch's own profiles are delivered, so its
+        clean_before need not wait for the next batch (a Refresh would)."""
+        store = FakeStore([], head=0)
+        clock = Clock()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, clock)
+        await fwd.start()
+        await fwd.step()
+        store.change_profile("@u:hs", clock.now() - 10)
+        clock.ms += 5_000
+        await fwd.step()
+        body = ingest.bodies[-1]
+        self.assertEqual([p["user_id"] for p in body["profiles"]], ["@u:hs"])
+        self.assertEqual(
+            body["profiles_clean_before"], clock.now() - PROFILE_CLOCK_GRACE_MS
+        )
+
+    async def test_an_undelivered_change_still_holds_it_back(self) -> None:
+        store = FakeStore([], head=0)
+        clock = Clock()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, clock, batch_max=1)
+        await fwd.start()
+        await fwd.step()
+        store.change_profile("@a:hs", 100)
+        store.change_profile("@b:hs", 200)
+        await fwd.step()  # sends @a only
+        self.assertEqual(
+            ingest.bodies[-1]["profiles_clean_before"], 200 - PROFILE_CLOCK_GRACE_MS
+        )
+
+
+class TestDeliveredCleanIsStored(unittest.IsolatedAsyncioTestCase):
+    async def test_ack_stores_profiles_clean_before(self) -> None:
+        store = FakeStore([], head=0)
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+        self.assertEqual(
+            store.delivered_clean, ingest.bodies[-1]["profiles_clean_before"]
+        )
+        ingest.fail_with = DeliveryError("http", "HTTP 503")
+        before = store.delivered_clean
+        fwd._last_post_ms = None
+        with self.assertRaises(DeliveryError):
+            await fwd.step()
+        self.assertEqual(store.delivered_clean, before)  # only on an ack

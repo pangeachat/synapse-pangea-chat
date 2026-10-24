@@ -21,6 +21,14 @@ class _IngestServer(ThreadingHTTPServer):
         super().__init__(address, handler)
         self.secret = secret
         self.status = 200
+        # Requests to drop by closing the connection without an answer, as a
+        # server does when an idle keep-alive connection times out under a
+        # request the client has just sent on it.
+        self.drop_next = 0
+        self.dropped = 0
+        # The client port of every request answered: a new port is a new
+        # connection.
+        self.ports: List[int] = []
         self.lock = threading.Lock()
         # (status answered, body) per request, in arrival order.
         self.requests: List[Tuple[int, dict]] = []
@@ -28,6 +36,11 @@ class _IngestServer(ThreadingHTTPServer):
 
 
 class _Handler(BaseHTTPRequestHandler):
+    # Keep-alive, and an idle connection is closed after a second, like a
+    # server's keep-alive timeout.
+    protocol_version = "HTTP/1.1"
+    timeout = 1
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass
 
@@ -36,6 +49,14 @@ class _Handler(BaseHTTPRequestHandler):
         server = self.server
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
+        with server.lock:
+            if server.drop_next > 0:
+                server.drop_next -= 1
+                server.dropped += 1
+                self.close_connection = True
+                self.connection.close()
+                return
+            server.ports.append(self.client_address[1])
         if self.path != INGEST_PATH:
             self._send(404, {"error": "not found"})
             return
@@ -82,6 +103,18 @@ class MockIngest:
 
     def set_on_post(self, hook: Optional[Callable[[dict], None]]) -> None:
         self._server.on_post = hook
+
+    def drop_next(self, count: int = 1) -> None:
+        with self._server.lock:
+            self._server.drop_next = count
+
+    def dropped(self) -> int:
+        with self._server.lock:
+            return self._server.dropped
+
+    def ports(self) -> List[int]:
+        with self._server.lock:
+            return list(self._server.ports)
 
     def requests(self) -> List[Tuple[int, dict]]:
         with self._server.lock:
