@@ -101,6 +101,7 @@ class Forwarder:
         self._failures = 0
         self._running = False
         self._woken = False
+        self._send_due = False
 
     @property
     def cursor(self) -> Optional[int]:
@@ -185,11 +186,17 @@ class Forwarder:
 
     # -- the loop -----------------------------------------------------------
 
-    def wake(self) -> None:
-        """Called on every forwarded event and on the poll timer. No I/O."""
+    def wake(self, send: bool = False) -> None:
+        """Called on every forwarded event and on the poll timer. No I/O.
+
+        ``send``: a head read saw something undelivered; the next step sends
+        a batch even if nothing is left to carry, so the barrier it read is
+        met by a batch read after it (coalesced: one batch per burst)."""
         if self._cursor is None:
             return
         self._woken = True
+        if send:
+            self._send_due = True
         if not self._running:
             self._running = True
             self._run_in_background(self.drain)
@@ -263,7 +270,8 @@ class Forwarder:
         )
         fence, owed, rev = self._fence, sorted(self._owed), self._rev
         full = len(events) >= self._batch_max
-        if not (records or dirty or fence or full or heartbeat_due):
+        send_due, self._send_due = self._send_due, False
+        if not (records or dirty or fence or full or heartbeat_due or send_due):
             return False
 
         profiles = await self._store.profiles([user_id for user_id, _ in dirty])
@@ -288,13 +296,17 @@ class Forwarder:
         if rev > self._saved_rev:
             await self._store.save_pending_rev(rev)
             self._saved_rev = rev
-        response = await self._post(body)
         try:
-            rejected = check_ack(response, reached)
-        except BadAck as exc:
-            raise DeliveryError("bad_ack", str(exc)) from exc
-
-        await self._store.advance(reached, dirty, clean_before)
+            response = await self._post(body)
+            try:
+                rejected = check_ack(response, reached)
+            except BadAck as exc:
+                raise DeliveryError("bad_ack", str(exc)) from exc
+            await self._store.advance(reached, dirty, clean_before)
+        except Exception:
+            if send_due:
+                self._send_due = True  # still owed to the head read
+            raise
         self._cursor = max(self._cursor, reached)
         self._last_post_ms = read_ms
         if self._fence == fence:

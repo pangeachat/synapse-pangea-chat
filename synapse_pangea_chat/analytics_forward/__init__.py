@@ -128,9 +128,9 @@ class AnalyticsForward:
             desc="pangea_analytics_forward_pending_invites",
         )
 
-    def _wake(self) -> None:
+    def _wake(self, send: bool) -> None:
         if self._forwarder is not None:
-            self._forwarder.wake()
+            self._forwarder.wake(send=send)
 
     async def _daily_scan(self) -> None:
         if self._forwarder is not None:

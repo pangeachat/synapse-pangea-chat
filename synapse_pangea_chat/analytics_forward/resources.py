@@ -74,7 +74,7 @@ class ForwardHead(_SecretResource):
         secret: str,
         store: Any,
         clock_ms: Any,
-        wake: Optional[Callable[[], None]] = None,
+        wake: Optional[Callable[[bool], None]] = None,
     ) -> None:
         super().__init__(secret)
         self._store = store
@@ -99,9 +99,10 @@ class ForwardHead(_SecretResource):
         )
         if self._wake is not None:
             # Where the forwarder runs in this process, anything undelivered
-            # goes now rather than at the next poll. wake() coalesces: a burst
-            # of head reads is one run, and an idle run sends nothing.
-            self._wake()
+            # goes now rather than at the next poll, and a profile barrier
+            # gets a batch read after it. wake() coalesces a burst of head
+            # reads into one run; with nothing undelivered, nothing is sent.
+            self._wake(any_dirty)
         return 200, {
             "stream_pos": head,
             "module_time_ms": now,

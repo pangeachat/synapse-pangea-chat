@@ -1146,6 +1146,79 @@ class TestRefreshBarrier(unittest.IsolatedAsyncioTestCase):
         await fwd.step()  # the same millisecond as the head read
         self.assertTrue(await self._met(ingest, barrier_time))
 
+    async def test_a_head_read_during_a_delivery_gets_its_own_batch(self) -> None:
+        """A head that saw a change while its batch was in flight is met by
+        the next batch, even when that one has nothing left to carry."""
+        from synapse_pangea_chat.analytics_forward.forwarder import refresh_barrier
+
+        store = FakeStore([], head=0)
+        clock = Clock()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, clock)
+        await fwd.start()
+        await fwd.step()
+        clock.ms += 1
+        store.change_profile("@a:hs", clock.now())
+        barrier: List[int] = []
+
+        def head_read_mid_flight(body: dict) -> None:
+            clock.ms += 10
+            barrier.append(refresh_barrier(0, True, None, clock.now())[1])
+            fwd.wake(send=True)
+
+        ingest.on_post = head_read_mid_flight
+        await fwd.step()  # delivers @a; the head read happens in flight
+        ingest.on_post = None
+        clock.ms += 1
+        await fwd.step()  # nothing dirty, no heartbeat due: still sent
+        self.assertTrue(await self._met(ingest, barrier[0]))
+
+    async def test_a_requested_send_survives_a_failed_delivery(self) -> None:
+        store = FakeStore([], head=0)
+        clock = Clock()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, clock)
+        await fwd.start()
+        await fwd.step()
+        fwd.wake(send=True)
+        ingest.fail_with = DeliveryError("http", "HTTP 503")
+        with self.assertRaises(DeliveryError):
+            await fwd.step()
+        ingest.fail_with = None
+        sent = len(ingest.bodies)
+        await fwd.step()  # no heartbeat due, nothing to carry: still sent
+        self.assertEqual(len(ingest.bodies), sent + 1)
+
+    async def test_head_requests_a_send_only_when_something_is_undelivered(
+        self,
+    ) -> None:
+        from synapse_pangea_chat.analytics_forward.resources import ForwardHead
+
+        class Store:
+            dirty = True
+
+            def head(self) -> int:
+                return 10
+
+            async def forwarded_head(self, upto: int) -> int:
+                return 8
+
+            async def any_dirty(self) -> bool:
+                return self.dirty
+
+            async def delivered_clean_before(self) -> Optional[int]:
+                return 5
+
+        store = Store()
+        wakes: List[bool] = []
+        head = ForwardHead(SECRET, store, lambda: 1_000, wakes.append)
+        status, body = await head._head(None)  # type: ignore[arg-type]
+        self.assertEqual(status, 200)
+        self.assertEqual(body["barrier_pos"], 8)
+        store.dirty = False
+        await head._head(None)  # type: ignore[arg-type]
+        self.assertEqual(wakes, [True, False])
+
     async def test_a_restart_waits_for_the_resend(self) -> None:
         """A value acknowledged before the restart must not meet a barrier
         read while the startup re-send is undelivered."""
