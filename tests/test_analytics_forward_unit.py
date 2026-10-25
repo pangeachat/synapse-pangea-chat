@@ -876,6 +876,25 @@ class TestWire(unittest.TestCase):
         self.assertFalse(is_forwarded("m.room.member", None))
         self.assertFalse(is_forwarded("m.room.message", None))
 
+    def test_forwarded_types_match_the_contract(self) -> None:
+        from synapse_pangea_chat.analytics_forward.wire import (
+            CONSTRUCT_TYPE,
+            STATE_TYPES,
+        )
+
+        path = os.path.join(
+            os.path.dirname(__file__),
+            "fixtures",
+            "analytics_forward",
+            "ingest_contract.json",
+        )
+        with open(path, encoding="utf-8") as f:
+            types = json.load(f)["forwarded_types"]
+        self.assertEqual(types["timeline"], [CONSTRUCT_TYPE])
+        self.assertEqual(types["state"], sorted(STATE_TYPES))
+        # The Announcements chat is marked by its alias.
+        self.assertTrue(is_forwarded("m.room.canonical_alias", ""))
+
     def test_contract_fixture_matches_the_body(self) -> None:
         path = os.path.join(
             os.path.dirname(__file__),

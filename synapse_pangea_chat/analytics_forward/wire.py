@@ -28,6 +28,9 @@ STATE_TYPES = frozenset(
         "m.room.avatar",
         "m.room.join_rules",
         "m.room.history_visibility",
+        # How the app marks a course's Announcements chat (alias localpart
+        # announcementsChat...).
+        "m.room.canonical_alias",
         "m.space.child",
         "m.space.parent",
         # Course-space state.

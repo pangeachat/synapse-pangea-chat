@@ -273,5 +273,33 @@
       ]
     },
     "notes": "Each known room's COMPLETE current state of the forwarded state types (an absent type is absent from the room, not unread); null for a room this homeserver does not know. Each profile carries a revision bumped by this read, so it is newer than anything pushed before it. At most 500 room ids and 500 user ids per request."
+  },
+  "forwarded_types": {
+    "description": "Exactly the event types the module forwards, live and in analytics_state snapshots. pangea.construct as a timeline event; every other type as state, from every room. m.room.canonical_alias marks a course's Announcements chat (alias localpart announcementsChat...).",
+    "timeline": [
+      "pangea.construct"
+    ],
+    "state": [
+      "m.room.avatar",
+      "m.room.canonical_alias",
+      "m.room.create",
+      "m.room.history_visibility",
+      "m.room.join_rules",
+      "m.room.member",
+      "m.room.name",
+      "m.room.power_levels",
+      "m.room.topic",
+      "m.space.child",
+      "m.space.parent",
+      "pangea.activity_plan",
+      "pangea.activity_roles",
+      "pangea.activity_room_ids",
+      "pangea.analytics_settings",
+      "pangea.course_missions",
+      "pangea.course_plan",
+      "pangea.course_settings",
+      "pangea.orchestrator_awarded_goals",
+      "pangea.teacher_mode"
+    ]
   }
 }

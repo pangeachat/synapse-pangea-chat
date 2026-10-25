@@ -468,6 +468,43 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
         self.assertEqual(self._membership(french, teacher), "invite")
         self._assert_no_forwarder_errors()
 
+    async def test_canonical_alias_forwarded_live_and_in_the_snapshot(self) -> None:
+        await self._start()
+        teacher, token = await self.new_user("aliasteacher")
+        course = self._course(token, teacher, teacher, "es")
+        chat = self._create_room(
+            token,
+            preset="public_chat",
+            room_alias_name=f"announcementsChat{self.tag}",
+        )
+        linked = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{self._q(course)}"
+            f"/state/m.space.child/{self._q(chat)}",
+            json={"via": ["localhost"]},
+            headers=self._h(token),
+        )
+        self.assertEqual(linked.status_code, 200, linked.text)
+        alias = self._sql(
+            "SELECT event_id FROM current_state_events "
+            "WHERE room_id = %s AND type = 'm.room.canonical_alias'",
+            (chat,),
+        )
+        self.assertTrue(alias)
+        await self._until(lambda: self._acked_with(alias[0][0]), "the alias, live")
+        snap = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/analytics_state",
+            json={"room_ids": [chat], "user_ids": []},
+            headers=self._h(SECRET),
+        ).json()
+        records = [
+            e
+            for e in snap["rooms"][chat]["events"]
+            if e["type"] == "m.room.canonical_alias"
+        ]
+        self.assertEqual(len(records), 1)
+        self.assertTrue(records[0]["content"]["alias"].startswith("#announcementsChat"))
+        self._assert_no_forwarder_errors()
+
     async def test_head_and_state_need_the_secret(self) -> None:
         await self._start()
         student, s_token = await self.new_user("snap")
