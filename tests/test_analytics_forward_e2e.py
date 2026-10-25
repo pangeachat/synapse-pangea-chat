@@ -496,6 +496,7 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
             json={"room_ids": [chat], "user_ids": []},
             headers=self._h(SECRET),
         ).json()
+        self.assertIn("m.room.canonical_alias", snap["forwarded_types"])
         records = [
             e
             for e in snap["rooms"][chat]["events"]

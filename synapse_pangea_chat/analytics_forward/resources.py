@@ -166,6 +166,9 @@ class AnalyticsState(_SecretResource):
         revisions = await self._store.bump_revisions(user_ids)
         profiles = await self._store.profiles(user_ids)
         return 200, {
+            # What this module forwards: the API trusts an absent type in a
+            # room (no Announcements chat, say) only if it is listed here.
+            "forwarded_types": sorted(STATE_TYPES),
             "rooms": rooms,
             "profiles": [
                 profile_record(user_id, revisions[user_id], profiles.get(user_id))

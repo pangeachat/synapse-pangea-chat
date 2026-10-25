@@ -892,6 +892,10 @@ class TestWire(unittest.TestCase):
             types = json.load(f)["forwarded_types"]
         self.assertEqual(types["timeline"], [CONSTRUCT_TYPE])
         self.assertEqual(types["state"], sorted(STATE_TYPES))
+        snapshot = json.load(open(path, encoding="utf-8"))["analytics_state_endpoint"]
+        self.assertEqual(
+            snapshot["response_example"]["forwarded_types"], sorted(STATE_TYPES)
+        )
         # The Announcements chat is marked by its alias.
         self.assertTrue(is_forwarded("m.room.canonical_alias", ""))
 
@@ -1377,3 +1381,46 @@ class TestDeliveredCleanIsStored(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(DeliveryError):
             await fwd.step()
         self.assertEqual(store.delivered_clean, before)  # only on an ack
+
+
+class TestSnapshotDeclaresForwardedTypes(unittest.IsolatedAsyncioTestCase):
+    """Every analytics_state answer names the state types this module
+    forwards, so the API trusts an absent type (no Announcements chat) only
+    from a module that forwards it."""
+
+    async def _snapshot(self, body: dict) -> Any:
+        from unittest import mock
+
+        from synapse_pangea_chat.analytics_forward.resources import AnalyticsState
+
+        class Store:
+            async def bump_revisions(self, user_ids: Any) -> Dict[str, int]:
+                return {u: 1 for u in user_ids}
+
+            async def profiles(self, user_ids: Any) -> Dict[str, Any]:
+                return {}
+
+        class State:
+            async def get_current_state(self, room_id: str, state_filter: Any) -> Any:
+                return {}
+
+        resource = AnalyticsState(SECRET, Store(), State())
+        with mock.patch(
+            "synapse_pangea_chat.analytics_forward.resources.extract_body_json",
+            new=mock.AsyncMock(return_value=body),
+        ):
+            return await resource._snapshot(None)  # type: ignore[arg-type]
+
+    async def test_declared_on_every_answer(self) -> None:
+        from synapse_pangea_chat.analytics_forward.wire import STATE_TYPES
+
+        bodies: List[Dict[str, Any]] = [
+            {"room_ids": ["!r:hs"], "user_ids": []},
+            {"room_ids": [], "user_ids": ["@u:hs"]},  # a profile-only round
+            {},
+        ]
+        for body in bodies:
+            status, answer = await self._snapshot(body)
+            self.assertEqual(status, 200)
+            self.assertEqual(answer["forwarded_types"], sorted(STATE_TYPES))
+            self.assertIn("m.room.canonical_alias", answer["forwarded_types"])
