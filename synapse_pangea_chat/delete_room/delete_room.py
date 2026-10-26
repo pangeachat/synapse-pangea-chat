@@ -101,8 +101,11 @@ class DeleteRoom(Resource):
 
             # Ensure request has highest power level. A server admin is compared
             # only with joined members, so an admin who left does not block the
-            # bot from clearing the room out; see delete-room.instructions.md
-            # § Who may delete.
+            # bot from clearing the room out (delete-room.instructions.md § Who
+            # may delete). This gives server admins nothing new: Synapse's admin
+            # API already lets them delete any room, and this routes them through
+            # this endpoint's cleanup. Everyone else keeps the full comparison,
+            # or a student left alone in a course chat could delete it.
             joined_members = (
                 room_members_ids
                 if await self._api.is_user_admin(requester_id)
