@@ -52,6 +52,28 @@ class TestUserHasHighestPowerLevel(unittest.IsolatedAsyncioTestCase):
         api = _api_with_power_levels({"users_default": 100, "users": {USER: 50}})
         self.assertFalse(await user_has_highest_power_level(api, USER, ROOM))
 
+    async def test_joined_members_ignore_a_departed_admin(self):
+        api = _api_with_power_levels({"users": {OTHER: 100, USER: 50}})
+        self.assertTrue(
+            await user_has_highest_power_level(api, USER, ROOM, joined_members={USER})
+        )
+
+    async def test_joined_members_still_count_a_joined_admin(self):
+        api = _api_with_power_levels({"users": {OTHER: 100, USER: 50}})
+        self.assertFalse(
+            await user_has_highest_power_level(
+                api, USER, ROOM, joined_members={USER, OTHER}
+            )
+        )
+
+    async def test_joined_members_count_an_unlisted_member_at_users_default(self):
+        api = _api_with_power_levels({"users_default": 100, "users": {USER: 50}})
+        self.assertFalse(
+            await user_has_highest_power_level(
+                api, USER, ROOM, joined_members={USER, OTHER}
+            )
+        )
+
 
 class TestIsRateLimited(unittest.TestCase):
     def setUp(self):

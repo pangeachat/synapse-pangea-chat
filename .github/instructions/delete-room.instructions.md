@@ -16,9 +16,7 @@ The requester must be authenticated, a joined member of the room, and hold the r
 
 Ties qualify: any member at the top power level may delete. This is intentional — the bot holds admin power level in the rooms it manages, and pangea-bot's cleanup deletes through this same rule.
 
-The comparison covers every member's effective power level, including members who only hold the room's default level.
-
-A room with no power-levels state event denies the request cleanly. It must never return a server error.
+Power still held by members who have left counts too, so an admin who left keeps everyone else from deleting the room. A server admin is the exception: they are compared only with the members still in the room. This lets the bot clear out an activity session whose creator left. It gives server admins nothing new, since Synapse's admin API already lets them delete any room; it sends them through this endpoint's cleanup instead. Everyone else keeps the full comparison, because otherwise a student left alone in a course chat whose teacher left could delete it.
 
 The client hides delete buttons from non-admins and in direct chats, but the server-side check is the authority.
 

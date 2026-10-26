@@ -99,8 +99,18 @@ class DeleteRoom(Resource):
                 )
                 return
 
-            # Ensure request has highest power level
-            if not await user_has_highest_power_level(self._api, requester_id, room_id):
+            # Ensure request has highest power level. A server admin is compared
+            # only with joined members, so an admin who left does not block the
+            # bot from clearing the room out; see delete-room.instructions.md
+            # § Who may delete.
+            joined_members = (
+                room_members_ids
+                if await self._api.is_user_admin(requester_id)
+                else None
+            )
+            if not await user_has_highest_power_level(
+                self._api, requester_id, room_id, joined_members
+            ):
                 respond_with_json(
                     request,
                     403,
