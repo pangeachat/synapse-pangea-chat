@@ -898,6 +898,9 @@ class TestWire(unittest.TestCase):
         )
         # The Announcements chat is marked by its alias.
         self.assertTrue(is_forwarded("m.room.canonical_alias", ""))
+        # A student's progress in a course, keyed by the course room id.
+        self.assertTrue(is_forwarded("pangea.course_progress", "!course:hs"))
+        self.assertFalse(is_forwarded("pangea.course_progress", None))
 
     def test_contract_fixture_matches_the_body(self) -> None:
         path = os.path.join(

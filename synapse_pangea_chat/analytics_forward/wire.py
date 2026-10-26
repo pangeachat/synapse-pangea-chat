@@ -45,6 +45,9 @@ STATE_TYPES = frozenset(
         # Analytics-room state.
         "pangea.analytics_settings",
         "pangea.activity_room_ids",
+        # A student's progress in a course (state_key = the course room id),
+        # written by the app into their analytics room.
+        "pangea.course_progress",
     }
 )
 

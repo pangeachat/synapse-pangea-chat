@@ -506,6 +506,46 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
         self.assertTrue(records[0]["content"]["alias"].startswith("#announcementsChat"))
         self._assert_no_forwarder_errors()
 
+    async def test_course_progress_forwarded_live_and_in_the_snapshot(self) -> None:
+        await self._start()
+        teacher, t_token = await self.new_user("pteacher")
+        student, s_token = await self.new_user("pstudent")
+        course = self._course(t_token, teacher, teacher, "es")
+        analytics = self._analytics_room(s_token)
+        put = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{self._q(analytics)}"
+            f"/state/pangea.course_progress/{self._q(course)}",
+            json={"completed": 3},
+            headers=self._h(s_token),
+        )
+        self.assertEqual(put.status_code, 200, put.text)
+        event_id = put.json()["event_id"]
+        await self._until(lambda: self._acked_with(event_id), "the progress, live")
+        record = next(
+            e
+            for b in self._acked_with(event_id)
+            for e in b["events"]
+            if e["event_id"] == event_id
+        )
+        self.assertEqual(record["state_key"], course)
+        self.assertEqual(record["content"], {"completed": 3})
+        snap = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/analytics_state",
+            json={"room_ids": [analytics], "user_ids": []},
+            headers=self._h(SECRET),
+        ).json()
+        self.assertIn("pangea.course_progress", snap["forwarded_types"])
+        progress = [
+            e
+            for e in snap["rooms"][analytics]["events"]
+            if e["type"] == "pangea.course_progress"
+        ]
+        self.assertEqual(
+            [(e["state_key"], e["content"]) for e in progress],
+            [(course, {"completed": 3})],
+        )
+        self._assert_no_forwarder_errors()
+
     async def test_head_and_state_need_the_secret(self) -> None:
         await self._start()
         student, s_token = await self.new_user("snap")
