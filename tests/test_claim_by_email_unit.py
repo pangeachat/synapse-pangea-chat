@@ -81,7 +81,11 @@ class TestClaimByEmail(unittest.IsolatedAsyncioTestCase):
         await self.claims._ensure_table()
         self.invitations = self.claims.invitations
         self.provisioner = CourseProvisioner(
-            self.api, self.invitations, self.claims, MagicMock()
+            self.api,
+            self.invitations,
+            self.claims,
+            MagicMock(),
+            course_missions=MagicMock(read=AsyncMock(return_value=None)),
         )
         self.claimer = ClaimByEmail(self.api, self.invitations, self.provisioner)
         # The address as the teacher typed it at the booth.

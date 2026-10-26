@@ -11,13 +11,13 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import psycopg2
 import requests
 
-from .base_e2e import BaseSynapseE2ETest
+from .base_e2e import BaseSynapseE2ETest, _free_port
 from .lti_platform_double import (
     INSTRUCTOR,
     HttpsPlatformServer,
@@ -27,7 +27,24 @@ from .lti_platform_double import (
 )
 from .test_logcontext_e2e import LEAK_MARKERS
 
-BASE = "http://localhost:8008/_synapse/client/pangea/v1/lti"
+
+def _listeners(port: int) -> List[Dict[str, Any]]:
+    """A listener on a port chosen before boot: the platform double signs
+    launches for the tool's URL, so that URL must be known in advance."""
+    return [
+        {
+            "port": port,
+            "type": "http",
+            "tls": False,
+            "bind_addresses": ["127.0.0.1"],
+            "resources": [{"names": ["client"], "compress": False}],
+        }
+    ]
+
+
+PORT = _free_port()
+ORIGIN = f"http://127.0.0.1:{PORT}"
+BASE = ORIGIN + "/_synapse/client/pangea/v1/lti"
 LAUNCH_URL = BASE + "/launch"
 APP = "https://app.pangea.chat"
 TOOL_KEY = new_rsa_key()
@@ -36,7 +53,8 @@ LOGIN_HINT = EMAIL
 MESSAGE_HINT = "message-hint-sentinel-7f3a"
 
 _SYNAPSE_CONFIG: Dict[str, Any] = {
-    "public_baseurl": "http://localhost:8008/",
+    "public_baseurl": ORIGIN + "/",
+    "listeners": _listeners(PORT),
     # The stand-in platform runs on loopback, which Synapse's outbound
     # blocklist refuses by default.
     "ip_range_whitelist": ["127.0.0.1/32", "::1/128"],
@@ -86,7 +104,7 @@ class LtiEndpointsE2ETest(BaseSynapseE2ETest):
             try:
                 parts = await self._start({"lti": lti_config})
                 self._assert_lti_absent()
-                health = requests.get("http://localhost:8008/health", timeout=10)
+                health = requests.get(ORIGIN + "/health", timeout=10)
                 self.assertEqual(health.status_code, 200)
                 logs = self._logs()
                 self.assertIn("LTI endpoints not started", logs)

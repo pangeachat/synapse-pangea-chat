@@ -1,6 +1,6 @@
 """The invitation activity ledger (seats amendment 2026-10-10, §2).
 
-``pangea_student_invitation_event`` is append-only: one row per invitation
+``pangea_seat_invitation_event`` is append-only: one row per invitation
 action, written in the same transaction as the change it records, by the
 store that makes that change. A row holds the course, the time, who acted (a
 teacher's Matrix id, or ``system`` for what happens on its own: a claim, a
@@ -51,7 +51,7 @@ ACTIONS = frozenset(
 )
 
 EVENT_SCHEMA = (
-    """CREATE TABLE IF NOT EXISTS pangea_student_invitation_event (
+    """CREATE TABLE IF NOT EXISTS pangea_seat_invitation_event (
         event_id TEXT PRIMARY KEY,
         room_id TEXT NOT NULL,
         ts_ms BIGINT NOT NULL,
@@ -59,8 +59,8 @@ EVENT_SCHEMA = (
         action TEXT NOT NULL,
         invitation_id TEXT,
         count INTEGER)""",
-    """CREATE INDEX IF NOT EXISTS pangea_student_invitation_event_room
-        ON pangea_student_invitation_event (room_id, ts_ms, event_id)""",
+    """CREATE INDEX IF NOT EXISTS pangea_seat_invitation_event_room
+        ON pangea_seat_invitation_event (room_id, ts_ms, event_id)""",
 )
 
 
@@ -79,7 +79,7 @@ def record_event(
         raise ValueError("unknown invitation event action")
     event_id = f"{next(_SEQUENCE):012d}{secrets.token_hex(8)}"
     txn.execute(
-        "INSERT INTO pangea_student_invitation_event"
+        "INSERT INTO pangea_seat_invitation_event"
         " (event_id, room_id, ts_ms, actor, action, invitation_id, count)"
         " VALUES (?, ?, ?, ?, ?, ?, ?)",
         (event_id, room_id, now_ms, actor, action, invitation_id, count),

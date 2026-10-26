@@ -77,8 +77,8 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         return resp.json()
 
     async def boot(self, module_config: Optional[Dict[str, Any]] = None) -> None:
-        self.sink = SmtpSink().__enter__()
-        self.addCleanup(self.sink.__exit__)
+        self.sink = SmtpSink().start()
+        self.addCleanup(self.sink.stop)
         template_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, template_dir)
         for name in ("course_invite.html", "course_invite.txt"):
@@ -846,8 +846,6 @@ class TestSchemaMigrationOnPostgres(unittest.TestCase):
             try:
                 cur = conn.cursor()
                 for sql in (
-                    "CREATE TABLE pangea_student_invitation (id TEXT PRIMARY KEY,"
-                    " email_key TEXT NOT NULL)",
                     "CREATE TABLE pangea_invitation_ack (invitation_id TEXT,"
                     " user_id TEXT, acked_at_ms BIGINT NOT NULL,"
                     " disclosure_version INTEGER NOT NULL, decision TEXT,"
@@ -877,7 +875,8 @@ class TestSchemaMigrationOnPostgres(unittest.TestCase):
                     columns["pangea_managed_account"],
                     ["user_id", "course_room_id", "created_at_ms"],
                 )
-                self.assertIn("member_user_id", columns["pangea_student_invitation"])
+                # The seat invitation table is not among the earlier shapes.
+                self.assertNotIn("pangea_seat_invitation", columns)
                 cur.execute("SELECT * FROM pangea_invitation_ack")
                 self.assertEqual(cur.fetchall(), [("i", "u", 5, None)])
                 cur.execute("SELECT * FROM pangea_managed_account")

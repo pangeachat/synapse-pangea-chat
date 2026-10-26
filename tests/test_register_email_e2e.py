@@ -22,11 +22,16 @@ logging.basicConfig(
     filemode="a",
 )
 
-ENDPOINT = "http://localhost:8008/_synapse/client/pangea/v1/register/email/requestToken"
+ENDPOINT = "/_synapse/client/pangea/v1/register/email/requestToken"
 # Synapse's own registration endpoint, reachable independently of the Pangea
 # route above. Covering it is the reason the address policy is a homeserver-wide
 # callback rather than a check inside the Pangea endpoint.
-BUILTIN_ENDPOINT = "http://localhost:8008/_matrix/client/v3/register/email/requestToken"
+BUILTIN_ENDPOINT = "/_matrix/client/v3/register/email/requestToken"
+# The endpoint's per-IP burst limit (5 a minute by default) is kept in the
+# server process, and every test talks from 127.0.0.1, so on a class's shared
+# homeserver the later tests would be refused for the earlier tests' requests.
+# Only TestRegisterEmailRateLimit, on a homeserver of its own, tests the limit.
+NO_BURST_LIMIT = {"register_email_requests_per_burst": 1000}
 
 
 class MockSMTPServer:
@@ -63,6 +68,16 @@ class MockSMTPServer:
             self._server_socket.close()
         if self._thread:
             self._thread.join(timeout=5)
+
+    def emails_to(self, address: str) -> List[dict]:
+        """The emails received for `address`, so that a test sharing this
+        server with others reads only the mail it caused."""
+        recipient = f"<{address.lower()}>"
+        return [
+            email
+            for email in list(self.received_emails)
+            if recipient in email["to"].lower()
+        ]
 
     def _run(self):
         while self._running:
@@ -132,475 +147,255 @@ class TestRegisterEmailE2ENoEmailConfig(BaseSynapseE2ETest):
     (email-send is never reached).
     """
 
-    async def _start_synapse_no_email(self):
-        return await self.start_test_synapse()
+    async def _homeserver_no_email(self):
+        return await self.homeserver(module_config=NO_BURST_LIMIT)
 
     # --- Parameter validation tests ---
 
     async def test_missing_username(self) -> None:
         """POST without 'username' → 400 M_MISSING_PARAM."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "client_secret": "s3cr3t",
-                    "email": "user@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_MISSING_PARAM")
-            self.assertIn("username", body["error"])
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "client_secret": "s3cr3t",
+                "email": "user@example.com",
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_MISSING_PARAM")
+        self.assertIn("username", body["error"])
 
     async def test_missing_email(self) -> None:
         """POST without 'email' → 400 M_MISSING_PARAM."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "newuser",
-                    "client_secret": "s3cr3t",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_MISSING_PARAM")
-            self.assertIn("email", body["error"])
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "newuser",
+                "client_secret": "s3cr3t",
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_MISSING_PARAM")
+        self.assertIn("email", body["error"])
 
     async def test_missing_client_secret(self) -> None:
         """POST without 'client_secret' → 400 M_MISSING_PARAM."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "newuser",
-                    "email": "user@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_MISSING_PARAM")
-            self.assertIn("client_secret", body["error"])
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "newuser",
+                "email": "user@example.com",
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_MISSING_PARAM")
+        self.assertIn("client_secret", body["error"])
 
     async def test_missing_send_attempt(self) -> None:
         """POST without 'send_attempt' → 400 M_MISSING_PARAM."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "newuser",
-                    "client_secret": "s3cr3t",
-                    "email": "user@example.com",
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_MISSING_PARAM")
-            self.assertIn("send_attempt", body["error"])
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "newuser",
+                "client_secret": "s3cr3t",
+                "email": "user@example.com",
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_MISSING_PARAM")
+        self.assertIn("send_attempt", body["error"])
 
     async def test_all_fields_missing(self) -> None:
         """POST with empty body → 400 M_MISSING_PARAM listing all fields."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            response = requests.post(ENDPOINT, json={})
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_MISSING_PARAM")
-            for field in ("username", "client_secret", "email", "send_attempt"):
-                self.assertIn(field, body["error"])
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(self.server_url + ENDPOINT, json={})
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_MISSING_PARAM")
+        for field in ("username", "client_secret", "email", "send_attempt"):
+            self.assertIn(field, body["error"])
 
     async def test_invalid_json_body(self) -> None:
         """POST with non-JSON body → 400 M_NOT_JSON."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            response = requests.post(
-                ENDPOINT,
-                data="not json at all",
-                headers={"Content-Type": "application/json"},
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_NOT_JSON")
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            data="not json at all",
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_NOT_JSON")
 
     # --- Username validation tests ---
 
     async def test_invalid_username_special_chars(self) -> None:
         """Username with invalid characters → 400 M_INVALID_USERNAME."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "bad@user!name",
-                    "client_secret": "s3cr3t",
-                    "email": "user@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_INVALID_USERNAME")
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "bad@user!name",
+                "client_secret": "s3cr3t",
+                "email": "user@example.com",
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_INVALID_USERNAME")
 
     async def test_empty_username(self) -> None:
         """Empty username → 400 M_INVALID_USERNAME."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "",
-                    "client_secret": "s3cr3t",
-                    "email": "user@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_INVALID_USERNAME")
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "",
+                "client_secret": "s3cr3t",
+                "email": "user@example.com",
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_INVALID_USERNAME")
 
     async def test_username_starts_with_underscore(self) -> None:
         """Username starting with '_' → 400 M_INVALID_USERNAME."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "_reserved",
-                    "client_secret": "s3cr3t",
-                    "email": "user@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_INVALID_USERNAME")
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "_reserved",
+                "client_secret": "s3cr3t",
+                "email": "user@example.com",
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_INVALID_USERNAME")
 
     async def test_username_too_long(self) -> None:
         """Username exceeding max length → 400 M_INVALID_USERNAME."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            # Matrix user IDs max out at 255 chars for the full @localpart:server
-            # The server name is "my.domain.name" (14 chars) + @ + : = 16 overhead
-            # So localpart must be < 255 - 16 = 239 chars. Use 250 to be safe.
-            long_username = "a" * 250
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": long_username,
-                    "client_secret": "s3cr3t",
-                    "email": "user@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_INVALID_USERNAME")
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Matrix user IDs max out at 255 chars for the full @localpart:server
+        # The server name is "my.domain.name" (14 chars) + @ + : = 16 overhead
+        # So localpart must be < 255 - 16 = 239 chars. Use 250 to be safe.
+        long_username = "a" * 250
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": long_username,
+                "client_secret": "s3cr3t",
+                "email": "user@example.com",
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_INVALID_USERNAME")
 
     async def test_username_already_taken(self) -> None:
         """Username already registered → 400 M_USER_IN_USE."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            # Register a user first
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="existinguser",
-                password="123123123",
-                admin=True,
-            )
+        # Register a user first
+        await self.new_user("existinguser", admin=True)
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "existinguser",
-                    "client_secret": "s3cr3t",
-                    "email": "user@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_USER_IN_USE")
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": self.localpart("existinguser"),
+                "client_secret": "s3cr3t",
+                "email": "user@example.com",
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_USER_IN_USE")
 
     async def test_username_taken_case_insensitive(self) -> None:
         """Username check is case-insensitive: 'ExistingUser' taken if 'existinguser' exists."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="myuser",
-                password="123123123",
-                admin=True,
-            )
+        await self.new_user("myuser", admin=True)
 
-            # Try uppercase variant
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "MyUser",
-                    "client_secret": "s3cr3t",
-                    "email": "user@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            # Synapse stores usernames lowercase, but check_username does
-            # case-insensitive lookup. Uppercase chars are also rejected
-            # by the invalid characters check (only a-z allowed).
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertIn(body["errcode"], ["M_INVALID_USERNAME", "M_USER_IN_USE"])
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Try uppercase variant
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": f"MyUser_{self.tag}",
+                "client_secret": "s3cr3t",
+                "email": "user@example.com",
+                "send_attempt": 1,
+            },
+        )
+        # Synapse stores usernames lowercase, but check_username does
+        # case-insensitive lookup. Uppercase chars are also rejected
+        # by the invalid characters check (only a-z allowed).
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertIn(body["errcode"], ["M_INVALID_USERNAME", "M_USER_IN_USE"])
 
     async def test_valid_username_no_email_config(self) -> None:
         """Valid username but no email config → 400 email registration disabled."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_no_email()
+        await self._homeserver_no_email()
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "validnewuser",
-                    "client_secret": "s3cr3t",
-                    "email": "user@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertIn("disabled", body["error"].lower())
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "validnewuser",
+                "client_secret": "s3cr3t",
+                "email": "user@example.com",
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertIn("disabled", body["error"].lower())
 
 
 class EmailConfiguredSynapseMixin:
-    """Starts the test homeserver with a mock SMTP server attached."""
+    """Starts the test homeserver with a mock SMTP server attached.
 
-    smtp_server: Optional[MockSMTPServer] = None
+    The SMTP server's port is in the homeserver config, so it lives as long as
+    the class's shared homeserver, and each test reads only the mail sent to
+    its own address.
+    """
+
+    smtp_server: MockSMTPServer
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()  # type: ignore[misc]
+        cls.smtp_server = MockSMTPServer()
+        smtp_port = cls.smtp_server.start()
+        logger.info("Mock SMTP server started on port %d", smtp_port)
+        cls.addClassCleanup(cls.smtp_server.stop)
 
     def _make_email_synapse_config(self, smtp_port: int) -> dict:
         return {
@@ -612,23 +407,13 @@ class EmailConfiguredSynapseMixin:
             },
         }
 
-    async def _start_synapse_with_email(self):
-        self.smtp_server = MockSMTPServer()
-        smtp_port = self.smtp_server.start()
-        logger.info("Mock SMTP server started on port %d", smtp_port)
-        return await self.start_test_synapse(
-            synapse_config_overrides=self._make_email_synapse_config(smtp_port),
+    async def _homeserver_with_email(self):
+        return await self.homeserver(
+            module_config=NO_BURST_LIMIT,
+            synapse_config_overrides=self._make_email_synapse_config(
+                self.smtp_server.port
+            ),
         )
-
-    def _stop_smtp(self):
-        if self.smtp_server:
-            self.smtp_server.stop()
-            self.smtp_server = None
-
-    def _require_smtp_server(self) -> MockSMTPServer:
-        if self.smtp_server is None:
-            raise AssertionError("Mock SMTP server was not started")
-        return self.smtp_server
 
 
 class TestRegisterEmailE2EWithEmailConfig(
@@ -641,376 +426,218 @@ class TestRegisterEmailE2EWithEmailConfig(
 
     async def test_happy_path_valid_username_and_email(self) -> None:
         """Valid username + valid email → 200 with sid."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        await self._homeserver_with_email()
+        address = f"newuser+{self.tag}@example.com"
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "brandnewuser",
-                    "client_secret": "mysecret123",
-                    "email": "newuser@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 200, response.json())
-            body = response.json()
-            self.assertIn("sid", body)
-            self.assertIsInstance(body["sid"], str)
-            self.assertTrue(len(body["sid"]) > 0)
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "brandnewuser",
+                "client_secret": "mysecret123",
+                "email": address,
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.json())
+        body = response.json()
+        self.assertIn("sid", body)
+        self.assertIsInstance(body["sid"], str)
+        self.assertTrue(len(body["sid"]) > 0)
 
-            # Verify email was actually sent via mock SMTP
-            smtp_server = self._require_smtp_server()
-            await asyncio.sleep(1)
-            self.assertGreater(
-                len(smtp_server.received_emails),
-                0,
-                "Expected at least one email to be sent via SMTP",
-            )
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Verify email was actually sent via mock SMTP
+        await asyncio.sleep(1)
+        self.assertGreater(
+            len(self.smtp_server.emails_to(address)),
+            0,
+            "Expected at least one email to be sent via SMTP",
+        )
 
     async def test_happy_path_with_next_link(self) -> None:
         """Valid request with next_link → 200 with sid."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        await self._homeserver_with_email()
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "nextlinkuser",
-                    "client_secret": "mysecret456",
-                    "email": "nextlink@example.com",
-                    "send_attempt": 1,
-                    "next_link": "https://app.pangea.chat/register",
-                },
-            )
-            self.assertEqual(response.status_code, 200, response.json())
-            body = response.json()
-            self.assertIn("sid", body)
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "nextlinkuser",
+                "client_secret": "mysecret456",
+                "email": f"nextlink+{self.tag}@example.com",
+                "send_attempt": 1,
+                "next_link": "https://app.pangea.chat/register",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.json())
+        body = response.json()
+        self.assertIn("sid", body)
 
     async def test_idempotent_send_attempt(self) -> None:
         """Same email/client_secret/send_attempt returns same sid without re-sending."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        await self._homeserver_with_email()
 
-            payload = {
-                "username": "idempotentuser",
-                "client_secret": "idempotentsecret",
-                "email": "idempotent@example.com",
-                "send_attempt": 1,
-            }
+        payload = {
+            "username": "idempotentuser",
+            "client_secret": "idempotentsecret",
+            "email": f"idempotent+{self.tag}@example.com",
+            "send_attempt": 1,
+        }
 
-            # First request
-            resp1 = requests.post(ENDPOINT, json=cast(Any, payload))
-            self.assertEqual(resp1.status_code, 200, resp1.json())
-            sid1 = resp1.json()["sid"]
+        # First request
+        resp1 = requests.post(self.server_url + ENDPOINT, json=cast(Any, payload))
+        self.assertEqual(resp1.status_code, 200, resp1.json())
+        sid1 = resp1.json()["sid"]
 
-            # Same request again (same send_attempt) — should return same sid
-            resp2 = requests.post(ENDPOINT, json=cast(Any, payload))
-            self.assertEqual(resp2.status_code, 200, resp2.json())
-            sid2 = resp2.json()["sid"]
+        # Same request again (same send_attempt) — should return same sid
+        resp2 = requests.post(self.server_url + ENDPOINT, json=cast(Any, payload))
+        self.assertEqual(resp2.status_code, 200, resp2.json())
+        sid2 = resp2.json()["sid"]
 
-            self.assertEqual(sid1, sid2)
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        self.assertEqual(sid1, sid2)
 
     async def test_higher_send_attempt_re_sends(self) -> None:
         """Higher send_attempt with same email/client_secret re-sends email."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        await self._homeserver_with_email()
 
-            base_payload = {
-                "username": "resenduser",
-                "client_secret": "resendsecret",
-                "email": "resend@example.com",
-            }
+        address = f"resend+{self.tag}@example.com"
+        base_payload = {
+            "username": "resenduser",
+            "client_secret": "resendsecret",
+            "email": address,
+        }
 
-            # First send_attempt
-            resp1 = requests.post(ENDPOINT, json={**base_payload, "send_attempt": 1})
-            self.assertEqual(resp1.status_code, 200, resp1.json())
-            sid1 = resp1.json()["sid"]
+        # First send_attempt
+        resp1 = requests.post(
+            self.server_url + ENDPOINT, json={**base_payload, "send_attempt": 1}
+        )
+        self.assertEqual(resp1.status_code, 200, resp1.json())
+        sid1 = resp1.json()["sid"]
 
-            smtp_server = self._require_smtp_server()
-            await asyncio.sleep(0.5)
-            emails_after_first = len(smtp_server.received_emails)
+        await asyncio.sleep(0.5)
+        emails_after_first = len(self.smtp_server.emails_to(address))
 
-            # Higher send_attempt should re-send
-            resp2 = requests.post(ENDPOINT, json={**base_payload, "send_attempt": 2})
-            self.assertEqual(resp2.status_code, 200, resp2.json())
-            sid2 = resp2.json()["sid"]
+        # Higher send_attempt should re-send
+        resp2 = requests.post(
+            self.server_url + ENDPOINT, json={**base_payload, "send_attempt": 2}
+        )
+        self.assertEqual(resp2.status_code, 200, resp2.json())
+        sid2 = resp2.json()["sid"]
 
-            # Same session
-            self.assertEqual(sid1, sid2)
+        # Same session
+        self.assertEqual(sid1, sid2)
 
-            # Should have sent an additional email
-            await asyncio.sleep(1)
-            self.assertGreater(
-                len(smtp_server.received_emails),
-                emails_after_first,
-                "Expected a new email for higher send_attempt",
-            )
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Should have sent an additional email
+        await asyncio.sleep(1)
+        self.assertGreater(
+            len(self.smtp_server.emails_to(address)),
+            emails_after_first,
+            "Expected a new email for higher send_attempt",
+        )
 
     async def test_email_already_in_use(self) -> None:
         """Email already bound to an account → 400 M_THREEPID_IN_USE."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        await self._homeserver_with_email()
 
-            # Register a user and bind an email via the Admin API
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="emailowner",
-                password="123123123",
-                admin=True,
-            )
-            user_id, access_token = await self.login_user(
-                user="emailowner", password="123123123"
-            )
+        taken = f"taken+{self.tag}@example.com"
 
-            # Use Synapse Admin API to bind the 3PID
-            admin_url = f"http://localhost:8008/_synapse/admin/v2/users/{user_id}"
-            resp = requests.put(
-                admin_url,
-                json={
-                    "threepids": [{"medium": "email", "address": "taken@example.com"}]
-                },
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-            self.assertEqual(
-                resp.status_code,
-                200,
-                f"Failed to bind 3PID: {resp.text}",
-            )
+        # Register a user and bind an email via the Admin API
+        user_id, access_token = await self.new_user("emailowner", admin=True)
 
-            # Now try to register with that email
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "anothernewuser",
-                    "client_secret": "emailsecret",
-                    "email": "taken@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_THREEPID_IN_USE")
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Use Synapse Admin API to bind the 3PID
+        admin_url = f"{self.server_url}/_synapse/admin/v2/users/{user_id}"
+        resp = requests.put(
+            admin_url,
+            json={"threepids": [{"medium": "email", "address": taken}]},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(
+            resp.status_code,
+            200,
+            f"Failed to bind 3PID: {resp.text}",
+        )
+
+        # Now try to register with that email
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "anothernewuser",
+                "client_secret": "emailsecret",
+                "email": taken,
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_THREEPID_IN_USE")
 
     async def test_username_taken_does_not_send_email(self) -> None:
         """If username is taken, no email should be sent."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        await self._homeserver_with_email()
 
-            # Register a user
-            await self.register_user(
-                config_path=config_path,
-                dir=synapse_dir,
-                user="takenuser",
-                password="123123123",
-                admin=True,
-            )
+        address = f"innocent+{self.tag}@example.com"
 
-            smtp_server = self._require_smtp_server()
-            emails_before = len(smtp_server.received_emails)
+        # Register a user
+        await self.new_user("takenuser", admin=True)
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "takenuser",
-                    "client_secret": "somesecret",
-                    "email": "innocent@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_USER_IN_USE")
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": self.localpart("takenuser"),
+                "client_secret": "somesecret",
+                "email": address,
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_USER_IN_USE")
 
-            # Verify no email was sent
-            await asyncio.sleep(1)
-            self.assertEqual(
-                len(smtp_server.received_emails),
-                emails_before,
-                "No email should be sent when username is already taken",
-            )
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Verify no email was sent
+        await asyncio.sleep(1)
+        self.assertEqual(
+            self.smtp_server.emails_to(address),
+            [],
+            "No email should be sent when username is already taken",
+        )
 
     async def test_invalid_email_format(self) -> None:
         """Invalid email format → 400."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        await self._homeserver_with_email()
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "validuser",
-                    "client_secret": "s3cr3t",
-                    "email": "not-an-email",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "validuser",
+                "client_secret": "s3cr3t",
+                "email": "not-an-email",
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
 
     async def test_invalid_username_with_email_config(self) -> None:
         """Invalid username still rejected even with email configured."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        await self._homeserver_with_email()
+        address = f"user+{self.tag}@example.com"
 
-            smtp_server = self._require_smtp_server()
-            emails_before = len(smtp_server.received_emails)
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "bad@user",
+                "client_secret": "s3cr3t",
+                "email": address,
+                "send_attempt": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_INVALID_USERNAME")
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "bad@user",
-                    "client_secret": "s3cr3t",
-                    "email": "user@example.com",
-                    "send_attempt": 1,
-                },
-            )
-            self.assertEqual(response.status_code, 400)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_INVALID_USERNAME")
-
-            # Verify no email was sent for invalid usernames.
-            await asyncio.sleep(1)
-            self.assertEqual(
-                len(smtp_server.received_emails),
-                emails_before,
-                "No email should be sent when username is invalid",
-            )
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Verify no email was sent for invalid usernames.
+        await asyncio.sleep(1)
+        self.assertEqual(
+            self.smtp_server.emails_to(address),
+            [],
+            "No email should be sent when username is invalid",
+        )
 
 
 class TestRegisterEmailRateLimit(BaseSynapseE2ETest):
@@ -1059,52 +686,39 @@ class TestRegisterEmailRateLimit(BaseSynapseE2ETest):
 
     async def test_rate_limit_e2e(self) -> None:
         """E2E: Endpoint returns 429 after exceeding rate limit."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "register_email_requests_per_burst": 2,
-                    "register_email_burst_duration_seconds": 60,
-                },
+        # The only test of this class that starts a homeserver, so the only
+        # one whose requests count against this limit.
+        await self.homeserver(
+            module_config={
+                "register_email_requests_per_burst": 2,
+                "register_email_burst_duration_seconds": 60,
+            },
+        )
+
+        payload = {
+            "username": "ratelimituser",
+            "client_secret": "ratesecret",
+            "email": "rate@example.com",
+            "send_attempt": 1,
+        }
+
+        # First requests should succeed (or fail with username/email errors,
+        # but NOT 429)
+        for i in range(2):
+            response = requests.post(
+                self.server_url + ENDPOINT, json=cast(Any, payload)
+            )
+            self.assertNotEqual(
+                response.status_code,
+                429,
+                f"Request {i+1} should not be rate limited",
             )
 
-            payload = {
-                "username": "ratelimituser",
-                "client_secret": "ratesecret",
-                "email": "rate@example.com",
-                "send_attempt": 1,
-            }
-
-            # First requests should succeed (or fail with username/email errors,
-            # but NOT 429)
-            for i in range(2):
-                response = requests.post(ENDPOINT, json=cast(Any, payload))
-                self.assertNotEqual(
-                    response.status_code,
-                    429,
-                    f"Request {i+1} should not be rate limited",
-                )
-
-            # Next request should be rate limited
-            response = requests.post(ENDPOINT, json=cast(Any, payload))
-            self.assertEqual(response.status_code, 429)
-            body = response.json()
-            self.assertEqual(body["errcode"], "M_LIMIT_EXCEEDED")
-        finally:
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # Next request should be rate limited
+        response = requests.post(self.server_url + ENDPOINT, json=cast(Any, payload))
+        self.assertEqual(response.status_code, 429)
+        body = response.json()
+        self.assertEqual(body["errcode"], "M_LIMIT_EXCEEDED")
 
 
 class TestRegisterEmailAddressPolicy(EmailConfiguredSynapseMixin, BaseSynapseE2ETest):
@@ -1122,131 +736,71 @@ class TestRegisterEmailAddressPolicy(EmailConfiguredSynapseMixin, BaseSynapseE2E
         return config
 
     async def test_pangea_endpoint_refuses_address_and_sends_nothing(self) -> None:
-        """`a@b` is the address the old presence-and-"@" check let through."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        """An address like `a@b` is what the old presence-and-"@" check let through."""
+        await self._homeserver_with_email()
+        address = f"a+{self.tag}@b"
 
-            smtp_server = self._require_smtp_server()
-            emails_before = len(smtp_server.received_emails)
+        response = requests.post(
+            self.server_url + ENDPOINT,
+            json={
+                "username": "policyuser",
+                "client_secret": "s3cr3t",
+                "email": address,
+                "send_attempt": 1,
+            },
+        )
 
-            response = requests.post(
-                ENDPOINT,
-                json={
-                    "username": "policyuser",
-                    "client_secret": "s3cr3t",
-                    "email": "a@b",
-                    "send_attempt": 1,
-                },
-            )
+        self.assertEqual(response.status_code, 400, response.text)
+        # Malformed, not "domain not authorized" — the Pangea endpoint runs
+        # the policy itself so the app can say which it was.
+        self.assertEqual(response.json()["errcode"], "M_INVALID_PARAM")
 
-            self.assertEqual(response.status_code, 400, response.text)
-            # Malformed, not "domain not authorized" — the Pangea endpoint runs
-            # the policy itself so the app can say which it was.
-            self.assertEqual(response.json()["errcode"], "M_INVALID_PARAM")
-
-            await asyncio.sleep(1)
-            self.assertEqual(
-                len(smtp_server.received_emails),
-                emails_before,
-                "No email should be sent for an address failing the policy",
-            )
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        await asyncio.sleep(1)
+        self.assertEqual(
+            self.smtp_server.emails_to(address),
+            [],
+            "No email should be sent for an address failing the policy",
+        )
 
     async def test_builtin_endpoint_refuses_address_and_sends_nothing(self) -> None:
         """The path the app does not use, and the reason for the callback."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        await self._homeserver_with_email()
+        address = f"a+{self.tag}@b"
 
-            smtp_server = self._require_smtp_server()
-            emails_before = len(smtp_server.received_emails)
+        response = requests.post(
+            self.server_url + BUILTIN_ENDPOINT,
+            json={
+                "client_secret": "s3cr3t",
+                "email": address,
+                "send_attempt": 1,
+            },
+        )
 
-            response = requests.post(
-                BUILTIN_ENDPOINT,
-                json={
-                    "client_secret": "s3cr3t",
-                    "email": "a@b",
-                    "send_attempt": 1,
-                },
-            )
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(response.json()["errcode"], "M_THREEPID_DENIED")
 
-            self.assertEqual(response.status_code, 403, response.text)
-            self.assertEqual(response.json()["errcode"], "M_THREEPID_DENIED")
-
-            await asyncio.sleep(1)
-            self.assertEqual(
-                len(smtp_server.received_emails),
-                emails_before,
-                "No email should be sent for an address failing the policy",
-            )
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        await asyncio.sleep(1)
+        self.assertEqual(
+            self.smtp_server.emails_to(address),
+            [],
+            "No email should be sent for an address failing the policy",
+        )
 
     async def test_builtin_endpoint_still_sends_for_a_good_address(self) -> None:
         """The control: the callback refuses junk, not everything."""
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self._start_synapse_with_email()
+        await self._homeserver_with_email()
+        address = f"builtin-learner+{self.tag}@example.com"
 
-            smtp_server = self._require_smtp_server()
-            emails_before = len(smtp_server.received_emails)
+        response = requests.post(
+            self.server_url + BUILTIN_ENDPOINT,
+            json={
+                "client_secret": "s3cr3t",
+                "email": address,
+                "send_attempt": 1,
+            },
+        )
 
-            response = requests.post(
-                BUILTIN_ENDPOINT,
-                json={
-                    "client_secret": "s3cr3t",
-                    "email": "builtin-learner@example.com",
-                    "send_attempt": 1,
-                },
-            )
+        self.assertEqual(response.status_code, 200, response.text)
 
-            self.assertEqual(response.status_code, 200, response.text)
-
-            await asyncio.sleep(1)
-            self.assertGreater(len(smtp_server.received_emails), emails_before)
-        finally:
-            self._stop_smtp()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        await asyncio.sleep(1)
+        self.assertGreater(len(self.smtp_server.emails_to(address)), 0)

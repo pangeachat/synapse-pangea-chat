@@ -15,7 +15,17 @@ exhausted.
 import json
 import logging
 import time
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
+from typing import (
+    Any,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 
 from synapse.api.constants import HistoryVisibility
 from synapse.storage.databases.main.room import RoomStore
@@ -57,6 +67,7 @@ RESPONSE_STATE_EVENTS: Tuple[str, ...] = (
     "m.room.power_levels",
     "m.room.topic",
     "pangea.course_plan",
+    "pangea.course_settings",
 )
 
 DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE = "pangea.course_plan"
@@ -77,6 +88,31 @@ PLAN_ID_CONTENT_KEYS: Tuple[str, ...] = ("uuid", "course_plan_id")
 # The target language, written into the same state event when the quest is
 # attached. Empty is the same as absent, here and in SQL.
 L2_CONTENT_KEY = "l2"
+
+# A central course carries `"central": true` on its own course settings, and
+# the mark counts only when one of the central admins wrote that event: any
+# course admin can write their own course's settings.
+COURSE_SETTINGS_EVENT_TYPE = "pangea.course_settings"
+CENTRAL_CONTENT_KEY = "central"
+DEFAULT_CENTRAL_ADMIN_LOCALPART = "support"
+
+
+def central_course_admins(
+    configured: Iterable[str], server_name: str
+) -> FrozenSet[str]:
+    """The accounts whose central mark the catalog trusts."""
+    return frozenset(configured) or frozenset(
+        {f"@{DEFAULT_CENTRAL_ADMIN_LOCALPART}:{server_name}"}
+    )
+
+
+def is_central(room_data: RoomStateMap, admins: FrozenSet[str]) -> bool:
+    """Whether a central admin marked this course central."""
+    event = room_data.get(COURSE_SETTINGS_EVENT_TYPE, {}).get("")
+    if not isinstance(event, dict) or event.get("sender") not in admins:
+        return False
+    content = event.get("content")
+    return isinstance(content, dict) and content.get(CENTRAL_CONTENT_KEY) is True
 
 
 def extract_plan_id(content: Mapping[str, Any]) -> Optional[str]:
@@ -527,6 +563,7 @@ def _build_course(
     entry: CatalogRow,
     room_data: RoomStateMap,
     stats: Dict[str, Any],
+    central_admins: FrozenSet[str],
 ) -> Course:
     """Build a single Course dict from the catalog row plus room state."""
     name = None
@@ -553,6 +590,7 @@ def _build_course(
 
     return Course(
         room_id=entry.room_id,
+        central=is_central(room_data, central_admins),
         name=name,
         topic=topic,
         avatar_url=avatar_url,
@@ -578,6 +616,7 @@ async def get_public_courses(
     limit: int,
     since: Optional[str],
     filters: Optional[CourseFilters] = None,
+    central_course_admins: FrozenSet[str] = frozenset(),
 ) -> PublicCoursesResponse:
     _cleanup_expired_cache()
 
@@ -637,6 +676,7 @@ async def get_public_courses(
             entry,
             rooms_data.get(entry.room_id, {}),
             room_stats.get(entry.room_id, {}),
+            central_course_admins,
         )
         for entry in page
     ]

@@ -66,8 +66,8 @@ def _responses(user_count: int) -> Dict[str, List[Tuple[Any, ...]]]:
         "get_users_recent_bot_notice_rooms": [(NOTIFIED_ROOM_ID,)],
         "get_users_direct_account_data": _direct_account_data_rows(user_count),
         "get_users_count": [(1,)],
-        "get_users_page": [("@quiet0:my.domain.name", "Quiet", 5)],
-        "get_users_last_message": [],
+        # The page row as the kept activity table answers it: login, message, latest.
+        "get_users_page": [("@quiet0:my.domain.name", "Quiet", 5, 0, 5)],
     }
 
 
@@ -90,8 +90,8 @@ class TestGetUsersCooldownQueryCount(unittest.IsolatedAsyncioTestCase):
         await _run_with_cooldown(large)
 
         self.assertEqual(small.db_pool.descs(), large.db_pool.descs())
-        # 2 cooldown queries + count + page + page-scoped last-message lookup
-        self.assertEqual(len(large.db_pool.calls), 5)
+        # 2 cooldown queries + count + page; the times come from the kept table, so no further read
+        self.assertEqual(len(large.db_pool.calls), 4)
 
     async def test_notice_lookup_is_scoped_by_sender(self):
         """The events query must be sender-scoped, never a full-table scan."""
@@ -124,6 +124,20 @@ class TestGetUsersCooldownQueryCount(unittest.IsolatedAsyncioTestCase):
 
         _desc, query, _args = store.db_pool.call_for("get_users_page")
         self.assertIn("LIMIT ? OFFSET ?", query)
+
+    async def test_no_query_reads_user_ips_or_events_in_bulk(self):
+        """The route reads the kept activity table only (user-activity doc: the invariant)."""
+        store = _FakeRoomStore(_responses(3))
+
+        out = await get_users(store, sort_by="latest_activity", sort_order="desc")  # type: ignore[arg-type]
+
+        for _desc, query, _args in store.db_pool.calls:
+            self.assertNotIn("user_ips", query)
+            self.assertNotIn("FROM events", query)
+        _desc, query, _args = store.db_pool.call_for("get_users_page")
+        self.assertIn("pangea_user_activity", query)
+        self.assertIn("GREATEST", query)
+        self.assertEqual(out["docs"][0]["latest_activity_ts"], 5)
 
     async def test_no_recent_notices_skips_account_data_read(self):
         """An empty notice result makes the account-data query unnecessary."""

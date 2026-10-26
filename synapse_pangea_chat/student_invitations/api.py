@@ -724,15 +724,26 @@ class InvitationOpenRoute(StudentInvitationRoute):
 class StudentInvitationsRoot(Resource):
     """``…/student_invitations``: its fixed routes (``add``, ``list``, …)
     are its children; any other segment is an invitation id, served by the
-    open route."""
+    open route. The path itself belongs to ``base`` when given: the course
+    invite code feature's own read (email_invite.student_invitation_api,
+    ``GET …/student_invitations?room_id=``), which shares this path. One
+    resource may sit at a path, so this one hands that request to it
+    unchanged."""
 
-    def __init__(self, open_route: InvitationOpenRoute) -> None:
+    def __init__(
+        self, open_route: InvitationOpenRoute, base: Optional[Resource] = None
+    ) -> None:
         super().__init__()
         self._open = open_route
+        self._base = base
 
     def getChild(self, path: bytes, request: Any) -> Resource:
+        if path == b"" and self._base is not None:
+            return self._base
         return self._open
 
     def render(self, request: SynapseRequest) -> Any:
+        if self._base is not None:
+            return self._base.render(request)
         respond_with_json(request, 404, NOT_FOUND, send_cors=True)
         return server.NOT_DONE_YET

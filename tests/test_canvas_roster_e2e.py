@@ -21,7 +21,7 @@ import jwt
 import psycopg2
 import requests
 
-from .base_e2e import BaseSynapseE2ETest
+from .base_e2e import BaseSynapseE2ETest, _free_port
 from .lti_platform_double import (
     INSTRUCTOR,
     LEARNER,
@@ -33,7 +33,24 @@ from .test_logcontext_e2e import LEAK_MARKERS
 
 P = "/_synapse/client/pangea/v1/"
 LTI = P + "lti/"
-BASE = "http://localhost:8008"
+
+
+def _listeners(port: int) -> List[Dict[str, Any]]:
+    """A listener on a port chosen before boot: the platform double signs
+    launches for the tool's URL, so that URL must be known in advance."""
+    return [
+        {
+            "port": port,
+            "type": "http",
+            "tls": False,
+            "bind_addresses": ["127.0.0.1"],
+            "resources": [{"names": ["client"], "compress": False}],
+        }
+    ]
+
+
+PORT = _free_port()
+BASE = f"http://127.0.0.1:{PORT}"
 LAUNCH_URL = BASE + "/" + LTI.lstrip("/") + "launch"
 APP = "https://app.example.test"
 DASH = "https://admin.example.test"
@@ -184,6 +201,7 @@ class CanvasRosterE2ETest(BaseSynapseE2ETest):
                     },
                     synapse_config_overrides={
                         "public_baseurl": BASE + "/",
+                        "listeners": _listeners(PORT),
                         "ip_range_whitelist": ["127.0.0.1/32", "::1/128"],
                         "templates": {"custom_template_directory": template_dir},
                         **LIMITS,
@@ -365,7 +383,7 @@ class CanvasRosterE2ETest(BaseSynapseE2ETest):
                 "application/vnd.ims.lti-nrps.v2.membershipcontainer+json",
             )
         [row] = self.db(
-            "SELECT id, state, source, lti_user_id FROM pangea_student_invitation"
+            "SELECT id, state, source, lti_user_id FROM pangea_seat_invitation"
         )
         invitation_id = row[0]
         self.assertEqual(row[1:], ("invited", "canvas", STUDENT_SUB))

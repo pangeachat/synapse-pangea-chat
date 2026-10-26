@@ -34,6 +34,9 @@ def _claim_store(
     store.get = AsyncMock(return_value=claim)
     store.claim = AsyncMock(return_value=wins)
     store.mark_promoted = AsyncMock()
+    # No student invitation holds the code unless a test says so.
+    store.students.for_code = AsyncMock(return_value=None)
+    store.students.record_use = AsyncMock()
     return store
 
 
@@ -395,3 +398,57 @@ class TestClaimingARequestedCourse(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStudentInvitationCodes(unittest.IsolatedAsyncioTestCase):
+    """A student invitation's own code opens its course like the class code, is never spent,
+    and records the join against the invitation (invite-by-email.instructions.md)."""
+
+    def setUp(self) -> None:
+        self.respond = MagicMock()
+        for p in [
+            patch(f"{MODULE}.respond_with_json", self.respond),
+            patch(f"{MODULE}.is_rate_limited", return_value=False),
+            patch(
+                f"{MODULE}.extract_body_json",
+                AsyncMock(return_value={"access_code": CODE}),
+            ),
+            patch(f"{MODULE}.get_user_room_membership", AsyncMock(return_value=None)),
+            patch(f"{MODULE}.is_blocked_by_room_admin", AsyncMock(return_value=False)),
+            patch(f"{MODULE}.invite_user_to_room", AsyncMock()),
+            # The class-code lookup is never consulted for an invitation code.
+            patch(
+                f"{LOOKUP}.get_rooms_with_access_code",
+                AsyncMock(side_effect=AssertionError("looked up join rules")),
+            ),
+        ]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    async def test_the_code_opens_the_course_and_the_use_is_recorded(self) -> None:
+        store = _claim_store()
+        store.students.for_code = AsyncMock(
+            return_value={"invitation_id": "inv-1", "room_id": ROOM_1, "uses": 0}
+        )
+        await _handler(claim_store=store)._async_render_POST(MagicMock())
+        status, body = self.respond.call_args.args[1], self.respond.call_args.args[2]
+        self.assertEqual(
+            (status, body["rooms"], body["already_joined"]), (200, [ROOM_1], [])
+        )
+        store.students.record_use.assert_awaited_once_with("inv-1", USER, 1_000)
+        store.students.for_code.assert_awaited_once_with(CODE)
+
+    async def test_a_second_use_of_a_forwarded_link_still_joins_and_counts(
+        self,
+    ) -> None:
+        store = _claim_store()
+        store.students.for_code = AsyncMock(
+            return_value={"invitation_id": "inv-1", "room_id": ROOM_1, "uses": 1}
+        )
+        with patch(
+            f"{MODULE}.get_user_room_membership", AsyncMock(return_value="join")
+        ):
+            await _handler(claim_store=store)._async_render_POST(MagicMock())
+        status, body = self.respond.call_args.args[1], self.respond.call_args.args[2]
+        self.assertEqual((status, body["already_joined"]), (200, [ROOM_1]))
+        store.students.record_use.assert_awaited_once()

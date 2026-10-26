@@ -2,7 +2,7 @@
 
 Three tables (SPEC §6):
 
-- ``pangea_student_invitation``: one row per (course, canonical email). States
+- ``pangea_seat_invitation``: one row per (course, canonical email). States
   ``invited`` -> ``joined`` (claimed by one account) -> ``left`` (that account
   left, or was removed from, the course); ``revoked`` by a course admin. A
   ``revoked`` or ``left`` row is reset to ``invited`` when the email is added
@@ -13,7 +13,7 @@ Three tables (SPEC §6):
   (null, granted, denied). A verified match claims with no request.
 - ``pangea_managed_account``: written by every claim (``created_at`` only),
   deleted when the invitation is revoked or its claimant leaves the course.
-- ``pangea_student_invitation_event``: the append-only activity ledger
+- ``pangea_seat_invitation_event``: the append-only activity ledger
   (``events.py``), written in the same transaction as each change.
 
 Every write that decides a claim locks the invitation row first (a no-op
@@ -58,7 +58,7 @@ DECISION_DENIED = "denied"
 
 SCHEMA = (
     (
-        """CREATE TABLE IF NOT EXISTS pangea_student_invitation (
+        """CREATE TABLE IF NOT EXISTS pangea_seat_invitation (
         id TEXT PRIMARY KEY,
         course_room_id TEXT NOT NULL,
         email_key TEXT NOT NULL,
@@ -76,16 +76,16 @@ SCHEMA = (
         lti_user_id TEXT,
         member_user_id TEXT,
         UNIQUE (course_room_id, email_key))""",
-        """CREATE UNIQUE INDEX IF NOT EXISTS pangea_student_invitation_one_joined
-        ON pangea_student_invitation (course_room_id, claimant)
+        """CREATE UNIQUE INDEX IF NOT EXISTS pangea_seat_invitation_one_joined
+        ON pangea_seat_invitation (course_room_id, claimant)
         WHERE state = 'joined'""",
-        """CREATE UNIQUE INDEX IF NOT EXISTS pangea_student_invitation_lti_identity
-        ON pangea_student_invitation (course_room_id, lti_issuer, lti_user_id)
+        """CREATE UNIQUE INDEX IF NOT EXISTS pangea_seat_invitation_lti_identity
+        ON pangea_seat_invitation (course_room_id, lti_issuer, lti_user_id)
         WHERE lti_user_id IS NOT NULL""",
-        """CREATE INDEX IF NOT EXISTS pangea_student_invitation_claimant
-        ON pangea_student_invitation (claimant)""",
-        """CREATE INDEX IF NOT EXISTS pangea_student_invitation_email_key
-        ON pangea_student_invitation (email_key)""",
+        """CREATE INDEX IF NOT EXISTS pangea_seat_invitation_claimant
+        ON pangea_seat_invitation (claimant)""",
+        """CREATE INDEX IF NOT EXISTS pangea_seat_invitation_email_key
+        ON pangea_seat_invitation (email_key)""",
         """CREATE TABLE IF NOT EXISTS pangea_invitation_ack (
         invitation_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
@@ -121,7 +121,7 @@ COLUMNS = (
     "lti_user_id",
     "member_user_id",
 )
-_SELECT = "SELECT " + ", ".join(COLUMNS) + " FROM pangea_student_invitation "
+_SELECT = "SELECT " + ", ".join(COLUMNS) + " FROM pangea_seat_invitation "
 REQUEST_COLUMNS = ("invitation_id", "user_id", "requested_at_ms", "decision")
 _REQUEST_SELECT = (
     "SELECT invitation_id, user_id, requested_at_ms, decision"
@@ -175,7 +175,7 @@ def _lock(txn: Any, invitation_id: str) -> None:
     # A no-op write takes the row lock: a concurrent writer of the same row
     # then fails serialisation and Synapse retries it on the new state.
     txn.execute(
-        "UPDATE pangea_student_invitation SET state = state WHERE id = ?",
+        "UPDATE pangea_seat_invitation SET state = state WHERE id = ?",
         (invitation_id,),
     )
 
@@ -207,7 +207,7 @@ class StudentInvitationStore:
                 txn.execute(sql)
             migrate(txn)
 
-        await self.db.runInteraction("pangea_student_invitation_schema", create)
+        await self.db.runInteraction("pangea_seat_invitation_schema", create)
         self._ready = True
 
     # --- reads ---
@@ -218,7 +218,7 @@ class StudentInvitationStore:
         def select(txn: Any) -> Optional[Dict]:
             return _select_one(txn, "WHERE id = ?", (invitation_id,))
 
-        return await self.db.runInteraction("pangea_student_invitation_get", select)
+        return await self.db.runInteraction("pangea_seat_invitation_get", select)
 
     async def in_room(
         self, room_id: str, invitation_id: str
@@ -238,7 +238,7 @@ class StudentInvitationStore:
             )
             return [r for r in (_row(x) for x in txn.fetchall()) if r is not None]
 
-        return await self.db.runInteraction("pangea_student_invitation_list", select)
+        return await self.db.runInteraction("pangea_seat_invitation_list", select)
 
     async def joined_by(self, user_id: str) -> List[Dict[str, Any]]:
         await self.ensure()
@@ -251,7 +251,7 @@ class StudentInvitationStore:
             )
             return [r for r in (_row(x) for x in txn.fetchall()) if r is not None]
 
-        return await self.db.runInteraction("pangea_student_invitation_joined", select)
+        return await self.db.runInteraction("pangea_seat_invitation_joined", select)
 
     async def joined_in_course(
         self, room_id: str, user_id: str
@@ -262,7 +262,7 @@ class StudentInvitationStore:
             return _joined_in_course(txn, room_id, user_id)
 
         return await self.db.runInteraction(
-            "pangea_student_invitation_joined_in_course", select
+            "pangea_seat_invitation_joined_in_course", select
         )
 
     async def invited_for_keys(self, email_keys: Iterable[str]) -> List[Dict]:
@@ -282,7 +282,7 @@ class StudentInvitationStore:
             rows.sort(key=lambda r: (r["created_at_ms"], r["id"]))
             return rows
 
-        return await self.db.runInteraction("pangea_student_invitation_keys", select)
+        return await self.db.runInteraction("pangea_seat_invitation_keys", select)
 
     async def canvas_invited(self, identity: CanvasIdentity) -> List[Dict]:
         """``invited`` rows, in any course, imported with exactly this Canvas
@@ -299,7 +299,7 @@ class StudentInvitationStore:
             )
             return [r for r in (_row(x) for x in txn.fetchall()) if r is not None]
 
-        return await self.db.runInteraction("pangea_student_invitation_canvas", select)
+        return await self.db.runInteraction("pangea_seat_invitation_canvas", select)
 
     async def get_request(self, invitation_id: str, user_id: str) -> Optional[Dict]:
         await self.ensure()
@@ -321,7 +321,7 @@ class StudentInvitationStore:
             txn.execute(
                 "SELECT a.invitation_id, a.user_id, a.requested_at_ms, a.decision"
                 " FROM pangea_invitation_ack a"
-                " JOIN pangea_student_invitation i ON i.id = a.invitation_id"
+                " JOIN pangea_seat_invitation i ON i.id = a.invitation_id"
                 " WHERE i.course_room_id = ? AND i.state = 'invited'"
                 " ORDER BY a.requested_at_ms, a.user_id",
                 (room_id,),
@@ -351,7 +351,7 @@ class StudentInvitationStore:
             # One fixed statement: each filter is off when its value is NULL.
             txn.execute(
                 "SELECT event_id, ts_ms, actor, action, invitation_id, count"
-                " FROM pangea_student_invitation_event"
+                " FROM pangea_seat_invitation_event"
                 " WHERE room_id = ?"
                 " AND (? IS NULL OR ts_ms >= ?)"
                 " AND (? IS NULL OR ts_ms < ?)"
@@ -387,7 +387,7 @@ class StudentInvitationStore:
 
         def select(txn: Any) -> Dict[str, str]:
             txn.execute(
-                "SELECT claimant, id FROM pangea_student_invitation"
+                "SELECT claimant, id FROM pangea_seat_invitation"
                 " WHERE course_room_id = ? AND state = 'joined'",
                 (room_id,),
             )
@@ -446,7 +446,7 @@ class StudentInvitationStore:
                 if key in by_key:
                     continue
                 txn.execute(
-                    "INSERT INTO pangea_student_invitation"
+                    "INSERT INTO pangea_seat_invitation"
                     " (id, course_room_id, email_key, email, state, source,"
                     "  invited_by, send_count, created_at_ms, member_user_id)"
                     " VALUES (?, ?, ?, ?, 'invited', ?, ?, 0, ?, ?)"
@@ -478,7 +478,7 @@ class StudentInvitationStore:
                     # address; only the send count carries over. A Canvas
                     # identity is cleared: this path is never a Canvas import.
                     txn.execute(
-                        "UPDATE pangea_student_invitation SET state = 'invited',"
+                        "UPDATE pangea_seat_invitation SET state = 'invited',"
                         " claimant = NULL, joined_at_ms = NULL, email = ?,"
                         " source = ?, invited_by = ?, created_at_ms = ?,"
                         " lti_issuer = NULL, lti_context_id = NULL,"
@@ -505,7 +505,7 @@ class StudentInvitationStore:
                 )
             return [by_key[key] for _, key in entries]
 
-        return await self.db.runInteraction("pangea_student_invitation_add", write)
+        return await self.db.runInteraction("pangea_seat_invitation_add", write)
 
     async def import_canvas(
         self,
@@ -560,7 +560,7 @@ class StudentInvitationStore:
                             conflicts.append(same_email["id"])
                         continue
                     txn.execute(
-                        "UPDATE pangea_student_invitation SET lti_issuer = ?,"
+                        "UPDATE pangea_seat_invitation SET lti_issuer = ?,"
                         " lti_context_id = ?, lti_user_id = ?"
                         " WHERE id = ? AND lti_user_id IS NULL",
                         (issuer, context_id, user_id, same_email["id"]),
@@ -570,7 +570,7 @@ class StudentInvitationStore:
                     counts["attached"] += 1
                     continue
                 txn.execute(
-                    "INSERT INTO pangea_student_invitation"
+                    "INSERT INTO pangea_seat_invitation"
                     " (id, course_room_id, email_key, email, state, source,"
                     "  invited_by, send_count, created_at_ms,"
                     "  lti_issuer, lti_context_id, lti_user_id)"
@@ -602,7 +602,7 @@ class StudentInvitationStore:
         for attempt in range(IMPORT_ATTEMPTS):
             try:
                 return await self.db.runInteraction(
-                    "pangea_student_invitation_import_canvas", write
+                    "pangea_seat_invitation_import_canvas", write
                 )
             except Exception as error:
                 if not is_integrity_error(error) or attempt + 1 == IMPORT_ATTEMPTS:
@@ -632,7 +632,7 @@ class StudentInvitationStore:
             if row is None or row["state"] != STATE_INVITED:
                 return "not_invited", None
             txn.execute(
-                "UPDATE pangea_student_invitation"
+                "UPDATE pangea_seat_invitation"
                 " SET send_count = send_count + 1, last_sent_at_ms = ?"
                 " WHERE id = ? AND state = 'invited' AND send_count = ?",
                 (now_ms, invitation_id, expected),
@@ -641,7 +641,7 @@ class StudentInvitationStore:
                 return "stale", None
             return "reserved", row
 
-        return await self.db.runInteraction("pangea_student_invitation_send", write)
+        return await self.db.runInteraction("pangea_seat_invitation_send", write)
 
     async def release_send(self, before: Dict[str, Any]) -> None:
         """Undo a reservation whose email was not sent, unless the row moved
@@ -649,7 +649,7 @@ class StudentInvitationStore:
 
         def write(txn: Any) -> None:
             txn.execute(
-                "UPDATE pangea_student_invitation"
+                "UPDATE pangea_seat_invitation"
                 " SET send_count = ?, last_sent_at_ms = ?"
                 " WHERE id = ? AND send_count = ?",
                 (
@@ -660,7 +660,7 @@ class StudentInvitationStore:
                 ),
             )
 
-        await self.db.runInteraction("pangea_student_invitation_unsend", write)
+        await self.db.runInteraction("pangea_seat_invitation_unsend", write)
 
     async def record_sent(
         self, before: Dict[str, Any], actor: str, now_ms: int
@@ -680,7 +680,7 @@ class StudentInvitationStore:
                 invitation_id=before["id"],
             )
 
-        await self.db.runInteraction("pangea_student_invitation_sent", write)
+        await self.db.runInteraction("pangea_seat_invitation_sent", write)
 
     async def revoke(
         self, room_id: str, invitation_id: str, actor: str, now_ms: int
@@ -703,7 +703,7 @@ class StudentInvitationStore:
             if row["state"] == STATE_JOINED and row["claimant"] is not None:
                 _delete_managed(txn, row["claimant"], room_id)
             txn.execute(
-                "UPDATE pangea_student_invitation SET state = 'revoked' WHERE id = ?",
+                "UPDATE pangea_seat_invitation SET state = 'revoked' WHERE id = ?",
                 (invitation_id,),
             )
             record_event(
@@ -716,7 +716,7 @@ class StudentInvitationStore:
             )
             return _select_one(txn, "WHERE id = ?", (invitation_id,))
 
-        return await self.db.runInteraction("pangea_student_invitation_revoke", write)
+        return await self.db.runInteraction("pangea_seat_invitation_revoke", write)
 
     async def release_on_leave(
         self, room_id: str, user_id: str, now_ms: int
@@ -732,7 +732,7 @@ class StudentInvitationStore:
                 return None
             _lock(txn, row["id"])
             txn.execute(
-                "UPDATE pangea_student_invitation SET state = 'left'"
+                "UPDATE pangea_seat_invitation SET state = 'left'"
                 " WHERE id = ? AND state = 'joined' AND claimant = ?",
                 (row["id"], user_id),
             )
@@ -749,7 +749,7 @@ class StudentInvitationStore:
             )
             return row["id"]
 
-        return await self.db.runInteraction("pangea_student_invitation_left", write)
+        return await self.db.runInteraction("pangea_seat_invitation_left", write)
 
     async def set_managed(
         self, invitation_id: str, user_id: str, managed: bool, now_ms: int
@@ -928,7 +928,7 @@ class StudentInvitationStore:
                     invitation_id=invitation_id,
                 )
             txn.execute(
-                "UPDATE pangea_student_invitation"
+                "UPDATE pangea_seat_invitation"
                 " SET state = 'joined', claimant = ?, joined_at_ms = ?"
                 " WHERE id = ? AND state = 'invited'",
                 (user_id, now_ms, invitation_id),
@@ -944,9 +944,7 @@ class StudentInvitationStore:
             return CLAIMED, _select_one(txn, "WHERE id = ?", (invitation_id,))
 
         try:
-            return await self.db.runInteraction(
-                "pangea_student_invitation_claim", write
-            )
+            return await self.db.runInteraction("pangea_seat_invitation_claim", write)
         except Exception as error:
             if is_integrity_error(error):
                 # The joined-per-course index caught a concurrent claim of
@@ -971,17 +969,11 @@ def migrate(txn: Any) -> None:
     """Bring tables created by earlier builds to the current columns, in
     place and idempotently (each step runs only when still needed):
 
-    - ``member_user_id`` on invitations (D2);
     - requests (seats amendment 2026-10-10): ``acked_at_ms`` becomes
       ``requested_at_ms`` and ``disclosure_version`` is dropped;
     - the managed record keeps only ``created_at_ms``: ``since_ms`` is
       renamed and ``invited_by`` dropped.
     """
-    invitation = _columns(txn, "pangea_student_invitation")
-    if "member_user_id" not in invitation:
-        txn.execute(
-            "ALTER TABLE pangea_student_invitation ADD COLUMN member_user_id TEXT"
-        )
     request = _columns(txn, "pangea_invitation_ack")
     if "acked_at_ms" in request and "requested_at_ms" not in request:
         txn.execute(

@@ -13,7 +13,7 @@ from synapse.module_api import ModuleApi
 from twisted.web.http_headers import Headers
 
 from synapse_pangea_chat.config import PangeaChatConfig
-from synapse_pangea_chat.notice_delivery.request import NoticeRequest
+from synapse_pangea_chat.notice_delivery.request import DecisionContext, NoticeRequest
 
 
 class DeliveryLogError(Exception):
@@ -74,12 +74,23 @@ class DeliveryLog:
         return response.code, payload
 
     @staticmethod
+    def _context(req: NoticeRequest) -> DecisionContext:
+        # Reservation and finish run only for requests the module records itself;
+        # a caller-owned record never reaches here (deliver.py).
+        if req.log is None:
+            raise DeliveryLogError(
+                "Decision context is required unless the caller owns the record"
+            )
+        return req.log
+
+    @staticmethod
     def _decision(req: NoticeRequest) -> Dict[str, Any]:
+        log = DeliveryLog._context(req)
         return {
             "outcome": "send",
             "category": req.category,
             "variant": req.variant,
-            "copy_key": req.log.copy_key,
+            "copy_key": log.copy_key,
             "channel": "none",
             "notice_event_id": req.notice_event_id,
             "notice_room_id": req.notice_room_id,
@@ -87,14 +98,15 @@ class DeliveryLog:
         }
 
     async def reserve(self, req: NoticeRequest) -> tuple[str, Optional[Dict[str, Any]]]:
+        log = self._context(req)
         row = {
-            "run": req.log.run,
+            "run": log.run,
             "subject": {
                 "kind": "account",
                 "subject_id": req.user_id,
                 "matrix_user_id": req.user_id,
             },
-            "state": req.log.state,
+            "state": log.state,
             "decision": self._decision(req),
         }
         status, payload = await self._request("POST", body=row)
@@ -108,7 +120,7 @@ class DeliveryLog:
         # Read after any conflict-shaped response. A failed create must never be
         # retried here: a timeout could have committed the reservation already.
         key = json.dumps(
-            [req.log.run["run_id"], req.user_id],
+            [log.run["run_id"], req.user_id],
             separators=(",", ":"),
             ensure_ascii=False,
         )

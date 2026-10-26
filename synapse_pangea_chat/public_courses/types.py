@@ -7,6 +7,7 @@ class CourseFilters(TypedDict, total=False):
 
 class Course(TypedDict):
     avatar_url: Optional[str]
+    central: bool
     canonical_alias: Optional[str]
     course_id: Optional[str]
     guest_can_join: bool

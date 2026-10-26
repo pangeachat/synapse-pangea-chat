@@ -10,7 +10,15 @@ from synapse.module_api import ModuleApi
 from synapse_pangea_chat.activity_session_previews import ActivitySessionPreviews
 from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
 from synapse_pangea_chat.blocked_join_gate import BlockedJoinGate
-from synapse_pangea_chat.config import PangeaChatConfig
+from synapse_pangea_chat.config import (
+    DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS,
+    PangeaChatConfig,
+)
+from synapse_pangea_chat.course_default_chats import (
+    CourseDefaultChats,
+    RecoverCourseDefaultChat,
+    SyncCourseDefaultChats,
+)
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
 from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
@@ -27,7 +35,12 @@ from synapse_pangea_chat.email_invite.course_claim_reminder import (
 )
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.email_invite.course_invitation_api import CourseInvitationAPI
+from synapse_pangea_chat.email_invite.course_missions import CourseMissionsReader
+from synapse_pangea_chat.email_invite.instructor_invitations import (
+    InstructorInvitationAPI,
+)
 from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
+from synapse_pangea_chat.email_invite.student_invitation_api import StudentInvitationAPI
 from synapse_pangea_chat.email_policy import EmailPolicy
 from synapse_pangea_chat.export_user_data import ExportUserData
 from synapse_pangea_chat.find_user_by_email import FindUserByEmail
@@ -37,15 +50,19 @@ from synapse_pangea_chat.grant_instructor_analytics_access import (
 from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.lti import register_lti
 from synapse_pangea_chat.lti.keys import LtiConfigError, LtiSettings, parse_lti_config
+from synapse_pangea_chat.member_analytics_profiles import MemberAnalyticsProfiles
 from synapse_pangea_chat.moderation import ChatModeration, tier1_prefilter
 from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.moderation import refusal as moderation_refusal
 from synapse_pangea_chat.moderation import severity as moderation_severity
 from synapse_pangea_chat.notice_delivery import (
+    MISSED_MESSAGE_UNSUBSCRIBE_PATH,
     DeliverNotice,
+    MissedMessageUnsubscribe,
     NoticeClick,
     NoticeUnsubscribe,
     PrepareNotice,
+    RefusalStore,
 )
 from synapse_pangea_chat.preview_with_code import (
     DEFAULT_PREVIEW_WITH_CODE_STATE_EVENT_TYPES,
@@ -63,11 +80,14 @@ from synapse_pangea_chat.room_preview import (
     invalidate_room_cache,
 )
 from synapse_pangea_chat.safety_incidents import register_safety_incidents
+from synapse_pangea_chat.set_course_plan import SetCoursePlan
 from synapse_pangea_chat.student_invitations import register_student_invitations
 from synapse_pangea_chat.student_invitations.rate_limits import parse_rate_limits
 from synapse_pangea_chat.user_activity import (
     CourseActivities,
     UserActivity,
+    UserActivityCache,
+    UserActivityRefresh,
     UserCourses,
 )
 from synapse_pangea_chat.user_directory_search import UserDirectorySearch
@@ -339,7 +359,9 @@ class PangeaChat:
         # address and sends the claim link; knock_with_code takes the claim and
         # sends the class link (knock-with-code.instructions.md).
         course_claim_store = CourseClaimStore(api._hs)
-        course_claim_mailer = CourseClaimMailer(api)
+        course_claim_mailer = CourseClaimMailer(
+            api, postal_address=config.notice_email_postal_address or ""
+        )
         course_claim_notifier = CourseClaimNotifier(
             api, config, course_claim_store, course_claim_mailer
         )
@@ -349,9 +371,19 @@ class PangeaChat:
             course_claim_store.invitations,
             course_claim_store,
             course_claim_notifier,
+            course_missions=CourseMissionsReader(
+                api, config.cms_base_url, config.cms_service_api_key
+            ),
+            blocked_join_gate_enabled=config.blocked_join_gate_enabled,
         )
         # --- Student invitations (seats): routes, claim, leave release ---
-        self.student_invitations = register_student_invitations(api, config)
+        # `…/student_invitations` itself is the course invite code read
+        # (email_invite.student_invitation_api); the seat routes sit under it,
+        # and one resource serves the path, handing that read to it.
+        self.student_invitations = register_student_invitations(
+            api, config, base=StudentInvitationAPI(api, course_claim_store)
+        )
+
         # Registers its own sign-in and verified-address callbacks.
         self.claim_by_email = ClaimByEmail(
             api,
@@ -359,6 +391,9 @@ class PangeaChat:
             provisioner,
             student_claims=self.student_invitations.claims,
         )
+        # Set Course Plan's room rewrite, shared with the invitation-side
+        # replacement of a claimed course (registered under its own path below).
+        self.set_course_plan_resource = SetCoursePlan(api, config)
         for endpoint, mode in (
             ("create_course_space", "prepare"),
             ("send_course_claim_reminder", "reminder"),
@@ -373,10 +408,21 @@ class PangeaChat:
                     course_claim_store.invitations,
                     course_claim_mailer,
                     mode,
+                    room_plan=self.set_course_plan_resource,
                 ),
             )
+        # Additional-instructor invitations into an existing course: prepared
+        # here, emailed by the caller through the v2 reminder endpoint, and
+        # claimed through the same code path as a first claim.
+        api.register_web_resource(
+            path="/_synapse/client/pangea/v2/instructor_invitations",
+            resource=InstructorInvitationAPI(
+                api, config, course_claim_store, course_claim_store.invitations
+            ),
+        )
 
         # --- Room Code ---
+
         self.knock_with_code_resource = KnockWithCode(
             api, config, course_claim_store, course_claim_notifier, provisioner
         )
@@ -416,11 +462,14 @@ class PangeaChat:
         )
 
         # --- Invite By Email ---
-        self.invite_by_email_resource = InviteByEmail(api, config)
+        self.invite_by_email_resource = InviteByEmail(api, config, course_claim_store)
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/invite_by_email",
             resource=self.invite_by_email_resource,
         )
+        # Which invitations a course's students joined through (the dashboard
+        # and the runner read it): served at `…/student_invitations` through
+        # register_student_invitations above, which shares that path.
 
         # --- Delete Room ---
         self.delete_room_resource = DeleteRoom(api, config)
@@ -450,6 +499,12 @@ class PangeaChat:
             resource=self.find_user_by_email_resource,
         )
 
+        # --- Set Course Plan ---
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/set_course_plan",
+            resource=self.set_course_plan_resource,
+        )
+
         # --- Course Member Emails ---
         # Registered only when enabled, so the path does not exist otherwise.
         if config.course_member_emails_enabled:
@@ -459,17 +514,54 @@ class PangeaChat:
                 resource=self.course_member_emails_resource,
             )
 
+        # --- Member Analytics Profiles ---
+        self.member_analytics_profiles_resource = MemberAnalyticsProfiles(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/member_analytics_profiles",
+            resource=self.member_analytics_profiles_resource,
+        )
+
         # --- Safety page: reports and the incident read ---
         # Always registered: a report is recorded whether or not moderation is
         # on, and the read is how a course admin sees both.
         register_safety_incidents(api, config)
 
         # --- User Activity ---
-        self.user_activity_resource = UserActivity(api, config)
+        # The route reads a table the module keeps (user-activity.instructions.md, "DB query strategy"):
+        # brought up to date on a loop, on demand through the refresh route, and in full when asked.
+        self.user_activity_cache = UserActivityCache(
+            api._hs.get_datastores().main.db_pool
+        )
+        self.user_activity_resource = UserActivity(
+            api, config, self.user_activity_cache
+        )
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/user_activity",
             resource=self.user_activity_resource,
         )
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/user_activity_refresh",
+            resource=UserActivityRefresh(api, config, self.user_activity_cache),
+        )
+        if (
+            config.user_activity_refresh_interval_seconds > 0
+            and self._api.should_run_background_tasks()
+        ):
+            # The first refresh soon after start (a rebuild when the table is new), then the loop: on the
+            # one instance that runs background tasks and never on the other workers. The looping call
+            # already keeps to that instance; the delayed first call did not, and on 2026-10-21 every
+            # process of a 17-process deployment rebuilt the table at once at each restart, colliding on
+            # the watermarks (user-activity doc, "DB query strategy").
+            self._api.delayed_background_call(
+                15_000,
+                self._refresh_user_activity,
+                desc="pangea_user_activity_first_refresh",
+            )
+            self._api.looping_background_call(
+                self._refresh_user_activity,
+                config.user_activity_refresh_interval_seconds * 1000,
+                desc="pangea_user_activity_refresh",
+            )
 
         # --- Course Activities ---
         self.course_activities_resource = CourseActivities(api, config)
@@ -526,6 +618,20 @@ class PangeaChat:
         if config.blocked_join_gate_enabled:
             self.blocked_join_gate = BlockedJoinGate(config, api)
 
+        # --- Course Default Chats ---
+        # Registered only when enabled, so the hook does not fire and the
+        # repair path does not exist otherwise.
+        if config.course_default_chats_enabled:
+            self.course_default_chats = CourseDefaultChats(api)
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/sync_course_default_chats",
+                resource=SyncCourseDefaultChats(api, self.course_default_chats),
+            )
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/recover_course_default_chat",
+                resource=RecoverCourseDefaultChat(api, self.course_default_chats),
+            )
+
         # --- Direct Push ---
         self.direct_push_resource = DirectPush(api, config)
         self._api.register_web_resource(
@@ -557,11 +663,24 @@ class PangeaChat:
             path="/_synapse/client/pangea/v1/deliver_nudge",
             resource=self.deliver_notice_resource,
         )
-        self.notice_unsubscribe_resource = NoticeUnsubscribe(api, config)
+        self.notice_refusal_store = RefusalStore(api)
+        self.notice_unsubscribe_resource = NoticeUnsubscribe(
+            api, config, self.notice_refusal_store
+        )
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/unsubscribe",
             resource=self.notice_unsubscribe_resource,
         )
+        if config.notice_missed_message_unsubscribe_enabled:
+            # Module resources are attached after Synapse's own, so this
+            # replaces Synapse's page at the path its missed-message email
+            # links to, in the body and in the List-Unsubscribe header.
+            self._api.register_web_resource(
+                path=MISSED_MESSAGE_UNSUBSCRIBE_PATH,
+                resource=MissedMessageUnsubscribe(
+                    api, config, self.notice_refusal_store
+                ),
+            )
         self.notice_click_resource = NoticeClick(api, config)
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/n",
@@ -615,6 +734,15 @@ class PangeaChat:
         room_id = event.room_id
         invalidate_room_cache(room_id)
 
+    async def _refresh_user_activity(self) -> None:
+        """One turn of the kept activity table's refresh (``UserActivityCache.refresh``)."""
+        try:
+            await self.user_activity_cache.refresh()
+        except (
+            Exception
+        ):  # noqa: BLE001  # silent-ok: logged with its traceback; the loop's next turn tries again, and the route's activity_refreshed_at shows the table's age
+            logger.exception("user activity refresh failed")
+
     @staticmethod
     def parse_config(config: Dict[str, Any]) -> PangeaChatConfig:
         config = dict(config)
@@ -655,6 +783,15 @@ class PangeaChat:
         public_courses_backfill_l2 = config.get("public_courses_backfill_l2", False)
         if not isinstance(public_courses_backfill_l2, bool):
             raise ValueError('Config "public_courses_backfill_l2" must be a boolean')
+
+        central_course_admin_user_ids = config.get("central_course_admin_user_ids", [])
+        if not isinstance(central_course_admin_user_ids, list) or not all(
+            isinstance(u, str) and u.startswith("@") and ":" in u
+            for u in central_course_admin_user_ids
+        ):
+            raise ValueError(
+                "central_course_admin_user_ids must be a list of full Matrix user IDs"
+            )
 
         public_courses_cms_cache_ttl_seconds = config.get(
             "public_courses_cms_cache_ttl_seconds", 5
@@ -759,6 +896,22 @@ class PangeaChat:
                 raise ValueError(
                     'Config "user_activity_notification_bot_user_id" must not be empty'
                 )
+        user_activity_refresh_interval_seconds = config.get(
+            "user_activity_refresh_interval_seconds", 300
+        )
+        if (
+            isinstance(user_activity_refresh_interval_seconds, bool)
+            or not isinstance(user_activity_refresh_interval_seconds, int)
+            or user_activity_refresh_interval_seconds < 0
+        ):
+            raise ValueError(
+                'Config "user_activity_refresh_interval_seconds" must be an integer >= 0 (0 turns the loop off)'
+            )
+        user_activity_refresh_on_read = config.get(
+            "user_activity_refresh_on_read", False
+        )
+        if not isinstance(user_activity_refresh_on_read, bool):
+            raise ValueError('Config "user_activity_refresh_on_read" must be a boolean')
 
         # --- delete_user config ---
         delete_user_requests_per_burst = config.get("delete_user_requests_per_burst", 5)
@@ -891,6 +1044,19 @@ class PangeaChat:
             raise ValueError(
                 "find_user_by_email_burst_duration_seconds must be an integer >= 1"
             )
+        find_user_by_email_rate_limit_exempt_user_ids = config.get(
+            "find_user_by_email_rate_limit_exempt_user_ids", []
+        )
+        if not isinstance(
+            find_user_by_email_rate_limit_exempt_user_ids, list
+        ) or not all(
+            isinstance(u, str) and u.startswith("@") and ":" in u
+            for u in find_user_by_email_rate_limit_exempt_user_ids
+        ):
+            raise ValueError(
+                "find_user_by_email_rate_limit_exempt_user_ids must be a list of "
+                "full Matrix user IDs"
+            )
 
         # --- course_member_emails config ---
         course_member_emails_enabled = config.get("course_member_emails_enabled", False)
@@ -918,6 +1084,17 @@ class PangeaChat:
             raise ValueError(
                 "course_member_emails_burst_duration_seconds must be an integer >= 1"
             )
+
+        # --- member_analytics_profiles config ---
+        member_analytics_profiles_limits: Dict[str, int] = {}
+        for key, default in (
+            ("member_analytics_profiles_requests_per_burst", 30),
+            ("member_analytics_profiles_burst_duration_seconds", 60),
+        ):
+            value = config.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{key} must be an integer >= 1")
+            member_analytics_profiles_limits[key] = value
 
         # --- safety incidents config ---
         safety_limits: Dict[str, int] = {}
@@ -978,10 +1155,26 @@ class PangeaChat:
             if not send_push_sygnal_url.strip():
                 raise ValueError('Config "send_push_sygnal_url" must not be empty')
 
+        send_push_allowed_sygnal_urls = config.get("send_push_allowed_sygnal_urls", [])
+        if not isinstance(send_push_allowed_sygnal_urls, list) or not all(
+            isinstance(url, str) and url.strip()
+            for url in send_push_allowed_sygnal_urls
+        ):
+            raise ValueError(
+                'Config "send_push_allowed_sygnal_urls" must be a list of URLs'
+            )
+
         # --- notice_delivery config ---
         notice_email_enabled = config.get("notice_email_enabled", False)
         if not isinstance(notice_email_enabled, bool):
             raise ValueError('Config "notice_email_enabled" must be a boolean')
+        notice_missed_message_unsubscribe_enabled = config.get(
+            "notice_missed_message_unsubscribe_enabled", False
+        )
+        if not isinstance(notice_missed_message_unsubscribe_enabled, bool):
+            raise ValueError(
+                'Config "notice_missed_message_unsubscribe_enabled" must be a boolean'
+            )
         notice_suppress_notice_push_rules = config.get(
             "notice_suppress_notice_push_rules", True
         )
@@ -1041,10 +1234,27 @@ class PangeaChat:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f'Config "{key}" must be an integer >= 1')
             notice_admin_limits[key] = value
+        notice_external_link_hosts = config.get(
+            "notice_external_link_hosts", list(DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS)
+        )
+        if not isinstance(notice_external_link_hosts, list) or not all(
+            isinstance(host, str) and host.strip() and "/" not in host
+            for host in notice_external_link_hosts
+        ):
+            raise ValueError(
+                'Config "notice_external_link_hosts" must be a list of host names'
+            )
+        notice_external_link_hosts = [
+            host.strip().lower() for host in notice_external_link_hosts
+        ]
 
         blocked_join_gate_enabled = config.get("blocked_join_gate_enabled", True)
         if not isinstance(blocked_join_gate_enabled, bool):
             raise ValueError('Config "blocked_join_gate_enabled" must be a boolean')
+
+        course_default_chats_enabled = config.get("course_default_chats_enabled", True)
+        if not isinstance(course_default_chats_enabled, bool):
+            raise ValueError('Config "course_default_chats_enabled" must be a boolean')
 
         # --- delayed_push config ---
         delayed_push = config.get("delayed_push", {})
@@ -1349,6 +1559,7 @@ class PangeaChat:
             course_plan_state_event_type=course_plan_state_event_type,
             public_courses_cms_cache_ttl_seconds=public_courses_cms_cache_ttl_seconds,
             public_courses_backfill_l2=public_courses_backfill_l2,
+            central_course_admin_user_ids=central_course_admin_user_ids,
             room_preview_state_event_types=all_event_types,
             room_preview_burst_duration_seconds=room_preview_burst_duration_seconds,
             room_preview_requests_per_burst=room_preview_requests_per_burst,
@@ -1363,6 +1574,8 @@ class PangeaChat:
             user_activity_requests_per_burst=user_activity_requests_per_burst,
             user_activity_burst_duration_seconds=user_activity_burst_duration_seconds,
             user_activity_notification_bot_user_id=user_activity_notification_bot_user_id,
+            user_activity_refresh_interval_seconds=user_activity_refresh_interval_seconds,
+            user_activity_refresh_on_read=user_activity_refresh_on_read,
             delete_user_requests_per_burst=delete_user_requests_per_burst,
             delete_user_burst_duration_seconds=delete_user_burst_duration_seconds,
             delete_user_schedule_delay_seconds=delete_user_schedule_delay_seconds,
@@ -1381,9 +1594,16 @@ class PangeaChat:
             user_directory_search_burst_duration_seconds=user_directory_search_burst_duration_seconds,
             find_user_by_email_requests_per_burst=find_user_by_email_requests_per_burst,
             find_user_by_email_burst_duration_seconds=find_user_by_email_burst_duration_seconds,
+            find_user_by_email_rate_limit_exempt_user_ids=find_user_by_email_rate_limit_exempt_user_ids,
             course_member_emails_enabled=course_member_emails_enabled,
             course_member_emails_requests_per_burst=course_member_emails_requests_per_burst,
             course_member_emails_burst_duration_seconds=course_member_emails_burst_duration_seconds,
+            member_analytics_profiles_requests_per_burst=member_analytics_profiles_limits[
+                "member_analytics_profiles_requests_per_burst"
+            ],
+            member_analytics_profiles_burst_duration_seconds=member_analytics_profiles_limits[
+                "member_analytics_profiles_burst_duration_seconds"
+            ],
             safety_report_requests_per_burst=safety_limits[
                 "safety_report_requests_per_burst"
             ],
@@ -1406,7 +1626,9 @@ class PangeaChat:
             send_push_requests_per_burst=send_push_requests_per_burst,
             send_push_burst_duration_seconds=send_push_burst_duration_seconds,
             send_push_sygnal_url=send_push_sygnal_url,
+            send_push_allowed_sygnal_urls=send_push_allowed_sygnal_urls,
             notice_email_enabled=notice_email_enabled,
+            notice_missed_message_unsubscribe_enabled=notice_missed_message_unsubscribe_enabled,
             notice_suppress_notice_push_rules=notice_suppress_notice_push_rules,
             notice_token_secret=notice_token_secret,
             notice_token_ttl_days=notice_token_ttl_days,
@@ -1417,11 +1639,13 @@ class PangeaChat:
                 "notice_admin_requests_per_minute"
             ],
             notice_admin_burst=notice_admin_limits["notice_admin_burst"],
+            notice_external_link_hosts=notice_external_link_hosts,
             delayed_push_enabled=delayed_push_enabled,
             delayed_push_delay_ms=delayed_push_delay_ms,
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,
             delayed_push_require_synapse_version=delayed_push_require_synapse_version,
             blocked_join_gate_enabled=blocked_join_gate_enabled,
+            course_default_chats_enabled=course_default_chats_enabled,
             moderation_tier1_enabled=moderation_tier1_enabled,
             moderation_tier1_phone_regions=moderation_tier1_phone_regions,
             moderation_tier2_enabled=moderation_tier2_enabled,

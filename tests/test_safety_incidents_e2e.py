@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 from urllib.parse import quote
 
 import requests
@@ -20,27 +20,30 @@ from .base_e2e import BaseSynapseE2ETest
 from .mock_moderation_server import MockModerationServer
 
 _SYNAPSE_CONFIG = {
-    "rc_login": {
-        "address": {"per_second": 9999, "burst_count": 9999},
-        "account": {"per_second": 9999, "burst_count": 9999},
-    },
     "rc_joins": {"local": {"per_second": 9999, "burst_count": 9999}},
     "rc_message": {"per_second": 9999, "burst_count": 9999},
 }
 
-_REPORT = "http://localhost:8008/_synapse/client/pangea/v1/report"
-_INCIDENTS = "http://localhost:8008/_synapse/client/pangea/v1/safety_incidents"
-
 
 class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
+    # The homeserver's config carries the mock's port, so the mock lives as
+    # long as the class's shared homeserver.
+    moderation: MockModerationServer
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.moderation = MockModerationServer().start()
+        cls.addClassCleanup(cls.moderation.stop)
+
+    def _report_url(self) -> str:
+        return f"{self.server_url}/_synapse/client/pangea/v1/report"
+
+    def _incidents_url(self) -> str:
+        return f"{self.server_url}/_synapse/client/pangea/v1/safety_incidents"
+
     def _headers(self, token: str) -> Dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
-
-    async def _user(
-        self, config_path: str, synapse_dir: str, name: str
-    ) -> Tuple[str, str]:
-        await self.register_user(config_path, synapse_dir, name, f"{name}-pw", False)
-        return await self.login_user(name, f"{name}-pw")
 
     def _create_room(self, token: str, **extra: Any) -> str:
         body: Dict[str, Any] = {"visibility": "private", "preset": "public_chat"}
@@ -95,7 +98,7 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
         self, token: str, room_id: str, event_id: str, report_id: str, reason: str
     ) -> requests.Response:
         return requests.post(
-            _REPORT,
+            self._report_url(),
             json={
                 "report_id": report_id,
                 "room_id": room_id,
@@ -107,7 +110,9 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
 
     def _incidents(self, token: str, space_id: str) -> requests.Response:
         return requests.get(
-            _INCIDENTS, params={"space_id": space_id}, headers=self._headers(token)
+            self._incidents_url(),
+            params={"space_id": space_id},
+            headers=self._headers(token),
         )
 
     def _wait_for_incident(
@@ -130,169 +135,136 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
         self.fail(f"no matching incident; last seen: {last}")
 
     async def test_reports_moderation_and_the_course_admin_read(self) -> None:
-        mock = MockModerationServer().start()
-        postgres = synapse_dir = server_process = stdout_thread = stderr_thread = None
-        try:
-            (
-                postgres,
-                synapse_dir,
-                config_path,
-                server_process,
-                stdout_thread,
-                stderr_thread,
-            ) = await self.start_test_synapse(
-                module_config={
-                    "moderation": {
-                        "tier1_enabled": True,
-                        "tier1_phone_regions": ["US"],
-                        "tier2_enabled": True,
-                        "choreo_base_url": mock.base_url,
-                        "choreo_access_token": "syt_mock_service_token",
-                    },
+        await self.homeserver(
+            module_config={
+                "moderation": {
+                    "tier1_enabled": True,
+                    "tier1_phone_regions": ["US"],
+                    "tier2_enabled": True,
+                    "choreo_base_url": self.moderation.base_url,
+                    "choreo_access_token": "syt_mock_service_token",
                 },
-                synapse_config_overrides=_SYNAPSE_CONFIG,
-            )
-            (teacher_id, teacher) = await self._user(
-                config_path, synapse_dir, "teacher"
-            )
-            (learner_id, learner) = await self._user(
-                config_path, synapse_dir, "learner"
-            )
-            (_, outsider) = await self._user(config_path, synapse_dir, "outsider")
+            },
+            synapse_config_overrides=_SYNAPSE_CONFIG,
+        )
+        (teacher_id, teacher) = await self.new_user("teacher")
+        (learner_id, learner) = await self.new_user("learner")
+        (_, outsider) = await self.new_user("outsider")
 
-            course = self._course(teacher)
-            other_course = self._course(teacher)
-            self._join(course, learner)
-            chat = self._create_room(
-                teacher,
-                name="Week 3 chat",
-                preset="private_chat",
-                initial_state=[
-                    {
-                        "type": "m.room.history_visibility",
-                        "state_key": "",
-                        "content": {"history_visibility": "joined"},
-                    }
-                ],
-            )
-            requests.post(
-                f"{self.server_url}/_matrix/client/v3/rooms/{quote(chat, safe='')}/invite",
-                json={"user_id": learner_id},
-                headers=self._headers(teacher),
-            )
-            self._join(chat, learner)
-            sent = self._send(chat, learner, "you are rudely unkind")
-            self.assertEqual(sent.status_code, 200, sent.text)
-            event_id = sent.json()["event_id"]
-            outsider_room = self._create_room(outsider)
-            elsewhere = self._send(outsider_room, outsider, "elsewhere").json()[
-                "event_id"
-            ]
+        course = self._course(teacher)
+        other_course = self._course(teacher)
+        self._join(course, learner)
+        chat = self._create_room(
+            teacher,
+            name="Week 3 chat",
+            preset="private_chat",
+            initial_state=[
+                {
+                    "type": "m.room.history_visibility",
+                    "state_key": "",
+                    "content": {"history_visibility": "joined"},
+                }
+            ],
+        )
+        requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{quote(chat, safe='')}/invite",
+            json={"user_id": learner_id},
+            headers=self._headers(teacher),
+        )
+        self._join(chat, learner)
+        sent = self._send(chat, learner, "you are rudely unkind")
+        self.assertEqual(sent.status_code, 200, sent.text)
+        event_id = sent.json()["event_id"]
+        outsider_room = self._create_room(outsider)
+        elsewhere = self._send(outsider_room, outsider, "elsewhere").json()["event_id"]
 
-            # --- A browser's preflight is answered, with CORS, by Synapse ---
-            for url in (_REPORT, _INCIDENTS):
-                preflight = requests.options(
-                    url,
-                    headers={
-                        "Origin": "https://app.pangea.chat",
-                        "Access-Control-Request-Method": "POST",
-                        "Access-Control-Request-Headers": "authorization,content-type",
-                    },
-                )
-                self.assertEqual(preflight.status_code, 204, preflight.text)
-                self.assertIn("Access-Control-Allow-Origin", preflight.headers)
+        # --- A browser's preflight is answered, with CORS, by Synapse ---
+        for url in (self._report_url(), self._incidents_url()):
+            preflight = requests.options(
+                url,
+                headers={
+                    "Origin": "https://app.pangea.chat",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "authorization,content-type",
+                },
+            )
+            self.assertEqual(preflight.status_code, 204, preflight.text)
+            self.assertIn("Access-Control-Allow-Origin", preflight.headers)
 
-            # --- The report endpoint ---
-            report_id = str(uuid.uuid4())
-            resp = self._report(teacher, chat, event_id, report_id, "unkind\x00!")
-            self.assertEqual(resp.status_code, 200, resp.text)
-            self.assertEqual(resp.json(), {"incident_id": f"report:{report_id}"})
-            retry = self._report(teacher, chat, event_id, report_id, "unkind\x00!")
-            self.assertEqual((retry.status_code, retry.json()), (200, resp.json()))
-            # Unknown event, an event from another room, and an event the
-            # caller cannot see: an outsider who was never in the room.
-            self.assertEqual(
-                self._report(
-                    teacher, chat, "$nope", str(uuid.uuid4()), "x"
-                ).status_code,
-                404,
-            )
-            self.assertEqual(
-                self._report(
-                    teacher, chat, elsewhere, str(uuid.uuid4()), "x"
-                ).status_code,
-                403,
-            )
-            self.assertEqual(
-                self._report(
-                    outsider, chat, event_id, str(uuid.uuid4()), "x"
-                ).status_code,
-                403,
-            )
+        # --- The report endpoint ---
+        report_id = str(uuid.uuid4())
+        resp = self._report(teacher, chat, event_id, report_id, "unkind\x00!")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), {"incident_id": f"report:{report_id}"})
+        retry = self._report(teacher, chat, event_id, report_id, "unkind\x00!")
+        self.assertEqual((retry.status_code, retry.json()), (200, resp.json()))
+        # Unknown event, an event from another room, and an event the
+        # caller cannot see: an outsider who was never in the room.
+        self.assertEqual(
+            self._report(teacher, chat, "$nope", str(uuid.uuid4()), "x").status_code,
+            404,
+        )
+        self.assertEqual(
+            self._report(teacher, chat, elsewhere, str(uuid.uuid4()), "x").status_code,
+            403,
+        )
+        self.assertEqual(
+            self._report(outsider, chat, event_id, str(uuid.uuid4()), "x").status_code,
+            403,
+        )
 
-            # --- Tier 1 and Tier 2 land on the learner's course ---
-            blocked = self._send(chat, learner, "text me at 415-555-2671")
-            self.assertEqual(blocked.status_code, 403, blocked.text)
-            flagged = self._send(chat, learner, "FLAGME you are awful")
-            self.assertEqual(flagged.status_code, 200, flagged.text)
-            flagged_id = flagged.json()["event_id"]
+        # --- Tier 1 and Tier 2 land on the learner's course ---
+        blocked = self._send(chat, learner, "text me at 415-555-2671")
+        self.assertEqual(blocked.status_code, 403, blocked.text)
+        flagged = self._send(chat, learner, "FLAGME you are awful")
+        self.assertEqual(flagged.status_code, 200, flagged.text)
+        flagged_id = flagged.json()["event_id"]
 
-            # --- The read endpoint ---
-            reported = self._wait_for_incident(
-                teacher, course, lambda i: i["incident_id"] == f"report:{report_id}"
-            )
-            self.assertEqual(reported["subject_id"], learner_id)
-            self.assertEqual(reported["reporter_id"], teacher_id)
-            self.assertEqual(reported["text"], "you are rudely unkind")
-            self.assertEqual(reported["reason"], "unkind␀!")
-            self.assertEqual(reported["action"], "reported")
-            self.assertEqual(reported["room_name"], "Week 3 chat")
-            self.assertNotIn("course_ids", reported)
-            block = self._wait_for_incident(
-                teacher, course, lambda i: i["action"] == "blocked"
-            )
-            self.assertEqual(block["text"], "text me at 415-555-2671")
-            self.assertIsNone(block["event_id"])
-            removed = self._wait_for_incident(
-                teacher,
-                course,
-                lambda i: i["event_id"] == flagged_id and i["outcome"] == "removed",
-            )
-            self.assertEqual(removed["action"], "redacted")
-            self.assertEqual(removed["text"], "FLAGME you are awful")
-            rows = self._incidents(teacher, course).json()["incidents"]
-            self.assertEqual(
-                [(r["created_ms"], r["incident_id"]) for r in rows],
-                sorted((r["created_ms"], r["incident_id"]) for r in rows),
-            )
-            # The teacher's other course gets none of it.
-            self.assertEqual(
-                self._incidents(teacher, other_course).json()["incidents"], []
-            )
+        # --- The read endpoint ---
+        reported = self._wait_for_incident(
+            teacher, course, lambda i: i["incident_id"] == f"report:{report_id}"
+        )
+        self.assertEqual(reported["subject_id"], learner_id)
+        self.assertEqual(reported["reporter_id"], teacher_id)
+        self.assertEqual(reported["text"], "you are rudely unkind")
+        self.assertEqual(reported["reason"], "unkind␀!")
+        self.assertEqual(reported["action"], "reported")
+        self.assertEqual(reported["room_name"], "Week 3 chat")
+        self.assertNotIn("course_ids", reported)
+        block = self._wait_for_incident(
+            teacher, course, lambda i: i["action"] == "blocked"
+        )
+        self.assertEqual(block["text"], "text me at 415-555-2671")
+        self.assertIsNone(block["event_id"])
+        removed = self._wait_for_incident(
+            teacher,
+            course,
+            lambda i: i["event_id"] == flagged_id and i["outcome"] == "removed",
+        )
+        self.assertEqual(removed["action"], "redacted")
+        self.assertEqual(removed["text"], "FLAGME you are awful")
+        rows = self._incidents(teacher, course).json()["incidents"]
+        self.assertEqual(
+            [(r["created_ms"], r["incident_id"]) for r in rows],
+            sorted((r["created_ms"], r["incident_id"]) for r in rows),
+        )
+        # The teacher's other course gets none of it.
+        self.assertEqual(self._incidents(teacher, other_course).json()["incidents"], [])
 
-            # --- Refusals: the same 403 for each ---
-            denied = self._incidents(learner, course)
-            self.assertEqual(denied.status_code, 403, denied.text)
-            for token, room in ((outsider, course), (teacher, chat)):
-                resp = self._incidents(token, room)
-                self.assertEqual(resp.status_code, 403, resp.text)
-                self.assertEqual(resp.json(), denied.json())
-            self._leave(course, teacher)
-            departed = self._incidents(teacher, course)
-            self.assertEqual(departed.status_code, 403, departed.text)
-            self.assertEqual(requests.get(_INCIDENTS).status_code, 401)
+        # --- Refusals: the same 403 for each ---
+        denied = self._incidents(learner, course)
+        self.assertEqual(denied.status_code, 403, denied.text)
+        for token, room in ((outsider, course), (teacher, chat)):
+            resp = self._incidents(token, room)
+            self.assertEqual(resp.status_code, 403, resp.text)
+            self.assertEqual(resp.json(), denied.json())
+        self._leave(course, teacher)
+        departed = self._incidents(teacher, course)
+        self.assertEqual(departed.status_code, 403, departed.text)
+        self.assertEqual(requests.get(self._incidents_url()).status_code, 401)
 
-            # --- Neither text nor reason reaches the server log ---
-            log_text = "\n".join(self.server_stdout_lines + self.server_stderr_lines)
-            self.assertIn("safety report recorded as", log_text)
-            for secret in ("you are rude", "unkind", "FLAGME you are awful"):
-                self.assertNotIn(secret, log_text)
-        finally:
-            mock.stop()
-            self.stop_synapse(
-                server_process=server_process,
-                stdout_thread=stdout_thread,
-                stderr_thread=stderr_thread,
-                synapse_dir=synapse_dir,
-                postgres=postgres,
-            )
+        # --- Neither text nor reason reaches the server log ---
+        log_text = "\n".join(self.server_log())
+        self.assertIn("safety report recorded as", log_text)
+        for secret in ("you are rude", "unkind", "FLAGME you are awful"):
+            self.assertNotIn(secret, log_text)

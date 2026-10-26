@@ -6,7 +6,7 @@ import html
 import json
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Dict, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, cast
 
 from synapse.api.constants import PresenceState
 from synapse.api.errors import (
@@ -21,6 +21,7 @@ from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.config import DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS
 from synapse_pangea_chat.direct_push.direct_push import DirectPush
 from synapse_pangea_chat.direct_push.types import SendPushRequest
 from synapse_pangea_chat.notice_delivery.categories import (
@@ -36,6 +37,7 @@ from synapse_pangea_chat.notice_delivery.common import (
     TOKEN_KIND_UNSUBSCRIBE,
     category_label,
     click_url,
+    item_slot,
     now_ms,
     public_baseurl,
     token_secret,
@@ -51,11 +53,18 @@ from synapse_pangea_chat.notice_delivery.push_rule import ensure_bot_notice_push
 from synapse_pangea_chat.notice_delivery.rate_limit import AdminRateLimiter
 from synapse_pangea_chat.notice_delivery.request import (
     EMAIL_ONLY,
+    SECONDARY_SLOT,
+    Destination,
     NoticeRequest,
     is_structured,
 )
 from synapse_pangea_chat.notice_delivery.schedule import NoticeSchedule
 from synapse_pangea_chat.notice_delivery.tokens import MILLISECONDS_PER_DAY, sign_token
+from synapse_pangea_chat.notice_delivery.transport_claim import (
+    PHASE_COMPLETE,
+    PHASE_PENDING,
+    TransportClaims,
+)
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -79,6 +88,19 @@ def _optional_str(value: Any) -> Optional[str]:
     return None
 
 
+def _push_content(body: Dict[str, Any], req: Optional[NoticeRequest]) -> Dict[str, Any]:
+    """The push payload's content. A caller's structured push carries only
+    ``pangea.*`` routing keys; the client's tap handler writes the opened record
+    from ``check_in_type``, so the service sets it from the validated variant."""
+    if not (req and req.push):
+        return body.get("content") or {}
+    content = dict(req.push.content)
+    variant = _optional_str(body.get("variant"))
+    if variant:
+        content["check_in_type"] = variant
+    return content
+
+
 class DeliverNotice(Resource):
     isLeaf = True
 
@@ -96,7 +118,11 @@ class DeliverNotice(Resource):
             config.notice_admin_requests_per_minute, config.notice_admin_burst
         )
         self._delivery_log = DeliveryLog(api, config)
-        self.schedule = NoticeSchedule(api, self._deliver_scheduled)
+        self._transport_claims = TransportClaims(api)
+        self.schedule = NoticeSchedule(
+            api, self._deliver_scheduled, config.notice_external_link_hosts
+        )
+
         self._send_email_handler = self._hs.get_send_email_handler()
         self._app_name = self._hs.config.email.email_app_name
         [self._email_html, self._email_text] = api.read_templates(
@@ -151,7 +177,7 @@ class DeliverNotice(Resource):
                     request, 400, {"error": "Invalid JSON"}, send_cors=True
                 )
                 return
-            error = self._validate(body)
+            error = self._validate(body, self._config.notice_external_link_hosts)
             if error is not None:
                 respond_with_json(request, 400, {"error": error}, send_cors=True)
                 return
@@ -201,10 +227,12 @@ class DeliverNotice(Resource):
         return parsed if isinstance(parsed, dict) else None
 
     @staticmethod
-    def _validate(body: Dict[str, Any]) -> Optional[str]:
+    def _validate(
+        body: Dict[str, Any], external_link_hosts: Optional[Iterable[str]] = None
+    ) -> Optional[str]:
         if is_structured(body):
             try:
-                NoticeRequest.parse(body)
+                NoticeRequest.parse(body, external_link_hosts=external_link_hosts)
             except ValueError as error:
                 return str(error)
             return None
@@ -218,25 +246,47 @@ class DeliverNotice(Resource):
         content = body.get("content")
         if content is not None and not isinstance(content, dict):
             return "content must be an object"
+        if body.get("secondary_destination") is not None:
+            # The flat body renders the module's own template, which has one
+            # call to action; a second link needs caller-rendered email.
+            return "secondary_destination requires structured email content"
+        if body.get("item_destinations") is not None:
+            # A list's links are slots in caller-rendered copy, which the flat body has none of.
+            return "item_destinations requires structured email content"
+        if body.get("destination") is not None:
+            try:
+                Destination.parse(
+                    body["destination"],
+                    DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS
+                    if external_link_hosts is None
+                    else external_link_hosts,
+                )
+            except ValueError as error:
+                return str(error)
         return None
+
+    def _parse(self, body: Dict[str, Any]) -> NoticeRequest:
+        return NoticeRequest.parse(
+            body, external_link_hosts=self._config.notice_external_link_hosts
+        )
 
     async def deliver(
         self, body: Dict[str, Any], *, requested_by: Optional[str] = None
     ) -> Dict[str, Any]:
         """Shared entry point for HTTP operators and trusted internal flows."""
-        error = self._validate(body)
+        error = self._validate(body, self._config.notice_external_link_hosts)
         if error:
             raise ValueError(error)
+        body = {**body, "_requested_by": requested_by or body.get("sender_id")}
         if "scheduled_at" in body:
-            body = {**body, "_requested_by": requested_by or body["sender_id"]}
-            req = NoticeRequest.parse(body)
+            req = self._parse(body)
             await self._validate_scheduled_target(body, req)
             return await self.schedule.enqueue(body)
         return await self._deliver_now(body)
 
     async def _deliver_scheduled(self, body: Dict[str, Any]) -> Dict[str, Any]:
         # Revalidate persisted content and eligibility; never run through enqueue.
-        NoticeRequest.parse(body)
+        self._parse(body)
         return await self._deliver_now(body)
 
     async def _validate_scheduled_target(
@@ -264,19 +314,42 @@ class DeliverNotice(Resource):
 
     async def _deliver_now(self, body: Dict[str, Any]) -> Dict[str, Any]:
         body = dict(body)
-        req = NoticeRequest.parse(body) if is_structured(body) else None
+        req = self._parse(body) if is_structured(body) else None
         record_id = None
+        # The push stands in for the notice event, so it is sent as that event's
+        # sender: a scheduled notice's sender_id, or the admin that asked when
+        # there is no event to read (notice-delivery.instructions.md, Direct push).
+        body["_push_sender"] = body.get("sender_id") or body.get("_requested_by")
+
         if req is not None:
             if req.notice_event_id is not None:
-                await self._validate_notice(req)
-            record_id, previous = await self._delivery_log.reserve(req)
-            if previous is not None:
-                return {
-                    **previous,
-                    "notification_log_id": record_id,
-                    "log_status": "complete",
-                    "duplicate": True,
-                }
+                body["_push_sender"] = await self._validate_notice(req)
+            if req.caller_owns_record:
+                # The caller wrote the Notification_Log row and will write the receipt onto
+                # it; this module touches the record not at all (engagement-system doc).
+                # One delivery call per decision still means one transport: the claim
+                # below is the module's own, keyed by the caller's row.
+                record_id = req.notification_log_id
+                assert record_id is not None
+                claimed, previous = await self._transport_claims.claim(
+                    record_id, req.user_id, body
+                )
+                if not claimed and previous is not None:
+                    return {
+                        **previous,
+                        "notification_log_id": record_id,
+                        "log_status": "caller",
+                        "duplicate": True,
+                    }
+            else:
+                record_id, previous = await self._delivery_log.reserve(req)
+                if previous is not None:
+                    return {
+                        **previous,
+                        "notification_log_id": record_id,
+                        "log_status": "complete",
+                        "duplicate": True,
+                    }
         result: Dict[str, Any]
         if req is not None and req.notice_event_id is None:
             reason: Optional[str]
@@ -302,13 +375,27 @@ class DeliverNotice(Resource):
                     "push_rule_installed": False,
                 }
             else:
-                result = await self._deliver_once(body, req)
+                result = await self._transport(body, req, record_id)
             req = replace(req, notice_event_id=body.get("notice_event_id"))
             result["notice_event_id"] = req.notice_event_id
             result["notice_room_id"] = req.notice_room_id
         else:
-            result = await self._deliver_once(body, req)
-        if req is not None and record_id is not None:
+            result = await self._transport(body, req, record_id)
+        if req is not None and req.caller_owns_record:
+            assert record_id is not None
+            result.update(notification_log_id=record_id, log_status="caller")
+            uncertain = (result.get("reason") or "").endswith("send_failed")
+            # The claim replays this on a retry: counts only, never device tokens.
+            stored = dict(result)
+            push = result.get("push")
+            if push:
+                stored["push"] = {
+                    k: push.get(k) for k in ("attempted", "sent", "failed")
+                }
+            await self._transport_claims.finish(
+                record_id, PHASE_PENDING if uncertain else PHASE_COMPLETE, stored
+            )
+        elif req is not None and record_id is not None:
             result.update(
                 notification_log_id=record_id, log_status="complete", duplicate=False
             )
@@ -328,7 +415,26 @@ class DeliverNotice(Resource):
                 result["log_status"] = "pending_reconciliation"
         return result
 
-    async def _validate_notice(self, req: NoticeRequest) -> None:
+    async def _transport(
+        self,
+        body: Dict[str, Any],
+        req: Optional[NoticeRequest],
+        record_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """One transport attempt. For a caller-owned record an exception after the claim
+        leaves the claim uncertain with a sanitized reason, so a retry reconciles instead of
+        sending again."""
+        try:
+            return await self._deliver_once(body, req)
+        except Exception as error:
+            if req is not None and req.caller_owns_record and record_id is not None:
+                await self._transport_claims.mark_uncertain(
+                    record_id, type(error).__name__
+                )
+            raise
+
+    async def _validate_notice(self, req: NoticeRequest) -> str:
+        """Checks the referenced notice and returns its sender."""
         assert req.notice_event_id is not None
         event = await self._store.get_event(req.notice_event_id, allow_none=True)
         if (
@@ -348,6 +454,7 @@ class DeliverNotice(Resource):
             raise ValueError(
                 "Recipient must be a joined local member of the notice room"
             )
+        return event.sender
 
     async def _deliver_once(
         self, body: Dict[str, Any], req: Optional[NoticeRequest]
@@ -399,6 +506,12 @@ class DeliverNotice(Resource):
                 }
             )
             body["notice_event_id"] = event.event_id
+            if req.caller_owns_record and req.notification_log_id is not None:
+                # Persist the event on the claim before any transport, so a crash
+                # during SMTP or push leaves the reference reconciliation needs.
+                await self._transport_claims.record_event(
+                    req.notification_log_id, event.event_id
+                )
 
         method = (
             req.method
@@ -427,14 +540,13 @@ class DeliverNotice(Resource):
 
         push_request: Dict[str, Any] = {
             "user_id": user_id,
+            "sender": body.get("_push_sender"),
             "body": req.push.body if req and req.push else body["body"],
             "title": req.push.title if req and req.push else body.get("title"),
             "room_id": _optional_str(body.get("notice_room_id")),
             "event_id": _optional_str(body.get("notice_event_id")),
             "type": BOT_NOTICE_EVENT_TYPE,
-            "content": req.push.content
-            if req and req.push
-            else body.get("content") or {},
+            "content": _push_content(body, req),
             "prio": "high",
         }
         push = await self._direct_push._send_push(
@@ -528,27 +640,55 @@ class DeliverNotice(Resource):
         now = now_ms(self._api)
         ttl_ms = self._config.notice_token_ttl_days * MILLISECONDS_PER_DAY
         variant = _optional_str(body.get("variant"))
-        click_token = sign_token(
-            secret,
-            {
-                "k": TOKEN_KIND_CLICK,
-                "u": user_id,
-                "e": _optional_str(body.get("notice_event_id")),
-                "r": _optional_str(body.get("notice_room_id")),
-                "v": variant,
-                "a": _optional_str(body.get("activity_id")),
-                "s": _optional_str(body.get("session_room_id")),
-            },
-            now_ms=now,
-            ttl_ms=ttl_ms,
-        )
+        items: tuple = ()
+        if req is not None:
+            primary, secondary = req.destination, req.secondary_destination
+            items = req.item_destinations
+        else:
+            primary = (
+                Destination.parse(
+                    body["destination"], self._config.notice_external_link_hosts
+                )
+                if body.get("destination") is not None
+                else Destination.from_ids(body)
+            )
+            secondary = None
+
+        def click_token(destination: Destination, link: str) -> str:
+            # Each link is its own signed token naming its destination and
+            # which link it is; `a`/`s` stay for links issued before `d`.
+            return sign_token(
+                secret,
+                {
+                    "k": TOKEN_KIND_CLICK,
+                    "u": user_id,
+                    "e": _optional_str(body.get("notice_event_id")),
+                    "r": _optional_str(body.get("notice_room_id")),
+                    "v": variant,
+                    "a": _optional_str(body.get("activity_id")),
+                    "s": _optional_str(body.get("session_room_id")),
+                    "d": destination.compact(),
+                    "l": link,
+                },
+                now_ms=now,
+                ttl_ms=ttl_ms,
+            )
+
         unsubscribe_token = sign_token(
             secret,
             {"k": TOKEN_KIND_UNSUBSCRIBE, "u": user_id, "c": category},
             now_ms=now,
             ttl_ms=ttl_ms,
         )
-        cta_url = click_url(base, click_token)
+        cta_url = click_url(base, click_token(primary, "cta"))
+        cta2_url = (
+            click_url(base, click_token(secondary, "cta2")) if secondary else None
+        )
+        # Each item of a list is its own signed link, named by its place (item1 …).
+        item_urls = {
+            item_slot(i): click_url(base, click_token(dest, f"item{i}"))
+            for i, dest in enumerate(items, start=1)
+        }
         unsub_url = unsubscribe_url(base, unsubscribe_token)
 
         email_content = req.email if req else None
@@ -583,7 +723,11 @@ class DeliverNotice(Resource):
                 "{{receiving_reason}}": email_content.receiving_reason,
                 "{{postal_address}}": self._config.notice_email_postal_address or "",
             }
+            if cta2_url is not None:
+                replacements[SECONDARY_SLOT] = cta2_url
+            replacements.update(item_urls)
             rendered_html, rendered_text = email_content.html, email_content.text
+
             for slot, value in replacements.items():
                 rendered_html = rendered_html.replace(
                     slot, html.escape(value, quote=True)

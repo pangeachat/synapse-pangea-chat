@@ -105,6 +105,10 @@ class DirectPush(Resource):
                 )
                 return
 
+            # The push names its sender: the admin that asked for it, never a
+            # caller-supplied or hardcoded account. The client follows a notice's
+            # app path only when this is its environment's bot.
+            body["sender"] = requester_id
             response = await self._send_push(target_user_id, device_id, body)
             respond_with_json(request, 200, response, send_cors=True)
 
@@ -176,7 +180,9 @@ class DirectPush(Resource):
 
             try:
                 payload = self._build_payload(event_id, req_body, pusher)
-                success = await self._post_to_sygnal(payload)
+                success = await self._post_to_sygnal(
+                    self._sygnal_url_for(pusher), payload
+                )
 
                 if success:
                     status["sent"] = True
@@ -240,7 +246,7 @@ class DirectPush(Resource):
                 "event_id": event_id,
                 "room_id": req_body.get("room_id"),
                 "type": req_body.get("type", "m.room.message"),
-                "sender": "@bot:pangea.chat",
+                "sender": req_body.get("sender"),
                 "sender_display_name": req_body.get("title") or "Pangea Bot",
                 "room_name": "",
                 "room_avatar_url": None,
@@ -286,10 +292,19 @@ class DirectPush(Resource):
             return False
         return True
 
-    async def _post_to_sygnal(self, payload: Dict[str, Any]) -> bool:
+    def _sygnal_url_for(self, pusher: Dict[str, Any]) -> Optional[str]:
+        """The Sygnal the device registered when it is an allowed one, else the
+        configured default (notice-delivery.instructions.md, "Which Sygnal")."""
+        registered_url = (pusher.get("data") or {}).get("url")
+        if registered_url in self._config.send_push_allowed_sygnal_urls:
+            return registered_url
+        return self._config.send_push_sygnal_url
+
+    async def _post_to_sygnal(
+        self, sygnal_url: Optional[str], payload: Dict[str, Any]
+    ) -> bool:
         try:
             agent = Agent(reactor)
-            sygnal_url = self._config.send_push_sygnal_url
             if sygnal_url is None:
                 return False
             url = sygnal_url.encode("utf-8")

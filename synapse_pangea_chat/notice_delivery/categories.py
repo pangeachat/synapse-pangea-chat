@@ -1,6 +1,6 @@
 """The message catalog's refusal grain, and the learner's refusal state.
 
-Category names are the org catalog's (user-communication-controls); this
+Category names are the org catalog's (notices (engagement repo)); this
 module never defines a new one. Refusal state is a single global account-data
 event per user, ``pangea.communication_preferences``, which the in-app
 preference screen and the emailed unsubscribe link both write.
@@ -15,8 +15,9 @@ import attr
 COMMUNICATION_PREFERENCES_ACCOUNT_DATA_TYPE = "pangea.communication_preferences"
 PREFERENCES_VERSION = 1
 
+MISSED_MESSAGE_CATEGORY = "missed_message"
 EVENT_CATEGORIES: FrozenSet[str] = frozenset(
-    {"credential", "missed_message", "course_invite"}
+    {"credential", MISSED_MESSAGE_CATEGORY, "course_invite"}
 )
 NUDGE_CATEGORIES: FrozenSet[str] = frozenset(
     {

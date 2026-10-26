@@ -122,11 +122,15 @@ class CourseClaimNotifier:
                 return
             attempt = reservation.attempt
             course_title, class_code = await self._course_title_and_class_code(room_id)
+            # A read failure here raises: the notice stays owed and is retried, never sent from the
+            # module's template in place of the caller's.
+            rendered = await self._store.invitations.claimed_email_for_room(room_id)
             await self._mailer.send_course_claimed(
                 email_address=reservation.requested_email,
                 course_title=course_title,
                 class_url=build_join_url(self._config.app_base_url, class_code),
                 class_code=class_code,
+                rendered=rendered,
             )
             await self._store.mark_notice_sent(
                 room_id, claimer_id, self._clock.time_msec()

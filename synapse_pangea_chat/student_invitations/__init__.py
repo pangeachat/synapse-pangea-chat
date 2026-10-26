@@ -6,9 +6,10 @@ release callback, and returns the claim service ``ClaimByEmail`` runs at
 sign-in and on every verified email addition.
 """
 
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from synapse.module_api import ModuleApi
+from twisted.web.resource import Resource
 
 from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
 from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
@@ -50,7 +51,12 @@ class StudentInvitations:
         self.handlers = handlers
 
 
-def register_student_invitations(api: ModuleApi, config: Any) -> StudentInvitations:
+def register_student_invitations(
+    api: ModuleApi, config: Any, base: Optional[Resource] = None
+) -> StudentInvitations:
+    """``base`` is the resource that serves ``…/student_invitations`` itself
+    (the course invite code read), which shares that path with these
+    routes."""
     homeserver = api._hs
     store = StudentInvitationStore(homeserver)
     accounts = Accounts(api)
@@ -175,7 +181,8 @@ def register_student_invitations(api: ModuleApi, config: Any) -> StudentInvitati
                 SlidingWindowRateLimiter(
                     requests_per_burst=burst, burst_duration_seconds=seconds
                 ),
-            )
+            ),
+            base,
         ),
     )
     api.register_third_party_rules_callbacks(

@@ -1,5 +1,11 @@
 """Current instructor authority, including creator power in newer rooms."""
+import logging
+
 from synapse.api.constants import EventTypes
+
+logger = logging.getLogger(
+    "synapse.module.synapse_pangea_chat.room_code.instructor_access"
+)
 
 
 def user_power(state, user_id):
@@ -14,9 +20,22 @@ def user_power(state, user_id):
     power = state.get((EventTypes.PowerLevels, ""))
     if power is None:
         return 0
-    return power.content.get("users", {}).get(
-        user_id, power.content.get("users_default", 0)
-    )
+    users_default = _level(power.content.get("users_default"), 0)
+    return _level(power.content.get("users", {}).get(user_id), users_default)
+
+
+def _level(value, default):
+    """A power level as an int. Old room versions let a string through, and a
+    comparison against it would raise instead of answering."""
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    logger.warning("Non-integer power level %r; using %d", value, default)
+    return default
 
 
 def is_joined_instructor(state, user_id):
@@ -26,3 +45,18 @@ def is_joined_instructor(state, user_id):
         and member.content.get("membership") == "join"
         and user_power(state, user_id) >= 100
     )
+
+
+def joined_local_instructors(api, state):
+    """Local, currently joined members with instructor power, strongest first
+    (ties by user id): the accounts eligible to act for the room — to invite
+    an additional instructor and grant their rights. Never promotes anyone to
+    manufacture a sender; an empty answer means explicit recovery."""
+    candidates = [
+        key
+        for kind, key in state
+        if kind == EventTypes.Member
+        and api.is_mine(key)
+        and is_joined_instructor(state, key)
+    ]
+    return sorted(candidates, key=lambda user: (-user_power(state, user), user))

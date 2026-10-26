@@ -41,6 +41,7 @@ def _notifier(
     store.reserve_notice = AsyncMock(return_value=reservation)
     store.mark_notice_sent = AsyncMock()
     store.outstanding_notices = AsyncMock(return_value=[])
+    store.invitations.claimed_email_for_room = AsyncMock(return_value=None)
     mailer = MagicMock()
     mailer.send_course_claimed = AsyncMock()
     return CourseClaimNotifier(api, PangeaChatConfig(), store, mailer), store, mailer
@@ -69,6 +70,38 @@ class TestNotify(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["course_title"], "Spanish 1")
         store.mark_notice_sent.assert_awaited_once_with(ROOM, CLAIMER, 1_000)
         self.capture.assert_not_called()
+        self.assertIsNone(sent["rendered"])  # nothing stored: the module's template
+
+    async def test_the_callers_stored_email_is_what_goes_out(self) -> None:
+        notifier, store, mailer = _notifier(NoticeReservation(REQUESTED, 1))
+        stored = {
+            "subject": "Invite your students",
+            "html": '<a href="{{class_url}}">x</a>',
+            "text": "{{class_url}}",
+            "receiving_reason": "r",
+        }
+        store.invitations.claimed_email_for_room = AsyncMock(return_value=stored)
+
+        await notifier.notify(ROOM, CLAIMER)
+
+        store.invitations.claimed_email_for_room.assert_awaited_once_with(ROOM)
+        self.assertEqual(
+            mailer.send_course_claimed.await_args.kwargs["rendered"], stored
+        )
+
+    async def test_a_failed_lookup_leaves_the_notice_owed_and_never_falls_back(
+        self,
+    ) -> None:
+        notifier, store, mailer = _notifier(NoticeReservation(REQUESTED, 1))
+        store.invitations.claimed_email_for_room = AsyncMock(
+            side_effect=RuntimeError("db")
+        )
+
+        await notifier.notify(ROOM, CLAIMER)
+
+        mailer.send_course_claimed.assert_not_called()
+        store.mark_notice_sent.assert_not_called()
+        self.capture.assert_called_once()
 
     async def test_no_reservation_sends_nothing(self) -> None:
         # Not owed, already sent, or another request or worker holds the lease.

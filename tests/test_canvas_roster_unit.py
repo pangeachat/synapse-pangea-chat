@@ -69,7 +69,7 @@ from synapse_pangea_chat.student_invitations.invite_email import InviteMailer
 from synapse_pangea_chat.student_invitations.membership_callback import (
     MembershipRelease,
 )
-from tests.test_student_invitations_unit import (
+from tests.test_seat_invitations_unit import (
     OTHER,
     OTHER_ROOM,
     ROOM,
@@ -935,7 +935,7 @@ class TestImport(_Base):
                 return
             fired.append(True)
             pool.connection.execute(
-                "INSERT INTO pangea_student_invitation (id, course_room_id,"
+                "INSERT INTO pangea_seat_invitation (id, course_room_id,"
                 " email_key, email, state, source, invited_by, send_count,"
                 " created_at_ms, lti_issuer, lti_context_id, lti_user_id)"
                 " VALUES ('raced', ?, 'race@school.example', 'race@school.example',"

@@ -6,7 +6,7 @@ if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 from synapse.api.errors import (
     AuthError,
@@ -45,6 +45,7 @@ try:
 except ImportError:
     # Sentry is an optional Synapse extra; without it captures are no-ops.
     sentry_sdk = None
+from synapse_pangea_chat.room_code.code_index import RoomCodeMatch
 from synapse_pangea_chat.room_code.code_lookup import rooms_for_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.get_inviter_user import (
@@ -175,11 +176,21 @@ class KnockWithCode(Resource):
                     )
                     return
 
-            # Join rules, and the claim record for a requested course's claim
-            # code, which members must not be able to read (code_lookup).
-            found = await rooms_for_code(
-                access_code, self._datastores.main, self._claim_store
-            )
+            # A student invitation's own code opens its course like the class code and
+            # records which invitation the join came from; it is never spent.
+            student = await self._claim_store.students.for_code(access_code)
+            found: Optional[Tuple[List[RoomCodeMatch], Set[str]]]
+            if student is not None:
+                found = (
+                    [RoomCodeMatch(room_id=student["room_id"], is_admin_code=False)],
+                    set(),
+                )
+            else:
+                # Join rules, and the claim record for a requested course's claim
+                # code, which members must not be able to read (code_lookup).
+                found = await rooms_for_code(
+                    access_code, self._datastores.main, self._claim_store
+                )
             if found is None:
                 respond_with_json(
                     request,
@@ -445,6 +456,14 @@ class KnockWithCode(Resource):
                     send_cors=True,
                 )
                 return
+            if student is not None and student["room_id"] in (
+                invited_rooms + already_joined_rooms
+            ):
+                await self._claim_store.students.record_use(
+                    student["invitation_id"],
+                    requester_id,
+                    self._api._hs.get_clock().time_msec(),
+                )
             respond_with_json(
                 request,
                 200,

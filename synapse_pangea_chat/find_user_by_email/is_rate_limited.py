@@ -20,6 +20,10 @@ def _get_config_window(config: PangeaChatConfig) -> Tuple[int, int]:
 
 
 def is_rate_limited(user_id: str, config: PangeaChatConfig) -> bool:
+    # An exempt caller is named exactly in config; the endpoint's server-admin
+    # check still applies to it.
+    if user_id in getattr(config, "find_user_by_email_rate_limit_exempt_user_ids", []):
+        return False
     current_time = time.time()
     window_seconds, max_requests = _get_config_window(config)
 

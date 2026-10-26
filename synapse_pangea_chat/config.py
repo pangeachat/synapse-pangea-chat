@@ -17,6 +17,17 @@ from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSIO
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.lti.keys import LtiSettings
+#: Hosts a notice's external destination may point at. A notice link is a
+#: signed redirect, so an unlisted host would turn our mail into an open
+#: redirect; the list is the booking page and the teacher dashboards.
+DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS = (
+    "calendar.app.google",
+    "admin.pangea.chat",
+    "admin.staging.pangea.chat",
+    # The website's course request and pricing pages, where the teacher funnel's
+    # create_course and pricing steps point until the dashboard carries them.
+    "pangea.chat",
+)
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -32,6 +43,9 @@ class PangeaChatConfig:
     # the plan id key). Off by default: the operator turns it on, deploys,
     # watches the summary log, and turns it off again.
     public_courses_backfill_l2: bool = False
+    # Accounts whose `central` mark on pangea.course_settings the catalog
+    # trusts. Empty means `@support:<server name>`.
+    central_course_admin_user_ids: List[str] = attr.Factory(list)
 
     # --- room_preview config ---
     room_preview_state_event_types: List[str] = attr.Factory(list)
@@ -66,6 +80,10 @@ class PangeaChatConfig:
     # Bot user ID used by the notification_cooldown_ms filter to identify bot DM rooms.
     # Required when using the notification_cooldown_ms query param.
     user_activity_notification_bot_user_id: Optional[str] = None
+    # How often the kept activity table is brought up to date (seconds); 0 turns the loop off, leaving
+    # the refresh route. refresh_on_read rebuilds the table on every read: for a small server only.
+    user_activity_refresh_interval_seconds: int = 300
+    user_activity_refresh_on_read: bool = False
 
     # --- delete_user config ---
     delete_user_requests_per_burst: int = 5
@@ -105,6 +123,10 @@ class PangeaChatConfig:
     # --- find_user_by_email config ---
     find_user_by_email_requests_per_burst: int = 10
     find_user_by_email_burst_duration_seconds: int = 60
+    # Exact user IDs the per-caller limit does not apply to: a service account
+    # whose job is to check a whole mailing list against accounts (the
+    # engagement runner's bot). Still server-admin only.
+    find_user_by_email_rate_limit_exempt_user_ids: List[str] = attr.Factory(list)
 
     # --- course_member_emails config ---
     # A course admin reads the sign-in email of each student in the course.
@@ -112,6 +134,11 @@ class PangeaChatConfig:
     course_member_emails_enabled: bool = False
     course_member_emails_requests_per_burst: int = 20
     course_member_emails_burst_duration_seconds: int = 60
+
+    # --- member_analytics_profiles config ---
+    # A room member reads every joined member's analytics profile at once.
+    member_analytics_profiles_requests_per_burst: int = 30
+    member_analytics_profiles_burst_duration_seconds: int = 60
 
     # --- safety incidents config ---
     # Per-caller limits on the Safety page's report and read endpoints.
@@ -137,11 +164,17 @@ class PangeaChatConfig:
     send_push_requests_per_burst: int = 10
     send_push_burst_duration_seconds: int = 1
     send_push_sygnal_url: Optional[str] = None
+    # Other Sygnal URLs a device's pusher may name and be pushed through.
+    send_push_allowed_sygnal_urls: List[str] = attr.Factory(list)
 
     # --- notice_delivery config ---
     # Email is the fallback channel for notices when a person has no push
     # device. Off by default: turning it on is a rollout decision (deploy-note).
     notice_email_enabled: bool = False
+    # Serve the missed-message email's unsubscribe link (Synapse's own path) with
+    # a confirm page that records the refusal. Off by default: replacing a
+    # Synapse page is a rollout decision (deploy-note).
+    notice_missed_message_unsubscribe_enabled: bool = False
     # Install the per-user push rule that keeps Synapse's own mailer and
     # rule-driven push off p.room.notice events (the bot delivers those itself).
     notice_suppress_notice_push_rules: bool = True
@@ -156,6 +189,11 @@ class PangeaChatConfig:
     notice_public_burst_duration_seconds: int = 60
     notice_admin_requests_per_minute: int = 600
     notice_admin_burst: int = 100
+    # Hosts an `external` notice destination may link to; re-checked when the
+    # link is clicked, so removing a host retires links already sent.
+    notice_external_link_hosts: List[str] = attr.Factory(
+        lambda: list(DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS)
+    )
 
     # --- delayed_push config ---
     delayed_push_enabled: bool = False
@@ -167,6 +205,12 @@ class PangeaChatConfig:
     # Refuse knocks/joins from users every room admin has blocked. Off switch
     # only; the rule itself is fixed by design.
     blocked_join_gate_enabled: bool = True
+
+    # --- course_default_chats config ---
+    # Keeps a space's default chats complete (every member joined, space
+    # admins as chat admins) and serves the repair endpoint. The off switch
+    # exists so a bad rollout can be stopped from Ansible without a deploy.
+    course_default_chats_enabled: bool = True
 
     # --- moderation config (server-side, trust-and-safety) ---
     # Both tiers ship dark: nothing runs until an operator enables a tier.
