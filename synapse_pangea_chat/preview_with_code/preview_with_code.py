@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from synapse.api.errors import (
     AuthError,
@@ -20,6 +20,7 @@ from twisted.web.resource import Resource
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.preview_with_code.get_preview import get_room_preview_for_code
 from synapse_pangea_chat.preview_with_code.is_rate_limited import is_rate_limited
+from synapse_pangea_chat.room_code.code_index import RoomCodeMatch
 from synapse_pangea_chat.room_code.code_lookup import rooms_for_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.instructor_access import is_joined_instructor
@@ -128,6 +129,10 @@ class PreviewWithCode(Resource):
                         api=self._api,
                         pangea_state_event_types=self._config.preview_with_code_state_event_types,
                     )
+                    if preview:
+                        # A course or instructor invitation makes its claimant
+                        # a teacher of the course.
+                        preview["opens_as_admin"] = True
                     respond_with_json(
                         request,
                         200,
@@ -135,9 +140,19 @@ class PreviewWithCode(Resource):
                         send_cors=True,
                     )
                     return
-            found = await rooms_for_code(
-                access_code, self._datastores.main, self._claim_store
-            )
+            # A student invitation's own code opens its course like the class
+            # code, as knock_with_code resolves it.
+            student = await self._claim_store.students.for_code(access_code)
+            found: Optional[Tuple[List[RoomCodeMatch], Set[str]]]
+            if student is not None:
+                found = (
+                    [RoomCodeMatch(room_id=student["room_id"], is_admin_code=False)],
+                    set(),
+                )
+            else:
+                found = await rooms_for_code(
+                    access_code, self._datastores.main, self._claim_store
+                )
             if found is None:
                 respond_with_json(
                     request,
@@ -185,6 +200,12 @@ class PreviewWithCode(Resource):
                     logger.error("Error building preview for %s: %s", match.room_id, e)
                     continue
                 if preview is not None:
+                    # Whether joining with this code makes the requester a
+                    # teacher (an admin code or a course claim), so the app
+                    # does not ask them to share their analytics.
+                    preview["opens_as_admin"] = (
+                        match.is_admin_code or match.room_id in claim_room_ids
+                    )
                     previews.append(preview)
 
             respond_with_json(

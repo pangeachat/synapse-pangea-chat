@@ -202,6 +202,12 @@ class TestE2EPreviewWithCode(PreviewWithCodeHelpers, BaseSynapseE2ETest):
             event_type="pangea.analytics_settings",
             content={"blockedConstructs": []},
         )
+        await self._set_state_event(
+            room_id=room_id,
+            access_token=admin1_token,
+            event_type="pangea.course_settings",
+            content={"require_analytics_access": True},
+        )
 
         await self._set_join_rules_with_code(
             room_id=room_id,
@@ -247,6 +253,11 @@ class TestE2EPreviewWithCode(PreviewWithCodeHelpers, BaseSynapseE2ETest):
             {"enabled": True, "activitiesToUnlockTopic": 3},
         )
         self.assertIn("pangea.analytics_settings", state_events)
+        self.assertEqual(
+            state_events["pangea.course_settings"]["default"]["content"],
+            {"require_analytics_access": True},
+        )
+        self.assertFalse(room["opens_as_admin"])
         self.assertNotIn(
             "pangea.course_chat_list",
             state_events,
@@ -292,6 +303,7 @@ class TestE2EPreviewWithCode(PreviewWithCodeHelpers, BaseSynapseE2ETest):
         self.assertEqual(len(rooms), 1)
         self.assertEqual(rooms[0]["room_id"], room_id)
         self.assertEqual({a["user_id"] for a in rooms[0]["admins"]}, {creator_id})
+        self.assertTrue(rooms[0]["opens_as_admin"])
 
     async def test_preview_with_code_validation(self) -> None:
         """Validation: bad bodies, missing auth, unknown codes."""
