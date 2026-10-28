@@ -2,11 +2,36 @@ import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import urlencode
 
 from synapse_pangea_chat.notice_delivery.eligibility import NoticeEligibility
 from synapse_pangea_chat.notice_delivery.request import NoticeRequest
 from tests import test_notice_schedule
 from tests.test_notice_schedule import scheduled_body
+
+# What a current client writes into `pangea.activity_plan`: a reference whose
+# version_id is a content signature, not a CMS version id.
+REFERENCE = {
+    "activity_id": "activity-1",
+    "version_id": "0123456789abcdef0123456789abcdef",
+    "source_course_id": "course-1",
+}
+CANONICAL_QUERY = "?" + urlencode(
+    {
+        "where[res.plan.activity_id][equals]": "activity-1",
+        "where[req.source_request_hash][exists]": "false",
+        "limit": 2,
+        "depth": 0,
+    }
+)
+
+
+def canonical_row(roles):
+    plan = {
+        "activity_id": "activity-1",
+        "roles": [{"role_id": n} for n in range(roles)],
+    }
+    return 200, {"docs": [{"res": {"plan": plan}}]}
 
 
 class TestEligibility(unittest.IsolatedAsyncioTestCase):
@@ -163,39 +188,23 @@ class TestEligibility(unittest.IsolatedAsyncioTestCase):
             api.get_room_state = AsyncMock(return_value=state)
             self.assertEqual(await gate.check(body, req, "42"), expected)
 
-    async def test_session_reference_reads_its_pinned_plan(self):
+    async def test_session_reference_reads_the_canonical_plan(self):
         gate, body, req, api = self.setup_gate({})
         body.update(
             session_room_id="!session:test", eligibility={"session_available": True}
         )
         api.get_room_state = AsyncMock(
             return_value={
-                ("pangea.activity_plan", ""): SimpleNamespace(
-                    content={"activity_id": "activity-1", "version_id": "version-1"}
-                ),
+                ("pangea.activity_plan", ""): SimpleNamespace(content=REFERENCE),
                 ("m.room.member", req.user_id): SimpleNamespace(
                     content={"membership": "join"}
                 ),
             }
         )
-        gate.log._request = AsyncMock(
-            return_value=(
-                200,
-                {
-                    "version": {
-                        "res": {
-                            "plan": {
-                                "activity_id": "activity-1",
-                                "roles": [{"role_id": "one"}, {"role_id": "two"}],
-                            }
-                        }
-                    }
-                },
-            )
-        )
+        gate.log._request = AsyncMock(return_value=canonical_row(2))
         self.assertIsNone(await gate.check(body, req, "42"))
         gate.log._request.assert_awaited_once_with(
-            "GET", "/version-1", collection="activities-v2/versions"
+            "GET", CANONICAL_QUERY, collection="activities-v2"
         )
 
     async def test_saved_completion_survives_missing_current_role(self):
@@ -281,6 +290,17 @@ class TestBotFillsOpenSeat(unittest.IsolatedAsyncioTestCase):
             gate, body, req = self.gate(in_room, extra=extra, roles=roles)
             with self.subTest(expected=expected):
                 self.assertEqual(await gate.check(body, req, "42"), expected)
+
+    async def test_reference_only_plan_is_sized_from_the_canonical_row(self):
+        plan = {("pangea.activity_plan", ""): SimpleNamespace(content=REFERENCE)}
+        for roles, expected in ((2, None), (3, "seats_open")):
+            gate, body, req = self.gate({LEARNER: "join", BOT: "join"}, extra=plan)
+            gate.log._request = AsyncMock(return_value=canonical_row(roles))
+            with self.subTest(roles=roles):
+                self.assertEqual(await gate.check(body, req, "42"), expected)
+                gate.log._request.assert_awaited_once_with(
+                    "GET", CANONICAL_QUERY, collection="activities-v2"
+                )
 
     def test_condition_requires_the_session(self):
         body = {**scheduled_body(), "eligibility": {"bot_fills_open_seat": True}}
