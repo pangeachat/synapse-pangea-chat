@@ -256,6 +256,7 @@
         "pangea.activity_plan",
         "pangea.activity_roles",
         "pangea.activity_room_ids",
+        "pangea.activity_summary",
         "pangea.analytics_settings",
         "pangea.course_missions",
         "pangea.course_plan",
@@ -295,10 +296,10 @@
         }
       ]
     },
-    "notes": "Each known room's COMPLETE current state of the forwarded state types (an absent type is absent from the room, not unread); null for a room this homeserver does not know. Each profile carries a revision bumped by this read, so it is newer than anything pushed before it. At most 500 room ids and 500 user ids per request. Every answer (profile-only rounds included) carries forwarded_types: exactly the state types this module forwards. Treat a type as absent from a room only when it is listed; a snapshot without the field (an older module) proves nothing about missing types."
+    "notes": "Each known room's COMPLETE current state of the forwarded state types (an absent type is absent from the room, not unread); null for a room this homeserver does not know or does not forward from (a DM, a room no course links). Each profile carries a revision bumped by this read, so it is newer than anything pushed before it. At most 500 room ids and 500 user ids per request. Every answer (profile-only rounds included) carries forwarded_types: exactly the state types this module forwards. Treat a type as absent from a room only when it is listed; a snapshot without the field (an older module) proves nothing about missing types."
   },
   "forwarded_types": {
-    "description": "Exactly the event types the module forwards, live and in analytics_state snapshots. pangea.construct as a timeline event; every other type as state, from every room. m.room.canonical_alias marks a course's Announcements chat (alias localpart announcementsChat...). pangea.course_progress (state_key = the course room id) is a student's progress in a course, written by the app into their analytics room.",
+    "description": "Exactly the event types the module forwards, live and in analytics_state snapshots, from the rooms it forwards from (analytics rooms, course spaces, and rooms a course space links both ways). pangea.construct as a timeline event; every other type as state. m.room.canonical_alias marks a course's Announcements chat (alias localpart announcementsChat...). pangea.course_progress (state_key = the course room id) is a student's progress in a course, written by the app into their analytics room. pangea.activity_summary is a session room's summary (the dashboard's session XP), state_key = a language code.",
     "timeline": [
       "pangea.construct"
     ],
@@ -317,6 +318,7 @@
       "pangea.activity_plan",
       "pangea.activity_roles",
       "pangea.activity_room_ids",
+      "pangea.activity_summary",
       "pangea.analytics_settings",
       "pangea.course_missions",
       "pangea.course_plan",

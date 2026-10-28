@@ -437,7 +437,7 @@ Pushes the teacher dashboard's Matrix inputs to admin-dash-api's `POST /api/inte
 
 ### What is sent
 
-- **Types** (`wire.py`): construct uses (`pangea.construct`, as timeline events), plus these state types: membership, power, room identity, `m.room.canonical_alias`, course-space, session-room and analytics-room state, and `pangea.course_progress`. admin-dash-api's forwarded-types inventory test decides the list.
+- **Types** (`wire.py`): construct uses (`pangea.construct`, as timeline events), plus these state types: membership, power, room identity, `m.room.canonical_alias`, course-space, session-room (including `pangea.activity_summary`, the source of the dashboard's session XP) and analytics-room state, and `pangea.course_progress`. admin-dash-api's forwarded-types inventory test decides the list.
 - **Rooms** (`ForwardStore.course_rooms`, decided from current state when each batch is read):
   - analytics rooms (`m.room.create` type `p.analytics`);
   - course spaces (`m.room.create` type `m.space` with a `pangea.course_plan`);

@@ -695,6 +695,41 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
         )
         self._assert_no_forwarder_errors()
 
+    async def test_activity_summary_forwarded_live_and_in_the_snapshot(self) -> None:
+        await self._start()
+        teacher, t_token = await self.new_user("sumteacher")
+        course = self._course(t_token, teacher, teacher, "es")
+        # A session room, linked as the app links it (launch_activity_session).
+        session = self._create_room(t_token, preset="private_chat")
+        self._link(t_token, course, session)
+        summary = {"summary": {"participants": [{"xp": 30}]}}
+        event_id = self._put_state(
+            t_token, session, "pangea.activity_summary", "en", summary
+        )
+        await self._until(lambda: self._acked_with(event_id), "the summary, live")
+        record = next(
+            e
+            for b in self._acked_with(event_id)
+            for e in b["events"]
+            if e["event_id"] == event_id
+        )
+        self.assertEqual((record["state_key"], record["content"]), ("en", summary))
+        snap = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/analytics_state",
+            json={"room_ids": [session], "user_ids": []},
+            headers=self._h(SECRET),
+        ).json()
+        self.assertIn("pangea.activity_summary", snap["forwarded_types"])
+        self.assertEqual(
+            [
+                (e["state_key"], e["content"])
+                for e in snap["rooms"][session]["events"]
+                if e["type"] == "pangea.activity_summary"
+            ],
+            [("en", summary)],
+        )
+        self._assert_no_forwarder_errors()
+
     async def test_head_and_state_need_the_secret(self) -> None:
         await self._start()
         student, s_token = await self.new_user("snap")

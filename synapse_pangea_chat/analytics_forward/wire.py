@@ -42,6 +42,9 @@ STATE_TYPES = frozenset(
         "pangea.activity_plan",
         "pangea.activity_roles",
         "pangea.orchestrator_awarded_goals",
+        # The session's summary (state_key = a language code); the dashboard's
+        # session XP comes from it.
+        "pangea.activity_summary",
         # Analytics-room state.
         "pangea.analytics_settings",
         "pangea.activity_room_ids",
