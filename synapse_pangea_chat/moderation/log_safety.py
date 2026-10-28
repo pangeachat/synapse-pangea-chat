@@ -159,8 +159,8 @@ def scrub_reachable_handlers(logger: logging.Logger) -> None:
     """Put a second scrubber on every handler `logger`'s records can reach.
 
     Called once when moderation starts. Handlers attached afterwards - by a
-    logging-configuration reload, say - are not covered, and that residue is
-    recorded in .github/instructions/moderation.instructions.md.
+    logging-configuration reload, say - are not covered; that residue is
+    accepted (moderation.instructions.md, "Logs never carry a Matrix ID").
     """
     for target in _reachable_loggers(logger):
         for handler in target.handlers:

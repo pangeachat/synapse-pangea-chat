@@ -17,9 +17,10 @@ where you live is an A1 lesson. Tier 1 rejects before persist, so each of
 those was a learner silenced mid-sentence. Judging an address needs the
 context only Tier 2 has.
 
-Package choices and their limits are recorded in
-.github/instructions/moderation.instructions.md. Profanity is matched across
-all our learner languages (see `profanity.py`).
+Phone numbers use `phonenumbers` (a libphonenumber port), matching VALID
+numbers only, so a bare year or house count does not trip it. Profanity is
+matched across all our learner languages (see `profanity.py`). Design:
+.github/instructions/moderation.instructions.md.
 """
 
 from typing import Callable, Iterable, List, Optional, Tuple
@@ -46,8 +47,8 @@ logger = scrubbing_logger(
 # a neutral diagnostic: it asserts what a particular message contained, which
 # is the kind of record this module keeps out of plaintext logs. The rule
 # family is what an operator debugging a false positive actually needs, and
-# there is one rule per family, so nothing is lost - the mapping from
-# identifier to check is in moderation.instructions.md.
+# there is one rule per family, so nothing is lost: `contact_details` is the
+# phone-number check and `profanity` is the wordlist.
 REASON_CONTACT_DETAILS = "contact_details"
 REASON_PROFANITY = "profanity"
 

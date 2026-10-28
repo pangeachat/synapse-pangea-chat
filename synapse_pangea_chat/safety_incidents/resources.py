@@ -62,7 +62,11 @@ class SlidingWindowLimit:
 
 
 def _read_json(request: SynapseRequest) -> Any:
-    """The body as JSON, or None. Never logs it."""
+    """The body as JSON, or None. Never logs it.
+
+    Parsed here rather than through Synapse's servlet helper, which logs a
+    malformed body - and a report's body carries the reporter's reason.
+    """
     try:
         raw = request.content.read(_MAX_BODY_BYTES + 1)
         if len(raw) > _MAX_BODY_BYTES:

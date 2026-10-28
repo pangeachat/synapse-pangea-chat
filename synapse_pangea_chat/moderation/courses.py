@@ -168,7 +168,15 @@ class StudentCourses:
         return self._is_exempt(user_id) or is_probable_bot_user_id(user_id)
 
     def position_now(self) -> int:
-        """The position to anchor an incident happening now."""
+        """The position to anchor an incident happening now.
+
+        Owner-accepted limit (moderation.instructions.md, "The Safety page's
+        record"): this is the contiguous persisted watermark, so with more
+        than one event persister an unfinished lower position can hold it
+        behind an already-committed leave or join, and the incident freezes
+        the older course list. Revisit if the homeserver gains a second event
+        persister.
+        """
         return int(self._current_position())
 
     async def for_user(self, user_id: str, position: int) -> Tuple[str, ...]:
@@ -222,6 +230,15 @@ def _is_course_now(homeserver: Any) -> Callable[[str], Awaitable[bool]]:
 
 
 def _state_at_position(homeserver: Any) -> StateAtPosition:
+    # Owner-accepted limits (moderation.instructions.md, "The Safety page's
+    # record"), each with the condition that reopens it:
+    # - A forked room graph (a late federated event on an older branch, or a
+    #   soft-failed event) can still show a learner who has left as joined at
+    #   the last persisted event, so later incidents land on the former
+    #   course. Revisit if the homeserver federates.
+    # - A course plan redacted and then pruned by retention can no longer be
+    #   read at an earlier position, so a late lookup lands on no course.
+    #   Revisit if the product ever redacts a course plan; it does not today.
     after_event = state_after_event_reader(homeserver)
 
     async def _read(room_id: str, user_id: str, position: int) -> StateMap:
