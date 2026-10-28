@@ -502,11 +502,11 @@ How the work runs:
 
 Both take `Authorization: Bearer <analytics_forward.secret>`, compared in constant time.
 
-- `GET /_synapse/client/pangea/v1/analytics_forward/head` returns what a Refresh waits for:
+- `GET /_synapse/client/pangea/v1/analytics_forward/head` returns a delivery barrier. admin-dash-api's Refresh does not use it today: Refresh does not wait for delivery. The barrier has two parts:
   - the newest forwarded event at or below the persisted head;
   - a profile time naming only changes not yet delivered.
 
-  An idle forwarder therefore costs a Refresh no wait. Reading the head also wakes the forwarder when it runs in the same process, so anything undelivered goes at once rather than at the next poll.
+  An idle forwarder therefore costs a reader no wait. Reading the head also wakes the forwarder when it runs in the same process, so anything undelivered goes at once rather than at the next poll.
 - `POST /_synapse/client/pangea/v1/analytics_state` takes up to 500 rooms and 500 users and returns:
   - each room's complete current state of the forwarded types (null for a room that is unknown or outside the rooms above);
   - each user's profile, with a revision raised by the read, so a snapshot always outranks earlier pushes.
