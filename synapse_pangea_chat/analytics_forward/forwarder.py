@@ -252,9 +252,15 @@ class Forwarder:
             self._cursor, head, self._batch_max
         )
         records: List[dict] = []
+        # Only the rooms the dashboard reads; a DM's events never leave.
+        course_rooms = await self._store.course_rooms(
+            {event.room_id for event in events}
+        )
         for event in events:
             state_key = event.get_state_key() if event.is_state() else None
             if not is_forwarded(event.type, state_key):
+                continue
+            if event.room_id not in course_rooms:
                 continue
             records.append(event_record(event))
             if (

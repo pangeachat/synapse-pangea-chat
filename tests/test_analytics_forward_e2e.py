@@ -132,6 +132,35 @@ class _ForwardHelpers(BaseSynapseE2ETest):
         self.assertEqual(resp.status_code, 200, resp.text)
         return resp.text
 
+    def _put_state(
+        self, token: str, room_id: str, etype: str, state_key: str, content: dict
+    ) -> str:
+        resp = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{self._q(room_id)}/state/"
+            f"{etype}/{self._q(state_key)}",
+            json=content,
+            headers=self._h(token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return resp.json()["event_id"]
+
+    def _link(self, token: str, course: str, room_id: str) -> None:
+        """Link a room under a course as the app does: the child in the space,
+        the parent in the room."""
+        self._put_state(token, course, "m.space.child", room_id, {"via": ["localhost"]})
+        self._put_state(
+            token, room_id, "m.space.parent", course, {"via": ["localhost"]}
+        )
+
+    def _member_event(self, room_id: str, user_id: str) -> str:
+        return str(
+            self._sql(
+                "SELECT event_id FROM local_current_membership "
+                "WHERE room_id = %s AND user_id = %s",
+                (room_id, user_id),
+            )[0][0]
+        )
+
     def _join(self, token: str, room_id: str) -> None:
         resp = requests.post(
             f"{self.server_url}/_matrix/client/v3/join/{self._q(room_id)}",
@@ -293,7 +322,7 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
     async def test_cursor_moves_only_after_an_acknowledged_batch(self) -> None:
         await self._start()
         _, token = await self.new_user("student")
-        room = self._create_room(token, preset="private_chat")
+        room = self._analytics_room(token)
         self.ingest.set_status(503)
         construct = self._send(token, room, "pangea.construct", {"uses": [1]})
         message = self._send(
@@ -317,6 +346,47 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
         self.assertEqual(record["content"], {"uses": [1]})
         # A type the dashboard does not read is never sent.
         self.assertEqual(self._attempted_with(message), [])
+        self._assert_no_forwarder_errors()
+
+    async def test_only_course_and_analytics_rooms_are_forwarded(self) -> None:
+        await self._start()
+        teacher, t_token = await self.new_user("fteacher")
+        friend, f_token = await self.new_user("ffriend")
+        # A DM: its name and memberships never leave the homeserver.
+        dm = self._create_room(
+            t_token, preset="trusted_private_chat", is_direct=True, invite=[friend]
+        )
+        self._join(f_token, dm)
+        dm_name = self._put_state(t_token, dm, "m.room.name", "", {"name": "just us"})
+        dm_join = self._member_event(dm, friend)
+        # A course chat, linked under a course space: forwarded.
+        course = self._course(t_token, teacher, teacher, "es")
+        chat = self._create_room(t_token, preset="public_chat")
+        self._link(t_token, course, chat)
+        chat_name = self._put_state(t_token, chat, "m.room.name", "", {"name": "Class"})
+        self._join(f_token, chat)
+        chat_join = self._member_event(chat, friend)
+
+        await self._until(lambda: self._acked_with(chat_name), "the chat's name")
+        await self._until(lambda: self._acked_with(chat_join), "the chat's join")
+        passed = max(self._pos(dm_name), self._pos(dm_join))
+        await self._until(lambda: self._cursor() >= passed, "the cursor past the DM")
+        self.assertEqual(
+            [
+                e
+                for _, body in self.ingest.requests()
+                for e in body["events"]
+                if e["room_id"] == dm
+            ],
+            [],
+        )
+        # The course space's own state goes too: the link is in it.
+        child = self._sql(
+            "SELECT event_id FROM current_state_events WHERE room_id = %s "
+            "AND type = 'm.space.child' AND state_key = %s",
+            (course, chat),
+        )[0][0]
+        await self._until(lambda: self._acked_with(child), "the space child")
         self._assert_no_forwarder_errors()
 
     async def test_profile_cleared_only_for_the_revision_sent(self) -> None:
@@ -477,20 +547,18 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
             preset="public_chat",
             room_alias_name=f"announcementsChat{self.tag}",
         )
-        linked = requests.put(
-            f"{self.server_url}/_matrix/client/v3/rooms/{self._q(course)}"
-            f"/state/m.space.child/{self._q(chat)}",
-            json={"via": ["localhost"]},
+        self._link(token, course, chat)
+        # The alias as set once the chat is linked (the one made with the room
+        # may be read before the link, and then the snapshot covers it).
+        current = requests.get(
+            f"{self.server_url}/_matrix/client/v3/rooms/{self._q(chat)}"
+            "/state/m.room.canonical_alias/",
             headers=self._h(token),
+        ).json()
+        alias = self._put_state(
+            token, chat, "m.room.canonical_alias", "", {**current, "alt_aliases": []}
         )
-        self.assertEqual(linked.status_code, 200, linked.text)
-        alias = self._sql(
-            "SELECT event_id FROM current_state_events "
-            "WHERE room_id = %s AND type = 'm.room.canonical_alias'",
-            (chat,),
-        )
-        self.assertTrue(alias)
-        await self._until(lambda: self._acked_with(alias[0][0]), "the alias, live")
+        await self._until(lambda: self._acked_with(alias), "the alias, live")
         snap = requests.post(
             f"{self.server_url}/_synapse/client/pangea/v1/analytics_state",
             json={"room_ids": [chat], "user_ids": []},
@@ -754,7 +822,7 @@ class TestAnalyticsForwardBarrierE2E(_ForwardHelpers):
         await self._start()
         await self._settled()
         _, token = await self.new_user("bstudent")
-        room = self._create_room(token, preset="private_chat")
+        room = self._analytics_room(token)
         construct = self._send(token, room, "pangea.construct", {"n": 1})
         await self._until(lambda: self._acked_with(construct), "the construct")
         # Events the dashboard does not read move the head, not the barrier.
@@ -787,7 +855,7 @@ class TestAnalyticsForwardBarrierE2E(_ForwardHelpers):
         await self._start()
         await self._settled()
         _, token = await self.new_user("bconn")
-        room = self._create_room(token, preset="private_chat")
+        room = self._analytics_room(token)
         before = len(self.ingest.ports())
         for n in range(3):
             event = self._send(token, room, "pangea.construct", {"n": n})

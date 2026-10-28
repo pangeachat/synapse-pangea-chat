@@ -433,7 +433,7 @@ Lists members whose current membership is `join`, excluding the caller, bots, an
 
 ## Analytics Forward
 
-Tails Synapse's event stream from a durable cursor and posts the event types the teacher dashboard reads, and changed profiles, to admin-dash-api's `POST /api/internal/matrix-events`. The cursor moves only after the ingest acknowledges a committed batch, so an outage delays delivery and loses nothing. It also completes a teacher's join into a student's analytics room when the student has consented. Runs whenever the `analytics_forward` block is configured, on the background-tasks instance only; deploy admin-dash-api's ingest first. Design: [analytics-forward.instructions.md](.github/instructions/analytics-forward.instructions.md). Contract: [ingest_contract.json](tests/fixtures/analytics_forward/ingest_contract.json).
+Tails Synapse's event stream from a durable cursor and posts the event types the teacher dashboard reads (from course spaces, rooms linked under one, and analytics rooms only; never a DM), and changed profiles, to admin-dash-api's `POST /api/internal/matrix-events`. The cursor moves only after the ingest acknowledges a committed batch, so an outage delays delivery and loses nothing. It also completes a teacher's join into a student's analytics room when the student has consented. Runs whenever the `analytics_forward` block is configured, on the background-tasks instance only; deploy admin-dash-api's ingest first. Design: [analytics-forward.instructions.md](.github/instructions/analytics-forward.instructions.md). Contract: [ingest_contract.json](tests/fixtures/analytics_forward/ingest_contract.json).
 
 ---
 

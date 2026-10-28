@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 import unittest
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from synapse_pangea_chat.analytics_forward.config import (
     AnalyticsForwardConfig,
@@ -78,6 +78,9 @@ class FakeStore:
         self.undelivered_join = 0
         self.pending_rev = 0
         self.delivered_clean: Optional[int] = None
+        #: The rooms the course filter passes; None passes every room.
+        self.course_room_ids: Optional[Set[str]] = None
+        self.filtered: List[Set[str]] = []
 
     def head(self) -> int:
         return self.head_pos
@@ -99,6 +102,13 @@ class FakeStore:
             rows[-1].internal_metadata.stream_ordering if len(rows) >= limit else upto
         )
         return rows, reached
+
+    async def course_rooms(self, room_ids: Iterable[str]) -> Set[str]:
+        asked = set(room_ids)
+        self.filtered.append(asked)
+        if self.course_room_ids is None:
+            return asked
+        return asked & self.course_room_ids
 
     async def advance(self, cursor: int, acked, clean_before: int = 0) -> None:
         self.delivered_clean = max(self.delivered_clean or clean_before, clean_before)
@@ -221,6 +231,49 @@ def _events(*positions: int) -> List[FakeEvent]:
 
 def _delivered_positions(ingest: Ingest) -> List[int]:
     return [e["stream_pos"] for b in ingest.bodies for e in b["events"]]
+
+
+class TestCourseRoomFilter(unittest.IsolatedAsyncioTestCase):
+    """Only course spaces, rooms linked under one, and analytics rooms are
+    forwarded; a DM's events never leave the homeserver."""
+
+    async def test_a_dm_is_not_forwarded_a_course_room_is(self) -> None:
+        dm, course = "!dm:hs", "!course:hs"
+        store = FakeStore(
+            [
+                FakeEvent(2, "m.room.name", "", {"name": "secret"}, room_id=dm),
+                FakeEvent(3, "m.room.member", "@b:hs", {"membership": "join"}, dm),
+                FakeEvent(4, "m.room.name", "", {"name": "Class"}, room_id=course),
+                FakeEvent(5, "m.room.member", "@b:hs", {"membership": "join"}, course),
+            ],
+            head=10,
+        )
+        store.course_room_ids = {course}
+        ingest, consent = Ingest(), FakeConsent()
+        fwd = _forwarder(store, ingest, Clock(), consent=consent)
+        await fwd.start()
+        await fwd.step()
+        sent = [
+            (e["room_id"], e["stream_pos"]) for b in ingest.bodies for e in b["events"]
+        ]
+        self.assertEqual(sent, [(course, 4), (course, 5)])
+        self.assertEqual(store.filtered, [{dm, course}])
+        # Delivery still reaches past the DM's events: they are never owed.
+        self.assertEqual(store.cursor, 10)
+
+    async def test_a_dm_invite_is_not_owed_a_consent_answer(self) -> None:
+        dm = "!dm:hs"
+        store = FakeStore(
+            [FakeEvent(2, "m.room.member", "@t:hs", {"membership": "invite"}, dm)],
+            head=5,
+        )
+        store.course_room_ids = set()
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+        # An owed invite would be named in the batch until answered.
+        self.assertEqual([b["pending_accepts"] for b in ingest.bodies], [[]])
 
 
 class TestCursorOnlyOnAck(unittest.IsolatedAsyncioTestCase):

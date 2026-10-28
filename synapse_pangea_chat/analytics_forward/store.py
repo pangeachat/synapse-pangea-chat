@@ -15,7 +15,7 @@ PostgreSQL only: the startup re-send reads custom profile fields as JSONB.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from synapse_pangea_chat.analytics_forward.consent import PROFILE_KEY
 from synapse_pangea_chat.analytics_forward.wire import FORWARDED_TYPES
@@ -145,6 +145,36 @@ _SELECT_PENDING_INVITES_SQL = """
 """
 
 
+# The rooms the dashboard reads, decided from current state when a batch is
+# read (so a room linked later is forwarded from then on): an analytics room,
+# a course space (it holds a pangea.course_plan), or a room whose
+# m.space.parent names a course space. Every other room, a DM included, is
+# never forwarded. Every lookup is by room id (current_state_events' key).
+_SELECT_COURSE_ROOMS_SQL = """
+    SELECT r.room_id FROM unnest(?::text[]) AS r(room_id)
+    WHERE EXISTS (
+        SELECT 1 FROM current_state_events AS cse
+        JOIN event_json AS ej ON ej.event_id = cse.event_id
+        WHERE cse.room_id = r.room_id
+            AND cse.type = 'm.room.create' AND cse.state_key = ''
+            AND ej.json::jsonb -> 'content' ->> 'type' = 'p.analytics'
+    ) OR EXISTS (
+        SELECT 1 FROM current_state_events AS plan
+        WHERE plan.room_id = r.room_id
+            AND plan.type = 'pangea.course_plan' AND plan.state_key = ''
+    ) OR EXISTS (
+        SELECT 1 FROM current_state_events AS parent
+        JOIN event_json AS ej ON ej.event_id = parent.event_id
+        JOIN current_state_events AS plan
+            ON plan.room_id = parent.state_key
+            AND plan.type = 'pangea.course_plan' AND plan.state_key = ''
+        WHERE parent.room_id = r.room_id AND parent.type = 'm.space.parent'
+            AND jsonb_typeof(ej.json::jsonb -> 'content' -> 'via') = 'array'
+            AND ej.json::jsonb -> 'content' -> 'via' <> '[]'::jsonb
+    )
+"""
+
+
 _SELECT_UNDELIVERED_JOIN_SQL = """
     SELECT COALESCE(MAX(e.stream_ordering), 0)
     FROM events AS e
@@ -221,6 +251,21 @@ class ForwardStore:
         # Rejected events are dropped here too; a dropped one is never sent.
         events = await self._main.get_events_as_list([eid for _, eid in rows])
         return events, reached
+
+    async def course_rooms(self, room_ids: Iterable[str]) -> Set[str]:
+        """Those of ``room_ids`` the dashboard reads, by current state: analytics
+        rooms, course spaces and rooms linked under a course space."""
+        rooms = sorted(set(room_ids))
+        if not rooms:
+            return set()
+
+        def _select(txn: Any) -> Set[str]:
+            txn.execute(_SELECT_COURSE_ROOMS_SQL, (rooms,))
+            return {str(row[0]) for row in txn.fetchall()}
+
+        return await self._pool.runInteraction(
+            "pangea_analytics_forward_course_rooms", _select
+        )
 
     async def load_pending_rev(self) -> int:
         def _load(txn: Any) -> int:
