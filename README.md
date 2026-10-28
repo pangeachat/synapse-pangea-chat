@@ -16,6 +16,7 @@ Unified [Synapse](https://github.com/element-hq/synapse) module that bundles all
 | [Find User By Email](#find-user-by-email)     | `synapse_pangea_chat/find_user_by_email/`   | `POST /_synapse/client/pangea/v1/find_user_by_email`      | Server-admin lookup of the account holding an email |
 | [Course Member Emails](#course-member-emails) | `synapse_pangea_chat/course_member_emails/` | `POST /_synapse/client/pangea/v1/course_member_emails`    | A course admin reads their joined students' sign-in emails (off by default) |
 | [Direct Message](#direct-message)             | `synapse_pangea_chat/direct_message/`       | `POST /_synapse/client/pangea/v1/ensure_direct_message`   | Create or repair a 1:1 DM for two local users     |
+| [Analytics Forward](#analytics-forward)       | `synapse_pangea_chat/analytics_forward/`    | `GET /_synapse/client/pangea/v1/analytics_forward/head`, `POST /_synapse/client/pangea/v1/analytics_state` | Pushes the dashboard's Matrix inputs from course and analytics rooms to admin-dash-api (runs when configured) |
 | [Delayed Push](#delayed-push)                 | `synapse_pangea_chat/delayed_push/`         | _(HttpPusher monkey patch)_                               | Delay HTTP pushes while users are active          |
 | [Limit User Directory](#limit-user-directory) | `synapse_pangea_chat/limit_user_directory/` | _(spam checker)_                                          | Filter user directory by public profile attribute |
 
@@ -78,6 +79,14 @@ modules:
         - "^@admin:example.com$"
       limit_user_directory_whitelist_candidate_user_id_patterns:
         - "^@bot:example.com$"
+
+      # --- Analytics Forward (runs only when this block is present) ---
+      analytics_forward:
+        url: "https://admin-dash-api.example.com/api/internal/matrix-events"
+        secret: "<at least 32 characters, shared with admin-dash-api>"
+        batch_max: 200 # default: 200 (1-1000)
+        poll_seconds: 5 # default: 5 (1-60)
+        start_position: current # default: current; read only when no cursor is stored
 
       # --- Delayed Push (disabled by default) ---
       delayed_push:
@@ -419,6 +428,117 @@ A course admin reads the sign-in email of each student currently in their course
 ```
 
 Lists members whose current membership is `join`, excluding the caller, bots, and other course admins. A member with no bound email is omitted. Addresses are never logged.
+
+---
+
+## Analytics Forward
+
+Pushes the teacher dashboard's Matrix inputs to admin-dash-api's `POST /api/internal/matrix-events`, and joins a teacher to a student's analytics room once the student has consented. Design and decisions: [analytics-forward.instructions.md](.github/instructions/analytics-forward.instructions.md). Request and response contract, shared with admin-dash-api: [ingest_contract.json](tests/fixtures/analytics_forward/ingest_contract.json).
+
+### What is sent
+
+- **Types** (`wire.py`): construct uses (`pangea.construct`, as timeline events), plus these state types: membership, power, room identity, `m.room.canonical_alias`, course-space, session-room (including `pangea.activity_summary`, the source of the dashboard's session XP) and analytics-room state, and `pangea.course_progress`. admin-dash-api's forwarded-types inventory test decides the list.
+- **Rooms** (`ForwardStore.course_rooms`, decided from current state when each batch is read):
+  - analytics rooms (`m.room.create` type `p.analytics`);
+  - course spaces (`m.room.create` type `m.space` with a `pangea.course_plan`);
+  - rooms a course links both ways: the room's `m.space.parent` names a course space, and that space holds the matching `m.space.child`, both with a non-empty `via`.
+
+  Every lookup is by `(room_id, type, state_key)`. Nothing from any other room is sent or snapshotted. A room linked later is sent from then on; its earlier state reaches admin-dash-api through the snapshot endpoint.
+- **Accepted gap:** a room unlinked from its course while its events are still undelivered (during an ingest outage, say) has those events skipped.
+
+### Delivery
+
+- **One loop, on the background-tasks instance only.** `on_new_event` fires on every worker, so a loop on each would send everything N times. The `pangea_analytics_forward_active` gauge is 1 there and 0 elsewhere.
+- **The stream is the queue.** The loop reads Synapse's own `events` table above a durable cursor. Reads are oldest first, in batches of at most `batch_max`, of the forwarded types only, never outliers or rejected events. `on_new_event` only wakes the loop, and a timer wakes it every `poll_seconds` in case a wake-up is missed. Reads are a quarter second apart, catch-up included, so a backlog costs Synapse's database a few reads a second.
+- **One connection per delivery.** No idle connection is kept: a pooled keep-alive connection the server closes just as a request is written on it can swallow that request.
+  - A request that gets no answer is sent once more at once, on a new connection.
+  - Each attempt is capped at 30 s, and a timed-out attempt aborts its connection.
+  - Only the first 64 KiB of an answer are read; a bigger answer is refused, not re-sent.
+- **The cursor moves only on an acknowledgement.** The ingest answers 200 only after committing the batch, echoing the batch's `delivered_through`.
+  - Anything else (an error, a timeout, a 200 that does not echo it) leaves the cursor where it was.
+  - The loop then retries the same events forever, backing off from 1 s, doubling to 60 s.
+  - A restart resumes from the stored cursor, so a re-sent batch is the only duplicate. The ingest's writes are idempotent.
+- **A wrong shared secret (401/403) is a configuration error.** It is logged as one and retried at the longest backoff until it is fixed.
+- **The delivery watermark.** Every batch carries `delivered_through`, the position delivery reaches once that batch is committed. When idle, the loop still sends an empty batch every `poll_seconds`, so the ingest always knows how far delivery has reached.
+
+### Profiles
+
+Profiles are not room events. Synapse calls `on_profile_update` after the write, in its own transaction, so a profile change goes through an outbox:
+
+- Each change marks the user's outbox row dirty and raises its revision. Every delivery sends the user's whole current profile with that revision. The acknowledgement clears the row only if the revision is unchanged, so a change made while a send was in flight is sent again.
+- Every batch carries `profiles_clean_before`: every profile change older than it has been delivered. It is the oldest undelivered change, minus two seconds as a margin for the gap between the write and the outbox row.
+- **On every start, before anything is sent,** every user in the outbox and every user with a `pangea.analytics_profile` is marked for re-send as "dirty since always". The heartbeat therefore reports profiles clean only after all of them are delivered again.
+- **Accepted limitation:** a crash between a profile write and its outbox row loses that change until the user's next profile change or the nightly reconcile's snapshot.
+
+### Consented analytics invites
+
+A student who allows a teacher's analytics request invites the teacher into their analytics room, and nothing in the app completes the join. The module completes it under the same five-fact proof admin-dash-api used (`composition._accept_consented_analytics_invites`), read from this homeserver's current state:
+
+1. The teacher currently holds an invite into the room.
+2. The room is the one a student of a course the teacher administers declares in their analytics profile for the course language, and no other student of that course claims it.
+   - A course is a space with a course plan.
+   - Administering it means joined at power 100 or more.
+3. That student sent the invite.
+4. That student created the room.
+5. The room is an analytics room (`m.room.create` type `p.analytics`).
+
+Rules around the proof:
+
+- A knock is never accepted.
+- The course language is the course plan's `l2`. Where a course plan names none, every room in the student's profile is a candidate (admin-dash-api's own unknown-language rule), and facts 3–5 still have to hold.
+- The proof is re-read before the join, so only the invite that was proven is accepted.
+- Consent never fails open.
+
+How the work runs:
+
+- The proof and the join run in their own worker, never in the delivery path. Every invite into a forwarded analytics room is owed to it.
+- Until the worker has answered, the invite is named in every batch (`pending_accepts`). Its `pending_accepts_rev` grows on every change and survives restarts.
+- A successful join's position is the fence on the next batch (`accept_join_pos`).
+- A failing or hanging join delays only its own invite. Failures are retried once per poll.
+- Pending invites are read on start, before anything is sent (a failed read fails the start, which is retried), and again daily.
+- On start, any self-join into an analytics room still above the cursor is fenced again. A crash between a join and its delivery therefore cannot release a Refresh early.
+
+### Endpoints (shared secret)
+
+Both take `Authorization: Bearer <analytics_forward.secret>`, compared in constant time.
+
+- `GET /_synapse/client/pangea/v1/analytics_forward/head` returns a delivery barrier. admin-dash-api's Refresh does not use it today: Refresh does not wait for delivery. The barrier has two parts:
+  - the newest forwarded event at or below the persisted head;
+  - a profile time naming only changes not yet delivered.
+
+  An idle forwarder therefore costs a reader no wait. Reading the head also wakes the forwarder when it runs in the same process, so anything undelivered goes at once rather than at the next poll.
+- `POST /_synapse/client/pangea/v1/analytics_state` takes up to 500 rooms and 500 users and returns:
+  - each room's complete current state of the forwarded types (null for a room that is unknown or outside the rooms above);
+  - each user's profile, with a revision raised by the read, so a snapshot always outranks earlier pushes.
+
+### Configuration
+
+There is no on/off switch. The forwarder runs wherever the block is configured; without it, the module logs once that it is not configured and does nothing. Deploy order is the safety: admin-dash-api's ingest first, then this config. Configured before the ingest exists, the forwarder only backs off and its cursor never moves, so nothing is lost.
+
+```yaml
+analytics_forward:
+  url: https://<admin-dash-api host>/api/internal/matrix-events  # https; plain http only to a loopback host
+  secret: <at least 32 characters, from the vault; the same value admin-dash-api holds>
+  batch_max: 200          # 1-1000
+  poll_seconds: 5         # 1-60
+  start_position: current # or a stream position; read only when no cursor is stored
+```
+
+PostgreSQL only. The module adds two tables to Synapse's database: `pangea_analytics_forward_cursor` and `pangea_analytics_profile_outbox`.
+
+### Observability
+
+- `pangea_analytics_forward_lag`: stream positions between the head and the cursor. Alert when it stays high for 10 minutes.
+- `pangea_analytics_forward_active`: alert when its sum is 0 where the forwarder is configured.
+- `pangea_analytics_forward_failures_total{reason}`: delivery failures.
+- `pangea_analytics_forward_rejected_total`: events the ingest set aside as rejects.
+- `pangea_analytics_forward_consent_total{verdict}`: consent answers.
+
+### Out of scope
+
+- Federated rooms.
+- Backfilled events: negative stream positions are below every cursor.
+- Redactions after delivery: the nightly reconcile handles them.
 
 ---
 

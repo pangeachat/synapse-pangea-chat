@@ -8,6 +8,13 @@ from synapse.events import EventBase
 from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.activity_session_previews import ActivitySessionPreviews
+from synapse_pangea_chat.analytics_forward import (
+    CONFIG_KEY as ANALYTICS_FORWARD_CONFIG_KEY,
+)
+from synapse_pangea_chat.analytics_forward import (
+    AnalyticsForward,
+    parse_analytics_forward_config,
+)
 from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
 from synapse_pangea_chat.blocked_join_gate import BlockedJoinGate
 from synapse_pangea_chat.config import (
@@ -500,6 +507,19 @@ class PangeaChat:
             self._api.register_web_resource(
                 path="/_synapse/client/pangea/v1/course_member_emails",
                 resource=self.course_member_emails_resource,
+            )
+
+        # --- Analytics forward (dashboard inputs pushed to admin-dash-api) ---
+        # Constructed only when configured (ingest URL + shared secret):
+        # construction registers its callbacks and endpoints. The loop itself
+        # runs only on the background-tasks instance, never in the send path.
+        self.analytics_forward: Optional[AnalyticsForward] = None
+        if config.analytics_forward is not None:
+            self.analytics_forward = AnalyticsForward(api, config.analytics_forward)
+        else:
+            logger.info(
+                "analytics_forward is not configured; the dashboard's Matrix "
+                "inputs are not forwarded"
             )
 
         # --- Member Analytics Profiles ---
@@ -1042,6 +1062,10 @@ class PangeaChat:
             )
 
         # --- course_member_emails config ---
+        analytics_forward = parse_analytics_forward_config(
+            config.get(ANALYTICS_FORWARD_CONFIG_KEY)
+        )
+
         course_member_emails_enabled = config.get("course_member_emails_enabled", False)
         if not isinstance(course_member_emails_enabled, bool):
             raise ValueError('Config "course_member_emails_enabled" must be a boolean')
@@ -1556,6 +1580,7 @@ class PangeaChat:
             find_user_by_email_burst_duration_seconds=find_user_by_email_burst_duration_seconds,
             find_user_by_email_rate_limit_exempt_user_ids=find_user_by_email_rate_limit_exempt_user_ids,
             course_member_emails_enabled=course_member_emails_enabled,
+            analytics_forward=analytics_forward,
             course_member_emails_requests_per_burst=course_member_emails_requests_per_burst,
             course_member_emails_burst_duration_seconds=course_member_emails_burst_duration_seconds,
             member_analytics_profiles_requests_per_burst=member_analytics_profiles_limits[

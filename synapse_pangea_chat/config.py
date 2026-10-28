@@ -13,6 +13,7 @@ from typing import List, Mapping, Optional
 
 import attr
 
+from synapse_pangea_chat.analytics_forward.config import AnalyticsForwardConfig
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 
 #: Hosts a notice's external destination may point at. A notice link is a
@@ -132,6 +133,11 @@ class PangeaChatConfig:
     course_member_emails_enabled: bool = False
     course_member_emails_requests_per_burst: int = 20
     course_member_emails_burst_duration_seconds: int = 60
+
+    # --- analytics_forward config ---
+    # The dashboard's Matrix inputs pushed to admin-dash-api. None when the
+    # block (ingest URL + shared secret) is not configured.
+    analytics_forward: Optional[AnalyticsForwardConfig] = None
 
     # --- member_analytics_profiles config ---
     # A room member reads every joined member's analytics profile at once.
