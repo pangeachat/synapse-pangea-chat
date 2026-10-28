@@ -218,7 +218,7 @@ def threshold_for(wire_name: Any, thresholds: Mapping[str, float]) -> float:
     return thresholds[UNKNOWN_CATEGORY]
 
 
-def _readable_score(scores: Any, wire_name: str) -> Optional[float]:
+def readable_score(scores: Any, wire_name: str) -> Optional[float]:
     """This category's score, or None when there is not one we can use.
 
     Exact key only. A fallback to the family's score would attribute one
@@ -283,7 +283,7 @@ def decide(
             continue
         seen.add(wire_name)
         threshold = threshold_for(wire_name, thresholds)
-        score = _readable_score(scores, wire_name)
+        score = readable_score(scores, wire_name)
         if score is None:
             unreadable = True
             continue
