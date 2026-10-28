@@ -137,6 +137,27 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
                 self.fail(f"Timed out waiting for {what}")
             time.sleep(0.25)
 
+    def _wait_handled(self, marker: str) -> None:
+        """Wait for the module's own log line about a link, so a negative
+        assertion is made after the link was handled, not before."""
+        self._wait_until(
+            lambda: any(marker in line for line in self.server_log()),
+            f"the log line {marker!r}",
+        )
+
+    def _admitted(self, room_id: str, user_id: str, token: str, reader: str) -> bool:
+        """Joined, on their review list and muted: the whole outcome, polled
+        together because the mute is written after the join."""
+        rule = self._mute_rule(room_id, token)
+        return (
+            self._membership(room_id, user_id, reader) == "join"
+            and room_id in self._review_list(user_id, token)
+            and rule is not None
+            and rule.get("actions") == []
+            and rule.get("conditions")
+            == [{"kind": "event_match", "key": "room_id", "pattern": room_id}]
+        )
+
     async def _course(self):
         """A course with a teacher, a co-teacher at admin power and two
         students; answers (space_id, users) where users maps name to
@@ -163,25 +184,17 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
         for name in ("teacher", "co"):
             user_id, token = users[name]
             self._wait_until(
-                lambda: self._membership(session_id, user_id, s1) == "join",
-                f"{name} joined to the session",
+                lambda: self._admitted(session_id, user_id, token, s1),
+                f"{name} joined to the session, listed and muted",
             )
-            self.assertIn(session_id, self._review_list(user_id, token))
-            rule = self._mute_rule(session_id, token)
-            self.assertIsNotNone(rule, f"{name} has no mute rule")
-            assert rule is not None
-            self.assertEqual(rule["actions"], [])
-            self.assertEqual(
-                rule["conditions"],
-                [{"kind": "event_match", "key": "room_id", "pattern": session_id}],
-            )
+        self._wait_handled(f"course_session_admins {session_id} linked into {space_id}")
 
         # A course member who is not an admin is never brought in.
         s2_id, s2 = users["s2"]
         self.assertIsNone(self._membership(session_id, s2_id, s1))
         self.assertNotIn(session_id, self._review_list(s2_id, s2))
-        # The student who launched it is still its only other member, and
-        # their own session is not on any list of theirs.
+        # The student who launched it is still a member, and their own session
+        # is not on any list of theirs.
         self.assertEqual(self._membership(session_id, s1_id, s1), "join")
         self.assertNotIn(session_id, self._review_list(s1_id, s1))
 
@@ -191,15 +204,12 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
         teacher_id, teacher = users["teacher"]
         chat_id = self._create_child(s1, space_id, None)
         self._link(s1, space_id, chat_id)
-        unlinked_id = self._create_child(s1, space_id, SESSION_TYPE)
-        # A control linked after them: once its join lands, the earlier link
-        # has been handled too.
-        control_id = self._create_child(s1, space_id, SESSION_TYPE)
-        self._link(s1, space_id, control_id)
-        self._wait_until(
-            lambda: self._membership(control_id, teacher_id, s1) == "join",
-            "the teacher joined to the control session",
+        self._wait_handled(
+            f"course_session_admins {chat_id} linked into {space_id}: "
+            "not an activity session"
         )
+        # Never linked, so nothing can touch it.
+        unlinked_id = self._create_child(s1, space_id, SESSION_TYPE)
 
         self.assertIsNone(self._membership(chat_id, teacher_id, s1))
         self.assertIsNone(self._membership(unlinked_id, teacher_id, s1))
@@ -215,17 +225,26 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
         session_id = self._create_child(s1, space_id, SESSION_TYPE)
         self._link(s1, space_id, session_id)
         self._wait_until(
-            lambda: self._membership(session_id, teacher_id, s1) == "join",
+            lambda: self._admitted(session_id, teacher_id, teacher, s1),
             "the teacher joined to the session",
         )
         # s2 becomes an admin only after the session was shared; sending the
         # link again (a new event replacing the first) must not join them.
         self._set_power(space_id, s2_id, 100, teacher)
         self._link(s1, space_id, session_id, via=[SERVER_NAME, "other.example"])
-        control_id = self._create_child(s1, space_id, SESSION_TYPE)
-        self._link(s1, space_id, control_id)
-        self._wait_until(
-            lambda: self._membership(control_id, s2_id, s1) == "join",
-            "the new admin joined to the control session",
+        self._wait_handled(
+            f"course_session_admins {session_id} linked into {space_id} again"
         )
         self.assertIsNone(self._membership(session_id, s2_id, s1))
+
+        # A second new session joins the teacher too, and both stay listed:
+        # adding one never drops another from the list.
+        second_id = self._create_child(s1, space_id, SESSION_TYPE)
+        self._link(s1, space_id, second_id)
+        self._wait_until(
+            lambda: self._admitted(second_id, teacher_id, teacher, s1),
+            "the teacher joined to the second session",
+        )
+        listed = self._review_list(teacher_id, teacher)
+        self.assertIn(session_id, listed)
+        self.assertIn(second_id, listed)

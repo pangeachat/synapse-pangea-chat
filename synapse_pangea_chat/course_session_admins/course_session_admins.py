@@ -87,7 +87,10 @@ def with_room_listed(
     already listed, so nothing is written."""
     content = dict(content or {})
     raw = content.get(ROOM_IDS_KEY)
-    listed = [r for r in raw if isinstance(r, str)] if isinstance(raw, list) else []
+    # Synapse answers account data frozen, so the list may arrive as a tuple.
+    listed = (
+        [r for r in raw if isinstance(r, str)] if isinstance(raw, (list, tuple)) else []
+    )
     if room_id in listed:
         return None
     content[ROOM_IDS_KEY] = sorted(set(listed) | {room_id})
@@ -135,6 +138,16 @@ class CourseSessionAdmins:
                     event.room_id,
                     event.state_key,
                 )
+            elif (
+                event.type == EventTypes.SpaceChild
+                and event.is_state()
+                and event.unsigned.get("replaces_state") is not None
+            ):
+                logger.info(
+                    "course_session_admins %s linked into %s again: not a new session",
+                    event.state_key,
+                    event.room_id,
+                )
         except Exception as e:
             # A failure here must never reject or delay the event itself.
             logger.exception(
@@ -149,10 +162,13 @@ class CourseSessionAdmins:
         is an activity session, hidden and muted. Answers who was joined; a
         failure for one admin is logged and does not stop the others."""
         if not await self._has_create_type(session_id, is_activity_session_type):
+            logger.info(
+                "course_session_admins %s linked into %s: not an activity session",
+                session_id,
+                space_id,
+            )
             return []
         admins = await self._course_admins(space_id)
-        if not admins:
-            return []
         joined: List[str] = []
         for user_id in sorted(admins):
             try:

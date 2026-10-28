@@ -71,6 +71,14 @@ class TestWithRoomListed(unittest.TestCase):
             {"room_ids": sorted([ROOM, OTHER]), "other": 1},
         )
 
+    def test_keeps_rooms_read_back_frozen(self):
+        # Synapse's get_global answers frozen data: the list arrives as a tuple,
+        # and every room already on it must stay listed.
+        self.assertEqual(
+            with_room_listed({"room_ids": (ROOM,)}, OTHER),
+            {"room_ids": sorted([ROOM, OTHER])},
+        )
+
     def test_an_already_listed_room_writes_nothing(self):
         self.assertIsNone(with_room_listed({"room_ids": [ROOM]}, ROOM))
 
