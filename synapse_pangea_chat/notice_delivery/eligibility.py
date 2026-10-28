@@ -4,7 +4,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 from synapse.storage.engines import PostgresEngine
 
@@ -344,36 +344,30 @@ class NoticeEligibility:
 
     async def _capacity(self, plan: dict) -> int:
         """How many roles the session's plan has: from the room's plan, or the
-        CMS copy it names when the room carries only the reference."""
+        activity's canonical CMS row when the room carries only the reference.
+        The reference's `version_id` is a content signature the choreographer
+        resolves, not a CMS version id, so it is not looked up here."""
         if not plan.get("activity_id"):
             raise ValueError("Session plan unavailable")
         planned_roles = plan.get("roles")
         if not isinstance(planned_roles, (dict, list)):
-            if plan.get("version_id"):
-                code, document = await self.log._request(
-                    "GET",
-                    "/" + quote(str(plan["version_id"]), safe=""),
-                    collection="activities-v2/versions",
-                )
-                document = document.get("version", {})
-            else:
-                code, found = await self.log._request(
-                    "GET",
-                    "?"
-                    + urlencode(
-                        {
-                            "where[res.plan.activity_id][equals]": plan["activity_id"],
-                            "where[req.source_request_hash][exists]": "false",
-                            "limit": 2,
-                            "depth": 0,
-                        }
-                    ),
-                    collection="activities-v2",
-                )
-                docs = found.get("docs", [])
-                if len(docs) != 1:
-                    raise ValueError("Ambiguous activity plan")
-                document = docs[0]
+            code, found = await self.log._request(
+                "GET",
+                "?"
+                + urlencode(
+                    {
+                        "where[res.plan.activity_id][equals]": plan["activity_id"],
+                        "where[req.source_request_hash][exists]": "false",
+                        "limit": 2,
+                        "depth": 0,
+                    }
+                ),
+                collection="activities-v2",
+            )
+            docs = found.get("docs", [])
+            if len(docs) != 1:
+                raise ValueError("Ambiguous activity plan")
+            document = docs[0]
             resolved = document.get("res", {}).get("plan", {})
             if code != 200 or resolved.get("activity_id") != plan["activity_id"]:
                 raise ValueError("Activity plan unavailable")

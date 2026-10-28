@@ -529,7 +529,7 @@ class TestNoticeDeliveryCMS(BaseSynapseE2ETest):
                     "pangea.activity_plan",
                     {
                         "activity_id": "activity-1",
-                        "version_id": "00000000-0000-0000-0000-000000000000",
+                        "version_id": "00000000000000000000000000000000",
                     },
                 ),
                 "none",
@@ -572,24 +572,14 @@ class TestNoticeDeliveryCMS(BaseSynapseE2ETest):
                 plan_doc, "Seed local CMS with a role-bearing canonical activity"
             )
             plan_id = plan_doc["res"]["plan"]["activity_id"]
-            versions = requests.get(
-                cms["url"] + "/api/activities-v2/versions",
-                headers=cms_headers,
-                params={
-                    "where[parent][equals]": plan_doc["id"],
-                    "limit": 1,
-                    "depth": 0,
-                },
-                timeout=20,
-            )
-            self.assertEqual(versions.status_code, 200, versions.text)
-            self.assertTrue(versions.json()["docs"])
             scheduled["activity_id"] = plan_id
+            # A client pins a content signature, which is no CMS id, so the
+            # module must size the session from the canonical row either way.
             for reference in (
                 {"activity_id": plan_id},
                 {
                     "activity_id": plan_id,
-                    "version_id": versions.json()["docs"][0]["id"],
+                    "version_id": "0123456789abcdef0123456789abcdef",
                 },
             ):
                 scheduled_case(
