@@ -17,9 +17,9 @@ where you live is an A1 lesson. Tier 1 rejects before persist, so each of
 those was a learner silenced mid-sentence. Judging an address needs the
 context only Tier 2 has.
 
-Package choices and their limits are recorded in
+The decisions this tier implements are in
 .github/instructions/moderation.instructions.md. Profanity is matched across
-all our learner languages (see `profanity.py`).
+all our learner languages (see `tier1_terms.py`).
 """
 
 from typing import Callable, Iterable, List, Optional, Tuple
@@ -47,7 +47,7 @@ logger = scrubbing_logger(
 # is the kind of record this module keeps out of plaintext logs. The rule
 # family is what an operator debugging a false positive actually needs, and
 # there is one rule per family, so nothing is lost - the mapping from
-# identifier to check is in moderation.instructions.md.
+# identifier to check is `_RULES` below.
 REASON_CONTACT_DETAILS = "contact_details"
 REASON_PROFANITY = "profanity"
 

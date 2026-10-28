@@ -133,6 +133,18 @@ class StudentCourses:
     the state at the position decides those. A course plan is set when a
     course space is created and never removed, so the current-state filter
     only saves reading every DM and activity room's history.
+
+    Two limits of the anchoring are owner-accepted, each with the condition
+    that reopens it (.github/instructions/moderation.instructions.md,
+    Decisions). On a forked room graph - a late federated event on an older
+    branch, or a soft-failed event - the state at the last persisted event can
+    still show a learner who has since left as joined, so their later
+    incidents land on the former course; revisit if Pangea's homeserver
+    federates. And the "now" position is the contiguous persisted watermark,
+    so with more than one event writer an unfinished lower position can hold
+    it behind an already-committed leave or join, and the incident freezes
+    the older course list; revisit if the homeserver gains more than one
+    event persister.
     """
 
     def __init__(
@@ -286,6 +298,12 @@ async def _load(
     the incident - replaced by a new one, say - was in force at the
     incident's position, and pruned to an empty content it would read as no
     course at all, moving the incident off the course it belonged to.
+
+    What it cannot do is read a course plan that Synapse's retention has
+    physically pruned after its redaction: an incident whose course is looked
+    up after that prune lands on no course. Owner-accepted
+    (.github/instructions/moderation.instructions.md, Decisions); revisit if
+    the product ever redacts a course plan, which it does not today.
     """
     from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 
