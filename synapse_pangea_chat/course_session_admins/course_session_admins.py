@@ -8,7 +8,7 @@ told to keep the room out of their chats and badges: the room is added to
 their ``pangea.admin_review`` account data and muted with the app's own mute
 rule, the same two writes the dashboard's review join makes.
 
-Design: pangeachat/synapse-pangea-chat#315 (instructions doc pending review).
+Design: course-session-admins.instructions.md.
 """
 
 from __future__ import annotations
