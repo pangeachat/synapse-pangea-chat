@@ -191,6 +191,13 @@ def merge_outcome(existing: Optional[str], new: Optional[str]) -> Optional[str]:
     - `removed` is final: the message is gone and nothing can say otherwise.
     - An actual attempt's result replaces whatever an earlier attempt left.
     - `skipped` fills an empty outcome only.
+
+    Owner-accepted limit (moderation.instructions.md, "The Safety page's
+    record"): rows from two attempts on one message are written detached and
+    retried, so they are not ordered. If attempt A's send and its row write
+    both fail and attempt B then records `unknown`, A's delayed retry can
+    overwrite it with `failed`. Both mean "removal not confirmed". Revisit if
+    the Safety page ever acts on the difference.
     """
     if new is None:
         return existing
