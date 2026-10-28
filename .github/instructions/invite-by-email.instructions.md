@@ -30,6 +30,21 @@ Room name, description, avatar, access code, and inviter identity are all read f
 
 The optional `message` field is included in the email as a personal note from the inviter.
 
+## Joining without the link
+
+When an account's verified email matches a student invitation, the app offers the student that course, so a student who signed up alone still gets in.
+
+1. The match runs at sign-in, when an email is verified, and when a teacher invites an address that already has an account. The email still goes out.
+2. When the student next opens the app, it shows the course and the inviting teacher, with Join and Decline. Closing it unanswered brings it back next time.
+3. Join works exactly as the link does, and the dashboard shows the student as joined.
+
+- **An offer, not a join.** Reason: a server-made join skips the app's own join, where analytics sharing and the join notices happen. Re-decided by: Will.
+- **Only the student sees the offer;** it is not a course invite. Reason: everyone in a course sees its invites, so one sent on a match would show the teacher and the class who owns the address before the student acts. Re-decided by: Will.
+- **Verified addresses only,** ignoring case. Reason: a mistyped address must not pull someone into a stranger's class. Other addresses, including Apple's Hide My Email, use the link or the code. Re-decided by: Will.
+- **Each invitation is offered to an account once.** A decline is final, and leaving the course does not bring the offer back. Reason: otherwise every sign-in would offer it again. Re-decided by: Will.
+- **Only invitations from the last 120 days are offered,** one seat term. Reason: invitations never expire, and an old one must not pull a student into a past course. Re-decided by: Will.
+- **No offer to an account in the course, banned from it, or blocked by every admin,** as with the course code. Re-decided by: engineer.
+
 ## Email
 
 Uses Synapse's built-in email sending (SMTP via Exim → SES). Templates live in [synapse-templates](../../../synapse-templates/) — same deployment pattern as registration/password-reset emails. See [course-invite-by-email.instructions.md](../../../synapse-templates/.github/instructions/course-invite-by-email.instructions.md) for template design.
