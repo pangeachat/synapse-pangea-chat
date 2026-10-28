@@ -45,6 +45,9 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 #: Connecting to the ingest; well under the overall cap, so an unreachable
 #: ingest fails fast and the loop's backoff takes over.
 CONNECT_TIMEOUT_SECONDS = 5
+#: The largest answer read. The ingest's acknowledgement is a few dozen bytes;
+#: anything bigger is not it, and is refused without being buffered.
+MAX_ANSWER_BYTES = 64 * 1024
 
 
 class DeliveryError(Exception):
@@ -367,17 +370,19 @@ def make_http_poster(
 ) -> Callable[[dict], Awaitable[Any]]:
     """POST a body to the ingest; the parsed answer, or :class:`DeliveryError`.
 
-    Only a 200 is an answer. A request that fails before any answer (a lost
+    Only a 200 is an answer, and only its first ``MAX_ANSWER_BYTES`` are
+    read. A request that fails before any answer (a lost
     or refused connection) is sent once more at once, on a new connection:
     the ingest is idempotent. The whole exchange, body included, is capped at
     ``REQUEST_TIMEOUT_SECONDS`` as a last resort.
     """
     from io import BytesIO
 
+    from synapse.http.client import BodyExceededMaxSize, read_body_with_max_size
     from synapse.logging.context import make_deferred_yieldable, run_in_background
     from synapse.util.async_helpers import timeout_deferred
     from synapse.util.json import json_encoder
-    from twisted.web.client import FileBodyProducer, readBody
+    from twisted.web.client import FileBodyProducer
     from twisted.web.http_headers import Headers
 
     uri = url.encode("ascii")
@@ -396,8 +401,16 @@ def make_http_poster(
             response = await make_deferred_yieldable(
                 agent.request(b"POST", uri, headers, FileBodyProducer(BytesIO(data)))
             )
-            content = await make_deferred_yieldable(readBody(response))
-            return response.code, content
+            buffer = BytesIO()
+            try:
+                await make_deferred_yieldable(
+                    read_body_with_max_size(response, buffer, MAX_ANSWER_BYTES)
+                )
+            except BodyExceededMaxSize:
+                # An answer came back, too big to be the acknowledgement: no
+                # re-send, and the body is never held in memory.
+                return response.code, None
+            return response.code, buffer.getvalue()
 
         async def attempt() -> Any:
             # Each attempt is bounded on its own and cancelled at its bound,
@@ -426,6 +439,10 @@ def make_http_poster(
             raise DeliveryError("auth", f"HTTP {code}")
         if code != 200:
             raise DeliveryError("http", f"HTTP {code}")
+        if content is None:
+            raise DeliveryError(
+                "bad_ack", f"answer is larger than {MAX_ANSWER_BYTES} bytes"
+            )
         try:
             return json.loads(content)
         except ValueError as exc:

@@ -24,6 +24,9 @@ _KNOWN_KEYS = frozenset(
 #: so its length is the whole of its strength.
 MIN_SECRET_LENGTH = 32
 
+#: Hosts plain ``http`` may reach: the bearer secret never leaves the machine.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
 #: ``start_position`` value meaning "the stream head when the cursor is first
 #: created". Only read when no cursor is stored yet.
 START_AT_CURRENT = "current"
@@ -70,6 +73,11 @@ def parse_analytics_forward_config(raw: Any) -> Optional[AnalyticsForwardConfig]
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError(
             f'Config "{CONFIG_KEY}.url" must be an http(s) URL with a host'
+        )
+    if parsed.scheme == "http" and parsed.hostname not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            f'Config "{CONFIG_KEY}.url" must be https: the shared secret travels '
+            "with every request (plain http only to this machine)"
         )
     if parsed.username or parsed.password:
         raise ValueError(

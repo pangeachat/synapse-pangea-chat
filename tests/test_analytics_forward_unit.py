@@ -961,6 +961,9 @@ class TestConfig(unittest.TestCase):
             {**base, "enabled": True},
             {**base, "url": "ftp://api.example/x"},
             {**base, "url": "https://user:pw@api.example/x"},
+            # The secret never travels in plaintext beyond this machine.
+            {**base, "url": "http://api.example/x"},
+            {**base, "url": "http://10.0.0.5:8000/x"},
             {**base, "secret": "short"},
             {**base, "batch_max": 0},
             {**base, "batch_max": True},
@@ -972,6 +975,16 @@ class TestConfig(unittest.TestCase):
         for raw in bad:
             with self.assertRaises(ValueError, msg=repr(raw)):
                 parse_analytics_forward_config(raw)
+
+    def test_plain_http_only_to_this_machine(self) -> None:
+        for url in (
+            "http://127.0.0.1:8000/x",
+            "http://localhost:8000/x",
+            "http://[::1]:8000/x",
+        ):
+            parsed = parse_analytics_forward_config({"url": url, "secret": SECRET})
+            assert parsed is not None, url
+            self.assertEqual(parsed.url, url)
 
     def test_start_position(self) -> None:
         parsed = parse_analytics_forward_config(
@@ -1087,6 +1100,16 @@ class TestIngestTransport(unittest.TestCase):
         _, failures = self._run(post)
         self.assertEqual(agent.calls, 1)
         self.assertEqual(failures[0].value.reason, "http")
+
+    def test_an_oversized_answer_is_refused_unread(self) -> None:
+        from synapse_pangea_chat.analytics_forward.forwarder import MAX_ANSWER_BYTES
+
+        agent = _Agent([_Response(200, b" " * (MAX_ANSWER_BYTES + 1))])
+        _, post = self._post(agent)
+        _, failures = self._run(post)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].value.reason, "bad_ack")
+        self.assertEqual(agent.calls, 1)  # an answer came back: not re-sent
 
     def test_a_stalled_body_times_out(self) -> None:
         from synapse_pangea_chat.analytics_forward.forwarder import (
