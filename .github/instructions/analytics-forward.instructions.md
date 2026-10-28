@@ -15,12 +15,12 @@ Synapse sends the teacher dashboard's Matrix data to admin-dash-api as it happen
 
 ## Decisions
 
-- **Only the rooms the dashboard reads are sent:** student analytics rooms, course spaces, and rooms a course links both ways. Nothing from a DM or any other room. Reason: privacy. Re-decided by: Will.
+- **Only the rooms the dashboard reads are sent:** student analytics rooms, course spaces, and rooms a course links both ways. Nothing from a DM or any other room. Reason: privacy. Re-decided by: Satvik.
 - **Nothing is lost in normal operation:** an event counts as delivered only once the dashboard confirms it saved it; until then it is retried. Accepted gap: a room unlinked from its course while its events are still undelivered has them skipped. Re-decided by: engineer.
 - **Delivery runs in the background at a steady pace,** so an outage or a backlog never slows Synapse. Re-decided by: engineer.
-- **Refresh does not wait for delivery;** data arrives within seconds, so anything sent in the last few seconds shows on the next Refresh. Re-decided by: Will.
+- **Refresh does not wait for delivery;** data arrives within seconds, so anything sent in the last few seconds shows on the next Refresh. Re-decided by: Satvik.
 - **Profile changes are sent too.** Accepted gap: a crash at the moment of a profile change can lose that change until the student's next change or the nightly reconcile. Re-decided by: engineer.
-- **The teacher is joined only when** the student invited them into the student's own analytics room, for a course the teacher runs, and no other student claims that room. A knock is never accepted; when in doubt, it does not join. Re-decided by: Will.
+- **The teacher is joined only when** the student invited them into the student's own analytics room, for a course the teacher runs, and no other student claims that room. A knock is never accepted; when in doubt, it does not join. Re-decided by: Satvik.
 - **No on/off switch:** it runs where it is configured. Deploy order is the safety: admin-dash-api first, then this config. Re-decided by: engineer.
 - **Out of scope:** federated rooms, old history loaded later, and deletions after delivery (the nightly reconcile handles these). Re-decided by: engineer.
 
