@@ -186,6 +186,20 @@
           "membership": "join",
           "displayname": "Student"
         }
+      },
+      {
+        "stream_pos": 812360,
+        "event_id": "$voice1",
+        "room_id": "!session:pangea.chat",
+        "type": "m.room.message",
+        "state_key": null,
+        "sender": "@student:pangea.chat",
+        "origin_server_ts": 1761200002000,
+        "content": {
+          "info": {
+            "duration": 4200
+          }
+        }
       }
     ],
     "profiles": [
@@ -299,8 +313,9 @@
     "notes": "Each known room's COMPLETE current state of the forwarded state types (an absent type is absent from the room, not unread); null for a room this homeserver does not know or does not forward from (a DM, a room no course links). Each profile carries a revision bumped by this read, so it is newer than anything pushed before it. At most 500 room ids and 500 user ids per request. Every answer (profile-only rounds included) carries forwarded_types: exactly the state types this module forwards. Treat a type as absent from a room only when it is listed; a snapshot without the field (an older module) proves nothing about missing types."
   },
   "forwarded_types": {
-    "description": "Exactly the event types the module forwards, live and in analytics_state snapshots, from the rooms it forwards from (analytics rooms, course spaces, and rooms a course space links both ways). pangea.construct as a timeline event; every other type as state. m.room.canonical_alias marks a course's Announcements chat (alias localpart announcementsChat...). pangea.course_progress (state_key = the course room id) is a student's progress in a course, written by the app into their analytics room. pangea.activity_summary is a session room's summary (the dashboard's session XP), state_key = a language code.",
+    "description": "Exactly the event types the module forwards, live and in analytics_state snapshots, from the rooms it forwards from (analytics rooms, course spaces, and rooms a course space links both ways). pangea.construct and voice messages (m.room.message, msgtype m.audio only) as timeline events; every other type as state. m.room.canonical_alias marks a course's Announcements chat (alias localpart announcementsChat...). pangea.course_progress (state_key = the course room id) is a student's progress in a course, written by the app into their analytics room. pangea.activity_summary is a session room's summary (the dashboard's session XP), state_key = a language code.",
     "timeline": [
+      "m.room.message",
       "pangea.construct"
     ],
     "state": [
@@ -326,6 +341,26 @@
       "pangea.course_settings",
       "pangea.orchestrator_awarded_goals",
       "pangea.teacher_mode"
-    ]
+    ],
+    "voice_message": {
+      "description": "An m.room.message with msgtype m.audio is forwarded as metadata only: the record envelope (stream_pos, event_id, room_id, type, state_key null, sender, origin_server_ts) and content {\"info\": {\"duration\": <ms, integer, or null when the message names none>}}. Nothing else of the message is sent: no body, url, file, transcript, msgtype or other content. No other message type is forwarded.",
+      "content_fields": [
+        "info.duration"
+      ],
+      "example": {
+        "stream_pos": 812360,
+        "event_id": "$voice1",
+        "room_id": "!session:pangea.chat",
+        "type": "m.room.message",
+        "state_key": null,
+        "sender": "@student:pangea.chat",
+        "origin_server_ts": 1761200002000,
+        "content": {
+          "info": {
+            "duration": 4200
+          }
+        }
+      }
+    }
   }
 }

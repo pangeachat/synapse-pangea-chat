@@ -11,8 +11,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping, Optional, Sequence
 
-#: The one room-timeline (non-state) type forwarded: a student's construct uses.
+#: A room-timeline (non-state) type forwarded: a student's construct uses.
 CONSTRUCT_TYPE = "pangea.construct"
+
+#: Voice messages: an ``m.room.message`` of msgtype ``m.audio`` only, sent as
+#: metadata (who, when, how long), never its body, file or transcript.
+MESSAGE_TYPE = "m.room.message"
+VOICE_MSGTYPE = "m.audio"
 
 #: State types forwarded from every room. The list the dashboard reads; the
 #: inventory test in admin-dash-api (plan PR A2) is what fixes it, and a type
@@ -54,21 +59,43 @@ STATE_TYPES = frozenset(
     }
 )
 
-FORWARDED_TYPES = frozenset(STATE_TYPES | {CONSTRUCT_TYPE})
+FORWARDED_TYPES = frozenset(STATE_TYPES | {CONSTRUCT_TYPE, MESSAGE_TYPE})
 
 SCHEMA_VERSION = 1
 
 
-def is_forwarded(event_type: str, state_key: Optional[str]) -> bool:
-    """A state type only as state, the construct type only as a timeline event."""
+def is_forwarded(
+    event_type: str, state_key: Optional[str], content: Any = None
+) -> bool:
+    """A state type only as state; the construct type, and a message only as a
+    voice message, as timeline events."""
     if event_type == CONSTRUCT_TYPE:
         return state_key is None
+    if event_type == MESSAGE_TYPE:
+        return (
+            state_key is None
+            and isinstance(content, Mapping)
+            and content.get("msgtype") == VOICE_MSGTYPE
+        )
     return event_type in STATE_TYPES and state_key is not None
+
+
+def _voice_content(content: Any) -> Dict[str, Any]:
+    """A voice message's content as sent: its duration (ms) and nothing else."""
+    info = content.get("info") if isinstance(content, Mapping) else None
+    duration = info.get("duration") if isinstance(info, Mapping) else None
+    if isinstance(duration, bool) or not isinstance(duration, int):
+        duration = None
+    return {"info": {"duration": duration}}
 
 
 def event_record(event: Any) -> Dict[str, Any]:
     """One event as the ingest takes it. ``stream_pos`` orders everything."""
     state_key = event.get_state_key() if event.is_state() else None
+    if event.type == MESSAGE_TYPE:
+        content: Dict[str, Any] = _voice_content(event.content)
+    else:
+        content = dict(event.content)
     return {
         "stream_pos": int(event.internal_metadata.stream_ordering),
         "event_id": event.event_id,
@@ -77,7 +104,7 @@ def event_record(event: Any) -> Dict[str, Any]:
         "state_key": state_key,
         "sender": event.sender,
         "origin_server_ts": int(event.origin_server_ts),
-        "content": dict(event.content),
+        "content": content,
     }
 
 

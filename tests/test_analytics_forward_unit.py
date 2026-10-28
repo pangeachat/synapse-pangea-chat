@@ -27,6 +27,7 @@ from synapse_pangea_chat.analytics_forward.forwarder import (
 from synapse_pangea_chat.analytics_forward.wire import (
     BadAck,
     check_ack,
+    event_record,
     ingest_body,
     is_forwarded,
 )
@@ -927,11 +928,61 @@ class TestWire(unittest.TestCase):
         self.assertFalse(is_forwarded("pangea.construct", ""))
         self.assertTrue(is_forwarded("m.room.member", "@u:hs"))
         self.assertFalse(is_forwarded("m.room.member", None))
+        # A message only as a voice message (m.audio), never as state.
         self.assertFalse(is_forwarded("m.room.message", None))
+        self.assertFalse(
+            is_forwarded("m.room.message", None, {"msgtype": "m.text", "body": "x"})
+        )
+        self.assertTrue(is_forwarded("m.room.message", None, {"msgtype": "m.audio"}))
+        self.assertFalse(is_forwarded("m.room.message", "", {"msgtype": "m.audio"}))
+
+    def test_a_voice_message_is_sent_as_metadata_only(self) -> None:
+        event = FakeEvent(
+            7,
+            "m.room.message",
+            None,
+            {
+                "msgtype": "m.audio",
+                "body": "voice.ogg",
+                "url": "mxc://hs/abc",
+                "file": {"url": "mxc://hs/enc"},
+                "info": {"duration": 4200, "mimetype": "audio/ogg", "size": 9},
+                "org.matrix.msc1767.transcript": "hola",
+            },
+        )
+        record = event_record(event)
+        self.assertEqual(record["content"], {"info": {"duration": 4200}})
+        self.assertEqual(
+            set(record),
+            {
+                "stream_pos",
+                "event_id",
+                "room_id",
+                "type",
+                "state_key",
+                "sender",
+                "origin_server_ts",
+                "content",
+            },
+        )
+        self.assertIsNone(record["state_key"])
+        missing_cases: List[Dict[str, Any]] = [
+            {},
+            {"info": "x"},
+            {"info": {"duration": True}},
+        ]
+        for missing in missing_cases:
+            bare = FakeEvent(
+                8, "m.room.message", None, {"msgtype": "m.audio", **missing}
+            )
+            self.assertEqual(
+                event_record(bare)["content"], {"info": {"duration": None}}
+            )
 
     def test_forwarded_types_match_the_contract(self) -> None:
         from synapse_pangea_chat.analytics_forward.wire import (
             CONSTRUCT_TYPE,
+            MESSAGE_TYPE,
             STATE_TYPES,
         )
 
@@ -943,7 +994,9 @@ class TestWire(unittest.TestCase):
         )
         with open(path, encoding="utf-8") as f:
             types = json.load(f)["forwarded_types"]
-        self.assertEqual(types["timeline"], [CONSTRUCT_TYPE])
+        self.assertEqual(types["timeline"], sorted([CONSTRUCT_TYPE, MESSAGE_TYPE]))
+        voice = types["voice_message"]["example"]
+        self.assertEqual(voice["content"], {"info": {"duration": 4200}})
         self.assertEqual(types["state"], sorted(STATE_TYPES))
         snapshot = json.load(open(path, encoding="utf-8"))["analytics_state_endpoint"]
         self.assertEqual(
