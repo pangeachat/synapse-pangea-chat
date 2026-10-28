@@ -258,7 +258,7 @@ class Forwarder:
         )
         for event in events:
             state_key = event.get_state_key() if event.is_state() else None
-            if not is_forwarded(event.type, state_key, event.content):
+            if not is_forwarded(event.type, state_key):
                 continue
             if event.room_id not in course_rooms:
                 continue

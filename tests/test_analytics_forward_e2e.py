@@ -730,64 +730,6 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
         )
         self._assert_no_forwarder_errors()
 
-    async def test_voice_messages_forwarded_as_metadata_only(self) -> None:
-        await self._start()
-        teacher, t_token = await self.new_user("voiceteacher")
-        friend, f_token = await self.new_user("voicefriend")
-        course = self._course(t_token, teacher, teacher, "es")
-        session = self._create_room(t_token, preset="public_chat")
-        self._link(t_token, course, session)
-        audio = {
-            "msgtype": "m.audio",
-            "body": "voice message",
-            "url": "mxc://localhost/abc",
-            "info": {"duration": 4200, "mimetype": "audio/ogg", "size": 1234},
-            "org.matrix.msc1767.transcript": "hola",
-        }
-        voice = self._send(t_token, session, "m.room.message", audio)
-        text = self._send(
-            t_token, session, "m.room.message", {"msgtype": "m.text", "body": "hi"}
-        )
-        # The same voice message in a DM and in a room the course never links.
-        dm = self._create_room(
-            t_token, preset="trusted_private_chat", is_direct=True, invite=[friend]
-        )
-        self._join(f_token, dm)
-        dm_voice = self._send(t_token, dm, "m.room.message", audio)
-        unlinked = self._create_room(f_token, preset="private_chat")
-        self._put_state(
-            f_token, unlinked, "m.space.parent", course, {"via": ["localhost"]}
-        )
-        unlinked_voice = self._send(f_token, unlinked, "m.room.message", audio)
-
-        await self._until(lambda: self._acked_with(voice), "the voice message")
-        record = next(
-            e
-            for b in self._acked_with(voice)
-            for e in b["events"]
-            if e["event_id"] == voice
-        )
-        self.assertEqual(
-            record,
-            {
-                "stream_pos": self._pos(voice),
-                "event_id": voice,
-                "room_id": session,
-                "type": "m.room.message",
-                "state_key": None,
-                "sender": teacher,
-                "origin_server_ts": record["origin_server_ts"],
-                "content": {"info": {"duration": 4200}},
-            },
-        )
-        self.assertNotIn("body", record["content"])
-        self.assertNotIn("url", record["content"])
-        passed = max(self._pos(e) for e in (text, dm_voice, unlinked_voice))
-        await self._until(lambda: self._cursor() >= passed, "the cursor")
-        for event_id in (text, dm_voice, unlinked_voice):
-            self.assertEqual(self._attempted_with(event_id), [], event_id)
-        self._assert_no_forwarder_errors()
-
     async def test_head_and_state_need_the_secret(self) -> None:
         await self._start()
         student, s_token = await self.new_user("snap")

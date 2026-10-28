@@ -437,7 +437,6 @@ Pushes the teacher dashboard's Matrix inputs to admin-dash-api's `POST /api/inte
 
 ### What is sent
 
-- **Voice messages, as metadata only:** an `m.room.message` of msgtype `m.audio` is sent as the record envelope (`stream_pos`, `event_id`, `room_id`, `type`, `state_key` null, `sender`, `origin_server_ts`) with `content` = `{"info": {"duration": <ms, or null>}}`. No body, url, file, transcript or other content is sent, and no other message type is read or sent.
 - **Types** (`wire.py`): construct uses (`pangea.construct`, as timeline events), plus these state types: membership, power, room identity, `m.room.canonical_alias`, course-space, session-room (including `pangea.activity_summary`, the source of the dashboard's session XP) and analytics-room state, and `pangea.course_progress`. admin-dash-api's forwarded-types inventory test decides the list.
 - **Rooms** (`ForwardStore.course_rooms`, decided from current state when each batch is read):
   - analytics rooms (`m.room.create` type `p.analytics`);

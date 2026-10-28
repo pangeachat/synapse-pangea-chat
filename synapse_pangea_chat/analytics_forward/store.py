@@ -33,14 +33,10 @@ _UPSERT_GREATEST_SQL = """
     )
 """
 _SELECT_FORWARDED_HEAD_SQL = """
-    SELECT COALESCE(MAX(e.stream_ordering), 0) FROM events AS e
-    WHERE e.stream_ordering > 0 AND e.stream_ordering <= ?
-        AND NOT e.outlier AND e.rejection_reason IS NULL
-        AND e.type = ANY(?)
-        AND (e.type <> 'm.room.message' OR EXISTS (
-            SELECT 1 FROM event_json AS ej WHERE ej.event_id = e.event_id
-                AND ej.json::jsonb -> 'content' ->> 'msgtype' = 'm.audio'
-        ))
+    SELECT COALESCE(MAX(stream_ordering), 0) FROM events
+    WHERE stream_ordering > 0 AND stream_ordering <= ?
+        AND NOT outlier AND rejection_reason IS NULL
+        AND type = ANY(?)
 """
 
 _CREATE_CURSOR_SQL = """
@@ -127,18 +123,12 @@ _ADVANCE_CURSOR_SQL = """
     SET stream_pos = GREATEST(stream_pos, ?) WHERE name = ?
 """
 
-# A message only as a voice message (msgtype m.audio): text and every other
-# message is never read.
 _SELECT_EVENTS_SQL = """
-    SELECT e.stream_ordering, e.event_id FROM events AS e
-    WHERE e.stream_ordering > ? AND e.stream_ordering <= ?
-        AND NOT e.outlier AND e.rejection_reason IS NULL
-        AND e.type = ANY(?)
-        AND (e.type <> 'm.room.message' OR EXISTS (
-            SELECT 1 FROM event_json AS ej WHERE ej.event_id = e.event_id
-                AND ej.json::jsonb -> 'content' ->> 'msgtype' = 'm.audio'
-        ))
-    ORDER BY e.stream_ordering LIMIT ?
+    SELECT stream_ordering, event_id FROM events
+    WHERE stream_ordering > ? AND stream_ordering <= ?
+        AND NOT outlier AND rejection_reason IS NULL
+        AND type = ANY(?)
+    ORDER BY stream_ordering LIMIT ?
 """
 _FORWARDED_TYPES = sorted(FORWARDED_TYPES)
 
