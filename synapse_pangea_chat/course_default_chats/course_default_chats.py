@@ -289,6 +289,27 @@ def plan_recovery(
     )
 
 
+async def wait_out_rate_limits(
+    clock: Any, action: Callable[[], Awaitable[Any]], name: str
+) -> None:
+    """Run a membership or state write, waiting out Synapse's rate limits.
+
+    Module writes are rate-limited like a client's, and the per-room join
+    limit (burst 10, then one a second by default) is what a class joining
+    one chat hits. Waiting is correct here: this runs in the background,
+    and a dropped member is the failure this module exists to prevent.
+    """
+    for _ in range(MAX_RATE_LIMIT_WAITS):
+        try:
+            await action()
+            return
+        except LimitExceededError as e:
+            wait_ms = e.retry_after_ms or 1000
+            logger.info("%s waiting %d ms for %s", name, wait_ms, e.limiter_name)
+            await clock.sleep(Duration(milliseconds=wait_ms))
+    raise LimitExceededError(limiter_name=name, retry_after_ms=None)
+
+
 def _capture_exception(e: Exception) -> None:
     # Background tasks and respond_with_json paths never reach Synapse's
     # request-level Sentry capture, so a failure absorbed here is invisible
@@ -866,26 +887,7 @@ class CourseDefaultChats:
         await self._paced(lambda: server_initiated_join(self._api, chat_id, user_id))
 
     async def _paced(self, action: Callable[[], Awaitable[Any]]) -> None:
-        """Run a membership or state write, waiting out Synapse's rate limits.
-
-        Module writes are rate-limited like a client's, and the per-room join
-        limit (burst 10, then one a second by default) is what a class joining
-        one chat hits. Waiting is correct here: this runs in the background,
-        and a dropped member is the failure this module exists to prevent.
-        """
-        for _ in range(MAX_RATE_LIMIT_WAITS):
-            try:
-                await action()
-                return
-            except LimitExceededError as e:
-                wait_ms = e.retry_after_ms or 1000
-                logger.info(
-                    "course_default_chats waiting %d ms for %s", wait_ms, e.limiter_name
-                )
-                await self._clock.sleep(Duration(milliseconds=wait_ms))
-        raise LimitExceededError(
-            limiter_name="course_default_chats", retry_after_ms=None
-        )
+        await wait_out_rate_limits(self._clock, action, "course_default_chats")
 
     def _report_no_admin(self, chat_id: str, reason: str, apply: bool) -> None:
         """A chat nobody can act for: logged every time, captured to Sentry
