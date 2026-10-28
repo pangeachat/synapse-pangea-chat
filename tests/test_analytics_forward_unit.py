@@ -1493,6 +1493,9 @@ class TestSnapshotDeclaresForwardedTypes(unittest.IsolatedAsyncioTestCase):
         from synapse_pangea_chat.analytics_forward.resources import AnalyticsState
 
         class Store:
+            async def course_rooms(self, room_ids: Any) -> Set[str]:
+                return set(room_ids)
+
             async def bump_revisions(self, user_ids: Any) -> Dict[str, int]:
                 return {u: 1 for u in user_ids}
 

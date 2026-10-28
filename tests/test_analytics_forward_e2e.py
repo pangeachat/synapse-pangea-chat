@@ -371,15 +371,7 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
         await self._until(lambda: self._acked_with(chat_join), "the chat's join")
         passed = max(self._pos(dm_name), self._pos(dm_join))
         await self._until(lambda: self._cursor() >= passed, "the cursor past the DM")
-        self.assertEqual(
-            [
-                e
-                for _, body in self.ingest.requests()
-                for e in body["events"]
-                if e["room_id"] == dm
-            ],
-            [],
-        )
+        self.assertEqual(self._sent_from(dm), [])
         # The course space's own state goes too: the link is in it.
         child = self._sql(
             "SELECT event_id FROM current_state_events WHERE room_id = %s "
@@ -387,6 +379,95 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
             (course, chat),
         )[0][0]
         await self._until(lambda: self._acked_with(child), "the space child")
+        self._assert_no_forwarder_errors()
+
+    def _snapshot(self, room_id: str) -> Any:
+        resp = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/analytics_state",
+            json={"room_ids": [room_id], "user_ids": []},
+            headers=self._h(SECRET),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return resp.json()["rooms"][room_id]
+
+    def _sent_from(self, room_id: str) -> List[dict]:
+        return [
+            e
+            for _, body in self.ingest.requests()
+            for e in body["events"]
+            if e["room_id"] == room_id
+        ]
+
+    async def test_snapshot_answers_nothing_for_a_room_outside_courses(self) -> None:
+        await self._start()
+        teacher, t_token = await self.new_user("steacher")
+        friend, f_token = await self.new_user("sfriend")
+        dm = self._create_room(
+            t_token, preset="trusted_private_chat", is_direct=True, invite=[friend]
+        )
+        self._join(f_token, dm)
+        self._put_state(t_token, dm, "m.room.name", "", {"name": "just us"})
+        self.assertIsNone(self._snapshot(dm))
+        course = self._course(t_token, teacher, teacher, "es")
+        chat = self._create_room(t_token, preset="public_chat")
+        self._link(t_token, course, chat)
+        self.assertIsNotNone(self._snapshot(chat))
+        self.assertIsNotNone(self._snapshot(course))
+        self._assert_no_forwarder_errors()
+
+    async def test_a_course_plan_outside_a_space_is_no_course(self) -> None:
+        await self._start()
+        teacher, t_token = await self.new_user("nteacher")
+        student, s_token = await self.new_user("nstudent")
+        # A plain room carrying a course plan, the teacher at power 100.
+        fake = self._create_room(
+            t_token,
+            preset="public_chat",
+            initial_state=[
+                {
+                    "type": "pangea.course_plan",
+                    "state_key": "",
+                    "content": {"uuid": "plan", "l2": "es"},
+                }
+            ],
+            power_level_content_override={"users": {teacher: 100}},
+        )
+        self._join(s_token, fake)
+        name = self._put_state(
+            t_token, fake, "m.room.name", "", {"name": "Not a course"}
+        )
+        self.assertIsNone(self._snapshot(fake))
+        # Its high-power member is no course admin: the invite is not accepted.
+        analytics = self._analytics_room(s_token)
+        self._point_profile(student, s_token, analytics)
+        self._room_action(s_token, analytics, "invite", user_id=teacher)
+        await self._until(lambda: self._answered(analytics, teacher), "the answer")
+        self.assertEqual(self._membership(analytics, teacher), "invite")
+        await self._until(lambda: self._cursor() >= self._pos(name), "the cursor")
+        self.assertEqual(self._sent_from(fake), [])
+        self._assert_no_forwarder_errors()
+
+    async def test_a_parent_the_course_does_not_link_is_not_followed(self) -> None:
+        await self._start()
+        teacher, t_token = await self.new_user("pclaimteacher")
+        _, o_token = await self.new_user("pclaimother")
+        course = self._course(t_token, teacher, teacher, "es")
+        # Anyone may claim a parent in their own room; the course never links it.
+        claimer = self._create_room(o_token, preset="private_chat")
+        self._put_state(
+            o_token, claimer, "m.space.parent", course, {"via": ["localhost"]}
+        )
+        name = self._put_state(o_token, claimer, "m.room.name", "", {"name": "mine"})
+        self.assertIsNone(self._snapshot(claimer))
+        # A room the course does link is followed.
+        chat = self._create_room(t_token, preset="public_chat")
+        self._link(t_token, course, chat)
+        linked_name = self._put_state(
+            t_token, chat, "m.room.name", "", {"name": "Class"}
+        )
+        await self._until(lambda: self._acked_with(linked_name), "the linked room")
+        await self._until(lambda: self._cursor() >= self._pos(name), "the cursor")
+        self.assertEqual(self._sent_from(claimer), [])
         self._assert_no_forwarder_errors()
 
     async def test_profile_cleared_only_for_the_revision_sent(self) -> None:

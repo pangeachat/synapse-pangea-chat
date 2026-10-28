@@ -44,6 +44,8 @@ logger = logging.getLogger("synapse.modules.synapse_pangea_chat.analytics_forwar
 ANALYTICS_ROOM_TYPE = "p.analytics"
 PROFILE_KEY = "pangea.analytics_profile"
 COURSE_PLAN_TYPE = "pangea.course_plan"
+#: A course is a space (``m.room.create`` type) holding a course plan.
+COURSE_ROOM_TYPE = "m.space"
 #: The power level at or above which a course member is an instructor
 #: (admin-dash-api ``reader._COURSE_ADMIN_POWER_LEVEL``).
 COURSE_ADMIN_POWER_LEVEL = 100
@@ -277,7 +279,14 @@ class ConsentAcceptor:
                 course_id, state_filter=self._course_filter
             )
             plan = state.get((COURSE_PLAN_TYPE, ""))
-            if plan is None:
+            create = state.get(("m.room.create", ""))
+            # A course is a space with a course plan; a plan in any other room
+            # makes no course, and its power-100 member no course admin.
+            if (
+                plan is None
+                or create is None
+                or create.content.get("type") != COURSE_ROOM_TYPE
+            ):
                 continue
             power_event = state.get(("m.room.power_levels", ""))
             powers: Dict[str, Any] = (

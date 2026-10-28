@@ -300,7 +300,7 @@ class TestCourseLanguageThroughTheFactReads(unittest.IsolatedAsyncioTestCase):
     ES_ROOM = "!es:hs"
     FR_ROOM = "!fr:hs"
 
-    def _acceptor(self, l2: Optional[str]) -> Any:
+    def _acceptor(self, l2: Optional[str], course_type: str = "m.space") -> Any:
         test = self
         plan: Dict[str, Any] = {"uuid": "plan"}
         if l2 is not None:
@@ -341,6 +341,7 @@ class TestCourseLanguageThroughTheFactReads(unittest.IsolatedAsyncioTestCase):
 
             async def get_current_state(self, room_id: str, state_filter: Any) -> Any:
                 return {
+                    ("m.room.create", ""): _Event(TEACHER, {"type": course_type}),
                     ("pangea.course_plan", ""): _Event(TEACHER, immutabledict(plan)),
                     ("m.room.power_levels", ""): _Event(
                         TEACHER, {"users": {TEACHER: 100}}
@@ -359,8 +360,10 @@ class TestCourseLanguageThroughTheFactReads(unittest.IsolatedAsyncioTestCase):
         acceptor._join_position = join_position  # type: ignore[method-assign]
         return acceptor
 
-    async def _verdict(self, l2: Optional[str], room_id: str) -> Tuple[str, int]:
-        acceptor = self._acceptor(l2)
+    async def _verdict(
+        self, l2: Optional[str], room_id: str, course_type: str = "m.space"
+    ) -> Tuple[str, int]:
+        acceptor = self._acceptor(l2, course_type)
         acceptor._join = mock.AsyncMock(return_value=9)
         return await acceptor.accept_if_consented(room_id, TEACHER)
 
@@ -375,6 +378,15 @@ class TestCourseLanguageThroughTheFactReads(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self._verdict("es-MX", self.FR_ROOM), (REFUSED_NO_CLAIM, 0)
         )
+
+    async def test_a_course_plan_outside_a_space_is_no_course(self) -> None:
+        # A plain room carrying a course plan: its power-100 member is no
+        # course admin, so nothing is proven.
+        for room_type in ("", "p.analytics"):
+            self.assertEqual(
+                await self._verdict("es", self.ES_ROOM, room_type),
+                (REFUSED_NO_CLAIM, 0),
+            )
 
     async def test_no_course_language_uses_every_room(self) -> None:
         self.assertEqual(await self._verdict(None, self.FR_ROOM), (ACCEPT, 9))

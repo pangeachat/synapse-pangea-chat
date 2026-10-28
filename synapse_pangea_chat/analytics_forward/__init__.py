@@ -1,4 +1,5 @@
-"""Forwards the dashboard's Matrix inputs to admin-dash-api, losslessly.
+"""Forwards the dashboard's Matrix inputs (course and analytics rooms only) to
+admin-dash-api.
 
 Design: ``.github/instructions/analytics-forward.instructions.md``.
 

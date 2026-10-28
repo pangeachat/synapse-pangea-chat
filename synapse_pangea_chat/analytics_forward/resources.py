@@ -144,7 +144,13 @@ class AnalyticsState(_SecretResource):
                 "Matrix room / user ids"
             }
         rooms: Dict[str, Any] = {}
+        # The same rooms the forwarder sends from: a room outside courses (a
+        # DM, a room the course does not link) answers null, as an unknown one.
+        eligible = await self._store.course_rooms(room_ids)
         for room_id in room_ids:
+            if room_id not in eligible:
+                rooms[room_id] = None
+                continue
             state = await self._state.get_current_state(
                 room_id, state_filter=self._filter
             )

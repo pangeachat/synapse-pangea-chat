@@ -146,10 +146,17 @@ _SELECT_PENDING_INVITES_SQL = """
 
 
 # The rooms the dashboard reads, decided from current state when a batch is
-# read (so a room linked later is forwarded from then on): an analytics room,
-# a course space (it holds a pangea.course_plan), or a room whose
-# m.space.parent names a course space. Every other room, a DM included, is
-# never forwarded. Every lookup is by room id (current_state_events' key).
+# read (so a room linked later is forwarded from then on):
+#
+# * an analytics room: ``m.room.create`` type ``p.analytics``;
+# * a course space: ``m.room.create`` type ``m.space`` AND a
+#   ``pangea.course_plan``. A course plan in any other room makes no course;
+# * a room the course links: its ``m.space.parent`` names a course space AND
+#   that space holds the matching ``m.space.child`` for it, both with a
+#   ``via``. A parent claimed by the room alone is not a link.
+#
+# Every other room, a DM included, is never forwarded or snapshotted. Every
+# lookup is by (room_id, type, state_key), current_state_events' own key.
 _SELECT_COURSE_ROOMS_SQL = """
     SELECT r.room_id FROM unnest(?::text[]) AS r(room_id)
     WHERE EXISTS (
@@ -160,17 +167,33 @@ _SELECT_COURSE_ROOMS_SQL = """
             AND ej.json::jsonb -> 'content' ->> 'type' = 'p.analytics'
     ) OR EXISTS (
         SELECT 1 FROM current_state_events AS plan
+        JOIN current_state_events AS cse
+            ON cse.room_id = plan.room_id
+            AND cse.type = 'm.room.create' AND cse.state_key = ''
+        JOIN event_json AS ej ON ej.event_id = cse.event_id
         WHERE plan.room_id = r.room_id
             AND plan.type = 'pangea.course_plan' AND plan.state_key = ''
+            AND ej.json::jsonb -> 'content' ->> 'type' = 'm.space'
     ) OR EXISTS (
         SELECT 1 FROM current_state_events AS parent
-        JOIN event_json AS ej ON ej.event_id = parent.event_id
+        JOIN event_json AS pj ON pj.event_id = parent.event_id
+        JOIN current_state_events AS child
+            ON child.room_id = parent.state_key
+            AND child.type = 'm.space.child' AND child.state_key = parent.room_id
+        JOIN event_json AS cj ON cj.event_id = child.event_id
         JOIN current_state_events AS plan
             ON plan.room_id = parent.state_key
             AND plan.type = 'pangea.course_plan' AND plan.state_key = ''
+        JOIN current_state_events AS cse
+            ON cse.room_id = parent.state_key
+            AND cse.type = 'm.room.create' AND cse.state_key = ''
+        JOIN event_json AS ej ON ej.event_id = cse.event_id
         WHERE parent.room_id = r.room_id AND parent.type = 'm.space.parent'
-            AND jsonb_typeof(ej.json::jsonb -> 'content' -> 'via') = 'array'
-            AND ej.json::jsonb -> 'content' -> 'via' <> '[]'::jsonb
+            AND jsonb_typeof(pj.json::jsonb -> 'content' -> 'via') = 'array'
+            AND pj.json::jsonb -> 'content' -> 'via' <> '[]'::jsonb
+            AND jsonb_typeof(cj.json::jsonb -> 'content' -> 'via') = 'array'
+            AND cj.json::jsonb -> 'content' -> 'via' <> '[]'::jsonb
+            AND ej.json::jsonb -> 'content' ->> 'type' = 'm.space'
     )
 """
 
