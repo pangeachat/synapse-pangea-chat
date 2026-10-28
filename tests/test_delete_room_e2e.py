@@ -141,6 +141,55 @@ class TestE2E(BaseSynapseE2ETest):
             joined_rooms = resp.json().get("joined_rooms", [])
             self.assertEqual(len(joined_rooms), 0)
 
+    async def test_server_admin_deletes_after_room_admin_left(self):
+        await self.homeserver()
+
+        creator_id, creator_token = await self.new_user("creator")
+        bot_id, bot_token = await self.new_user("bot", admin=True)
+        member_id, member_token = await self.new_user("member")
+        room_id = await self.create_private_room(creator_token)
+        for user_id, token in [(bot_id, bot_token), (member_id, member_token)]:
+            self.assertTrue(
+                await self.invite_user_to_room(room_id, user_id, creator_token)
+            )
+            self.assertTrue(await self.accept_room_invitation(room_id, token))
+            self.assertTrue(
+                await self.set_member_power_level(room_id, user_id, 50, creator_token)
+            )
+
+        # The creator's 100 stays in m.room.power_levels after they leave
+        resp = requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/leave",
+            json={},
+            headers={"Authorization": f"Bearer {creator_token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        delete_url = f"{self.server_url}/_synapse/client/pangea/v1/delete_room"
+        # Everyone else still counts the departed creator
+        response = requests.post(
+            delete_url,
+            json={"room_id": room_id},
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("highest power level", response.json().get("error", ""))
+
+        # A server admin is compared only with the members still in the room
+        response = requests.post(
+            delete_url,
+            json={"room_id": room_id},
+            headers={"Authorization": f"Bearer {bot_token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message"], "Deleted")
+        resp = requests.get(
+            f"{self.server_url}/_matrix/client/v3/joined_rooms",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn(room_id, resp.json().get("joined_rooms", []))
+
     async def set_member_power_level(
         self, room_id: str, user_id: str, power_level: int, access_token: str
     ):
