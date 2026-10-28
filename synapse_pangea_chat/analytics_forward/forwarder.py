@@ -347,6 +347,55 @@ def refresh_barrier(
     return forwarded_head, now_ms - PROFILE_CLOCK_GRACE_MS
 
 
+def read_capped_body(response: Any, limit: int) -> Any:
+    """A Deferred of the response body, or of ``None`` once it exceeds ``limit``
+    bytes (the connection is then aborted and the rest never read).
+
+    Like Twisted's ``readBody``, cancelling it aborts the connection, so an
+    attempt cut at its timeout leaves no stalled connection open; Synapse's
+    ``read_body_with_max_size`` has no canceller.
+    """
+    from io import BytesIO
+
+    from twisted.internet import defer, protocol
+    from twisted.python.failure import Failure
+    from twisted.web.client import ResponseDone
+
+    class _CappedBody(protocol.Protocol):
+        def __init__(self) -> None:
+            self.buffer = BytesIO()
+            self.length = 0
+
+        def dataReceived(self, data: bytes) -> None:
+            if result.called:
+                return
+            self.length += len(data)
+            if self.length > limit:
+                result.callback(None)
+                if self.transport is not None:
+                    self.transport.abortConnection()
+                return
+            self.buffer.write(data)
+
+        def connectionLost(self, reason: Failure = protocol.connectionDone) -> None:
+            if result.called:
+                return
+            if reason.check(ResponseDone):
+                result.callback(self.buffer.getvalue())
+            else:
+                result.errback(reason)
+
+    body = _CappedBody()
+
+    def cancel(_: Any) -> None:
+        if body.transport is not None:
+            body.transport.abortConnection()
+
+    result: "defer.Deferred[Any]" = defer.Deferred(cancel)
+    response.deliverBody(body)
+    return result
+
+
 def make_ingest_agent(reactor: Any) -> Any:
     """The HTTP agent for the ingest: no idle connection is kept.
 
@@ -378,7 +427,6 @@ def make_http_poster(
     """
     from io import BytesIO
 
-    from synapse.http.client import BodyExceededMaxSize, read_body_with_max_size
     from synapse.logging.context import make_deferred_yieldable, run_in_background
     from synapse.util.async_helpers import timeout_deferred
     from synapse.util.json import json_encoder
@@ -401,16 +449,12 @@ def make_http_poster(
             response = await make_deferred_yieldable(
                 agent.request(b"POST", uri, headers, FileBodyProducer(BytesIO(data)))
             )
-            buffer = BytesIO()
-            try:
-                await make_deferred_yieldable(
-                    read_body_with_max_size(response, buffer, MAX_ANSWER_BYTES)
-                )
-            except BodyExceededMaxSize:
-                # An answer came back, too big to be the acknowledgement: no
-                # re-send, and the body is never held in memory.
-                return response.code, None
-            return response.code, buffer.getvalue()
+            # None when the answer is too big to be the acknowledgement: an
+            # answer came back, so it is not re-sent.
+            content = await make_deferred_yieldable(
+                read_capped_body(response, MAX_ANSWER_BYTES)
+            )
+            return response.code, content
 
         async def attempt() -> Any:
             # Each attempt is bounded on its own and cancelled at its bound,

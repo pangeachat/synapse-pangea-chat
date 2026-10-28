@@ -1003,11 +1003,14 @@ if __name__ == "__main__":
 
 
 class _Transport:
+    def __init__(self) -> None:
+        self.aborted = False
+
     def stopProducing(self) -> None:  # noqa: N802
         pass
 
     def abortConnection(self) -> None:  # noqa: N802
-        pass
+        self.aborted = True
 
 
 class _Response:
@@ -1019,12 +1022,13 @@ class _Response:
         self.code = code
         self.length = len(body) if body is not None else 10
         self._body = body
+        self.transport = _Transport()
 
     def deliverBody(self, protocol: Any) -> None:  # noqa: N802
         from twisted.python.failure import Failure
         from twisted.web.client import ResponseDone
 
-        protocol.makeConnection(_Transport())
+        protocol.makeConnection(self.transport)
         if self._body is None:
             return  # the body never ends
         protocol.dataReceived(self._body)
@@ -1104,26 +1108,42 @@ class TestIngestTransport(unittest.TestCase):
     def test_an_oversized_answer_is_refused_unread(self) -> None:
         from synapse_pangea_chat.analytics_forward.forwarder import MAX_ANSWER_BYTES
 
-        agent = _Agent([_Response(200, b" " * (MAX_ANSWER_BYTES + 1))])
+        response = _Response(200, b" " * (MAX_ANSWER_BYTES + 1))
+        agent = _Agent([response])
         _, post = self._post(agent)
         _, failures = self._run(post)
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0].value.reason, "bad_ack")
         self.assertEqual(agent.calls, 1)  # an answer came back: not re-sent
+        self.assertTrue(response.transport.aborted)
+
+    def test_an_answer_at_the_cap_is_read(self) -> None:
+        from synapse_pangea_chat.analytics_forward.forwarder import MAX_ANSWER_BYTES
+
+        answer = b'{"delivered_through": 1}'
+        padded = answer + b" " * (MAX_ANSWER_BYTES - len(answer))
+        _, post = self._post(_Agent([_Response(200, padded)]))
+        results, failures = self._run(post)
+        self.assertEqual(failures, [])
+        self.assertEqual(results, [{"delivered_through": 1}])
 
     def test_a_stalled_body_times_out(self) -> None:
         from synapse_pangea_chat.analytics_forward.forwarder import (
             REQUEST_TIMEOUT_SECONDS,
         )
 
-        reactor, post = self._post(_Agent([_Response(200, None), _Response(200, None)]))
+        stalled = [_Response(200, None), _Response(200, None)]
+        reactor, post = self._post(_Agent(list(stalled)))
         _, failures = self._run(post)
         reactor.advance(REQUEST_TIMEOUT_SECONDS / 2 + 0.5)
+        # The stalled body's connection is closed at its bound, never left open.
+        self.assertTrue(stalled[0].transport.aborted)
         reactor.advance(REQUEST_TIMEOUT_SECONDS / 2 - 1)
         self.assertEqual(failures, [])  # the re-send is still within its bound
         reactor.advance(1)
         self.assertEqual(len(failures), 1)
         self.assertIsInstance(failures[0].value, DeliveryError)
+        self.assertTrue(stalled[1].transport.aborted)
 
     def test_the_cap_cancels_everything_and_starts_nothing_more(self) -> None:
         """Each attempt is bounded and cancelled at its bound; the re-send is
