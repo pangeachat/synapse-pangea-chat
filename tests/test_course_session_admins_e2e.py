@@ -248,3 +248,27 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
         listed = self._review_list(teacher_id, teacher)
         self.assertIn(session_id, listed)
         self.assertIn(second_id, listed)
+
+    async def test_a_session_that_does_not_admit_the_course_is_ignored(self):
+        # Any course member may link a child, so a learner could link a
+        # session-typed room that is public, invite-only or restricted to
+        # another course; none of them pulls the course's admins in.
+        space_id, users = await self._course()
+        s1 = users["s1"][1]
+        teacher_id, teacher = users["teacher"]
+        other_space = self._create_course(s1)
+        public_id = self._create_room(
+            s1, {"preset": "public_chat", "creation_content": {"type": SESSION_TYPE}}
+        )
+        invite_id = self._create_room(
+            s1, {"preset": "private_chat", "creation_content": {"type": SESSION_TYPE}}
+        )
+        elsewhere_id = self._create_child(s1, other_space, SESSION_TYPE)
+        for room_id in (public_id, invite_id, elsewhere_id):
+            self._link(s1, space_id, room_id)
+            self._wait_handled(
+                f"course_session_admins {room_id} linked into {space_id}: "
+                "its join rule does not admit the course"
+            )
+            self.assertIsNone(self._membership(room_id, teacher_id, s1))
+            self.assertNotIn(room_id, self._review_list(teacher_id, teacher))

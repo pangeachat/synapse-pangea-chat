@@ -79,6 +79,28 @@ def is_first_link(event: EventBase) -> bool:
     )
 
 
+def admits_course(join_rules: Optional[Mapping[str, Any]], space_id: str) -> bool:
+    """Whether a room's ``m.room.join_rules`` content admits the members of
+    ``space_id`` by restricted join: the shape the client gives a session it
+    shares into a course. A public, invite-only or plain-knock room, or one
+    restricted to another space, does not, so linking it into the course
+    never pulls the course's admins in."""
+    if not join_rules or join_rules.get("join_rule") not in (
+        "restricted",
+        "knock_restricted",
+    ):
+        return False
+    allow = join_rules.get("allow")
+    if not isinstance(allow, (list, tuple)):
+        return False
+    return any(
+        isinstance(entry, Mapping)
+        and entry.get("type") == "m.room_membership"
+        and entry.get("room_id") == space_id
+        for entry in allow
+    )
+
+
 def with_room_listed(
     content: Optional[Mapping[str, Any]], room_id: str
 ) -> Optional[Dict[str, Any]]:
@@ -168,11 +190,24 @@ class CourseSessionAdmins:
                 space_id,
             )
             return []
+        join_rules = await self._state.get_current_state_event(
+            session_id, EventTypes.JoinRules, ""
+        )
+        if not admits_course(
+            join_rules.content if join_rules is not None else None, space_id
+        ):
+            logger.info(
+                "course_session_admins %s linked into %s: its join rule does not "
+                "admit the course",
+                session_id,
+                space_id,
+            )
+            return []
         admins = await self._course_admins(space_id)
         joined: List[str] = []
         for user_id in sorted(admins):
             try:
-                if await self._join_admin(session_id, user_id):
+                if await self._join_admin(space_id, session_id, user_id):
                     joined.append(user_id)
             except Exception as e:
                 logger.warning(
@@ -218,24 +253,49 @@ class CourseSessionAdmins:
             and is_joined_instructor(state, user_id)
         )
 
-    async def _join_admin(self, room_id: str, user_id: str) -> bool:
-        """List, join, then mute. An admin already in the room (the one who
-        launched it), or one who has left or been banned from it, is left as
-        they are. A room that could not be listed is not joined, so it never
-        lands in the admin's chats."""
+    async def _join_admin(self, space_id: str, room_id: str, user_id: str) -> bool:
+        """List, join, then mute. Whether the admin may still be joined is read
+        again right before every attempt, since an attempt can wait out a rate
+        limit: she is not already in the room, has not left it or been banned,
+        is still a course admin, and the course still links the room. A room
+        that could not be listed is not joined, so it never lands in her
+        chats."""
+        joined = False
+
+        async def attempt() -> None:
+            nonlocal joined
+            if not await self._still_eligible(space_id, room_id, user_id):
+                return
+            await self._list(user_id, room_id)
+            await server_initiated_join(self._api, room_id, user_id)
+            joined = True
+
+        await wait_out_rate_limits(self._clock, attempt, "course_session_admins")
+        if joined:
+            await self._mute(user_id, room_id)
+        return joined
+
+    async def _still_eligible(self, space_id: str, room_id: str, user_id: str) -> bool:
         membership, _ = await self._store.get_local_current_membership_for_user_in_room(
             user_id, room_id
         )
         if membership not in (None, MEMBERSHIP_INVITE):
             return False
-        await self._list(user_id, room_id)
-        await wait_out_rate_limits(
-            self._clock,
-            lambda: server_initiated_join(self._api, room_id, user_id),
-            "course_session_admins",
+        state = await self._api.get_room_state(
+            space_id,
+            event_filter=[
+                (EventTypes.Create, ""),
+                (EventTypes.PowerLevels, ""),
+                (EventTypes.Member, user_id),
+                (EventTypes.SpaceChild, room_id),
+            ],
         )
-        await self._mute(user_id, room_id)
-        return True
+        link = state.get((EventTypes.SpaceChild, room_id))
+        return (
+            link is not None
+            and has_valid_via(link.content)
+            and is_joined_instructor(state, user_id)
+        )
 
     async def _list(self, user_id: str, room_id: str) -> None:
         async with self._user_locks.queue(user_id):
