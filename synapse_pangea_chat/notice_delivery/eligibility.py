@@ -11,11 +11,17 @@ from synapse.storage.engines import PostgresEngine
 from synapse_pangea_chat.blocked_join_gate.is_blocked_by_room_admin import (
     is_blocked_by_room_admin,
 )
+from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
 
 logger = logging.getLogger(__name__)
 MAX_ROOMS = 256
 MAX_ROLES = 32
-FLAGS = {"recipient_not_returned", "activity_not_started", "session_available"}
+FLAGS = {
+    "recipient_not_returned",
+    "activity_not_started",
+    "session_available",
+    "bot_fills_open_seat",
+}
 
 
 def validate_eligibility(body: dict) -> None:
@@ -39,6 +45,7 @@ def validate_eligibility(body: dict) -> None:
     for flag, target in (
         ("activity_not_started", "activity_id"),
         ("session_available", "session_room_id"),
+        ("bot_fills_open_seat", "session_room_id"),
     ):
         if conditions.get(flag) and not body.get(target):
             raise ValueError(f"{flag} requires {target}")
@@ -115,7 +122,13 @@ class NoticeEligibility:
                 if reason:
                     return reason
             if conditions.get("session_available"):
-                return await self._session(req.user_id, body["session_room_id"])
+                reason = await self._session(req.user_id, body["session_room_id"])
+                if reason:
+                    return reason
+            if conditions.get("bot_fills_open_seat"):
+                return await self._bot_fills_open_seat(
+                    req.user_id, body["sender_id"], body["session_room_id"]
+                )
             return None
         except Exception:
             # No event or transport has run yet. Record the failed check as a
@@ -249,9 +262,91 @@ class NoticeEligibility:
             ):
                 return "session_inaccessible"
         plan = content("pangea.activity_plan")
+        roles = self._roles(content("pangea.activity_roles"))
+        capacity = await self._capacity(plan)
+        holders = [r.get("user_id", r.get("userId")) for r in roles.values()]
+        members = (
+            await self.api.get_room_state(
+                room_id, event_filter=[("m.room.member", u) for u in holders]
+            )
+            if holders
+            else {}
+        )
+        occupied = 0
+        for role in roles.values():
+            holder = role.get("user_id", role.get("userId"))
+            event = members.get(("m.room.member", holder))
+            if event is None:
+                raise ValueError("Role membership unavailable")
+            if role.get("finished_at", role.get("finishedAt")) or role.get(
+                "archived_at", role.get("archivedAt")
+            ):
+                return "session_ended"
+            if event.content.get("membership") not in {"leave", "ban"}:
+                occupied += 1
+        return "session_full" if occupied >= capacity else None
+
+    async def _bot_fills_open_seat(
+        self, user_id: str, bot_user_id: str, room_id: str
+    ) -> str | None:
+        """Whether the bot will take this session's last seat at the hour, by
+        the rule pangea-bot's open-session sweep applies
+        (notice-delivery.instructions.md, "The open-session notice"): the
+        learner and the bot are in it, nobody asked for the bot, nothing has
+        finished, and joined plus invited people leave exactly one seat."""
+        kinds = (
+            "pangea.activity_plan",
+            "pangea.activity_roles",
+            "pangea.activity_summary",
+            "pangea.bot_participant",
+            "m.room.tombstone",
+        )
+        state = await self.api.get_room_state(
+            room_id,
+            event_filter=[(k, "") for k in kinds] + [("m.room.member", None)],
+        )
+
+        def content(kind):
+            event = state.get((kind, ""))
+            return dict(event.content) if event is not None else {}
+
+        if ("m.room.tombstone", "") in state:
+            return "session_inaccessible"
+        if ("pangea.bot_participant", "") in state:
+            return "bot_already_chosen"
+        roles = self._roles(content("pangea.activity_roles"))
+        if ("pangea.activity_summary", "") in state or any(
+            role.get("finished_at", role.get("finishedAt"))
+            or role.get("archived_at", role.get("archivedAt"))
+            for role in roles.values()
+        ):
+            return "session_ended"
+        membership = {
+            key[1]: event.content.get("membership")
+            for key, event in state.items()
+            if key[0] == "m.room.member"
+        }
+        if membership.get(user_id) != "join":
+            return "recipient_left"
+        if membership.get(bot_user_id) != "join":
+            return "bot_not_in_session"
+        taken = sum(
+            1
+            for member, value in membership.items()
+            if value in {"join", "invite"}
+            and member != bot_user_id
+            and not is_probable_bot_user_id(member)
+        )
+        open_seats = await self._capacity(content("pangea.activity_plan")) - taken
+        if open_seats < 1:
+            return "session_full"
+        return "seats_open" if open_seats > 1 else None
+
+    async def _capacity(self, plan: dict) -> int:
+        """How many roles the session's plan has: from the room's plan, or the
+        CMS copy it names when the room carries only the reference."""
         if not plan.get("activity_id"):
             raise ValueError("Session plan unavailable")
-        roles = self._roles(content("pangea.activity_roles"))
         planned_roles = plan.get("roles")
         if not isinstance(planned_roles, (dict, list)):
             if plan.get("version_id"):
@@ -292,24 +387,4 @@ class NoticeEligibility:
             or not 0 < capacity <= MAX_ROLES
         ):
             raise ValueError("Session capacity unavailable")
-        holders = [r.get("user_id", r.get("userId")) for r in roles.values()]
-        members = (
-            await self.api.get_room_state(
-                room_id, event_filter=[("m.room.member", u) for u in holders]
-            )
-            if holders
-            else {}
-        )
-        occupied = 0
-        for role in roles.values():
-            holder = role.get("user_id", role.get("userId"))
-            event = members.get(("m.room.member", holder))
-            if event is None:
-                raise ValueError("Role membership unavailable")
-            if role.get("finished_at", role.get("finishedAt")) or role.get(
-                "archived_at", role.get("archivedAt")
-            ):
-                return "session_ended"
-            if event.content.get("membership") not in {"leave", "ban"}:
-                occupied += 1
-        return "session_full" if occupied >= capacity else None
+        return capacity

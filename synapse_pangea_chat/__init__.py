@@ -66,6 +66,7 @@ from synapse_pangea_chat.notice_delivery import (
     MissedMessageUnsubscribe,
     NoticeClick,
     NoticeUnsubscribe,
+    OpenSessionNotice,
     PrepareNotice,
     RefusalStore,
 )
@@ -657,6 +658,15 @@ class PangeaChat:
             api, config, self.direct_push_resource
         )
         self.deliver_notice_resource.schedule.start()
+        if config.open_session_notice_bot_user_id is not None:
+            self.open_session_notice = OpenSessionNotice(
+                api,
+                self.deliver_notice_resource,
+                config.open_session_notice_bot_user_id,
+            )
+            self._api.register_third_party_rules_callbacks(
+                on_new_event=self.open_session_notice.on_new_event,
+            )
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/deliver_notice",
             resource=self.deliver_notice_resource,
@@ -1183,6 +1193,15 @@ class PangeaChat:
             raise ValueError(
                 'Config "notice_suppress_notice_push_rules" must be a boolean'
             )
+        open_session_notice_bot_user_id = config.get("open_session_notice_bot_user_id")
+        if open_session_notice_bot_user_id is not None and (
+            not isinstance(open_session_notice_bot_user_id, str)
+            or not open_session_notice_bot_user_id.startswith("@")
+            or ":" not in open_session_notice_bot_user_id
+        ):
+            raise ValueError(
+                'Config "open_session_notice_bot_user_id" must be a Matrix user id'
+            )
         notice_token_secret = config.get("notice_token_secret")
         if notice_token_secret is not None and (
             not isinstance(notice_token_secret, str) or not notice_token_secret.strip()
@@ -1614,6 +1633,7 @@ class PangeaChat:
             notice_email_enabled=notice_email_enabled,
             notice_missed_message_unsubscribe_enabled=notice_missed_message_unsubscribe_enabled,
             notice_suppress_notice_push_rules=notice_suppress_notice_push_rules,
+            open_session_notice_bot_user_id=open_session_notice_bot_user_id,
             notice_token_secret=notice_token_secret,
             notice_token_ttl_days=notice_token_ttl_days,
             notice_email_postal_address=notice_email_postal_address,

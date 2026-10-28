@@ -1,5 +1,5 @@
 ---
-applyTo: "synapse_pangea_chat/direct_push/**,synapse_pangea_chat/notice_delivery/**,synapse_pangea_chat/config.py,synapse_pangea_chat/__init__.py,tests/test_direct_push*.py,tests/test_notice_delivery*.py"
+applyTo: "synapse_pangea_chat/direct_push/**,synapse_pangea_chat/notice_delivery/**,synapse_pangea_chat/config.py,synapse_pangea_chat/__init__.py,tests/test_direct_push*.py,tests/test_notice_delivery*.py,tests/test_open_session_notice*.py"
 description: "Notice delivery — the Synapse module's channel selection, communication preferences, logged-out unsubscribe surface, first-party click record, and suppression of duplicate delivery for bot notices."
 ---
 
@@ -46,11 +46,15 @@ An optional `scheduled_at` defers the entire notice, including its in-app event,
 
 Schedules survive restarts and are deduplicated by run/person, or by the caller's row when the request carries `notification_log_id`. At send time, recheck permissions, membership, preferences, and availability, then use the existing delivery service and Notification_Log. Uncertain delivery outcomes require reconciliation rather than automatic resending.
 
-Scheduled notices may include optional eligibility conditions, checked against current server data immediately before delivery. Conditions can suppress delivery when the recipient has returned since the decision, another qualifying contact violates the caller’s minimum spacing, the target activity has been started or completed, or the target session is full or inaccessible.
+Scheduled notices may include optional eligibility conditions, checked against current server data immediately before delivery. Conditions can suppress delivery when the recipient has returned since the decision, another qualifying contact violates the caller’s minimum spacing, the target activity has been started or completed, the target session is full or inaccessible, or the bot will not take the session's last seat at the hour.
 
 Failed or unavailable checks send nothing and record a reason in Notification_Log. Requests without these conditions retain existing behavior.
 
 Server admins may cancel queued notices atomically. Cancellation succeeds only before the worker claims the notice, is idempotent, and prevents any notice event, push, or email. Claimed or uncertain deliveries cannot be reported as cancelled. Cancelled decisions remain deduplicated.
+
+## The open-session notice
+
+When a learner starts an activity session, the module schedules one notice to them for 30 minutes after the session was created. It is push only, in category `activity_nudges`, with variant `open_session_bot_soon`, and it is recorded with runner `synapse`. It tells the learner that Pangea Bot takes the open seat at the hour, and tapping it opens the session. Just before sending, the module checks the session the way the bot does before it fills a seat ([bot-modes](../../../pangea-bot/.github/instructions/bot-modes.instructions.md)): the learner and the bot are still in it, nobody has asked for the bot, no role is finished, and exactly one seat is open, with invited people holding theirs. Anything else sends nothing, so a session that filled, got the bot, or was left gets no notice. The copy is English until notices are localized. Setting `open_session_notice_bot_user_id` turns it on; while it is unset, nothing is scheduled.
 
 ## The refusal store
 

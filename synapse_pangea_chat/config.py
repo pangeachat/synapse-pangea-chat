@@ -190,6 +190,9 @@ class PangeaChatConfig:
     notice_external_link_hosts: List[str] = attr.Factory(
         lambda: list(DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS)
     )
+    # The bot that sends the open-session notice. Unset, no notice is
+    # scheduled: turning it on is a rollout decision (deploy-note).
+    open_session_notice_bot_user_id: Optional[str] = None
 
     # --- delayed_push config ---
     delayed_push_enabled: bool = False

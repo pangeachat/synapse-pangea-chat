@@ -219,3 +219,70 @@ class TestEligibility(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await gate.check(body, req, "42"), "activity_already_completed"
         )
+
+
+BOT = "@bot:test"
+LEARNER = "LEARNER"  # the recipient, filled in by the fixture
+
+
+class TestBotFillsOpenSeat(unittest.IsolatedAsyncioTestCase):
+    """The open-session notice goes out only while pangea-bot's sweep would
+    take the session's last seat at the hour."""
+
+    def gate(self, members, *, capacity=2, extra=None, roles=None):
+        gate, body, req, api = TestEligibility().setup_gate({})
+        body.update(
+            sender_id=BOT,
+            session_room_id="!session:test",
+            eligibility={"bot_fills_open_seat": True},
+        )
+        state = {
+            ("pangea.activity_plan", ""): SimpleNamespace(
+                content={
+                    "activity_id": "activity-1",
+                    "roles": {str(n): {} for n in range(capacity)},
+                }
+            ),
+            ("pangea.activity_roles", ""): SimpleNamespace(
+                content={"roles": roles or {}}
+            ),
+            **(extra or {}),
+        }
+        for user, membership in members.items():
+            key = ("m.room.member", req.user_id if user == LEARNER else user)
+            state[key] = SimpleNamespace(content={"membership": membership})
+        api.get_room_state = AsyncMock(return_value=state)
+        return gate, body, req
+
+    async def test_only_the_last_open_seat_with_learner_and_bot_in(self):
+        friend = "@friend:test"
+        for members, capacity, expected in (
+            ({LEARNER: "join", BOT: "join"}, 2, None),
+            ({LEARNER: "join", BOT: "join", friend: "invite"}, 3, None),
+            ({LEARNER: "join", BOT: "join", friend: "invite"}, 2, "session_full"),
+            ({LEARNER: "join", BOT: "join"}, 3, "seats_open"),
+            ({LEARNER: "leave", BOT: "join", friend: "join"}, 3, "recipient_left"),
+            ({LEARNER: "join", BOT: "leave"}, 2, "bot_not_in_session"),
+        ):
+            gate, body, req = self.gate(members, capacity=capacity)
+            with self.subTest(members=members, capacity=capacity):
+                self.assertEqual(await gate.check(body, req, "42"), expected)
+
+    async def test_bot_chosen_or_session_ended_sends_nothing(self):
+        in_room = {LEARNER: "join", BOT: "join"}
+        marker = {("pangea.bot_participant", ""): SimpleNamespace(content={})}
+        summary = {("pangea.activity_summary", ""): SimpleNamespace(content={})}
+        finished = {"one": {"user_id": "@x:test", "finished_at": "2026-10-01"}}
+        for extra, roles, expected in (
+            (marker, None, "bot_already_chosen"),
+            (summary, None, "session_ended"),
+            ({}, finished, "session_ended"),
+        ):
+            gate, body, req = self.gate(in_room, extra=extra, roles=roles)
+            with self.subTest(expected=expected):
+                self.assertEqual(await gate.check(body, req, "42"), expected)
+
+    def test_condition_requires_the_session(self):
+        body = {**scheduled_body(), "eligibility": {"bot_fills_open_seat": True}}
+        with self.assertRaises(ValueError):
+            NoticeRequest.parse(body)
