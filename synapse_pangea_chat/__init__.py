@@ -27,6 +27,7 @@ from synapse_pangea_chat.course_default_chats import (
     SyncCourseDefaultChats,
 )
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
+from synapse_pangea_chat.course_session_admins import CourseSessionAdmins
 from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 from synapse_pangea_chat.delete_room import DeleteRoom
@@ -640,6 +641,12 @@ class PangeaChat:
                 path="/_synapse/client/pangea/v1/recover_course_default_chat",
                 resource=RecoverCourseDefaultChat(api, self.course_default_chats),
             )
+
+        # --- Course Session Admins ---
+        # Joins a course's admins to each new activity session linked into the
+        # course, hidden and muted in their app.
+        if config.course_session_admins_enabled:
+            self.course_session_admins = CourseSessionAdmins(api)
 
         # --- Direct Push ---
         self.direct_push_resource = DirectPush(api, config)
@@ -1276,6 +1283,12 @@ class PangeaChat:
         if not isinstance(course_default_chats_enabled, bool):
             raise ValueError('Config "course_default_chats_enabled" must be a boolean')
 
+        course_session_admins_enabled = config.get(
+            "course_session_admins_enabled", True
+        )
+        if not isinstance(course_session_admins_enabled, bool):
+            raise ValueError('Config "course_session_admins_enabled" must be a boolean')
+
         # --- delayed_push config ---
         delayed_push = config.get("delayed_push", {})
         if delayed_push is None:
@@ -1650,6 +1663,7 @@ class PangeaChat:
             delayed_push_require_synapse_version=delayed_push_require_synapse_version,
             blocked_join_gate_enabled=blocked_join_gate_enabled,
             course_default_chats_enabled=course_default_chats_enabled,
+            course_session_admins_enabled=course_session_admins_enabled,
             moderation_tier1_enabled=moderation_tier1_enabled,
             moderation_tier1_phone_regions=moderation_tier1_phone_regions,
             moderation_tier2_enabled=moderation_tier2_enabled,

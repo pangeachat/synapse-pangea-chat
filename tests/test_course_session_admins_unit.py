@@ -1,0 +1,215 @@
+import asyncio
+import unittest
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, Optional
+from unittest.mock import AsyncMock, Mock, patch
+
+from synapse.api.errors import LimitExceededError
+
+from synapse_pangea_chat.course_session_admins import course_session_admins
+from synapse_pangea_chat.course_session_admins.course_session_admins import (
+    CourseSessionAdmins,
+    admits_course,
+    is_activity_session_type,
+    is_first_link,
+    mute_rule_conditions,
+    with_room_listed,
+)
+
+ROOM = "!session:example.com"
+OTHER = "!other:example.com"
+SPACE = "!course:example.com"
+TEACHER = "@teacher:example.com"
+
+
+def _event(
+    *,
+    event_type: str = "m.space.child",
+    state_key: Optional[str] = ROOM,
+    content: Optional[Dict[str, Any]] = None,
+    unsigned: Optional[Dict[str, Any]] = None,
+) -> Any:
+    return SimpleNamespace(
+        type=event_type,
+        state_key=state_key,
+        content={"via": ["example.com"]} if content is None else content,
+        unsigned=unsigned or {},
+        is_state=lambda: state_key is not None,
+    )
+
+
+class TestIsActivitySessionType(unittest.TestCase):
+    def test_the_clients_session_type_with_and_without_an_activity(self):
+        self.assertTrue(is_activity_session_type("p.activity.session:act-1"))
+        self.assertTrue(is_activity_session_type("p.activity.session"))
+
+    def test_other_room_types_are_not_sessions(self):
+        self.assertFalse(is_activity_session_type("m.space"))
+        self.assertFalse(is_activity_session_type("p.analytics"))
+        self.assertFalse(is_activity_session_type("p.activity.sessionx"))
+        self.assertFalse(is_activity_session_type(None))
+        self.assertFalse(is_activity_session_type(7))
+
+
+class TestIsFirstLink(unittest.TestCase):
+    def test_a_new_link_is_the_first(self):
+        self.assertTrue(is_first_link(_event()))
+
+    def test_a_link_sent_again_is_not(self):
+        # No backfill: an older session's link re-sent replaces an earlier one.
+        event = _event(unsigned={"replaces_state": "$earlier"})
+        self.assertFalse(is_first_link(event))
+
+    def test_an_unlink_is_not(self):
+        self.assertFalse(is_first_link(_event(content={})))
+
+    def test_other_events_are_not(self):
+        self.assertFalse(is_first_link(_event(event_type="m.room.member")))
+        self.assertFalse(is_first_link(_event(state_key="")))
+        self.assertFalse(is_first_link(_event(state_key=None)))
+
+
+class TestWithRoomListed(unittest.TestCase):
+    def test_adds_to_an_empty_list(self):
+        self.assertEqual(with_room_listed(None, ROOM), {"room_ids": [ROOM]})
+
+    def test_keeps_the_list_sorted_and_other_keys(self):
+        content = {"room_ids": [ROOM], "other": 1}
+        self.assertEqual(
+            with_room_listed(content, OTHER),
+            {"room_ids": sorted([ROOM, OTHER]), "other": 1},
+        )
+
+    def test_keeps_rooms_read_back_frozen(self):
+        # Synapse's get_global answers frozen data: the list arrives as a tuple,
+        # and every room already on it must stay listed.
+        self.assertEqual(
+            with_room_listed({"room_ids": (ROOM,)}, OTHER),
+            {"room_ids": sorted([ROOM, OTHER])},
+        )
+
+    def test_an_already_listed_room_writes_nothing(self):
+        self.assertIsNone(with_room_listed({"room_ids": [ROOM]}, ROOM))
+
+    def test_malformed_entries_are_dropped_not_raised_on(self):
+        self.assertEqual(
+            with_room_listed({"room_ids": [ROOM, 3, None]}, OTHER),
+            {"room_ids": sorted([ROOM, OTHER])},
+        )
+        self.assertEqual(
+            with_room_listed({"room_ids": "nope"}, ROOM), {"room_ids": [ROOM]}
+        )
+
+
+class TestMuteRule(unittest.TestCase):
+    def test_matches_the_room_like_the_apps_mute(self):
+        self.assertEqual(
+            mute_rule_conditions(ROOM),
+            [{"kind": "event_match", "key": "room_id", "pattern": ROOM}],
+        )
+
+
+class TestAdmitsCourse(unittest.TestCase):
+    def _rules(self, join_rule: str, allow_room: Optional[str] = SPACE) -> Any:
+        allow = [{"type": "m.room_membership", "room_id": allow_room}]
+        return {"join_rule": join_rule, "allow": allow if allow_room else []}
+
+    def test_a_session_restricted_to_this_course_is_admitted(self):
+        self.assertTrue(admits_course(self._rules("knock_restricted"), SPACE))
+        self.assertTrue(admits_course(self._rules("restricted"), SPACE))
+
+    def test_frozen_allow_lists_are_read(self):
+        rules = {
+            "join_rule": "knock_restricted",
+            "allow": ({"type": "m.room_membership", "room_id": SPACE},),
+        }
+        self.assertTrue(admits_course(rules, SPACE))
+
+    def test_public_invite_knock_and_other_courses_are_not(self):
+        self.assertFalse(admits_course({"join_rule": "public"}, SPACE))
+        self.assertFalse(admits_course({"join_rule": "invite"}, SPACE))
+        self.assertFalse(admits_course(self._rules("knock"), SPACE))
+        self.assertFalse(admits_course(self._rules("public"), SPACE))
+        self.assertFalse(admits_course(self._rules("knock_restricted", OTHER), SPACE))
+        self.assertFalse(admits_course(self._rules("knock_restricted", None), SPACE))
+        self.assertFalse(admits_course(None, SPACE))
+
+
+def _ev(content: Dict[str, Any], sender: str = TEACHER) -> Any:
+    return SimpleNamespace(
+        content=content,
+        sender=sender,
+        room_version=SimpleNamespace(msc4289_creator_power_enabled=False),
+    )
+
+
+class TestEligibilityIsReadBeforeEveryAttempt(unittest.TestCase):
+    """An attempt can wait out a rate limit; whatever changed meanwhile is
+    honoured on the next attempt."""
+
+    def setUp(self) -> None:
+        self.membership: Optional[str] = None
+        self.power = 100
+        self.linked = True
+        self.joins = 0
+
+        async def membership(user_id: str, room_id: str) -> Any:
+            return self.membership, None
+
+        async def space_state(room_id: str, event_filter: Any) -> Dict[Any, Any]:
+            state: Dict[Any, Any] = {
+                ("m.room.create", ""): _ev({"type": "m.space"}),
+                ("m.room.power_levels", ""): _ev({"users": {TEACHER: self.power}}),
+                ("m.room.member", TEACHER): _ev({"membership": "join"}),
+            }
+            if self.linked:
+                state[("m.space.child", ROOM)] = _ev({"via": ["example.com"]})
+            return state
+
+        module: Any = object.__new__(CourseSessionAdmins)
+        module._clock = SimpleNamespace(sleep=AsyncMock())
+        module._store = Mock(
+            get_local_current_membership_for_user_in_room=AsyncMock(
+                side_effect=membership
+            )
+        )
+        module._api = Mock(get_room_state=AsyncMock(side_effect=space_state))
+        module._list = AsyncMock()
+        module._mute = AsyncMock()
+        self.module = module
+
+    async def _run(self, during_wait: Callable[[], None]) -> bool:
+        async def join(api: Any, room_id: str, user_id: str) -> None:
+            self.joins += 1
+            if self.joins == 1:
+                during_wait()
+                raise LimitExceededError("test", retry_after_ms=1)
+
+        with patch.object(course_session_admins, "server_initiated_join", join):
+            return await self.module._join_admin(SPACE, ROOM, TEACHER)
+
+    def _assert_skipped(self, during_wait: Callable[[], None]) -> None:
+        self.assertFalse(asyncio.run(self._run(during_wait)))
+        self.assertEqual(self.joins, 1)
+        self.module._mute.assert_not_awaited()
+
+    def test_an_admin_who_left_during_the_wait_is_not_rejoined(self):
+        self._assert_skipped(lambda: setattr(self, "membership", "leave"))
+
+    def test_an_admin_banned_during_the_wait_is_not_joined(self):
+        self._assert_skipped(lambda: setattr(self, "membership", "ban"))
+
+    def test_an_admin_demoted_during_the_wait_is_not_joined(self):
+        self._assert_skipped(lambda: setattr(self, "power", 50))
+
+    def test_a_session_unlinked_during_the_wait_is_not_joined(self):
+        self._assert_skipped(lambda: setattr(self, "linked", False))
+
+    def test_with_nothing_changed_the_next_attempt_joins_and_mutes(self):
+        self.assertTrue(asyncio.run(self._run(lambda: None)))
+        self.assertEqual(self.joins, 2)
+        self.module._mute.assert_awaited_once_with(TEACHER, ROOM)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -211,6 +211,11 @@ class PangeaChatConfig:
     # exists so a bad rollout can be stopped from Ansible without a deploy.
     course_default_chats_enabled: bool = True
 
+    # --- course_session_admins config ---
+    # Joins a course's admins to each new activity session linked into the
+    # course, hidden and muted in their app. Off switch only, for a bad rollout.
+    course_session_admins_enabled: bool = True
+
     # --- moderation config (server-side, trust-and-safety) ---
     # Both tiers ship dark: nothing runs until an operator enables a tier.
     moderation_tier1_enabled: bool = False
