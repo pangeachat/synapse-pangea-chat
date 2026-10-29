@@ -15,7 +15,7 @@ Synapse sends the teacher dashboard's Matrix data to admin-dash-api as it happen
 
 ## Decisions
 
-- **Only the rooms the dashboard reads are sent:** student analytics rooms, course spaces, and rooms a course links both ways. Nothing from a DM or any other room. Reason: privacy. Re-decided by: Satvik.
+- **Only the rooms the dashboard reads are sent:** student analytics rooms, course spaces, rooms a course links both ways, and activity session rooms a course lists as a child (older session rooms carry no parent link). Nothing from a DM or any other room. Reason: privacy. Re-decided by: Satvik.
 - **Nothing is lost in normal operation:** an event counts as delivered only once the dashboard confirms it saved it; until then it is retried. Accepted gap: a room unlinked from its course while its events are still undelivered has them skipped. Re-decided by: engineer.
 - **Delivery runs in the background at a steady pace,** so an outage or a backlog never slows Synapse. Re-decided by: engineer.
 - **Refresh does not wait for delivery;** data arrives within seconds, so anything sent in the last few seconds shows on the next Refresh. Re-decided by: Satvik.

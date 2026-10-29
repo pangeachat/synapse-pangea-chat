@@ -470,6 +470,62 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
         self.assertEqual(self._sent_from(claimer), [])
         self._assert_no_forwarder_errors()
 
+    async def test_a_session_room_the_course_lists_only_as_a_child_is_followed(
+        self,
+    ) -> None:
+        await self._start()
+        teacher, t_token = await self.new_user("childteacher")
+        friend, f_token = await self.new_user("childfriend")
+        course = self._course(t_token, teacher, teacher, "es")
+
+        def list_child(room_id: str) -> None:
+            # The space side only, as older session rooms were linked.
+            self._put_state(
+                t_token, course, "m.space.child", room_id, {"via": ["localhost"]}
+            )
+
+        # A non-session room and a DM, listed as children only: not followed.
+        chat = self._create_room(t_token, preset="public_chat")
+        list_child(chat)
+        chat_name = self._put_state(t_token, chat, "m.room.name", "", {"name": "c"})
+        dm = self._create_room(
+            t_token, preset="trusted_private_chat", is_direct=True, invite=[friend]
+        )
+        self._join(f_token, dm)
+        list_child(dm)
+        dm_name = self._put_state(t_token, dm, "m.room.name", "", {"name": "us"})
+        self.assertIsNone(self._snapshot(chat))
+        self.assertIsNone(self._snapshot(dm))
+
+        # An activity session room, listed as a child only: followed.
+        session = self._create_room(
+            t_token,
+            preset="private_chat",
+            creation_content={"type": "p.activity.session:activity-1"},
+        )
+        list_child(session)
+        summary = {"summary": {"participants": [{"xp": 10}]}}
+        summary_id = self._put_state(
+            t_token, session, "pangea.activity_summary", "en", summary
+        )
+        await self._until(lambda: self._acked_with(summary_id), "the session, live")
+        snap = self._snapshot(session)
+        self.assertIsNotNone(snap)
+        self.assertEqual(
+            [
+                (e["state_key"], e["content"])
+                for e in snap["events"]
+                if e["type"] == "pangea.activity_summary"
+            ],
+            [("en", summary)],
+        )
+
+        passed = max(self._pos(chat_name), self._pos(dm_name))
+        await self._until(lambda: self._cursor() >= passed, "the cursor")
+        self.assertEqual(self._sent_from(chat), [])
+        self.assertEqual(self._sent_from(dm), [])
+        self._assert_no_forwarder_errors()
+
     async def test_profile_cleared_only_for_the_revision_sent(self) -> None:
         await self._start()
         user, token = await self.new_user("profiled")

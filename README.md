@@ -441,9 +441,10 @@ Pushes the teacher dashboard's Matrix inputs to admin-dash-api's `POST /api/inte
 - **Rooms** (`ForwardStore.course_rooms`, decided from current state when each batch is read):
   - analytics rooms (`m.room.create` type `p.analytics`);
   - course spaces (`m.room.create` type `m.space` with a `pangea.course_plan`);
-  - rooms a course links both ways: the room's `m.space.parent` names a course space, and that space holds the matching `m.space.child`, both with a non-empty `via`.
+  - rooms a course links both ways: the room's `m.space.parent` names a course space, and that space holds the matching `m.space.child`, both with a non-empty `via`;
+  - activity session rooms (`m.room.create` type `p.activity.session:<activity id>`) a course space lists with an `m.space.child` with a non-empty `via`, parent link or not: older session rooms have none. The course is looked for among the rooms the session's creator has a membership in, since no index finds a space by the child it lists.
 
-  Every lookup is by `(room_id, type, state_key)`. Nothing from any other room is sent or snapshotted. A room linked later is sent from then on; its earlier state reaches admin-dash-api through the snapshot endpoint.
+  Every lookup is by an index: `(room_id, type, state_key)`, or Synapse's member index by user. Nothing scans `current_state_events`. Nothing from any other room is sent or snapshotted. A room linked later is sent from then on; its earlier state reaches admin-dash-api through the snapshot endpoint.
 - **Accepted gap:** a room unlinked from its course while its events are still undelivered (during an ingest outage, say) has those events skipped.
 
 ### Delivery

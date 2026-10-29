@@ -153,10 +153,18 @@ _SELECT_PENDING_INVITES_SQL = """
 #   ``pangea.course_plan``. A course plan in any other room makes no course;
 # * a room the course links: its ``m.space.parent`` names a course space AND
 #   that space holds the matching ``m.space.child`` for it, both with a
-#   ``via``. A parent claimed by the room alone is not a link.
+#   ``via``. A parent claimed by the room alone is not a link;
+# * an activity session room the course links one way: its ``m.room.create``
+#   type is the client's session type (``p.activity.session:<activity id>``)
+#   and a course space holds an ``m.space.child`` for it with a ``via``. Older
+#   session rooms carry no ``m.space.parent``. No index finds a space by the
+#   child it lists, so the course is looked for among the rooms the session's
+#   creator has a membership in (Synapse's member index), which the creator of
+#   a session launched from a course always has.
 #
 # Every other room, a DM included, is never forwarded or snapshotted. Every
-# lookup is by (room_id, type, state_key), current_state_events' own key.
+# lookup is by an index: (room_id, type, state_key), current_state_events' own
+# key, or the member index by user. Nothing scans current_state_events.
 _SELECT_COURSE_ROOMS_SQL = """
     SELECT r.room_id FROM unnest(?::text[]) AS r(room_id)
     WHERE EXISTS (
@@ -191,6 +199,31 @@ _SELECT_COURSE_ROOMS_SQL = """
         WHERE parent.room_id = r.room_id AND parent.type = 'm.space.parent'
             AND jsonb_typeof(pj.json::jsonb -> 'content' -> 'via') = 'array'
             AND pj.json::jsonb -> 'content' -> 'via' <> '[]'::jsonb
+            AND jsonb_typeof(cj.json::jsonb -> 'content' -> 'via') = 'array'
+            AND cj.json::jsonb -> 'content' -> 'via' <> '[]'::jsonb
+            AND ej.json::jsonb -> 'content' ->> 'type' = 'm.space'
+    ) OR EXISTS (
+        SELECT 1 FROM current_state_events AS own
+        JOIN event_json AS oj ON oj.event_id = own.event_id
+        JOIN current_state_events AS creator
+            ON creator.type = 'm.room.member'
+            AND creator.state_key = oj.json::jsonb ->> 'sender'
+        JOIN current_state_events AS child
+            ON child.room_id = creator.room_id
+            AND child.type = 'm.space.child' AND child.state_key = own.room_id
+        JOIN event_json AS cj ON cj.event_id = child.event_id
+        JOIN current_state_events AS plan
+            ON plan.room_id = child.room_id
+            AND plan.type = 'pangea.course_plan' AND plan.state_key = ''
+        JOIN current_state_events AS cse
+            ON cse.room_id = child.room_id
+            AND cse.type = 'm.room.create' AND cse.state_key = ''
+        JOIN event_json AS ej ON ej.event_id = cse.event_id
+        WHERE own.room_id = r.room_id
+            AND own.type = 'm.room.create' AND own.state_key = ''
+            AND starts_with(
+                oj.json::jsonb -> 'content' ->> 'type', 'p.activity.session'
+            )
             AND jsonb_typeof(cj.json::jsonb -> 'content' -> 'via') = 'array'
             AND cj.json::jsonb -> 'content' -> 'via' <> '[]'::jsonb
             AND ej.json::jsonb -> 'content' ->> 'type' = 'm.space'
@@ -277,7 +310,8 @@ class ForwardStore:
 
     async def course_rooms(self, room_ids: Iterable[str]) -> Set[str]:
         """Those of ``room_ids`` the dashboard reads, by current state: analytics
-        rooms, course spaces and rooms linked under a course space."""
+        rooms, course spaces, rooms linked under a course space, and session
+        rooms a course space lists as a child."""
         rooms = sorted(set(room_ids))
         if not rooms:
             return set()
