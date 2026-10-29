@@ -17,10 +17,22 @@ import logging
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional
 
 from synapse.api.constants import EventTypes
+from synapse.api.errors import (
+    AuthError,
+    InvalidClientCredentialsError,
+    InvalidClientTokenError,
+    MissingClientTokenError,
+)
 from synapse.events import EventBase
+from synapse.http import server
+from synapse.http.server import respond_with_json
+from synapse.http.site import SynapseRequest
+from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
+from synapse.types import RoomID
 from synapse.util.async_helpers import Linearizer
 from synapse.util.duration import Duration
+from twisted.web.resource import Resource
 
 from synapse_pangea_chat.activity_session_previews.get_activity_session_previews import (
     has_valid_via,
@@ -31,6 +43,7 @@ from synapse_pangea_chat.course_default_chats.course_default_chats import (
     SPACE_ROOM_TYPE,
     wait_out_rate_limits,
 )
+from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.instructor_access import is_joined_instructor
 
 try:
@@ -183,24 +196,13 @@ class CourseSessionAdmins:
         """Join every admin of the course ``space_id`` to ``session_id`` when it
         is an activity session, hidden and muted. Answers who was joined; a
         failure for one admin is logged and does not stop the others."""
-        if not await self._has_create_type(session_id, is_activity_session_type):
+        refusal = await self._not_a_course_session(space_id, session_id)
+        if refusal is not None:
             logger.info(
-                "course_session_admins %s linked into %s: not an activity session",
+                "course_session_admins %s linked into %s: %s",
                 session_id,
                 space_id,
-            )
-            return []
-        join_rules = await self._state.get_current_state_event(
-            session_id, EventTypes.JoinRules, ""
-        )
-        if not admits_course(
-            join_rules.content if join_rules is not None else None, space_id
-        ):
-            logger.info(
-                "course_session_admins %s linked into %s: its join rule does not "
-                "admit the course",
-                session_id,
-                space_id,
+                refusal,
             )
             return []
         admins = await self._course_admins(space_id)
@@ -225,6 +227,78 @@ class CourseSessionAdmins:
         )
         return joined
 
+    async def _not_a_course_session(
+        self, space_id: str, session_id: str
+    ) -> Optional[str]:
+        """Why ``session_id`` is not a session of the course ``space_id`` whose
+        admins may be joined to it, or ``None`` when it is one: an activity
+        session whose join rule admits the course."""
+        if not await self._has_create_type(session_id, is_activity_session_type):
+            return "not an activity session"
+        join_rules = await self._state.get_current_state_event(
+            session_id, EventTypes.JoinRules, ""
+        )
+        if not admits_course(
+            join_rules.content if join_rules is not None else None, space_id
+        ):
+            return "its join rule does not admit the course"
+        return None
+
+    async def is_space(self, room_id: str) -> bool:
+        return await self._has_create_type(room_id, lambda t: t == SPACE_ROOM_TYPE)
+
+    async def course_sessions(self, space_id: str) -> List[str]:
+        """The sessions the course ``space_id`` links today whose admins may be
+        joined to them, sorted: the rooms a backfill walks."""
+        state = await self._api.get_room_state(
+            space_id, event_filter=[(EventTypes.SpaceChild, None)]
+        )
+        sessions = []
+        for (_, child_id), event in state.items():
+            if (
+                isinstance(child_id, str)
+                and has_valid_via(event.content)
+                and await self._not_a_course_session(space_id, child_id) is None
+            ):
+                sessions.append(child_id)
+        return sorted(sessions)
+
+    async def backfill_course(self, space_id: str, session_ids: List[str]) -> int:
+        """Join the course's admins to each of its existing sessions, one room
+        after another, with the same steps and checks as a new session. Safe to
+        run again: an admin already in a room is skipped. Answers how many
+        admin joins were made."""
+        logger.info(
+            "course_session_admins backfill of %s: %d sessions",
+            space_id,
+            len(session_ids),
+        )
+        total = 0
+        for done, session_id in enumerate(session_ids, start=1):
+            try:
+                total += len(await self.join_admins(space_id, session_id))
+            except Exception as e:
+                logger.warning(
+                    "course_session_admins backfill failed for %s in %s: %s",
+                    session_id,
+                    space_id,
+                    e,
+                )
+                _capture_exception(e)
+            logger.info(
+                "course_session_admins backfill of %s: %d/%d sessions, %d joins",
+                space_id,
+                done,
+                len(session_ids),
+                total,
+            )
+        logger.info(
+            "course_session_admins backfill of %s finished: %d joins",
+            space_id,
+            total,
+        )
+        return total
+
     async def _has_create_type(self, room_id: str, test: Any) -> bool:
         create = await self._state.get_current_state_event(
             room_id, EventTypes.Create, ""
@@ -233,7 +307,7 @@ class CourseSessionAdmins:
 
     async def _course_admins(self, space_id: str) -> FrozenSet[str]:
         """Joined, local, non-bot members of the space at admin power."""
-        if not await self._has_create_type(space_id, lambda t: t == SPACE_ROOM_TYPE):
+        if not await self.is_space(space_id):
             return frozenset()
         state = await self._api.get_room_state(
             space_id,
@@ -319,3 +393,95 @@ class CourseSessionAdmins:
             actions=[],
         )
         self._push_rules.notify_user(user_id)
+
+
+class BackfillCourseSessionAdmins(Resource):
+    """``POST /_synapse/client/pangea/v1/backfill_course_session_admins``: joins
+    one course's admins to the sessions it already links, the way a new
+    session is handled. Server admins only, exactly one course per call.
+
+    ``{"room_id": <course space>}`` answers 202 at once with how many sessions
+    will be walked, and does the joins in the background, paced by Synapse's
+    rate limits; progress is logged per session. Running it again skips every
+    admin already in a room. One course per call, like the default-chats
+    repair endpoint: which courses to touch is the operator's decision."""
+
+    isLeaf = True
+
+    def __init__(self, api: ModuleApi, admins: CourseSessionAdmins):
+        super().__init__()
+        self._api = api
+        self._auth = api._hs.get_auth()
+        self._admins = admins
+
+    def render_POST(self, request: SynapseRequest) -> int:
+        run_in_background(self._async_render_POST, request)
+        return server.NOT_DONE_YET
+
+    async def _async_render_POST(self, request: SynapseRequest) -> None:
+        try:
+            requester = await self._auth.get_user_by_req(request)
+            if not await self._api.is_user_admin(requester.user.to_string()):
+                respond_with_json(
+                    request, 403, {"error": "Admin access required"}, send_cors=True
+                )
+                return
+
+            body = await extract_body_json(request)
+            room_id = body.get("room_id") if isinstance(body, dict) else None
+            if not isinstance(room_id, str) or not _is_valid_room_id(room_id):
+                respond_with_json(
+                    request,
+                    400,
+                    {"error": "'room_id' must be a valid room ID"},
+                    send_cors=True,
+                )
+                return
+            if not await self._admins.is_space(room_id):
+                respond_with_json(
+                    request, 400, {"error": "'room_id' must be a space"}, send_cors=True
+                )
+                return
+
+            sessions = await self._admins.course_sessions(room_id)
+            self._api.run_as_background_process(
+                "course_session_admins_backfill",
+                self._admins.backfill_course,
+                room_id,
+                sessions,
+            )
+            respond_with_json(
+                request,
+                202,
+                {"room_id": room_id, "sessions": len(sessions), "scheduled": True},
+                send_cors=True,
+            )
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
+        except (
+            MissingClientTokenError,
+            InvalidClientTokenError,
+            InvalidClientCredentialsError,
+            AuthError,
+        ) as e:
+            logger.info("Authentication failed: %s", e)
+            respond_with_json(
+                request,
+                401,
+                {"error": "Unauthorized", "errcode": "M_UNAUTHORIZED"},
+                send_cors=True,
+            )
+        except Exception as e:
+            logger.exception("Error backfilling course session admins")
+            _capture_exception(e)
+            respond_with_json(
+                request, 500, {"error": "Internal server error"}, send_cors=True
+            )
+
+
+def _is_valid_room_id(room_id: str) -> bool:
+    try:
+        RoomID.from_string(room_id)
+    # silent-ok: validation only - the caller answers 400 for an invalid id
+    except Exception:
+        return False
+    return True

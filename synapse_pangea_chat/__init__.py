@@ -27,7 +27,10 @@ from synapse_pangea_chat.course_default_chats import (
     SyncCourseDefaultChats,
 )
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
-from synapse_pangea_chat.course_session_admins import CourseSessionAdmins
+from synapse_pangea_chat.course_session_admins import (
+    BackfillCourseSessionAdmins,
+    CourseSessionAdmins,
+)
 from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 from synapse_pangea_chat.delete_room import DeleteRoom
@@ -647,6 +650,10 @@ class PangeaChat:
         # course, hidden and muted in their app.
         if config.course_session_admins_enabled:
             self.course_session_admins = CourseSessionAdmins(api)
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/backfill_course_session_admins",
+                resource=BackfillCourseSessionAdmins(api, self.course_session_admins),
+            )
 
         # --- Direct Push ---
         self.direct_push_resource = DirectPush(api, config)
