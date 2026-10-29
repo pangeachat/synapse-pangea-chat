@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple
 
 import attr
 
+from synapse_pangea_chat.analytics_forward.config import AnalyticsForwardConfig
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 
 if TYPE_CHECKING:
@@ -135,6 +136,11 @@ class PangeaChatConfig:
     course_member_emails_requests_per_burst: int = 20
     course_member_emails_burst_duration_seconds: int = 60
 
+    # --- analytics_forward config ---
+    # The dashboard's Matrix inputs pushed to admin-dash-api. None when the
+    # block (ingest URL + shared secret) is not configured.
+    analytics_forward: Optional[AnalyticsForwardConfig] = None
+
     # --- member_analytics_profiles config ---
     # A room member reads every joined member's analytics profile at once.
     member_analytics_profiles_requests_per_burst: int = 30
@@ -194,6 +200,9 @@ class PangeaChatConfig:
     notice_external_link_hosts: List[str] = attr.Factory(
         lambda: list(DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS)
     )
+    # The bot that sends the open-session notice. Unset, no notice is
+    # scheduled: turning it on is a rollout decision (deploy-note).
+    open_session_notice_bot_user_id: Optional[str] = None
 
     # --- delayed_push config ---
     delayed_push_enabled: bool = False
@@ -211,6 +220,11 @@ class PangeaChatConfig:
     # admins as chat admins) and serves the repair endpoint. The off switch
     # exists so a bad rollout can be stopped from Ansible without a deploy.
     course_default_chats_enabled: bool = True
+
+    # --- course_session_admins config ---
+    # Joins a course's admins to each new activity session linked into the
+    # course, hidden and muted in their app. Off switch only, for a bad rollout.
+    course_session_admins_enabled: bool = True
 
     # --- moderation config (server-side, trust-and-safety) ---
     # Both tiers ship dark: nothing runs until an operator enables a tier.

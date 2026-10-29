@@ -46,11 +46,7 @@ class DeliveryLog:
         *,
         collection: str = "notification-log",
     ):
-        if collection not in {
-            "notification-log",
-            "activities-v2",
-            "activities-v2/versions",
-        }:
+        if collection not in {"notification-log", "activities-v2"}:
             raise ValueError("Unsupported notice CMS collection")
         response = await self._http.request(
             method,

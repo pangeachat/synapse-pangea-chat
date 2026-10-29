@@ -213,12 +213,12 @@ class DecisionContext:
             key: string(run, key)
             for key in ("run_id", "runner", "funnel", "decided_at")
         }
-        if clean["runner"] not in {"bot", "skill"} or clean["funnel"] not in {
-            "learner",
-            "teacher",
-        }:
+        # synapse: a notice this module schedules itself, the open-session notice.
+        if clean["runner"] not in {"bot", "skill", "synapse"} or clean[
+            "funnel"
+        ] not in {"learner", "teacher"}:
             raise ValueError(
-                "log.run requires runner bot/skill and funnel learner/teacher"
+                "log.run requires runner bot/skill/synapse and funnel learner/teacher"
             )
         try:
             stamp = datetime.fromisoformat(clean["decided_at"].replace("Z", "+00:00"))

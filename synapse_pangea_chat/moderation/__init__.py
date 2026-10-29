@@ -707,6 +707,20 @@ class ChatModeration:
         # one that runs it: the guard protects a log, and the log belongs to
         # the process rather than to the worker pool.
         install_proxy_log_guard()
+        # One instance runs all of Tier 2; batching clears the 33 msg/s target
+        # with ~2.8x headroom, so sharding is not needed now (see
+        # moderation.instructions.md, "Decisions"). Schedule it on any
+        # steady-state `queue_full` drop, a mean queue depth above a quarter
+        # of capacity, a screened rate above ~50 msg/s, or a flag rate above
+        # 10%. The plan: a stateless `hash(event_id) % N == index` split
+        # (`on_new_event` already fires on every instance), config for N and
+        # this instance's index refusing startup unless the indices form a
+        # complete 0..N-1 set, per-shard gauge labels, and an "active" alert
+        # redefined as "two instances claim one shard". The disposition
+        # table's atomic claim already resolves two instances deciding one
+        # event, including during a shard-count change. Alerting today: a sum
+        # of `pangea_moderation_tier2_active` above 1 means two instances run
+        # Tier 2; 0 means nothing does.
         self._tier2_active = bool(self._api.should_run_background_tasks())
         metrics.TIER2_ACTIVE.set(1 if self._tier2_active else 0)
         if not self._tier2_active:
@@ -1277,7 +1291,7 @@ class ChatModeration:
             if (
                 confirmed
                 and _usable_categories(categories)
-                and _should_preserve(categories)
+                and _keeps_for_self_harm(categories, result.get("category_scores"))
             ):
                 run_in_background(
                     self._record_preserved, job, _summarize_categories(categories)
@@ -1377,7 +1391,7 @@ class ChatModeration:
             )
             return
         category = _summarize_categories(categories)
-        if _should_preserve(categories):
+        if _keeps_for_self_harm(categories, result.get("category_scores")):
             # Deleting a disclosure of self-harm is itself a harm: the learner
             # is asking for help, the message is the only record that they did,
             # and a redaction removes it from the room while telling nobody.
@@ -1424,6 +1438,12 @@ class ChatModeration:
         # returned, so a self-harm disclosure never reaches a threshold and no
         # value an operator can configure takes part in that decision - which
         # is asserted directly rather than left to this comment.
+        #
+        # A verdict still carrying self-harm here is abuse that also reads as
+        # self-harm, with another flag scoring higher. It is decided on its
+        # other flags alone, like any message with only those flags.
+        categories = [name for name in categories if not _preserves(name)]
+        category = _summarize_categories(categories)
         decision = severity.decide(
             categories, result.get("category_scores"), self._category_thresholds
         )
@@ -2203,15 +2223,43 @@ def _should_preserve(categories: Iterable[Any]) -> bool:
     — and deciding on the summary would have redacted a self-harm disclosure
     because a second label sorted ahead of it.
 
-    Preserving therefore wins over redacting when a verdict carries both. A
-    message that is genuinely both is the hardest case and the reasoning is
-    the same as for the simple one: a learner in crisis who is also being
-    abusive still needs the disclosure to survive, and the abuse is answerable
-    by a human who can see it. The cost is that a redaction the room wanted
-    does not happen, which stays true until somebody is notified — see
-    `_check_and_redact`.
+    This says whether the verdict reads as self-harm at all, which is what the
+    Safety record's self-harm label shows. Whether the message is KEPT for it
+    is `_keeps_for_self_harm`.
     """
     return any(_preserves(category) for category in categories)
+
+
+def _keeps_for_self_harm(categories: Sequence[Any], scores: Any) -> bool:
+    """Is this verdict kept up as a self-harm disclosure?
+
+    Only when self-harm is its strongest flag. Abuse aimed at someone else,
+    such as "you need to die", is tagged harassment and self-harm at once, and
+    keeping every message with any self-harm label left that abuse up. So a
+    verdict whose other flag scores strictly higher than every self-harm flag
+    is not kept for self-harm. A tie, an unreadable self-harm score, or no
+    readable score for any other flag keeps the message: without that
+    evidence the disclosure is not shown to be the weaker reading. See moderation.instructions.md, "Self-harm is
+    preserved".
+    """
+    if not _should_preserve(categories):
+        return False
+    self_harm: List[float] = []
+    others: List[float] = []
+    for name in categories:
+        score = severity.readable_score(scores, name)
+        if _preserves(name):
+            if score is None:
+                # A self-harm label we cannot score - an unknown sub-category,
+                # a spelling we only recognise by prefix - may be the strongest
+                # flag, so it keeps the message.
+                return True
+            self_harm.append(score)
+        elif score is not None:
+            others.append(score)
+    if not others:
+        return True
+    return max(self_harm) >= max(others)
 
 
 def _preserves(category: Any) -> bool:

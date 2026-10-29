@@ -1226,7 +1226,11 @@ class ChoreoChecker:
         self._max_batch_chars = max_batch_chars
         # The batch contract, negotiated once and then remembered. Starts
         # optimistic: an upgraded endpoint is the intended state, and the cost
-        # of being wrong is one refused request per process.
+        # of being wrong is one refused request per process. There is no
+        # re-probe once demoted: demotion is only ever entered on positive
+        # evidence that this endpoint implements the older contract, so what
+        # it survives is a deployment that genuinely has not been upgraded,
+        # and a rolling restart picks up an upgrade.
         self._batch_supported = True
         # Refusals of the SMALLEST batch this module sends that no size could
         # explain, since the last batch that succeeded. Evidence, accumulated,
@@ -1308,6 +1312,10 @@ class ChoreoChecker:
             self._breaker.release(ticket)
 
         if results is None:
+            # An ordinary failure (timeout, 5xx) deliberately does NOT retry
+            # as singles, unlike a refusal: thirty-two more calls against a
+            # service that is already failing is the opposite of what the
+            # breaker exists for. These messages fail open per item, counted.
             return BatchVerdicts([None] * len(texts), confirmed=False)
         if results is _BATCH_UNSUPPORTED:
             self._demote_batching()

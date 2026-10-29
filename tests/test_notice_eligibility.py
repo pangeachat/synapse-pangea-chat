@@ -2,11 +2,36 @@ import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import urlencode
 
 from synapse_pangea_chat.notice_delivery.eligibility import NoticeEligibility
 from synapse_pangea_chat.notice_delivery.request import NoticeRequest
 from tests import test_notice_schedule
 from tests.test_notice_schedule import scheduled_body
+
+# What a current client writes into `pangea.activity_plan`: a reference whose
+# version_id is a content signature, not a CMS version id.
+REFERENCE = {
+    "activity_id": "activity-1",
+    "version_id": "0123456789abcdef0123456789abcdef",
+    "source_course_id": "course-1",
+}
+CANONICAL_QUERY = "?" + urlencode(
+    {
+        "where[res.plan.activity_id][equals]": "activity-1",
+        "where[req.source_request_hash][exists]": "false",
+        "limit": 2,
+        "depth": 0,
+    }
+)
+
+
+def canonical_row(roles):
+    plan = {
+        "activity_id": "activity-1",
+        "roles": [{"role_id": n} for n in range(roles)],
+    }
+    return 200, {"docs": [{"res": {"plan": plan}}]}
 
 
 class TestEligibility(unittest.IsolatedAsyncioTestCase):
@@ -163,39 +188,23 @@ class TestEligibility(unittest.IsolatedAsyncioTestCase):
             api.get_room_state = AsyncMock(return_value=state)
             self.assertEqual(await gate.check(body, req, "42"), expected)
 
-    async def test_session_reference_reads_its_pinned_plan(self):
+    async def test_session_reference_reads_the_canonical_plan(self):
         gate, body, req, api = self.setup_gate({})
         body.update(
             session_room_id="!session:test", eligibility={"session_available": True}
         )
         api.get_room_state = AsyncMock(
             return_value={
-                ("pangea.activity_plan", ""): SimpleNamespace(
-                    content={"activity_id": "activity-1", "version_id": "version-1"}
-                ),
+                ("pangea.activity_plan", ""): SimpleNamespace(content=REFERENCE),
                 ("m.room.member", req.user_id): SimpleNamespace(
                     content={"membership": "join"}
                 ),
             }
         )
-        gate.log._request = AsyncMock(
-            return_value=(
-                200,
-                {
-                    "version": {
-                        "res": {
-                            "plan": {
-                                "activity_id": "activity-1",
-                                "roles": [{"role_id": "one"}, {"role_id": "two"}],
-                            }
-                        }
-                    }
-                },
-            )
-        )
+        gate.log._request = AsyncMock(return_value=canonical_row(2))
         self.assertIsNone(await gate.check(body, req, "42"))
         gate.log._request.assert_awaited_once_with(
-            "GET", "/version-1", collection="activities-v2/versions"
+            "GET", CANONICAL_QUERY, collection="activities-v2"
         )
 
     async def test_saved_completion_survives_missing_current_role(self):
@@ -219,3 +228,81 @@ class TestEligibility(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await gate.check(body, req, "42"), "activity_already_completed"
         )
+
+
+BOT = "@bot:test"
+LEARNER = "LEARNER"  # the recipient, filled in by the fixture
+
+
+class TestBotFillsOpenSeat(unittest.IsolatedAsyncioTestCase):
+    """The open-session notice goes out only while pangea-bot's sweep would
+    take the session's last seat at the hour."""
+
+    def gate(self, members, *, capacity=2, extra=None, roles=None):
+        gate, body, req, api = TestEligibility().setup_gate({})
+        body.update(
+            sender_id=BOT,
+            session_room_id="!session:test",
+            eligibility={"bot_fills_open_seat": True},
+        )
+        state = {
+            ("pangea.activity_plan", ""): SimpleNamespace(
+                content={
+                    "activity_id": "activity-1",
+                    "roles": {str(n): {} for n in range(capacity)},
+                }
+            ),
+            ("pangea.activity_roles", ""): SimpleNamespace(
+                content={"roles": roles or {}}
+            ),
+            **(extra or {}),
+        }
+        for user, membership in members.items():
+            key = ("m.room.member", req.user_id if user == LEARNER else user)
+            state[key] = SimpleNamespace(content={"membership": membership})
+        api.get_room_state = AsyncMock(return_value=state)
+        return gate, body, req
+
+    async def test_only_the_last_open_seat_with_learner_and_bot_in(self):
+        friend = "@friend:test"
+        for members, capacity, expected in (
+            ({LEARNER: "join", BOT: "join"}, 2, None),
+            ({LEARNER: "join", BOT: "join", friend: "invite"}, 3, None),
+            ({LEARNER: "join", BOT: "join", friend: "invite"}, 2, "session_full"),
+            ({LEARNER: "join", BOT: "join"}, 3, "seats_open"),
+            ({LEARNER: "leave", BOT: "join", friend: "join"}, 3, "recipient_left"),
+            ({LEARNER: "join", BOT: "leave"}, 2, "bot_not_in_session"),
+        ):
+            gate, body, req = self.gate(members, capacity=capacity)
+            with self.subTest(members=members, capacity=capacity):
+                self.assertEqual(await gate.check(body, req, "42"), expected)
+
+    async def test_bot_chosen_or_session_ended_sends_nothing(self):
+        in_room = {LEARNER: "join", BOT: "join"}
+        marker = {("pangea.bot_participant", ""): SimpleNamespace(content={})}
+        summary = {("pangea.activity_summary", ""): SimpleNamespace(content={})}
+        finished = {"one": {"user_id": "@x:test", "finished_at": "2026-10-01"}}
+        for extra, roles, expected in (
+            (marker, None, "bot_already_chosen"),
+            (summary, None, "session_ended"),
+            ({}, finished, "session_ended"),
+        ):
+            gate, body, req = self.gate(in_room, extra=extra, roles=roles)
+            with self.subTest(expected=expected):
+                self.assertEqual(await gate.check(body, req, "42"), expected)
+
+    async def test_reference_only_plan_is_sized_from_the_canonical_row(self):
+        plan = {("pangea.activity_plan", ""): SimpleNamespace(content=REFERENCE)}
+        for roles, expected in ((2, None), (3, "seats_open")):
+            gate, body, req = self.gate({LEARNER: "join", BOT: "join"}, extra=plan)
+            gate.log._request = AsyncMock(return_value=canonical_row(roles))
+            with self.subTest(roles=roles):
+                self.assertEqual(await gate.check(body, req, "42"), expected)
+                gate.log._request.assert_awaited_once_with(
+                    "GET", CANONICAL_QUERY, collection="activities-v2"
+                )
+
+    def test_condition_requires_the_session(self):
+        body = {**scheduled_body(), "eligibility": {"bot_fills_open_seat": True}}
+        with self.assertRaises(ValueError):
+            NoticeRequest.parse(body)

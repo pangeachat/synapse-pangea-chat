@@ -8,6 +8,13 @@ from synapse.events import EventBase
 from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.activity_session_previews import ActivitySessionPreviews
+from synapse_pangea_chat.analytics_forward import (
+    CONFIG_KEY as ANALYTICS_FORWARD_CONFIG_KEY,
+)
+from synapse_pangea_chat.analytics_forward import (
+    AnalyticsForward,
+    parse_analytics_forward_config,
+)
 from synapse_pangea_chat.assign_room_membership import AssignRoomMembership
 from synapse_pangea_chat.blocked_join_gate import BlockedJoinGate
 from synapse_pangea_chat.config import (
@@ -20,6 +27,10 @@ from synapse_pangea_chat.course_default_chats import (
     SyncCourseDefaultChats,
 )
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
+from synapse_pangea_chat.course_session_admins import (
+    BackfillCourseSessionAdmins,
+    CourseSessionAdmins,
+)
 from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 from synapse_pangea_chat.delete_room import DeleteRoom
@@ -61,6 +72,7 @@ from synapse_pangea_chat.notice_delivery import (
     MissedMessageUnsubscribe,
     NoticeClick,
     NoticeUnsubscribe,
+    OpenSessionNotice,
     PrepareNotice,
     RefusalStore,
 )
@@ -514,6 +526,19 @@ class PangeaChat:
                 resource=self.course_member_emails_resource,
             )
 
+        # --- Analytics forward (dashboard inputs pushed to admin-dash-api) ---
+        # Constructed only when configured (ingest URL + shared secret):
+        # construction registers its callbacks and endpoints. The loop itself
+        # runs only on the background-tasks instance, never in the send path.
+        self.analytics_forward: Optional[AnalyticsForward] = None
+        if config.analytics_forward is not None:
+            self.analytics_forward = AnalyticsForward(api, config.analytics_forward)
+        else:
+            logger.info(
+                "analytics_forward is not configured; the dashboard's Matrix "
+                "inputs are not forwarded"
+            )
+
         # --- Member Analytics Profiles ---
         self.member_analytics_profiles_resource = MemberAnalyticsProfiles(api, config)
         self._api.register_web_resource(
@@ -632,6 +657,16 @@ class PangeaChat:
                 resource=RecoverCourseDefaultChat(api, self.course_default_chats),
             )
 
+        # --- Course Session Admins ---
+        # Joins a course's admins to each new activity session linked into the
+        # course, hidden and muted in their app.
+        if config.course_session_admins_enabled:
+            self.course_session_admins = CourseSessionAdmins(api)
+            self._api.register_web_resource(
+                path="/_synapse/client/pangea/v1/backfill_course_session_admins",
+                resource=BackfillCourseSessionAdmins(api, self.course_session_admins),
+            )
+
         # --- Direct Push ---
         self.direct_push_resource = DirectPush(api, config)
         self._api.register_web_resource(
@@ -649,6 +684,15 @@ class PangeaChat:
             api, config, self.direct_push_resource
         )
         self.deliver_notice_resource.schedule.start()
+        if config.open_session_notice_bot_user_id is not None:
+            self.open_session_notice = OpenSessionNotice(
+                api,
+                self.deliver_notice_resource,
+                config.open_session_notice_bot_user_id,
+            )
+            self._api.register_third_party_rules_callbacks(
+                on_new_event=self.open_session_notice.on_new_event,
+            )
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/deliver_notice",
             resource=self.deliver_notice_resource,
@@ -1059,6 +1103,10 @@ class PangeaChat:
             )
 
         # --- course_member_emails config ---
+        analytics_forward = parse_analytics_forward_config(
+            config.get(ANALYTICS_FORWARD_CONFIG_KEY)
+        )
+
         course_member_emails_enabled = config.get("course_member_emails_enabled", False)
         if not isinstance(course_member_emails_enabled, bool):
             raise ValueError('Config "course_member_emails_enabled" must be a boolean')
@@ -1182,6 +1230,15 @@ class PangeaChat:
             raise ValueError(
                 'Config "notice_suppress_notice_push_rules" must be a boolean'
             )
+        open_session_notice_bot_user_id = config.get("open_session_notice_bot_user_id")
+        if open_session_notice_bot_user_id is not None and (
+            not isinstance(open_session_notice_bot_user_id, str)
+            or not open_session_notice_bot_user_id.startswith("@")
+            or ":" not in open_session_notice_bot_user_id
+        ):
+            raise ValueError(
+                'Config "open_session_notice_bot_user_id" must be a Matrix user id'
+            )
         notice_token_secret = config.get("notice_token_secret")
         if notice_token_secret is not None and (
             not isinstance(notice_token_secret, str) or not notice_token_secret.strip()
@@ -1255,6 +1312,12 @@ class PangeaChat:
         course_default_chats_enabled = config.get("course_default_chats_enabled", True)
         if not isinstance(course_default_chats_enabled, bool):
             raise ValueError('Config "course_default_chats_enabled" must be a boolean')
+
+        course_session_admins_enabled = config.get(
+            "course_session_admins_enabled", True
+        )
+        if not isinstance(course_session_admins_enabled, bool):
+            raise ValueError('Config "course_session_admins_enabled" must be a boolean')
 
         # --- delayed_push config ---
         delayed_push = config.get("delayed_push", {})
@@ -1596,6 +1659,7 @@ class PangeaChat:
             find_user_by_email_burst_duration_seconds=find_user_by_email_burst_duration_seconds,
             find_user_by_email_rate_limit_exempt_user_ids=find_user_by_email_rate_limit_exempt_user_ids,
             course_member_emails_enabled=course_member_emails_enabled,
+            analytics_forward=analytics_forward,
             course_member_emails_requests_per_burst=course_member_emails_requests_per_burst,
             course_member_emails_burst_duration_seconds=course_member_emails_burst_duration_seconds,
             member_analytics_profiles_requests_per_burst=member_analytics_profiles_limits[
@@ -1630,6 +1694,7 @@ class PangeaChat:
             notice_email_enabled=notice_email_enabled,
             notice_missed_message_unsubscribe_enabled=notice_missed_message_unsubscribe_enabled,
             notice_suppress_notice_push_rules=notice_suppress_notice_push_rules,
+            open_session_notice_bot_user_id=open_session_notice_bot_user_id,
             notice_token_secret=notice_token_secret,
             notice_token_ttl_days=notice_token_ttl_days,
             notice_email_postal_address=notice_email_postal_address,
@@ -1646,6 +1711,7 @@ class PangeaChat:
             delayed_push_require_synapse_version=delayed_push_require_synapse_version,
             blocked_join_gate_enabled=blocked_join_gate_enabled,
             course_default_chats_enabled=course_default_chats_enabled,
+            course_session_admins_enabled=course_session_admins_enabled,
             moderation_tier1_enabled=moderation_tier1_enabled,
             moderation_tier1_phone_regions=moderation_tier1_phone_regions,
             moderation_tier2_enabled=moderation_tier2_enabled,
