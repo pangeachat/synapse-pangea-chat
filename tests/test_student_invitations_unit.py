@@ -41,6 +41,29 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("email", self.store.public(rows[0]))
         self.assertEqual(rows[0]["email"], "ann@school.example")
 
+    async def test_an_invitation_matches_one_account_once(self):
+        ident = await self.store.create(
+            ROOM, "Ann@School.example", "abc2def", "@t:x", 100
+        )
+        old = await self.store.create(ROOM, "ann@school.example", "ghi3jkm", "@t:x", 50)
+        await self.store.create(ROOM, "not an address", "mno4pqr", "@t:x", 100)
+        found = await self.store.unmatched_for_emails(["ann@school.example"], 100)
+        self.assertEqual([row["invitation_id"] for row in found], [ident])
+        self.assertNotIn(old, [row["invitation_id"] for row in found])
+        self.assertEqual(await self.store.unmatched_for_emails([], 0), [])
+
+        self.assertTrue(await self.store.match(ident, "@ann:x", 200))
+        self.assertFalse(await self.store.match(ident, "@other:x", 300))
+        self.assertEqual(
+            await self.store.unmatched_for_emails(["ann@school.example"], 100), []
+        )
+        # Only the account that took the match releases it.
+        await self.store.unmatch(ident, "@other:x")
+        self.assertFalse(await self.store.match(ident, "@other:x", 300))
+        await self.store.unmatch(ident, "@ann:x")
+        found = await self.store.unmatched_for_emails(["ann@school.example"], 100)
+        self.assertEqual([row["invitation_id"] for row in found], [ident])
+
     async def test_a_new_class_code_never_collides_with_an_invitation_code(self):
         await self.store.create(ROOM, "ann@school.example", "abc2def", "@t:x", 100)
         room_store = MagicMock()

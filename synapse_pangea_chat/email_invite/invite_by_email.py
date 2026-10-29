@@ -26,6 +26,9 @@ from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
+from synapse_pangea_chat.email_invite.student_invitation_match import (
+    StudentInvitationMatch,
+)
 from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 from synapse_pangea_chat.room_code.constants import (
     ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
@@ -54,13 +57,21 @@ REQUIRED_POWER_LEVEL = 50
 class InviteByEmail(Resource):
     isLeaf = True
 
-    def __init__(self, api: ModuleApi, config: PangeaChatConfig, claim_store=None):
+    def __init__(
+        self,
+        api: ModuleApi,
+        config: PangeaChatConfig,
+        claim_store=None,
+        matcher: Optional[StudentInvitationMatch] = None,
+    ):
         super().__init__()
         self._api = api
         self._config = config
         # The claim store carries the student invitation store and the collision check a new
         # code passes (knock-with-code.instructions.md); None only in tests of the old path.
         self._claim_store = claim_store
+        # Invites an account that already holds an emailed address into the course.
+        self._matcher = matcher
         self._auth = self._api._hs.get_auth()
         self._send_email_handler = self._api._hs.get_send_email_handler()
         self._app_name = self._api._hs.config.email.email_app_name
@@ -194,6 +205,8 @@ class InviteByEmail(Resource):
                         invitations.append(
                             {"email": email, "invitation_id": invitation_id}
                         )
+                        if self._matcher is not None:
+                            await self._matcher.match_address(email)
                 except Exception as e:
                     logger.warning("Failed to send invite to %s: %s", email, e)
                     errors.append({"email": email, "error": str(e)})
