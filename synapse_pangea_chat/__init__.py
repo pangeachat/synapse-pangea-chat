@@ -28,6 +28,12 @@ from synapse_pangea_chat.course_default_chats import (
 )
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
 from synapse_pangea_chat.course_session_admins import CourseSessionAdmins
+from synapse_pangea_chat.course_trip import (
+    CoursePositionPass,
+    CoursePositionRun,
+    SliceCourse,
+    shared_city_list,
+)
 from synapse_pangea_chat.delayed_push import configure_delayed_push
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 from synapse_pangea_chat.delete_room import DeleteRoom
@@ -647,6 +653,19 @@ class PangeaChat:
         # course, hidden and muted in their app.
         if config.course_session_admins_enabled:
             self.course_session_admins = CourseSessionAdmins(api)
+        # --- Course trip (pangeachat/.github#780) ---
+        self.city_list = shared_city_list(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/slice_course",
+            resource=SliceCourse(api, config, self.city_list),
+        )
+        self.course_position = CoursePositionPass(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/course_position",
+            resource=CoursePositionRun(api, self.course_position),
+        )
+        if config.course_position_enabled:
+            self.course_position.start()
 
         # --- Direct Push ---
         self.direct_push_resource = DirectPush(api, config)

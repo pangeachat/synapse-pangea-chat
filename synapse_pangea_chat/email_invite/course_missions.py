@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from io import BytesIO
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import quote, urlencode
 
 from synapse.http.client import read_body_with_max_size
@@ -157,13 +157,23 @@ def activities_query(lo_ids: Sequence[str], l2: str) -> str:
 
 
 class CourseMissionsReader:
-    def __init__(self, api: ModuleApi, cms_base_url: str, cms_api_key: str):
+    def __init__(
+        self,
+        api: ModuleApi,
+        cms_base_url: str,
+        cms_api_key: str,
+        slicer: Optional[Callable[[], Awaitable[Any]]] = None,
+    ):
         self._http = api.http_client
         self._clock = api._hs.get_clock()
         self._base = cms_base_url.rstrip("/") + "/api/"
         self._headers = Headers(
             {"Authorization": [f"service-users API-Key {cms_api_key}"]}
         )
+        #: When set (course_missions_v2_enabled), a new course's copy is the
+        #: trip: ``slicer()`` answers a ``TripSlicer`` over the current city
+        #: list, and the copy is sliced before it is written.
+        self._slicer = slicer
 
     async def _get(self, path: str) -> Any:
         response = await self._http.request(
@@ -179,7 +189,9 @@ class CourseMissionsReader:
             )
         return json.loads(buffer.getvalue())
 
-    async def _build(self, quest_id: str) -> Dict[str, Any]:
+    async def _build_with_docs(
+        self, quest_id: str
+    ) -> "tuple[Dict[str, Any], List[Mapping[str, Any]]]":
         quest = await self._get(f"quest-plans/{quote(quest_id, safe='')}?depth=0")
         if not isinstance(quest, Mapping):
             raise CourseMissionsError("quest read returned no document")
@@ -188,12 +200,36 @@ class CourseMissionsReader:
         if l2 is None:
             raise CourseMissionsError("quest has no target language")
         if not lo_ids:
-            return build_course_missions_content(quest, [])
+            return build_course_missions_content(quest, []), []
         found = await self._get("activities-v2?" + activities_query(lo_ids, l2))
         docs = found.get("docs") if isinstance(found, Mapping) else None
         if not isinstance(docs, list):
             raise CourseMissionsError("activities read returned no docs list")
-        return build_course_missions_content(quest, docs)
+        return build_course_missions_content(quest, docs), docs
+
+    async def _build(self, quest_id: str) -> Dict[str, Any]:
+        content, docs = await self._build_with_docs(quest_id)
+        slicer = self._slicer
+        if slicer is None:
+            return content
+        # The trip (course-trip.instructions.md): each Can-Do sliced to its
+        # city, from the same documents.
+        copy, _ = (await slicer()).slice_copy(content, docs, None)
+        return copy
+
+    async def read_with_docs(
+        self, quest_id: str
+    ) -> "tuple[Dict[str, Any], List[Mapping[str, Any]]]":
+        """The version 1 copy and the activity documents it was built from,
+        for a slicer; raises :class:`CourseMissionsError` when it cannot be
+        built (unlike :meth:`read`, which answers None)."""
+        return await make_deferred_yieldable(
+            timeout_deferred(
+                deferred=run_in_background(self._build_with_docs, quest_id),
+                timeout=FETCH_TIMEOUT_SECONDS,
+                clock=self._clock,
+            )
+        )
 
     async def read(self, quest_id: str) -> Optional[Dict[str, Any]]:
         """The copy for ``quest_id``, or None when it cannot be built."""

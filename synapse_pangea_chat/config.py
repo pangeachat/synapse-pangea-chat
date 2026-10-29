@@ -46,6 +46,20 @@ class PangeaChatConfig:
     # trusts. Empty means `@support:<server name>`.
     central_course_admin_user_ids: List[str] = attr.Factory(list)
 
+    # --- course_trip config (pangeachat/.github#780) ---
+    # Write new server-created course copies as the trip (version 2, each
+    # Can-Do sliced to its city). Off until the app's version 2 reader has
+    # shipped: an older app treats a version it does not know as no copy.
+    course_missions_v2_enabled: bool = False
+    # The scheduled pass that places an undated course's ship at its busiest
+    # stop. Ships dark; the operator endpoint runs one course on demand either way.
+    course_position_enabled: bool = False
+    course_position_interval_seconds: int = 900
+    # "Active this week": a member whose progress record was written within
+    # this window counts (the dashboard's seven-day count; a default to tune).
+    course_position_active_window_seconds: int = 7 * 86400
+    course_trip_cities_cache_ttl_seconds: int = 3600
+
     # --- room_preview config ---
     room_preview_state_event_types: List[str] = attr.Factory(list)
     room_preview_burst_duration_seconds: int = 60

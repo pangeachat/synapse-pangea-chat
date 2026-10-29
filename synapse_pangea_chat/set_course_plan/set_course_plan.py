@@ -34,6 +34,7 @@ from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.course_trip.slicing import trip_slicer
 from synapse_pangea_chat.email_invite.course_missions import (
     COURSE_MISSIONS_STATE_EVENT_TYPE,
     CourseMissionsReader,
@@ -231,7 +232,10 @@ class SetCoursePlan(Resource):
             or DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE
         )
         self._course_missions = CourseMissionsReader(
-            api, config.cms_base_url, config.cms_service_api_key
+            api,
+            config.cms_base_url,
+            config.cms_service_api_key,
+            slicer=trip_slicer(api, config),
         )
 
     def render_POST(self, request: SynapseRequest):
