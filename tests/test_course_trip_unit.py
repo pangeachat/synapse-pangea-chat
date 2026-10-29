@@ -140,14 +140,16 @@ class TestSlice(unittest.TestCase):
             "version": 1,
             "revision": 1,
             "missions": [
-                {"lo_id": "lo1", "activity_ids": ["s1", "m1", "m2"]},
+                {"lo_id": "lo1", "activity_ids": ["s1", "m1", "m2", "m3"]},
                 {"lo_id": "lo2", "activity_ids": ["far"]},
-                {"lo_id": "lo3", "activity_ids": []},
+                {"lo_id": "lo3", "activity_ids": ["m1"]},
+                {"lo_id": "lo4", "activity_ids": ["m2"]},
             ],
         }
         docs = [
             _doc("m1", 19.35, -99.16),
             _doc("m2", 19.50, -99.10),
+            _doc("m3", 19.40, -99.20),
             _doc("s1", 40.42, -3.70),
             _doc("far", 0.5, 0.5),
             _doc("none", None, None),
@@ -157,7 +159,11 @@ class TestSlice(unittest.TestCase):
             "revision": 4,
             "time_zone": "America/Mexico_City",
             "missions": [
-                # The teacher's own copy "own1" stays pinned (no position known).
+                # The teacher put lo2 first, removed lo3, and never had lo4
+                # (a library addition since the copy was made).
+                {"lo_id": "lo2", "activity_ids": ["far"]},
+                # The teacher's own copy "own1" stays pinned (no position
+                # known); "m2" was removed and is never pinned again.
                 {
                     "lo_id": "lo1",
                     "activity_ids": ["m1", "own1"],
@@ -165,9 +171,11 @@ class TestSlice(unittest.TestCase):
                     "due_at": "2026-11-09T05:59:00Z",
                     "removed_activity_ids": ["m2"],
                 },
+                # A Can-Do the teacher added: kept, with its own activity.
+                {"lo_id": "lo-own", "activity_ids": ["own2"]},
             ],
             "removed_missions": [
-                {"lo_id": "lo9", "activity_ids": ["z"], "shown_count": 1}
+                {"lo_id": "lo3", "activity_ids": ["m1"], "shown_count": 1}
             ],
         }
         copy, slices = TripSlicer(CITIES).slice_copy(built, docs, existing)
@@ -177,10 +185,14 @@ class TestSlice(unittest.TestCase):
         self.assertNotIn("start_date", copy)
         self.assertEqual(copy["removed_missions"], existing["removed_missions"])
         self.assertEqual(
-            copy["missions"][0],
+            [m["lo_id"] for m in copy["missions"]], ["lo2", "lo1", "lo-own"]
+        )
+        self.assertEqual(copy["missions"][0], {"lo_id": "lo2", "activity_ids": ["far"]})
+        self.assertEqual(
+            copy["missions"][1],
             {
                 "lo_id": "lo1",
-                "activity_ids": ["m1", "m2", "own1"],
+                "activity_ids": ["m1", "m3", "own1"],
                 "city": {
                     "name": "Mexico City",
                     "lat_e6": 19444400,
@@ -191,13 +203,30 @@ class TestSlice(unittest.TestCase):
                 "removed_activity_ids": ["m2"],
             },
         )
-        self.assertEqual(copy["missions"][1], {"lo_id": "lo2", "activity_ids": ["far"]})
-        self.assertEqual(copy["missions"][2], {"lo_id": "lo3", "activity_ids": []})
+        self.assertEqual(
+            copy["missions"][2], {"lo_id": "lo-own", "activity_ids": ["own2"]}
+        )
         summary = report(slices)
         self.assertEqual(
-            (summary["viable"], summary["thin"], summary["empty"]), (1, 1, 1)
+            (summary["viable"], summary["thin"], summary["empty"]), (1, 2, 0)
         )
-        self.assertEqual(summary["can_dos"][0]["city"], "Mexico City")
+        self.assertEqual(summary["can_dos"][1]["city"], "Mexico City")
+
+    def test_without_a_course_list_every_quest_can_do_is_sliced(self) -> None:
+        built = {
+            "version": 1,
+            "revision": 1,
+            "missions": [
+                {"lo_id": "lo1", "activity_ids": ["m1"]},
+                {"lo_id": "lo2", "activity_ids": []},
+            ],
+        }
+        for existing in (None, {"version": 1, "revision": 2, "missions": []}):
+            copy, _ = TripSlicer(CITIES).slice_copy(
+                built, [_doc("m1", 19.35, -99.16)], existing
+            )
+            self.assertEqual([m["lo_id"] for m in copy["missions"]], ["lo1", "lo2"])
+            self.assertEqual(copy["missions"][0]["activity_ids"], ["m1"])
 
     def test_a_dated_copy_keeps_its_start_date(self) -> None:
         built = {

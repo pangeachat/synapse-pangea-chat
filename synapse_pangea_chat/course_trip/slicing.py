@@ -128,9 +128,10 @@ class TripSlicer:
         existing: Optional[Mapping[str, Any]] = None,
     ) -> "tuple[Dict[str, Any], List[Slice]]":
         """``content`` (a version 1 copy as the reader builds it: each Can-Do
-        with every library activity) as the trip: each Can-Do sliced, the
-        existing copy's notes, due dates, removed lists and start date kept,
-        at the existing copy's revision plus one. Returns the copy and each
+        with every library activity) as the trip: each Can-Do sliced, at the
+        existing copy's revision plus one. An existing copy keeps its Can-Do
+        list and order, its notes, due dates, removed lists and start date,
+        and no activity it removed is pinned. Returns the copy and each
         Can-Do's slice, for the report."""
         points: Dict[str, "tuple[float, float]"] = {}
         for doc in activity_docs:
@@ -138,25 +139,51 @@ class TripSlicer:
             point = activity_point(doc)
             if isinstance(activity_id, str) and activity_id and point is not None:
                 points[activity_id] = point
-        kept: Dict[str, Mapping[str, Any]] = {}
-        if existing is not None:
-            for entry in existing.get("missions") or []:
-                if isinstance(entry, Mapping) and isinstance(entry.get("lo_id"), str):
-                    kept[entry["lo_id"]] = entry
+        library_by_lo: Dict[str, List[str]] = {}
+        for entry in content.get("missions") or []:
+            if isinstance(entry, Mapping) and isinstance(entry.get("lo_id"), str):
+                library_by_lo[entry["lo_id"]] = [
+                    a for a in entry.get("activity_ids", []) if isinstance(a, str)
+                ]
+        # An existing copy is the course's own list (content-studio doc, "The
+        # course's own copy"): its Can-Dos in its order, the teacher's added
+        # ones included and removed ones left out, and an activity the teacher
+        # removed is never pinned again. Library additions never reach it.
+        # With no copy (or an empty one) the course lists the quest's Can-Dos.
+        existing_entries = [
+            entry
+            for entry in (existing or {}).get("missions") or []
+            if isinstance(entry, Mapping) and isinstance(entry.get("lo_id"), str)
+        ]
+        order: List[Mapping[str, Any]] = existing_entries or [
+            {"lo_id": lo_id} for lo_id in library_by_lo
+        ]
         missions: List[Dict[str, Any]] = []
         slices: List[Slice] = []
-        for entry in content.get("missions") or []:
+        for entry in order:
             lo_id = entry["lo_id"]
-            library = [a for a in entry.get("activity_ids", []) if isinstance(a, str)]
-            previous = kept.get(lo_id)
+            previous = entry if existing_entries else None
             listed = (
                 [a for a in previous.get("activity_ids", []) if isinstance(a, str)]
                 if previous is not None
                 else []
             )
+            removed = (
+                {
+                    a
+                    for a in previous.get("removed_activity_ids") or []
+                    if isinstance(a, str)
+                }
+                if previous is not None
+                else set()
+            )
             # The library's activities decide the city; the course's own listed
             # ones (a teacher's copies among them) stay pinned at it.
-            candidates = list(dict.fromkeys([*library, *listed]))
+            candidates = [
+                a
+                for a in dict.fromkeys([*library_by_lo.get(lo_id, []), *listed])
+                if a not in removed
+            ]
             sliced = slice_can_do(lo_id, candidates, points, self._index)
             slices.append(sliced)
             mission: Dict[str, Any] = {
