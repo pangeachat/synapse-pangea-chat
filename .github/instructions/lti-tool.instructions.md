@@ -1,22 +1,43 @@
 ---
 applyTo: "synapse_pangea_chat/lti/**"
-description: "The Synapse module's LTI 1.3 tool for Canvas: registration and operator approval, launch validation, the launch hand-offs, course connect and the roster import."
+description: "What the module decides for the Canvas connection (LTI 1.3): it is off unless configured, which schools may connect, how a launch from Canvas is checked and handed to the app, and what a roster import may do."
 ---
 
-# LTI tool (Canvas)
+# Canvas tool (LTI)
 
-The module is Pangea's LTI 1.3 tool. [lms-integration](../../../.github/.github/instructions/lms-integration.instructions.md) owns the install, connect, import and launch flows and the "never" rules; [seats](../../../.github/.github/instructions/seats.instructions.md) owns the invitations an import creates. This doc owns what the module decides in carrying them out.
+The module is how a school's Canvas (or another LMS) connects to Pangea: a teacher links a Canvas course to a Pangea course, imports the class list as seat invitations, and students open Pangea from Canvas. The flows are in the org [lms-integration](../../../.github/.github/instructions/lms-integration.instructions.md) doc; the invitations an import creates are in the org [seats](../../../.github/.github/instructions/seats.instructions.md) doc.
 
-Canvas is not released: the tool's routes are registered only when the module config carries an `lti` block, no environment has one yet, and admin-dash shows nothing Canvas.
+Canvas is not released: the tool runs only when the module is configured for it, no environment is, and admin-dash shows nothing Canvas.
+
+## The experience
+
+1. A school's Canvas admin installs Pangea; a Pangea server admin approves the school before anything works.
+2. A teacher launches Pangea from Canvas and links the Canvas course to one of their Pangea courses.
+3. The teacher imports the class list; each student becomes an invitation, with no email sent.
+4. A student launches Pangea from Canvas and lands in the course, signing in or linking their account the first time.
 
 ## Decisions
 
-- **Off without its key.** The tool's signing key reaches the module only through its config, filled from Secrets Manager. Without a usable key the LTI endpoints are not registered at all and the rest of the module starts as normal; nothing generates or falls back to a key.
-- **Dynamic Registration only, then an operator's approval.** A platform registers itself from its own configuration document, which must name an issuer and a registration endpoint on the same host it was fetched from (Instructure's own issuers may use Instructure's documented login host), so a document hosted anywhere cannot pose as another platform or receive the registration token. A new platform stays pending, with its logins and launches refused, until a server admin approves it; a deployment the registration didn't name is recorded on its first signed launch after approval.
-- **Every launch is fully validated** against LTI 1.3 Core and the 1EdTech Security Framework. A launch is good once and only in the browser that started it, so it cannot be replayed or carried elsewhere.
-- **Platform URLs are untrusted.** A fetch to a platform-supplied address follows the homeserver's network blocklist, follows no redirects and is bounded in size and time, and unknown signing keys cannot make the tool fetch repeatedly, so a platform cannot use it to reach internal hosts or amplify requests.
-- **Hand-offs are single-use tickets.** A launch hands the app or admin-dash, in a part of the URL no server logs, a short-lived ticket that works once, whatever happens next; the ticket itself is never stored. Where a launch goes depends on role and on whether the Canvas identity is already linked; a linked student with nothing new to confirm gets a short-lived one-time sign-in instead. A server admin account never gets one and goes to the normal sign-in, and is never a managed account, because a platform's say-so must never open or manage an admin account.
-- **Linking needs the account's own sign-in.** An unbound ticket links the account whose token returns it; a bound ticket acts only for the account it was issued to. One Canvas identity links to one account, and one account to one identity per platform. A Canvas email is never treated as verified and never links or signs in an account; the import uses it only to add an Invited row.
-- **Connect binds one Canvas course to one Pangea course**, only for the account the instructor launch resolved to and only for a course it administers, re-checked at connect. The Canvas course comes from the ticket, never from the request.
-- **Import reads only what connect stored.** Admin rights are checked before any call to Canvas. The roster read is never retried and Canvas's token goes only to the roster's own host. Only active learners are imported. An import never rewrites a row's email, and two imports that race converge on the same rows. No email is sent.
-- **Nothing sensitive in logs.** Logs, error bodies and Sentry never carry a token, ticket, key, Canvas user id or email.
+### Switching it on
+
+- Without its signing key in the module's config the tool does not exist, and the rest of the module runs normally. Re-decide: engineer.
+- A school can only install by registering itself, and stays switched off until a Pangea server admin approves it. Re-decide: Satvik.
+- A school's details must come from its own Canvas address, so one school cannot pose as another. Re-decide: engineer.
+
+### Launches
+
+- Every launch from Canvas is checked against the LTI 1.3 security rules, works once, and only in the browser that started it. Re-decide: engineer.
+- Addresses a school's Canvas gives us are treated as untrusted, so the tool can never be used to reach Pangea's internal systems. Re-decide: engineer.
+- A launch hands the app or admin-dash a short-lived one-time pass kept out of every server log; a student already linked may get a one-time sign-in instead. Re-decide: engineer.
+- A server admin's account is never signed in from Canvas and is never managed, because a school's say-so must never open an admin account. Re-decide: Satvik.
+
+### Linking and import
+
+- Linking a Canvas identity to an account needs that account's own sign-in, and one Canvas identity links to one account per school. Re-decide: Satvik.
+- A Canvas email is never treated as verified and never signs anyone in; an import uses it only to create an invitation. Re-decide: Satvik.
+- A Canvas course links to one Pangea course, only by a teacher of that course, re-checked when linking. Re-decide: Satvik.
+- An import checks the teacher first, reads the class list once, brings in only active students, never changes an existing invitation's email, and sends no email. Re-decide: Satvik.
+
+### Privacy
+
+- No pass, key, Canvas id or email is ever logged or sent to error tracking. Re-decide: engineer.
