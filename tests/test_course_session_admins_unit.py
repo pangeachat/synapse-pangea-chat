@@ -211,10 +211,6 @@ class TestEligibilityIsReadBeforeEveryAttempt(unittest.TestCase):
         self.module._mute.assert_awaited_once_with(TEACHER, ROOM)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestBackfillCourse(unittest.TestCase):
     def _module(self, join_admins: Any) -> Any:
         module: Any = object.__new__(CourseSessionAdmins)
@@ -254,3 +250,98 @@ class TestCourseSessions(unittest.TestCase):
         self.assertEqual(asyncio.run(module.course_sessions(SPACE)), [ROOM])
         checked = {c.args[1] for c in module._not_a_course_session.await_args_list}
         self.assertNotIn("!gone:example.com", checked)
+
+
+def _module_on(instance: str, writer: str = "master") -> Any:
+    """A module built as Synapse builds it, on ``instance`` of a homeserver
+    whose push rules writer is ``writer``."""
+    hs = Mock()
+    hs.get_instance_name.return_value = instance
+    hs.config.worker.writers.push_rules = [writer]
+    return CourseSessionAdmins(Mock(_hs=hs))
+
+
+class TestOnlyThePushRulesWriterJoins(unittest.TestCase):
+    """The hook fires on every Synapse process, but a push rule can only be
+    written on the push rules writer: that one process does all the work."""
+
+    def _link_session(self, instance: str, writer: str) -> Any:
+        module = _module_on(instance, writer)
+        module._not_a_course_session = AsyncMock(return_value=None)
+        module._course_admins = AsyncMock(return_value=frozenset({TEACHER}))
+        module._still_eligible = AsyncMock(return_value=True)
+        module._list = AsyncMock()
+        module._mute = AsyncMock()
+        join = AsyncMock()
+        scheduled: list = []
+        module._clock.call_later = Mock(
+            side_effect=lambda _delay, f, *args: scheduled.append((f, args))
+        )
+        module._api.run_as_background_process = lambda _desc, func, *args: func(*args)
+
+        async def run() -> None:
+            await module.on_new_event(
+                SimpleNamespace(**vars(_event()), room_id=SPACE, event_id="$e"), {}
+            )
+            for f, args in scheduled:
+                await f(*args)
+
+        with patch.object(course_session_admins, "server_initiated_join", join):
+            asyncio.run(run())
+        module.join = join
+        return module
+
+    def test_another_process_does_no_join_list_or_mute(self):
+        for instance, writer in (("generic-0", "master"), ("master", "pushw")):
+            with self.subTest(instance=instance, writer=writer):
+                module = self._link_session(instance, writer)
+                module._course_admins.assert_not_awaited()
+                module._list.assert_not_awaited()
+                module.join.assert_not_awaited()
+                module._mute.assert_not_awaited()
+
+    def test_the_push_rules_writer_lists_joins_and_mutes(self):
+        for writer in ("master", "pushw"):
+            with self.subTest(writer=writer):
+                module = self._link_session(writer, writer)
+                module._list.assert_awaited_once_with(TEACHER, ROOM)
+                module.join.assert_awaited_once()
+                self.assertEqual(module.join.await_args.args[1:], (ROOM, TEACHER))
+                module._mute.assert_awaited_once_with(TEACHER, ROOM)
+
+
+class TestBackfillRunsOnlyOnThePushRulesWriter(unittest.TestCase):
+    def _post(self, instance: str, writer: str) -> Any:
+        module = _module_on(instance, writer)
+        module.is_space = AsyncMock(return_value=True)
+        module.course_sessions = AsyncMock(return_value=[ROOM])
+        api = Mock(is_user_admin=AsyncMock(return_value=True))
+        resource = course_session_admins.BackfillCourseSessionAdmins(api, module)
+        resource._auth = Mock(get_user_by_req=AsyncMock(return_value=Mock()))
+        respond = Mock()
+        with patch.object(
+            course_session_admins,
+            "extract_body_json",
+            AsyncMock(return_value={"room_id": SPACE}),
+        ), patch.object(course_session_admins, "respond_with_json", respond):
+            asyncio.run(resource._async_render_POST(Mock()))
+        return SimpleNamespace(api=api, module=module, code=respond.call_args.args[1])
+
+    def test_another_process_refuses_and_schedules_nothing(self):
+        for instance, writer in (("generic-0", "master"), ("master", "pushw")):
+            with self.subTest(instance=instance, writer=writer):
+                posted = self._post(instance, writer)
+                self.assertEqual(posted.code, 421)
+                posted.module.course_sessions.assert_not_awaited()
+                posted.api.run_as_background_process.assert_not_called()
+
+    def test_the_push_rules_writer_schedules_the_backfill(self):
+        for writer in ("master", "pushw"):
+            with self.subTest(writer=writer):
+                posted = self._post(writer, writer)
+                self.assertEqual(posted.code, 202)
+                posted.api.run_as_background_process.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

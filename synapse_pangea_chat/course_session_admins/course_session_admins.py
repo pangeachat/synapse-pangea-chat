@@ -148,6 +148,13 @@ class CourseSessionAdmins:
 
     def __init__(self, api: ModuleApi):
         self._api = api
+        # The hook fires on every Synapse process, and a push rule can only be
+        # written on the push rules writer ("master" on a single process), so
+        # that one process does all the joins and the others nothing.
+        self.push_rules_writer = api._hs.config.worker.writers.push_rules[0]
+        self.is_push_rules_writer = (
+            api._hs.get_instance_name() == self.push_rules_writer
+        )
         self._state = api._hs.get_storage_controllers().state
         self._store = api._hs.get_datastores().main
         self._clock = api._hs.get_clock()
@@ -163,6 +170,8 @@ class CourseSessionAdmins:
         """Awaited inline for every event on the homeserver, so this decides
         from the event alone and hands the work to a background task: the
         student's session is never held up by the admins' joins."""
+        if not self.is_push_rules_writer:
+            return
         try:
             if is_first_link(event):
                 self._clock.call_later(
@@ -424,6 +433,18 @@ class BackfillCourseSessionAdmins(Resource):
             if not await self._api.is_user_admin(requester.user.to_string()):
                 respond_with_json(
                     request, 403, {"error": "Admin access required"}, send_cors=True
+                )
+                return
+            if not self._admins.is_push_rules_writer:
+                # The mutes can only be written there; nothing is half done here.
+                respond_with_json(
+                    request,
+                    421,
+                    {
+                        "error": "Send this to the push rules writer: "
+                        + self._admins.push_rules_writer
+                    },
+                    send_cors=True,
                 )
                 return
 
