@@ -39,6 +39,7 @@ from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.analytics_forward.consent import profile_analytics_rooms
+from synapse_pangea_chat.course_trip.slicing import TRIP_VERSION
 from synapse_pangea_chat.email_invite.course_missions import (
     COURSE_MISSIONS_STATE_EVENT_TYPE,
 )
@@ -57,7 +58,6 @@ logger = logging.getLogger("synapse.module.synapse_pangea_chat.course_trip.posit
 
 COURSE_POSITION_STATE_EVENT_TYPE = "pangea.course_position"
 COURSE_PROGRESS_STATE_EVENT_TYPE = "pangea.course_progress"
-TRIP_VERSION = 2
 
 
 def _parse_iso_ms(value: Any) -> Optional[int]:
@@ -239,13 +239,39 @@ class CoursePositionPass:
             "course_position: pass over %d course spaces: %s", len(rooms), outcomes
         )
 
+    async def _progress_records(
+        self, course_room_id: str, analytics_rooms: Sequence[str]
+    ) -> Dict[str, Mapping[str, Any]]:
+        """Each analytics room's ``pangea.course_progress`` record for the
+        course, keyed by analytics room: one batched read of current state and
+        one bulk event fetch, rather than a state read per member."""
+        if not analytics_rooms:
+            return {}
+        rows = await self._store.db_pool.simple_select_many_batch(
+            table="current_state_events",
+            column="room_id",
+            iterable=analytics_rooms,
+            retcols=("room_id", "event_id"),
+            keyvalues={
+                "type": COURSE_PROGRESS_STATE_EVENT_TYPE,
+                "state_key": course_room_id,
+            },
+            desc="course_position_progress_records",
+        )
+        events = await self._store.get_events([event_id for _, event_id in rows])
+        records: Dict[str, Mapping[str, Any]] = {}
+        for analytics_room, event_id in rows:
+            event = events.get(event_id)
+            if event is not None and isinstance(event.content, Mapping):
+                records[analytics_room] = dict(event.content)
+        return records
+
     async def _member_stops(
         self,
         room_id: str,
-        state: Mapping[Any, Any],
+        plan: Any,
         missions: Sequence[Mapping[str, Any]],
     ) -> List[int]:
-        plan = state.get((self._plan_type, ""))
         language = extract_l2(dict(plan.content)) if plan is not None else None
         members = [
             uid
@@ -253,21 +279,20 @@ class CoursePositionPass:
             if self._api.is_mine(uid)
         ]
         profiles = await self._store.get_profile_data_for_users(members)
+        rooms_by_member = {
+            uid: profile_analytics_rooms(profiles.get(uid), language or "")
+            for uid in members
+        }
+        records = await self._progress_records(
+            room_id,
+            list(dict.fromkeys(r for rooms in rooms_by_member.values() for r in rooms)),
+        )
         now = self._clock.time_msec()
         stops: List[int] = []
         for uid in members:
-            for analytics_room in profile_analytics_rooms(
-                profiles.get(uid), language or ""
-            ):
-                progress_state = await self._api.get_room_state(
-                    analytics_room, [(COURSE_PROGRESS_STATE_EVENT_TYPE, room_id)]
-                )
-                record = progress_state.get((COURSE_PROGRESS_STATE_EVENT_TYPE, room_id))
+            for analytics_room in rooms_by_member[uid]:
                 stop = member_stop(
-                    missions,
-                    dict(record.content) if record is not None else None,
-                    now,
-                    self._window_ms,
+                    missions, records.get(analytics_room), now, self._window_ms
                 )
                 if stop is not None:
                     stops.append(stop)
@@ -275,15 +300,26 @@ class CoursePositionPass:
         return stops
 
     async def run_course(self, room_id: str, *, dry_run: bool) -> CourseStop:
-        state = await self._api.get_room_state(room_id)
-        if state.get((self._plan_type, "")) is None:
+        # Only what decides the position: most course spaces are not undated
+        # trips, and a full state read would load every member event to learn
+        # that. The full state is read only when a write is due.
+        state = await self._api.get_room_state(
+            room_id,
+            [
+                (self._plan_type, ""),
+                (COURSE_MISSIONS_STATE_EVENT_TYPE, ""),
+                (COURSE_POSITION_STATE_EVENT_TYPE, ""),
+            ],
+        )
+        plan = state.get((self._plan_type, ""))
+        if plan is None:
             return CourseStop(room_id, NOT_A_COURSE)
         copy_event = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
         copy = dict(copy_event.content) if copy_event is not None else None
         if not is_undated_trip(copy):
             return CourseStop(room_id, NOT_AN_UNDATED_TRIP)
         missions = [m for m in copy["missions"] if isinstance(m, Mapping)]  # type: ignore[index]
-        stops = await self._member_stops(room_id, state, missions)
+        stops = await self._member_stops(room_id, plan, missions)
         current_event = state.get((COURSE_POSITION_STATE_EVENT_TYPE, ""))
         previous = (
             parse_position(dict(current_event.content)) if current_event else None
@@ -293,7 +329,9 @@ class CoursePositionPass:
         )
         if position is None:
             return CourseStop(room_id, UNCHANGED, previous, len(stops))
-        instructors = joined_local_instructors(self._api, state)
+        instructors = joined_local_instructors(
+            self._api, await self._api.get_room_state(room_id)
+        )
         if not instructors:
             logger.warning(
                 "course_position: no local instructor in %s can send the position",
