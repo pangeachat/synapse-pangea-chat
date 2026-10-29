@@ -14,11 +14,11 @@ A teacher can only read a student's activity session if she is in its room. The 
 - **Who:** the course's joined, local admins at power level 100 or more, never the bot. Anyone already in the room, such as the teacher who launched it, is left as they are, and so is anyone who left or was banned from it. Course members who are not admins are never joined.
 - **How:** as themselves, through the room's own join rule, with no invite. A room whose rule does not admit course members is not joined.
 - **Hidden and muted:** each admin gets the same two writes the dashboard's review join makes. The room goes on her `pangea.admin_review` list before the join, and is muted with the app's own mute rule after it. The app keeps a listed room out of her chats and badges until she takes a role in it. A room that could not be listed is not joined.
-- **Never in the way:** the work runs in the background after the link, waits out Synapse's rate limits, and logs each failure to Sentry without failing the student's session.
+- **Never in the way:** the work runs in the background after the link, waits out Synapse's rate limits, and logs each failure to Sentry without failing the student's session. It runs on one Synapse process only, the push rules writer, since only that process can write the mute.
 
 ## Older sessions, on request
 
-A server admin can join a course's admins to the sessions it already links, one course per call (`POST /_synapse/client/pangea/v1/backfill_course_session_admins`). Each session gets exactly the treatment a new one does: the same rooms and admins qualify, and each admin is listed, joined and muted, at the pace Synapse's rate limits allow. The call answers at once with how many sessions it will walk and does the joins in the background, logging progress. Running it again joins nobody already in.
+A server admin can join a course's admins to the sessions it already links, one course per call (`POST /_synapse/client/pangea/v1/backfill_course_session_admins`). Each session gets exactly the treatment a new one does: the same rooms and admins qualify, and each admin is listed, joined and muted, at the pace Synapse's rate limits allow. The call answers at once with how many sessions it will walk and does the joins in the background, logging progress. Running it again joins nobody already in. The call must reach the push rules writer; any other process answers 421 and does nothing.
 
 ## Known limits
 
