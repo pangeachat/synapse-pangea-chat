@@ -46,4 +46,4 @@ A teacher adds a student's email to a course; the module keeps that invitation, 
 
 ## Open questions
 
-- The org seats doc says management continues after a student leaves, until the teacher graduates them; today the managed mark ends when the student leaves. Graduation, and recording how management began and who graduated the student, are not built yet. Owner: Satvik.
+- The org seats doc says management continues after a student leaves, until the teacher graduates them; today the managed mark ends when the student leaves. Graduation, and recording how management began and who graduated the student, are not built yet (pangeachat/.github#799). Owner: Satvik.
