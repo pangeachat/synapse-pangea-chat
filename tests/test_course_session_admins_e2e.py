@@ -272,3 +272,66 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
             )
             self.assertIsNone(self._membership(room_id, teacher_id, s1))
             self.assertNotIn(room_id, self._review_list(teacher_id, teacher))
+
+    # -- the backfill endpoint ----------------------------------------------
+
+    def _backfill(self, token: str, space_id: str) -> requests.Response:
+        return requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/"
+            "backfill_course_session_admins",
+            headers=self._headers(token),
+            json={"room_id": space_id},
+        )
+
+    async def test_the_backfill_joins_admins_to_existing_sessions(self):
+        space_id, users = await self._course()
+        s1_id, s1 = users["s1"]
+        s2_id, s2 = users["s2"]
+        teacher_id, teacher = users["teacher"]
+        _, operator = await self.new_user("operator", admin=True)
+        # s2 becomes an admin only after these sessions were shared, so the
+        # link joined nobody for s2: they are s2's "older" sessions.
+        old_id = self._create_child(s1, space_id, SESSION_TYPE)
+        self._link(s1, space_id, old_id)
+        self._wait_until(
+            lambda: self._admitted(old_id, teacher_id, teacher, s1),
+            "the teacher joined to the session at its link",
+        )
+        public_id = self._create_room(
+            s1, {"preset": "public_chat", "creation_content": {"type": SESSION_TYPE}}
+        )
+        self._link(s1, space_id, public_id)
+        self._set_power(space_id, s2_id, 100, teacher)
+        # A course member who is not an admin.
+        s3_id, s3 = await self.new_user("s3")
+        self._join(space_id, s3)
+
+        # Only a server admin may run it.
+        self.assertEqual(self._backfill(s1, space_id).status_code, 403)
+
+        response = self._backfill(operator, space_id)
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json()["sessions"], 1)
+        self._wait_handled(
+            f"course_session_admins backfill of {space_id} finished: 1 joins"
+        )
+        self.assertTrue(self._admitted(old_id, s2_id, s2, s1))
+        self.assertIsNone(self._membership(old_id, s3_id, s1))
+        self.assertIsNone(self._membership(public_id, s2_id, s1))
+        self.assertNotIn(public_id, self._review_list(s2_id, s2))
+
+        # A second run finds nothing left to do.
+        response = self._backfill(operator, space_id)
+        self.assertEqual(response.status_code, 202, response.text)
+        self._wait_handled(
+            f"course_session_admins backfill of {space_id} finished: 0 joins"
+        )
+        self.assertTrue(self._admitted(old_id, s2_id, s2, s1))
+
+    async def test_the_backfill_refuses_a_room_that_is_not_a_course(self):
+        space_id, users = await self._course()
+        s1 = users["s1"][1]
+        _, operator = await self.new_user("operator", admin=True)
+        session_id = self._create_child(s1, space_id, SESSION_TYPE)
+        self.assertEqual(self._backfill(operator, session_id).status_code, 400)
+        self.assertEqual(self._backfill(operator, "not-a-room").status_code, 400)

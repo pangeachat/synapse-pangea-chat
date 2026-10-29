@@ -213,3 +213,44 @@ class TestEligibilityIsReadBeforeEveryAttempt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBackfillCourse(unittest.TestCase):
+    def _module(self, join_admins: Any) -> Any:
+        module: Any = object.__new__(CourseSessionAdmins)
+        module.join_admins = AsyncMock(side_effect=join_admins)
+        return module
+
+    def test_counts_joins_and_one_failing_room_does_not_stop_the_rest(self):
+        async def join_admins(space_id: str, session_id: str) -> Any:
+            if session_id == OTHER:
+                raise RuntimeError("boom")
+            return [TEACHER]
+
+        module = self._module(join_admins)
+        rooms = [ROOM, OTHER, "!third:example.com"]
+        self.assertEqual(asyncio.run(module.backfill_course(SPACE, rooms)), 2)
+        self.assertEqual(module.join_admins.await_count, 3)
+
+    def test_a_course_with_nothing_left_to_do_makes_no_joins(self):
+        module = self._module(lambda space_id, session_id: [])
+        self.assertEqual(asyncio.run(module.backfill_course(SPACE, [ROOM])), 0)
+
+
+class TestCourseSessions(unittest.TestCase):
+    def test_only_live_links_to_course_sessions_are_walked(self):
+        linked = {
+            ("m.space.child", ROOM): _ev({"via": ["example.com"]}),
+            ("m.space.child", OTHER): _ev({"via": ["example.com"]}),
+            ("m.space.child", "!gone:example.com"): _ev({}),
+        }
+        module: Any = object.__new__(CourseSessionAdmins)
+        module._api = Mock(get_room_state=AsyncMock(return_value=linked))
+
+        async def refusal(space_id: str, room_id: str) -> Optional[str]:
+            return None if room_id == ROOM else "not an activity session"
+
+        module._not_a_course_session = AsyncMock(side_effect=refusal)
+        self.assertEqual(asyncio.run(module.course_sessions(SPACE)), [ROOM])
+        checked = {c.args[1] for c in module._not_a_course_session.await_args_list}
+        self.assertNotIn("!gone:example.com", checked)
