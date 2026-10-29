@@ -32,11 +32,9 @@ The optional `message` field is included in the email as a personal note from th
 
 ## Joining without the link
 
-When an account's verified email matches a student invitation, the server sends that account a course invite from the teacher, so a student who signed up alone still gets in. Everyone in the course can see the invite, so the teacher and the class learn which account owns the address. Each invitation invites an account only once, so a student who declines or leaves is not invited again. Only invitations from the last 120 days match, because invitations never expire.
+The server matches invitations to students' accounts by their verified email addresses. The check runs when a user signs in, when a user verifies an email address, and when a teacher sends an invitation to an email address that is linked to an account. For each match, the server invites that account to the course, so a student who signed up without the link can still get in. When the student accepts, the dashboard shows them as joined. 
 
-1. The match runs at sign-in, when an email is verified, and when a teacher invites an address that already has an account.
-2. The app shows it like any course invite; the student accepts or declines.
-3. Accepting works exactly as the link does, and the dashboard shows the student as joined.
+Each invitation invites an account only once, so a student who declines or leaves is not invited again. Only invitations sent in the last 120 days match, so an account made long after a class ended is not invited into it.
 
 - **A course invite from the server, not a join.** Reason: it works on every installed version of the app, and accepting runs the app's own join, where analytics sharing and the join notices happen. Re-decided by: Will.
 - **Verified addresses only.** Reason: a mistyped address must not pull someone into a stranger's class. Re-decided by: Will.
