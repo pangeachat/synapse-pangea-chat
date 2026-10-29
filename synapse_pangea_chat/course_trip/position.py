@@ -65,7 +65,7 @@ def _parse_iso_ms(value: Any) -> Optional[int]:
         return None
     try:
         moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+    except ValueError:  # silent-ok: an unparsable computed_at reads as never computed
         return None
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
