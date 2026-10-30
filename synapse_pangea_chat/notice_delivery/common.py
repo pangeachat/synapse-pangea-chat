@@ -60,6 +60,7 @@ CATEGORY_LABELS = {
     "trial_marketing": "trial and discount offers",
     "teacher_setup": "course setup reminders",
     "weekly_class_report": "the weekly class report",
+    "class_messages": "messages from your teacher",
     "missed_message": "missed-message emails",
     "course_invite": "course invitations",
     "campaigns": "product updates",

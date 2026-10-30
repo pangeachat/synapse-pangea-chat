@@ -26,6 +26,7 @@ NUDGE_CATEGORIES: FrozenSet[str] = frozenset(
         "onboarding_nudges",
         "teacher_setup",
         "weekly_class_report",
+        "class_messages",
     }
 )
 MARKETING_CATEGORIES: FrozenSet[str] = frozenset({"trial_marketing", "campaigns"})

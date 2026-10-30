@@ -78,7 +78,12 @@ class TestContentValidation(unittest.TestCase):
         body = request_body("push-only")
         del body["email"]
         self.assertIsNone(NoticeRequest.parse(body).email)
-        for category in ("teacher_setup", "weekly_class_report", "campaigns"):
+        for category in (
+            "teacher_setup",
+            "weekly_class_report",
+            "class_messages",
+            "campaigns",
+        ):
             body["category"] = category
             with self.assertRaisesRegex(ValueError, "email only"):
                 NoticeRequest.parse(body)

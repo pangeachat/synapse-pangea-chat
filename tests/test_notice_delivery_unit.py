@@ -134,6 +134,7 @@ class TestCategories(unittest.TestCase):
         prefs = categories.parse_preferences({"all_off": True})
         self.assertTrue(categories.is_refused(prefs, "activity_nudges"))
         self.assertTrue(categories.is_refused(prefs, "trial_marketing"))
+        self.assertTrue(categories.is_refused(prefs, "class_messages"))
         self.assertFalse(categories.is_refused(prefs, "missed_message"))
         self.assertFalse(categories.is_refused(prefs, "course_invite"))
 
@@ -153,6 +154,12 @@ class TestCategories(unittest.TestCase):
         )
         self.assertTrue(updated_all["all_off"])
         self.assertEqual(updated_all["refused"], ["suggestions"])
+
+    def test_class_messages_is_its_own_deliverable_refusal(self):
+        self.assertIn("class_messages", categories.DELIVERABLE_CATEGORIES)
+        prefs = categories.parse_preferences({"refused": ["class_messages"]})
+        self.assertTrue(categories.is_refused(prefs, "class_messages"))
+        self.assertFalse(categories.is_refused(prefs, "suggestions"))
 
 
 class TestTokens(unittest.TestCase):
