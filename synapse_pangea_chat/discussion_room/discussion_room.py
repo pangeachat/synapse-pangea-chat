@@ -225,6 +225,8 @@ class DiscussionRoom(Resource):
             respond_with_json(
                 request, 200, {"room_id": room_id, "created": created}, send_cors=True
             )
+        # silent-ok: answered 404, a caller asking for an activity that is not
+        # one of this course's discussions
         except DiscussionNotFound:
             respond_with_json(
                 request,
