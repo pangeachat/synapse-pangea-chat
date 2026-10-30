@@ -37,6 +37,10 @@ from synapse.util.async_helpers import timeout_deferred
 from twisted.web.http_headers import Headers
 
 COURSE_MISSIONS_STATE_EVENT_TYPE = "pangea.course_missions"
+# The ship's position on an undated trip, written by the course_trip pass.
+# Defined here beside the copy, not in course_trip, so the public catalog can
+# read both without importing course_trip, which imports the catalog.
+COURSE_POSITION_STATE_EVENT_TYPE = "pangea.course_position"
 
 # The whole read (both CMS requests) is bounded: course creation and a claim
 # wait on it, and a caller that times out and retries a creation would make a

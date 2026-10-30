@@ -1,4 +1,4 @@
-from typing import List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 
 class CourseFilters(TypedDict, total=False):
@@ -19,6 +19,8 @@ class Course(TypedDict):
     target_language: Optional[str]
     topic: Optional[str]
     world_readable: bool
+    course_missions: Optional[Dict[str, Any]]
+    course_position: Optional[Dict[str, Any]]
 
 
 class PublicCoursesResponse(TypedDict):

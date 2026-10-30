@@ -42,6 +42,7 @@ from synapse_pangea_chat.analytics_forward.consent import profile_analytics_room
 from synapse_pangea_chat.course_trip.slicing import TRIP_VERSION
 from synapse_pangea_chat.email_invite.course_missions import (
     COURSE_MISSIONS_STATE_EVENT_TYPE,
+    COURSE_POSITION_STATE_EVENT_TYPE,
 )
 from synapse_pangea_chat.moderation.compat import (
     background_process_args,
@@ -56,7 +57,6 @@ from synapse_pangea_chat.room_code.instructor_access import joined_local_instruc
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.course_trip.position")
 
-COURSE_POSITION_STATE_EVENT_TYPE = "pangea.course_position"
 COURSE_PROGRESS_STATE_EVENT_TYPE = "pangea.course_progress"
 
 

@@ -31,10 +31,7 @@ to Matrix state is what keeps it one rule, applied the same way whether or not a
 filter is passed. Two code paths that each decided eligibility separately are how the
 catalog came to disagree with itself.
 
-The plan id is read from `uuid`, falling back to `course_plan_id`. Everything now
-writes `uuid`; the fallback is for rooms created before that and is what the one-time
-backfill normalises. Only current room state counts, so a room that once had a course
-plan and no longer does is not a course.
+Only current room state counts, so a room that once had a course plan and no longer does is not a course.
 
 The id is a `quest-plans` row id — that is what a course space pins (see the
 cross-repo [quests and learning objectives](../../../.github/.github/instructions/quests-and-learning-objectives.instructions.md)
@@ -67,7 +64,7 @@ A central course is the one Pangea-run course per language for learners who aren
 - **The mark.** A course is central when its current `pangea.course_settings` state event carries `"central": true`. Every course in the response has a `central` field, which is `false` for all other courses.
 - **Only a Pangea admin can make a course central.** The mark counts only when the `pangea.course_settings` event was sent by an account listed in `central_course_admin_user_ids`, which defaults to `@support:<server name>`. Any course admin can write that event in their own course. Without this check, a teacher could mark their course central and receive every learner the client sends there. A mark from anyone else is ignored rather than refused: the event is ordinary course state, and the catalog reports the course as not central.
 - **The catalog doesn't enforce one central course per language.** If two courses in the same language are marked, both are reported as central. Only Pangea admins can set the mark, so a second one is an operations mistake to fix in room state, and the server doesn't guess which course was meant.
-- **Whether a course appears doesn't change.** The mark only adds a field. A central course appears in the catalog by the same rule as every other course: published in the room directory, with a current `pangea.course_plan` that carries a plan id.
+- **Whether a course appears doesn't change.** The mark only adds a field.
 
 ## Pagination
 
@@ -75,6 +72,12 @@ Filtering happens before pagination, so a page is full unless the catalog is
 exhausted, and a non-null `next_batch` means more results genuinely exist. A caller
 that receives a full page and a cursor can keep paging without guessing whether the
 thin page it got means "no more courses" or "kept looking in the wrong place".
+
+A page holds at most 100 courses; a larger `limit` gets 100 and a cursor, because each page reads every listed room's state.
+
+## Trips
+
+Each course carries its [trip](course-trip.instructions.md) as written: `course_missions` and `course_position` are the current content of those state events, or null. Nothing is derived here, so the client places a public course's ship by the same rule as one the learner is in, and that rule has one implementation. The [world view](../../../.github/.github/instructions/world-view.instructions.md) reads them for ships of courses the learner is not in.
 
 ## When the CMS is unavailable
 

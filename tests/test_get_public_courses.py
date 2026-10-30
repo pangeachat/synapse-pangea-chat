@@ -275,6 +275,127 @@ class TestGetPublicCourses(unittest.IsolatedAsyncioTestCase):
         page = await self._get(catalog, limit=0)
         self.assertEqual(len(page["chunk"]), mod.DEFAULT_LIMIT)
 
+    async def test_limit_above_the_cap_is_served_at_the_cap(self) -> None:
+        catalog = FakeCatalog(
+            [(f"!r{i:03d}:test", f"plan-{i}", "es") for i in range(mod.MAX_LIMIT + 5)]
+        )
+        page = await self._get(catalog, limit=10_000)
+        self.assertEqual(len(page["chunk"]), mod.MAX_LIMIT)
+        self.assertEqual(page["next_batch"], page["chunk"][-1]["room_id"])
+
+    async def test_a_capped_page_continues_from_a_legacy_offset(self) -> None:
+        catalog = FakeCatalog(
+            [(f"!r{i:03d}:test", f"plan-{i}", "es") for i in range(mod.MAX_LIMIT + 10)]
+        )
+        page = await self._get(catalog, limit=10_000, since="5")
+        self.assertEqual(len(page["chunk"]), mod.MAX_LIMIT)
+        self.assertEqual(page["chunk"][0]["room_id"], "!r005:test")
+        rest = await self._get(catalog, limit=10_000, since=page["next_batch"])
+        self.assertEqual(len(rest["chunk"]), 5)
+        self.assertIsNone(rest["next_batch"])
+
+    async def _trip(
+        self, events: List[Tuple[str, str, Dict[str, Any]]]
+    ) -> Dict[str, Any]:
+        catalog = FakeCatalog(
+            [("!trip:test", "plan-1", "es")], state={"!trip:test": events}
+        )
+        return (await self._get(catalog))["chunk"][0]
+
+    async def test_a_course_carries_the_public_part_of_its_trip(self) -> None:
+        copy = {
+            "version": 2,
+            "revision": 3,
+            "time_zone": "America/Mexico_City",
+            "start_date": "2026-11-02",
+            "removed_missions": [
+                {"lo_id": "lo9", "activity_ids": ["z"], "shown_count": 1}
+            ],
+            "later_field": "members only",
+            "missions": [
+                {
+                    "lo_id": "lo1",
+                    "activity_ids": ["a1"],
+                    "removed_activity_ids": ["a2"],
+                    "note": "Bring your notebook",
+                    "due_at": "2026-11-09T00:00:00Z",
+                    "city": {"name": "Oaxaca", "lat_e6": 17065400, "lng_e6": -96726600},
+                }
+            ],
+        }
+        position = {"stop": 0, "from_stop": 0, "since": 1, "revision": 3}
+        course = await self._trip(
+            [
+                power_levels({TEACHER: 100}),
+                trip_event("pangea.course_missions", TEACHER, copy),
+                trip_event("pangea.course_position", TEACHER, position),
+            ]
+        )
+        self.assertEqual(
+            course["course_missions"],
+            {
+                "version": 2,
+                "revision": 3,
+                "time_zone": "America/Mexico_City",
+                "start_date": "2026-11-02",
+                "missions": [
+                    {
+                        "lo_id": "lo1",
+                        "activity_ids": ["a1"],
+                        "due_at": "2026-11-09T00:00:00Z",
+                        "city": {
+                            "name": "Oaxaca",
+                            "lat_e6": 17065400,
+                            "lng_e6": -96726600,
+                        },
+                    }
+                ],
+            },
+        )
+        self.assertEqual(course["course_position"], position)
+
+    async def test_a_course_without_a_trip_carries_none(self) -> None:
+        course = await self._trip([power_levels({TEACHER: 100})])
+        self.assertIsNone(course["course_missions"])
+        self.assertIsNone(course["course_position"])
+
+    async def test_a_trip_from_someone_not_a_course_admin_now_is_left_out(
+        self,
+    ) -> None:
+        """The app ignores it in a course the learner is in; so does the catalog."""
+        course = await self._trip(
+            [
+                power_levels({TEACHER: 50}),
+                trip_event("pangea.course_missions", TEACHER, {"version": 2}),
+                trip_event("pangea.course_position", TEACHER, {"stop": 0}),
+            ]
+        )
+        self.assertIsNone(course["course_missions"])
+        self.assertIsNone(course["course_position"])
+
+    async def test_a_creator_of_a_room_with_creator_power_is_a_course_admin(
+        self,
+    ) -> None:
+        course = await self._trip(
+            [
+                (
+                    "m.room.create",
+                    "",
+                    {"sender": TEACHER, "content": {"room_version": "12"}},
+                ),
+                power_levels({}),
+                trip_event("pangea.course_position", TEACHER, {"stop": 0}),
+            ]
+        )
+        self.assertEqual(course["course_position"], {"stop": 0})
+
+    async def test_a_trip_under_another_state_key_is_left_out(self) -> None:
+        stray = trip_event("pangea.course_missions", TEACHER, {"version": 2})
+        course = await self._trip(
+            [power_levels({TEACHER: 100}), (stray[0], "other", stray[2])]
+        )
+        self.assertIsNone(course["course_missions"])
+
     async def test_empty_catalog_returns_no_cursor(self) -> None:
         catalog = FakeCatalog([])
         page = await self._get(catalog)
@@ -335,6 +456,19 @@ if __name__ == "__main__":
 
 
 SUPPORT = "@support:test"
+
+
+TEACHER = "@teacher:test"
+
+
+def power_levels(users: Dict[str, int]) -> Tuple[str, str, Any]:
+    return ("m.room.power_levels", "", {"sender": TEACHER, "content": {"users": users}})
+
+
+def trip_event(
+    event_type: str, sender: str, content: Dict[str, Any]
+) -> Tuple[str, str, Any]:
+    return (event_type, "", {"type": event_type, "sender": sender, "content": content})
 
 
 def course_settings(sender: str, content: Dict[str, Any]) -> Tuple[str, str, Any]:

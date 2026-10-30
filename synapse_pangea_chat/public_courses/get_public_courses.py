@@ -15,6 +15,7 @@ exhausted.
 import json
 import logging
 import time
+from types import SimpleNamespace
 from typing import (
     Any,
     Dict,
@@ -27,15 +28,22 @@ from typing import (
     Tuple,
 )
 
-from synapse.api.constants import HistoryVisibility
+from synapse.api.constants import EventTypes, HistoryVisibility
+from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
 from synapse.storage.databases.main.room import RoomStore
 
 from synapse_pangea_chat.config import PangeaChatConfig
+from synapse_pangea_chat.course_member_emails.members import COURSE_ADMIN_POWER_LEVEL
+from synapse_pangea_chat.email_invite.course_missions import (
+    COURSE_MISSIONS_STATE_EVENT_TYPE,
+    COURSE_POSITION_STATE_EVENT_TYPE,
+)
 from synapse_pangea_chat.public_courses.types import (
     Course,
     CourseFilters,
     PublicCoursesResponse,
 )
+from synapse_pangea_chat.room_code.instructor_access import user_power
 
 EventContent = Dict[str, Any]
 StateKeyMap = Dict[Optional[str], EventContent]
@@ -68,11 +76,16 @@ RESPONSE_STATE_EVENTS: Tuple[str, ...] = (
     "m.room.topic",
     "pangea.course_plan",
     "pangea.course_settings",
+    COURSE_MISSIONS_STATE_EVENT_TYPE,
+    COURSE_POSITION_STATE_EVENT_TYPE,
 )
 
 DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE = "pangea.course_plan"
 
 DEFAULT_LIMIT = 10
+# A larger page is served at this size, with a cursor for the rest: a page
+# reads every listed room's state, so its size is not the caller's to choose.
+MAX_LIMIT = 100
 
 # The plan id is read from these content keys, in this order. Everything writes
 # ``uuid`` now, including create_course_space; ``course_plan_id`` is what older
@@ -113,6 +126,67 @@ def is_central(room_data: RoomStateMap, admins: FrozenSet[str]) -> bool:
         return False
     content = event.get("content")
     return isinstance(content, dict) and content.get(CENTRAL_CONTENT_KEY) is True
+
+
+# The parts of a course's trip any caller of the catalog may read: what places
+# its ship and dates its route. A field is public only once listed here, so a
+# teacher's notes, removed Can-Dos and activities, and any field added to the
+# record later stay with the course's members.
+TRIP_COPY_FIELDS: Tuple[str, ...] = ("version", "revision", "time_zone", "start_date")
+TRIP_MISSION_FIELDS: Tuple[str, ...] = ("lo_id", "activity_ids", "due_at", "city")
+TRIP_POSITION_FIELDS: Tuple[str, ...] = ("stop", "from_stop", "since", "revision")
+
+
+def _sent_by_course_admin(room_data: RoomStateMap, event: Mapping[str, Any]) -> bool:
+    """Whether *event*'s sender is a course admin in the room now: the check
+    the app makes before it reads a course's trip, so a public ship and a
+    joined one come from the same events."""
+    state: Dict[Tuple[str, str], Any] = {}
+    create = room_data.get(EventTypes.Create, {}).get("")
+    if isinstance(create, dict):
+        content = create.get("content") or {}
+        state[(EventTypes.Create, "")] = SimpleNamespace(
+            sender=create.get("sender"),
+            content=content,
+            room_version=KNOWN_ROOM_VERSIONS.get(content.get("room_version", "1")),
+        )
+    power = room_data.get(EventTypes.PowerLevels, {}).get("")
+    if isinstance(power, dict):
+        state[(EventTypes.PowerLevels, "")] = SimpleNamespace(
+            content=power.get("content") or {}
+        )
+    return user_power(state, event.get("sender")) >= COURSE_ADMIN_POWER_LEVEL
+
+
+def _public_trip(
+    room_data: RoomStateMap, event_type: str, fields: Tuple[str, ...]
+) -> Optional[EventContent]:
+    """The listed *fields* of a trip event, read as the app reads it: the
+    empty state key only, and only from a current course admin. Missions keep
+    only their listed fields; anything malformed is passed on as it is, for
+    the app's parser to refuse."""
+    event = room_data.get(event_type, {}).get("")
+    if not isinstance(event, dict) or not _sent_by_course_admin(room_data, event):
+        return None
+    content = event.get("content")
+    if not isinstance(content, dict):
+        return None
+    public = {key: content[key] for key in fields if key in content}
+    missions = content.get("missions")
+    if event_type == COURSE_MISSIONS_STATE_EVENT_TYPE and missions is not None:
+        public["missions"] = (
+            [
+                (
+                    {key: m[key] for key in TRIP_MISSION_FIELDS if key in m}
+                    if isinstance(m, dict)
+                    else m
+                )
+                for m in missions
+            ]
+            if isinstance(missions, list)
+            else missions
+        )
+    return public or None
 
 
 def extract_plan_id(content: Mapping[str, Any]) -> Optional[str]:
@@ -582,6 +656,15 @@ def _build_course(
             "alias"
         )
 
+    # The course's trip, for the client to place its ship by the same rule it
+    # applies to a course it is in; nothing is derived here.
+    course_missions = _public_trip(
+        room_data, COURSE_MISSIONS_STATE_EVENT_TYPE, TRIP_COPY_FIELDS
+    )
+    course_position = _public_trip(
+        room_data, COURSE_POSITION_STATE_EVENT_TYPE, TRIP_POSITION_FIELDS
+    )
+
     history_visibility = stats.get("history_visibility")
     guest_access = stats.get("guest_access")
     join_rules = stats.get("join_rules")
@@ -602,6 +685,8 @@ def _build_course(
         join_rule=join_rules,
         room_type=room_type,
         target_language=entry.l2,
+        course_missions=course_missions,
+        course_position=course_position,
     )
 
 
@@ -628,6 +713,7 @@ async def get_public_courses(
 
     if limit <= 0:
         limit = DEFAULT_LIMIT
+    limit = min(limit, MAX_LIMIT)
 
     cursor = parse_since(since)
 
