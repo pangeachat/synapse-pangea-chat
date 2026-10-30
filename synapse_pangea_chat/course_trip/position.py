@@ -126,21 +126,32 @@ class Position(NamedTuple):
     stop: int
     from_stop: int
     since: int
+    #: The course copy's revision the indexes refer to: a publish that
+    #: reorders or removes Can-Dos makes them name other Missions, so a reader
+    #: ignores a position of another revision and the pass writes a fresh one.
+    revision: int
 
     def content(self) -> Dict[str, Any]:
-        return {"stop": self.stop, "from_stop": self.from_stop, "since": self.since}
+        return {
+            "stop": self.stop,
+            "from_stop": self.from_stop,
+            "since": self.since,
+            "revision": self.revision,
+        }
 
 
 def parse_position(content: Any) -> Optional[Position]:
     if not isinstance(content, Mapping):
         return None
     values: List[int] = []
-    for key in ("stop", "from_stop", "since"):
+    for key in ("stop", "from_stop", "since", "revision"):
         value = content.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return None
         values.append(value)
-    return Position(values[0], values[1], values[2])
+    if values[3] < 1:
+        return None
+    return Position(values[0], values[1], values[2], values[3])
 
 
 def next_position(
@@ -148,16 +159,23 @@ def next_position(
     busiest: int,
     missions: Sequence[Mapping[str, Any]],
     now_ms: int,
+    revision: int,
 ) -> Optional[Position]:
     """The position to write, or None when nothing changes. The ship sails to
     the busiest stop from where it is; a Mission with no city does not move
-    it; the first write has ``from_stop`` equal to ``stop``."""
+    it. The first write, and the first after the copy's revision changed (its
+    indexes may name other Missions now), has ``from_stop`` equal to
+    ``stop``."""
     has_city = 0 <= busiest < len(missions) and bool(missions[busiest].get("city"))
-    if previous is None:
-        return Position(busiest, busiest, now_ms)
+    if (
+        previous is None
+        or previous.revision != revision
+        or not 0 <= previous.stop < len(missions)
+    ):
+        return Position(busiest, busiest, now_ms, revision)
     if busiest == previous.stop or not has_city:
         return None
-    return Position(busiest, previous.stop, now_ms)
+    return Position(busiest, previous.stop, now_ms, revision)
 
 
 class CourseStop(NamedTuple):
@@ -177,6 +195,7 @@ UNCHANGED = "unchanged"
 WRITTEN = "written"
 WOULD_WRITE = "would_write"
 REFUSED = "refused"
+COPY_CHANGED = "copy_changed"
 
 
 class CoursePositionPass:
@@ -324,8 +343,11 @@ class CoursePositionPass:
         previous = (
             parse_position(dict(current_event.content)) if current_event else None
         )
+        revision = copy.get("revision")  # type: ignore[union-attr]
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            return CourseStop(room_id, NOT_AN_UNDATED_TRIP)
         position = next_position(
-            previous, busiest_stop(stops), missions, self._clock.time_msec()
+            previous, busiest_stop(stops), missions, self._clock.time_msec(), revision
         )
         if position is None:
             return CourseStop(room_id, UNCHANGED, previous, len(stops))
@@ -341,6 +363,14 @@ class CoursePositionPass:
         sender = instructors[0]
         if dry_run:
             return CourseStop(room_id, WOULD_WRITE, position, len(stops), sender)
+        # The reads above take a while; a copy published meanwhile has its own
+        # Missions, so this position waits for the next pass.
+        again = await self._api.get_room_state(
+            room_id, [(COURSE_MISSIONS_STATE_EVENT_TYPE, "")]
+        )
+        latest = again.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
+        if latest is None or latest.event_id != copy_event.event_id:  # type: ignore[union-attr]
+            return CourseStop(room_id, COPY_CHANGED, None, len(stops))
         await self._api.create_and_send_event_into_room(
             {
                 "type": COURSE_POSITION_STATE_EVENT_TYPE,

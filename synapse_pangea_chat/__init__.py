@@ -29,6 +29,7 @@ from synapse_pangea_chat.course_default_chats import (
 from synapse_pangea_chat.course_member_emails import CourseMemberEmails
 from synapse_pangea_chat.course_session_admins import CourseSessionAdmins
 from synapse_pangea_chat.course_trip import (
+    AutoSlice,
     CoursePositionPass,
     CoursePositionRun,
     SliceCourse,
@@ -655,10 +656,15 @@ class PangeaChat:
             self.course_session_admins = CourseSessionAdmins(api)
         # --- Course trip (pangeachat/.github#780) ---
         self.city_list = shared_city_list(api, config)
+        self.slice_course = SliceCourse(api, config, self.city_list)
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/slice_course",
-            resource=SliceCourse(api, config, self.city_list),
+            resource=self.slice_course,
         )
+        # A copy an app writes is sliced here, the one slicer outside the
+        # dashboard's publish (course-trip.instructions.md).
+        if config.course_missions_v2_enabled:
+            self.auto_slice = AutoSlice(api, self.slice_course)
         self.course_position = CoursePositionPass(api, config)
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/course_position",

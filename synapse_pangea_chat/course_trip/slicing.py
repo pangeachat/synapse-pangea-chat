@@ -11,6 +11,8 @@ existing copy already runs by dates.
 
 from __future__ import annotations
 
+import logging
+
 from typing import (
     Any,
     Awaitable,
@@ -23,7 +25,14 @@ from typing import (
     Sequence,
 )
 
-from synapse_pangea_chat.course_trip.cities import City, CityIndex, shared_city_list
+from synapse_pangea_chat.course_trip.cities import (
+    City,
+    CityIndex,
+    CityListError,
+    shared_city_list,
+)
+
+logger = logging.getLogger("synapse.module.synapse_pangea_chat.course_trip.slicing")
 
 TRIP_VERSION = 2
 #: A Can-Do with this many pinned activities or more is viable; fewer, thin.
@@ -32,34 +41,6 @@ VIABLE_PINS = 3
 VIABLE = "viable"
 THIN = "thin"
 EMPTY = "empty"
-
-
-def _plan(doc: Mapping[str, Any]) -> Mapping[str, Any]:
-    res = doc.get("res")
-    plan = res.get("plan") if isinstance(res, Mapping) else None
-    return plan if isinstance(plan, Mapping) else {}
-
-
-def _number(value: Any) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
-
-
-def activity_point(doc: Mapping[str, Any]) -> Optional["tuple[float, float]"]:
-    """``(lat, lng)`` from ``res.plan.coordinates`` (``[lng, lat]``), or None
-    for an activity with no usable position. ``[0, 0]`` is the unplaced
-    sentinel, never a place."""
-    coordinates = _plan(doc).get("coordinates")
-    if not isinstance(coordinates, list) or len(coordinates) != 2:
-        return None
-    lng = _number(coordinates[0])
-    lat = _number(coordinates[1])
-    if lat is None or lng is None or not -90 <= lat <= 90 or not -180 <= lng <= 180:
-        return None
-    if lat == 0.0 and lng == 0.0:
-        return None
-    return lat, lng
 
 
 class Slice(NamedTuple):
@@ -115,8 +96,8 @@ def slice_can_do(
 
 
 class TripSlicer:
-    """Builds the version 2 copy from a version 1 copy's content and the
-    library's activity documents."""
+    """Builds the version 2 copy from a course's list and the positions of
+    the activities on it."""
 
     def __init__(self, index: CityIndex) -> None:
         self._index = index
@@ -124,67 +105,43 @@ class TripSlicer:
     def slice_copy(
         self,
         content: Mapping[str, Any],
-        activity_docs: Sequence[Mapping[str, Any]],
+        points: Mapping[str, "tuple[float, float]"],
         existing: Optional[Mapping[str, Any]] = None,
     ) -> "tuple[Dict[str, Any], List[Slice]]":
-        """``content`` (a version 1 copy as the reader builds it: each Can-Do
-        with every library activity) as the trip: each Can-Do sliced, at the
-        existing copy's revision plus one. An existing copy keeps its Can-Do
-        list and order, its notes, due dates, removed lists and start date,
-        and no activity it removed is pinned. Returns the copy and each
-        Can-Do's slice, for the report."""
-        points: Dict[str, "tuple[float, float]"] = {}
-        for doc in activity_docs:
-            activity_id = _plan(doc).get("activity_id")
-            point = activity_point(doc)
-            if isinstance(activity_id, str) and activity_id and point is not None:
-                points[activity_id] = point
-        library_by_lo: Dict[str, List[str]] = {}
-        for entry in content.get("missions") or []:
-            if isinstance(entry, Mapping) and isinstance(entry.get("lo_id"), str):
-                library_by_lo[entry["lo_id"]] = [
-                    a for a in entry.get("activity_ids", []) if isinstance(a, str)
-                ]
-        # An existing copy is the course's own list (content-studio doc, "The
-        # course's own copy"): its Can-Dos in its order, the teacher's added
-        # ones included and removed ones left out, and an activity the teacher
-        # removed is never pinned again. Library additions never reach it.
-        # With no copy (or an empty one) the course lists the quest's Can-Dos.
+        """The trip, at the existing copy's revision plus one, and each
+        Can-Do's slice for the report.
+
+        Slicing narrows a course's own list to one city; it never adds to it.
+        An existing copy is that list (content-studio doc, "The course's own
+        copy"): its Can-Dos in its order, the teacher's added ones included and
+        removed ones left out, each sliced over the activities it lists. An
+        activity the slice leaves out joins the Can-Do's removed activities, so
+        work already done on it keeps counting. With no copy (or an empty one)
+        the course's list is ``content``, the quest's Can-Dos with their library
+        activities. ``points`` holds each activity's ``(lat, lng)``; one it
+        lacks has no known position and is kept wherever the city falls."""
         existing_entries = [
             entry
             for entry in (existing or {}).get("missions") or []
             if isinstance(entry, Mapping) and isinstance(entry.get("lo_id"), str)
         ]
-        order: List[Mapping[str, Any]] = existing_entries or [
-            {"lo_id": lo_id} for lo_id in library_by_lo
+        own_list = bool(existing_entries)
+        entries = existing_entries or [
+            entry
+            for entry in content.get("missions") or []
+            if isinstance(entry, Mapping) and isinstance(entry.get("lo_id"), str)
         ]
         missions: List[Dict[str, Any]] = []
         slices: List[Slice] = []
-        for entry in order:
+        for entry in entries:
             lo_id = entry["lo_id"]
-            previous = entry if existing_entries else None
-            listed = (
-                [a for a in previous.get("activity_ids", []) if isinstance(a, str)]
-                if previous is not None
-                else []
-            )
-            removed = (
-                {
-                    a
-                    for a in previous.get("removed_activity_ids") or []
-                    if isinstance(a, str)
-                }
-                if previous is not None
-                else set()
-            )
-            # The library's activities decide the city; the course's own listed
-            # ones (a teacher's copies among them) stay pinned at it.
-            candidates = [
-                a
-                for a in dict.fromkeys([*library_by_lo.get(lo_id, []), *listed])
-                if a not in removed
+            listed = [a for a in entry.get("activity_ids", []) if isinstance(a, str)]
+            removed = [
+                a for a in entry.get("removed_activity_ids") or [] if isinstance(a, str)
             ]
-            sliced = slice_can_do(lo_id, candidates, points, self._index)
+            sliced = slice_can_do(
+                lo_id, [a for a in listed if a not in removed], points, self._index
+            )
             slices.append(sliced)
             mission: Dict[str, Any] = {
                 "lo_id": lo_id,
@@ -192,10 +149,16 @@ class TripSlicer:
             }
             if sliced.city is not None:
                 mission["city"] = sliced.city.as_mission_city()
-            if previous is not None:
-                for field in ("note", "due_at", "removed_activity_ids"):
-                    if previous.get(field):
-                        mission[field] = previous[field]
+            if own_list:
+                for field in ("note", "due_at"):
+                    if entry.get(field):
+                        mission[field] = entry[field]
+                pinned = set(sliced.activity_ids)
+                kept_credit = list(
+                    dict.fromkeys([*removed, *(a for a in listed if a not in pinned)])
+                )
+                if kept_credit:
+                    mission["removed_activity_ids"] = kept_credit
             missions.append(mission)
         revision = existing.get("revision") if existing is not None else None
         copy: Dict[str, Any] = {
@@ -231,14 +194,21 @@ def report(slices: Sequence[Slice]) -> Dict[str, Any]:
     }
 
 
-def trip_slicer(api: Any, config: Any) -> Optional[Callable[[], Awaitable[TripSlicer]]]:
+def trip_slicer(
+    api: Any, config: Any
+) -> Optional[Callable[[], Awaitable[Optional[TripSlicer]]]]:
     """What a course-copy reader slices new copies with, when
     ``course_missions_v2_enabled``; None leaves it writing version 1."""
     if not getattr(config, "course_missions_v2_enabled", False):
         return None
     cities = shared_city_list(api, config)
 
-    async def make() -> TripSlicer:
-        return TripSlicer(await cities.index())
+    async def make() -> Optional[TripSlicer]:
+        try:
+            return TripSlicer(await cities.index())
+        except CityListError as e:
+            # silent-ok: logged; the caller writes the copy unsliced and the slice pass gives it cities
+            logger.warning("A new course copy is written unsliced: %s", e)
+            return None
 
     return make

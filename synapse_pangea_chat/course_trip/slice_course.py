@@ -25,13 +25,15 @@ from synapse.api.errors import (
 )
 from synapse.http import server
 from synapse.http.server import respond_with_json
+from synapse.events import EventBase
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
+from synapse.util.duration import Duration
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.course_trip.cities import CityListError, CityListReader
-from synapse_pangea_chat.course_trip.slicing import TripSlicer, report
+from synapse_pangea_chat.course_trip.slicing import TRIP_VERSION, TripSlicer, report
 from synapse_pangea_chat.email_invite.course_missions import (
     COURSE_MISSIONS_STATE_EVENT_TYPE,
     CourseMissionsError,
@@ -42,11 +44,29 @@ from synapse_pangea_chat.public_courses.get_public_courses import (
     extract_plan_id,
 )
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
-from synapse_pangea_chat.room_code.instructor_access import joined_local_instructors
+from synapse_pangea_chat.room_code.instructor_access import (
+    joined_local_instructors,
+    user_power,
+)
 
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.course_trip.slice_course"
 )
+
+try:
+    import sentry_sdk  # type: ignore[import-not-found]
+except ImportError:  # silent-ok: Sentry is optional in the module's environments
+    sentry_sdk = None
+
+
+def _capture_exception(e: Exception) -> None:
+    # Background work never reaches Synapse's request-level Sentry capture.
+    if sentry_sdk is not None:
+        sentry_sdk.capture_exception(e)
+
+
+#: The power level a copy's sender must hold for the copy to count.
+INSTRUCTOR_POWER_LEVEL = 100
 
 
 def _content(event: Any) -> Optional[Dict[str, Any]]:
@@ -111,6 +131,7 @@ class SliceCourse(Resource):
             body = await extract_body_json(request)
             room_id = body.get("room_id") if isinstance(body, dict) else None
             dry_run = body.get("dry_run", False) if isinstance(body, dict) else False
+            force = body.get("force", False) if isinstance(body, dict) else False
             if not isinstance(room_id, str) or not room_id.startswith("!"):
                 respond_with_json(
                     request,
@@ -119,15 +140,15 @@ class SliceCourse(Resource):
                     send_cors=True,
                 )
                 return
-            if not isinstance(dry_run, bool):
+            if not isinstance(dry_run, bool) or not isinstance(force, bool):
                 respond_with_json(
                     request,
                     400,
-                    {"error": "'dry_run' must be a boolean"},
+                    {"error": "'dry_run' and 'force' must be booleans"},
                     send_cors=True,
                 )
                 return
-            code, answer = await self.apply(room_id, operator, dry_run)
+            code, answer = await self.apply(room_id, operator, dry_run, force)
             respond_with_json(request, code, answer, send_cors=True)
         except Exception:
             logger.exception("Error slicing a course")
@@ -136,23 +157,57 @@ class SliceCourse(Resource):
             )
 
     async def apply(
-        self, room_id: str, operator: str, dry_run: bool
+        self,
+        room_id: str,
+        operator: str,
+        dry_run: bool,
+        force: bool = False,
+        require_copy: bool = False,
     ) -> Tuple[int, Dict[str, Any]]:
         state = await self._api.get_room_state(room_id)
         plan = _content(state.get((self._plan_type, "")))
         quest_id = extract_plan_id(plan) if plan is not None else None
         if quest_id is None:
             return 404, {"error": "Room has no course plan"}
-        existing = _content(state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
+        copy_event = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
+        # A copy counts only when a course admin sent it, as every reader
+        # counts it; anything else is no copy.
+        existing = (
+            _content(copy_event)
+            if copy_event is not None
+            and user_power(state, copy_event.sender) >= INSTRUCTOR_POWER_LEVEL
+            else None
+        )
         if existing == {}:
             existing = None
+        if require_copy and existing is None:
+            return 409, {"room_id": room_id, "error": "The course has no copy to slice"}
+        if (
+            existing is not None
+            and existing.get("version") == TRIP_VERSION
+            and not force
+        ):
+            # Sliced already, or published as a trip from the dashboard: the
+            # one-time pass never re-slices a teacher's cities.
+            return 409, {
+                "room_id": room_id,
+                "error": "The course copy is already a trip",
+                "already_sliced": True,
+            }
         try:
             index = await self._cities.index()
         except CityListError as e:
             logger.error("slice_course: the city list could not be read: %s", e)
             return 503, {"error": "The city list could not be read"}
+        listed = [
+            activity_id
+            for entry in (existing or {}).get("missions") or []
+            if isinstance(entry, Mapping)
+            for activity_id in entry.get("activity_ids") or []
+            if isinstance(activity_id, str)
+        ]
         try:
-            built, docs = await self._reader.read_with_docs(quest_id)
+            built, points = await self._reader.read_for_slice(quest_id, listed)
         except CourseMissionsError as e:
             logger.error(
                 "slice_course: no copy could be built for %s in %s: %s",
@@ -161,7 +216,7 @@ class SliceCourse(Resource):
                 e,
             )
             return 503, {"error": "The course copy could not be built from the CMS"}
-        copy, slices = TripSlicer(index).slice_copy(built, docs, existing)
+        copy, slices = TripSlicer(index).slice_copy(built, points, existing)
         instructors = joined_local_instructors(self._api, state)
         answer: Dict[str, Any] = {
             "room_id": room_id,
@@ -186,8 +241,10 @@ class SliceCourse(Resource):
             again = await self._api.get_room_state(
                 room_id, [(COURSE_MISSIONS_STATE_EVENT_TYPE, "")]
             )
-            now = _content(again.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
-            if (now or None) != existing:
+            now_event = again.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
+            if (now_event.event_id if now_event is not None else None) != (
+                copy_event.event_id if copy_event is not None else None
+            ):
                 logger.warning(
                     "slice_course: %s changed while its copy was built; refused",
                     room_id,
@@ -218,3 +275,65 @@ class SliceCourse(Resource):
             dry_run,
         )
         return 200, {**answer, "sender": sender, "changed": not dry_run}
+
+
+class AutoSlice:
+    """Slices a course's own copy as soon as an app writes it as version 1,
+    so every course that gets a copy outside the dashboard is sliced by this
+    one server path (course-trip.instructions.md), not by each app. Only on
+    with ``course_missions_v2_enabled``. A copy that is already a trip, or
+    that no course admin sent, is left alone."""
+
+    OPERATOR = "auto:new-copy"
+
+    def __init__(self, api: ModuleApi, slice_course: SliceCourse) -> None:
+        self._api = api
+        self._clock = api._hs.get_clock()
+        self._slice = slice_course
+        api.register_third_party_rules_callbacks(on_new_event=self.on_new_event)
+
+    async def on_new_event(
+        self, event: EventBase, _state: Mapping[Any, EventBase]
+    ) -> None:
+        """Awaited inline for every event on the homeserver, so this decides
+        from the event alone and hands the slice to a background task."""
+        try:
+            content = event.content
+            if (
+                event.type == COURSE_MISSIONS_STATE_EVENT_TYPE
+                and event.is_state()
+                and event.state_key == ""
+                and isinstance(content, Mapping)
+                and content.get("version") == 1
+                and content.get("missions")
+            ):
+                self._clock.call_later(
+                    Duration(milliseconds=0),
+                    self._api.run_as_background_process,
+                    "course_trip_auto_slice",
+                    self.slice,
+                    event.room_id,
+                )
+        except Exception as e:
+            # A failure here must never reject or delay the event itself.
+            logger.exception(
+                "course_trip auto-slice hook failed for %s in %s",
+                event.event_id,
+                event.room_id,
+            )
+            _capture_exception(e)
+
+    async def slice(self, room_id: str) -> None:
+        code, answer = await self._slice.apply(
+            room_id, self.OPERATOR, dry_run=False, require_copy=True
+        )
+        if code == 200:
+            return
+        # Refused (no city list, no local instructor, a newer copy): the course
+        # keeps its unsliced copy and the one-time pass can slice it later.
+        logger.warning(
+            "course_trip auto-slice of %s refused (%s): %s",
+            room_id,
+            code,
+            answer.get("error"),
+        )

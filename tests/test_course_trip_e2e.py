@@ -8,11 +8,12 @@ activities (with positions) and the city list.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import requests
 
@@ -46,6 +47,27 @@ class _TripCmsHandler(BaseHTTPRequestHandler):
                         {"learning_objective": "lo-c"},
                     ]
                 },
+            }
+        elif path == "/api/activities-v2" and "activity_id][in]" in unquote(self.path):
+            # By id: a teacher's own copy the library listing never returns,
+            # set in Madrid.
+            asked = (
+                parse_qs(urlparse(self.path).query)
+                .get("where[res.plan.activity_id][in]", [""])[0]
+                .split(",")
+            )
+            code, body = 200, {
+                "docs": [
+                    {
+                        "id": "row-t1",
+                        "res": {
+                            "plan": {"activity_id": "t1", "coordinates": [-3.70, 40.42]}
+                        },
+                    }
+                ]
+                if "t1" in asked
+                else [],
+                "hasNextPage": False,
             }
         elif path == "/api/activities-v2":
 
@@ -190,7 +212,12 @@ class TestCourseTripEndpoints(BaseSynapseE2ETest):
             "revision": 2,
             "time_zone": "America/Mexico_City",
             "missions": [
-                {"lo_id": "lo-a", "activity_ids": ["a1", "a4"], "note": "Week 1"},
+                # Three in Mexico City outvote one in Madrid.
+                {
+                    "lo_id": "lo-a",
+                    "activity_ids": ["a1", "a2", "a3", "a4", "t1"],
+                    "note": "Week 1",
+                },
                 {
                     "lo_id": "lo-b",
                     "activity_ids": ["b1"],
@@ -268,6 +295,9 @@ class TestCourseTripEndpoints(BaseSynapseE2ETest):
                             "lng_e6": -99132900,
                         },
                         "note": "Week 1",
+                        # Madrid's activities leave the pins, keeping their
+                        # credit: the teacher's own "t1" is placed there by id.
+                        "removed_activity_ids": ["a4", "t1"],
                     },
                     {
                         "lo_id": "lo-b",
@@ -286,6 +316,17 @@ class TestCourseTripEndpoints(BaseSynapseE2ETest):
         # Nobody joined and nobody's power changed.
         state = self._state(admin_token, space)
         self.assertNotIn(("m.room.member", operator_id), state)
+
+        # The pass is one-time: a trip is never sliced again unless forced.
+        resp = self._post("slice_course", {"room_id": space}, admin_token)
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertTrue(resp.json()["already_sliced"])
+        resp = self._post(
+            "slice_course",
+            {"room_id": space, "dry_run": True, "force": True},
+            admin_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
 
         # A space with no local instructor is refused and reported.
         (student_id, student_token) = await self.new_user("student")
@@ -443,7 +484,8 @@ class TestCourseTripEndpoints(BaseSynapseE2ETest):
         self.assertEqual((after["stop"], after["from_stop"]), (1, 0))
         self.assertGreater(after["since"], 0)
         # The space holds the stop and nothing about who is where.
-        self.assertEqual(set(after), {"stop", "from_stop", "since"})
+        self.assertEqual(set(after), {"stop", "from_stop", "since", "revision"})
+        self.assertEqual(after["revision"], 1)
         # Unchanged on the next pass.
         resp = self._post("course_position", {"room_id": space}, admin_token)
         self.assertEqual(resp.json()["outcome"], "unchanged")
@@ -467,3 +509,71 @@ class TestCourseTripEndpoints(BaseSynapseE2ETest):
         resp = self._post("course_position", {"room_id": dated}, admin_token)
         self.assertEqual(resp.json()["outcome"], "not_an_undated_trip")
         self.assertNotIn((_POSITION, ""), self._state(admin_token, dated))
+
+
+class TestCourseTripAutoSlice(TestCourseTripEndpoints):
+    """With version 2 on, a copy an app writes as version 1 is sliced by the
+    server: the one slicer outside the dashboard's publish."""
+
+    async def _server(self) -> None:
+        port = self._cms.server_address[1]
+        await self.homeserver(
+            module_config={
+                "cms_base_url": f"http://127.0.0.1:{port}",
+                "cms_service_api_key": _KEY,
+                "course_missions_v2_enabled": True,
+            }
+        )
+
+    # The parent class's tests run under the parent's configuration only.
+    test_slicing_an_existing_course_pins_each_can_do_in_its_city = None  # type: ignore[assignment]
+    test_the_ship_sits_at_the_busiest_stop_of_an_undated_course = None  # type: ignore[assignment]
+
+    async def test_a_copy_an_app_writes_is_sliced_into_cities(self) -> None:
+        await self._server()
+        (_, admin_token) = await self.new_user("op", admin=True)
+        (teacher_id, teacher_token) = await self.new_user("teacher")
+        space = self._create_space(
+            teacher_token,
+            [
+                {
+                    "type": _COURSE_PLAN,
+                    "state_key": "",
+                    "content": {"uuid": "quest-1", "l2": "es"},
+                }
+            ],
+        )
+        # What the app writes at course creation: its own list, unsliced.
+        self._put_state(
+            teacher_token,
+            space,
+            _COURSE_COPY,
+            "",
+            {
+                "version": 1,
+                "revision": 1,
+                "missions": [
+                    {"lo_id": "lo-a", "activity_ids": ["a1", "a2", "a3", "a4"]},
+                    {"lo_id": "lo-b", "activity_ids": ["b1"]},
+                ],
+            },
+        )
+        copy: Dict[str, Any] = {}
+        for _ in range(50):
+            copy = self._state(admin_token, space)[(_COURSE_COPY, "")]
+            if copy["content"].get("version") == 2:
+                break
+            await asyncio.sleep(0.1)
+        self.assertEqual(copy["content"]["version"], 2, copy)
+        self.assertEqual(copy["sender"], teacher_id)
+        self.assertEqual(copy["content"]["revision"], 2)
+        lo_a = copy["content"]["missions"][0]
+        self.assertEqual(lo_a["activity_ids"], ["a1", "a2", "a3"])
+        self.assertEqual(lo_a["city"]["name"], "Mexico City")
+        self.assertEqual(lo_a["removed_activity_ids"], ["a4"])
+        # The trip is never sliced again by the hook.
+        await asyncio.sleep(0.5)
+        self.assertEqual(
+            self._state(admin_token, space)[(_COURSE_COPY, "")]["content"]["revision"],
+            2,
+        )

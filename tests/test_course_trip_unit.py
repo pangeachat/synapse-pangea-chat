@@ -23,6 +23,7 @@ from synapse_pangea_chat.course_trip.position import (
     next_position,
     parse_position,
 )
+from synapse_pangea_chat.email_invite.course_missions import activity_points
 from synapse_pangea_chat.course_trip.slicing import (
     EMPTY,
     THIN,
@@ -140,20 +141,23 @@ class TestSlice(unittest.TestCase):
             "version": 1,
             "revision": 1,
             "missions": [
-                {"lo_id": "lo1", "activity_ids": ["s1", "m1", "m2", "m3"]},
+                {"lo_id": "lo1", "activity_ids": ["s1", "m1", "m2", "m3", "m4"]},
                 {"lo_id": "lo2", "activity_ids": ["far"]},
                 {"lo_id": "lo3", "activity_ids": ["m1"]},
                 {"lo_id": "lo4", "activity_ids": ["m2"]},
             ],
         }
-        docs = [
-            _doc("m1", 19.35, -99.16),
-            _doc("m2", 19.50, -99.10),
-            _doc("m3", 19.40, -99.20),
-            _doc("s1", 40.42, -3.70),
-            _doc("far", 0.5, 0.5),
-            _doc("none", None, None),
-        ]
+        points = activity_points(
+            [
+                _doc("m1", 19.35, -99.16),
+                _doc("m2", 19.50, -99.10),
+                _doc("m3", 19.40, -99.20),
+                _doc("m4", 19.45, -99.15),
+                _doc("s1", 40.42, -3.70),
+                _doc("far", 0.5, 0.5),
+                _doc("none", None, None),
+            ]
+        )
         existing = {
             "version": 1,
             "revision": 4,
@@ -162,11 +166,13 @@ class TestSlice(unittest.TestCase):
                 # The teacher put lo2 first, removed lo3, and never had lo4
                 # (a library addition since the copy was made).
                 {"lo_id": "lo2", "activity_ids": ["far"]},
-                # The teacher's own copy "own1" stays pinned (no position
-                # known); "m2" was removed and is never pinned again.
+                # Madrid's "s1" is outvoted and leaves the pins but keeps its
+                # credit; "m2" was removed and stays removed; the library's
+                # "m4" never joins; the teacher's own "own1" (no position
+                # known) stays pinned.
                 {
                     "lo_id": "lo1",
-                    "activity_ids": ["m1", "own1"],
+                    "activity_ids": ["s1", "m1", "m3", "own1"],
                     "note": "Week 1",
                     "due_at": "2026-11-09T05:59:00Z",
                     "removed_activity_ids": ["m2"],
@@ -178,7 +184,7 @@ class TestSlice(unittest.TestCase):
                 {"lo_id": "lo3", "activity_ids": ["m1"], "shown_count": 1}
             ],
         }
-        copy, slices = TripSlicer(CITIES).slice_copy(built, docs, existing)
+        copy, slices = TripSlicer(CITIES).slice_copy(built, points, existing)
         self.assertEqual(copy["version"], 2)
         self.assertEqual(copy["revision"], 5)
         self.assertEqual(copy["time_zone"], "America/Mexico_City")
@@ -200,7 +206,7 @@ class TestSlice(unittest.TestCase):
                 },
                 "note": "Week 1",
                 "due_at": "2026-11-09T05:59:00Z",
-                "removed_activity_ids": ["m2"],
+                "removed_activity_ids": ["m2", "s1"],
             },
         )
         self.assertEqual(
@@ -217,16 +223,30 @@ class TestSlice(unittest.TestCase):
             "version": 1,
             "revision": 1,
             "missions": [
-                {"lo_id": "lo1", "activity_ids": ["m1"]},
+                {"lo_id": "lo1", "activity_ids": ["m1", "s1", "m2"]},
                 {"lo_id": "lo2", "activity_ids": []},
             ],
         }
+        points = activity_points(
+            [
+                _doc("m1", 19.35, -99.16),
+                _doc("m2", 19.50, -99.10),
+                _doc("s1", 40.42, -3.70),
+            ]
+        )
         for existing in (None, {"version": 1, "revision": 2, "missions": []}):
-            copy, _ = TripSlicer(CITIES).slice_copy(
-                built, [_doc("m1", 19.35, -99.16)], existing
-            )
+            copy, _ = TripSlicer(CITIES).slice_copy(built, points, existing)
             self.assertEqual([m["lo_id"] for m in copy["missions"]], ["lo1", "lo2"])
-            self.assertEqual(copy["missions"][0]["activity_ids"], ["m1"])
+            # The library has no credit to keep: the other city's activity is
+            # simply not pinned.
+            self.assertEqual(
+                copy["missions"][0],
+                {
+                    "lo_id": "lo1",
+                    "activity_ids": ["m1", "m2"],
+                    "city": MEXICO_CITY.as_mission_city(),
+                },
+            )
 
     def test_a_dated_copy_keeps_its_start_date(self) -> None:
         built = {
@@ -240,7 +260,7 @@ class TestSlice(unittest.TestCase):
             "start_date": "2026-11-02",
             "missions": [],
         }
-        copy, _ = TripSlicer(CITIES).slice_copy(built, [], existing)
+        copy, _ = TripSlicer(CITIES).slice_copy(built, {}, existing)
         self.assertEqual(copy["start_date"], "2026-11-02")
         self.assertEqual(copy["revision"], 3)
 
@@ -250,7 +270,7 @@ class TestSlice(unittest.TestCase):
             "revision": 1,
             "missions": [{"lo_id": "lo1", "activity_ids": []}],
         }
-        copy, _ = TripSlicer(CITIES).slice_copy(built, [], None)
+        copy, _ = TripSlicer(CITIES).slice_copy(built, {}, None)
         self.assertEqual(copy["revision"], 1)
 
 
@@ -312,21 +332,35 @@ class TestPosition(unittest.TestCase):
     def test_the_ship_sails_from_where_it_is_and_a_mission_with_no_city_does_not_move_it(
         self,
     ) -> None:
-        first = next_position(None, 2, MISSIONS, NOW)
-        self.assertEqual(first, Position(2, 2, NOW))
-        self.assertIsNone(next_position(first, 2, MISSIONS, NOW + 1))
+        first = next_position(None, 2, MISSIONS, NOW, 3)
+        self.assertEqual(first, Position(2, 2, NOW, 3))
+        self.assertIsNone(next_position(first, 2, MISSIONS, NOW + 1, 3))
         self.assertEqual(
-            next_position(first, 0, MISSIONS, NOW + 1), Position(0, 2, NOW + 1)
+            next_position(first, 0, MISSIONS, NOW + 1, 3), Position(0, 2, NOW + 1, 3)
         )
         # lo2 has no city: the ship stays.
-        self.assertIsNone(next_position(first, 1, MISSIONS, NOW + 1))
+        self.assertIsNone(next_position(first, 1, MISSIONS, NOW + 1, 3))
 
-    def test_a_position_is_three_non_negative_integers(self) -> None:
+    def test_a_new_copy_revision_writes_a_fresh_position(self) -> None:
+        # The same index under another revision may name another Mission, so
+        # the ship is placed afresh rather than left at a stale index.
+        at_two = Position(2, 0, NOW, 3)
         self.assertEqual(
-            parse_position({"stop": 1, "from_stop": 0, "since": 5}), Position(1, 0, 5)
+            next_position(at_two, 2, MISSIONS, NOW + 1, 4), Position(2, 2, NOW + 1, 4)
         )
-        self.assertIsNone(parse_position({"stop": "1", "from_stop": 0, "since": 5}))
-        self.assertIsNone(parse_position({"stop": -1, "from_stop": 0, "since": 5}))
+        # A stop the copy no longer has is placed afresh too.
+        beyond = Position(9, 2, NOW, 3)
+        self.assertEqual(
+            next_position(beyond, 0, MISSIONS, NOW + 1, 3), Position(0, 0, NOW + 1, 3)
+        )
+
+    def test_a_position_is_four_non_negative_integers(self) -> None:
+        good = {"stop": 1, "from_stop": 0, "since": 5, "revision": 2}
+        self.assertEqual(parse_position(good), Position(1, 0, 5, 2))
+        self.assertIsNone(parse_position({**good, "stop": "1"}))
+        self.assertIsNone(parse_position({**good, "stop": -1}))
+        self.assertIsNone(parse_position({**good, "revision": 0}))
+        self.assertIsNone(parse_position({"stop": 1, "from_stop": 0, "since": 5}))
         self.assertIsNone(parse_position("x"))
 
     def test_only_an_undated_trip_gets_a_position(self) -> None:

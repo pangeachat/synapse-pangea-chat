@@ -152,9 +152,9 @@ class CityListError(RuntimeError):
 
 class CityListReader:
     """The ``cities`` collection, read whole with the module's service key and
-    kept for ``cache_ttl_seconds``. A read that fails raises
-    :class:`CityListError`; a caller that needs the list refuses rather than
-    name nothing."""
+    kept for ``cache_ttl_seconds``. A read that fails, stops short or finds no
+    city raises :class:`CityListError`; a caller that needs the list refuses
+    rather than name nothing."""
 
     def __init__(
         self,
@@ -206,9 +206,14 @@ class CityListReader:
             rows.extend(docs)
             if found.get("hasNextPage") is not True:
                 break
+        else:
+            # Part of the list would name some points by the wrong city.
+            raise CityListError(f"cities read did not finish within {MAX_PAGES} pages")
         index = CityIndex.from_rows(rows)
         if len(index) == 0:
-            logger.warning("The city list is empty: no Can-Do can be given a city")
+            # An empty list would write trips with no cities that the one-time
+            # pass then never revisits: the same as an unreadable list.
+            raise CityListError("the city list is empty")
         self._cached, self._cached_at_ms = index, now
         return index
 

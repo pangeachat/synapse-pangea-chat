@@ -16,10 +16,11 @@ from synapse_pangea_chat.course_trip.position import (
     CoursePositionPass,
     CoursePositionRun,
 )
-from synapse_pangea_chat.course_trip.slice_course import SliceCourse
+from synapse_pangea_chat.course_trip.slice_course import AutoSlice, SliceCourse
 from synapse_pangea_chat.course_trip.slicing import TripSlicer, trip_slicer
 
 __all__ = [
+    "AutoSlice",
     "COURSE_POSITION_STATE_EVENT_TYPE",
     "CityIndex",
     "CityListReader",
