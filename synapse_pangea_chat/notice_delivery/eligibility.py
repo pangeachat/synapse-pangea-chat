@@ -330,13 +330,19 @@ class NoticeEligibility:
             return "recipient_left"
         if membership.get(bot_user_id) != "join":
             return "bot_not_in_session"
-        taken = sum(
-            1
+        # A role or an invite holds a seat; a member who joined without a role,
+        # such as a course admin course_session_admins joined to read along,
+        # holds none (pangea-bot's held_seat_count).
+        present = {
+            member
             for member, value in membership.items()
             if value in {"join", "invite"}
             and member != bot_user_id
             and not is_probable_bot_user_id(member)
-        )
+        }
+        invited = {member for member in present if membership[member] == "invite"}
+        holders = {role.get("user_id", role.get("userId")) for role in roles.values()}
+        taken = len((holders & present) | invited)
         open_seats = await self._capacity(content("pangea.activity_plan")) - taken
         if open_seats < 1:
             return "session_full"
