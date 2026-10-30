@@ -1308,6 +1308,24 @@ class PangeaChat:
         if not isinstance(course_session_admins_enabled, bool):
             raise ValueError('Config "course_session_admins_enabled" must be a boolean')
 
+        # --- course_trip config (pangeachat/.github#780) ---
+        course_trip_flags: Dict[str, bool] = {}
+        for key in ("course_missions_v2_enabled", "course_position_enabled"):
+            value = config.get(key, False)
+            if not isinstance(value, bool):
+                raise ValueError(f'Config "{key}" must be a boolean')
+            course_trip_flags[key] = value
+        course_trip_seconds: Dict[str, int] = {}
+        for key, default in (
+            ("course_position_interval_seconds", 900),
+            ("course_position_active_window_seconds", 7 * 86400),
+            ("course_trip_cities_cache_ttl_seconds", 3600),
+        ):
+            value = config.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f'Config "{key}" must be a positive integer')
+            course_trip_seconds[key] = value
+
         # --- delayed_push config ---
         delayed_push = config.get("delayed_push", {})
         if delayed_push is None:
@@ -1683,6 +1701,8 @@ class PangeaChat:
             blocked_join_gate_enabled=blocked_join_gate_enabled,
             course_default_chats_enabled=course_default_chats_enabled,
             course_session_admins_enabled=course_session_admins_enabled,
+            **course_trip_flags,
+            **course_trip_seconds,
             moderation_tier1_enabled=moderation_tier1_enabled,
             moderation_tier1_phone_regions=moderation_tier1_phone_regions,
             moderation_tier2_enabled=moderation_tier2_enabled,
