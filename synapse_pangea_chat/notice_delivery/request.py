@@ -18,7 +18,9 @@ from synapse_pangea_chat.notice_delivery.common import (
 )
 from synapse_pangea_chat.notice_delivery.eligibility import validate_eligibility
 
-EMAIL_ONLY = frozenset({"teacher_setup", "weekly_class_report", "campaigns"})
+EMAIL_ONLY = frozenset(
+    {"teacher_setup", "weekly_class_report", "class_messages", "campaigns"}
+)
 METHODS = frozenset({"use-available", "email-only", "push-only", "in-app-only"})
 LINK_SLOTS = ("{{cta_url}}", "{{unsubscribe_url}}")
 SECONDARY_SLOT = "{{cta2_url}}"
