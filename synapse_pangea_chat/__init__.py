@@ -52,6 +52,9 @@ from synapse_pangea_chat.email_invite.instructor_invitations import (
 )
 from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
 from synapse_pangea_chat.email_invite.student_invitation_api import StudentInvitationAPI
+from synapse_pangea_chat.email_invite.student_invitation_match import (
+    StudentInvitationMatch,
+)
 from synapse_pangea_chat.email_policy import EmailPolicy
 from synapse_pangea_chat.export_user_data import ExportUserData
 from synapse_pangea_chat.find_user_by_email import FindUserByEmail
@@ -396,12 +399,17 @@ class PangeaChat:
             api, config, base=StudentInvitationAPI(api, course_claim_store)
         )
 
-        # Registers its own sign-in and verified-address callbacks.
+        # Each registers its own sign-in and verified-address callbacks.
         self.claim_by_email = ClaimByEmail(
             api,
             course_claim_store.invitations,
             provisioner,
             student_claims=self.student_invitations.claims,
+        )
+        self.student_invitation_match = StudentInvitationMatch(
+            api,
+            course_claim_store.students,
+            blocked_join_gate_enabled=config.blocked_join_gate_enabled,
         )
         # Set Course Plan's room rewrite, shared with the invitation-side
         # replacement of a claimed course (registered under its own path below).
@@ -474,7 +482,9 @@ class PangeaChat:
         )
 
         # --- Invite By Email ---
-        self.invite_by_email_resource = InviteByEmail(api, config, course_claim_store)
+        self.invite_by_email_resource = InviteByEmail(
+            api, config, course_claim_store, self.student_invitation_match
+        )
         api.register_web_resource(
             path="/_synapse/client/pangea/v1/invite_by_email",
             resource=self.invite_by_email_resource,
