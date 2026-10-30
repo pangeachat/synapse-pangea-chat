@@ -9,13 +9,15 @@ Unified configuration combining all previously separate synapse module configs:
 - limit_user_directory (from synapse-limit-user-directory)
 """
 
-from typing import List, Mapping, Optional
+from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple
 
 import attr
 
 from synapse_pangea_chat.analytics_forward.config import AnalyticsForwardConfig
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 
+if TYPE_CHECKING:
+    from synapse_pangea_chat.lti.keys import LtiSettings
 #: Hosts a notice's external destination may point at. A notice link is a
 #: signed redirect, so an unlisted host would turn our mail into an open
 #: redirect; the list is the booking page and the teacher dashboards.
@@ -165,10 +167,18 @@ class PangeaChatConfig:
     safety_incidents_requests_per_burst: int = 60
     safety_incidents_burst_duration_seconds: int = 60
 
+    # --- student_invitations config ---
+    # Per-route (requests per burst, burst seconds), keyed by route name; see
+    # student_invitations/rate_limits.py for the routes and their defaults.
+    student_invitation_rate_limits: Mapping[str, Tuple[int, int]] = attr.Factory(dict)
+
     # --- invite_by_email config ---
     invite_by_email_requests_per_burst: int = 5
     invite_by_email_burst_duration_seconds: int = 60
     app_base_url: str = "https://app.pangea.chat"
+    # admin-dash, where an instructor's Canvas launch completes the course
+    # connect (`<admin_dash_base_url>/canvas-connect`).
+    admin_dash_base_url: str = "https://admin.pangea.chat"
 
     # --- send_push config ---
     send_push_requests_per_burst: int = 10
@@ -360,3 +370,11 @@ class PangeaChatConfig:
     moderation_tier2_drain_timeout_seconds: float = 10.0
     # How often the supervisor looks for a worker that died.
     moderation_tier2_supervisor_interval_seconds: float = 30.0
+
+    # --- lti (LTI 1.3 tool core) ---
+    # Built from the module config's `lti` block, whose private key Ansible
+    # fills from Secrets Manager. None when the block is absent or unusable:
+    # then the LTI endpoints are not registered, and `lti_config_error` says
+    # why (never the key itself).
+    lti: Optional["LtiSettings"] = None
+    lti_config_error: Optional[str] = None

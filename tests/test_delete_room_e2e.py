@@ -405,3 +405,55 @@ class TestE2E(BaseSynapseE2ETest):
             child_room_ids_after,
             "Room should no longer be a child of the space after deletion",
         )
+
+    async def test_server_admin_delete_unlinks_from_a_space_it_is_not_in(self):
+        await self.homeserver()
+
+        teacher_id, teacher_token = await self.new_user("spaceteacher")
+        creator_id, creator_token = await self.new_user("sessioncreator")
+        bot_id, bot_token = await self.new_user("bot", admin=True)
+
+        # A course the bot never joined, and a session the creator launched
+        space_id = await self.create_space(teacher_token, "Course")
+        self.assertTrue(
+            await self.invite_user_to_room(space_id, creator_id, teacher_token)
+        )
+        self.assertTrue(await self.accept_room_invitation(space_id, creator_token))
+        room_id = await self.create_private_room(creator_token)
+        self.assertTrue(await self.add_child_to_space(space_id, room_id, teacher_token))
+        self.assertTrue(await self.add_parent_to_room(room_id, space_id, creator_token))
+
+        # The bot is in the session; its creator leaves it
+        self.assertTrue(await self.invite_user_to_room(room_id, bot_id, creator_token))
+        self.assertTrue(await self.accept_room_invitation(room_id, bot_token))
+        self.assertTrue(
+            await self.set_member_power_level(room_id, bot_id, 50, creator_token)
+        )
+        resp = requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/leave",
+            json={},
+            headers={"Authorization": f"Bearer {creator_token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/delete_room",
+            json={"room_id": room_id},
+            headers={"Authorization": f"Bearer {bot_token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+
+        # The course's top member, not the bot, removed the link
+        resp = requests.get(
+            f"{self.server_url}/_matrix/client/v3/rooms/{space_id}/state",
+            headers={"Authorization": f"Bearer {teacher_token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        links = [
+            event
+            for event in resp.json()
+            if event["type"] == "m.space.child" and event["state_key"] == room_id
+        ]
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]["content"], {})
+        self.assertEqual(links[0]["sender"], teacher_id)

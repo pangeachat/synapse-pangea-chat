@@ -23,9 +23,9 @@ from synapse.api.errors import (
     InvalidClientTokenError,
     MissingClientTokenError,
 )
+from synapse.events import EventBase
 from synapse.http import server
 from synapse.http.server import respond_with_json
-from synapse.events import EventBase
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import run_in_background
 from synapse.module_api import ModuleApi
