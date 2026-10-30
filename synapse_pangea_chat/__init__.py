@@ -37,6 +37,7 @@ from synapse_pangea_chat.delete_room import DeleteRoom
 from synapse_pangea_chat.delete_user import DeleteUser
 from synapse_pangea_chat.direct_message import EnsureDirectMessage
 from synapse_pangea_chat.direct_push import DirectPush
+from synapse_pangea_chat.discussion_room import DiscussionRoom
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
 from synapse_pangea_chat.email_invite.claim_by_email import ClaimByEmail
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
@@ -355,6 +356,15 @@ class PangeaChat:
         # Register reactive cache invalidation callback for room preview
         self._api.register_third_party_rules_callbacks(
             on_new_event=self._on_new_event_room_preview,
+        )
+
+        # --- Discussion rooms ---
+        # Join or create a room for one of a course's discussions, the seat
+        # written by the server (org discussions.instructions.md).
+        self.discussion_room_resource = DiscussionRoom(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/discussion_room",
+            resource=self.discussion_room_resource,
         )
 
         # --- Activity Session Previews ---
@@ -868,6 +878,15 @@ class PangeaChat:
         )
         room_preview_requests_per_burst = config.get(
             "room_preview_requests_per_burst", 10
+        )
+
+        # --- discussion_room config ---
+        discussion_room_capacity = config.get("discussion_room_capacity", 12)
+        discussion_room_requests_per_burst = config.get(
+            "discussion_room_requests_per_burst", 10
+        )
+        discussion_room_burst_duration_seconds = config.get(
+            "discussion_room_burst_duration_seconds", 60
         )
 
         # --- room_code config ---
@@ -1626,6 +1645,9 @@ class PangeaChat:
             room_preview_state_event_types=all_event_types,
             room_preview_burst_duration_seconds=room_preview_burst_duration_seconds,
             room_preview_requests_per_burst=room_preview_requests_per_burst,
+            discussion_room_capacity=discussion_room_capacity,
+            discussion_room_requests_per_burst=discussion_room_requests_per_burst,
+            discussion_room_burst_duration_seconds=discussion_room_burst_duration_seconds,
             knock_with_code_requests_per_burst=knock_with_code_requests_per_burst,
             knock_with_code_burst_duration_seconds=knock_with_code_burst_duration_seconds,
             preview_with_code_requests_per_burst=preview_with_code_requests_per_burst,

@@ -100,6 +100,11 @@ class PangeaChatConfig:
     cms_base_url: str = ""
     cms_service_api_key: str = ""
 
+    # --- discussion_room config ---
+    discussion_room_capacity: int = 12
+    discussion_room_requests_per_burst: int = 10
+    discussion_room_burst_duration_seconds: int = 60
+
     # --- limit_user_directory config ---
     limit_user_directory_public_attribute_search_path: Optional[str] = None
     limit_user_directory_whitelist_requester_id_patterns: List[str] = attr.Factory(list)
