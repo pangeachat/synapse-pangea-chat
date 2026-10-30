@@ -66,6 +66,9 @@ def notice_request(
         "notice_content": {
             "msgtype": "m.notice",
             "body": BODY,
+            # pangea-bot reads every notice in its DM as a check-in and rejects
+            # one without notice_type.
+            "notice_type": "check_in",
             "check_in_type": VARIANT,
             **routing,
         },

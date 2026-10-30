@@ -67,6 +67,14 @@ class TestOpenSessionNotice(unittest.IsolatedAsyncioTestCase):
         due = datetime.fromisoformat(body["scheduled_at"]).timestamp() * 1000
         self.assertEqual(due, CREATED_MS + NOTICE_DELAY_MS)
 
+    async def test_the_dm_notice_is_a_check_in_the_bot_can_read(self):
+        notice, handler = self.notice()
+        await notice.on_new_event(plan_event(), {})
+        content = handler.schedule.enqueue.await_args.args[0]["notice_content"]
+        self.assertEqual(
+            (content["notice_type"], content["check_in_type"]), ("check_in", VARIANT)
+        )
+
     async def test_the_same_session_builds_the_same_request(self):
         # A second trigger must be a schedule duplicate, not a conflict.
         notice, handler = self.notice()

@@ -12,7 +12,6 @@ existing copy already runs by dates.
 from __future__ import annotations
 
 import logging
-
 from typing import (
     Any,
     Awaitable,
@@ -175,12 +174,14 @@ class TripSlicer:
 
 
 def report(slices: Sequence[Slice]) -> Dict[str, Any]:
-    """The generation backlog: each Can-Do's city, pins and status, and the
-    totals (viable at three pinned or more, thin at one or two, empty)."""
+    """The generation backlog: each Can-Do's city (by name, and by its CMS key,
+    since names repeat), pins and status, and the totals (viable at three
+    pinned or more, thin at one or two, empty)."""
     rows = [
         {
             "lo_id": s.lo_id,
             "city": s.city.name if s.city is not None else None,
+            "city_key": s.city.key if s.city is not None else None,
             "pinned": len(s.activity_ids),
             "status": s.status,
         }

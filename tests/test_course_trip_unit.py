@@ -23,7 +23,6 @@ from synapse_pangea_chat.course_trip.position import (
     next_position,
     parse_position,
 )
-from synapse_pangea_chat.email_invite.course_missions import activity_points
 from synapse_pangea_chat.course_trip.slicing import (
     EMPTY,
     THIN,
@@ -32,6 +31,7 @@ from synapse_pangea_chat.course_trip.slicing import (
     report,
     slice_can_do,
 )
+from synapse_pangea_chat.email_invite.course_missions import activity_points
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MEXICO_CITY = city("mx", "Mexico City", "Mexico", 19.4444, -99.1329)

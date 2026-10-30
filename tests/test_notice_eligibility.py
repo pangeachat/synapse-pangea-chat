@@ -238,13 +238,29 @@ class TestBotFillsOpenSeat(unittest.IsolatedAsyncioTestCase):
     """The open-session notice goes out only while pangea-bot's sweep would
     take the session's last seat at the hour."""
 
-    def gate(self, members, *, capacity=2, extra=None, roles=None):
+    def gate(self, members, *, capacity=2, extra=None, roles=None, readers=()):
+        """Every joined human holds a role unless `roles` says otherwise;
+        readers are joined without one, as a course admin
+        course_session_admins joins is."""
         gate, body, req, api = TestEligibility().setup_gate({})
         body.update(
             sender_id=BOT,
             session_room_id="!session:test",
             eligibility={"bot_fills_open_seat": True},
         )
+        if roles is None:
+            roles = {
+                str(n): {"user_id": user}
+                for n, (user, membership) in enumerate(members.items())
+                if membership == "join" and user != BOT
+            }
+        roles = {
+            key: {**role, "user_id": req.user_id}
+            if role.get("user_id") == LEARNER
+            else role
+            for key, role in roles.items()
+        }
+        members = {**members, **{reader: "join" for reader in readers}}
         state = {
             ("pangea.activity_plan", ""): SimpleNamespace(
                 content={
@@ -276,6 +292,19 @@ class TestBotFillsOpenSeat(unittest.IsolatedAsyncioTestCase):
             gate, body, req = self.gate(members, capacity=capacity)
             with self.subTest(members=members, capacity=capacity):
                 self.assertEqual(await gate.check(body, req, "42"), expected)
+
+    async def test_a_member_without_a_role_holds_no_seat(self):
+        # course_session_admins joins a course's admins to every new session.
+        admins = ("@teacher:test", "@coteacher:test")
+        gate, body, req = self.gate({LEARNER: "join", BOT: "join"}, readers=admins)
+        self.assertIsNone(await gate.check(body, req, "42"))
+
+    async def test_a_role_left_behind_by_someone_who_left_holds_no_seat(self):
+        roles = {"0": {"user_id": "@peer:test"}, "1": {"user_id": LEARNER}}
+        gate, body, req = self.gate(
+            {LEARNER: "join", BOT: "join", "@peer:test": "leave"}, roles=roles
+        )
+        self.assertIsNone(await gate.check(body, req, "42"))
 
     async def test_bot_chosen_or_session_ended_sends_nothing(self):
         in_room = {LEARNER: "join", BOT: "join"}
