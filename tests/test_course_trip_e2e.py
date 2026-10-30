@@ -262,11 +262,24 @@ class TestCourseTripEndpoints(BaseSynapseE2ETest):
                 {
                     "lo_id": "lo-a",
                     "city": "Mexico City",
+                    "city_key": "mx",
                     "pinned": 3,
                     "status": "viable",
                 },
-                {"lo_id": "lo-b", "city": "Madrid", "pinned": 1, "status": "thin"},
-                {"lo_id": "lo-c", "city": None, "pinned": 1, "status": "thin"},
+                {
+                    "lo_id": "lo-b",
+                    "city": "Madrid",
+                    "city_key": "es",
+                    "pinned": 1,
+                    "status": "thin",
+                },
+                {
+                    "lo_id": "lo-c",
+                    "city": None,
+                    "city_key": None,
+                    "pinned": 1,
+                    "status": "thin",
+                },
             ],
         )
         self.assertEqual(
