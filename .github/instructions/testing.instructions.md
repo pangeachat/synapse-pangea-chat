@@ -59,15 +59,17 @@ CPPFLAGS="-I/opt/homebrew/opt/openssl@3/include -I/opt/homebrew/opt/libpq/includ
 # Run tests (postgres@17 + UTF-8 locale required at run time, not just install time)
 PATH="/opt/homebrew/opt/postgresql@17/bin:/opt/homebrew/opt/libpq/bin:$PATH" \
 LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
+PYTHONPATH="$PWD" \
 .venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'
 ```
 
 Why each piece:
 
-- **`postgresql@17` before `libpq` on PATH** — both ship `initdb`, but `testing.postgresql` needs the one with `postgres` (the server binary) next to it; libpq's `initdb` is client-only.
+- **`postgresql@17` before `libpq` on PATH** — both ship `initdb`, but `testing.postgresql` needs the one with `postgres` (the server binary) next to it; libpq's `initdb` is client-only. With neither on PATH, every E2E class errors at setup with `RuntimeError: command not found: initdb`.
 - **`LC_ALL=en_US.UTF-8` at run time** — Postgres 17 on macOS exits with `postmaster became multithreaded during startup` if `LC_ALL` is unset, but `LC_ALL=C` produces `SQL_ASCII` databases that synapse rejects with `IncorrectDatabaseSetup`. UTF-8 is the only locale that satisfies both.
 - **Any Python 3.10 or later** — the pinned matrix-synapse ships a prebuilt `abi3` wheel for arm64 macOS, so pip installs it without compiling anything and no Rust toolchain is needed. Use whichever current Python Homebrew ships; CI runs 3.13.
 - **The Synapse version comes from the `pyproject.toml` pin, not from this doc.** This recipe used to carry workarounds tied to one Synapse release (a Rust build, `setuptools<81`, "3.13 not 3.14"), and they stopped being true when the pin moved on. When the pin changes, check the recipe still installs cleanly rather than trusting notes about an older release.
+- **`PYTHONPATH="$PWD"` when the venv was installed from another checkout** (a worktree using the main checkout's `.venv`) — the test Synapse runs in a temporary directory, so without it Synapse imports this module from wherever `pip install -e` was run and the tests report on that copy, not the worktree's. It is harmless in the checkout the venv was installed from.
 - **Don't run these tests from the repo's `.tox/py` environment.** It can hold an older matrix-synapse than the pin and an old, non-editable copy of this module, and the test Synapse loads that copy instead of your working tree. Tests run there report on stale code: `create_course_space` returned 500 on unmodified `main` in such an environment. Use the venv above.
 
 ## CI
