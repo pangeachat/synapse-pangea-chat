@@ -223,6 +223,27 @@ class TestSlice(unittest.TestCase):
                 },
             )
 
+    def test_a_copy_whose_teacher_removed_every_can_do_stays_empty(self) -> None:
+        """Slicing never adds to a course's list: the removed Can-Dos stay
+        removed rather than coming back from the library."""
+        built = {
+            "version": 1,
+            "revision": 1,
+            "missions": [{"lo_id": "lo1", "activity_ids": ["m1"]}],
+        }
+        existing = {
+            "version": 1,
+            "revision": 2,
+            "missions": [],
+            "removed_missions": [
+                {"lo_id": "lo1", "activity_ids": ["m1"], "shown_count": 1}
+            ],
+        }
+        copy, slices = TripSlicer(CITIES).slice_copy(built, {"m1": "mx"}, existing)
+        self.assertEqual(copy["missions"], [])
+        self.assertEqual(copy["removed_missions"], existing["removed_missions"])
+        self.assertEqual(slices, [])
+
     def test_a_dated_copy_keeps_its_start_date(self) -> None:
         built = {
             "version": 1,
