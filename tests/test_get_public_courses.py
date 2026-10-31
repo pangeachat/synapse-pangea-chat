@@ -93,13 +93,16 @@ class FakeCatalog:
         if name == "get_public_courses_room_stats":
             return []
         if name == "get_public_courses_admins":
-            # args: member type, *room_ids, *user_ids
+            # args: member type, then room and user ids. Every member event of
+            # the rooms asked about; the catalog keeps the ones it named, or
+            # the admins among them where every member may be one. The real
+            # query is covered end to end.
             return [
                 (room_id, state_key, event)
                 for room_id, events in self.state.items()
                 if room_id in args
                 for event_type, state_key, event in events
-                if event_type == args[0] and state_key in args
+                if event_type == args[0]
             ]
         raise AssertionError(f"Unexpected query name: {name}")
 
@@ -419,6 +422,30 @@ class TestGetPublicCourses(unittest.IsolatedAsyncioTestCase):
                     "avatar_url": "mxc://test/rivera",
                 }
             ],
+        )
+
+    async def test_a_default_level_of_100_makes_every_joined_human_an_admin(
+        self,
+    ) -> None:
+        course = await self._trip(
+            [
+                (
+                    "m.room.power_levels",
+                    "",
+                    {
+                        "sender": TEACHER,
+                        "content": {"users_default": 100, "users": {"@low:test": 50}},
+                    },
+                ),
+                member(TEACHER, "join", "Ms. Rivera"),
+                member("@aide:test", "join", "Aide"),
+                member("@bot:test", "join", "Pangea Bot"),
+                member("@gone:test", "leave", "Gone"),
+                member("@low:test", "join", "Lowered"),
+            ]
+        )
+        self.assertEqual(
+            [a["user_id"] for a in course["admins"]], ["@aide:test", TEACHER]
         )
 
     async def test_a_creator_with_creator_power_runs_the_course(self) -> None:

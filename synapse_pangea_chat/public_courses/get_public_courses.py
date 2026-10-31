@@ -200,11 +200,15 @@ def _institution(room_data: RoomStateMap) -> Optional[CourseInstitution]:
     )
 
 
-def _admin_candidates(room_data: RoomStateMap) -> List[str]:
-    """The people who run a course: its course admins (creators, where the
-    room version gives them power, and power level 100), never a bot. Whether
-    each is still in the course is read with their membership."""
+def _admin_candidates(room_data: RoomStateMap) -> Optional[List[str]]:
+    """The people who may run a course: its course admins (creators, where the
+    room version gives them power, and power level 100), never a bot. None
+    when the room's default level makes every member an admin, so each joined
+    member is a candidate. Whether each is still in the course is read with
+    their membership."""
     state = _power_state(room_data)
+    if user_power(state, "") >= COURSE_ADMIN_POWER_LEVEL:
+        return None
     users: List[str] = []
     create = state.get((EventTypes.Create, ""))
     if create is not None:
@@ -653,19 +657,51 @@ WHERE cse.room_id IN ({room_placeholders})
     return rooms_data
 
 
+def _course_admin(user_id: str, content: Any) -> Optional[CourseAdmin]:
+    """A joined member as the course names them, from their membership
+    content; None when they are not joined."""
+    if not isinstance(content, dict) or content.get("membership") != "join":
+        return None
+    name = content.get("displayname")
+    avatar = content.get("avatar_url")
+    return CourseAdmin(
+        user_id=user_id,
+        display_name=name if isinstance(name, str) and name else None,
+        avatar_url=(
+            avatar if isinstance(avatar, str) and avatar.startswith("mxc://") else None
+        ),
+    )
+
+
 async def _fetch_admins(
     room_store: RoomStore,
-    candidates: Dict[str, List[str]],
+    candidates: Dict[str, Optional[List[str]]],
+    rooms_data: Dict[str, RoomStateMap],
 ) -> Dict[str, List[CourseAdmin]]:
     """The candidates still joined to each course, with the name and avatar
-    they show there, in one read of their membership."""
-    pairs = {
-        (room_id, user_id) for room_id, users in candidates.items() for user_id in users
-    }
-    if not pairs:
+    they show there, in one read of their membership. A course whose default
+    level makes every member an admin (``None``) reads all its members, each
+    kept while a course admin and not a bot."""
+    named = {room_id: users for room_id, users in candidates.items() if users}
+    everyone = sorted(room_id for room_id, users in candidates.items() if users is None)
+    if not named and not everyone:
         return {}
-    room_ids = sorted({room_id for room_id, _ in pairs})
-    user_ids = sorted({user_id for _, user_id in pairs})
+    pairs = {
+        (room_id, user_id) for room_id, users in named.items() for user_id in users
+    }
+    room_ids = sorted({*named, *everyone})
+    clauses: List[str] = []
+    params: List[Any] = [EventTypes.Member]
+    if pairs:
+        user_ids = sorted({user_id for _, user_id in pairs})
+        clauses.append(
+            f"(cse.room_id IN ({','.join('?' for _ in named)})"
+            f" AND cse.state_key IN ({','.join('?' for _ in user_ids)}))"
+        )
+        params += [*sorted(named), *user_ids]
+    if everyone:
+        clauses.append(f"cse.room_id IN ({','.join('?' for _ in everyone)})")
+        params += everyone
     rows = await room_store.db_pool.execute(
         "get_public_courses_admins",
         f"""
@@ -673,38 +709,31 @@ SELECT cse.room_id, cse.state_key, ej.json
 FROM current_state_events cse
 INNER JOIN event_json ej ON ej.event_id = cse.event_id
 WHERE cse.type = ?
-  AND cse.room_id IN ({",".join("?" for _ in room_ids)})
-  AND cse.state_key IN ({",".join("?" for _ in user_ids)})
+  AND ({" OR ".join(clauses)})
         """,
-        EventTypes.Member,
-        *room_ids,
-        *user_ids,
+        *params,
     )
-    joined: Dict[Tuple[str, str], CourseAdmin] = {}
+    admins: Dict[str, Dict[str, CourseAdmin]] = {room_id: {} for room_id in room_ids}
+    states = {
+        room_id: _power_state(rooms_data.get(room_id, {})) for room_id in everyone
+    }
     for room_id, user_id, json_data in rows or []:
-        if (room_id, user_id) not in pairs:
+        if room_id in states:
+            if is_probable_bot_user_id(user_id) or (
+                user_power(states[room_id], user_id) < COURSE_ADMIN_POWER_LEVEL
+            ):
+                continue
+        elif (room_id, user_id) not in pairs:
             continue
         event = json.loads(json_data) if isinstance(json_data, str) else json_data
-        content = event.get("content") if isinstance(event, dict) else None
-        if isinstance(content, dict) and content.get("membership") == "join":
-            name = content.get("displayname")
-            avatar = content.get("avatar_url")
-            joined[(room_id, user_id)] = CourseAdmin(
-                user_id=user_id,
-                display_name=name if isinstance(name, str) and name else None,
-                avatar_url=(
-                    avatar
-                    if isinstance(avatar, str) and avatar.startswith("mxc://")
-                    else None
-                ),
-            )
+        admin = _course_admin(
+            user_id, event.get("content") if isinstance(event, dict) else None
+        )
+        if admin is not None and room_id in admins:
+            admins[room_id][user_id] = admin
     return {
-        room_id: [
-            joined[(room_id, user_id)]
-            for user_id in users
-            if (room_id, user_id) in joined
-        ]
-        for room_id, users in candidates.items()
+        room_id: [found[user_id] for user_id in sorted(found)]
+        for room_id, found in admins.items()
     }
 
 
@@ -888,6 +917,7 @@ async def get_public_courses(
             room_id: _admin_candidates(rooms_data.get(room_id, {}))
             for room_id in room_ids
         },
+        rooms_data,
     )
 
     courses: List[Course] = [
