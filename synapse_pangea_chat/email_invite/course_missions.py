@@ -26,7 +26,6 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
-    Tuple,
 )
 from urllib.parse import parse_qsl, quote, urlencode
 
@@ -156,13 +155,15 @@ def build_course_missions_content(
     }
 
 
-def activity_points(
+def activity_places(
     docs: Sequence[Mapping[str, Any]],
-) -> Dict[str, Tuple[float, float]]:
-    """Each activity's ``(lat, lng)`` from ``res.plan.coordinates`` (stored
-    ``[lng, lat]``); an activity with no usable position is left out, and
-    ``[0, 0]`` is the unplaced sentinel, never a place."""
-    points: Dict[str, Tuple[float, float]] = {}
+) -> Dict[str, Optional[str]]:
+    """Each placed activity's city key, as the CMS stores it (``city_key``,
+    cms cities.instructions.md), or None for one placed under no listed city.
+    An activity with no usable position in ``res.plan.coordinates`` (stored
+    ``[lng, lat]``; ``[0, 0]`` is the unplaced sentinel) is left out: its
+    place is unknown, which a slice treats differently from no city."""
+    places: Dict[str, Optional[str]] = {}
     for doc in docs:
         if not isinstance(doc, Mapping):
             continue
@@ -180,8 +181,9 @@ def activity_points(
             continue
         if not (-90 <= lat <= 90 and -180 <= lng <= 180) or (lat == 0 and lng == 0):
             continue
-        points.setdefault(activity_id, (float(lat), float(lng)))
-    return points
+        key = doc.get("city_key")
+        places.setdefault(activity_id, key if isinstance(key, str) and key else None)
+    return places
 
 
 def activities_query(lo_ids: Sequence[str], l2: str) -> str:
@@ -269,7 +271,7 @@ class CourseMissionsReader:
         trip = await slicer()
         if trip is None:
             return content
-        copy, _ = trip.slice_copy(content, activity_points(docs), None)
+        copy, _ = trip.slice_copy(content, activity_places(docs), None)
         return copy
 
     async def _all_docs(self, collection: str, params: List[Any]) -> List[Any]:
@@ -292,7 +294,7 @@ class CourseMissionsReader:
 
     async def _complete_with_docs(
         self, quest_id: str, listed: Sequence[str]
-    ) -> "tuple[Dict[str, Any], Dict[str, Tuple[float, float]]]":
+    ) -> "tuple[Dict[str, Any], Dict[str, Optional[str]]]":
         quest = await self._get(f"quest-plans/{quote(quest_id, safe='')}?depth=0")
         if not isinstance(quest, Mapping):
             raise CourseMissionsError("quest read returned no document")
@@ -305,11 +307,11 @@ class CourseMissionsReader:
             docs = await self._all_docs(
                 "activities-v2", parse_qsl(activities_query(lo_ids, l2))
             )
-        points = activity_points(docs)
+        places = activity_places(docs)
         # A course's own list can name activities the library listing does
         # not return (a teacher's copies, rows past the listing's page): their
-        # positions are read by id, so each is placed at its real city.
-        missing = [a for a in dict.fromkeys(listed) if a not in points]
+        # cities are read by id, so each is placed at its real city.
+        missing = [a for a in dict.fromkeys(listed) if a not in places]
         for start in range(0, len(missing), POINTS_BATCH):
             batch = missing[start : start + POINTS_BATCH]
             rows = await self._all_docs(
@@ -320,18 +322,19 @@ class CourseMissionsReader:
                     ("depth", "0"),
                     ("select[res][plan][activity_id]", "true"),
                     ("select[res][plan][coordinates]", "true"),
+                    ("select[city_key]", "true"),
                 ],
             )
-            for activity_id, point in activity_points(rows).items():
-                points.setdefault(activity_id, point)
-        return build_course_missions_content(quest, docs), points
+            for activity_id, key in activity_places(rows).items():
+                places.setdefault(activity_id, key)
+        return build_course_missions_content(quest, docs), places
 
     async def read_for_slice(
         self, quest_id: str, listed: Sequence[str] = ()
-    ) -> "tuple[Dict[str, Any], Dict[str, Tuple[float, float]]]":
+    ) -> "tuple[Dict[str, Any], Dict[str, Optional[str]]]":
         """For the one-time slice: the quest's whole library as a version 1
-        copy, and the position of every activity it lists or the course lists
-        (``listed``). Raises :class:`CourseMissionsError` when either cannot be
+        copy, and the city of every placed activity it lists or the course
+        lists (``listed``). Raises :class:`CourseMissionsError` when either cannot be
         read in full (unlike :meth:`read`, which answers None)."""
         return await make_deferred_yieldable(
             timeout_deferred(
