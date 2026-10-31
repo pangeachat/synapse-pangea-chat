@@ -24,17 +24,9 @@ The public course catalog behind Browse — where a learner finds a course to jo
 public room directory and has a current `pangea.course_plan` state event carrying a
 plan id.
 
-Nothing else is checked — not the member count, not the join rule, and above all not
-the contents of the quest. A quest with zero missions is a published course and
-appears. Synapse cannot see quest content and must not be taught to: holding the rule
-to Matrix state is what keeps it one rule, applied the same way whether or not a
-filter is passed. Two code paths that each decided eligibility separately are how the
-catalog came to disagree with itself.
+Nothing else is checked: not the member count, the join rule or the quest's contents, so a quest with zero missions appears. Synapse cannot see quest content and must not be taught to; holding the rule to Matrix state keeps it one rule, applied the same way with or without a filter.
 
-The plan id is read from `uuid`, falling back to `course_plan_id`. Everything now
-writes `uuid`; the fallback is for rooms created before that and is what the one-time
-backfill normalises. Only current room state counts, so a room that once had a course
-plan and no longer does is not a course.
+Only current room state counts, so a room that once had a course plan and no longer does is not a course.
 
 The id is a `quest-plans` row id — that is what a course space pins (see the
 cross-repo [quests and learning objectives](../../../.github/.github/instructions/quests-and-learning-objectives.instructions.md)
@@ -65,16 +57,26 @@ course's L1 or level reads them from the plan it already fetches to render the c
 A central course is the one Pangea-run course per language for learners who aren't in a teacher's course ([central courses](../../../.github/.github/instructions/central-courses.instructions.md)). The catalog marks which courses are central, so the client can send a learner to one without a second lookup.
 
 - **The mark.** A course is central when its current `pangea.course_settings` state event carries `"central": true`. Every course in the response has a `central` field, which is `false` for all other courses.
-- **Only a Pangea admin can make a course central.** The mark counts only when the `pangea.course_settings` event was sent by an account listed in `central_course_admin_user_ids`, which defaults to `@support:<server name>`. Any course admin can write that event in their own course. Without this check, a teacher could mark their course central and receive every learner the client sends there. A mark from anyone else is ignored rather than refused: the event is ordinary course state, and the catalog reports the course as not central.
+- **Only a Pangea admin can make a course central.** The mark counts only when the `pangea.course_settings` event was sent by an account listed in `central_course_admin_user_ids`, which defaults to `@support:<server name>`. Any course admin can write that event, so without this check a teacher could mark their course central and receive every learner the client sends there. A mark from anyone else is ignored, not refused: the course is reported as not central.
 - **The catalog doesn't enforce one central course per language.** If two courses in the same language are marked, both are reported as central. Only Pangea admins can set the mark, so a second one is an operations mistake to fix in room state, and the server doesn't guess which course was meant.
-- **Whether a course appears doesn't change.** The mark only adds a field. A central course appears in the catalog by the same rule as every other course: published in the room directory, with a current `pangea.course_plan` that carries a plan id.
+- **Whether a course appears doesn't change.** The mark only adds a field.
 
 ## Pagination
 
-Filtering happens before pagination, so a page is full unless the catalog is
-exhausted, and a non-null `next_batch` means more results genuinely exist. A caller
-that receives a full page and a cursor can keep paging without guessing whether the
-thin page it got means "no more courses" or "kept looking in the wrong place".
+Filtering happens before pagination, so a page is full unless the catalog is exhausted, and a non-null `next_batch` means more results genuinely exist; a caller never has to guess whether a thin page means the end.
+
+A page holds at most 100 courses; a larger `limit` gets 100 and a cursor, because each page reads every listed room's state.
+
+## Trips
+
+Each course carries its [trip](course-trip.instructions.md): `course_missions` and `course_position` are the content of those state events, or null. Nothing is derived here, so a public ship is placed by the client's one rule for ships. The [world view](../../../.github/.github/instructions/world-view.instructions.md) reads them for ships of courses the learner is not in.
+
+- **Read as the app reads them.** Only the event under the empty state key counts, and only when its sender is a course admin now; otherwise the field is null, as the app ignores it inside the course.
+- **Only the public part.** The copy keeps what places a ship and dates its route: its version, revision, time zone and start date, and each Can-Do's id, activities, due date and city. A teacher's notes and the Can-Dos and activities they removed stay with members, because a listed course may be one a learner must ask to join. A field is public only once named in the code.
+
+## Who runs a course
+
+`admins` lists each course admin still in the course who is not a bot, with the name and avatar they show there. The client says Pangea for a central course. `institution` is the school the course names, `{name, id}` from its own `pangea.course_institution` event, read as the trip is; `id` is a ROR or NCES id when one was picked, as on a course request.
 
 ## When the CMS is unavailable
 

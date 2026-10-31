@@ -15,6 +15,7 @@ exhausted.
 import json
 import logging
 import time
+from types import SimpleNamespace
 from typing import (
     Any,
     Dict,
@@ -27,15 +28,25 @@ from typing import (
     Tuple,
 )
 
-from synapse.api.constants import HistoryVisibility
+from synapse.api.constants import EventTypes, HistoryVisibility
+from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
 from synapse.storage.databases.main.room import RoomStore
 
+from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
 from synapse_pangea_chat.config import PangeaChatConfig
+from synapse_pangea_chat.course_member_emails.members import COURSE_ADMIN_POWER_LEVEL
+from synapse_pangea_chat.email_invite.course_missions import (
+    COURSE_MISSIONS_STATE_EVENT_TYPE,
+    COURSE_POSITION_STATE_EVENT_TYPE,
+)
 from synapse_pangea_chat.public_courses.types import (
     Course,
+    CourseAdmin,
     CourseFilters,
+    CourseInstitution,
     PublicCoursesResponse,
 )
+from synapse_pangea_chat.room_code.instructor_access import user_power
 
 EventContent = Dict[str, Any]
 StateKeyMap = Dict[Optional[str], EventContent]
@@ -58,6 +69,12 @@ _COUNT_CACHE_MAX_ENTRIES = 256
 logger = logging.getLogger("synapse_pangea_chat.get_public_courses")
 
 # List of state events required to build a course preview
+# The school a course names, as its admins set it: a display name and, when
+# one was picked, its ROR or NCES id (`ror:…` / `nces:…`), the same pair a
+# course request carries. Its own event, so no other writer's rewrite of the
+# plan or settings can drop it.
+COURSE_INSTITUTION_EVENT_TYPE = "pangea.course_institution"
+
 RESPONSE_STATE_EVENTS: Tuple[str, ...] = (
     "m.room.avatar",
     "m.room.canonical_alias",
@@ -68,11 +85,17 @@ RESPONSE_STATE_EVENTS: Tuple[str, ...] = (
     "m.room.topic",
     "pangea.course_plan",
     "pangea.course_settings",
+    COURSE_MISSIONS_STATE_EVENT_TYPE,
+    COURSE_POSITION_STATE_EVENT_TYPE,
+    COURSE_INSTITUTION_EVENT_TYPE,
 )
 
 DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE = "pangea.course_plan"
 
 DEFAULT_LIMIT = 10
+# A larger page is served at this size, with a cursor for the rest: a page
+# reads every listed room's state, so its size is not the caller's to choose.
+MAX_LIMIT = 100
 
 # The plan id is read from these content keys, in this order. Everything writes
 # ``uuid`` now, including create_course_space; ``course_plan_id`` is what older
@@ -113,6 +136,129 @@ def is_central(room_data: RoomStateMap, admins: FrozenSet[str]) -> bool:
         return False
     content = event.get("content")
     return isinstance(content, dict) and content.get(CENTRAL_CONTENT_KEY) is True
+
+
+# The parts of a course's trip any caller of the catalog may read: what places
+# its ship and dates its route. A field is public only once listed here, so a
+# teacher's notes, removed Can-Dos and activities, and any field added to the
+# record later stay with the course's members.
+TRIP_COPY_FIELDS: Tuple[str, ...] = ("version", "revision", "time_zone", "start_date")
+TRIP_MISSION_FIELDS: Tuple[str, ...] = ("lo_id", "activity_ids", "due_at", "city")
+TRIP_POSITION_FIELDS: Tuple[str, ...] = ("stop", "from_stop", "since", "revision")
+
+
+def _power_state(room_data: RoomStateMap) -> Dict[Tuple[str, str], Any]:
+    """The create and power-levels events in the shape ``user_power`` reads,
+    so who counts as a course admin is the one rule the module already has."""
+    state: Dict[Tuple[str, str], Any] = {}
+    create = room_data.get(EventTypes.Create, {}).get("")
+    if isinstance(create, dict):
+        content = create.get("content") or {}
+        state[(EventTypes.Create, "")] = SimpleNamespace(
+            sender=create.get("sender"),
+            content=content,
+            room_version=KNOWN_ROOM_VERSIONS.get(content.get("room_version", "1")),
+        )
+    power = room_data.get(EventTypes.PowerLevels, {}).get("")
+    if isinstance(power, dict):
+        state[(EventTypes.PowerLevels, "")] = SimpleNamespace(
+            content=power.get("content") or {}
+        )
+    return state
+
+
+def _sent_by_course_admin(room_data: RoomStateMap, event: Mapping[str, Any]) -> bool:
+    """Whether *event*'s sender is a course admin in the room now: the check
+    the app makes before it reads a course's trip, so a public ship and a
+    joined one come from the same events."""
+    return (
+        user_power(_power_state(room_data), event.get("sender"))
+        >= COURSE_ADMIN_POWER_LEVEL
+    )
+
+
+def _institution(room_data: RoomStateMap) -> Optional[CourseInstitution]:
+    """The school the course names, read as the trip is: the empty state key,
+    from a current course admin. None without a name."""
+    event = room_data.get(COURSE_INSTITUTION_EVENT_TYPE, {}).get("")
+    if not isinstance(event, dict) or not _sent_by_course_admin(room_data, event):
+        return None
+    content = event.get("content")
+    if not isinstance(content, dict):
+        return None
+    name = content.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    institution_id = content.get("id")
+    return CourseInstitution(
+        name=name.strip(),
+        id=(
+            institution_id
+            if isinstance(institution_id, str) and institution_id
+            else None
+        ),
+    )
+
+
+def _admin_candidates(room_data: RoomStateMap) -> Optional[List[str]]:
+    """The people who may run a course: its course admins (creators, where the
+    room version gives them power, and power level 100), never a bot. None
+    when the room's default level makes every member an admin, so each joined
+    member is a candidate. Whether each is still in the course is read with
+    their membership."""
+    state = _power_state(room_data)
+    if user_power(state, "") >= COURSE_ADMIN_POWER_LEVEL:
+        return None
+    users: List[str] = []
+    create = state.get((EventTypes.Create, ""))
+    if create is not None:
+        users.append(create.sender)
+        extra = create.content.get("additional_creators")
+        if isinstance(extra, list):
+            users.extend(extra)
+    power = state.get((EventTypes.PowerLevels, ""))
+    if power is not None and isinstance(power.content.get("users"), dict):
+        users.extend(power.content["users"])
+    return sorted(
+        {
+            user_id
+            for user_id in users
+            if isinstance(user_id, str)
+            and not is_probable_bot_user_id(user_id)
+            and user_power(state, user_id) >= COURSE_ADMIN_POWER_LEVEL
+        }
+    )
+
+
+def _public_trip(
+    room_data: RoomStateMap, event_type: str, fields: Tuple[str, ...]
+) -> Optional[EventContent]:
+    """The listed *fields* of a trip event, read as the app reads it: the
+    empty state key only, and only from a current course admin. Missions keep
+    only their listed fields; anything malformed is passed on as it is, for
+    the app's parser to refuse."""
+    event = room_data.get(event_type, {}).get("")
+    if not isinstance(event, dict) or not _sent_by_course_admin(room_data, event):
+        return None
+    content = event.get("content")
+    if not isinstance(content, dict):
+        return None
+    public = {key: content[key] for key in fields if key in content}
+    missions = content.get("missions")
+    if event_type == COURSE_MISSIONS_STATE_EVENT_TYPE and missions is not None:
+        public["missions"] = (
+            [
+                (
+                    {key: m[key] for key in TRIP_MISSION_FIELDS if key in m}
+                    if isinstance(m, dict)
+                    else m
+                )
+                for m in missions
+            ]
+            if isinstance(missions, list)
+            else missions
+        )
+    return public or None
 
 
 def extract_plan_id(content: Mapping[str, Any]) -> Optional[str]:
@@ -511,6 +657,86 @@ WHERE cse.room_id IN ({room_placeholders})
     return rooms_data
 
 
+def _course_admin(user_id: str, content: Any) -> Optional[CourseAdmin]:
+    """A joined member as the course names them, from their membership
+    content; None when they are not joined."""
+    if not isinstance(content, dict) or content.get("membership") != "join":
+        return None
+    name = content.get("displayname")
+    avatar = content.get("avatar_url")
+    return CourseAdmin(
+        user_id=user_id,
+        display_name=name if isinstance(name, str) and name else None,
+        avatar_url=(
+            avatar if isinstance(avatar, str) and avatar.startswith("mxc://") else None
+        ),
+    )
+
+
+async def _fetch_admins(
+    room_store: RoomStore,
+    candidates: Dict[str, Optional[List[str]]],
+    rooms_data: Dict[str, RoomStateMap],
+) -> Dict[str, List[CourseAdmin]]:
+    """The candidates still joined to each course, with the name and avatar
+    they show there, in one read of their membership. A course whose default
+    level makes every member an admin (``None``) reads all its members, each
+    kept while a course admin and not a bot."""
+    named = {room_id: users for room_id, users in candidates.items() if users}
+    everyone = sorted(room_id for room_id, users in candidates.items() if users is None)
+    if not named and not everyone:
+        return {}
+    pairs = {
+        (room_id, user_id) for room_id, users in named.items() for user_id in users
+    }
+    room_ids = sorted({*named, *everyone})
+    clauses: List[str] = []
+    params: List[Any] = [EventTypes.Member]
+    if pairs:
+        user_ids = sorted({user_id for _, user_id in pairs})
+        clauses.append(
+            f"(cse.room_id IN ({','.join('?' for _ in named)})"
+            f" AND cse.state_key IN ({','.join('?' for _ in user_ids)}))"
+        )
+        params += [*sorted(named), *user_ids]
+    if everyone:
+        clauses.append(f"cse.room_id IN ({','.join('?' for _ in everyone)})")
+        params += everyone
+    rows = await room_store.db_pool.execute(
+        "get_public_courses_admins",
+        f"""
+SELECT cse.room_id, cse.state_key, ej.json
+FROM current_state_events cse
+INNER JOIN event_json ej ON ej.event_id = cse.event_id
+WHERE cse.type = ?
+  AND ({" OR ".join(clauses)})
+        """,
+        *params,
+    )
+    admins: Dict[str, Dict[str, CourseAdmin]] = {room_id: {} for room_id in room_ids}
+    states = {
+        room_id: _power_state(rooms_data.get(room_id, {})) for room_id in everyone
+    }
+    for room_id, user_id, json_data in rows or []:
+        if room_id in states:
+            if is_probable_bot_user_id(user_id) or (
+                user_power(states[room_id], user_id) < COURSE_ADMIN_POWER_LEVEL
+            ):
+                continue
+        elif (room_id, user_id) not in pairs:
+            continue
+        event = json.loads(json_data) if isinstance(json_data, str) else json_data
+        admin = _course_admin(
+            user_id, event.get("content") if isinstance(event, dict) else None
+        )
+        if admin is not None and room_id in admins:
+            admins[room_id][user_id] = admin
+    return {
+        room_id: [found[user_id] for user_id in sorted(found)]
+        for room_id, found in admins.items()
+    }
+
+
 async def _fetch_room_stats(
     room_store: RoomStore,
     room_ids: List[str],
@@ -564,6 +790,7 @@ def _build_course(
     room_data: RoomStateMap,
     stats: Dict[str, Any],
     central_admins: FrozenSet[str],
+    admins: List[CourseAdmin],
 ) -> Course:
     """Build a single Course dict from the catalog row plus room state."""
     name = None
@@ -581,6 +808,15 @@ def _build_course(
         canonical_alias = _get_event_content(room_data["m.room.canonical_alias"]).get(
             "alias"
         )
+
+    # The course's trip, for the client to place its ship by the same rule it
+    # applies to a course it is in; nothing is derived here.
+    course_missions = _public_trip(
+        room_data, COURSE_MISSIONS_STATE_EVENT_TYPE, TRIP_COPY_FIELDS
+    )
+    course_position = _public_trip(
+        room_data, COURSE_POSITION_STATE_EVENT_TYPE, TRIP_POSITION_FIELDS
+    )
 
     history_visibility = stats.get("history_visibility")
     guest_access = stats.get("guest_access")
@@ -602,6 +838,10 @@ def _build_course(
         join_rule=join_rules,
         room_type=room_type,
         target_language=entry.l2,
+        course_missions=course_missions,
+        course_position=course_position,
+        admins=admins,
+        institution=_institution(room_data),
     )
 
 
@@ -628,6 +868,7 @@ async def get_public_courses(
 
     if limit <= 0:
         limit = DEFAULT_LIMIT
+    limit = min(limit, MAX_LIMIT)
 
     cursor = parse_since(since)
 
@@ -670,6 +911,14 @@ async def get_public_courses(
         room_store, room_ids, event_types_with_required
     )
     room_stats = await _fetch_room_stats(room_store, room_ids)
+    admins = await _fetch_admins(
+        room_store,
+        {
+            room_id: _admin_candidates(rooms_data.get(room_id, {}))
+            for room_id in room_ids
+        },
+        rooms_data,
+    )
 
     courses: List[Course] = [
         _build_course(
@@ -677,6 +926,7 @@ async def get_public_courses(
             rooms_data.get(entry.room_id, {}),
             room_stats.get(entry.room_id, {}),
             central_course_admins,
+            admins.get(entry.room_id, []),
         )
         for entry in page
     ]
