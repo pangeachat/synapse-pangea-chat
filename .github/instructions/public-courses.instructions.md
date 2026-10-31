@@ -76,7 +76,7 @@ Each course carries its [trip](course-trip.instructions.md): `course_missions` a
 
 ## Who runs a course
 
-`admins` lists each course admin still in the course who is not a bot, with the name they show there. The client says Pangea for a central course. `institution` is the school the course names, `{name, id}` from its own `pangea.course_institution` event, read as the trip is; `id` is a ROR or NCES id when one was picked, as on a course request.
+`admins` lists each course admin still in the course who is not a bot, with the name and avatar they show there. The client says Pangea for a central course. `institution` is the school the course names, `{name, id}` from its own `pangea.course_institution` event, read as the trip is; `id` is a ROR or NCES id when one was picked, as on a course request.
 
 ## When the CMS is unavailable
 

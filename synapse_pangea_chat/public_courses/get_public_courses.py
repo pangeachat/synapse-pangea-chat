@@ -657,8 +657,8 @@ async def _fetch_admins(
     room_store: RoomStore,
     candidates: Dict[str, List[str]],
 ) -> Dict[str, List[CourseAdmin]]:
-    """The candidates still joined to each course, with the name they show
-    there, in one read of their membership."""
+    """The candidates still joined to each course, with the name and avatar
+    they show there, in one read of their membership."""
     pairs = {
         (room_id, user_id) for room_id, users in candidates.items() for user_id in users
     }
@@ -680,7 +680,7 @@ WHERE cse.type = ?
         *room_ids,
         *user_ids,
     )
-    joined: Dict[Tuple[str, str], Optional[str]] = {}
+    joined: Dict[Tuple[str, str], CourseAdmin] = {}
     for room_id, user_id, json_data in rows or []:
         if (room_id, user_id) not in pairs:
             continue
@@ -688,12 +688,19 @@ WHERE cse.type = ?
         content = event.get("content") if isinstance(event, dict) else None
         if isinstance(content, dict) and content.get("membership") == "join":
             name = content.get("displayname")
-            joined[(room_id, user_id)] = (
-                name if isinstance(name, str) and name else None
+            avatar = content.get("avatar_url")
+            joined[(room_id, user_id)] = CourseAdmin(
+                user_id=user_id,
+                display_name=name if isinstance(name, str) and name else None,
+                avatar_url=(
+                    avatar
+                    if isinstance(avatar, str) and avatar.startswith("mxc://")
+                    else None
+                ),
             )
     return {
         room_id: [
-            CourseAdmin(user_id=user_id, display_name=joined[(room_id, user_id)])
+            joined[(room_id, user_id)]
             for user_id in users
             if (room_id, user_id) in joined
         ]

@@ -7,10 +7,11 @@ class CourseFilters(TypedDict, total=False):
 
 class CourseAdmin(TypedDict):
     """Someone who runs a course: a course admin who is not a bot and is
-    still in it, with the name they show there."""
+    still in it, with the name and avatar (an mxc URI) they show there."""
 
     user_id: str
     display_name: Optional[str]
+    avatar_url: Optional[str]
 
 
 class CourseInstitution(TypedDict):

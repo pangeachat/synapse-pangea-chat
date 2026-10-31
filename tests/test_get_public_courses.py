@@ -404,14 +404,21 @@ class TestGetPublicCourses(unittest.IsolatedAsyncioTestCase):
         course = await self._trip(
             [
                 power_levels({TEACHER: 100, bot: 100, left: 100, "@ta:test": 50}),
-                member(TEACHER, "join", "Ms. Rivera"),
+                member(TEACHER, "join", "Ms. Rivera", "mxc://test/rivera"),
                 member(bot, "join", "Pangea Bot"),
                 member(left, "leave", "Gone"),
                 member("@ta:test", "join", "Assistant"),
             ]
         )
         self.assertEqual(
-            course["admins"], [{"user_id": TEACHER, "display_name": "Ms. Rivera"}]
+            course["admins"],
+            [
+                {
+                    "user_id": TEACHER,
+                    "display_name": "Ms. Rivera",
+                    "avatar_url": "mxc://test/rivera",
+                }
+            ],
         )
 
     async def test_a_creator_with_creator_power_runs_the_course(self) -> None:
@@ -426,7 +433,10 @@ class TestGetPublicCourses(unittest.IsolatedAsyncioTestCase):
                 member(TEACHER, "join", None),
             ]
         )
-        self.assertEqual(course["admins"], [{"user_id": TEACHER, "display_name": None}])
+        self.assertEqual(
+            course["admins"],
+            [{"user_id": TEACHER, "display_name": None, "avatar_url": None}],
+        )
 
     async def test_a_course_names_its_school_from_a_course_admin(self) -> None:
         course = await self._trip(
@@ -546,10 +556,17 @@ def power_levels(users: Dict[str, int]) -> Tuple[str, str, Any]:
     return ("m.room.power_levels", "", {"sender": TEACHER, "content": {"users": users}})
 
 
-def member(user_id: str, membership: str, name: Optional[str]) -> Tuple[str, str, Any]:
+def member(
+    user_id: str,
+    membership: str,
+    name: Optional[str],
+    avatar: Optional[str] = None,
+) -> Tuple[str, str, Any]:
     content: Dict[str, Any] = {"membership": membership}
     if name is not None:
         content["displayname"] = name
+    if avatar is not None:
+        content["avatar_url"] = avatar
     return ("m.room.member", user_id, {"sender": user_id, "content": content})
 
 
