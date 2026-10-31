@@ -5,6 +5,14 @@ class CourseFilters(TypedDict, total=False):
     target_language: str
 
 
+class CourseAdmin(TypedDict):
+    """Someone who runs a course: a course admin who is not a bot and is
+    still in it, with the name they show there."""
+
+    user_id: str
+    display_name: Optional[str]
+
+
 class Course(TypedDict):
     avatar_url: Optional[str]
     central: bool
@@ -21,6 +29,7 @@ class Course(TypedDict):
     world_readable: bool
     course_missions: Optional[Dict[str, Any]]
     course_position: Optional[Dict[str, Any]]
+    admins: List[CourseAdmin]
 
 
 class PublicCoursesResponse(TypedDict):

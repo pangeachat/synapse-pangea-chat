@@ -92,6 +92,15 @@ class FakeCatalog:
             ]
         if name == "get_public_courses_room_stats":
             return []
+        if name == "get_public_courses_admins":
+            # args: member type, *room_ids, *user_ids
+            return [
+                (room_id, state_key, event)
+                for room_id, events in self.state.items()
+                if room_id in args
+                for event_type, state_key, event in events
+                if event_type == args[0] and state_key in args
+            ]
         raise AssertionError(f"Unexpected query name: {name}")
 
 
@@ -389,6 +398,36 @@ class TestGetPublicCourses(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(course["course_position"], {"stop": 0})
 
+    async def test_who_runs_a_course_is_its_joined_human_admins(self) -> None:
+        bot = "@bot:test"
+        left = "@left:test"
+        course = await self._trip(
+            [
+                power_levels({TEACHER: 100, bot: 100, left: 100, "@ta:test": 50}),
+                member(TEACHER, "join", "Ms. Rivera"),
+                member(bot, "join", "Pangea Bot"),
+                member(left, "leave", "Gone"),
+                member("@ta:test", "join", "Assistant"),
+            ]
+        )
+        self.assertEqual(
+            course["admins"], [{"user_id": TEACHER, "display_name": "Ms. Rivera"}]
+        )
+
+    async def test_a_creator_with_creator_power_runs_the_course(self) -> None:
+        course = await self._trip(
+            [
+                (
+                    "m.room.create",
+                    "",
+                    {"sender": TEACHER, "content": {"room_version": "12"}},
+                ),
+                power_levels({}),
+                member(TEACHER, "join", None),
+            ]
+        )
+        self.assertEqual(course["admins"], [{"user_id": TEACHER, "display_name": None}])
+
     async def test_a_trip_under_another_state_key_is_left_out(self) -> None:
         stray = trip_event("pangea.course_missions", TEACHER, {"version": 2})
         course = await self._trip(
@@ -463,6 +502,13 @@ TEACHER = "@teacher:test"
 
 def power_levels(users: Dict[str, int]) -> Tuple[str, str, Any]:
     return ("m.room.power_levels", "", {"sender": TEACHER, "content": {"users": users}})
+
+
+def member(user_id: str, membership: str, name: Optional[str]) -> Tuple[str, str, Any]:
+    content: Dict[str, Any] = {"membership": membership}
+    if name is not None:
+        content["displayname"] = name
+    return ("m.room.member", user_id, {"sender": user_id, "content": content})
 
 
 def trip_event(
