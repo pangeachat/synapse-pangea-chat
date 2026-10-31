@@ -58,23 +58,23 @@ class Slice(NamedTuple):
 def slice_can_do(
     lo_id: str,
     candidates: Sequence[str],
-    points: Mapping[str, "tuple[float, float]"],
+    places: Mapping[str, Optional[str]],
     index: CityIndex,
 ) -> Slice:
     """The slice for one Can-Do over ``candidates`` (its activities, in order):
     the listed city most of them fall under, ties to the first candidate's,
-    and the candidates under it. A candidate with no known position is kept
-    whatever the city, since it cannot be placed elsewhere; one placed under
-    another city, or under no listed city, is left out."""
+    and the candidates under it. ``places`` holds each placed activity's
+    stored city key (``activity_places``). A candidate with no known position
+    is kept whatever the city, since it cannot be placed elsewhere; one placed
+    under another city, or under no listed city, is left out."""
     counts: Dict[str, int] = {}
     cities: Dict[str, City] = {}
     #: Each placed candidate's city key; None for one under no listed city.
     placed: Dict[str, Optional[str]] = {}
     for activity_id in candidates:
-        point = points.get(activity_id)
-        if point is None:
+        if activity_id not in places:
             continue
-        found = index.nearest(*point)
+        found = index.city(places[activity_id])
         placed[activity_id] = found.key if found is not None else None
         if found is None:
             continue
@@ -104,7 +104,7 @@ class TripSlicer:
     def slice_copy(
         self,
         content: Mapping[str, Any],
-        points: Mapping[str, "tuple[float, float]"],
+        places: Mapping[str, Optional[str]],
         existing: Optional[Mapping[str, Any]] = None,
     ) -> "tuple[Dict[str, Any], List[Slice]]":
         """The trip, at the existing copy's revision plus one, and each
@@ -117,8 +117,8 @@ class TripSlicer:
         activity the slice leaves out joins the Can-Do's removed activities, so
         work already done on it keeps counting. With no copy (or an empty one)
         the course's list is ``content``, the quest's Can-Dos with their library
-        activities. ``points`` holds each activity's ``(lat, lng)``; one it
-        lacks has no known position and is kept wherever the city falls."""
+        activities. ``places`` holds each placed activity's stored city key; one
+        it lacks has no known position and is kept wherever the city falls."""
         existing_entries = [
             entry
             for entry in (existing or {}).get("missions") or []
@@ -139,7 +139,7 @@ class TripSlicer:
                 a for a in entry.get("removed_activity_ids") or [] if isinstance(a, str)
             ]
             sliced = slice_can_do(
-                lo_id, [a for a in listed if a not in removed], points, self._index
+                lo_id, [a for a in listed if a not in removed], places, self._index
             )
             slices.append(sliced)
             mission: Dict[str, Any] = {

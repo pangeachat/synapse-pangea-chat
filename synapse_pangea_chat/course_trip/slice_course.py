@@ -207,7 +207,7 @@ class SliceCourse(Resource):
             if isinstance(activity_id, str)
         ]
         try:
-            built, points = await self._reader.read_for_slice(quest_id, listed)
+            built, places = await self._reader.read_for_slice(quest_id, listed)
         except CourseMissionsError as e:
             logger.error(
                 "slice_course: no copy could be built for %s in %s: %s",
@@ -216,7 +216,7 @@ class SliceCourse(Resource):
                 e,
             )
             return 503, {"error": "The course copy could not be built from the CMS"}
-        copy, slices = TripSlicer(index).slice_copy(built, points, existing)
+        copy, slices = TripSlicer(index).slice_copy(built, places, existing)
         instructors = joined_local_instructors(self._api, state)
         answer: Dict[str, Any] = {
             "room_id": room_id,

@@ -60,6 +60,7 @@ class _TripCmsHandler(BaseHTTPRequestHandler):
                 "docs": [
                     {
                         "id": "row-t1",
+                        "city_key": "es",
                         "res": {
                             "plan": {"activity_id": "t1", "coordinates": [-3.70, 40.42]}
                         },
@@ -70,12 +71,17 @@ class _TripCmsHandler(BaseHTTPRequestHandler):
                 "hasNextPage": False,
             }
         elif path == "/api/activities-v2":
-
+            # Each activity carries the city the CMS stores for it.
             def doc(
-                activity_id: str, lo: str, lng: float, lat: float
+                activity_id: str,
+                lo: str,
+                lng: float,
+                lat: float,
+                city_key: Optional[str],
             ) -> Dict[str, Any]:
                 return {
                     "id": f"row-{activity_id}",
+                    "city_key": city_key,
                     "req": {},
                     "res": {
                         "plan": {
@@ -92,14 +98,14 @@ class _TripCmsHandler(BaseHTTPRequestHandler):
             code, body = 200, {
                 "docs": [
                     # lo-a: three in Mexico City, one in Madrid: viable at Mexico City.
-                    doc("a1", "lo-a", -99.16, 19.35),
-                    doc("a2", "lo-a", -99.10, 19.50),
-                    doc("a3", "lo-a", -99.13, 19.43),
-                    doc("a4", "lo-a", -3.70, 40.42),
+                    doc("a1", "lo-a", -99.16, 19.35, "mx"),
+                    doc("a2", "lo-a", -99.10, 19.50, "mx"),
+                    doc("a3", "lo-a", -99.13, 19.43, "mx"),
+                    doc("a4", "lo-a", -3.70, 40.42, "es"),
                     # lo-b: one in Madrid: thin.
-                    doc("b1", "lo-b", -3.70, 40.42),
+                    doc("b1", "lo-b", -3.70, 40.42, "es"),
                     # lo-c: beyond every listed city: empty... of cities, pinned as is.
-                    doc("c1", "lo-c", 0.5, 0.5),
+                    doc("c1", "lo-c", 0.5, 0.5, None),
                 ]
             }
         elif path == "/api/cities":

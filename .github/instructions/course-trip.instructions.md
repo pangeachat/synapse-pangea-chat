@@ -17,7 +17,7 @@ Re-decider for every line: Will, unless named.
 
 ## The city rule
 
-- A point belongs to the nearest listed city within 250 miles and to no city beyond that; the list is the CMS `cities` collection, read with the module's service key and cached for an hour. The same rule as admin-dash-api, checked against the same example set (`tests/fixtures/nearest_city.json`).
+- An activity's city is the one the CMS stores on it (`city_key`, cms [cities](../../../cms/.github/instructions/cities.instructions.md)), so this module matches no point. It reads the CMS `cities` list with its service key, cached for an hour, only to name a key's city in the record.
 
 ## Slicing a course (`POST /_synapse/client/pangea/v1/slice_course`)
 

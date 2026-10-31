@@ -1,10 +1,10 @@
-"""The listed cities and the one rule that names a point by them.
+"""The listed cities, by key.
 
 The list is CMS content (the ``cities`` collection: every city of a million or
-more plus the destinations added by hand). A point belongs to the nearest
-listed city within 250 miles and to no city beyond that: the same rule as
-admin-dash-api's ``app/plan/cities.py`` and the app's ``city_index.dart``,
-checked against the same example set (``tests/fixtures/nearest_city.json``).
+more plus the destinations added by hand). The CMS names each activity's city
+by the one rule and stores its key on the activity (``city_key``; cms
+cities.instructions.md), so this module matches no point: it turns a stored
+key into the city a course record names.
 """
 
 from __future__ import annotations
@@ -23,21 +23,9 @@ from twisted.web.http_headers import Headers
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.course_trip.cities")
 
-#: A point further than this from every listed city belongs to no city.
-CAP_MILES = 250.0
-EARTH_RADIUS_MILES = 3958.7613
-# The cap as the cosine of its central angle: two unit vectors' dot product is
-# the cosine of the angle between them, so a city is within the cap exactly
-# when its dot product with the point is at least this.
-_CAP_COS = math.cos(CAP_MILES / EARTH_RADIUS_MILES)
 PAGE = 1000
 MAX_PAGES = 5
 MAX_BODY_BYTES = 16_000_000
-
-
-def _unit(lat: float, lng: float) -> "tuple[float, float, float]":
-    phi, lam = math.radians(lat), math.radians(lng)
-    return (math.cos(phi) * math.cos(lam), math.cos(phi) * math.sin(lam), math.sin(phi))
 
 
 class City(NamedTuple):
@@ -46,9 +34,6 @@ class City(NamedTuple):
     country: str
     lat: float
     lng: float
-    x: float
-    y: float
-    z: float
 
     def as_mission_city(self) -> Dict[str, Any]:
         """The record's ``city``: name and position (pangeachat/.github#780).
@@ -62,7 +47,7 @@ class City(NamedTuple):
 
 
 def city(key: str, name: str, country: str, lat: float, lng: float) -> City:
-    return City(key, name, country, lat, lng, *_unit(lat, lng))
+    return City(key, name, country, lat, lng)
 
 
 def _number(value: Any) -> Optional[float]:
@@ -98,11 +83,13 @@ def parse_city(row: Any) -> Optional[City]:
 
 
 class CityIndex:
-    """The listed cities and the rule that names a point by them."""
+    """The listed cities, each key once."""
 
     def __init__(self, cities: Iterable[City]) -> None:
         self.cities: List[City] = list(cities)
-        self._answers: Dict["tuple[float, float]", Optional[City]] = {}
+        self._by_key: Dict[str, City] = {}
+        for listed in self.cities:
+            self._by_key.setdefault(listed.key, listed)
 
     @classmethod
     def from_rows(cls, rows: Iterable[Any]) -> "CityIndex":
@@ -119,31 +106,10 @@ class CityIndex:
     def __len__(self) -> int:
         return len(self.cities)
 
-    def nearest(self, lat: float, lng: float) -> Optional[City]:
-        """The listed city nearest the point when it is within the cap (on the
-        sphere), else None. Points are rounded to about 100 m so activities
-        sharing a place share one lookup."""
-        point = (round(lat, 3), round(lng, 3))
-        if point in self._answers:
-            return self._answers[point]
-        x, y, z = _unit(*point)
-        best: Optional[City] = None
-        best_dot = _CAP_COS
-        for candidate in self.cities:
-            dot = candidate.x * x + candidate.y * y + candidate.z * z
-            if dot > best_dot:
-                best, best_dot = candidate, dot
-        if len(self._answers) < 50_000:
-            self._answers[point] = best
-        return best
-
-
-def miles_between(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Great-circle distance, for the example set's cap edges."""
-    x1, y1, z1 = _unit(lat1, lng1)
-    x2, y2, z2 = _unit(lat2, lng2)
-    dot = max(-1.0, min(1.0, x1 * x2 + y1 * y2 + z1 * z2))
-    return math.acos(dot) * EARTH_RADIUS_MILES
+    def city(self, key: Optional[str]) -> Optional[City]:
+        """The listed city with ``key``, or None (no key, or a key the list
+        no longer holds)."""
+        return self._by_key.get(key) if key else None
 
 
 class CityListError(RuntimeError):

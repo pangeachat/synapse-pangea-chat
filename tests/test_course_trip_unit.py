@@ -1,6 +1,6 @@
-"""Unit tests for the course trip (course-trip.instructions.md): the one city
-rule over the shared example set, a Can-Do's city slice, and the busiest
-stop an undated course's ship sits at."""
+"""Unit tests for the course trip (course-trip.instructions.md): the city
+list by key, a Can-Do's city slice over the cities the CMS stores on each
+activity, and the busiest stop an undated course's ship sits at."""
 
 from __future__ import annotations
 
@@ -9,12 +9,7 @@ import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from synapse_pangea_chat.course_trip.cities import (
-    CAP_MILES,
-    CityIndex,
-    city,
-    miles_between,
-)
+from synapse_pangea_chat.course_trip.cities import CityIndex, city
 from synapse_pangea_chat.course_trip.position import (
     Position,
     busiest_stop,
@@ -31,7 +26,7 @@ from synapse_pangea_chat.course_trip.slicing import (
     report,
     slice_can_do,
 )
-from synapse_pangea_chat.email_invite.course_missions import activity_points
+from synapse_pangea_chat.email_invite.course_missions import activity_places
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MEXICO_CITY = city("mx", "Mexico City", "Mexico", 19.4444, -99.1329)
@@ -39,47 +34,22 @@ MADRID = city("es", "Madrid", "Spain", 40.4, -3.6834)
 CITIES = CityIndex([MEXICO_CITY, MADRID])
 
 
-class TestCityRule(unittest.TestCase):
-    """The shared example set: the same file admin-dash-api and the app check
-    their matchers against (cms ``scripts/data/nearest_city.json``)."""
+class TestCityList(unittest.TestCase):
+    """The CMS list, read by key: the CMS names each activity's city, so
+    nothing here matches a point."""
 
     @classmethod
     def setUpClass(cls) -> None:
         rows = json.loads((FIXTURES / "cities.json").read_text(encoding="utf-8"))
         cls.index = CityIndex.from_rows(rows)
-        cls.examples = json.loads(
-            (FIXTURES / "nearest_city.json").read_text(encoding="utf-8")
-        )
 
     def test_the_list_is_the_seed(self) -> None:
         self.assertEqual(len(self.index), 515)
 
-    def test_every_example_names_its_city_within_the_cap(self) -> None:
-        self.assertGreaterEqual(len(self.examples), 40)
-        for example in self.examples:
-            with self.subTest(example["description"]):
-                found = self.index.nearest(example["lat"], example["lng"])
-                expected = example["city"]
-                if expected is None:
-                    self.assertIsNone(found)
-                else:
-                    self.assertIsNotNone(found)
-                    assert found is not None
-                    self.assertEqual(
-                        (found.name, found.country),
-                        (expected["name"], expected["country"]),
-                    )
-                    self.assertLessEqual(
-                        miles_between(
-                            example["lat"], example["lng"], found.lat, found.lng
-                        ),
-                        CAP_MILES,
-                    )
-
-    def test_the_cap_is_250_miles(self) -> None:
-        lone = CityIndex([city("x", "Lone", "Nowhere", 0.0, 0.0)])
-        self.assertEqual(lone.nearest(0.0, 3.6).name, "Lone")  # type: ignore[union-attr]
-        self.assertIsNone(lone.nearest(0.0, 3.64))
+    def test_a_key_names_its_city(self) -> None:
+        self.assertEqual(CITIES.city("mx"), MEXICO_CITY)
+        self.assertIsNone(CITIES.city("gone"))
+        self.assertIsNone(CITIES.city(None))
 
     def test_rows_that_cannot_be_placed_are_dropped(self) -> None:
         index = CityIndex.from_rows(
@@ -96,25 +66,30 @@ class TestCityRule(unittest.TestCase):
 
 
 def _doc(
-    activity_id: str, lat: Optional[float], lng: Optional[float]
+    activity_id: str,
+    lat: Optional[float],
+    lng: Optional[float],
+    city_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     plan: Dict[str, Any] = {"activity_id": activity_id, "l2": "es"}
     if lat is not None and lng is not None:
         plan["coordinates"] = [lng, lat]
-    return {"res": {"plan": plan}}
+    return {"city_key": city_key, "res": {"plan": plan}}
 
 
 class TestSlice(unittest.TestCase):
-    POINTS = {
-        "m1": (19.35, -99.16),
-        "m2": (19.50, -99.10),
-        "s1": (40.42, -3.70),
-        "far": (0.5, 0.5),
+    # Each placed activity's stored city key; "far" is placed under no
+    # listed city, and "none" has no known position.
+    PLACES: Dict[str, Optional[str]] = {
+        "m1": "mx",
+        "m2": "mx",
+        "s1": "es",
+        "far": None,
     }
 
     def test_the_pins_decide_the_city_most_of_them_fall_under(self) -> None:
         sliced = slice_can_do(
-            "lo", ["s1", "m1", "none", "far", "m2"], self.POINTS, CITIES
+            "lo", ["s1", "m1", "none", "far", "m2"], self.PLACES, CITIES
         )
         self.assertEqual(sliced.city, MEXICO_CITY)
         # The pins: the ones under the city, and one with no known position.
@@ -123,18 +98,18 @@ class TestSlice(unittest.TestCase):
 
     def test_a_tie_goes_to_the_first_candidates_city(self) -> None:
         self.assertEqual(
-            slice_can_do("lo", ["s1", "m1"], self.POINTS, CITIES).city, MADRID
+            slice_can_do("lo", ["s1", "m1"], self.PLACES, CITIES).city, MADRID
         )
         self.assertEqual(
-            slice_can_do("lo", ["m1", "s1"], self.POINTS, CITIES).city, MEXICO_CITY
+            slice_can_do("lo", ["m1", "s1"], self.PLACES, CITIES).city, MEXICO_CITY
         )
 
     def test_no_listed_city_keeps_every_activity_and_names_none(self) -> None:
-        sliced = slice_can_do("lo", ["none", "far"], self.POINTS, CITIES)
+        sliced = slice_can_do("lo", ["none", "far"], self.PLACES, CITIES)
         self.assertIsNone(sliced.city)
         self.assertEqual(sliced.activity_ids, ["none", "far"])
         self.assertEqual(sliced.status, THIN)
-        self.assertEqual(slice_can_do("lo", [], self.POINTS, CITIES).status, EMPTY)
+        self.assertEqual(slice_can_do("lo", [], self.PLACES, CITIES).status, EMPTY)
 
     def test_the_copy_is_the_trip_keeping_the_existing_copys_edits(self) -> None:
         built = {
@@ -147,13 +122,13 @@ class TestSlice(unittest.TestCase):
                 {"lo_id": "lo4", "activity_ids": ["m2"]},
             ],
         }
-        points = activity_points(
+        places = activity_places(
             [
-                _doc("m1", 19.35, -99.16),
-                _doc("m2", 19.50, -99.10),
-                _doc("m3", 19.40, -99.20),
-                _doc("m4", 19.45, -99.15),
-                _doc("s1", 40.42, -3.70),
+                _doc("m1", 19.35, -99.16, "mx"),
+                _doc("m2", 19.50, -99.10, "mx"),
+                _doc("m3", 19.40, -99.20, "mx"),
+                _doc("m4", 19.45, -99.15, "mx"),
+                _doc("s1", 40.42, -3.70, "es"),
                 _doc("far", 0.5, 0.5),
                 _doc("none", None, None),
             ]
@@ -184,7 +159,7 @@ class TestSlice(unittest.TestCase):
                 {"lo_id": "lo3", "activity_ids": ["m1"], "shown_count": 1}
             ],
         }
-        copy, slices = TripSlicer(CITIES).slice_copy(built, points, existing)
+        copy, slices = TripSlicer(CITIES).slice_copy(built, places, existing)
         self.assertEqual(copy["version"], 2)
         self.assertEqual(copy["revision"], 5)
         self.assertEqual(copy["time_zone"], "America/Mexico_City")
@@ -227,15 +202,15 @@ class TestSlice(unittest.TestCase):
                 {"lo_id": "lo2", "activity_ids": []},
             ],
         }
-        points = activity_points(
+        places = activity_places(
             [
-                _doc("m1", 19.35, -99.16),
-                _doc("m2", 19.50, -99.10),
-                _doc("s1", 40.42, -3.70),
+                _doc("m1", 19.35, -99.16, "mx"),
+                _doc("m2", 19.50, -99.10, "mx"),
+                _doc("s1", 40.42, -3.70, "es"),
             ]
         )
         for existing in (None, {"version": 1, "revision": 2, "missions": []}):
-            copy, _ = TripSlicer(CITIES).slice_copy(built, points, existing)
+            copy, _ = TripSlicer(CITIES).slice_copy(built, places, existing)
             self.assertEqual([m["lo_id"] for m in copy["missions"]], ["lo1", "lo2"])
             # The library has no credit to keep: the other city's activity is
             # simply not pinned.
