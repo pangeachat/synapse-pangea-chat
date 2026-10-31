@@ -43,6 +43,7 @@ from synapse_pangea_chat.public_courses.types import (
     Course,
     CourseAdmin,
     CourseFilters,
+    CourseInstitution,
     PublicCoursesResponse,
 )
 from synapse_pangea_chat.room_code.instructor_access import user_power
@@ -68,6 +69,12 @@ _COUNT_CACHE_MAX_ENTRIES = 256
 logger = logging.getLogger("synapse_pangea_chat.get_public_courses")
 
 # List of state events required to build a course preview
+# The school a course names, as its admins set it: a display name and, when
+# one was picked, its ROR or NCES id (`ror:…` / `nces:…`), the same pair a
+# course request carries. Its own event, so no other writer's rewrite of the
+# plan or settings can drop it.
+COURSE_INSTITUTION_EVENT_TYPE = "pangea.course_institution"
+
 RESPONSE_STATE_EVENTS: Tuple[str, ...] = (
     "m.room.avatar",
     "m.room.canonical_alias",
@@ -80,6 +87,7 @@ RESPONSE_STATE_EVENTS: Tuple[str, ...] = (
     "pangea.course_settings",
     COURSE_MISSIONS_STATE_EVENT_TYPE,
     COURSE_POSITION_STATE_EVENT_TYPE,
+    COURSE_INSTITUTION_EVENT_TYPE,
 )
 
 DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE = "pangea.course_plan"
@@ -166,6 +174,29 @@ def _sent_by_course_admin(room_data: RoomStateMap, event: Mapping[str, Any]) -> 
     return (
         user_power(_power_state(room_data), event.get("sender"))
         >= COURSE_ADMIN_POWER_LEVEL
+    )
+
+
+def _institution(room_data: RoomStateMap) -> Optional[CourseInstitution]:
+    """The school the course names, read as the trip is: the empty state key,
+    from a current course admin. None without a name."""
+    event = room_data.get(COURSE_INSTITUTION_EVENT_TYPE, {}).get("")
+    if not isinstance(event, dict) or not _sent_by_course_admin(room_data, event):
+        return None
+    content = event.get("content")
+    if not isinstance(content, dict):
+        return None
+    name = content.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    institution_id = content.get("id")
+    return CourseInstitution(
+        name=name.strip(),
+        id=(
+            institution_id
+            if isinstance(institution_id, str) and institution_id
+            else None
+        ),
     )
 
 
@@ -774,6 +805,7 @@ def _build_course(
         course_missions=course_missions,
         course_position=course_position,
         admins=admins,
+        institution=_institution(room_data),
     )
 
 

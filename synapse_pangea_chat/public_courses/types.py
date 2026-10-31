@@ -13,6 +13,14 @@ class CourseAdmin(TypedDict):
     display_name: Optional[str]
 
 
+class CourseInstitution(TypedDict):
+    """The school a course names: its display name and, when one was picked,
+    its ROR or NCES id."""
+
+    name: str
+    id: Optional[str]
+
+
 class Course(TypedDict):
     avatar_url: Optional[str]
     central: bool
@@ -30,6 +38,7 @@ class Course(TypedDict):
     course_missions: Optional[Dict[str, Any]]
     course_position: Optional[Dict[str, Any]]
     admins: List[CourseAdmin]
+    institution: Optional[CourseInstitution]
 
 
 class PublicCoursesResponse(TypedDict):

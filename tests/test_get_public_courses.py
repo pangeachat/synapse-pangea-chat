@@ -428,6 +428,48 @@ class TestGetPublicCourses(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(course["admins"], [{"user_id": TEACHER, "display_name": None}])
 
+    async def test_a_course_names_its_school_from_a_course_admin(self) -> None:
+        course = await self._trip(
+            [
+                power_levels({TEACHER: 100}),
+                trip_event(
+                    "pangea.course_institution",
+                    TEACHER,
+                    {"name": " Universidad de Oaxaca ", "id": "ror:abc123"},
+                ),
+            ]
+        )
+        self.assertEqual(
+            course["institution"],
+            {"name": "Universidad de Oaxaca", "id": "ror:abc123"},
+        )
+        mod.reset_caches()
+        named_only = await self._trip(
+            [
+                power_levels({TEACHER: 100}),
+                trip_event("pangea.course_institution", TEACHER, {"name": "A School"}),
+            ]
+        )
+        self.assertEqual(named_only["institution"], {"name": "A School", "id": None})
+
+    async def test_a_school_from_someone_not_a_course_admin_or_unnamed_is_left_out(
+        self,
+    ) -> None:
+        for events in (
+            [
+                power_levels({TEACHER: 50}),
+                trip_event("pangea.course_institution", TEACHER, {"name": "X"}),
+            ],
+            [
+                power_levels({TEACHER: 100}),
+                trip_event("pangea.course_institution", TEACHER, {"name": " "}),
+            ],
+            [power_levels({TEACHER: 100})],
+        ):
+            mod.reset_caches()
+            course = await self._trip(events)
+            self.assertIsNone(course["institution"])
+
     async def test_a_trip_under_another_state_key_is_left_out(self) -> None:
         stray = trip_event("pangea.course_missions", TEACHER, {"version": 2})
         course = await self._trip(
