@@ -118,12 +118,12 @@ def discussion_power_levels(
     creator: str, admins: FrozenSet[str], bot_user_id: Optional[str]
 ) -> Dict[str, Any]:
     """The activity room defaults (client ``RoomDefaults``), with the course's
-    admins at 100 and students at 0. The creator starts at 100 so the server
-    can finish setting the room up as them, then is lowered to a student."""
+    admins at 100, the bot at 50 and students at 0. The creator starts at 100
+    so the server can finish setting the room up as them, then is lowered."""
     users: Dict[str, int] = {admin: 100 for admin in admins}
-    users[creator] = 100
     if bot_user_id:
         users[bot_user_id] = 50
+    users[creator] = 100
     return {
         "ban": 50,
         "kick": 50,
@@ -423,6 +423,12 @@ class DiscussionRoom(Resource):
         admins: FrozenSet[str],
         avatar_url: Optional[str],
     ) -> str:
+        bot_user_id = self._config.user_activity_notification_bot_user_id
+        # The bot creates the room and the student joins once it is set up,
+        # so the student's arrival comes after the activity's own state, which
+        # the chat draws as its top block: a creator's join comes before it.
+        # Without a bot the student creates it, as an activity's first player.
+        creator = bot_user_id or user_id
         initial_state: List[Dict[str, Any]] = [
             {
                 "type": ACTIVITY_PLAN_EVENT,
@@ -452,9 +458,7 @@ class DiscussionRoom(Resource):
             {
                 "type": EventTypes.PowerLevels,
                 "state_key": "",
-                "content": discussion_power_levels(
-                    user_id, admins, self._config.user_activity_notification_bot_user_id
-                ),
+                "content": discussion_power_levels(creator, admins, bot_user_id),
             },
         ]
         if avatar_url:
@@ -476,18 +480,14 @@ class DiscussionRoom(Resource):
         }
         if plan.get("description"):
             config["topic"] = plan["description"]
-        bot_user_id = self._config.user_activity_notification_bot_user_id
-        # The bot facilitates every discussion. It is no course member, so the
-        # room's restricted join admits it only through this invite.
-        if bot_user_id:
-            config["invite"] = [bot_user_id]
         room_id, _, _ = await self._api._hs.get_room_creation_handler().create_room(
             requester=create_requester(
-                user_id, authenticated_entity=self._api.server_name
+                creator, authenticated_entity=self._api.server_name
             ),
             config=config,
             ratelimit=False,
         )
+        # Linked into the course by the student: the bot is no course member.
         await self._api.create_and_send_event_into_room(
             {
                 "type": SPACE_CHILD_EVENT,
@@ -497,42 +497,31 @@ class DiscussionRoom(Resource):
                 "content": {"via": [self._api.server_name]},
             }
         )
-        # Lower the creator to a student: only the course's admins run the room.
-        # A course admin opening their own course's discussion stays admin.
-        power = discussion_power_levels(
-            user_id, admins, self._config.user_activity_notification_bot_user_id
-        )
-        if user_id not in admins:
-            power["users"].pop(user_id, None)
+        # Lower the creator: only the course's admins run the room. A course
+        # admin opening their own course's discussion stays admin.
+        power = discussion_power_levels(creator, admins, bot_user_id)
+        if creator == bot_user_id:
+            power["users"][creator] = 50
+        elif creator not in admins:
+            power["users"].pop(creator, None)
         await self._api.create_and_send_event_into_room(
             {
                 "type": EventTypes.PowerLevels,
                 "room_id": room_id,
-                "sender": user_id,
+                "sender": creator,
                 "state_key": "",
                 "content": power,
             }
         )
         if bot_user_id:
-            await self._join_bot(room_id, bot_user_id)
+            # The course's members are admitted by the room's restricted join.
+            await server_initiated_join(self._api, room_id, user_id)
         else:
             logger.error(
                 "discussion_room: no bot configured, room %s has no facilitator",
                 room_id,
             )
         return room_id
-
-    async def _join_bot(self, room_id: str, bot_user_id: str) -> None:
-        """Join the bot on the server's side rather than waiting on it to
-        accept, so the room has its facilitator before the student's first
-        message. A failed join leaves the invite for the bot to accept."""
-        try:
-            await server_initiated_join(self._api, room_id, bot_user_id)
-        except Exception:
-            logger.exception(
-                "discussion_room: bot join failed for %s; invite left pending",
-                room_id,
-            )
 
     async def _ensure_seat(self, room_id: str, user_id: str) -> None:
         state = await self._api.get_room_state(
