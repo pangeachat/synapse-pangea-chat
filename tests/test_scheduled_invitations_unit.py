@@ -178,7 +178,7 @@ class TestScheduling(_Scheduled):
                 TEACHER, {"room_id": ROOM, "send_at_ms": bad, "items": items}
             )
             self.assertEqual(status, 400, bad)
-            self.assertEqual(body["errcode"], "M_INVALID_PARAM")
+            self.assertEqual(body["errcode"], "ORG.PANGEA.INVALID_SEND_AT")
         self.assertIsNone((await self.h.row(ident))["send_at_ms"])
 
     async def test_schedule_is_for_course_admins_and_needs_a_class_code(self):

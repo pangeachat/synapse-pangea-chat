@@ -388,7 +388,10 @@ class StudentInvitationHandlers:
             return refusal
         send_at = _future_ms(body.get("send_at_ms"), now_ms())
         if send_at is None:
-            return _bad("'send_at_ms' must be a future time within 366 days")
+            return 400, {
+                "error": "'send_at_ms' must be a future time within 366 days",
+                "errcode": "ORG.PANGEA.INVALID_SEND_AT",
+            }
         parsed, invalid = _send_items(body.get("items"))
         if invalid is not None:
             return invalid
