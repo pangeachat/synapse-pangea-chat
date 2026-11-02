@@ -25,6 +25,7 @@ from urllib.parse import urlencode
 from synapse.api.constants import EventTypes, RoomCreationPreset
 from synapse.api.errors import (
     AuthError,
+    LimitExceededError,
     InvalidClientTokenError,
     MissingClientTokenError,
 )
@@ -66,6 +67,10 @@ DISCUSSION_ROLE_ID = "participant"
 DISCUSSION_ROLE_NAME = "Participant"
 
 CMS_AUTH_COLLECTION = "service-users"
+
+# Tries at joining a student past Synapse's per-room join limit, each waiting
+# as long as Synapse asks (capped): about ten seconds at its defaults.
+JOIN_ATTEMPTS = 6
 
 
 class DiscussionNotFound(Exception):
@@ -314,6 +319,16 @@ class DiscussionRoom(Resource):
             respond_with_json(
                 request, 200, {"room_id": room_id, "created": created}, send_cors=True
             )
+        # silent-ok: answered 429, the room still refusing joins after every
+        # retry; the student is asked to try again
+        except LimitExceededError:
+            logger.warning("discussion_room: joins still rate limited, answered busy")
+            respond_with_json(
+                request,
+                429,
+                {"error": "Busy, try again", "errcode": "M_LIMIT_EXCEEDED"},
+                send_cors=True,
+            )
         # silent-ok: answered 404, a caller asking for an activity that is not
         # one of this course's discussions
         except DiscussionNotFound:
@@ -348,32 +363,51 @@ class DiscussionRoom(Resource):
 
     async def _survey(
         self, user_id: str, course_id: str, activity_id: str
-    ) -> Tuple[Optional[str], List[Tuple[str, int]], FrozenSet[str]]:
+    ) -> Tuple[Optional[str], List[Tuple[str, int, int]], FrozenSet[str]]:
         """The discussion's rooms as placement sees them: the student's own
         room if they are in one, else each room with its student count
-        (course admins and the bot never count), and the course's admins.
-        Shared by placing a student and previewing where they would go, so
-        the two never disagree."""
+        (course admins and the bot never count) and when it was created, and
+        the course's admins. Shared by placing a student and previewing where
+        they would go, so the two never disagree.
+
+        A course admin is joined to every session room to read it
+        (course_session_admins), so their own room is the one they hold a seat
+        in, not any room they are in."""
         admins = await self._course_admins(course_id)
         rooms = await _activity_session_ids(
             await _child_room_ids([course_id], self._store), activity_id, self._store
         )
-        counts: List[Tuple[str, int]] = []
+        is_admin = user_id in admins
+        rooms_info: List[Tuple[str, int, int]] = []
         for room_id in rooms:
             members = await self._joined_members(room_id)
-            if user_id in members:
-                return (
-                    room_id,
-                    [(room_id, self._student_count(members, admins))],
-                    admins,
-                )
-            counts.append((room_id, self._student_count(members, admins)))
-        return None, counts, admins
+            students = self._student_count(members, admins)
+            if user_id in members and (
+                not is_admin or await self._has_seat(room_id, user_id)
+            ):
+                return room_id, [(room_id, students, 0)], admins
+            rooms_info.append((room_id, students, await self._created_ts(room_id)))
+        return None, rooms_info, admins
 
     @staticmethod
     def _student_count(members: List[str], admins: FrozenSet[str]) -> int:
         return len(
             [m for m in members if m not in admins and not is_probable_bot_user_id(m)]
+        )
+
+    def _choose(
+        self, user_id: str, rooms: List[Tuple[str, int, int]], admins: FrozenSet[str]
+    ) -> Optional[str]:
+        """The room to put someone with no room of their own in: a student
+        goes to the fullest room with space; a course admin, who never counts
+        toward a room's students, to the newest room. None means a new room."""
+        if user_id in admins:
+            if not rooms:
+                return None
+            return max(rooms, key=lambda r: r[2])[0]
+        return pick_room(
+            [(room_id, students) for room_id, students, _ in rooms],
+            self._config.discussion_room_capacity,
         )
 
     async def _place(
@@ -384,15 +418,15 @@ class DiscussionRoom(Resource):
         plan: Dict[str, Any],
         avatar_url: Optional[str],
     ) -> Tuple[str, bool]:
-        own, counts, admins = await self._survey(user_id, course_id, activity_id)
+        own, rooms, admins = await self._survey(user_id, course_id, activity_id)
         if own is not None:
             # Their own room: back to it, ended or not.
             await self._ensure_seat(own, user_id)
             return own, False
 
-        room_id = pick_room(counts, self._config.discussion_room_capacity)
+        room_id = self._choose(user_id, rooms, admins)
         if room_id is not None:
-            await server_initiated_join(self._api, room_id, user_id)
+            await self._join(room_id, user_id)
             await self._ensure_seat(room_id, user_id)
             return room_id, False
 
@@ -407,12 +441,47 @@ class DiscussionRoom(Resource):
         """Where the student would be placed now, without placing them: their
         own room, else the room placement would pick, else none (a new room).
         `students` counts that room's students; 0 for a new room."""
-        own, counts, _ = await self._survey(user_id, course_id, activity_id)
+        own, rooms, admins = await self._survey(user_id, course_id, activity_id)
         if own is not None:
-            return {"room_id": own, "students": counts[0][1], "joined": True}
-        room_id = pick_room(counts, self._config.discussion_room_capacity)
-        students = dict(counts).get(room_id, 0) if room_id is not None else 0
+            return {"room_id": own, "students": rooms[0][1], "joined": True}
+        room_id = self._choose(user_id, rooms, admins)
+        students = (
+            next(n for r, n, _ in rooms if r == room_id) if room_id is not None else 0
+        )
         return {"room_id": room_id, "students": students, "joined": False}
+
+    async def _join(self, room_id: str, user_id: str) -> None:
+        """Join on the server's side, waiting out Synapse's per-room join
+        limit: a class told to open the discussion at once arrives faster than
+        it allows. Gives up after [JOIN_ATTEMPTS], raising its refusal, which
+        the endpoint answers as busy."""
+        for attempt in range(JOIN_ATTEMPTS):
+            try:
+                await server_initiated_join(self._api, room_id, user_id)
+                return
+            except LimitExceededError as e:
+                if attempt == JOIN_ATTEMPTS - 1:
+                    raise
+                wait_ms = e.retry_after_ms or 1000
+                await self._api.sleep(min(max(wait_ms, 200), 5000) / 1000)
+
+    async def _has_seat(self, room_id: str, user_id: str) -> bool:
+        state = await self._api.get_room_state(
+            room_id, event_filter=[(ACTIVITY_ROLES_EVENT, "")]
+        )
+        current = state.get((ACTIVITY_ROLES_EVENT, ""))
+        roles = (current.content.get("roles") if current is not None else None) or {}
+        return any(
+            isinstance(seat, dict) and seat.get("user_id") == user_id
+            for seat in roles.values()
+        )
+
+    async def _created_ts(self, room_id: str) -> int:
+        state = await self._api.get_room_state(
+            room_id, event_filter=[(EventTypes.Create, "")]
+        )
+        create = state.get((EventTypes.Create, ""))
+        return create.origin_server_ts if create is not None else 0
 
     async def _create(
         self,
@@ -515,7 +584,7 @@ class DiscussionRoom(Resource):
         )
         if bot_user_id:
             # The course's members are admitted by the room's restricted join.
-            await server_initiated_join(self._api, room_id, user_id)
+            await self._join(room_id, user_id)
         else:
             logger.error(
                 "discussion_room: no bot configured, room %s has no facilitator",
