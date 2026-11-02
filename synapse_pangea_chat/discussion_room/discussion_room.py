@@ -354,6 +354,11 @@ class DiscussionRoom(Resource):
         }
         if plan.get("description"):
             config["topic"] = plan["description"]
+        bot_user_id = self._config.user_activity_notification_bot_user_id
+        # The bot facilitates every discussion. It is no course member, so the
+        # room's restricted join admits it only through this invite.
+        if bot_user_id:
+            config["invite"] = [bot_user_id]
         room_id, _, _ = await self._api._hs.get_room_creation_handler().create_room(
             requester=create_requester(
                 user_id, authenticated_entity=self._api.server_name
@@ -386,7 +391,26 @@ class DiscussionRoom(Resource):
                 "content": power,
             }
         )
+        if bot_user_id:
+            await self._join_bot(room_id, bot_user_id)
+        else:
+            logger.error(
+                "discussion_room: no bot configured, room %s has no facilitator",
+                room_id,
+            )
         return room_id
+
+    async def _join_bot(self, room_id: str, bot_user_id: str) -> None:
+        """Join the bot on the server's side rather than waiting on it to
+        accept, so the room has its facilitator before the student's first
+        message. A failed join leaves the invite for the bot to accept."""
+        try:
+            await server_initiated_join(self._api, room_id, bot_user_id)
+        except Exception:
+            logger.exception(
+                "discussion_room: bot join failed for %s; invite left pending",
+                room_id,
+            )
 
     async def _ensure_seat(self, room_id: str, user_id: str) -> None:
         state = await self._api.get_room_state(
