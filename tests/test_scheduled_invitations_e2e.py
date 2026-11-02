@@ -150,6 +150,77 @@ class TestScheduledInvitationsE2E(BaseSynapseE2ETest):
             [(e["target"], e["actor"]) for e in sent], [(ids[0], "system")]
         )
 
+    async def test_a_moved_row_sends_once_at_its_new_time_and_send_now_clears_its_own(
+        self,
+    ):
+        await self.homeserver(
+            module_config={"app_base_url": APP},
+            synapse_config_overrides={
+                "email": self.sink.synapse_email_config(),
+                "templates": {"custom_template_directory": self.templates},
+            },
+        )
+        teacher, token = await self.new_user("teacher")
+        room = self.course(token)
+        moved, early = (
+            f"{name}+{self.tag}@school.example" for name in ("moved", "early")
+        )
+        added: List[Dict[str, Any]] = self.call(
+            "POST",
+            SI + "add",
+            token,
+            {"room_id": room, "emails": [moved, early], "source": "manual"},
+        )["invitations"]
+        moved_id, early_id = (row["invitation_id"] for row in added)
+        first = int(time.time() * 1000) + 2000
+        self.schedule(room, token, moved_id, first)
+        self.schedule(room, token, early_id, first)
+        # A full tick falls between the two times.
+        second = first + (TICK_SECONDS + 10) * 1000
+        self.schedule(room, token, moved_id, second)
+        self.assertEqual(self.rows(room, token)[moved_id]["send_at_ms"], second)
+
+        answer = self.call(
+            "POST",
+            SI + "send",
+            token,
+            {
+                "room_id": room,
+                "early": True,
+                "items": [{"invitation_id": early_id, "expected_send_count": 0}],
+            },
+        )
+        self.assertEqual(answer["results"][0]["outcome"], "sent", answer)
+        self.assertIsNotNone(self.sink.wait_for(early, SUBJECT, timeout=30))
+        self.assertIsNone(self.rows(room, token)[early_id]["send_at_ms"])
+
+        time.sleep(max(0.0, second / 1000 - time.time() - 1))
+        self.assertEqual(self.sink.messages_to(moved), [], "silent at the first time")
+
+        mail = self.sink.wait_for(moved, SUBJECT, timeout=TICK_SECONDS + 30)
+        self.assertIsNotNone(mail)
+        self.assertGreaterEqual(int(time.time() * 1000), second)
+
+        # One more real tick: neither goes twice.
+        time.sleep(TICK_SECONDS + 5)
+        self.assertEqual(len(self.sink.messages_to(moved)), 1)
+        self.assertEqual(len(self.sink.messages_to(early)), 1)
+        rows = self.rows(room, token)
+        self.assertEqual(rows[moved_id]["send_count"], 1)
+        self.assertEqual(rows[early_id]["send_count"], 1)
+        self.assertIsNone(rows[moved_id]["send_at_ms"])
+        events = self.call("GET", SI + f"events?room_id={quote(room, safe='')}", token)[
+            "events"
+        ]
+        moves = [
+            e
+            for e in events
+            if e["action"] == "invite_scheduled" and e["target"] == moved_id
+        ]
+        self.assertEqual(len(moves), 2)
+        sent = {e["target"]: e["actor"] for e in events if e["action"] == "invite_sent"}
+        self.assertEqual(sent, {moved_id: "system", early_id: teacher})
+
 
 class TestDueQueryOnPostgres(unittest.TestCase):
     """The additive migration and the due query on real Postgres."""

@@ -26,8 +26,6 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, cast
 
 from synapse.metrics.background_process_metrics import run_as_background_process
-from twisted.internet.error import ConnectError, DNSLookupError
-from twisted.mail.smtp import SMTPClientError, SMTPConnectError
 
 from synapse_pangea_chat.moderation.compat import (
     background_process_args,
@@ -38,6 +36,7 @@ from synapse_pangea_chat.student_invitations.api import (
     MAX_SEND_AHEAD_MS,
     CourseRooms,
     Mailer,
+    not_delivered,
     send_failure,
 )
 from synapse_pangea_chat.student_invitations.claim import now_ms
@@ -56,13 +55,6 @@ __all__ = [
 TICK_SECONDS = 60
 BATCH = 20
 RETRY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000
-
-
-def _not_delivered(error: BaseException) -> bool:
-    """True only when the mail server cannot have accepted the message."""
-    if isinstance(error, (ConnectError, DNSLookupError, SMTPConnectError)):
-        return True
-    return isinstance(error, SMTPClientError) and 400 <= int(error.code or 0) < 500
 
 
 class NoClassCode(Exception):
@@ -136,7 +128,7 @@ class ScheduledInvites:
         except Exception as error:
             reason = send_failure(error)
             late = self._now() - row["send_at_ms"] > RETRY_WINDOW_MS
-            retry = _not_delivered(error) and not late
+            retry = not_delivered(error) and not late
             await self._store.release_send(row, keep_schedule=retry)
             report_failure(
                 "scheduled invitation",

@@ -44,7 +44,8 @@ from synapse.http.site import SynapseRequest
 from synapse.logging.context import run_in_background
 from synapse.types import RoomID
 from synapse.util.threepids import validate_email
-from twisted.mail.smtp import SMTPDeliveryError
+from twisted.internet.error import ConnectError, DNSLookupError
+from twisted.mail.smtp import SMTPClientError, SMTPConnectError, SMTPDeliveryError
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
@@ -246,6 +247,13 @@ def send_failure(error: BaseException) -> str:
     return "mail_error"
 
 
+def not_delivered(error: BaseException) -> bool:
+    """True only when the mail server cannot have accepted the message."""
+    if isinstance(error, (ConnectError, DNSLookupError, SMTPConnectError)):
+        return True
+    return isinstance(error, SMTPClientError) and 400 <= int(error.code or 0) < 500
+
+
 class StudentInvitationHandlers:
     """Each route as a function of the caller and its parsed input, returning
     (status, body)."""
@@ -330,6 +338,11 @@ class StudentInvitationHandlers:
         parsed, invalid = _send_items(body.get("items"))
         if invalid is not None:
             return invalid
+        # ``early`` sends a row waiting for its time now; without it a waiting
+        # row is left alone.
+        early = body.get("early", False)
+        if not isinstance(early, bool):
+            return _bad("'early' must be a boolean")
         code = await self._rooms.access_code(room_id)
         if not code:
             return NO_CLASS_CODE
@@ -337,7 +350,7 @@ class StudentInvitationHandlers:
         stopped: Optional[str] = None
         for ident, expected in parsed:
             status, before = await self._store.reserve_send(
-                room_id, ident, expected, now_ms()
+                room_id, ident, expected, now_ms(), early=early
             )
             if status != "reserved" or before is None:
                 results.append(
@@ -348,7 +361,11 @@ class StudentInvitationHandlers:
                 await self._mailer.send_invite(before, code)
             except Exception as error:
                 reason = send_failure(error)
-                await self._store.release_send(before)
+                # A row sent early goes back to its time only when no email can
+                # have reached the student: the loop would send it unasked.
+                await self._store.release_send(
+                    before, keep_schedule=not_delivered(error)
+                )
                 logger.warning(
                     "student invitation %s not sent: %s (%s)",
                     ident,

@@ -621,13 +621,15 @@ class StudentInvitationStore:
         invitation_id: str,
         expected: int,
         now_ms: int,
+        early: bool = False,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Compare-and-set the send count before a send. The send's event is
         written by ``record_sent`` once the email is accepted.
 
         Returns ("reserved", row before), ("not_invited", None), ("stale", None)
         or ("scheduled", None) for a row waiting for its ``send_at_ms``, which
-        no send call may email early."""
+        only an ``early`` send may email. The reservation clears that time in
+        the same write, so the loop's claim of the row finds it gone."""
         await self.ensure()
 
         def write(txn: Any) -> Tuple[str, Optional[Dict]]:
@@ -638,11 +640,11 @@ class StudentInvitationStore:
             )
             if row is None or row["state"] != STATE_INVITED:
                 return "not_invited", None
-            if row["send_at_ms"] is not None:
+            if row["send_at_ms"] is not None and not early:
                 return "scheduled", None
             txn.execute(
-                "UPDATE pangea_seat_invitation"
-                " SET send_count = send_count + 1, last_sent_at_ms = ?"
+                "UPDATE pangea_seat_invitation SET send_count = send_count + 1,"
+                " last_sent_at_ms = ?, send_at_ms = NULL"
                 " WHERE id = ? AND state = 'invited' AND send_count = ?",
                 (now_ms, invitation_id, expected),
             )

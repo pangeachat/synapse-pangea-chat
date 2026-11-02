@@ -343,6 +343,212 @@ class TestNoDoubleSend(_Scheduled):
         self.assertEqual(sent[0]["actor"], "system")
 
 
+class TestChangingTheTime(_Scheduled):
+    async def test_a_moved_row_passes_its_first_time_and_sends_once_at_its_new_one(
+        self,
+    ):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident, at=self.now + DAY_MS)
+        await self.schedule(ident, at=self.now + 2 * DAY_MS)
+        self.now += DAY_MS
+        await self.sender.run_due()
+        self.assertEqual(self.h.mailer.sent, [], "nothing at the first time")
+        self.now += DAY_MS
+        await self.sender.run_due()
+        self.now += DAY_MS
+        await self.sender.run_due()
+        self.assertEqual(self.sent_ids(), [ident])
+
+    async def test_a_row_can_be_moved_earlier(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident, at=self.now + 2 * DAY_MS)
+        await self.schedule(ident, at=self.now + DAY_MS)
+        self.now += DAY_MS
+        await self.sender.run_due()
+        self.assertEqual(self.sent_ids(), [ident])
+
+    async def test_a_row_moved_after_the_tick_read_it_is_not_sent_at_its_old_time(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        later = self.now + DAY_MS
+        read = self.h.rooms.access_code
+
+        async def moved_during_the_read(room):
+            self.h.rooms.access_code = read
+            await self.schedule(ident, at=later)
+            return await read(room)
+
+        self.h.rooms.access_code = moved_during_the_read
+        await self.sender.run_due()
+        self.assertEqual(self.h.mailer.sent, [])
+        self.assertEqual((await self.h.row(ident))["send_at_ms"], later)
+
+    async def test_a_row_being_sent_cannot_be_moved(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        answers: List[Dict[str, Any]] = []
+        send = self.h.mailer.send_invite
+
+        async def moved_mid_send(*args: Any) -> None:
+            answers.append(await self.schedule(ident, at=self.now + DAY_MS))
+            await send(*args)
+
+        self.h.mailer.send_invite = moved_mid_send
+        await self.sender.run_due()
+        self.assertEqual(
+            answers[0]["results"],
+            [{"invitation_id": ident, "outcome": "skipped", "reason": "stale"}],
+        )
+        self.assertIsNone((await self.h.row(ident))["send_at_ms"])
+        self.now += DAY_MS
+        await self.sender.run_due()
+        self.assertEqual(self.sent_ids(), [ident])
+
+    async def test_a_row_already_sent_says_so_and_stays_sent(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        await self.sender.run_due()
+        body = await self.schedule(ident, at=self.now + DAY_MS)
+        self.assertEqual(body["results"][0]["reason"], "stale")
+        self.now += DAY_MS
+        await self.sender.run_due()
+        self.assertEqual(self.sent_ids(), [ident])
+
+
+class TestSendNow(_Scheduled):
+    async def send_early(self, *ids: str, expected: int = 0) -> Dict[str, Any]:
+        status, body = await self.h.handlers.send(
+            TEACHER,
+            {
+                "room_id": ROOM,
+                "early": True,
+                "items": [
+                    {"invitation_id": i, "expected_send_count": expected} for i in ids
+                ],
+            },
+        )
+        self.assertEqual(status, 200, body)
+        return body
+
+    async def test_send_now_emails_a_waiting_row_once_and_the_loop_leaves_it(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        body = await self.send_early(ident)
+        self.assertEqual(body["results"][0]["outcome"], "sent")
+        after = await self.h.row(ident)
+        self.assertIsNone(after["send_at_ms"])
+        self.assertEqual(after["send_count"], 1)
+        self.now += DAY_MS
+        await self.sender.run_due()
+        self.now += DAY_MS
+        await self.sender.run_due()
+        self.assertEqual(self.sent_ids(), [ident])
+
+    async def test_send_now_is_recorded_as_the_teachers_send(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        await self.send_early(ident)
+        sent = [e for e in await self.h.events() if e["action"] == "invite_sent"]
+        self.assertEqual([e["actor"] for e in sent], [TEACHER])
+
+    async def test_a_second_click_sends_once(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        await self.send_early(ident)
+        body = await self.send_early(ident)
+        self.assertEqual(
+            body["results"],
+            [{"invitation_id": ident, "outcome": "skipped", "reason": "stale"}],
+        )
+        self.assertEqual(self.sent_ids(), [ident])
+
+    async def test_send_now_after_the_loop_claimed_the_row_sends_nothing_more(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        await self.sender.run_due()
+        body = await self.send_early(ident)
+        self.assertEqual(body["results"][0]["reason"], "stale")
+        self.assertEqual(self.sent_ids(), [ident])
+
+    async def test_the_loop_cannot_claim_a_row_send_now_took_after_its_read(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        due = await self.h.store.next_due(self.now)
+        await self.send_early(ident)
+        self.assertFalse(await self.h.store.claim_due(due, self.now))
+        self.assertEqual(self.sent_ids(), [ident])
+
+    async def test_without_the_word_a_send_still_will_not_email_a_waiting_row(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        body = await self.send_now(ident)
+        self.assertEqual(body["results"][0]["reason"], "scheduled")
+        self.assertEqual(self.h.mailer.sent, [])
+
+    async def test_early_must_be_a_boolean(self):
+        (row,) = await self.h.add(INVITED)
+        status, _ = await self.h.handlers.send(
+            TEACHER,
+            {
+                "room_id": ROOM,
+                "early": "yes",
+                "items": [
+                    {
+                        "invitation_id": row["invitation_id"],
+                        "expected_send_count": 0,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(status, 400)
+
+    async def test_a_send_now_nothing_delivered_goes_back_to_its_time(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        at = (await self.h.row(ident))["send_at_ms"]
+        self.h.mailer.fail_with = ConnectionRefusedError()
+        body = await self.send_early(ident)
+        self.assertEqual(body["results"][0]["outcome"], "failed")
+        after = await self.h.row(ident)
+        self.assertEqual((after["send_at_ms"], after["send_count"]), (at, 0))
+        self.h.mailer.fail_with = None
+        self.now += DAY_MS
+        await self.sender.run_due()
+        self.assertEqual(self.sent_ids(), [ident])
+
+    async def test_a_send_now_that_may_have_delivered_is_never_sent_again_on_its_own(
+        self,
+    ):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.h.mailer.fail_with = ConnectionLost()
+        body = await self.send_early(ident)
+        self.assertEqual(body["results"][0]["outcome"], "failed")
+        self.assertIsNone((await self.h.row(ident))["send_at_ms"])
+        self.h.mailer.fail_with = None
+        self.now += DAY_MS
+        await self.sender.run_due()
+        self.assertEqual(self.h.mailer.sent, [])
+
+
 class TestBounds(_Scheduled):
     async def test_a_tick_sends_a_fixed_batch_oldest_first_and_leaves_the_rest(self):
         emails = [f"s{i}@school.example" for i in range(BATCH + 3)]
