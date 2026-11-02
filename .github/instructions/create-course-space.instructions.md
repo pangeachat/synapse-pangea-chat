@@ -4,7 +4,7 @@ applyTo: "synapse_pangea_chat/email_invite/**"
 
 # Create Course Space — Synapse Module
 
-Cross-repo design: [teacher-funnel.instructions.md](../../../.github/.github/instructions/teacher-funnel.instructions.md)
+Cross-repo design: [teacher-funnel.instructions.md](../../../engagement/.github/instructions/teacher-funnel.instructions.md)
 
 ## Deferred v2 preparation
 
