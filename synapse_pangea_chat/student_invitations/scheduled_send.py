@@ -96,7 +96,7 @@ class ScheduledInvites:
         self._running = True
         try:
             for _ in range(BATCH):
-                row = await self._store.claim_due(self._now())
+                row = await self._store.next_due(self._now())
                 if row is None or not await self._deliver(row):
                     return
         except Exception as error:
@@ -105,18 +105,21 @@ class ScheduledInvites:
             self._running = False
 
     async def _deliver(self, row: Dict[str, Any]) -> bool:
-        """Email one claimed row. False when the tick should stop."""
+        """Email one due row. False when the tick should stop."""
         room_id = row["course_room_id"]
         ident = row["id"]
+        # Read before the claim, so the claim is the last check of the row
+        # before the email. A failed read claims nothing: the row stays due.
+        code = await self._rooms.access_code(room_id)
+        if not code:
+            count = await self._store.unschedule_course(room_id)
+            report_failure(
+                "scheduled invitations", NoClassCode(), room=room_id, count=count
+            )
+            return True
+        if not await self._store.claim_due(row, self._now()):
+            return True
         try:
-            code = await self._rooms.access_code(room_id)
-            if not code:
-                await self._store.release_send(row)
-                count = 1 + await self._store.unschedule_course(room_id)
-                report_failure(
-                    "scheduled invitations", NoClassCode(), room=room_id, count=count
-                )
-                return True
             await self._mailer.send_invite(row, code)
         except Exception as error:
             reason = send_failure(error)

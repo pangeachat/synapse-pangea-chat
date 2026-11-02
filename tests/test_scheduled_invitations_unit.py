@@ -229,6 +229,24 @@ class TestNeverEmailed(_Scheduled):
         await self.sender.run_due()
         self.assertEqual(self.sent_ids(), [second])
 
+    async def test_a_row_revoked_while_the_tick_reads_the_course_is_not_emailed(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        working = self.h.rooms.access_code
+
+        async def revoked_meanwhile(room_id: str) -> Optional[str]:
+            await self.h.handlers.revoke(
+                TEACHER, {"room_id": ROOM, "invitation_id": ident}
+            )
+            return await working(room_id)
+
+        self.h.rooms.access_code = revoked_meanwhile
+        await self.sender.run_due()
+        self.assertEqual(self.h.mailer.sent, [])
+        self.assertEqual((await self.h.row(ident))["send_count"], 0)
+
     async def test_a_claimed_row_is_never_emailed(self):
         (row,) = await self.h.add(INVITED)
         ident = row["invitation_id"]
@@ -274,8 +292,10 @@ class TestNoDoubleSend(_Scheduled):
         (row,) = await self.h.add(INVITED)
         await self.schedule(row["invitation_id"])
         self.now += DAY_MS
-        self.assertIsNotNone(await self.h.store.claim_due(self.now))
-        self.assertIsNone(await self.h.store.claim_due(self.now))
+        due = await self.h.store.next_due(self.now)
+        self.assertTrue(await self.h.store.claim_due(due, self.now))
+        self.assertFalse(await self.h.store.claim_due(due, self.now))
+        self.assertIsNone(await self.h.store.next_due(self.now))
 
     async def test_a_claimed_row_lost_mid_send_is_not_sent_again(self):
         # The process died after the claim: the row is not due again.
@@ -283,7 +303,8 @@ class TestNoDoubleSend(_Scheduled):
         ident = row["invitation_id"]
         await self.schedule(ident)
         self.now += DAY_MS
-        await self.h.store.claim_due(self.now)
+        due = await self.h.store.next_due(self.now)
+        await self.h.store.claim_due(due, self.now)
         await self.sender.run_due()
         self.assertEqual(self.h.mailer.sent, [])
 
@@ -357,6 +378,23 @@ class TestFailures(_Scheduled):
         self.h.mailer.fail_with = None
         await self.sender.run_due()
         self.assertEqual(sorted(self.sent_ids()), sorted(ids))
+
+    async def test_a_time_set_during_a_failed_send_stands(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        later = self.now + DAY_MS
+
+        async def rescheduled_then_fails(*_: Any) -> None:
+            await self.schedule(ident, at=later, expected=1)
+            raise ConnectionError("mail service down")
+
+        self.h.mailer.send_invite = rescheduled_then_fails
+        await self.sender.run_due()
+        after = await self.h.row(ident)
+        self.assertEqual(after["send_at_ms"], later)
+        self.assertEqual(after["send_count"], 0)
 
     async def test_a_row_failing_past_the_retry_window_stops_and_logs(self):
         (row,) = await self.h.add(INVITED)

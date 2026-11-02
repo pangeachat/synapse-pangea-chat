@@ -699,22 +699,27 @@ class StudentInvitationStore:
 
         return await self.db.runInteraction("pangea_seat_invitation_schedule", write)
 
-    async def claim_due(self, now_ms: int) -> Optional[Dict[str, Any]]:
-        """Claim the oldest due row, or None. The claim takes the row out of
-        the due set and counts the send before any email, in one compare-and-
-        set, so no second claim, restart or send call can email it again.
-        Returns the row as it was before the claim."""
+    async def next_due(self, now_ms: int) -> Optional[Dict[str, Any]]:
+        """The oldest due row, or None."""
         await self.ensure()
 
-        def write(txn: Any) -> Optional[Dict]:
-            row = _select_one(
+        def select(txn: Any) -> Optional[Dict]:
+            return _select_one(
                 txn,
                 "WHERE state = 'invited' AND send_at_ms IS NOT NULL"
                 " AND send_at_ms <= ? ORDER BY send_at_ms, id LIMIT 1",
                 (now_ms,),
             )
-            if row is None:
-                return None
+
+        return await self.db.runInteraction("pangea_seat_invitation_due", select)
+
+    async def claim_due(self, row: Dict[str, Any], now_ms: int) -> bool:
+        """Claim a row read from ``next_due``, unless it changed since: revoked,
+        claimed, sent or rescheduled. The claim takes the row out of the due
+        set and counts the send before any email, in one compare-and-set, so no
+        second claim, restart or send call can email it again."""
+
+        def write(txn: Any) -> bool:
             txn.execute(
                 "UPDATE pangea_seat_invitation SET send_count = send_count + 1,"
                 " last_sent_at_ms = ?, send_at_ms = NULL"
@@ -722,7 +727,7 @@ class StudentInvitationStore:
                 " AND send_at_ms = ?",
                 (now_ms, row["id"], row["send_count"], row["send_at_ms"]),
             )
-            return row if txn.rowcount == 1 else None
+            return bool(txn.rowcount == 1)
 
         return await self.db.runInteraction("pangea_seat_invitation_claim_due", write)
 
@@ -747,12 +752,14 @@ class StudentInvitationStore:
     ) -> None:
         """Undo a reservation whose email was not sent, unless the row moved
         on. A failed send wrote no event, so the ledger is untouched.
-        ``keep_schedule`` puts a claimed row back in the due set."""
+        ``keep_schedule`` puts a claimed row back in the due set; a time set
+        since the claim stands either way."""
 
         def write(txn: Any) -> None:
             txn.execute(
                 "UPDATE pangea_seat_invitation"
-                " SET send_count = ?, last_sent_at_ms = ?, send_at_ms = ?"
+                " SET send_count = ?, last_sent_at_ms = ?,"
+                " send_at_ms = COALESCE(send_at_ms, ?)"
                 " WHERE id = ? AND send_count = ?",
                 (
                     before["send_count"],
