@@ -55,7 +55,7 @@ _COUNT_CACHE_TTL_SECONDS = 60
 # every request. Cap it and evict the oldest entry once it is full.
 _COUNT_CACHE_MAX_ENTRIES = 256
 
-logger = logging.getLogger("synapse_pangea_chat.get_public_courses")
+logger = logging.getLogger("synapse.module.synapse_pangea_chat.get_public_courses")
 
 # List of state events required to build a course preview
 RESPONSE_STATE_EVENTS: Tuple[str, ...] = (
