@@ -180,9 +180,7 @@ class DiscussionRoom(Resource):
         try:
             requester = await self._auth.get_user_by_req(request)
             user_id = requester.user.to_string()
-            # Its own window, so a start page refreshing its count never uses
-            # up the student's joins.
-            if is_rate_limited(f"{user_id}:preview", self._config):
+            if is_rate_limited(user_id, self._config, preview=True):
                 respond_with_json(
                     request, 429, {"error": "Rate limited"}, send_cors=True
                 )

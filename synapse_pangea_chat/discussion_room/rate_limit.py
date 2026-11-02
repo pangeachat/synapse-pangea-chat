@@ -9,14 +9,26 @@ if TYPE_CHECKING:
 _request_log: Dict[str, List[float]] = {}
 
 
-def is_rate_limited(user_id: str, config: PangeaChatConfig) -> bool:
-    """Per-user sliding window for the discussion_room endpoint."""
+# A start page asks for its preview every few seconds while open, so the
+# preview gets this many times the join allowance.
+PREVIEW_ALLOWANCE_FACTOR = 3
+
+
+def is_rate_limited(
+    user_id: str, config: PangeaChatConfig, *, preview: bool = False
+) -> bool:
+    """Per-user sliding window for the discussion_room endpoint; previews are
+    counted in a window of their own, so polling never uses up joins."""
     now = time.time()
     window = config.discussion_room_burst_duration_seconds
-    recent = [t for t in _request_log.get(user_id, []) if now - t <= window]
-    if len(recent) >= config.discussion_room_requests_per_burst:
-        _request_log[user_id] = recent
+    key = f"{user_id}:preview" if preview else user_id
+    limit = config.discussion_room_requests_per_burst * (
+        PREVIEW_ALLOWANCE_FACTOR if preview else 1
+    )
+    recent = [t for t in _request_log.get(key, []) if now - t <= window]
+    if len(recent) >= limit:
+        _request_log[key] = recent
         return True
     recent.append(now)
-    _request_log[user_id] = recent
+    _request_log[key] = recent
     return False
