@@ -144,6 +144,14 @@ def discussion_power_levels(
     }
 
 
+def _query_arg(request: SynapseRequest, name: str) -> Optional[str]:
+    values = request.args.get(name.encode()) if request.args else None
+    if not values:
+        return None
+    value = values[0].decode("utf-8", "replace").strip()
+    return value or None
+
+
 class DiscussionRoom(Resource):
     isLeaf = True
 
@@ -158,6 +166,89 @@ class DiscussionRoom(Resource):
         # Per process: a deploy that runs this endpoint on more than one
         # worker must route it to one, or move to the worker locks handler.
         self._locks = Linearizer("discussion_room", clock=api._hs.get_clock())
+
+    def render_GET(self, request: SynapseRequest):
+        run_in_background(self._async_render_GET, request)
+        return server.NOT_DONE_YET
+
+    async def _async_render_GET(self, request: SynapseRequest):
+        """Preview: which room opening the discussion would put the student
+        in and how many students it has, so the start page counts the room
+        they will land in. Read-only and unlocked: a placement that runs
+        between this and the student's tap places them by the room's state
+        then, never by this answer."""
+        try:
+            requester = await self._auth.get_user_by_req(request)
+            user_id = requester.user.to_string()
+            # Its own window, so a start page refreshing its count never uses
+            # up the student's joins.
+            if is_rate_limited(f"{user_id}:preview", self._config):
+                respond_with_json(
+                    request, 429, {"error": "Rate limited"}, send_cors=True
+                )
+                return
+            course_id = _query_arg(request, "course_id")
+            activity_id = _query_arg(request, "activity_id")
+            if not (course_id and activity_id):
+                respond_with_json(
+                    request,
+                    400,
+                    {"error": "'course_id' and 'activity_id' are required"},
+                    send_cors=True,
+                )
+                return
+            (
+                membership,
+                _,
+            ) = await self._store.get_local_current_membership_for_user_in_room(
+                user_id, course_id
+            )
+            if membership != "join":
+                respond_with_json(
+                    request,
+                    403,
+                    {"error": "Not a member of this course"},
+                    send_cors=True,
+                )
+                return
+            await self._discussion_plan(course_id, activity_id)
+            respond_with_json(
+                request,
+                200,
+                await self._preview(user_id, course_id, activity_id),
+                send_cors=True,
+            )
+        # silent-ok: answered 404, a caller asking for an activity that is not
+        # one of this course's discussions
+        except DiscussionNotFound:
+            respond_with_json(
+                request,
+                404,
+                {"error": "Not a discussion of this course"},
+                send_cors=True,
+            )
+        except CmsUnavailable as e:
+            logger.error("discussion_room preview: CMS unavailable: %s", e)
+            respond_with_json(
+                request,
+                502,
+                {"error": "Could not check the discussion"},
+                send_cors=True,
+            )
+        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
+        except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
+            logger.info("discussion_room preview: authentication failed: %s", e)
+            respond_with_json(
+                request,
+                401,
+                {"error": "Unauthorized", "errcode": "M_UNAUTHORIZED"},
+                send_cors=True,
+            )
+        except Exception:
+            logger.exception("discussion_room preview failed")
+            respond_with_json(
+                request, 500, {"error": "Internal server error"}, send_cors=True
+            )
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -257,14 +348,14 @@ class DiscussionRoom(Resource):
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
 
-    async def _place(
-        self,
-        user_id: str,
-        course_id: str,
-        activity_id: str,
-        plan: Dict[str, Any],
-        avatar_url: Optional[str],
-    ) -> Tuple[str, bool]:
+    async def _survey(
+        self, user_id: str, course_id: str, activity_id: str
+    ) -> Tuple[Optional[str], List[Tuple[str, int]], FrozenSet[str]]:
+        """The discussion's rooms as placement sees them: the student's own
+        room if they are in one, else each room with its student count
+        (course admins and the bot never count), and the course's admins.
+        Shared by placing a student and previewing where they would go, so
+        the two never disagree."""
         admins = await self._course_admins(course_id)
         rooms = await _activity_session_ids(
             await _child_room_ids([course_id], self._store), activity_id, self._store
@@ -273,13 +364,33 @@ class DiscussionRoom(Resource):
         for room_id in rooms:
             members = await self._joined_members(room_id)
             if user_id in members:
-                # Their own room: back to it, ended or not.
-                await self._ensure_seat(room_id, user_id)
-                return room_id, False
-            students = [
-                m for m in members if m not in admins and not is_probable_bot_user_id(m)
-            ]
-            counts.append((room_id, len(students)))
+                return (
+                    room_id,
+                    [(room_id, self._student_count(members, admins))],
+                    admins,
+                )
+            counts.append((room_id, self._student_count(members, admins)))
+        return None, counts, admins
+
+    @staticmethod
+    def _student_count(members: List[str], admins: FrozenSet[str]) -> int:
+        return len(
+            [m for m in members if m not in admins and not is_probable_bot_user_id(m)]
+        )
+
+    async def _place(
+        self,
+        user_id: str,
+        course_id: str,
+        activity_id: str,
+        plan: Dict[str, Any],
+        avatar_url: Optional[str],
+    ) -> Tuple[str, bool]:
+        own, counts, admins = await self._survey(user_id, course_id, activity_id)
+        if own is not None:
+            # Their own room: back to it, ended or not.
+            await self._ensure_seat(own, user_id)
+            return own, False
 
         room_id = pick_room(counts, self._config.discussion_room_capacity)
         if room_id is not None:
@@ -291,6 +402,19 @@ class DiscussionRoom(Resource):
             user_id, course_id, activity_id, plan, admins, avatar_url
         )
         return room_id, True
+
+    async def _preview(
+        self, user_id: str, course_id: str, activity_id: str
+    ) -> Dict[str, Any]:
+        """Where the student would be placed now, without placing them: their
+        own room, else the room placement would pick, else none (a new room).
+        `students` counts that room's students; 0 for a new room."""
+        own, counts, _ = await self._survey(user_id, course_id, activity_id)
+        if own is not None:
+            return {"room_id": own, "students": counts[0][1], "joined": True}
+        room_id = pick_room(counts, self._config.discussion_room_capacity)
+        students = dict(counts).get(room_id, 0) if room_id is not None else 0
+        return {"room_id": room_id, "students": students, "joined": False}
 
     async def _create(
         self,
