@@ -60,7 +60,8 @@ class TestEligibility(unittest.IsolatedAsyncioTestCase):
         gate, body, req, _ = self.setup_gate({"activity_not_started": True})
         gate._query.side_effect = RuntimeError("statement timeout")
         with self.assertLogs(
-            "synapse_pangea_chat.notice_delivery.eligibility", level="ERROR"
+            "synapse.module.synapse_pangea_chat.notice_delivery.eligibility",
+            level="ERROR",
         ):
             self.assertEqual(
                 await gate.check(body, req, "42"), "eligibility_unavailable"

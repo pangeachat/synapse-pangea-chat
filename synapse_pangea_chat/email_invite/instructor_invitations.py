@@ -27,7 +27,9 @@ from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.instructor_access import joined_local_instructors
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(
+    "synapse.module.synapse_pangea_chat.email_invite.instructor_invitations"
+)
 
 EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 ERRCODE_NO_ELIGIBLE_INSTRUCTOR = "ORG.PANGEA.NO_ELIGIBLE_INSTRUCTOR"

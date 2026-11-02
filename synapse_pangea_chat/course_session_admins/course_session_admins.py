@@ -43,6 +43,7 @@ from synapse_pangea_chat.course_default_chats.course_default_chats import (
     SPACE_ROOM_TYPE,
     wait_out_rate_limits,
 )
+from synapse_pangea_chat.push_rules_writer import push_rules_writer, writes_push_rules
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.instructor_access import is_joined_instructor
 
@@ -151,10 +152,8 @@ class CourseSessionAdmins:
         # The hook fires on every Synapse process, and a push rule can only be
         # written on the push rules writer ("master" on a single process), so
         # that one process does all the joins and the others nothing.
-        self.push_rules_writer = api._hs.config.worker.writers.push_rules[0]
-        self.is_push_rules_writer = (
-            api._hs.get_instance_name() == self.push_rules_writer
-        )
+        self.push_rules_writer = push_rules_writer(api)
+        self.is_push_rules_writer = writes_push_rules(api)
         self._state = api._hs.get_storage_controllers().state
         self._store = api._hs.get_datastores().main
         self._clock = api._hs.get_clock()

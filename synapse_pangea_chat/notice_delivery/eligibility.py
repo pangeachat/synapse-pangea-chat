@@ -13,7 +13,9 @@ from synapse_pangea_chat.blocked_join_gate.is_blocked_by_room_admin import (
 )
 from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(
+    "synapse.module.synapse_pangea_chat.notice_delivery.eligibility"
+)
 MAX_ROOMS = 256
 MAX_ROLES = 32
 FLAGS = {
