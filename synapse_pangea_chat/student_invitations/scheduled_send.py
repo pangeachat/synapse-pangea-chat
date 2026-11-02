@@ -8,9 +8,12 @@ The claim counts the send and takes the row out of the due set before any
 email, so a process dying mid-send loses that row's email rather than sending
 it twice: a resend is explicit. A failed send puts it back or gives it up:
 
-- the mail service failed: the row stays due and the tick stops, as the send
-  route stops, so an outage heals by itself, one attempt a minute. A row still
-  failing past ``RETRY_WINDOW_MS`` after its time is given up.
+- the mail server was never reached, or answered "try later": nothing was
+  delivered, so the row stays due and the tick stops, as the send route stops.
+  An outage heals by itself, one attempt a minute. A row still failing past
+  ``RETRY_WINDOW_MS`` after its time is given up.
+- anything else, including a connection lost mid-message, may have delivered:
+  given up rather than risk a second email, and logged.
 - the mail server refused the address: given up, it would only fail again.
 - the course has no class code: none of its rows can be sent, so all are given
   up, with one report.
@@ -23,6 +26,8 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, cast
 
 from synapse.metrics.background_process_metrics import run_as_background_process
+from twisted.internet.error import ConnectError, DNSLookupError
+from twisted.mail.smtp import SMTPClientError, SMTPConnectError
 
 from synapse_pangea_chat.moderation.compat import (
     background_process_args,
@@ -51,6 +56,13 @@ __all__ = [
 TICK_SECONDS = 60
 BATCH = 20
 RETRY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000
+
+
+def _not_delivered(error: BaseException) -> bool:
+    """True only when the mail server cannot have accepted the message."""
+    if isinstance(error, (ConnectError, DNSLookupError, SMTPConnectError)):
+        return True
+    return isinstance(error, SMTPClientError) and 400 <= int(error.code or 0) < 500
 
 
 class NoClassCode(Exception):
@@ -124,7 +136,7 @@ class ScheduledInvites:
         except Exception as error:
             reason = send_failure(error)
             late = self._now() - row["send_at_ms"] > RETRY_WINDOW_MS
-            retry = reason == "mail_error" and not late
+            retry = _not_delivered(error) and not late
             await self._store.release_send(row, keep_schedule=retry)
             report_failure(
                 "scheduled invitation",

@@ -9,7 +9,8 @@ import unittest
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
-from twisted.mail.smtp import SMTPDeliveryError
+from twisted.internet.error import ConnectionLost, ConnectionRefusedError
+from twisted.mail.smtp import SMTPDeliveryError, SMTPTimeoutError
 
 from synapse_pangea_chat.student_invitations.api import MAX_SEND
 from synapse_pangea_chat.student_invitations.claim import now_ms
@@ -367,7 +368,7 @@ class TestFailures(_Scheduled):
         ids = [r["invitation_id"] for r in rows]
         await self.schedule(*ids)
         self.now += DAY_MS
-        self.h.mailer.fail_with = ConnectionError("mail service down")
+        self.h.mailer.fail_with = ConnectionRefusedError()
         await self.sender.run_due()
         for ident in ids:
             row = await self.h.row(ident)
@@ -388,7 +389,7 @@ class TestFailures(_Scheduled):
 
         async def rescheduled_then_fails(*_: Any) -> None:
             await self.schedule(ident, at=later, expected=1)
-            raise ConnectionError("mail service down")
+            raise ConnectionRefusedError()
 
         self.h.mailer.send_invite = rescheduled_then_fails
         await self.sender.run_due()
@@ -396,12 +397,51 @@ class TestFailures(_Scheduled):
         self.assertEqual(after["send_at_ms"], later)
         self.assertEqual(after["send_count"], 0)
 
+    async def test_a_try_later_answer_keeps_the_row_due(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        self.h.mailer.fail_with = SMTPDeliveryError(451, b"try later")
+        await self.sender.run_due()
+        self.assertEqual((await self.h.row(ident))["send_at_ms"], self.now)
+
+    async def test_an_uncertain_delivery_is_never_sent_again_on_its_own(self):
+        for uncertain in (
+            ConnectionLost(),
+            SMTPTimeoutError(-1, b"timeout"),
+            RuntimeError("template"),
+        ):
+            self.h = Harness()
+            self.h.rooms.codes[ROOM] = "cl4sscd"
+            self.sender = ScheduledInvites(
+                self.h.api,
+                self.h.store,
+                self.h.rooms,
+                self.h.mailer,
+                now=lambda: self.now,
+            )
+            (row,) = await self.h.add(INVITED)
+            ident = row["invitation_id"]
+            await self.schedule(ident)
+            self.now += DAY_MS
+            self.h.mailer.fail_with = uncertain
+            logs = self.capture_logs()
+            await self.sender.run_due()
+            self.h.mailer.fail_with = None
+            await self.sender.run_due()
+            self.assertEqual(self.h.mailer.sent, [], repr(uncertain))
+            after = await self.h.row(ident)
+            self.assertIsNone(after["send_at_ms"])
+            self.assertEqual(after["send_count"], 0)
+            self.assertIn(ident, logs.text())
+
     async def test_a_row_failing_past_the_retry_window_stops_and_logs(self):
         (row,) = await self.h.add(INVITED)
         ident = row["invitation_id"]
         await self.schedule(ident)
         self.now += DAY_MS + RETRY_WINDOW_MS + 1
-        self.h.mailer.fail_with = ConnectionError("mail service down")
+        self.h.mailer.fail_with = ConnectionRefusedError()
         logs = self.capture_logs()
         await self.sender.run_due()
         after = await self.h.row(ident)
