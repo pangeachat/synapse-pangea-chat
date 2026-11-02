@@ -12,6 +12,7 @@ from synapse.events import EventBase
 from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
+from synapse_pangea_chat.notice_delivery.push_rule import writes_push_rules
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
 
 if TYPE_CHECKING:
@@ -93,12 +94,17 @@ class OpenSessionNotice:
         self._deliver = deliver
         self._bot_user_id = bot_user_id
         self._store = api._hs.get_datastores().main
+        # The hook fires on every Synapse process, and every one of them racing
+        # to insert the same schedule row is wasted work; the process that
+        # delivers notices schedules them.
+        self._schedules = writes_push_rules(api)
 
     async def on_new_event(
         self, event: EventBase, _: Mapping[Tuple[str, str], EventBase]
     ) -> None:
         if (
-            event.type != PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
+            not self._schedules
+            or event.type != PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
             or event.get_state_key() != ""
         ):
             return

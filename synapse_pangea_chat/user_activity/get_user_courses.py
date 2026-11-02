@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from synapse.storage.databases.main.room import RoomStore
 
-logger = logging.getLogger("synapse_pangea_chat.user_activity.get_user_courses")
+logger = logging.getLogger(
+    "synapse.module.synapse_pangea_chat.user_activity.get_user_courses"
+)
 
 PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE = "pangea.activity_plan"
 PANGEA_COURSE_PLAN_STATE_EVENT_TYPE = "pangea.course_plan"

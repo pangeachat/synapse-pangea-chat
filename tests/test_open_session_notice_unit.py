@@ -27,9 +27,13 @@ def plan_event(*, replaces=False, state_key="", event_type="pangea.activity_plan
 
 
 class TestOpenSessionNotice(unittest.IsolatedAsyncioTestCase):
-    def notice(self, *, creator=LEARNER, direct=None, dm_membership="join"):
+    def notice(
+        self, *, creator=LEARNER, direct=None, dm_membership="join", instance="master"
+    ):
         handler, api = TestScheduledDelivery().handler()
         handler.schedule.enqueue = AsyncMock(return_value={"status": "queued"})
+        api._hs.get_instance_name.return_value = instance
+        api._hs.config.worker.writers.push_rules = ["master"]
         api.is_mine = MagicMock(return_value=True)
         api.get_room_state = AsyncMock(
             return_value={
@@ -93,6 +97,11 @@ class TestOpenSessionNotice(unittest.IsolatedAsyncioTestCase):
             await notice.on_new_event(event, {})
             with self.subTest(event=event.type):
                 handler.schedule.enqueue.assert_not_awaited()
+
+    async def test_only_the_push_rules_writer_schedules(self):
+        notice, handler = self.notice(instance="matrix-synapse-worker-sync-0")
+        await notice.on_new_event(plan_event(), {})
+        handler.schedule.enqueue.assert_not_awaited()
 
     async def test_no_learner_or_no_bot_dm_schedules_nothing(self):
         for kwargs in (
