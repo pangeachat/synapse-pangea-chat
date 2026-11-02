@@ -12,7 +12,7 @@ from synapse.events import EventBase
 from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
-from synapse_pangea_chat.notice_delivery.push_rule import writes_push_rules
+from synapse_pangea_chat.push_rules_writer import writes_push_rules
 from synapse_pangea_chat.room_preview import PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE
 
 if TYPE_CHECKING:

@@ -47,14 +47,6 @@ async def _has_rule(store: Any, user_id: str) -> bool:
     return existing is not None
 
 
-def writes_push_rules(api: ModuleApi) -> bool:
-    """Whether this process is the push rules writer ("master" on a single
-    process). Synapse has no replication path for push-rule writes, so on any
-    other process installing the rule raises "Not a push writer"."""
-    hs = api._hs
-    return hs.get_instance_name() == hs.config.worker.writers.push_rules[0]
-
-
 async def ensure_bot_notice_push_rule(api: ModuleApi, user_id: str) -> bool:
     """Give ``user_id`` the rule; return True if it was installed just now."""
     if user_id in _confirmed_users:

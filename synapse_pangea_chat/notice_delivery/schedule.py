@@ -17,8 +17,8 @@ from synapse_pangea_chat.moderation.compat import (
     looping_call_interval,
 )
 from synapse_pangea_chat.notice_delivery.delivery_log import DeliveryConflict
-from synapse_pangea_chat.notice_delivery.push_rule import writes_push_rules
 from synapse_pangea_chat.notice_delivery.request import NoticeRequest
+from synapse_pangea_chat.push_rules_writer import writes_push_rules
 
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.notice_delivery.schedule"
