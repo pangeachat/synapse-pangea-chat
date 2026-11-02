@@ -84,6 +84,8 @@ SOURCE_MEMBER = "member"
 # canonicalises the rest the way it stores verified addresses.
 _EMAIL_SHAPE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 _MAX_BODY_BYTES = 256 * 1024
+# How far ahead a send can be set: a course planned a year out at most.
+MAX_SEND_AHEAD_MS = 366 * 24 * 60 * 60 * 1000
 
 Result = Tuple[int, Dict[str, Any]]
 
@@ -92,6 +94,10 @@ RATE_LIMITED = {"error": "Rate limited", "errcode": "M_LIMIT_EXCEEDED"}
 FORBIDDEN = {"error": "Forbidden: course admin required", "errcode": "M_FORBIDDEN"}
 NOT_FOUND = {"error": "Not found", "errcode": "M_NOT_FOUND"}
 INTERNAL = {"error": "Internal server error"}
+NO_CLASS_CODE: Tuple[int, Dict[str, Any]] = (
+    400,
+    {"error": "Course has no class code", "errcode": "ORG.PANGEA.NO_JOIN_CODE"},
+)
 
 
 def _bad(message: str, **extra: Any) -> Result:
@@ -153,6 +159,26 @@ def _count(value: Any) -> Optional[int]:
     return value
 
 
+def _future_ms(value: Any, now: int) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if now < value <= now + MAX_SEND_AHEAD_MS else None
+
+
+def _send_items(items: Any) -> Tuple[List[Tuple[str, int]], Optional[Result]]:
+    """(invitation id, expected send count) per item, or the 400 to answer."""
+    if not isinstance(items, list) or not 1 <= len(items) <= MAX_SEND:
+        return [], _bad(f"'items' must be a list of 1 to {MAX_SEND} items")
+    parsed: List[Tuple[str, int]] = []
+    for item in items:
+        ident = _string(item.get("invitation_id")) if isinstance(item, dict) else None
+        expected = _count(item.get("expected_send_count")) if ident else None
+        if ident is None or expected is None:
+            return [], _bad("Each item needs 'invitation_id' and 'expected_send_count'")
+        parsed.append((ident, expected))
+    return parsed, None
+
+
 def parse_email(value: Any) -> Optional[Tuple[str, str]]:
     """(as entered, trimmed; canonical key) or None if not an email."""
     if not isinstance(value, str):
@@ -196,6 +222,8 @@ def _view_fields(
         "last_sent_at_ms": row["last_sent_at_ms"],
         "created_at_ms": row["created_at_ms"],
         "joined_at_ms": row["joined_at_ms"],
+        # A row claimed or revoked while waiting keeps its value, unused.
+        "send_at_ms": row["send_at_ms"] if row["state"] == STATE_INVITED else None,
         "canvas_identity": row["lti_user_id"] is not None,
         "pending_count": pending_count if row["state"] == STATE_INVITED else 0,
         "same_student_as": same_student_as if row["state"] == STATE_INVITED else None,
@@ -212,7 +240,7 @@ def _parse_cursor(value: Any) -> Optional[Tuple[int, str]]:
     return int(ts), event_id
 
 
-def _send_failure(error: BaseException) -> str:
+def send_failure(error: BaseException) -> str:
     if isinstance(error, SMTPDeliveryError) and 500 <= int(error.code or 0) < 600:
         return "address_rejected"
     return "mail_error"
@@ -299,24 +327,12 @@ class StudentInvitationHandlers:
         room_id, refusal = await self._admin_room(caller, body)
         if room_id is None:
             return refusal
-        items = body.get("items")
-        if not isinstance(items, list) or not 1 <= len(items) <= MAX_SEND:
-            return _bad(f"'items' must be a list of 1 to {MAX_SEND} items")
-        parsed: List[Tuple[str, int]] = []
-        for item in items:
-            ident = (
-                _string(item.get("invitation_id")) if isinstance(item, dict) else None
-            )
-            expected = _count(item.get("expected_send_count")) if ident else None
-            if ident is None or expected is None:
-                return _bad("Each item needs 'invitation_id' and 'expected_send_count'")
-            parsed.append((ident, expected))
+        parsed, invalid = _send_items(body.get("items"))
+        if invalid is not None:
+            return invalid
         code = await self._rooms.access_code(room_id)
         if not code:
-            return 400, {
-                "error": "Course has no class code",
-                "errcode": "ORG.PANGEA.NO_JOIN_CODE",
-            }
+            return NO_CLASS_CODE
         results: List[Dict[str, Any]] = []
         stopped: Optional[str] = None
         for ident, expected in parsed:
@@ -331,7 +347,7 @@ class StudentInvitationHandlers:
             try:
                 await self._mailer.send_invite(before, code)
             except Exception as error:
-                reason = _send_failure(error)
+                reason = send_failure(error)
                 await self._store.release_send(before)
                 logger.warning(
                     "student invitation %s not sent: %s (%s)",
@@ -362,6 +378,42 @@ class StudentInvitationHandlers:
             len(parsed),
         )
         return 200, {"results": results, "stopped_reason": stopped}
+
+    async def schedule(self, caller: str, body: Any) -> Result:
+        """Set a later time for these emails; ``scheduled_send`` sends them
+        then, re-reading the row, without the teacher's token. A course with
+        no class code is refused now rather than failing on the day."""
+        room_id, refusal = await self._admin_room(caller, body)
+        if room_id is None:
+            return refusal
+        send_at = _future_ms(body.get("send_at_ms"), now_ms())
+        if send_at is None:
+            return _bad("'send_at_ms' must be a future time within 366 days")
+        parsed, invalid = _send_items(body.get("items"))
+        if invalid is not None:
+            return invalid
+        if not await self._rooms.access_code(room_id):
+            return NO_CLASS_CODE
+        results: List[Dict[str, Any]] = []
+        for ident, expected in parsed:
+            status, _ = await self._store.schedule_send(
+                room_id, ident, expected, send_at, caller, now_ms()
+            )
+            scheduled = status == "scheduled"
+            results.append(
+                {
+                    "invitation_id": ident,
+                    "outcome": "scheduled" if scheduled else "skipped",
+                    "reason": None if scheduled else status,
+                }
+            )
+        logger.info(
+            "student invitations schedule: room=%s scheduled=%d of %d",
+            room_id,
+            sum(1 for r in results if r["outcome"] == "scheduled"),
+            len(parsed),
+        )
+        return 200, {"results": results, "stopped_reason": None}
 
     async def list(self, caller: str, query: Any) -> Result:
         room_id, refusal = await self._admin_room(caller, query)

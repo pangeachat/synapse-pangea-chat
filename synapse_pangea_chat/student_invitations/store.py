@@ -7,6 +7,8 @@ Three tables (SPEC §6):
   left, or was removed from, the course); ``revoked`` by a course admin. A
   ``revoked`` or ``left`` row is reset to ``invited`` when the email is added
   again. The ``lti_*`` columns hold the Canvas identity of an imported row.
+  ``send_at_ms`` is set on a row whose email waits for a later time; only
+  ``invited`` rows with one are due, and ``scheduled_send`` sends them.
 - ``pangea_invitation_ack``: the **request** table (seats amendment
   2026-10-10). A request is written only when an account opens an invitation
   whose address it does not have verified; it carries the teacher's decision
@@ -37,6 +39,7 @@ from synapse_pangea_chat.student_invitations.events import (
     INVITATION_CLAIMED,
     INVITATION_WITHDRAWN,
     INVITE_RESENT,
+    INVITE_SCHEDULED,
     INVITE_SENT,
     REQUEST_DENIED,
     REQUEST_GRANTED,
@@ -75,6 +78,7 @@ SCHEMA = (
         lti_context_id TEXT,
         lti_user_id TEXT,
         member_user_id TEXT,
+        send_at_ms BIGINT,
         UNIQUE (course_room_id, email_key))""",
         """CREATE UNIQUE INDEX IF NOT EXISTS pangea_seat_invitation_one_joined
         ON pangea_seat_invitation (course_room_id, claimant)
@@ -120,6 +124,7 @@ COLUMNS = (
     "lti_context_id",
     "lti_user_id",
     "member_user_id",
+    "send_at_ms",
 )
 _SELECT = "SELECT " + ", ".join(COLUMNS) + " FROM pangea_seat_invitation "
 REQUEST_COLUMNS = ("invitation_id", "user_id", "requested_at_ms", "decision")
@@ -482,7 +487,8 @@ class StudentInvitationStore:
                         " claimant = NULL, joined_at_ms = NULL, email = ?,"
                         " source = ?, invited_by = ?, created_at_ms = ?,"
                         " lti_issuer = NULL, lti_context_id = NULL,"
-                        " lti_user_id = NULL, member_user_id = ? WHERE id = ?",
+                        " lti_user_id = NULL, member_user_id = ?,"
+                        " send_at_ms = NULL WHERE id = ?",
                         (email, source, invited_by, now_ms, member_user_id, row["id"]),
                     )
                     txn.execute(
@@ -619,8 +625,9 @@ class StudentInvitationStore:
         """Compare-and-set the send count before a send. The send's event is
         written by ``record_sent`` once the email is accepted.
 
-        Returns ("reserved", row before), ("not_invited", None) or
-        ("stale", None)."""
+        Returns ("reserved", row before), ("not_invited", None), ("stale", None)
+        or ("scheduled", None) for a row waiting for its ``send_at_ms``, which
+        no send call may email early."""
         await self.ensure()
 
         def write(txn: Any) -> Tuple[str, Optional[Dict]]:
@@ -631,6 +638,8 @@ class StudentInvitationStore:
             )
             if row is None or row["state"] != STATE_INVITED:
                 return "not_invited", None
+            if row["send_at_ms"] is not None:
+                return "scheduled", None
             txn.execute(
                 "UPDATE pangea_seat_invitation"
                 " SET send_count = send_count + 1, last_sent_at_ms = ?"
@@ -643,18 +652,112 @@ class StudentInvitationStore:
 
         return await self.db.runInteraction("pangea_seat_invitation_send", write)
 
-    async def release_send(self, before: Dict[str, Any]) -> None:
+    async def schedule_send(
+        self,
+        room_id: str,
+        invitation_id: str,
+        expected: int,
+        send_at_ms: int,
+        actor: str,
+        now_ms: int,
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Set when this row's email goes out, compare-and-set on the send
+        count as a send is. A call with the time already set changes nothing,
+        so a retried call records one event.
+
+        Returns ("scheduled", row), ("not_invited", None) or ("stale", None)."""
+        await self.ensure()
+
+        def write(txn: Any) -> Tuple[str, Optional[Dict]]:
+            row = _select_one(
+                txn,
+                "WHERE id = ? AND course_room_id = ?",
+                (invitation_id, room_id),
+            )
+            if row is None or row["state"] != STATE_INVITED:
+                return "not_invited", None
+            if row["send_count"] != expected:
+                return "stale", None
+            if row["send_at_ms"] == send_at_ms:
+                return "scheduled", row
+            txn.execute(
+                "UPDATE pangea_seat_invitation SET send_at_ms = ?"
+                " WHERE id = ? AND state = 'invited' AND send_count = ?",
+                (send_at_ms, invitation_id, expected),
+            )
+            if txn.rowcount != 1:
+                return "stale", None
+            record_event(
+                txn,
+                room_id=room_id,
+                actor=actor,
+                action=INVITE_SCHEDULED,
+                now_ms=now_ms,
+                invitation_id=invitation_id,
+            )
+            return "scheduled", _select_one(txn, "WHERE id = ?", (invitation_id,))
+
+        return await self.db.runInteraction("pangea_seat_invitation_schedule", write)
+
+    async def claim_due(self, now_ms: int) -> Optional[Dict[str, Any]]:
+        """Claim the oldest due row, or None. The claim takes the row out of
+        the due set and counts the send before any email, in one compare-and-
+        set, so no second claim, restart or send call can email it again.
+        Returns the row as it was before the claim."""
+        await self.ensure()
+
+        def write(txn: Any) -> Optional[Dict]:
+            row = _select_one(
+                txn,
+                "WHERE state = 'invited' AND send_at_ms IS NOT NULL"
+                " AND send_at_ms <= ? ORDER BY send_at_ms, id LIMIT 1",
+                (now_ms,),
+            )
+            if row is None:
+                return None
+            txn.execute(
+                "UPDATE pangea_seat_invitation SET send_count = send_count + 1,"
+                " last_sent_at_ms = ?, send_at_ms = NULL"
+                " WHERE id = ? AND state = 'invited' AND send_count = ?"
+                " AND send_at_ms = ?",
+                (now_ms, row["id"], row["send_count"], row["send_at_ms"]),
+            )
+            return row if txn.rowcount == 1 else None
+
+        return await self.db.runInteraction("pangea_seat_invitation_claim_due", write)
+
+    async def unschedule_course(self, room_id: str) -> int:
+        """Stop waiting to send this course's invitations; how many were
+        waiting. They stay on the roster for the teacher to send."""
+        await self.ensure()
+
+        def write(txn: Any) -> int:
+            txn.execute(
+                "UPDATE pangea_seat_invitation SET send_at_ms = NULL"
+                " WHERE course_room_id = ? AND state = 'invited'"
+                " AND send_at_ms IS NOT NULL",
+                (room_id,),
+            )
+            return int(txn.rowcount)
+
+        return await self.db.runInteraction("pangea_seat_invitation_unschedule", write)
+
+    async def release_send(
+        self, before: Dict[str, Any], keep_schedule: bool = False
+    ) -> None:
         """Undo a reservation whose email was not sent, unless the row moved
-        on. A failed send wrote no event, so the ledger is untouched."""
+        on. A failed send wrote no event, so the ledger is untouched.
+        ``keep_schedule`` puts a claimed row back in the due set."""
 
         def write(txn: Any) -> None:
             txn.execute(
                 "UPDATE pangea_seat_invitation"
-                " SET send_count = ?, last_sent_at_ms = ?"
+                " SET send_count = ?, last_sent_at_ms = ?, send_at_ms = ?"
                 " WHERE id = ? AND send_count = ?",
                 (
                     before["send_count"],
                     before["last_sent_at_ms"],
+                    before["send_at_ms"] if keep_schedule else None,
                     before["id"],
                     before["send_count"] + 1,
                 ),
@@ -972,7 +1075,9 @@ def migrate(txn: Any) -> None:
     - requests (seats amendment 2026-10-10): ``acked_at_ms`` becomes
       ``requested_at_ms`` and ``disclosure_version`` is dropped;
     - the managed record keeps only ``created_at_ms``: ``since_ms`` is
-      renamed and ``invited_by`` dropped.
+      renamed and ``invited_by`` dropped;
+    - invitations gain ``send_at_ms`` (nullable, so no row is rewritten) and
+      the partial index of rows waiting to send, which is empty at this point.
     """
     request = _columns(txn, "pangea_invitation_ack")
     if "acked_at_ms" in request and "requested_at_ms" not in request:
@@ -989,6 +1094,20 @@ def migrate(txn: Any) -> None:
         )
     if "invited_by" in managed:
         txn.execute("ALTER TABLE pangea_managed_account DROP COLUMN invited_by")
+    if "send_at_ms" not in _columns(txn, "pangea_seat_invitation"):
+        # Every process runs this on first use; on Postgres one that loses the
+        # race waits on the table lock and must then find the column added.
+        postgres = isinstance(getattr(txn, "database_engine", None), PostgresEngine)
+        txn.execute(
+            "ALTER TABLE pangea_seat_invitation ADD COLUMN "
+            + ("IF NOT EXISTS " if postgres else "")
+            + "send_at_ms BIGINT"
+        )
+    txn.execute(
+        "CREATE INDEX IF NOT EXISTS pangea_seat_invitation_due"
+        " ON pangea_seat_invitation (send_at_ms)"
+        " WHERE state = 'invited' AND send_at_ms IS NOT NULL"
+    )
 
 
 def _insert_managed(txn: Any, user_id: str, room_id: str, now_ms: int) -> None:
