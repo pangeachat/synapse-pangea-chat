@@ -888,6 +888,16 @@ class PangeaChat:
         discussion_room_burst_duration_seconds = config.get(
             "discussion_room_burst_duration_seconds", 60
         )
+        for name, value in (
+            ("discussion_room_capacity", discussion_room_capacity),
+            ("discussion_room_requests_per_burst", discussion_room_requests_per_burst),
+            (
+                "discussion_room_burst_duration_seconds",
+                discussion_room_burst_duration_seconds,
+            ),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f'Config "{name}" must be an integer >= 1')
 
         # --- room_code config ---
         knock_with_code_requests_per_burst = config.get(
