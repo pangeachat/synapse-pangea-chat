@@ -1,5 +1,12 @@
-"""``POST /_synapse/client/pangea/v1/discussion_room``: put a student in a room
-for one of their course's discussions.
+"""``/_synapse/client/pangea/v1/discussion_room``: a student's room for one of
+their course's discussions.
+
+``POST {course_id, activity_id, avatar_url?}`` places the student and answers
+``{room_id, created}``. ``GET ?course_id=&activity_id=`` answers where a
+placement would put them now, without placing them: ``{room_id, students,
+joined}``, ``room_id`` null meaning a new room. Both answer 403 to a caller who
+is not a member of the course and 404 when the activity is not one of the
+course's discussions.
 
 The student is sent back to their own room for the discussion when they have
 one; otherwise into the fullest room for it with fewer than
@@ -19,15 +26,26 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+)
 from urllib.parse import urlencode
 
 from synapse.api.constants import EventTypes, RoomCreationPreset
 from synapse.api.errors import (
     AuthError,
-    LimitExceededError,
     InvalidClientTokenError,
+    LimitExceededError,
     MissingClientTokenError,
 )
 from synapse.http import server
@@ -77,8 +95,11 @@ CMS_MAX_BODY_BYTES = 1_000_000
 DISCUSSION_CACHE_SECONDS = 60
 
 # Tries at joining a student past Synapse's per-room join limit, each waiting
-# as long as Synapse asks (capped): about ten seconds at its defaults.
+# as long as Synapse asks, clamped: about ten seconds at its defaults.
 JOIN_ATTEMPTS = 6
+JOIN_WAIT_DEFAULT_MS = 1000
+JOIN_WAIT_MIN_MS = 200
+JOIN_WAIT_MAX_MS = 5000
 
 
 class DiscussionNotFound(Exception):
@@ -87,6 +108,44 @@ class DiscussionNotFound(Exception):
 
 class CmsUnavailable(Exception):
     """The CMS could not be asked whether the activity is a discussion."""
+
+
+class _Refused(Exception):
+    """A request answered with a 4xx before any placement work."""
+
+    def __init__(self, status: int, error: str, errcode: Optional[str] = None):
+        super().__init__(error)
+        self.status = status
+        self.body: Dict[str, Any] = {"error": error}
+        if errcode:
+            self.body["errcode"] = errcode
+
+
+@dataclass(frozen=True)
+class _RoomView:
+    room_id: str
+    joined: FrozenSet[str]
+    seated: FrozenSet[str]
+    # Joined, or seated without ever having been a member: a seat written
+    # ahead of its join holds its place, and keeps holding it if the join
+    # fails, until the student's next try joins them.
+    occupants: FrozenSet[str]
+    students: int
+    # Read only for a course admin, who is placed in the newest room.
+    created_ts: int
+
+
+def _roles(content: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    roles = (content or {}).get("roles")
+    return dict(roles) if isinstance(roles, Mapping) else {}
+
+
+def seated_user_ids(roles_content: Optional[Mapping[str, Any]]) -> Set[str]:
+    return {
+        seat["user_id"]
+        for seat in _roles(roles_content).values()
+        if isinstance(seat, Mapping) and isinstance(seat.get("user_id"), str)
+    }
 
 
 def seat_key(user_id: str) -> str:
@@ -99,17 +158,14 @@ def with_seat(roles_content: Optional[Dict[str, Any]], user_id: str) -> Dict[str
     """The roles content with ``user_id``'s seat added; an existing seat for
     them (finished or not) is kept as it is."""
     content = dict(roles_content or {})
-    roles = dict(content.get("roles") or {})
-    for seat in roles.values():
-        if isinstance(seat, dict) and seat.get("user_id") == user_id:
-            content["roles"] = roles
-            return content
-    roles[seat_key(user_id)] = {
-        "id": DISCUSSION_ROLE_ID,
-        "user_id": user_id,
-        "role": DISCUSSION_ROLE_NAME,
-    }
+    roles = _roles(content)
     content["roles"] = roles
+    if user_id not in seated_user_ids(content):
+        roles[seat_key(user_id)] = {
+            "id": DISCUSSION_ROLE_ID,
+            "user_id": user_id,
+            "role": DISCUSSION_ROLE_NAME,
+        }
     return content
 
 
@@ -157,12 +213,13 @@ def discussion_power_levels(
     }
 
 
-def _query_arg(request: SynapseRequest, name: str) -> Optional[str]:
+def _query_string(request: SynapseRequest, name: str) -> Optional[str]:
     values = request.args.get(name.encode()) if request.args else None
-    if not values:
-        return None
-    value = values[0].decode("utf-8", "replace").strip()
-    return value or None
+    return values[0].decode("utf-8", "replace") if values else None
+
+
+def _nonempty(value: Any) -> Optional[str]:
+    return (value.strip() or None) if isinstance(value, str) else None
 
 
 class DiscussionRoom(Resource):
@@ -176,251 +233,187 @@ class DiscussionRoom(Resource):
         self._store = api._hs.get_datastores().main
         self._clock = api._hs.get_clock()
         self._http = api.http_client
+        # The bot's user id, read from user_activity_notification_bot_user_id:
+        # it creates each room and writes seats ahead of their joins.
+        self._bot_user_id = config.user_activity_notification_bot_user_id or None
         # (course_id, activity_id) -> (expires at, plan)
         self._plans: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
-        # One request at a time per course and discussion, so a room is
-        # counted and filled by one request before the next looks at it.
+        # One placement at a time per course and discussion, so a room is
+        # counted and its seat written by one request before the next looks.
         # Per process: a deploy that runs this endpoint on more than one
         # worker must route it to one, or move to the worker locks handler.
         self._locks = Linearizer("discussion_room", clock=self._clock)
 
     def render_GET(self, request: SynapseRequest):
-        run_in_background(self._async_render_GET, request)
+        run_in_background(self._handle, request, preview=True)
         return server.NOT_DONE_YET
 
-    async def _async_render_GET(self, request: SynapseRequest):
-        """Preview: which room opening the discussion would put the student
-        in and how many students it has, so the start page counts the room
-        they will land in. Read-only and unlocked: a placement that runs
-        between this and the student's tap places them by the room's state
-        then, never by this answer."""
+    def render_POST(self, request: SynapseRequest):
+        run_in_background(self._handle, request, preview=False)
+        return server.NOT_DONE_YET
+
+    async def _handle(self, request: SynapseRequest, *, preview: bool) -> None:
+        action = "preview" if preview else "place"
         try:
-            requester = await self._auth.get_user_by_req(request)
-            user_id = requester.user.to_string()
-            if is_rate_limited(user_id, self._config, preview=True):
-                respond_with_json(
-                    request, 429, {"error": "Rate limited"}, send_cors=True
-                )
-                return
-            course_id = _query_arg(request, "course_id")
-            activity_id = _query_arg(request, "activity_id")
-            if not (course_id and activity_id):
-                respond_with_json(
-                    request,
-                    400,
-                    {"error": "'course_id' and 'activity_id' are required"},
-                    send_cors=True,
-                )
-                return
-            (
-                membership,
-                _,
-            ) = await self._store.get_local_current_membership_for_user_in_room(
-                user_id, course_id
-            )
-            if membership != "join":
-                respond_with_json(
-                    request,
-                    403,
-                    {"error": "Not a member of this course"},
-                    send_cors=True,
-                )
-                return
-            await self._discussion_plan(course_id, activity_id)
-            respond_with_json(
-                request,
-                200,
-                await self._preview(user_id, course_id, activity_id),
-                send_cors=True,
-            )
+            status, body = 200, await self._answer(request, preview)
+        # silent-ok: the caller's own error, answered with its 4xx
+        except _Refused as e:
+            status, body = e.status, e.body
         # silent-ok: answered 404, a caller asking for an activity that is not
         # one of this course's discussions
         except DiscussionNotFound:
-            respond_with_json(
-                request,
-                404,
-                {"error": "Not a discussion of this course"},
-                send_cors=True,
-            )
-        except CmsUnavailable as e:
-            logger.error("discussion_room preview: CMS unavailable: %s", e)
-            respond_with_json(
-                request,
-                502,
-                {"error": "Could not check the discussion"},
-                send_cors=True,
-            )
-        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
-        except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
-            logger.info("discussion_room preview: authentication failed: %s", e)
-            respond_with_json(
-                request,
-                401,
-                {"error": "Unauthorized", "errcode": "M_UNAUTHORIZED"},
-                send_cors=True,
-            )
-        except Exception:
-            logger.exception("discussion_room preview failed")
-            respond_with_json(
-                request, 500, {"error": "Internal server error"}, send_cors=True
-            )
-
-    def render_POST(self, request: SynapseRequest):
-        run_in_background(self._async_render_POST, request)
-        return server.NOT_DONE_YET
-
-    async def _async_render_POST(self, request: SynapseRequest):
-        try:
-            requester = await self._auth.get_user_by_req(request)
-            user_id = requester.user.to_string()
-            if is_rate_limited(user_id, self._config):
-                respond_with_json(
-                    request, 429, {"error": "Rate limited"}, send_cors=True
-                )
-                return
-
-            body = await extract_body_json(request)
-            course_id = body.get("course_id") if isinstance(body, dict) else None
-            activity_id = body.get("activity_id") if isinstance(body, dict) else None
-            avatar_url = body.get("avatar_url") if isinstance(body, dict) else None
-            if not (
-                isinstance(course_id, str)
-                and course_id
-                and isinstance(activity_id, str)
-                and activity_id
-            ):
-                respond_with_json(
-                    request,
-                    400,
-                    {"error": "'course_id' and 'activity_id' are required strings"},
-                    send_cors=True,
-                )
-                return
-
-            (
-                membership,
-                _,
-            ) = await self._store.get_local_current_membership_for_user_in_room(
-                user_id, course_id
-            )
-            if membership != "join":
-                respond_with_json(
-                    request,
-                    403,
-                    {"error": "Not a member of this course"},
-                    send_cors=True,
-                )
-                return
-
-            plan = await self._discussion_plan(course_id, activity_id)
-            async with self._locks.queue((course_id, activity_id)):
-                room_id, created = await self._place(
-                    user_id,
-                    course_id,
-                    activity_id,
-                    plan,
-                    avatar_url if isinstance(avatar_url, str) and avatar_url else None,
-                )
-            logger.info(
-                "discussion_room %s in %s: room=%s created=%s",
-                activity_id,
-                course_id,
-                room_id,
-                created,
-            )
-            respond_with_json(
-                request, 200, {"room_id": room_id, "created": created}, send_cors=True
-            )
+            status, body = 404, {"error": "Not a discussion of this course"}
         # silent-ok: answered 429, the room still refusing joins after every
         # retry; the student is asked to try again
         except LimitExceededError:
             logger.warning("discussion_room: joins still rate limited, answered busy")
-            respond_with_json(
-                request,
-                429,
-                {"error": "Busy, try again", "errcode": "M_LIMIT_EXCEEDED"},
-                send_cors=True,
-            )
-        # silent-ok: answered 404, a caller asking for an activity that is not
-        # one of this course's discussions
-        except DiscussionNotFound:
-            respond_with_json(
-                request,
-                404,
-                {"error": "Not a discussion of this course"},
-                send_cors=True,
-            )
+            status = 429
+            body = {"error": "Busy, try again", "errcode": "M_LIMIT_EXCEEDED"}
         except CmsUnavailable as e:
-            logger.error("discussion_room: CMS unavailable: %s", e)
-            respond_with_json(
-                request,
-                502,
-                {"error": "Could not check the discussion"},
-                send_cors=True,
-            )
-        # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
+            logger.error("discussion_room %s: CMS unavailable: %s", action, e)
+            status, body = 502, {"error": "Could not check the discussion"}
+        except Exception:
+            logger.exception("discussion_room %s failed", action)
+            status, body = 500, {"error": "Internal server error"}
+        respond_with_json(request, status, body, send_cors=True)
+
+    async def _answer(self, request: SynapseRequest, preview: bool) -> Dict[str, Any]:
+        try:
+            requester = await self._auth.get_user_by_req(request)
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:
             logger.info("discussion_room: authentication failed: %s", e)
-            respond_with_json(
-                request,
-                401,
-                {"error": "Unauthorized", "errcode": "M_UNAUTHORIZED"},
-                send_cors=True,
-            )
-        except Exception:
-            logger.exception("discussion_room failed")
-            respond_with_json(
-                request, 500, {"error": "Internal server error"}, send_cors=True
-            )
+            raise _Refused(401, "Unauthorized", "M_UNAUTHORIZED") from e
+        user_id = requester.user.to_string()
+        if is_rate_limited(user_id, self._config, preview=preview):
+            raise _Refused(429, "Rate limited")
+
+        if preview:
+            args: Any = {
+                name: _query_string(request, name)
+                for name in ("course_id", "activity_id")
+            }
+        else:
+            args = await extract_body_json(request)
+        if not isinstance(args, dict):
+            args = {}
+        course_id = _nonempty(args.get("course_id"))
+        activity_id = _nonempty(args.get("activity_id"))
+        if not (course_id and activity_id):
+            raise _Refused(400, "'course_id' and 'activity_id' are required strings")
+
+        membership, _ = await self._store.get_local_current_membership_for_user_in_room(
+            user_id, course_id
+        )
+        if membership != "join":
+            raise _Refused(403, "Not a member of this course")
+
+        plan = await self._discussion_plan(course_id, activity_id)
+        if preview:
+            return await self._preview(user_id, course_id, activity_id)
+
+        room_id, created = await self._place(
+            user_id,
+            course_id,
+            activity_id,
+            plan,
+            _nonempty(args.get("avatar_url")),
+        )
+        logger.info(
+            "discussion_room %s in %s: room=%s created=%s",
+            activity_id,
+            course_id,
+            room_id,
+            created,
+        )
+        return {"room_id": room_id, "created": created}
 
     async def _survey(
         self, user_id: str, course_id: str, activity_id: str
-    ) -> Tuple[Optional[str], List[Tuple[str, int, int]], FrozenSet[str]]:
+    ) -> Tuple[Optional[_RoomView], List[_RoomView], FrozenSet[str]]:
         """The discussion's rooms as placement sees them: the student's own
-        room if they are in one, else each room with its student count
-        (course admins and the bot never count) and when it was created, and
-        the course's admins. Shared by placing a student and previewing where
-        they would go, so the two never disagree.
+        room if they have one, else every room; and the course's admins.
+        Shared by placing a student and previewing where they would go, so
+        the two never disagree.
 
         A course admin is joined to every session room to read it
-        (course_session_admins), so their own room is the one they hold a seat
-        in, not any room they are in."""
+        (course_session_admins), so their own room is the one they hold a
+        seat in, not any room they are in."""
         admins = await self._course_admins(course_id)
-        rooms = await _activity_session_ids(
+        is_admin = user_id in admins
+        room_ids = await _activity_session_ids(
             await _child_room_ids([course_id], self._store), activity_id, self._store
         )
-        is_admin = user_id in admins
-        rooms_info: List[Tuple[str, int, int]] = []
-        for room_id in rooms:
-            members = await self._joined_members(room_id)
-            students = self._student_count(members, admins)
-            if user_id in members and (
-                not is_admin or await self._has_seat(room_id, user_id)
-            ):
-                return room_id, [(room_id, students, 0)], admins
-            rooms_info.append((room_id, students, await self._created_ts(room_id)))
-        return None, rooms_info, admins
+        rooms: List[_RoomView] = []
+        for room_id in room_ids:
+            room = await self._room_view(room_id, admins, with_created=is_admin)
+            if user_id in room.occupants and (not is_admin or user_id in room.seated):
+                return room, [], admins
+            rooms.append(room)
+        return None, rooms, admins
 
-    @staticmethod
-    def _student_count(members: List[str], admins: FrozenSet[str]) -> int:
-        return len(
-            [m for m in members if m not in admins and not is_probable_bot_user_id(m)]
+    async def _room_view(
+        self, room_id: str, admins: FrozenSet[str], *, with_created: bool
+    ) -> _RoomView:
+        event_filter: List[Tuple[str, Optional[str]]] = [
+            (EventTypes.Member, None),
+            (ACTIVITY_ROLES_EVENT, ""),
+        ]
+        if with_created:
+            event_filter.append((EventTypes.Create, ""))
+        state = await self._api.get_room_state(room_id, event_filter=event_filter)
+        memberships = {
+            key: event.content.get("membership")
+            for (event_type, key), event in state.items()
+            if event_type == EventTypes.Member
+        }
+        joined = frozenset(k for k, m in memberships.items() if m == "join")
+        roles = state.get((ACTIVITY_ROLES_EVENT, ""))
+        seated = frozenset(seated_user_ids(roles.content if roles else None))
+        occupants = joined | seated.difference(memberships)
+        create = state.get((EventTypes.Create, ""))
+        return _RoomView(
+            room_id=room_id,
+            joined=joined,
+            seated=seated,
+            occupants=occupants,
+            students=sum(
+                1
+                for m in occupants
+                if m not in admins and not is_probable_bot_user_id(m)
+            ),
+            created_ts=create.origin_server_ts if create is not None else 0,
         )
 
     def _choose(
-        self, user_id: str, rooms: List[Tuple[str, int, int]], admins: FrozenSet[str]
-    ) -> Optional[str]:
+        self, user_id: str, rooms: List[_RoomView], admins: FrozenSet[str]
+    ) -> Optional[_RoomView]:
         """The room to put someone with no room of their own in: a student
         goes to the fullest room with space; a course admin, who never counts
         toward a room's students, to the newest room. None means a new room."""
         if user_id in admins:
-            if not rooms:
-                return None
-            return max(rooms, key=lambda r: r[2])[0]
-        return pick_room(
-            [(room_id, students) for room_id, students, _ in rooms],
+            return max(rooms, key=lambda r: r.created_ts, default=None)
+        by_id = {room.room_id: room for room in rooms}
+        picked = pick_room(
+            [(room.room_id, room.students) for room in rooms],
             self._config.discussion_room_capacity,
         )
+        return by_id[picked] if picked is not None else None
+
+    async def _preview(
+        self, user_id: str, course_id: str, activity_id: str
+    ) -> Dict[str, Any]:
+        """Read-only and unlocked: a placement that runs between this and the
+        student's tap places them by the rooms' state then, never by this
+        answer."""
+        own, rooms, admins = await self._survey(user_id, course_id, activity_id)
+        room = own or self._choose(user_id, rooms, admins)
+        if room is None:
+            return {"room_id": None, "students": 0, "joined": False}
+        return {
+            "room_id": room.room_id,
+            "students": room.students,
+            "joined": own is not None and user_id in own.joined,
+        }
 
     async def _place(
         self,
@@ -430,37 +423,50 @@ class DiscussionRoom(Resource):
         plan: Dict[str, Any],
         avatar_url: Optional[str],
     ) -> Tuple[str, bool]:
-        own, rooms, admins = await self._survey(user_id, course_id, activity_id)
-        if own is not None:
-            # Their own room: back to it, ended or not.
-            await self._ensure_seat(own, user_id)
-            return own, False
-
-        room_id = self._choose(user_id, rooms, admins)
-        if room_id is not None:
+        # The join runs after the lock: it can wait out Synapse's join limit,
+        # and the seat written under the lock already counts the student.
+        async with self._locks.queue((course_id, activity_id)):
+            room_id, created, joined = await self._reserve(
+                user_id, course_id, activity_id, plan, avatar_url
+            )
+        if not joined:
             await self._join(room_id, user_id)
-            await self._ensure_seat(room_id, user_id)
-            return room_id, False
+        return room_id, created
 
-        room_id = await self._create(
-            user_id, course_id, activity_id, plan, admins, avatar_url
-        )
-        return room_id, True
-
-    async def _preview(
-        self, user_id: str, course_id: str, activity_id: str
-    ) -> Dict[str, Any]:
-        """Where the student would be placed now, without placing them: their
-        own room, else the room placement would pick, else none (a new room).
-        `students` counts that room's students; 0 for a new room."""
+    async def _reserve(
+        self,
+        user_id: str,
+        course_id: str,
+        activity_id: str,
+        plan: Dict[str, Any],
+        avatar_url: Optional[str],
+    ) -> Tuple[str, bool, bool]:
+        """Chooses the student's room and writes their seat in it: (room,
+        created, already joined). Their own room is chosen, ended or not."""
         own, rooms, admins = await self._survey(user_id, course_id, activity_id)
-        if own is not None:
-            return {"room_id": own, "students": rooms[0][1], "joined": True}
-        room_id = self._choose(user_id, rooms, admins)
-        students = (
-            next(n for r, n, _ in rooms if r == room_id) if room_id is not None else 0
-        )
-        return {"room_id": room_id, "students": students, "joined": False}
+        room = own or self._choose(user_id, rooms, admins)
+        if room is None:
+            room_id = await self._create(
+                user_id, course_id, activity_id, plan, admins, avatar_url
+            )
+            # Without the bot the student created the room, so is in it.
+            return room_id, True, self._bot_user_id is None
+
+        joined = user_id in room.joined
+        if joined:
+            sender = user_id
+        elif self._bot_user_id in room.joined:
+            sender = self._bot_user_id
+        else:
+            logger.warning(
+                "discussion_room: bot not in %s, joining %s under the lock",
+                room.room_id,
+                user_id,
+            )
+            await self._join(room.room_id, user_id)
+            sender, joined = user_id, True
+        await self._ensure_seat(room.room_id, user_id, sender)
+        return room.room_id, False, joined
 
     async def _join(self, room_id: str, user_id: str) -> None:
         """Join on the server's side, waiting out Synapse's per-room join
@@ -474,26 +480,9 @@ class DiscussionRoom(Resource):
             except LimitExceededError as e:
                 if attempt == JOIN_ATTEMPTS - 1:
                     raise
-                wait_ms = e.retry_after_ms or 1000
-                await self._api.sleep(min(max(wait_ms, 200), 5000) / 1000)
-
-    async def _has_seat(self, room_id: str, user_id: str) -> bool:
-        state = await self._api.get_room_state(
-            room_id, event_filter=[(ACTIVITY_ROLES_EVENT, "")]
-        )
-        current = state.get((ACTIVITY_ROLES_EVENT, ""))
-        roles = (current.content.get("roles") if current is not None else None) or {}
-        return any(
-            isinstance(seat, dict) and seat.get("user_id") == user_id
-            for seat in roles.values()
-        )
-
-    async def _created_ts(self, room_id: str) -> int:
-        state = await self._api.get_room_state(
-            room_id, event_filter=[(EventTypes.Create, "")]
-        )
-        create = state.get((EventTypes.Create, ""))
-        return create.origin_server_ts if create is not None else 0
+                wait_ms = e.retry_after_ms or JOIN_WAIT_DEFAULT_MS
+                wait_ms = min(max(wait_ms, JOIN_WAIT_MIN_MS), JOIN_WAIT_MAX_MS)
+                await self._api.sleep(wait_ms / 1000)
 
     async def _create(
         self,
@@ -504,11 +493,11 @@ class DiscussionRoom(Resource):
         admins: FrozenSet[str],
         avatar_url: Optional[str],
     ) -> str:
-        bot_user_id = self._config.user_activity_notification_bot_user_id
-        # The bot creates the room and the student joins once it is set up,
-        # so the student's arrival comes after the activity's own state, which
-        # the chat draws as its top block: a creator's join comes before it.
-        # Without a bot the student creates it, as an activity's first player.
+        """A new room with the student's seat in it. The bot creates it and
+        the student joins once it is set up, so their arrival comes after the
+        activity's own state, which the chat draws as its top block. Without
+        the bot the student creates it, as an activity's first player."""
+        bot_user_id = self._bot_user_id
         creator = bot_user_id or user_id
         initial_state: List[Dict[str, Any]] = [
             {
@@ -594,45 +583,37 @@ class DiscussionRoom(Resource):
                 "content": power,
             }
         )
-        if bot_user_id:
-            # The course's members are admitted by the room's restricted join.
-            await self._join(room_id, user_id)
-        else:
+        if not bot_user_id:
             logger.error(
-                "discussion_room: no bot configured, room %s has no facilitator",
+                "discussion_room: user_activity_notification_bot_user_id is not "
+                "set, room %s has no bot",
                 room_id,
             )
         return room_id
 
-    async def _ensure_seat(self, room_id: str, user_id: str) -> None:
+    async def _ensure_seat(self, room_id: str, user_id: str, sender: str) -> None:
+        """Adds ``user_id``'s seat, sent by ``sender``, a member of the room.
+
+        Read-modify-write: a client's roles write (a seat marked ended)
+        landing between this read and the send is lost. The ModuleApi has no
+        conditional state write, so the read is taken right before the send,
+        and a write happens only on a student's first arrival."""
         state = await self._api.get_room_state(
             room_id, event_filter=[(ACTIVITY_ROLES_EVENT, "")]
         )
         current = state.get((ACTIVITY_ROLES_EVENT, ""))
         content = current.content if current is not None else None
-        updated = with_seat(content, user_id)
-        if updated == (content or {}):
+        if user_id in seated_user_ids(content):
             return
         await self._api.create_and_send_event_into_room(
             {
                 "type": ACTIVITY_ROLES_EVENT,
                 "room_id": room_id,
-                "sender": user_id,
+                "sender": sender,
                 "state_key": "",
-                "content": updated,
+                "content": with_seat(content, user_id),
             }
         )
-
-    async def _joined_members(self, room_id: str) -> List[str]:
-        state = await self._api.get_room_state(
-            room_id, event_filter=[(EventTypes.Member, None)]
-        )
-        return [
-            key
-            for (event_type, key), event in state.items()
-            if event_type == EventTypes.Member
-            and event.content.get("membership") == "join"
-        ]
 
     async def _course_admins(self, course_id: str) -> FrozenSet[str]:
         state = await self._api.get_room_state(
