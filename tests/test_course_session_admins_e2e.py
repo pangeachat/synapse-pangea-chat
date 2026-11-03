@@ -147,7 +147,8 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
 
     def _admitted(self, room_id: str, user_id: str, token: str, reader: str) -> bool:
         """Joined, on their review list and muted: the whole outcome, polled
-        together because the mute is written after the join."""
+        together so a missing listing or mute fails the wait, not just a
+        missing join."""
         rule = self._mute_rule(room_id, token)
         return (
             self._membership(room_id, user_id, reader) == "join"

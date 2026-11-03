@@ -336,12 +336,14 @@ class CourseSessionAdmins:
         )
 
     async def _join_admin(self, space_id: str, room_id: str, user_id: str) -> bool:
-        """List, join, then mute. Whether the admin may still be joined is read
+        """List, mute, then join. Whether the admin may still be joined is read
         again right before every attempt, since an attempt can wait out a rate
         limit: she is not already in the room, has not left it or been banned,
         is still a course admin, and the course still links the room. A room
-        that could not be listed is not joined, so it never lands in her
-        chats."""
+        that could not be listed or muted is not joined, so it never lands in
+        her chats or notifies her. The mute comes first because Synapse decides
+        who to notify as each message is created: a message sent between the
+        join and a later mute would notify her, and stay notified."""
         joined = False
 
         async def attempt() -> None:
@@ -349,12 +351,11 @@ class CourseSessionAdmins:
             if not await self._still_eligible(space_id, room_id, user_id):
                 return
             await self._list(user_id, room_id)
+            await self._mute(user_id, room_id)
             await server_initiated_join(self._api, room_id, user_id)
             joined = True
 
         await wait_out_rate_limits(self._clock, attempt, "course_session_admins")
-        if joined:
-            await self._mute(user_id, room_id)
         return joined
 
     async def _still_eligible(self, space_id: str, room_id: str, user_id: str) -> bool:
