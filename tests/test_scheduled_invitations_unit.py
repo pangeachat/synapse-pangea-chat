@@ -17,6 +17,7 @@ from synapse_pangea_chat.student_invitations.claim import now_ms
 from synapse_pangea_chat.student_invitations.scheduled_send import (
     BATCH,
     MAX_SEND_AHEAD_MS,
+    RECIPIENT_RETRY_MS,
     RETRY_WINDOW_MS,
     TICK_SECONDS,
     ScheduledInvites,
@@ -612,6 +613,127 @@ class TestFailures(_Scheduled):
         await self.sender.run_due()
         self.assertEqual((await self.h.row(ident))["send_at_ms"], self.now)
 
+    def turn_away(self, ident):
+        """One address held at RCPT, as Twisted raises it; every other row goes."""
+        sent = self.h.mailer.send_invite
+
+        async def held(row: Dict[str, Any], code: str) -> None:
+            if row["id"] == ident:
+                raise SMTPDeliveryError(
+                    452,
+                    "No recipients accepted",
+                    b"",
+                    [(b"full@school.test", 452, b"mailbox full")],
+                )
+            await sent(row, code)
+
+        self.h.mailer.send_invite = held
+
+    def count_attempts(self, error):
+        """Every send fails with ``error``; the rows tried, in order."""
+        attempts: List[str] = []
+
+        async def fails(row: Dict[str, Any], _code: str) -> None:
+            attempts.append(row["id"])
+            raise error
+
+        self.h.mailer.send_invite = fails
+        return attempts
+
+    async def test_a_full_mailbox_moves_that_row_and_the_tick_goes_on(self):
+        """One student's mailbox must not hold up the other teachers' invitations."""
+        rows = await self.h.add(INVITED, SECOND)
+        full, other = [r["invitation_id"] for r in rows]
+        await self.schedule(full, at=self.now + DAY_MS)
+        await self.schedule(other, at=self.now + DAY_MS + 1)
+        self.now += DAY_MS + 1
+        self.turn_away(full)
+        await self.sender.run_due()
+        self.assertEqual(self.sent_ids(), [other])
+        held = await self.h.row(full)
+        self.assertEqual(held["send_count"], 0)
+        self.assertIsNone(held["last_sent_at_ms"])
+        self.assertEqual(held["send_at_ms"], self.now + RECIPIENT_RETRY_MS)
+
+        # Not due yet: a tick leaves it alone.
+        await self.sender.run_due()
+        self.assertEqual(self.sent_ids(), [other])
+
+    async def test_a_held_row_is_sent_once_when_the_mailbox_clears(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        sent = self.h.mailer.send_invite
+        self.turn_away(ident)
+        await self.sender.run_due()
+        self.h.mailer.send_invite = sent
+        self.now += RECIPIENT_RETRY_MS
+        await self.sender.run_due()
+        await self.sender.run_due()
+        self.assertEqual(self.sent_ids(), [ident])
+        self.assertEqual((await self.h.row(ident))["send_count"], 1)
+
+    async def test_a_held_row_is_given_up_on_its_first_time_not_its_moved_one(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        self.turn_away(ident)
+        await self.sender.run_due()
+        self.now += RETRY_WINDOW_MS - RECIPIENT_RETRY_MS
+        await self.sender.run_due()
+        self.assertIsNotNone((await self.h.row(ident))["send_at_ms"])
+
+        self.now += 2 * RECIPIENT_RETRY_MS
+        logs = self.capture_logs()
+        await self.sender.run_due()
+        after = await self.h.row(ident)
+        self.assertIsNone(after["send_at_ms"])
+        self.assertEqual(after["send_count"], 0)
+        self.assertIn(ident, logs.text())
+
+    async def test_a_teachers_new_time_starts_a_new_window(self):
+        (row,) = await self.h.add(INVITED)
+        ident = row["invitation_id"]
+        await self.schedule(ident)
+        self.now += DAY_MS
+        self.turn_away(ident)
+        await self.sender.run_due()
+        self.now += RETRY_WINDOW_MS
+        await self.schedule(ident, at=self.now + DAY_MS)
+        self.now += DAY_MS
+        await self.sender.run_due()
+        after = await self.h.row(ident)
+        self.assertEqual(after["send_at_ms"], self.now + RECIPIENT_RETRY_MS)
+
+    async def test_a_try_later_answer_to_the_whole_server_stops_the_tick(self):
+        """Refused before any address was tried, as at MAIL FROM: every row would
+        be refused the same way, so none moves and the tick stops."""
+        rows = await self.h.add(INVITED, SECOND)
+        ids = [r["invitation_id"] for r in rows]
+        await self.schedule(*ids)
+        self.now += DAY_MS
+        attempts = self.count_attempts(SMTPDeliveryError(451, b"busy", b"", []))
+        await self.sender.run_due()
+        self.assertEqual(self.h.mailer.sent, [])
+        self.assertEqual(len(attempts), 1)
+        for ident in ids:
+            self.assertEqual((await self.h.row(ident))["send_at_ms"], self.now)
+
+    async def test_a_server_closing_at_the_address_stops_the_tick(self):
+        rows = await self.h.add(INVITED, SECOND)
+        ids = [r["invitation_id"] for r in rows]
+        await self.schedule(*ids)
+        self.now += DAY_MS
+        attempts = self.count_attempts(
+            SMTPDeliveryError(
+                421, "No recipients accepted", b"", [(b"a@b.c", 421, b"closing")]
+            )
+        )
+        await self.sender.run_due()
+        self.assertEqual(len(attempts), 1)
+
     async def test_an_uncertain_delivery_is_never_sent_again_on_its_own(self):
         for uncertain in (
             ConnectionLost(),
@@ -762,6 +884,7 @@ class TestMigration(unittest.TestCase):
         for sql in SCHEMA:
             db.execute(sql)
         db.execute("ALTER TABLE pangea_seat_invitation DROP COLUMN send_at_ms")
+        db.execute("ALTER TABLE pangea_seat_invitation DROP COLUMN first_due_ms")
         db.execute(
             "INSERT INTO pangea_seat_invitation (id, course_room_id, email_key,"
             " state, source, invited_by, created_at_ms)"
@@ -784,6 +907,7 @@ class TestMigration(unittest.TestCase):
             r[1] for r in db.execute("PRAGMA table_info(pangea_seat_invitation)")
         ]
         self.assertIn("send_at_ms", columns)
+        self.assertIn("first_due_ms", columns)
         self.assertEqual(
             db.execute("SELECT id, send_at_ms FROM pangea_seat_invitation").fetchall(),
             [("a", None)],

@@ -17,7 +17,10 @@ import psycopg2
 import requests
 import testing.postgresql
 
-from synapse_pangea_chat.student_invitations.scheduled_send import TICK_SECONDS
+from synapse_pangea_chat.student_invitations.scheduled_send import (
+    RECIPIENT_RETRY_MS,
+    TICK_SECONDS,
+)
 from tests.base_e2e import BaseSynapseE2ETest
 from tests.smtp_sink import SmtpSink, body_text
 
@@ -149,6 +152,38 @@ class TestScheduledInvitationsE2E(BaseSynapseE2ETest):
         self.assertEqual(
             [(e["target"], e["actor"]) for e in sent], [(ids[0], "system")]
         )
+
+    async def test_a_full_mailbox_moves_its_row_and_the_next_row_still_goes(self):
+        await self.homeserver(
+            module_config={"app_base_url": APP},
+            synapse_config_overrides={
+                "email": self.sink.synapse_email_config(),
+                "templates": {"custom_template_directory": self.templates},
+            },
+        )
+        _, token = await self.new_user("teacher")
+        room = self.course(token)
+        full, other = (
+            f"{name}+{self.tag}@school.example" for name in ("full", "other")
+        )
+        added: List[Dict[str, Any]] = self.call(
+            "POST",
+            SI + "add",
+            token,
+            {"room_id": room, "emails": [full, other], "source": "manual"},
+        )["invitations"]
+        ids = [row["invitation_id"] for row in added]
+        self.sink.hold(full)
+        self.addCleanup(self.sink.release, full)
+        soon = int(time.time() * 1000) + 2000
+        self.schedule(room, token, ids[0], soon)
+        self.schedule(room, token, ids[1], soon + 1)
+
+        self.assertIsNotNone(self.sink.wait_for(other, SUBJECT, TICK_SECONDS + 30))
+        self.assertEqual(self.sink.messages_to(full), [])
+        row = self.rows(room, token)[ids[0]]
+        self.assertEqual(row["send_count"], 0)
+        self.assertGreater(row["send_at_ms"], soon + RECIPIENT_RETRY_MS - 1)
 
     async def test_a_moved_row_sends_once_at_its_new_time_and_send_now_clears_its_own(
         self,

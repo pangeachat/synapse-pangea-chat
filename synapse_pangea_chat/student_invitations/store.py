@@ -79,6 +79,7 @@ SCHEMA = (
         lti_user_id TEXT,
         member_user_id TEXT,
         send_at_ms BIGINT,
+        first_due_ms BIGINT,
         UNIQUE (course_room_id, email_key))""",
         """CREATE UNIQUE INDEX IF NOT EXISTS pangea_seat_invitation_one_joined
         ON pangea_seat_invitation (course_room_id, claimant)
@@ -125,6 +126,7 @@ COLUMNS = (
     "lti_user_id",
     "member_user_id",
     "send_at_ms",
+    "first_due_ms",
 )
 _SELECT = "SELECT " + ", ".join(COLUMNS) + " FROM pangea_seat_invitation "
 REQUEST_COLUMNS = ("invitation_id", "user_id", "requested_at_ms", "decision")
@@ -683,7 +685,8 @@ class StudentInvitationStore:
             if row["send_at_ms"] == send_at_ms:
                 return "scheduled", row
             txn.execute(
-                "UPDATE pangea_seat_invitation SET send_at_ms = ?"
+                "UPDATE pangea_seat_invitation SET send_at_ms = ?,"
+                " first_due_ms = NULL"
                 " WHERE id = ? AND state = 'invited' AND send_count = ?",
                 (send_at_ms, invitation_id, expected),
             )
@@ -750,23 +753,33 @@ class StudentInvitationStore:
         return await self.db.runInteraction("pangea_seat_invitation_unschedule", write)
 
     async def release_send(
-        self, before: Dict[str, Any], keep_schedule: bool = False
+        self,
+        before: Dict[str, Any],
+        keep_schedule: bool = False,
+        retry_at: Optional[int] = None,
     ) -> None:
         """Undo a reservation whose email was not sent, unless the row moved
         on. A failed send wrote no event, so the ledger is untouched.
-        ``keep_schedule`` puts a claimed row back in the due set; a time set
+        ``keep_schedule`` puts a claimed row back in the due set; ``retry_at``
+        puts it back at that time instead, and ``first_due_ms`` keeps the time
+        it was first due, which the retry window is measured from. A time set
         since the claim stands either way."""
 
         def write(txn: Any) -> None:
             txn.execute(
                 "UPDATE pangea_seat_invitation"
                 " SET send_count = ?, last_sent_at_ms = ?,"
+                " first_due_ms = CASE WHEN send_at_ms IS NULL"
+                " THEN COALESCE(first_due_ms, ?) ELSE first_due_ms END,"
                 " send_at_ms = COALESCE(send_at_ms, ?)"
                 " WHERE id = ? AND send_count = ?",
                 (
                     before["send_count"],
                     before["last_sent_at_ms"],
-                    before["send_at_ms"] if keep_schedule else None,
+                    before["send_at_ms"] if retry_at is not None else None,
+                    retry_at
+                    if retry_at is not None
+                    else (before["send_at_ms"] if keep_schedule else None),
                     before["id"],
                     before["send_count"] + 1,
                 ),
@@ -1103,15 +1116,17 @@ def migrate(txn: Any) -> None:
         )
     if "invited_by" in managed:
         txn.execute("ALTER TABLE pangea_managed_account DROP COLUMN invited_by")
-    if "send_at_ms" not in _columns(txn, "pangea_seat_invitation"):
-        # Every process runs this on first use; on Postgres one that loses the
-        # race waits on the table lock and must then find the column added.
-        postgres = isinstance(getattr(txn, "database_engine", None), PostgresEngine)
-        txn.execute(
-            "ALTER TABLE pangea_seat_invitation ADD COLUMN "
-            + ("IF NOT EXISTS " if postgres else "")
-            + "send_at_ms BIGINT"
-        )
+    invitation = _columns(txn, "pangea_seat_invitation")
+    for column in ("send_at_ms", "first_due_ms"):
+        if column not in invitation:
+            # Every process runs this on first use; on Postgres one that loses the
+            # race waits on the table lock and must then find the column added.
+            postgres = isinstance(getattr(txn, "database_engine", None), PostgresEngine)
+            txn.execute(
+                "ALTER TABLE pangea_seat_invitation ADD COLUMN "
+                + ("IF NOT EXISTS " if postgres else "")
+                + f"{column} BIGINT"
+            )
     txn.execute(
         "CREATE INDEX IF NOT EXISTS pangea_seat_invitation_due"
         " ON pangea_seat_invitation (send_at_ms)"

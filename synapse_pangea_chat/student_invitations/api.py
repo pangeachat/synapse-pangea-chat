@@ -254,6 +254,19 @@ def not_delivered(error: BaseException) -> bool:
     return isinstance(error, SMTPClientError) and 400 <= int(error.code or 0) < 500
 
 
+def held_for_recipient(error: BaseException) -> bool:
+    """True when the mail server turned away this one address for now, as with a
+    full mailbox: it read the address and answered 4xx. Refused before any address
+    was read, or told to close (421), it is the whole server's answer. Delivery
+    never began, so ``not_delivered`` holds too."""
+    if not isinstance(error, SMTPDeliveryError):
+        return False
+    answers = error.addresses or ()
+    return bool(answers) and all(
+        400 <= code < 500 and code != 421 for _, code, _ in answers
+    )
+
+
 class StudentInvitationHandlers:
     """Each route as a function of the caller and its parsed input, returning
     (status, body)."""

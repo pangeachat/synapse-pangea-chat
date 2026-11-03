@@ -8,10 +8,14 @@ The claim counts the send and takes the row out of the due set before any
 email, so a process dying mid-send loses that row's email rather than sending
 it twice: a resend is explicit. A failed send puts it back or gives it up:
 
-- the mail server was never reached, or answered "try later": nothing was
-  delivered, so the row stays due and the tick stops, as the send route stops.
-  An outage heals by itself, one attempt a minute. A row still failing past
-  ``RETRY_WINDOW_MS`` after its time is given up.
+- the mail server was never reached, or answered "try later" for everyone:
+  nothing was delivered, so the row stays due and the tick stops, as the send
+  route stops. An outage heals by itself, one attempt a minute.
+- the mail server answered "try later" for this address, as for a full mailbox:
+  nothing was delivered, and only this student is held up, so the row's next
+  attempt moves ``RECIPIENT_RETRY_MS`` on and the tick goes on to the others.
+- a row still failing either way past ``RETRY_WINDOW_MS`` after its first time
+  is given up.
 - anything else, including a connection lost mid-message, may have delivered:
   given up rather than risk a second email, and logged.
 - the mail server refused the address: given up, it would only fail again.
@@ -36,6 +40,7 @@ from synapse_pangea_chat.student_invitations.api import (
     MAX_SEND_AHEAD_MS,
     CourseRooms,
     Mailer,
+    held_for_recipient,
     not_delivered,
     send_failure,
 )
@@ -47,6 +52,7 @@ from synapse_pangea_chat.student_invitations.store import StudentInvitationStore
 __all__ = [
     "BATCH",
     "MAX_SEND_AHEAD_MS",
+    "RECIPIENT_RETRY_MS",
     "RETRY_WINDOW_MS",
     "TICK_SECONDS",
     "ScheduledInvites",
@@ -55,6 +61,7 @@ __all__ = [
 TICK_SECONDS = 60
 BATCH = 20
 RETRY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000
+RECIPIENT_RETRY_MS = 60 * 60 * 1000
 
 
 class NoClassCode(Exception):
@@ -127,9 +134,15 @@ class ScheduledInvites:
             await self._mailer.send_invite(row, code)
         except Exception as error:
             reason = send_failure(error)
-            late = self._now() - row["send_at_ms"] > RETRY_WINDOW_MS
+            first_due = row["first_due_ms"] or row["send_at_ms"]
+            late = self._now() - first_due > RETRY_WINDOW_MS
             retry = not_delivered(error) and not late
-            await self._store.release_send(row, keep_schedule=retry)
+            held = held_for_recipient(error)
+            await self._store.release_send(
+                row,
+                keep_schedule=retry,
+                retry_at=self._now() + RECIPIENT_RETRY_MS if retry and held else None,
+            )
             report_failure(
                 "scheduled invitation",
                 error,
@@ -137,7 +150,7 @@ class ScheduledInvites:
                 reason=reason,
                 retry=retry,
             )
-            return reason != "mail_error"
+            return held or reason != "mail_error"
         try:
             await self._store.record_sent(row, SYSTEM, self._now())
         except Exception as error:
