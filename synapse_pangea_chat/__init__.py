@@ -37,7 +37,11 @@ from synapse_pangea_chat.delete_room import DeleteRoom
 from synapse_pangea_chat.delete_user import DeleteUser
 from synapse_pangea_chat.direct_message import EnsureDirectMessage
 from synapse_pangea_chat.direct_push import DirectPush
-from synapse_pangea_chat.discussion_room import DiscussionRoom
+from synapse_pangea_chat.discussion_room import (
+    DiscussionAdminMirror,
+    DiscussionJoinCheck,
+    DiscussionRoom,
+)
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
 from synapse_pangea_chat.email_invite.claim_by_email import ClaimByEmail
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
@@ -359,13 +363,24 @@ class PangeaChat:
         )
 
         # --- Discussion rooms ---
-        # Join or create a room for one of a course's discussions, the seat
-        # written by the server (org discussions.instructions.md).
+        # Places a student in a room for one of their course's discussions and
+        # ends or reopens their seat; the server is the only writer of seats.
+        # The join check and the admin mirror need the discussion bot
+        # (discussion-room.instructions.md).
         self.discussion_room_resource = DiscussionRoom(api, config)
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/discussion_room",
             resource=self.discussion_room_resource,
         )
+        # The discussion bot is user_activity_notification_bot_user_id, shared
+        # with the user-activity filter.
+        if config.user_activity_notification_bot_user_id:
+            self.discussion_join_check = DiscussionJoinCheck(
+                api, config.user_activity_notification_bot_user_id
+            )
+            self.discussion_admin_mirror = DiscussionAdminMirror(
+                api, config.user_activity_notification_bot_user_id
+            )
 
         # --- Activity Session Previews ---
         # Space-scoped session discovery: a thin front on the room_preview
@@ -881,23 +896,16 @@ class PangeaChat:
         )
 
         # --- discussion_room config ---
+        # Request limits are in the shared table (student_invitations/rate_limits.py).
         discussion_room_capacity = config.get("discussion_room_capacity", 12)
-        discussion_room_requests_per_burst = config.get(
-            "discussion_room_requests_per_burst", 10
-        )
-        discussion_room_burst_duration_seconds = config.get(
-            "discussion_room_burst_duration_seconds", 60
-        )
-        for name, value in (
-            ("discussion_room_capacity", discussion_room_capacity),
-            ("discussion_room_requests_per_burst", discussion_room_requests_per_burst),
-            (
-                "discussion_room_burst_duration_seconds",
-                discussion_room_burst_duration_seconds,
-            ),
+        if (
+            not isinstance(discussion_room_capacity, int)
+            or isinstance(discussion_room_capacity, bool)
+            or discussion_room_capacity < 1
         ):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise ValueError(f'Config "{name}" must be an integer >= 1')
+            raise ValueError(
+                'Config "discussion_room_capacity" must be an integer >= 1'
+            )
 
         # --- room_code config ---
         knock_with_code_requests_per_burst = config.get(
@@ -1656,8 +1664,6 @@ class PangeaChat:
             room_preview_burst_duration_seconds=room_preview_burst_duration_seconds,
             room_preview_requests_per_burst=room_preview_requests_per_burst,
             discussion_room_capacity=discussion_room_capacity,
-            discussion_room_requests_per_burst=discussion_room_requests_per_burst,
-            discussion_room_burst_duration_seconds=discussion_room_burst_duration_seconds,
             knock_with_code_requests_per_burst=knock_with_code_requests_per_burst,
             knock_with_code_burst_duration_seconds=knock_with_code_burst_duration_seconds,
             preview_with_code_requests_per_burst=preview_with_code_requests_per_burst,

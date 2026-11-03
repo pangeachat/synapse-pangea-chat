@@ -38,14 +38,16 @@ from synapse_pangea_chat.activity_session_previews.get_activity_session_previews
     has_valid_via,
 )
 from synapse_pangea_chat.blocked_join_gate import server_initiated_join
-from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
 from synapse_pangea_chat.course_default_chats.course_default_chats import (
     SPACE_ROOM_TYPE,
     wait_out_rate_limits,
 )
 from synapse_pangea_chat.push_rules_writer import push_rules_writer, writes_push_rules
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
-from synapse_pangea_chat.room_code.instructor_access import is_joined_instructor
+from synapse_pangea_chat.room_code.instructor_access import (
+    course_admins,
+    is_joined_instructor,
+)
 
 try:
     import sentry_sdk  # type: ignore[import-not-found]
@@ -317,23 +319,7 @@ class CourseSessionAdmins:
         """Joined, local, non-bot members of the space at admin power."""
         if not await self.is_space(space_id):
             return frozenset()
-        state = await self._api.get_room_state(
-            space_id,
-            event_filter=[
-                (EventTypes.Create, ""),
-                (EventTypes.PowerLevels, ""),
-                (EventTypes.Member, None),
-            ],
-        )
-        return frozenset(
-            user_id
-            for (event_type, user_id), _ in state.items()
-            if event_type == EventTypes.Member
-            and isinstance(user_id, str)
-            and self._api.is_mine(user_id)
-            and not is_probable_bot_user_id(user_id)
-            and is_joined_instructor(state, user_id)
-        )
+        return await course_admins(self._api, space_id)
 
     async def _join_admin(self, space_id: str, room_id: str, user_id: str) -> bool:
         """List, join, then mute. Whether the admin may still be joined is read

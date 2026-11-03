@@ -16,15 +16,14 @@ from __future__ import annotations
 
 import json
 import logging
-from io import BytesIO
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import quote, urlencode
 
-from synapse.http.client import read_body_with_max_size
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.module_api import ModuleApi
 from synapse.util.async_helpers import timeout_deferred
-from twisted.web.http_headers import Headers
+
+from synapse_pangea_chat.cms_http import cms_request, service_headers
 
 COURSE_MISSIONS_STATE_EVENT_TYPE = "pangea.course_missions"
 
@@ -97,6 +96,16 @@ def _visible_at(doc: Mapping[str, Any], l2: str) -> bool:
     )
 
 
+def activity_lo_ids(doc: Mapping[str, Any]) -> List[str]:
+    """The Missions an ``activities-v2`` row is filed under."""
+    refs = doc.get("learningObjectiveRefs")
+    return [
+        lo_id
+        for lo_id in (_ref_id(ref) for ref in (refs if isinstance(refs, list) else []))
+        if lo_id is not None
+    ]
+
+
 def build_course_missions_content(
     quest: Mapping[str, Any], activities: Sequence[Mapping[str, Any]]
 ) -> Dict[str, Any]:
@@ -119,11 +128,8 @@ def build_course_missions_content(
         if not isinstance(activity_id, str) or not activity_id or activity_id in seen:
             continue
         seen.add(activity_id)
-        refs = doc.get("learningObjectiveRefs")
-        for ref in refs if isinstance(refs, list) else []:
-            lo_id = _ref_id(ref)
-            if lo_id is not None:
-                by_lo.setdefault(lo_id, []).append(activity_id)
+        for lo_id in activity_lo_ids(doc):
+            by_lo.setdefault(lo_id, []).append(activity_id)
 
     return {
         "version": 1,
@@ -161,28 +167,32 @@ class CourseMissionsReader:
         self._http = api.http_client
         self._clock = api._hs.get_clock()
         self._base = cms_base_url.rstrip("/") + "/api/"
-        self._headers = Headers(
-            {"Authorization": [f"service-users API-Key {cms_api_key}"]}
-        )
+        self._headers = service_headers(cms_api_key)
 
     async def _get(self, path: str) -> Any:
-        response = await self._http.request(
-            "GET", self._base + path, headers=self._headers
+        code, raw = await cms_request(
+            self._http,
+            "GET",
+            self._base + path,
+            self._headers,
+            max_bytes=MAX_BODY_BYTES,
         )
-        buffer = BytesIO()
-        await make_deferred_yieldable(
-            read_body_with_max_size(response, buffer, MAX_BODY_BYTES)
-        )
-        if response.code != 200:
-            raise CourseMissionsError(
-                f"CMS {path.split('?')[0]} answered {response.code}"
-            )
-        return json.loads(buffer.getvalue())
+        if code != 200:
+            raise CourseMissionsError(f"CMS {path.split('?')[0]} answered {code}")
+        return json.loads(raw)
 
-    async def _build(self, quest_id: str) -> Dict[str, Any]:
+    async def _quest(self, quest_id: str) -> Mapping[str, Any]:
         quest = await self._get(f"quest-plans/{quote(quest_id, safe='')}?depth=0")
         if not isinstance(quest, Mapping):
             raise CourseMissionsError("quest read returned no document")
+        return quest
+
+    async def quest_lo_ids(self, quest_id: str) -> List[str]:
+        """The quest's Missions, in order; raises when the CMS cannot say."""
+        return quest_lo_ids(await self._quest(quest_id))
+
+    async def _build(self, quest_id: str) -> Dict[str, Any]:
+        quest = await self._quest(quest_id)
         l2 = quest_target_language(quest)
         lo_ids = quest_lo_ids(quest)
         if l2 is None:

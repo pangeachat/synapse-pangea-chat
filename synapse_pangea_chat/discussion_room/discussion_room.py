@@ -1,33 +1,27 @@
 """``/_synapse/client/pangea/v1/discussion_room``: a student's room for one of
-their course's discussions.
+their course's discussions, and their seat in it.
 
-``POST {course_id, activity_id, avatar_url?}`` places the student and answers
-``{room_id, created}``. ``GET ?course_id=&activity_id=`` answers where a
-placement would put them now, without placing them: ``{room_id, students,
-joined}``, ``room_id`` null meaning a new room. Both answer 403 to a caller who
-is not a member of the course and 404 when the activity is not one of the
-course's discussions.
+- ``POST {course_id, activity_id}`` places the caller and answers
+  ``{room_id, created}``.
+- ``GET ?course_id=&activity_id=`` answers where a placement would put them
+  now, without placing them: ``{room_id, students, joined}``, ``room_id``
+  null meaning a new room.
+- ``POST {room_id, action: "end" | "continue"}`` ends or reopens the
+  caller's own seat and answers ``{room_id, seat}``.
 
-The student is sent back to their own room for the discussion when they have
-one; otherwise into the fullest room for it with fewer than
-``discussion_room_capacity`` students, or a new room when none has space. The
-server writes the student's seat, so two students arriving at once never
-overfill a room or lose a seat. Design: org discussions.instructions.md
-("Rooms").
+The server is the only writer of a discussion room's seats, under one lock
+per discussion, so two requests never overfill a room or drop a seat.
 
-A discussion room is an ordinary activity session room (its create type is
-``p.activity.session:<activity id>`` and it carries ``pangea.activity_plan``),
-so every activity-room reader works on it. What sets it apart is the seats:
-every student holds their own seat on the plan's one shared role, keyed by
-student rather than by role.
+Design: discussion-room.instructions.md; product rules: org
+discussions.instructions.md.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
-from io import BytesIO
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -39,7 +33,7 @@ from typing import (
     Set,
     Tuple,
 )
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 from synapse.api.constants import EventTypes, RoomCreationPreset
 from synapse.api.errors import (
@@ -47,59 +41,99 @@ from synapse.api.errors import (
     InvalidClientTokenError,
     LimitExceededError,
     MissingClientTokenError,
+    SynapseError,
 )
 from synapse.http import server
-from synapse.http.client import read_body_with_max_size
 from synapse.http.server import respond_with_json
+from synapse.http.servlet import parse_string
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.module_api import ModuleApi
 from synapse.types import create_requester
 from synapse.util.async_helpers import Linearizer, timeout_deferred
-from twisted.web.http_headers import Headers
 from twisted.web.resource import Resource
 
-from synapse_pangea_chat.activity_session_previews.get_activity_session_previews import (
-    _activity_session_ids,
-    _child_room_ids,
-)
 from synapse_pangea_chat.blocked_join_gate.blocked_join_gate import (
     server_initiated_join,
 )
-from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
-from synapse_pangea_chat.discussion_room.rate_limit import is_rate_limited
+from synapse_pangea_chat.cms_http import (
+    canonical_activity_where,
+    cms_request,
+    service_headers,
+)
+from synapse_pangea_chat.course_default_chats.course_default_chats import (
+    wait_out_rate_limits,
+)
+from synapse_pangea_chat.discussion_room.rooms import (
+    ACTIVITY_PLAN_EVENT,
+    ACTIVITY_ROLES_EVENT,
+    DISCUSSION_MODE,
+    RoomView,
+    continued_seat,
+    course_discussion_rooms,
+    creation_content,
+    discussion_marker,
+    discussion_power_levels,
+    ended_seat,
+    find_seat,
+    is_discussion_plan,
+    pick_room,
+    room_view,
+    utc_timestamp,
+    with_seat,
+    with_seat_changed,
+    without_seat,
+)
+from synapse_pangea_chat.email_invite.course_missions import (
+    CourseMissionsReader,
+    activity_lo_ids,
+)
+from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
-from synapse_pangea_chat.room_code.instructor_access import is_joined_instructor
+from synapse_pangea_chat.room_code.instructor_access import course_admins
+from synapse_pangea_chat.room_preview.constants import (
+    PANGEA_COURSE_PLAN_STATE_EVENT_TYPE as COURSE_PLAN_EVENT,
+)
+from synapse_pangea_chat.sentry_capture import capture_exception
+from synapse_pangea_chat.student_invitations.rate_limits import limit_for
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.discussion_room")
 
-ACTIVITY_SESSION_TYPE_PREFIX = "p.activity.session:"
-ACTIVITY_PLAN_EVENT = "pangea.activity_plan"
-ACTIVITY_ROLES_EVENT = "pangea.activity_roles"
-ACTIVITY_SUMMARY_EVENT = "pangea.activity_summary"
-SPACE_CHILD_EVENT = "m.space.child"
-
-DISCUSSION_MODE = "Discussion"
-# The plan's one shared role; every student's seat is on it.
-DISCUSSION_ROLE_ID = "participant"
-DISCUSSION_ROLE_NAME = "Participant"
-
-CMS_AUTH_COLLECTION = "service-users"
 CMS_TIMEOUT_SECONDS = 5
 CMS_MAX_BODY_BYTES = 1_000_000
 # A start page polls its preview every few seconds; a discussion's plan is
 # read from the CMS at most this often per course and discussion.
 DISCUSSION_CACHE_SECONDS = 60
+# Previews reuse the rooms' state this long; a placement never does, and
+# clears it for the discussion it changed.
+PREVIEW_CACHE_SECONDS = 3
 
-# Tries at joining a student past Synapse's per-room join limit, each waiting
-# as long as Synapse asks, clamped: about ten seconds at its defaults.
+# Joins wait out Synapse's per-room join limit at most this many times, each
+# wait clamped, so a request is answered busy after about ten seconds.
 JOIN_ATTEMPTS = 6
-JOIN_WAIT_DEFAULT_MS = 1000
-JOIN_WAIT_MIN_MS = 200
-JOIN_WAIT_MAX_MS = 5000
+JOIN_WAIT_MAX_MS = 2000
+# A join the chosen room refuses sends placement to another room this many
+# times before the caller is refused.
+PLACEMENT_ATTEMPTS = 3
+
+ROUTE_PLACE = "discussion_room_place"
+ROUTE_PREVIEW = "discussion_room_preview"
+ROUTE_SEAT = "discussion_room_seat"
+
+ACTION_END = "end"
+ACTION_CONTINUE = "continue"
+
+# The room version every discussion room is created in: version 12 forbids
+# listing the creator in power levels, which these rooms do for the bot.
+DISCUSSION_ROOM_VERSION = "11"
+
+# Choreo's content signature (canonicalize.compute_activity_signature): 32 hex.
+VERSION_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+
+YOUTUBE_POSTER = "https://img.youtube.com/vi/{}/mqdefault.jpg"
 
 
 class DiscussionNotFound(Exception):
@@ -111,7 +145,7 @@ class CmsUnavailable(Exception):
 
 
 class _Refused(Exception):
-    """A request answered with a 4xx before any placement work."""
+    """A request answered with a 4xx or 503, with no placement work done."""
 
     def __init__(self, status: int, error: str, errcode: Optional[str] = None):
         super().__init__(error)
@@ -122,104 +156,61 @@ class _Refused(Exception):
 
 
 @dataclass(frozen=True)
-class _RoomView:
+class _Reservation:
     room_id: str
-    joined: FrozenSet[str]
-    seated: FrozenSet[str]
-    # Joined, or seated without ever having been a member: a seat written
-    # ahead of its join holds its place, and keeps holding it if the join
-    # fails, until the student's next try joins them.
-    occupants: FrozenSet[str]
-    students: int
-    # Read only for a course admin, who is placed in the newest room.
-    created_ts: int
-
-
-def _roles(content: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    roles = (content or {}).get("roles")
-    return dict(roles) if isinstance(roles, Mapping) else {}
-
-
-def seated_user_ids(roles_content: Optional[Mapping[str, Any]]) -> Set[str]:
-    return {
-        seat["user_id"]
-        for seat in _roles(roles_content).values()
-        if isinstance(seat, Mapping) and isinstance(seat.get("user_id"), str)
-    }
-
-
-def seat_key(user_id: str) -> str:
-    """A student's seat in ``pangea.activity_roles``: keyed by student, since
-    every student holds the same role."""
-    return f"{DISCUSSION_ROLE_ID}:{user_id}"
-
-
-def with_seat(roles_content: Optional[Dict[str, Any]], user_id: str) -> Dict[str, Any]:
-    """The roles content with ``user_id``'s seat added; an existing seat for
-    them (finished or not) is kept as it is."""
-    content = dict(roles_content or {})
-    roles = _roles(content)
-    content["roles"] = roles
-    if user_id not in seated_user_ids(content):
-        roles[seat_key(user_id)] = {
-            "id": DISCUSSION_ROLE_ID,
-            "user_id": user_id,
-            "role": DISCUSSION_ROLE_NAME,
-        }
-    return content
-
-
-def pick_room(student_counts: List[Tuple[str, int]], capacity: int) -> Optional[str]:
-    """The fullest room with space, so conversations fill up rather than
-    spread thin; ties go to the room listed first."""
-    open_rooms = [
-        (count, i, room)
-        for i, (room, count) in enumerate(student_counts)
-        if count < capacity
-    ]
-    if not open_rooms:
-        return None
-    open_rooms.sort(key=lambda r: (-r[0], r[1]))
-    return open_rooms[0][2]
-
-
-def discussion_power_levels(
-    creator: str, admins: FrozenSet[str], bot_user_id: Optional[str]
-) -> Dict[str, Any]:
-    """The activity room defaults (client ``RoomDefaults``), with the course's
-    admins at 100, the bot at 50 and students at 0. The creator starts at 100
-    so the server can finish setting the room up as them, then is lowered."""
-    users: Dict[str, int] = {admin: 100 for admin in admins}
-    if bot_user_id:
-        users[bot_user_id] = 50
-    users[creator] = 100
-    return {
-        "ban": 50,
-        "kick": 50,
-        "invite": 50,
-        "redact": 50,
-        "events": {
-            ACTIVITY_PLAN_EVENT: 0,
-            ACTIVITY_ROLES_EVENT: 0,
-            ACTIVITY_SUMMARY_EVENT: 0,
-            "m.room.power_levels": 100,
-            "m.room.pinned_events": 50,
-        },
-        "events_default": 0,
-        "state_default": 50,
-        "users_default": 0,
-        "notifications": {"room": 50},
-        "users": users,
-    }
-
-
-def _query_string(request: SynapseRequest, name: str) -> Optional[str]:
-    values = request.args.get(name.encode()) if request.args else None
-    return values[0].decode("utf-8", "replace") if values else None
+    created: bool
+    joined: bool
+    # This request wrote the seat, so a failed join releases it.
+    wrote_seat: bool
+    own: bool
 
 
 def _nonempty(value: Any) -> Optional[str]:
     return (value.strip() or None) if isinstance(value, str) else None
+
+
+def _youtube_id(url: Any) -> Optional[str]:
+    """The video id of a YouTube watch, youtu.be, embed or shorts URL, the
+    client's own test (ActivityMediaBlock.youtubeId)."""
+    if not isinstance(url, str):
+        return None
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
+    if host == "youtu.be":
+        candidate = parsed.path.lstrip("/").split("/", 1)[0]
+    elif host.endswith("youtube.com"):
+        parts = parsed.path.strip("/").split("/")
+        if parts and parts[0] in ("embed", "shorts", "v") and len(parts) > 1:
+            candidate = parts[1]
+        else:
+            query = dict(
+                pair.split("=", 1) for pair in parsed.query.split("&") if "=" in pair
+            )
+            candidate = query.get("v", "")
+    else:
+        return None
+    return candidate if len(candidate) == 11 else None
+
+
+def _version_id(value: Any, activity_id: str) -> Optional[str]:
+    """The activity version the start page read from choreo (its content
+    signature), which a new room pins as a roleplay session does. Only that
+    shape is pinned; anything else creates the room on the latest version,
+    which every reader also handles."""
+    if isinstance(value, str) and VERSION_ID_PATTERN.fullmatch(value):
+        return value
+    logger.warning(
+        "discussion_room: no usable version_id for %s (%s); a new room is unpinned",
+        activity_id,
+        "missing" if value is None else "malformed",
+    )
+    return None
+
+
+def _web_url(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    return value if urlparse(value).scheme in ("http", "https") else None
 
 
 class DiscussionRoom(Resource):
@@ -231,17 +222,38 @@ class DiscussionRoom(Resource):
         self._config = config
         self._auth = api._hs.get_auth()
         self._store = api._hs.get_datastores().main
+        self._state = api._hs.get_storage_controllers().state
         self._clock = api._hs.get_clock()
         self._http = api.http_client
-        # The bot's user id, read from user_activity_notification_bot_user_id:
-        # it creates each room and writes seats ahead of their joins.
+        # The course's quest and its Missions, read as the course copy reads them.
+        self._quests = CourseMissionsReader(
+            api, config.cms_base_url, config.cms_service_api_key
+        )
+        # The facilitator bot creates every room and writes every seat. Its id
+        # is user_activity_notification_bot_user_id, shared with the
+        # user-activity filter.
         self._bot_user_id = config.user_activity_notification_bot_user_id or None
+        if self._bot_user_id is None:
+            logger.error(
+                "discussion_room: user_activity_notification_bot_user_id is not "
+                "set; the endpoint answers 503"
+            )
+        self._limiters: Dict[str, SlidingWindowRateLimiter] = {}
+        for route in (ROUTE_PLACE, ROUTE_PREVIEW, ROUTE_SEAT):
+            burst, seconds = limit_for(config.student_invitation_rate_limits, route)
+            self._limiters[route] = SlidingWindowRateLimiter(
+                requests_per_burst=burst, burst_duration_seconds=seconds
+            )
         # (course_id, activity_id) -> (expires at, plan)
         self._plans: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
-        # One placement at a time per course and discussion, so a room is
-        # counted and its seat written by one request before the next looks.
-        # Per process: a deploy that runs this endpoint on more than one
-        # worker must route it to one, or move to the worker locks handler.
+        # (course_id, activity_id) -> (expires at, rooms), for previews only
+        self._views: Dict[Tuple[str, str], Tuple[float, List[RoomView]]] = {}
+        # Discussion rooms found without their bot, reported once per process.
+        self._reported_botless: Set[str] = set()
+        # One seat write at a time per course and discussion, so a room is
+        # counted and its seats written by one request before the next looks.
+        # Per process: the endpoint is routed to the main process only
+        # (discussion-room.instructions.md, "Concurrency").
         self._locks = Linearizer("discussion_room", clock=self._clock)
 
     def render_GET(self, request: SynapseRequest):
@@ -253,10 +265,10 @@ class DiscussionRoom(Resource):
         return server.NOT_DONE_YET
 
     async def _handle(self, request: SynapseRequest, *, preview: bool) -> None:
-        action = "preview" if preview else "place"
         try:
             status, body = 200, await self._answer(request, preview)
-        # silent-ok: the caller's own error, answered with its 4xx
+        # silent-ok: the caller's own error, or the endpoint unconfigured
+        # (logged at startup), answered with its status
         except _Refused as e:
             status, body = e.status, e.body
         # silent-ok: answered 404, a caller asking for an activity that is not
@@ -264,16 +276,18 @@ class DiscussionRoom(Resource):
         except DiscussionNotFound:
             status, body = 404, {"error": "Not a discussion of this course"}
         # silent-ok: answered 429, the room still refusing joins after every
-        # retry; the student is asked to try again
+        # retry; the seat was released and the student is asked to try again
         except LimitExceededError:
             logger.warning("discussion_room: joins still rate limited, answered busy")
             status = 429
             body = {"error": "Busy, try again", "errcode": "M_LIMIT_EXCEEDED"}
         except CmsUnavailable as e:
-            logger.error("discussion_room %s: CMS unavailable: %s", action, e)
+            logger.error("discussion_room: CMS unavailable: %s", e)
+            capture_exception(e)
             status, body = 502, {"error": "Could not check the discussion"}
-        except Exception:
-            logger.exception("discussion_room %s failed", action)
+        except Exception as e:
+            logger.exception("discussion_room request failed")
+            capture_exception(e)
             status, body = 500, {"error": "Internal server error"}
         respond_with_json(request, status, body, send_cors=True)
 
@@ -284,18 +298,38 @@ class DiscussionRoom(Resource):
             logger.info("discussion_room: authentication failed: %s", e)
             raise _Refused(401, "Unauthorized", "M_UNAUTHORIZED") from e
         user_id = requester.user.to_string()
-        if is_rate_limited(user_id, self._config, preview=preview):
-            raise _Refused(429, "Rate limited")
+        if self._bot_user_id is None:
+            logger.warning(
+                "discussion_room: refused, the discussion bot is not configured"
+            )
+            raise _Refused(503, "Discussions are not available")
+        bot_user_id = self._bot_user_id
 
-        if preview:
-            args: Any = {
-                name: _query_string(request, name)
-                for name in ("course_id", "activity_id")
-            }
-        else:
-            args = await extract_body_json(request)
+        args: Any
+        try:
+            if preview:
+                args = {
+                    name: parse_string(request, name, required=False, encoding="utf-8")
+                    for name in ("course_id", "activity_id")
+                }
+            else:
+                args = await extract_body_json(request)
+        except SynapseError as e:
+            raise _Refused(e.code, e.msg, e.errcode) from e
         if not isinstance(args, dict):
             args = {}
+
+        if not preview and "action" in args:
+            self._check_rate(user_id, ROUTE_SEAT)
+            room_id = _nonempty(args.get("room_id"))
+            action = args.get("action")
+            if not room_id or action not in (ACTION_END, ACTION_CONTINUE):
+                raise _Refused(
+                    400, "'room_id' and an 'action' of 'end' or 'continue' are required"
+                )
+            return await self._change_seat(user_id, room_id, action, bot_user_id)
+
+        self._check_rate(user_id, ROUTE_PREVIEW if preview else ROUTE_PLACE)
         course_id = _nonempty(args.get("course_id"))
         activity_id = _nonempty(args.get("activity_id"))
         if not (course_id and activity_id):
@@ -309,14 +343,15 @@ class DiscussionRoom(Resource):
 
         plan = await self._discussion_plan(course_id, activity_id)
         if preview:
-            return await self._preview(user_id, course_id, activity_id)
+            return await self._preview(user_id, course_id, activity_id, bot_user_id)
 
         room_id, created = await self._place(
             user_id,
             course_id,
             activity_id,
             plan,
-            _nonempty(args.get("avatar_url")),
+            _version_id(args.get("version_id"), activity_id),
+            bot_user_id,
         )
         logger.info(
             "discussion_room %s in %s: room=%s created=%s",
@@ -327,93 +362,80 @@ class DiscussionRoom(Resource):
         )
         return {"room_id": room_id, "created": created}
 
-    async def _survey(
-        self, user_id: str, course_id: str, activity_id: str
-    ) -> Tuple[Optional[_RoomView], List[_RoomView], FrozenSet[str]]:
-        """The discussion's rooms as placement sees them: the student's own
-        room if they have one, else every room; and the course's admins.
-        Shared by placing a student and previewing where they would go, so
-        the two never disagree.
+    def _check_rate(self, user_id: str, route: str) -> None:
+        if self._limiters[route].is_rate_limited(user_id):
+            raise _Refused(429, "Rate limited", "M_LIMIT_EXCEEDED")
 
-        A course admin is joined to every session room to read it
-        (course_session_admins), so their own room is the one they hold a
-        seat in, not any room they are in."""
-        admins = await self._course_admins(course_id)
-        is_admin = user_id in admins
-        room_ids = await _activity_session_ids(
-            await _child_room_ids([course_id], self._store), activity_id, self._store
-        )
-        rooms: List[_RoomView] = []
-        for room_id in room_ids:
-            room = await self._room_view(room_id, admins, with_created=is_admin)
-            if user_id in room.occupants and (not is_admin or user_id in room.seated):
-                return room, [], admins
-            rooms.append(room)
-        return None, rooms, admins
+    # --- Rooms ------------------------------------------------------------
 
-    async def _room_view(
-        self, room_id: str, admins: FrozenSet[str], *, with_created: bool
-    ) -> _RoomView:
-        event_filter: List[Tuple[str, Optional[str]]] = [
-            (EventTypes.Member, None),
-            (ACTIVITY_ROLES_EVENT, ""),
-        ]
-        if with_created:
-            event_filter.append((EventTypes.Create, ""))
-        state = await self._api.get_room_state(room_id, event_filter=event_filter)
-        memberships = {
-            key: event.content.get("membership")
-            for (event_type, key), event in state.items()
-            if event_type == EventTypes.Member
-        }
-        joined = frozenset(k for k, m in memberships.items() if m == "join")
-        roles = state.get((ACTIVITY_ROLES_EVENT, ""))
-        seated = frozenset(seated_user_ids(roles.content if roles else None))
-        occupants = joined | seated.difference(memberships)
-        create = state.get((EventTypes.Create, ""))
-        return _RoomView(
-            room_id=room_id,
-            joined=joined,
-            seated=seated,
-            occupants=occupants,
-            students=sum(
-                1
-                for m in occupants
-                if m not in admins and not is_probable_bot_user_id(m)
-            ),
-            created_ts=create.origin_server_ts if create is not None else 0,
+    async def _room_views(
+        self, course_id: str, activity_id: str, bot_user_id: str
+    ) -> List[RoomView]:
+        refs = await course_discussion_rooms(
+            self._store, course_id, bot_user_id, activity_id
         )
+        views: List[RoomView] = []
+        for ref in refs:
+            state = await self._api.get_room_state(
+                ref.room_id,
+                event_filter=[(EventTypes.Member, None), (ACTIVITY_ROLES_EVENT, "")],
+            )
+            view = room_view(ref.room_id, state, bot_user_id, ref.created_ts)
+            if not view.bot_joined and ref.room_id not in self._reported_botless:
+                # The bot can't be removed, so this is a bug or a manual change.
+                self._reported_botless.add(ref.room_id)
+                error = RuntimeError(f"discussion room {ref.room_id} has no bot")
+                logger.error("discussion_room: %s", error)
+                capture_exception(error)
+            views.append(view)
+        return views
 
     def _choose(
-        self, user_id: str, rooms: List[_RoomView], admins: FrozenSet[str]
-    ) -> Optional[_RoomView]:
-        """The room to put someone with no room of their own in: a student
-        goes to the fullest room with space; a course admin, who never counts
-        toward a room's students, to the newest room. None means a new room."""
-        if user_id in admins:
-            return max(rooms, key=lambda r: r.created_ts, default=None)
-        by_id = {room.room_id: room for room in rooms}
+        self, user_id: str, views: List[RoomView], excluded: Set[str]
+    ) -> Optional[RoomView]:
+        """The fullest room with space that will take the caller; None means a
+        new room. Course admins are placed the same way as students."""
+        candidates = [
+            view
+            for view in views
+            if view.bot_joined
+            and not view.refuses(user_id)
+            and view.room_id not in excluded
+        ]
         picked = pick_room(
-            [(room.room_id, room.students) for room in rooms],
+            [(view.room_id, view.students) for view in candidates],
             self._config.discussion_room_capacity,
         )
-        return by_id[picked] if picked is not None else None
+        return next((view for view in candidates if view.room_id == picked), None)
 
     async def _preview(
-        self, user_id: str, course_id: str, activity_id: str
+        self, user_id: str, course_id: str, activity_id: str, bot_user_id: str
     ) -> Dict[str, Any]:
         """Read-only and unlocked: a placement that runs between this and the
         student's tap places them by the rooms' state then, never by this
         answer."""
-        own, rooms, admins = await self._survey(user_id, course_id, activity_id)
-        room = own or self._choose(user_id, rooms, admins)
+        key = (course_id, activity_id)
+        now = self._clock.time()
+        cached = self._views.get(key)
+        if cached is not None and cached[0] > now:
+            views = cached[1]
+        else:
+            views = await self._room_views(course_id, activity_id, bot_user_id)
+            self._views = {k: v for k, v in self._views.items() if v[0] > now}
+            self._views[key] = (now + PREVIEW_CACHE_SECONDS, views)
+        own = next((view for view in views if view.is_own(user_id)), None)
+        if own is not None:
+            return {
+                "room_id": own.room_id,
+                "students": own.students,
+                "joined": own.joined(user_id),
+            }
+        room = self._choose(user_id, views, set())
         if room is None:
             return {"room_id": None, "students": 0, "joined": False}
-        return {
-            "room_id": room.room_id,
-            "students": room.students,
-            "joined": own is not None and user_id in own.joined,
-        }
+        return {"room_id": room.room_id, "students": room.students, "joined": False}
+
+    # --- Placement ----------------------------------------------------------
 
     async def _place(
         self,
@@ -421,17 +443,49 @@ class DiscussionRoom(Resource):
         course_id: str,
         activity_id: str,
         plan: Dict[str, Any],
-        avatar_url: Optional[str],
+        version_id: Optional[str],
+        bot_user_id: str,
     ) -> Tuple[str, bool]:
-        # The join runs after the lock: it can wait out Synapse's join limit,
-        # and the seat written under the lock already counts the student.
-        async with self._locks.queue((course_id, activity_id)):
-            room_id, created, joined = await self._reserve(
-                user_id, course_id, activity_id, plan, avatar_url
-            )
-        if not joined:
-            await self._join(room_id, user_id)
-        return room_id, created
+        """Seat the caller under the lock, then join them after it: the join
+        can wait out Synapse's join limit, and the seat already counts them.
+        A join the room refuses releases the seat this request wrote and
+        tries another room."""
+        key = (course_id, activity_id)
+        excluded: Set[str] = set()
+        for _ in range(PLACEMENT_ATTEMPTS):
+            async with self._locks.queue(key):
+                reservation = await self._reserve(
+                    user_id,
+                    course_id,
+                    activity_id,
+                    plan,
+                    version_id,
+                    bot_user_id,
+                    excluded,
+                )
+                self._views.pop(key, None)
+            if reservation.joined:
+                return reservation.room_id, reservation.created
+            try:
+                await self._join(reservation.room_id, user_id)
+                return reservation.room_id, reservation.created
+            except LimitExceededError:
+                await self._release(key, reservation, user_id, bot_user_id)
+                raise
+            except Exception as e:
+                if reservation.own:
+                    # Their own room, with their awards in it: never a second seat.
+                    raise
+                logger.warning(
+                    "discussion_room: %s refused %s (%s), trying another room",
+                    reservation.room_id,
+                    user_id,
+                    type(e).__name__,
+                )
+                capture_exception(e)
+                await self._release(key, reservation, user_id, bot_user_id)
+                excluded.add(reservation.room_id)
+        raise _Refused(403, "No room for this discussion can take you")
 
     async def _reserve(
         self,
@@ -439,50 +493,148 @@ class DiscussionRoom(Resource):
         course_id: str,
         activity_id: str,
         plan: Dict[str, Any],
-        avatar_url: Optional[str],
-    ) -> Tuple[str, bool, bool]:
-        """Chooses the student's room and writes their seat in it: (room,
-        created, already joined). Their own room is chosen, ended or not."""
-        own, rooms, admins = await self._survey(user_id, course_id, activity_id)
-        room = own or self._choose(user_id, rooms, admins)
+        version_id: Optional[str],
+        bot_user_id: str,
+        excluded: Set[str],
+    ) -> _Reservation:
+        """Chooses the caller's room and writes their seat in it. Their own
+        room is chosen, ended or not, and even when it is full."""
+        views = await self._room_views(course_id, activity_id, bot_user_id)
+        own = next((view for view in views if view.is_own(user_id)), None)
+        if own is not None:
+            if not own.bot_joined:
+                raise RuntimeError(f"discussion room {own.room_id} has no bot")
+            wrote = await self._ensure_seat(own.room_id, user_id, bot_user_id)
+            return _Reservation(
+                own.room_id, False, own.joined(user_id), wrote, own=True
+            )
+        room = self._choose(user_id, views, excluded)
         if room is None:
             room_id = await self._create(
-                user_id, course_id, activity_id, plan, admins, avatar_url
+                user_id, course_id, activity_id, plan, version_id, bot_user_id
             )
-            # Without the bot the student created the room, so is in it.
-            return room_id, True, self._bot_user_id is None
-
-        joined = user_id in room.joined
-        if joined:
-            sender = user_id
-        elif self._bot_user_id in room.joined:
-            sender = self._bot_user_id
-        else:
-            logger.warning(
-                "discussion_room: bot not in %s, joining %s under the lock",
-                room.room_id,
-                user_id,
-            )
-            await self._join(room.room_id, user_id)
-            sender, joined = user_id, True
-        await self._ensure_seat(room.room_id, user_id, sender)
-        return room.room_id, False, joined
+            return _Reservation(room_id, True, False, True, own=False)
+        wrote = await self._ensure_seat(room.room_id, user_id, bot_user_id)
+        return _Reservation(room.room_id, False, room.joined(user_id), wrote, own=False)
 
     async def _join(self, room_id: str, user_id: str) -> None:
         """Join on the server's side, waiting out Synapse's per-room join
-        limit: a class told to open the discussion at once arrives faster than
-        it allows. Gives up after [JOIN_ATTEMPTS], raising its refusal, which
-        the endpoint answers as busy."""
-        for attempt in range(JOIN_ATTEMPTS):
-            try:
-                await server_initiated_join(self._api, room_id, user_id)
-                return
-            except LimitExceededError as e:
-                if attempt == JOIN_ATTEMPTS - 1:
-                    raise
-                wait_ms = e.retry_after_ms or JOIN_WAIT_DEFAULT_MS
-                wait_ms = min(max(wait_ms, JOIN_WAIT_MIN_MS), JOIN_WAIT_MAX_MS)
-                await self._api.sleep(wait_ms / 1000)
+        limit: a class told to open the discussion at once arrives faster
+        than it allows. Gives up after ``JOIN_ATTEMPTS``, raising the limit,
+        which the endpoint answers as busy."""
+
+        async def join() -> None:
+            await server_initiated_join(self._api, room_id, user_id)
+
+        await wait_out_rate_limits(
+            self._clock,
+            join,
+            "discussion_room",
+            max_waits=JOIN_ATTEMPTS,
+            max_wait_ms=JOIN_WAIT_MAX_MS,
+        )
+
+    async def _release(
+        self,
+        key: Tuple[str, str],
+        reservation: _Reservation,
+        user_id: str,
+        bot_user_id: str,
+    ) -> None:
+        """Removes the seat this request wrote for a join that never
+        happened, so it stops counting. A failure here is captured and never
+        hides the join's own failure."""
+        if not reservation.wrote_seat:
+            return
+        try:
+            async with self._locks.queue(key):
+                state = await self._api.get_room_state(
+                    reservation.room_id,
+                    event_filter=[
+                        (ACTIVITY_ROLES_EVENT, ""),
+                        (EventTypes.Member, user_id),
+                    ],
+                )
+                if (EventTypes.Member, user_id) in state:
+                    return
+                current = state.get((ACTIVITY_ROLES_EVENT, ""))
+                content = current.content if current is not None else None
+                if find_seat(content, user_id) is None:
+                    return
+                await self._send_roles(
+                    reservation.room_id, without_seat(content, user_id), bot_user_id
+                )
+                self._views.pop(key, None)
+        except Exception as e:
+            logger.exception(
+                "discussion_room: could not release %s's seat in %s",
+                user_id,
+                reservation.room_id,
+            )
+            capture_exception(e)
+
+    async def _ensure_seat(self, room_id: str, user_id: str, bot_user_id: str) -> bool:
+        """Adds ``user_id``'s seat, written by the bot; whether it wrote one.
+        Called under the lock, and only the server writes seats, so the read
+        and the write cannot interleave with another writer."""
+        state = await self._api.get_room_state(
+            room_id, event_filter=[(ACTIVITY_ROLES_EVENT, "")]
+        )
+        current = state.get((ACTIVITY_ROLES_EVENT, ""))
+        content = current.content if current is not None else None
+        if find_seat(content, user_id) is not None:
+            return False
+        await self._send_roles(room_id, with_seat(content, user_id), bot_user_id)
+        return True
+
+    async def _send_roles(
+        self, room_id: str, content: Mapping[str, Any], bot_user_id: str
+    ) -> None:
+        await self._api.create_and_send_event_into_room(
+            {
+                "type": ACTIVITY_ROLES_EVENT,
+                "room_id": room_id,
+                "sender": bot_user_id,
+                "state_key": "",
+                "content": dict(content),
+            }
+        )
+
+    # --- Ending and reopening a seat ------------------------------------------
+
+    async def _change_seat(
+        self, user_id: str, room_id: str, action: str, bot_user_id: str
+    ) -> Dict[str, Any]:
+        create = await self._state.get_current_state_event(
+            room_id, EventTypes.Create, ""
+        )
+        if create is None:
+            raise _Refused(404, "Unknown room")
+        marker = discussion_marker(create.sender, create.content, bot_user_id)
+        if marker is None:
+            raise _Refused(403, "Not a discussion room")
+        async with self._locks.queue((marker.course_id, marker.activity_id)):
+            state = await self._api.get_room_state(
+                room_id, event_filter=[(ACTIVITY_ROLES_EVENT, "")]
+            )
+            current = state.get((ACTIVITY_ROLES_EVENT, ""))
+            content = current.content if current is not None else None
+            found = find_seat(content, user_id)
+            if found is None:
+                raise _Refused(403, "No seat in this room")
+            key, seat = found
+            if action == ACTION_END:
+                changed = ended_seat(seat, utc_timestamp(self._clock.time()))
+            else:
+                changed = continued_seat(seat)
+            if changed != seat:
+                await self._send_roles(
+                    room_id, with_seat_changed(content, key, changed), bot_user_id
+                )
+        logger.info("discussion_room %s: %s %s their seat", room_id, user_id, action)
+        return {"room_id": room_id, "seat": changed}
+
+    # --- Creating a room ------------------------------------------------------
 
     async def _create(
         self,
@@ -490,20 +642,26 @@ class DiscussionRoom(Resource):
         course_id: str,
         activity_id: str,
         plan: Dict[str, Any],
-        admins: FrozenSet[str],
-        avatar_url: Optional[str],
+        version_id: Optional[str],
+        bot_user_id: str,
     ) -> str:
-        """A new room with the student's seat in it. The bot creates it and
-        the student joins once it is set up, so their arrival comes after the
-        activity's own state, which the chat draws as its top block. Without
-        the bot the student creates it, as an activity's first player."""
-        bot_user_id = self._bot_user_id
-        creator = bot_user_id or user_id
+        """A new room with the caller's seat in it. The bot creates it and the
+        caller joins once it is set up, so their arrival comes after the
+        activity's own state, which the chat draws as its top block."""
+        admins = await course_admins(self._api, course_id)
         initial_state: List[Dict[str, Any]] = [
             {
                 "type": ACTIVITY_PLAN_EVENT,
                 "state_key": "",
-                "content": {"activity_id": activity_id, "source_course_id": course_id},
+                # The reference a client-made roleplay session carries, with
+                # the mode: the room keeps the version it started with, so an
+                # edit never changes the questions under awards already given.
+                "content": {
+                    "activity_id": activity_id,
+                    **({"version_id": version_id} if version_id else {}),
+                    "source_course_id": course_id,
+                    "mode": DISCUSSION_MODE,
+                },
             },
             {
                 "type": ACTIVITY_ROLES_EVENT,
@@ -528,9 +686,10 @@ class DiscussionRoom(Resource):
             {
                 "type": EventTypes.PowerLevels,
                 "state_key": "",
-                "content": discussion_power_levels(creator, admins, bot_user_id),
+                "content": discussion_power_levels(bot_user_id, admins),
             },
         ]
+        avatar_url = await self._avatar_url(plan, activity_id)
         if avatar_url:
             initial_state.append(
                 {
@@ -542,98 +701,139 @@ class DiscussionRoom(Resource):
         config: Dict[str, Any] = {
             "preset": RoomCreationPreset.PRIVATE_CHAT,
             "visibility": "private",
+            "room_version": DISCUSSION_ROOM_VERSION,
             "name": plan.get("title") or "",
-            "creation_content": {
-                "type": f"{ACTIVITY_SESSION_TYPE_PREFIX}{activity_id}"
-            },
+            "creation_content": creation_content(course_id, activity_id),
             "initial_state": initial_state,
         }
         if plan.get("description"):
             config["topic"] = plan["description"]
         room_id, _, _ = await self._api._hs.get_room_creation_handler().create_room(
             requester=create_requester(
-                creator, authenticated_entity=self._api.server_name
+                bot_user_id, authenticated_entity=self._api.server_name
             ),
             config=config,
             ratelimit=False,
         )
-        # Linked into the course by the student: the bot is no course member.
-        await self._api.create_and_send_event_into_room(
-            {
-                "type": SPACE_CHILD_EVENT,
-                "room_id": course_id,
-                "sender": user_id,
-                "state_key": room_id,
-                "content": {"via": [self._api.server_name]},
-            }
-        )
-        # Lower the creator: only the course's admins run the room. A course
-        # admin opening their own course's discussion stays admin.
-        power = discussion_power_levels(creator, admins, bot_user_id)
-        if creator == bot_user_id:
-            power["users"][creator] = 50
-        elif creator not in admins:
-            power["users"].pop(creator, None)
-        await self._api.create_and_send_event_into_room(
-            {
-                "type": EventTypes.PowerLevels,
-                "room_id": room_id,
-                "sender": creator,
-                "state_key": "",
-                "content": power,
-            }
-        )
-        if not bot_user_id:
-            logger.error(
-                "discussion_room: user_activity_notification_bot_user_id is not "
-                "set, room %s has no bot",
-                room_id,
-            )
+        await self._link(room_id, course_id, user_id, admins, bot_user_id)
         return room_id
 
-    async def _ensure_seat(self, room_id: str, user_id: str, sender: str) -> None:
-        """Adds ``user_id``'s seat, sent by ``sender``, a member of the room.
-
-        Read-modify-write: a client's roles write (a seat marked ended)
-        landing between this read and the send is lost. The ModuleApi has no
-        conditional state write, so the read is taken right before the send,
-        and a write happens only on a student's first arrival."""
-        state = await self._api.get_room_state(
-            room_id, event_filter=[(ACTIVITY_ROLES_EVENT, "")]
-        )
-        current = state.get((ACTIVITY_ROLES_EVENT, ""))
-        content = current.content if current is not None else None
-        if user_id in seated_user_ids(content):
-            return
-        await self._api.create_and_send_event_into_room(
-            {
-                "type": ACTIVITY_ROLES_EVENT,
-                "room_id": room_id,
-                "sender": sender,
-                "state_key": "",
-                "content": with_seat(content, user_id),
-            }
-        )
-
-    async def _course_admins(self, course_id: str) -> FrozenSet[str]:
-        state = await self._api.get_room_state(
+    async def _link(
+        self,
+        room_id: str,
+        course_id: str,
+        user_id: str,
+        admins: FrozenSet[str],
+        bot_user_id: str,
+    ) -> None:
+        """Lists the room under the course, sent by a course admin (a course
+        may keep ``m.space.child`` above a student's level), else by the
+        student. A room that cannot be listed is unreachable, so the bot
+        leaves it and the request fails."""
+        senders = [admin for admin in sorted(admins) if self._api.is_mine(admin)]
+        senders.append(user_id)
+        failure: Optional[Exception] = None
+        for sender in senders:
+            try:
+                await self._api.create_and_send_event_into_room(
+                    {
+                        "type": EventTypes.SpaceChild,
+                        "room_id": course_id,
+                        "sender": sender,
+                        "state_key": room_id,
+                        "content": {"via": [self._api.server_name]},
+                    }
+                )
+                return
+            # silent-ok: the next sender is tried; the last failure is raised
+            except Exception as e:
+                failure = e
+        logger.error(
+            "discussion_room: could not list %s under %s; abandoning it",
+            room_id,
             course_id,
-            event_filter=[(EventTypes.PowerLevels, ""), (EventTypes.Member, None)],
         )
-        return frozenset(
-            key
-            for (event_type, key), _ in state.items()
-            if event_type == EventTypes.Member
-            and isinstance(key, str)
-            and not is_probable_bot_user_id(key)
-            and is_joined_instructor(state, key)
+        try:
+            await self._api.update_room_membership(
+                sender=bot_user_id,
+                target=bot_user_id,
+                room_id=room_id,
+                new_membership="leave",
+            )
+        except Exception as e:
+            logger.exception("discussion_room: bot could not leave %s", room_id)
+            capture_exception(e)
+        raise RuntimeError(f"could not list {room_id} under {course_id}") from failure
+
+    async def _avatar_url(
+        self, plan: Mapping[str, Any], activity_id: str
+    ) -> Optional[str]:
+        """The room's image, from the plan rather than the caller: the first
+        visible media block's image or poster, as the client's start page
+        picks it, else the plan's single legacy image. None when it has none
+        or the image cannot be resolved (captured: the room is still made)."""
+        try:
+            media = plan.get("media")
+            for block in media if isinstance(media, list) else []:
+                if not isinstance(block, Mapping):
+                    continue
+                kind = block.get("blockType") or block.get("block_type")
+                if kind == "youtube":
+                    video_id = _youtube_id(block.get("url"))
+                    return _web_url(block.get("thumbnail_url")) or (
+                        YOUTUBE_POSTER.format(video_id) if video_id else None
+                    )
+                if kind in ("image", "video"):
+                    return await self._media_image(block.get("upload_id"), kind)
+            return _web_url(plan.get("image_url"))
+        except Exception as e:
+            logger.warning(
+                "discussion_room: no room image for %s (%s)",
+                activity_id,
+                type(e).__name__,
+            )
+            capture_exception(e)
+            return None
+
+    async def _media_image(self, upload_id: Any, kind: str) -> Optional[str]:
+        """An upload's CDN image: for an image its medium size or original, for
+        a video only a poster size, never the video file itself."""
+        if not isinstance(upload_id, str) or not upload_id:
+            return None
+        base = self._config.cms_base_url.rstrip("/")
+        code, raw = await cms_request(
+            self._http,
+            "GET",
+            f"{base}/api/media/{quote(upload_id, safe='')}?depth=0",
+            service_headers(self._config.cms_service_api_key),
+            max_bytes=CMS_MAX_BODY_BYTES,
         )
+        if code != 200:
+            raise ValueError(f"CMS media answered {code}")
+        doc = json.loads(raw)
+        if not isinstance(doc, Mapping):
+            raise ValueError("CMS media answered a non-object")
+        sizes = doc.get("sizes")
+        candidates: List[Any] = []
+        if isinstance(sizes, Mapping):
+            for size in ("medium", "thumbnail"):
+                variant = sizes.get(size)
+                if isinstance(variant, Mapping):
+                    candidates.append(variant.get("url"))
+        if kind == "image":
+            candidates.append(doc.get("url"))
+        for url in candidates:
+            if isinstance(url, str) and url:
+                return _web_url(urljoin(base + "/", url))
+        return None
+
+    # --- The plan -------------------------------------------------------------
 
     async def _discussion_plan(
         self, course_id: str, activity_id: str
     ) -> Dict[str, Any]:
         """The discussion's plan; raises ``DiscussionNotFound`` unless the
-        activity is a discussion this course owns."""
+        activity is a discussion this course may use."""
         key = (course_id, activity_id)
         now = self._clock.time()
         cached = self._plans.get(key)
@@ -660,47 +860,78 @@ class DiscussionRoom(Resource):
     async def _fetch_plan(
         self, course_id: str, activity_id: str
     ) -> Optional[Dict[str, Any]]:
-        """The plan from the CMS, or None when the course has no such
-        discussion; raises on any failure to ask."""
+        """The plan, or None when the activity is not a discussion this course
+        may use; raises on any failure to ask, and on two rows for one
+        activity.
+
+        A discussion is a catalog activity filed under a Mission, as a
+        roleplay is. A course may use it when the discussion is the course's
+        own copy, or when its Mission is in the course's quest. Another
+        course's copy is never used. Rooms stay per course either way."""
         base = self._config.cms_base_url
         api_key = self._config.cms_service_api_key
         if not base or not api_key:
             raise ValueError("cms_base_url or cms_service_api_key is not configured")
         query = urlencode(
-            {
-                "where[and][0][res.plan.activity_id][equals]": activity_id,
-                "where[and][1][course_room_id][equals]": course_id,
-                "where[and][2][res.plan.mode][equals]": DISCUSSION_MODE,
-                "where[and][3][req.source_request_hash][exists]": "false",
-                "limit": "1",
-                "depth": "0",
-            }
+            {**canonical_activity_where(activity_id), "limit": "2", "depth": "0"}
         )
-        response = await self._http.request(
+        code, raw = await cms_request(
+            self._http,
             "GET",
             f"{base.rstrip('/')}/api/activities-v2?{query}",
-            headers=Headers(
-                {"Authorization": [f"{CMS_AUTH_COLLECTION} API-Key {api_key}"]}
-            ),
+            service_headers(api_key),
+            max_bytes=CMS_MAX_BODY_BYTES,
         )
-        buffer = BytesIO()
-        await make_deferred_yieldable(
-            read_body_with_max_size(response, buffer, CMS_MAX_BODY_BYTES)
-        )
-        if response.code != 200:
-            raise ValueError(f"CMS answered {response.code}")
-        found = json.loads(buffer.getvalue())
+        if code != 200:
+            raise ValueError(f"CMS answered {code}")
+        found = json.loads(raw)
         docs = found.get("docs") if isinstance(found, dict) else None
         if not isinstance(docs, list):
             raise ValueError("CMS answered without a docs list")
         if not docs:
             return None
-        res = docs[0].get("res") if isinstance(docs[0], dict) else None
+        if len(docs) > 1:
+            raise ValueError(f"CMS has more than one row for {activity_id}")
+        doc = docs[0] if isinstance(docs[0], dict) else {}
+        res = doc.get("res")
         plan = res.get("plan") if isinstance(res, dict) else None
         if not isinstance(plan, dict):
-            logger.warning(
-                "discussion_room: CMS row for %s has no plan, room left untitled",
-                activity_id,
+            raise ValueError(f"CMS row for {activity_id} has no plan")
+        if not is_discussion_plan(plan):
+            logger.info(
+                "discussion_room: %s is not shaped as a discussion", activity_id
             )
-            return {}
+            return None
+        copy_of = doc.get("course_room_id")
+        if copy_of:
+            if copy_of == course_id:
+                return plan
+            logger.info(
+                "discussion_room: %s is another course's copy, not %s",
+                activity_id,
+                course_id,
+            )
+            return None
+        if not await self._in_course_quest(course_id, activity_lo_ids(doc)):
+            logger.info(
+                "discussion_room: %s is not in a Mission of %s's quest",
+                activity_id,
+                course_id,
+            )
+            return None
         return plan
+
+    async def _in_course_quest(self, course_id: str, lo_ids: List[str]) -> bool:
+        """Whether one of these Missions is in the quest the course follows
+        (its ``pangea.course_plan``). A course with no quest uses none."""
+        if not lo_ids:
+            return False
+        state = await self._api.get_room_state(
+            course_id, event_filter=[(COURSE_PLAN_EVENT, "")]
+        )
+        course_plan = state.get((COURSE_PLAN_EVENT, ""))
+        quest_id = course_plan.content.get("uuid") if course_plan is not None else None
+        if not isinstance(quest_id, str) or not quest_id:
+            return False
+        quest_lo_ids = await self._quests.quest_lo_ids(quest_id)
+        return not set(lo_ids).isdisjoint(quest_lo_ids)
