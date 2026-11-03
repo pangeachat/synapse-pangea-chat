@@ -621,7 +621,7 @@ class TestFailures(_Scheduled):
             if row["id"] == ident:
                 raise SMTPDeliveryError(
                     452,
-                    "No recipients accepted",
+                    b"No recipients accepted",
                     b"",
                     [(b"full@school.test", 452, b"mailbox full")],
                 )
@@ -728,7 +728,7 @@ class TestFailures(_Scheduled):
         self.now += DAY_MS
         attempts = self.count_attempts(
             SMTPDeliveryError(
-                421, "No recipients accepted", b"", [(b"a@b.c", 421, b"closing")]
+                421, b"No recipients accepted", b"", [(b"a@b.c", 421, b"closing")]
             )
         )
         await self.sender.run_due()
