@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+from io import BytesIO
 from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -30,12 +31,14 @@ from synapse.api.errors import (
     MissingClientTokenError,
 )
 from synapse.http import server
+from synapse.http.client import read_body_with_max_size
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
-from synapse.logging.context import run_in_background
+from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.module_api import ModuleApi
 from synapse.types import create_requester
-from synapse.util.async_helpers import Linearizer
+from synapse.util.async_helpers import Linearizer, timeout_deferred
+from twisted.web.http_headers import Headers
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.activity_session_previews.get_activity_session_previews import (
@@ -67,6 +70,11 @@ DISCUSSION_ROLE_ID = "participant"
 DISCUSSION_ROLE_NAME = "Participant"
 
 CMS_AUTH_COLLECTION = "service-users"
+CMS_TIMEOUT_SECONDS = 5
+CMS_MAX_BODY_BYTES = 1_000_000
+# A start page polls its preview every few seconds; a discussion's plan is
+# read from the CMS at most this often per course and discussion.
+DISCUSSION_CACHE_SECONDS = 60
 
 # Tries at joining a student past Synapse's per-room join limit, each waiting
 # as long as Synapse asks (capped): about ten seconds at its defaults.
@@ -166,11 +174,15 @@ class DiscussionRoom(Resource):
         self._config = config
         self._auth = api._hs.get_auth()
         self._store = api._hs.get_datastores().main
+        self._clock = api._hs.get_clock()
+        self._http = api.http_client
+        # (course_id, activity_id) -> (expires at, plan)
+        self._plans: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
         # One request at a time per course and discussion, so a room is
         # counted and filled by one request before the next looks at it.
         # Per process: a deploy that runs this endpoint on more than one
         # worker must route it to one, or move to the worker locks handler.
-        self._locks = Linearizer("discussion_room", clock=api._hs.get_clock())
+        self._locks = Linearizer("discussion_room", clock=self._clock)
 
     def render_GET(self, request: SynapseRequest):
         run_in_background(self._async_render_GET, request)
@@ -639,19 +651,40 @@ class DiscussionRoom(Resource):
     async def _discussion_plan(
         self, course_id: str, activity_id: str
     ) -> Dict[str, Any]:
-        """The discussion's plan, read from the CMS; raises ``DiscussionNotFound``
-        unless the activity is a discussion this course owns."""
-        from synapse.logging.context import make_deferred_yieldable
-        from twisted.internet import reactor
-        from twisted.web.client import Agent, readBody
-        from twisted.web.http_headers import Headers
-
-        base = self._config.cms_base_url
-        key = self._config.cms_service_api_key
-        if not base or not key:
-            raise CmsUnavailable(
-                "cms_base_url or cms_service_api_key is not configured"
+        """The discussion's plan; raises ``DiscussionNotFound`` unless the
+        activity is a discussion this course owns."""
+        key = (course_id, activity_id)
+        now = self._clock.time()
+        cached = self._plans.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        try:
+            plan = await make_deferred_yieldable(
+                timeout_deferred(
+                    deferred=run_in_background(
+                        self._fetch_plan, course_id, activity_id
+                    ),
+                    timeout=CMS_TIMEOUT_SECONDS,
+                    clock=self._clock,
+                )
             )
+        except Exception as e:
+            raise CmsUnavailable(f"{type(e).__name__}: {e}") from e
+        if plan is None:
+            raise DiscussionNotFound()
+        self._plans = {k: v for k, v in self._plans.items() if v[0] > now}
+        self._plans[key] = (now + DISCUSSION_CACHE_SECONDS, plan)
+        return plan
+
+    async def _fetch_plan(
+        self, course_id: str, activity_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """The plan from the CMS, or None when the course has no such
+        discussion; raises on any failure to ask."""
+        base = self._config.cms_base_url
+        api_key = self._config.cms_service_api_key
+        if not base or not api_key:
+            raise ValueError("cms_base_url or cms_service_api_key is not configured")
         query = urlencode(
             {
                 "where[and][0][res.plan.activity_id][equals]": activity_id,
@@ -662,27 +695,31 @@ class DiscussionRoom(Resource):
                 "depth": "0",
             }
         )
-        try:
-            response = await make_deferred_yieldable(
-                Agent(reactor).request(
-                    b"GET",
-                    f"{base}/api/activities-v2?{query}".encode("utf-8"),
-                    Headers(
-                        {
-                            b"Authorization": [
-                                f"{CMS_AUTH_COLLECTION} API-Key {key}".encode("utf-8")
-                            ]
-                        }
-                    ),
-                    None,
-                )
-            )
-            body = await make_deferred_yieldable(readBody(response))
-        except Exception as e:
-            raise CmsUnavailable(str(e)) from e
-        if response.code >= 400:
-            raise CmsUnavailable(f"CMS answered {response.code}")
-        docs = json.loads(body).get("docs") or []
+        response = await self._http.request(
+            "GET",
+            f"{base.rstrip('/')}/api/activities-v2?{query}",
+            headers=Headers(
+                {"Authorization": [f"{CMS_AUTH_COLLECTION} API-Key {api_key}"]}
+            ),
+        )
+        buffer = BytesIO()
+        await make_deferred_yieldable(
+            read_body_with_max_size(response, buffer, CMS_MAX_BODY_BYTES)
+        )
+        if response.code != 200:
+            raise ValueError(f"CMS answered {response.code}")
+        found = json.loads(buffer.getvalue())
+        docs = found.get("docs") if isinstance(found, dict) else None
+        if not isinstance(docs, list):
+            raise ValueError("CMS answered without a docs list")
         if not docs:
-            raise DiscussionNotFound()
-        return (docs[0].get("res") or {}).get("plan") or {}
+            return None
+        res = docs[0].get("res") if isinstance(docs[0], dict) else None
+        plan = res.get("plan") if isinstance(res, dict) else None
+        if not isinstance(plan, dict):
+            logger.warning(
+                "discussion_room: CMS row for %s has no plan, room left untitled",
+                activity_id,
+            )
+            return {}
+        return plan
