@@ -8,6 +8,7 @@ same idea one level up.
 """
 
 import sqlite3
+import weakref
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
@@ -272,7 +273,13 @@ class DbPoolDouble:
     """
 
     def __init__(self) -> None:
-        self.connection = sqlite3.connect(":memory:")
+        # Tests leave the double to the collector. An open connection it
+        # collects warns, and fails the E2E test it lands in. A finalizer
+        # closes it first, where `__del__` can run after the warning, and on
+        # whichever thread collects (an E2E test's server threads do), so the
+        # connection must accept a close from another thread.
+        self.connection = sqlite3.connect(":memory:", check_same_thread=False)
+        weakref.finalize(self, self.connection.close)
         #: Set by a test to make the next interaction fail, the way a database
         #: that is down or a table that could not be created would.
         self.error: Optional[Exception] = None
@@ -286,15 +293,6 @@ class DbPoolDouble:
         #: the failure the coarse one cannot express: a database that accepts
         #: every other row and refuses ONE.
         self.on_statement: Optional[Callable[[str, Any], None]] = None
-
-    def __del__(self) -> None:
-        # An in-memory database left to the collector raises a ResourceWarning
-        # into whichever test happened to trigger the collection, which is
-        # noise the next reader has to rule out.
-        try:
-            self.connection.close()
-        except Exception:
-            pass
 
     async def runInteraction(
         self, desc: str, func: Callable[..., Any], *args: Any, **kwargs: Any

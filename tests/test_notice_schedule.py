@@ -33,7 +33,11 @@ class SQLPool:
     """Real SQL transactions without a Synapse reactor for queue tests."""
 
     def __init__(self):
-        self.db = sqlite3.connect(":memory:")
+        # Some fixtures leave the close to a finalizer (test_notice_content),
+        # which runs on whichever thread collects, an E2E test's server
+        # threads included; sqlite refuses a close from another thread unless
+        # the connection allows it.
+        self.db = sqlite3.connect(":memory:", check_same_thread=False)
         self.engine = None
 
     async def runInteraction(self, name, callback):
@@ -202,7 +206,11 @@ class TestScheduledDelivery(unittest.IsolatedAsyncioTestCase):
         handler._direct_push._send_push.return_value["sent"] = 1
         body = scheduled_body()
         body["delivery_method"] = "push-only"
-        result = await handler._deliver_scheduled(body)
+        with patch(
+            "synapse_pangea_chat.notice_delivery.deliver.ensure_bot_notice_push_rule",
+            new=AsyncMock(return_value=True),
+        ):
+            result = await handler._deliver_scheduled(body)
         self.assertEqual(result["channel"], "push")
         push_request = handler._direct_push._send_push.await_args.args[2]
         self.assertEqual(push_request["sender"], "@admin:test")
