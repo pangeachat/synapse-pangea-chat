@@ -1,14 +1,16 @@
 """Mock CMS HTTP server for E2E tests.
 
-Implements Payload-compatible routes for matrix-users and user-exports,
-backed by in-memory storage.
+Implements Payload-compatible routes for matrix-users, user-exports,
+activities-v2 (looked up by activity id) and quest-plans, backed by
+in-memory storage.
 """
 
 import json
 import threading
+import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Dict, List, Optional
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 EXPECTED_AUTH_SCHEME = "service-users API-Key "
@@ -48,6 +50,10 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/matrix-users":
             self._handle_get_matrix_users(parsed.query)
+        elif parsed.path == "/api/activities-v2":
+            self._handle_get_activities(parsed.query)
+        elif parsed.path.startswith("/api/quest-plans/"):
+            self._handle_get_quest(parsed.path.split("/")[-1])
         else:
             self._send_json(404, {"error": "Not found"})
 
@@ -76,6 +82,29 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
         state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
         docs = state.get_matrix_users(username)
         self._send_json(200, {"docs": docs})
+
+    # --- activities-v2 and quest-plans handlers ---
+
+    def _handle_get_activities(self, query_string: str) -> None:
+        """Answers the lookup of one activity's canonical row by its id."""
+        qs = parse_qs(query_string)
+        activity_id = qs.get("where[res.plan.activity_id][equals]", [None])[0]
+        state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
+        status, delay_seconds = state.activity_fault(activity_id)
+        if delay_seconds:
+            time.sleep(delay_seconds)
+        if status is not None:
+            self._send_json(status, {"errors": [{"message": "CMS fault"}]})
+            return
+        self._send_json(200, {"docs": state.get_activities(activity_id)})
+
+    def _handle_get_quest(self, quest_id: str) -> None:
+        state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
+        quest = state.get_quest(quest_id)
+        if quest is None:
+            self._send_json(404, {"errors": [{"message": "Not found"}]})
+        else:
+            self._send_json(200, quest)
 
     # --- user-exports handlers ---
 
@@ -137,6 +166,9 @@ class _MockCmsState:
         self._matrix_users_by_username: Dict[str, Dict[str, Any]] = {}
         self._matrix_users_by_id: Dict[str, Dict[str, Any]] = {}
         self._exports_by_id: Dict[str, Dict[str, Any]] = {}
+        self._activities_by_id: Dict[str, List[Dict[str, Any]]] = {}
+        self._activity_faults: Dict[str, Tuple[Optional[int], float]] = {}
+        self._quests_by_id: Dict[str, Dict[str, Any]] = {}
 
     def seed_matrix_user(self, username: str) -> Dict[str, Any]:
         with self._lock:
@@ -155,6 +187,38 @@ class _MockCmsState:
                 return []
             doc = self._matrix_users_by_username.get(username)
             return [dict(doc)] if doc is not None else []
+
+    def seed_activity(self, doc: Dict[str, Any]) -> None:
+        """Adds an ``activities-v2`` row; a second row for one activity id is
+        kept, so a lookup can answer two."""
+        activity_id = doc["res"]["plan"]["activity_id"]
+        with self._lock:
+            self._activities_by_id.setdefault(activity_id, []).append(dict(doc))
+
+    def get_activities(self, activity_id: Optional[str]) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                dict(doc) for doc in self._activities_by_id.get(activity_id or "", [])
+            ]
+
+    def set_activity_fault(
+        self, activity_id: str, status: Optional[int], delay_seconds: float
+    ) -> None:
+        with self._lock:
+            self._activity_faults[activity_id] = (status, delay_seconds)
+
+    def activity_fault(self, activity_id: Optional[str]) -> Tuple[Optional[int], float]:
+        with self._lock:
+            return self._activity_faults.get(activity_id or "", (None, 0.0))
+
+    def seed_quest(self, quest: Dict[str, Any]) -> None:
+        with self._lock:
+            self._quests_by_id[quest["id"]] = dict(quest)
+
+    def get_quest(self, quest_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            quest = self._quests_by_id.get(quest_id)
+            return dict(quest) if quest is not None else None
 
     def has_matrix_user_id(self, matrix_user_id: str) -> bool:
         with self._lock:
@@ -225,12 +289,18 @@ class _MockCmsState:
             ]
 
 
+class _CmsHttpServer(ThreadingHTTPServer):
+    # A class tapping at once opens many connections together; the default
+    # backlog of 5 resets the rest, which a real CMS would not.
+    request_queue_size = 64
+
+
 class MockCmsServer:
     """Start/stop a mock CMS HTTP server on a random port."""
 
     def __init__(self) -> None:
         self._state = _MockCmsState()
-        self._server: Optional[HTTPServer] = None
+        self._server: Optional[_CmsHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
     def seed_matrix_user(self, username: str) -> Dict[str, Any]:
@@ -241,9 +311,27 @@ class MockCmsServer:
     ) -> List[Dict[str, Any]]:
         return self._state.get_exports_for_matrix_user_id(matrix_user_id)
 
+    def seed_activity(self, doc: Dict[str, Any]) -> None:
+        self._state.seed_activity(doc)
+
+    def seed_quest(self, quest: Dict[str, Any]) -> None:
+        self._state.seed_quest(quest)
+
+    def set_activity_fault(
+        self,
+        activity_id: str,
+        *,
+        status: Optional[int] = None,
+        delay_seconds: float = 0.0,
+    ) -> None:
+        """Answer ``status`` for this activity's lookup, after waiting
+        ``delay_seconds``: a CMS that is down or slow."""
+        self._state.set_activity_fault(activity_id, status, delay_seconds)
+
     def start(self) -> str:
         """Start the server and return its base URL (e.g. http://127.0.0.1:PORT)."""
-        self._server = HTTPServer(("127.0.0.1", 0), _MockCmsHandler)
+        # Threaded, so a request held open (a slow CMS) never stalls the rest.
+        self._server = _CmsHttpServer(("127.0.0.1", 0), _MockCmsHandler)
         self._server._state = self._state  # type: ignore[attr-defined]
         port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)

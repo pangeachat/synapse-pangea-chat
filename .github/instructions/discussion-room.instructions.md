@@ -44,6 +44,11 @@ A course member could join a discussion room directly, outside placement and its
 
 It answers what Join would do without placing anyone: the room, its count, and whether the student is already in it. It takes no lock and reuses room state for a few seconds.
 
+## Answers
+
+- Placing answers the room and whether it was just made; the preview answers the room (none means a new room), its count and whether the caller is in it; ending or reopening answers the room and the caller's seat.
+- 400 for missing fields or an unknown action, 401 without a valid login, 403 for a caller who isn't in the course, whom no room will take, or who ends or reopens a seat they don't hold or in a room that isn't a discussion room, 404 for an activity that isn't one of this course's discussions or an unknown room, 429 when rate limited or a join is still refused as too fast, 502 when the CMS can't be asked, 503 without a discussion bot.
+
 ## Failures and concurrency
 
 Every 500 and 502 is reported to Sentry. The per-discussion lock lives in one process, which holds because only the main process serves this endpoint; serving it from several workers would need Synapse's cross-worker lock.
