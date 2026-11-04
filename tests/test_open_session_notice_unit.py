@@ -9,7 +9,7 @@ from synapse_pangea_chat.notice_delivery.open_session_notice import (
     OpenSessionNotice,
 )
 from synapse_pangea_chat.notice_delivery.request import NoticeRequest
-from tests.test_notice_schedule import TestScheduledDelivery
+from tests import test_notice_schedule
 
 BOT = "@bot:test"
 LEARNER = "@alice:test"
@@ -30,7 +30,7 @@ class TestOpenSessionNotice(unittest.IsolatedAsyncioTestCase):
     def notice(
         self, *, creator=LEARNER, direct=None, dm_membership="join", instance="master"
     ):
-        handler, api = TestScheduledDelivery().handler()
+        handler, api = test_notice_schedule.TestScheduledDelivery().handler()
         handler.schedule.enqueue = AsyncMock(return_value={"status": "queued"})
         api._hs.get_instance_name.return_value = instance
         api._hs.config.worker.writers.push_rules = ["master"]
