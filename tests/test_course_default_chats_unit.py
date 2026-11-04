@@ -1,8 +1,12 @@
 import unittest
+from unittest.mock import MagicMock, create_autospec
+
+from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.course_default_chats.course_default_chats import (
     ChatRecoveryPlan,
     ChatState,
+    CourseDefaultChats,
     RecoveryRefused,
     SpaceRoster,
     admins_to_demote,
@@ -192,3 +196,31 @@ class TestPlanRecovery(unittest.TestCase):
     def test_a_chat_with_no_current_state_is_refused(self):
         chat = ChatState(power_content={}, memberships={}, immutable=frozenset())
         self.assertEqual(self._refusal(chat, TEACHER), "no_current_state")
+
+
+def _module_api(run_background_tasks):
+    # create_autospec, so the registration is checked against the real
+    # ModuleApi signature. _hs is set in ModuleApi.__init__, not declared on
+    # the class, so it is attached by hand.
+    api = create_autospec(ModuleApi, instance=True)
+    api._hs = MagicMock()
+    api.should_run_background_tasks.return_value = run_background_tasks
+    return api
+
+
+class TestOneProcess(unittest.TestCase):
+    """Synapse calls the hook in every process. When every process ran the
+    same joins, the processes that lost the race had their joins and invites
+    refused and reported them as failures (SYNAPSE-D5, SYNAPSE-DD)."""
+
+    def test_the_process_that_runs_background_tasks_registers_the_hook(self):
+        api = _module_api(run_background_tasks=True)
+        syncer = CourseDefaultChats(api)
+        api.register_third_party_rules_callbacks.assert_called_once_with(
+            on_new_event=syncer.on_new_event
+        )
+
+    def test_no_other_process_registers_the_hook(self):
+        api = _module_api(run_background_tasks=False)
+        CourseDefaultChats(api)
+        api.register_third_party_rules_callbacks.assert_not_called()

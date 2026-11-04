@@ -319,27 +319,34 @@ def _capture_exception(e: Exception) -> None:
 
 
 class CourseDefaultChats:
-    """The rule's hook and sync. One instance per Synapse process."""
+    """The rule's hook and sync. One instance per Synapse process; only the
+    one that runs background tasks registers the hook."""
 
     def __init__(self, api: ModuleApi):
         self._api = api
         self._state = api._hs.get_storage_controllers().state
         self._store = api._hs.get_datastores().main
         self._clock = api._hs.get_clock()
-        # One sync per chat at a time in this process: the admin mirror is a
-        # read-modify-write of the chat's power levels, and two triggers on
-        # one space (a link and a join, say) can land together. Across
-        # workers the sync is idempotent and converges on the next trigger.
+        # One sync per chat at a time: the admin mirror is a read-modify-write
+        # of the chat's power levels, and two triggers on one space (a link
+        # and a join, say) can land together. The hook runs in one process,
+        # so this orders every sync it starts; the repair and recovery
+        # endpoints run in the process that serves the request.
         self._chat_locks = Linearizer("course_default_chats", clock=self._clock)
         # Each space's default chat ids, so a member join does not re-read
         # every child of a busy course (activity sessions are children too).
-        # Invalidated by the m.space.child events this process's hook sees;
-        # the repair endpoint bypasses it.
+        # Invalidated by the m.space.child events the hook sees, so only the
+        # hook's syncs read it; the endpoints bypass it.
         self._default_chats: Dict[str, List[str]] = {}
         # A chat nobody can act for is reported once per process, not on
         # every join and profile change in its space.
         self._reported_no_admin: Set[str] = set()
-        api.register_third_party_rules_callbacks(on_new_event=self.on_new_event)
+        # Synapse calls the hook in every process of a worker deployment, and
+        # processes running the same sync at once refuse each other's joins
+        # and invites and report them as failures. One process acts on it:
+        # course-default-chats.instructions.md, "When the rule is applied".
+        if api.should_run_background_tasks():
+            api.register_third_party_rules_callbacks(on_new_event=self.on_new_event)
 
     # ------------------------------------------------------------------
     # Hook
