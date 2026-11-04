@@ -191,7 +191,9 @@ class TestEligibilityIsReadBeforeEveryAttempt(unittest.TestCase):
     def _assert_skipped(self, during_wait: Callable[[], None]) -> None:
         self.assertFalse(asyncio.run(self._run(during_wait)))
         self.assertEqual(self.joins, 1)
-        self.module._mute.assert_not_awaited()
+        # The first attempt muted before its join was refused; like its
+        # listing, the mute stays.
+        self.module._mute.assert_awaited_once_with(TEACHER, ROOM)
 
     def test_an_admin_who_left_during_the_wait_is_not_rejoined(self):
         self._assert_skipped(lambda: setattr(self, "membership", "leave"))
@@ -208,7 +210,39 @@ class TestEligibilityIsReadBeforeEveryAttempt(unittest.TestCase):
     def test_with_nothing_changed_the_next_attempt_joins_and_mutes(self):
         self.assertTrue(asyncio.run(self._run(lambda: None)))
         self.assertEqual(self.joins, 2)
-        self.module._mute.assert_awaited_once_with(TEACHER, ROOM)
+        self.module._mute.assert_awaited_with(TEACHER, ROOM)
+
+
+class TestTheMuteComesBeforeTheJoin(unittest.TestCase):
+    """Synapse decides who to notify as each message is created, so a mute
+    written after the join would miss any message sent in between."""
+
+    def setUp(self) -> None:
+        self.writes: list = []
+        module: Any = object.__new__(CourseSessionAdmins)
+        module._clock = SimpleNamespace(sleep=AsyncMock())
+        module._api = Mock()
+        module._still_eligible = AsyncMock(return_value=True)
+        module._list = AsyncMock(side_effect=lambda *_: self.writes.append("list"))
+        module._mute = AsyncMock(side_effect=lambda *_: self.writes.append("mute"))
+        self.module = module
+
+    def _join_admin(self) -> bool:
+        async def join(api: Any, room_id: str, user_id: str) -> None:
+            self.writes.append("join")
+
+        with patch.object(course_session_admins, "server_initiated_join", join):
+            return asyncio.run(self.module._join_admin(SPACE, ROOM, TEACHER))
+
+    def test_the_room_is_listed_and_muted_before_the_join(self):
+        self.assertTrue(self._join_admin())
+        self.assertEqual(self.writes, ["list", "mute", "join"])
+
+    def test_a_room_that_could_not_be_muted_is_not_joined(self):
+        self.module._mute = AsyncMock(side_effect=RuntimeError("no push rule"))
+        with self.assertRaises(RuntimeError):
+            self._join_admin()
+        self.assertEqual(self.writes, ["list"])
 
 
 class TestBackfillCourse(unittest.TestCase):
