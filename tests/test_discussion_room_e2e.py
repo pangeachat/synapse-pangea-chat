@@ -124,9 +124,15 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
         self.cms.seed_activity(_row(_plan(activity_id), **row_fields))
         return activity_id
 
-    def _course(self, teacher_token: str) -> str:
+    def _course(
+        self,
+        teacher_token: str,
+        plan: Optional[Dict[str, Any]] = None,
+        member_events: Tuple[str, ...] = (),
+    ) -> str:
         """A course space as production has it: any member may link a child,
-        and its quest named in pangea.course_plan."""
+        and its quest named in pangea.course_plan. ``member_events`` are
+        further state any member may write."""
         response = requests.post(
             self._url("/_matrix/client/v3/createRoom"),
             headers=self._headers(teacher_token),
@@ -134,12 +140,17 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
                 "preset": "public_chat",
                 "visibility": "private",
                 "creation_content": {"type": "m.space"},
-                "power_level_content_override": {"events": {"m.space.child": 0}},
+                "power_level_content_override": {
+                    "events": {
+                        "m.space.child": 0,
+                        **{event_type: 0 for event_type in member_events},
+                    }
+                },
                 "initial_state": [
                     {
                         "type": "pangea.course_plan",
                         "state_key": "",
-                        "content": {"uuid": QUEST},
+                        "content": plan if plan is not None else {"uuid": QUEST},
                     }
                 ],
             },
@@ -527,6 +538,46 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
         self.assertEqual(
             self._place(member_token, course_id, own_copy).status_code, 200
         )
+
+    async def test_the_courses_missions_from_its_plan_and_its_own_list(self):
+        await self._start()
+        _, teacher_token = await self.new_user("teacher")
+
+        # An older space names its quest as course_plan_id, not uuid.
+        older = self._course(teacher_token, plan={"course_plan_id": QUEST})
+        ((_, older_token),) = await self._students(older, 1, prefix="o")
+        in_quest = self._discussion("in-quest")
+        self.assertEqual(self._place(older_token, older, in_quest).status_code, 200)
+
+        # A Mission the quest does not carry is the course's once a course
+        # admin's own Can-Do list adds it, and never because a student's does.
+        course_id = self._course(
+            teacher_token, member_events=("pangea.course_missions",)
+        )
+        ((_, token),) = await self._students(course_id, 1)
+        added = self._discussion("added", learningObjectiveRefs=["lo-added"])
+        self.assertEqual(self._place(token, course_id, added).status_code, 404)
+
+        def write_copy(writer_token: str) -> None:
+            response = requests.put(
+                self._room_url(course_id, "state/pangea.course_missions/"),
+                headers=self._headers(writer_token),
+                json={
+                    "version": 1,
+                    "revision": 1,
+                    "missions": [
+                        {"lo_id": MISSION, "activity_ids": []},
+                        {"lo_id": "lo-added", "activity_ids": [added]},
+                    ],
+                },
+                timeout=10,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        write_copy(token)
+        self.assertEqual(self._place(token, course_id, added).status_code, 404)
+        write_copy(teacher_token)
+        self.assertEqual(self._place(token, course_id, added).status_code, 200)
 
     async def test_a_cms_that_is_down_or_slow_answers_502(self):
         _, course_id, _ = await self._setting()

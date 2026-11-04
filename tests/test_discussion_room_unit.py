@@ -44,6 +44,7 @@ from synapse_pangea_chat.discussion_room.rooms import (
     with_seat_changed,
     without_seat,
 )
+from synapse_pangea_chat.email_invite.course_missions import course_copy_lo_ids
 
 BOT = "@discussion-bot:example.com"
 COURSE = "!course:example.com"
@@ -52,6 +53,9 @@ ROOM = "!room:example.com"
 ACTIVITY = "act-1"
 TEACHER = "@teacher:example.com"
 CAPACITY = 12
+COURSE_MISSIONS_LOGGER = (
+    "synapse.module.synapse_pangea_chat.email_invite.course_missions"
+)
 
 
 def _student(n: int) -> str:
@@ -394,6 +398,111 @@ def _row(plan: Dict[str, Any], **fields: Any) -> Dict[str, Any]:
     return {"id": "row-1", "req": {}, "res": {"plan": plan}, **fields}
 
 
+def _copy_content(*lo_ids: str, **fields: Any) -> Dict[str, Any]:
+    """A ``pangea.course_missions`` record as the client writes it."""
+    return {
+        "version": 1,
+        "revision": 1,
+        "missions": [{"lo_id": lo_id, "activity_ids": []} for lo_id in lo_ids],
+        **fields,
+    }
+
+
+def _course_state(
+    copy: Optional[Dict[str, Any]] = None,
+    copy_sender: str = TEACHER,
+    plan: Optional[Dict[str, Any]] = None,
+    creator_power: bool = False,
+) -> Dict[Tuple[str, str], Any]:
+    """A course space's state: the teacher at 100, a student at the default,
+    and the course plan and copy when given."""
+    state: Dict[Tuple[str, str], Any] = {
+        ("m.room.create", ""): SimpleNamespace(
+            content={},
+            sender=TEACHER,
+            room_version=SimpleNamespace(msc4289_creator_power_enabled=creator_power),
+        ),
+        ("m.room.power_levels", ""): SimpleNamespace(
+            content={"users": {TEACHER: 100}, "users_default": 0}, sender=TEACHER
+        ),
+    }
+    if plan is not None:
+        state[("pangea.course_plan", "")] = SimpleNamespace(
+            content=plan, sender=TEACHER
+        )
+    if copy is not None:
+        state[("pangea.course_missions", "")] = SimpleNamespace(
+            content=copy, sender=copy_sender, room_id=COURSE
+        )
+    return state
+
+
+class TestCourseCopyLoIds(unittest.TestCase):
+    """The Missions a course's own Can-Do list names, read as the client
+    reads it: a course admin's well-formed record, or nothing."""
+
+    def test_shown_and_removed_missions_of_an_admins_copy(self):
+        copy = _copy_content(
+            "lo-1",
+            "lo-added",
+            removed_missions=[
+                {"lo_id": "lo-gone", "activity_ids": ["a"], "shown_count": 1}
+            ],
+        )
+        self.assertEqual(
+            course_copy_lo_ids(_course_state(copy)), ["lo-1", "lo-added", "lo-gone"]
+        )
+
+    def test_a_copy_a_student_wrote_names_nothing(self):
+        state = _course_state(_copy_content("lo-added"), copy_sender=_student(1))
+        self.assertEqual(course_copy_lo_ids(state), [])
+
+    def test_a_copy_whose_writer_is_no_longer_an_admin_names_nothing(self):
+        state = _course_state(_copy_content("lo-added"))
+        state[("m.room.power_levels", "")].content["users"][TEACHER] = 50
+        self.assertEqual(course_copy_lo_ids(state), [])
+
+    def test_a_room_version_12_creator_counts_as_an_admin(self):
+        state = _course_state(_copy_content("lo-added"), creator_power=True)
+        state[("m.room.power_levels", "")].content["users"] = {}
+        self.assertEqual(course_copy_lo_ids(state), ["lo-added"])
+
+    def test_no_copy_names_nothing(self):
+        self.assertEqual(course_copy_lo_ids(_course_state()), [])
+
+    def test_a_malformed_copy_names_nothing(self):
+        for broken in (
+            _copy_content("lo-1", version=2),
+            _copy_content("lo-1", revision=0),
+            _copy_content("lo-1", revision=True),
+            _copy_content("lo-1", missions="lo-1"),
+            _copy_content("lo-1", "lo-1"),
+            _copy_content("lo-1", missions=[{"lo_id": "", "activity_ids": []}]),
+            _copy_content("lo-1", missions=[{"lo_id": "lo-1"}]),
+            _copy_content("lo-1", missions=[{"lo_id": "lo-1", "activity_ids": [1]}]),
+            _copy_content(
+                "lo-1",
+                missions=[
+                    {"lo_id": "lo-1", "activity_ids": [], "removed_activity_ids": "a"}
+                ],
+            ),
+            _copy_content("lo-1", removed_missions={}),
+            _copy_content(
+                "lo-1",
+                removed_missions=[
+                    {"lo_id": "lo-2", "activity_ids": ["a"], "shown_count": 2}
+                ],
+            ),
+        ):
+            with self.subTest(broken=broken):
+                with self.assertLogs(COURSE_MISSIONS_LOGGER, "WARNING"):
+                    self.assertEqual(course_copy_lo_ids(_course_state(broken)), [])
+
+    def test_the_empty_copy_a_failed_read_leaves_names_nothing_quietly(self):
+        with self.assertNoLogs(COURSE_MISSIONS_LOGGER, "WARNING"):
+            self.assertEqual(course_copy_lo_ids(_course_state({})), [])
+
+
 class TestFetchPlan(unittest.IsolatedAsyncioTestCase):
     """Which activity a course may open as a discussion: its own copy, or a
     catalog discussion filed under a Mission of the course's quest."""
@@ -440,6 +549,73 @@ class TestFetchPlan(unittest.IsolatedAsyncioTestCase):
     async def test_a_course_with_no_quest_uses_no_catalog_discussion(self):
         self.api.get_room_state.return_value = {}
         self._cms(200, [_row(_discussion_plan(), learningObjectiveRefs=["lo-1"])])
+        self.assertIsNone(await self.resource._fetch_plan(COURSE, ACTIVITY))
+        self.quest_lo_ids.assert_not_awaited()
+
+    async def test_an_older_space_naming_its_quest_as_course_plan_id(self):
+        self.api.get_room_state.return_value = _course_state(
+            plan={"course_plan_id": "quest-1"}
+        )
+        plan = _discussion_plan()
+        self._cms(200, [_row(plan, learningObjectiveRefs=["lo-2"])])
+        self.assertEqual(await self.resource._fetch_plan(COURSE, ACTIVITY), plan)
+        self.quest_lo_ids.assert_awaited_once_with("quest-1")
+
+    async def test_uuid_wins_over_course_plan_id_and_empty_is_absent(self):
+        self.api.get_room_state.return_value = _course_state(
+            plan={"uuid": "", "course_plan_id": "quest-old"}
+        )
+        self._cms(200, [_row(_discussion_plan(), learningObjectiveRefs=["lo-2"])])
+        await self.resource._fetch_plan(COURSE, ACTIVITY)
+        self.quest_lo_ids.assert_awaited_once_with("quest-old")
+        self.quest_lo_ids.reset_mock()
+        self.resource._plans.clear()
+        self.api.get_room_state.return_value = _course_state(
+            plan={"uuid": "quest-1", "course_plan_id": "quest-old"}
+        )
+        await self.resource._fetch_plan(COURSE, ACTIVITY)
+        self.quest_lo_ids.assert_awaited_once_with("quest-1")
+
+    async def test_a_mission_the_courses_own_list_adds(self):
+        self.api.get_room_state.return_value = _course_state(
+            copy=_copy_content("lo-1", "lo-added"), plan={"uuid": "quest-1"}
+        )
+        plan = _discussion_plan()
+        self._cms(200, [_row(plan, learningObjectiveRefs=["lo-added"])])
+        self.assertEqual(await self.resource._fetch_plan(COURSE, ACTIVITY), plan)
+        # The copy answered: the quest is not read.
+        self.quest_lo_ids.assert_not_awaited()
+        state_filter = self.api.get_room_state.await_args.kwargs["event_filter"]
+        self.assertIn(("pangea.course_missions", ""), state_filter)
+        self.assertIn(("m.room.power_levels", ""), state_filter)
+        self.assertIn(("m.room.create", ""), state_filter)
+
+    async def test_a_mission_only_a_students_list_adds_is_not_the_courses(self):
+        self.api.get_room_state.return_value = _course_state(
+            copy=_copy_content("lo-added"),
+            copy_sender=_student(1),
+            plan={"uuid": "quest-1"},
+        )
+        self._cms(200, [_row(_discussion_plan(), learningObjectiveRefs=["lo-added"])])
+        self.assertIsNone(await self.resource._fetch_plan(COURSE, ACTIVITY))
+
+    async def test_a_quest_mission_the_list_leaves_out_is_still_the_courses(self):
+        self.api.get_room_state.return_value = _course_state(
+            copy=_copy_content("lo-added"), plan={"uuid": "quest-1"}
+        )
+        plan = _discussion_plan()
+        self._cms(200, [_row(plan, learningObjectiveRefs=["lo-2"])])
+        self.assertEqual(await self.resource._fetch_plan(COURSE, ACTIVITY), plan)
+
+    async def test_a_course_with_a_list_and_no_quest(self):
+        self.api.get_room_state.return_value = _course_state(
+            copy=_copy_content("lo-added")
+        )
+        plan = _discussion_plan()
+        self._cms(200, [_row(plan, learningObjectiveRefs=["lo-added"])])
+        self.assertEqual(await self.resource._fetch_plan(COURSE, ACTIVITY), plan)
+        self.resource._plans.clear()
+        self._cms(200, [_row(plan, learningObjectiveRefs=["lo-9"])])
         self.assertIsNone(await self.resource._fetch_plan(COURSE, ACTIVITY))
         self.quest_lo_ids.assert_not_awaited()
 

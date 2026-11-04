@@ -85,10 +85,13 @@ from synapse_pangea_chat.discussion_room.rooms import (
     without_seat,
 )
 from synapse_pangea_chat.email_invite.course_missions import (
+    COURSE_MISSIONS_STATE_EVENT_TYPE,
     CourseMissionsReader,
     activity_lo_ids,
+    course_copy_lo_ids,
 )
 from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
+from synapse_pangea_chat.public_courses.get_public_courses import extract_plan_id
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.instructor_access import course_admins
 from synapse_pangea_chat.room_preview.constants import (
@@ -866,8 +869,9 @@ class DiscussionRoom(Resource):
 
         A discussion is a catalog activity filed under a Mission, as a
         roleplay is. A course may use it when the discussion is the course's
-        own copy, or when its Mission is in the course's quest. Another
-        course's copy is never used. Rooms stay per course either way."""
+        own copy, or when its Mission is one of the course's: in the course's
+        quest, or in the course's own Can-Do list. Another course's copy is
+        never used. Rooms stay per course either way."""
         base = self._config.cms_base_url
         api_key = self._config.cms_service_api_key
         if not base or not api_key:
@@ -912,26 +916,43 @@ class DiscussionRoom(Resource):
                 course_id,
             )
             return None
-        if not await self._in_course_quest(course_id, activity_lo_ids(doc)):
+        if not await self._in_course_missions(course_id, activity_lo_ids(doc)):
             logger.info(
-                "discussion_room: %s is not in a Mission of %s's quest",
+                "discussion_room: %s is not in a Mission of %s",
                 activity_id,
                 course_id,
             )
             return None
         return plan
 
-    async def _in_course_quest(self, course_id: str, lo_ids: List[str]) -> bool:
-        """Whether one of these Missions is in the quest the course follows
-        (its ``pangea.course_plan``). A course with no quest uses none."""
+    async def _in_course_missions(self, course_id: str, lo_ids: List[str]) -> bool:
+        """Whether one of these Missions is one of the course's: in the course's
+        own Can-Do list (``pangea.course_missions``, read as the client reads
+        it, so only a course admin's list counts), or in the quest the course
+        follows (``pangea.course_plan``). The copy can add Missions the quest
+        does not carry, and the client lists their activities. A course with
+        neither uses none."""
         if not lo_ids:
             return False
         state = await self._api.get_room_state(
-            course_id, event_filter=[(COURSE_PLAN_EVENT, "")]
+            course_id,
+            event_filter=[
+                (COURSE_PLAN_EVENT, ""),
+                (COURSE_MISSIONS_STATE_EVENT_TYPE, ""),
+                (EventTypes.Create, ""),
+                (EventTypes.PowerLevels, ""),
+            ],
         )
+        wanted = set(lo_ids)
+        if not wanted.isdisjoint(course_copy_lo_ids(state)):
+            return True
         course_plan = state.get((COURSE_PLAN_EVENT, ""))
-        quest_id = course_plan.content.get("uuid") if course_plan is not None else None
-        if not isinstance(quest_id, str) or not quest_id:
+        # The quest id under either key the course plan has carried, by the
+        # catalog's own rule, as the client reads it.
+        quest_id = (
+            extract_plan_id(course_plan.content) if course_plan is not None else None
+        )
+        if quest_id is None:
             return False
         quest_lo_ids = await self._quests.quest_lo_ids(quest_id)
-        return not set(lo_ids).isdisjoint(quest_lo_ids)
+        return not wanted.isdisjoint(quest_lo_ids)
