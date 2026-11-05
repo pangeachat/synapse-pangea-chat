@@ -6,7 +6,9 @@ first link lands, the course's admins are joined to the session as themselves,
 exactly as the default chats join a space's members, and each admin's app is
 told to keep the room out of their chats and badges: the room is added to
 their ``pangea.admin_review`` account data and muted with the app's own mute
-rule, the same two writes the dashboard's review join makes.
+rule, the same two writes the dashboard's review join makes. Each joined
+admin is then raised to the room's ``invite`` level, so she can invite her
+students to it.
 
 Design: course-session-admins.instructions.md.
 """
@@ -42,6 +44,10 @@ from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
 from synapse_pangea_chat.course_default_chats.course_default_chats import (
     SPACE_ROOM_TYPE,
     wait_out_rate_limits,
+)
+from synapse_pangea_chat.course_member_emails.members import effective_power_levels
+from synapse_pangea_chat.public_courses.select_state_sender import (
+    select_state_sender,
 )
 from synapse_pangea_chat.push_rules_writer import push_rules_writer, writes_push_rules
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
@@ -133,6 +139,37 @@ def with_room_listed(
     return content
 
 
+def _as_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def with_invite_level(
+    content: Optional[Mapping[str, Any]], user_id: str, creators: FrozenSet[str]
+) -> Optional[Dict[str, Any]]:
+    """The ``m.room.power_levels`` content with ``user_id`` raised to the
+    room's ``invite`` level, every other key and user kept as read; ``None``
+    when she already holds it (a creator always does), so nothing is written.
+    Nobody is ever lowered. A room with no power-levels event lets anyone
+    invite, so it needs nothing."""
+    if content is None or user_id in creators:
+        return None
+    invite = _as_int(content.get("invite"), 0)
+    level = effective_power_levels([user_id], content, set(creators))[user_id]
+    if level >= invite:
+        return None
+    raw_users = content.get("users")
+    users = dict(raw_users) if isinstance(raw_users, Mapping) else {}
+    users[user_id] = invite
+    raised = dict(content)
+    raised["users"] = users
+    return raised
+
+
 def mute_rule_conditions(room_id: str) -> List[Dict[str, str]]:
     """The conditions of the app's own mute: an override rule matching the room."""
     return [{"kind": "event_match", "key": "room_id", "pattern": room_id}]
@@ -161,6 +198,10 @@ class CourseSessionAdmins:
         # The account-data list is a read-modify-write with no compare-and-set,
         # so two sessions linked together must not each drop the other's id.
         self._user_locks = Linearizer("course_session_admins", clock=self._clock)
+        # The power levels are a whole-event read-modify-write too: two admins
+        # raised in one room (a link and a backfill together, or two courses
+        # sharing the session) must not each drop the other's entry.
+        self._room_locks = Linearizer("course_session_admins_power", clock=self._clock)
         api.register_third_party_rules_callbacks(on_new_event=self.on_new_event)
 
     async def on_new_event(
@@ -222,6 +263,18 @@ class CourseSessionAdmins:
             except Exception as e:
                 logger.warning(
                     "course_session_admins join failed for %s in %s: %s",
+                    user_id,
+                    session_id,
+                    e,
+                )
+                _capture_exception(e)
+                continue
+            try:
+                await self._raise_to_invite_level(space_id, session_id, user_id)
+            except Exception as e:
+                # She is in the room and can read it; only inviting waits.
+                logger.warning(
+                    "course_session_admins power level failed for %s in %s: %s",
                     user_id,
                     session_id,
                     e,
@@ -364,6 +417,13 @@ class CourseSessionAdmins:
         )
         if membership not in (None, MEMBERSHIP_INVITE):
             return False
+        return await self._admin_of_linking_course(space_id, room_id, user_id)
+
+    async def _admin_of_linking_course(
+        self, space_id: str, room_id: str, user_id: str
+    ) -> bool:
+        """She is still a joined admin of the course, and it still links the
+        room."""
         state = await self._api.get_room_state(
             space_id,
             event_filter=[
@@ -379,6 +439,79 @@ class CourseSessionAdmins:
             and has_valid_via(link.content)
             and is_joined_instructor(state, user_id)
         )
+
+    async def _raise_to_invite_level(
+        self, space_id: str, room_id: str, user_id: str
+    ) -> None:
+        """Raise a joined admin to the room's ``invite`` level, so she can
+        invite her students: the client creates a session with ``invite`` at
+        50 and only its creator and the bot listed. Applies to an admin joined
+        just now and to one already in the room (a backfill reaches admins an
+        earlier join left at the default level). Sent as the room's own
+        highest-powered local member able to change power levels, which in a
+        session is its creator; the bot holds 50 there and cannot. Every
+        other key and user is kept as read, under a per-room lock. Whether she
+        may still be raised is read again right before every attempt: she is
+        in the room, still a course admin, the course still links it, and the
+        room still admits the course."""
+
+        async def attempt() -> None:
+            (
+                membership,
+                _,
+            ) = await self._store.get_local_current_membership_for_user_in_room(
+                user_id, room_id
+            )
+            if (
+                membership != MEMBERSHIP_JOIN
+                or not await self._admin_of_linking_course(space_id, room_id, user_id)
+                or await self._not_a_course_session(space_id, room_id) is not None
+            ):
+                return
+            state = await self._api.get_room_state(
+                room_id,
+                event_filter=[(EventTypes.Create, ""), (EventTypes.PowerLevels, "")],
+            )
+            power = state.get((EventTypes.PowerLevels, ""))
+            create = state.get((EventTypes.Create, ""))
+            creators: FrozenSet[str] = frozenset()
+            if create is not None and getattr(
+                create.room_version, "msc4289_creator_power_enabled", False
+            ):
+                creators = frozenset(
+                    [create.sender, *create.content.get("additional_creators", [])]
+                )
+            content = with_invite_level(
+                power.content if power is not None else None, user_id, creators
+            )
+            if content is None:
+                return
+            sender = await select_state_sender(
+                self._api, room_id, EventTypes.PowerLevels
+            )
+            if sender is None:
+                raise RuntimeError(
+                    f"no joined local member can change the power levels of {room_id}"
+                )
+            await self._api.create_and_send_event_into_room(
+                {
+                    "type": EventTypes.PowerLevels,
+                    "room_id": room_id,
+                    "sender": sender,
+                    "state_key": "",
+                    "content": content,
+                }
+            )
+            logger.info(
+                "course_session_admins raised %s to %s in %s as %s",
+                user_id,
+                content["users"][user_id],
+                room_id,
+                sender,
+            )
+
+        async with self._room_locks.queue(room_id):
+            await wait_out_rate_limits(self._clock, attempt, "course_session_admins")
 
     async def _list(self, user_id: str, room_id: str) -> None:
         async with self._user_locks.queue(user_id):

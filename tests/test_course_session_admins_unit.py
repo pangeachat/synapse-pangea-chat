@@ -13,6 +13,7 @@ from synapse_pangea_chat.course_session_admins.course_session_admins import (
     is_activity_session_type,
     is_first_link,
     mute_rule_conditions,
+    with_invite_level,
     with_room_listed,
 )
 
@@ -20,6 +21,22 @@ ROOM = "!session:example.com"
 OTHER = "!other:example.com"
 SPACE = "!course:example.com"
 TEACHER = "@teacher:example.com"
+CREATOR = "@student:example.com"
+BOT = "@bot:example.com"
+
+#: A session's power levels as the client creates one.
+SESSION_POWER = {
+    "ban": 50,
+    "kick": 50,
+    "invite": 50,
+    "redact": 50,
+    "events": {"m.room.power_levels": 100, "m.room.pinned_events": 50},
+    "events_default": 0,
+    "state_default": 50,
+    "users_default": 0,
+    "notifications": {"room": 50},
+    "users": {CREATOR: 100, BOT: 50},
+}
 
 
 def _event(
@@ -107,6 +124,259 @@ class TestMuteRule(unittest.TestCase):
             mute_rule_conditions(ROOM),
             [{"kind": "event_match", "key": "room_id", "pattern": ROOM}],
         )
+
+
+class TestWithInviteLevel(unittest.TestCase):
+    def test_raises_an_admin_below_invite_and_keeps_everything_else(self):
+        raised = with_invite_level(SESSION_POWER, TEACHER, frozenset())
+        expected = dict(SESSION_POWER)
+        expected["users"] = {CREATOR: 100, BOT: 50, TEACHER: 50}
+        self.assertEqual(raised, expected)
+        # The content read is never changed in place.
+        self.assertNotIn(TEACHER, SESSION_POWER["users"])
+
+    def test_an_admin_at_or_above_invite_is_left_alone(self):
+        for level in (50, 75, 100):
+            with self.subTest(level=level):
+                content = {**SESSION_POWER, "users": {CREATOR: 100, TEACHER: level}}
+                self.assertIsNone(with_invite_level(content, TEACHER, frozenset()))
+
+    def test_raises_to_the_rooms_own_invite_level(self):
+        content = {**SESSION_POWER, "invite": 30, "users": {TEACHER: 10}}
+        raised = with_invite_level(content, TEACHER, frozenset())
+        self.assertEqual(raised and raised["users"], {TEACHER: 30})
+
+    def test_users_default_counts_as_her_level(self):
+        content = {**SESSION_POWER, "users_default": 50, "users": {}}
+        self.assertIsNone(with_invite_level(content, TEACHER, frozenset()))
+
+    def test_a_creator_with_creator_power_is_never_listed(self):
+        for invite in (50, 150):
+            with self.subTest(invite=invite):
+                content = {**SESSION_POWER, "invite": invite, "users": {BOT: 50}}
+                self.assertIsNone(
+                    with_invite_level(content, TEACHER, frozenset({TEACHER}))
+                )
+
+    def test_no_power_levels_or_no_invite_level_needs_nothing(self):
+        self.assertIsNone(with_invite_level(None, TEACHER, frozenset()))
+        content = {k: v for k, v in SESSION_POWER.items() if k != "invite"}
+        self.assertIsNone(with_invite_level(content, TEACHER, frozenset()))
+
+    def test_a_missing_or_malformed_users_map_is_started_fresh(self):
+        for users in (None, "nope"):
+            with self.subTest(users=users):
+                content = {**SESSION_POWER, "users": users}
+                raised = with_invite_level(content, TEACHER, frozenset())
+                self.assertEqual(raised and raised["users"], {TEACHER: 50})
+
+
+class TestRaiseToInviteLevel(unittest.TestCase):
+    """The power-levels write after the join: the merged event, sent as the
+    room's creator, once."""
+
+    def setUp(self) -> None:
+        self.power: Dict[str, Any] = dict(SESSION_POWER)
+        self.membership: Optional[str] = "join"
+        self.sent: list = []
+
+        async def membership(user_id: str, room_id: str) -> Any:
+            return self.membership, None
+
+        async def room_state(room_id: str, event_filter: Any) -> Dict[Any, Any]:
+            return {
+                ("m.room.create", ""): _ev({}, sender=CREATOR),
+                ("m.room.power_levels", ""): _ev(self.power, sender=CREATOR),
+            }
+
+        async def send(event: Dict[str, Any]) -> None:
+            self.sent.append(event)
+            self.power = event["content"]
+
+        module: Any = object.__new__(CourseSessionAdmins)
+        module._clock = SimpleNamespace(sleep=AsyncMock())
+        module._store = Mock(
+            get_local_current_membership_for_user_in_room=AsyncMock(
+                side_effect=membership
+            )
+        )
+        module._api = Mock(
+            get_room_state=AsyncMock(side_effect=room_state),
+            create_and_send_event_into_room=AsyncMock(side_effect=send),
+        )
+        module._room_locks = course_session_admins.Linearizer("test", clock=Mock())
+        self.eligible = True
+
+        async def eligible(space_id: str, room_id: str, user_id: str) -> bool:
+            return self.eligible
+
+        module._admin_of_linking_course = AsyncMock(side_effect=eligible)
+        self.refusal: Optional[str] = None
+
+        async def refusal(space_id: str, room_id: str) -> Optional[str]:
+            return self.refusal
+
+        module._not_a_course_session = AsyncMock(side_effect=refusal)
+        self.module = module
+        self.select = AsyncMock(return_value=CREATOR)
+
+    def _raise(self) -> None:
+        with patch.object(course_session_admins, "select_state_sender", self.select):
+            asyncio.run(self.module._raise_to_invite_level(SPACE, ROOM, TEACHER))
+
+    def test_sends_the_merged_power_levels_as_the_creator(self):
+        with self.assertLogs(course_session_admins.logger, "INFO") as logs:
+            self._raise()
+        self.assertEqual(len(self.sent), 1)
+        event = self.sent[0]
+        self.assertEqual(
+            {k: event[k] for k in ("type", "room_id", "sender", "state_key")},
+            {
+                "type": "m.room.power_levels",
+                "room_id": ROOM,
+                "sender": CREATOR,
+                "state_key": "",
+            },
+        )
+        expected = dict(SESSION_POWER)
+        expected["users"] = {CREATOR: 100, BOT: 50, TEACHER: 50}
+        self.assertEqual(event["content"], expected)
+        self.select.assert_awaited_once_with(
+            self.module._api, ROOM, "m.room.power_levels"
+        )
+        raised = [line for line in logs.output if "raised" in line]
+        self.assertEqual(len(raised), 1)
+        self.assertIn(f"raised {TEACHER} to 50 in {ROOM} as {CREATOR}", raised[0])
+
+    def test_running_again_sends_nothing(self):
+        self._raise()
+        self._raise()
+        self.assertEqual(len(self.sent), 1)
+
+    def test_an_admin_already_at_invite_is_not_written(self):
+        self.power = {**SESSION_POWER, "users": {CREATOR: 100, TEACHER: 100}}
+        self._raise()
+        self.assertEqual(self.sent, [])
+        self.select.assert_not_awaited()
+
+    def test_an_admin_not_in_the_room_is_not_written(self):
+        for membership in (None, "invite", "leave", "ban"):
+            with self.subTest(membership=membership):
+                self.membership = membership
+                self._raise()
+                self.assertEqual(self.sent, [])
+
+    def test_an_admin_no_longer_admin_or_linked_is_not_written(self):
+        self.eligible = False
+        self._raise()
+        self.assertEqual(self.sent, [])
+        self.module._admin_of_linking_course.assert_awaited_once_with(
+            SPACE, ROOM, TEACHER
+        )
+
+    def test_a_room_that_no_longer_admits_the_course_is_not_written(self):
+        self.refusal = "its join rule does not admit the course"
+        self._raise()
+        self.assertEqual(self.sent, [])
+        self.module._not_a_course_session.assert_awaited_once_with(SPACE, ROOM)
+
+    def test_eligibility_is_read_again_after_a_rate_limit_wait(self):
+        for change in (
+            lambda: setattr(self, "membership", "leave"),
+            lambda: setattr(self, "membership", "ban"),
+            lambda: setattr(self, "eligible", False),
+            lambda: setattr(self, "refusal", "its join rule does not admit the course"),
+        ):
+            with self.subTest():
+                self.setUp()
+                calls = 0
+
+                async def limited(event: Dict[str, Any], change: Any = change) -> None:
+                    nonlocal calls
+                    calls += 1
+                    change()
+                    raise LimitExceededError("test", retry_after_ms=1)
+
+                self.module._api.create_and_send_event_into_room.side_effect = limited
+                self._raise()
+                self.assertEqual(calls, 1)
+                self.assertEqual(self.sent, [])
+
+    def test_a_room_nobody_can_change_raises_without_writing(self):
+        self.select = AsyncMock(return_value=None)
+        with self.assertRaises(RuntimeError):
+            self._raise()
+        self.assertEqual(self.sent, [])
+
+    def test_a_rate_limited_write_is_retried_on_fresh_state(self):
+        calls = 0
+        original = self.module._api.create_and_send_event_into_room.side_effect
+
+        async def limited(event: Dict[str, Any]) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # Someone else changed the power levels during the wait.
+                self.power = {**SESSION_POWER, "users": {CREATOR: 100, "@x:e": 50}}
+                raise LimitExceededError("test", retry_after_ms=1)
+            await original(event)
+
+        self.module._api.create_and_send_event_into_room.side_effect = limited
+        self._raise()
+        self.assertEqual(
+            self.sent[-1]["content"]["users"],
+            {CREATOR: 100, "@x:e": 50, TEACHER: 50},
+        )
+
+
+class TestJoinAdminsRaisesEachJoinedAdmin(unittest.TestCase):
+    def _module(self) -> Any:
+        module: Any = object.__new__(CourseSessionAdmins)
+        module._not_a_course_session = AsyncMock(return_value=None)
+        module._course_admins = AsyncMock(return_value=frozenset({TEACHER}))
+        module._join_admin = AsyncMock(return_value=True)
+        module._raise_to_invite_level = AsyncMock()
+        return module
+
+    def test_a_joined_admin_is_raised(self):
+        module = self._module()
+        self.assertEqual(asyncio.run(module.join_admins(SPACE, ROOM)), [TEACHER])
+        module._raise_to_invite_level.assert_awaited_once_with(SPACE, ROOM, TEACHER)
+
+    def test_an_admin_already_in_is_raised_too(self):
+        # A backfill reaches admins an earlier join left at the default level.
+        module = self._module()
+        module._join_admin = AsyncMock(return_value=False)
+        self.assertEqual(asyncio.run(module.join_admins(SPACE, ROOM)), [])
+        module._raise_to_invite_level.assert_awaited_once_with(SPACE, ROOM, TEACHER)
+
+    def test_a_failed_raise_is_logged_and_keeps_the_join(self):
+        module = self._module()
+        module._raise_to_invite_level = AsyncMock(side_effect=RuntimeError("nope"))
+        capture = Mock()
+        with patch.object(
+            course_session_admins, "_capture_exception", capture
+        ), self.assertLogs(course_session_admins.logger, "WARNING") as logs:
+            joined = asyncio.run(module.join_admins(SPACE, ROOM))
+        self.assertEqual(joined, [TEACHER])
+        self.assertTrue(any("power level failed" in line for line in logs.output))
+        capture.assert_called_once()
+
+    def test_the_backfill_raises_admins_in_every_session_it_walks(self):
+        module = self._module()
+        module._join_admin = AsyncMock(return_value=False)
+        rooms = [ROOM, OTHER]
+        self.assertEqual(asyncio.run(module.backfill_course(SPACE, rooms)), 0)
+        self.assertEqual(
+            [c.args for c in module._raise_to_invite_level.await_args_list],
+            [(SPACE, ROOM, TEACHER), (SPACE, OTHER, TEACHER)],
+        )
+
+    def test_a_failed_join_is_not_raised(self):
+        module = self._module()
+        module._join_admin = AsyncMock(side_effect=RuntimeError("refused"))
+        self.assertEqual(asyncio.run(module.join_admins(SPACE, ROOM)), [])
+        module._raise_to_invite_level.assert_not_awaited()
 
 
 class TestAdmitsCourse(unittest.TestCase):
@@ -306,6 +576,7 @@ class TestOnlyThePushRulesWriterJoins(unittest.TestCase):
         module._still_eligible = AsyncMock(return_value=True)
         module._list = AsyncMock()
         module._mute = AsyncMock()
+        module._raise_to_invite_level = AsyncMock()
         join = AsyncMock()
         scheduled: list = []
         module._clock.call_later = Mock(
@@ -330,6 +601,7 @@ class TestOnlyThePushRulesWriterJoins(unittest.TestCase):
             with self.subTest(instance=instance, writer=writer):
                 module = self._link_session(instance, writer)
                 module._course_admins.assert_not_awaited()
+                module._raise_to_invite_level.assert_not_awaited()
                 module._list.assert_not_awaited()
                 module.join.assert_not_awaited()
                 module._mute.assert_not_awaited()
@@ -342,6 +614,9 @@ class TestOnlyThePushRulesWriterJoins(unittest.TestCase):
                 module.join.assert_awaited_once()
                 self.assertEqual(module.join.await_args.args[1:], (ROOM, TEACHER))
                 module._mute.assert_awaited_once_with(TEACHER, ROOM)
+                module._raise_to_invite_level.assert_awaited_once_with(
+                    SPACE, ROOM, TEACHER
+                )
 
 
 class TestBackfillRunsOnlyOnThePushRulesWriter(unittest.TestCase):
