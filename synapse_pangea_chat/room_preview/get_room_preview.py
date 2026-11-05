@@ -12,6 +12,7 @@ from synapse_pangea_chat.room_preview.constants import (
     JOIN_RULE_CONTENT_KEY,
     MEMBERSHIP_CONTENT_KEY,
     MEMBERSHIP_INVITE,
+    MEMBERSHIP_JOIN,
     PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE,
     PANGEA_ACTIVITY_ROLE_STATE_EVENT_TYPE,
     PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
@@ -241,14 +242,20 @@ def _add_membership_summary(
 
 
 def _with_invited(
-    room_data: Dict[str, Dict[str, Any]], membership_summary: Dict[str, str]
+    room_data: Dict[str, Dict[str, Any]],
+    membership_summary: Dict[str, str],
+    requester_id: Optional[str],
 ) -> Dict[str, Any]:
     """
     The room's preview plus ``invited``: who holds a pending invite to this
-    room, sorted. Built from the membership already read for
-    ``membership_summary`` (no extra query) on a shallow copy, so the shared
-    cache never carries it and the plain room preview never shows it.
+    room, sorted, shown only to a requester joined to the room itself (anyone
+    can link a known room into a space of their own). Built from the
+    membership already read for ``membership_summary`` (no extra query) on a
+    shallow copy, so the shared cache never carries it and the plain room
+    preview never shows it.
     """
+    if requester_id is None or membership_summary.get(requester_id) != MEMBERSHIP_JOIN:
+        return room_data
     invited = sorted(
         user_id
         for user_id, membership in membership_summary.items()
@@ -262,7 +269,7 @@ async def get_room_preview(
     api: ModuleApi,
     room_store: RoomStore,
     config: "PangeaChatConfig",
-    include_invited: bool = False,
+    invited_for: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Get room preview data including state events for the specified rooms.
@@ -291,9 +298,9 @@ async def get_room_preview(
     :param rooms: List of room IDs to get preview data for.
     :param room_store: The RoomStore instance to query the database.
     :param config: The configuration containing state event types to query.
-    :param include_invited: Add each activity room's pending invitees as
-        ``invited`` (see ``_with_invited``); only the membership-gated session
-        previews ask for it.
+    :param invited_for: The requester to add each room's pending invitees for,
+        as ``invited``, where she is joined to it (see ``_with_invited``); only
+        the membership-gated session previews pass it.
     :return: A dictionary mapping room_id to state event data organized by
              event type and state key, plus a membership_summary for activity roles.
     """
@@ -314,10 +321,8 @@ async def get_room_preview(
             # in case membership has changed since caching
             membership_summary = await _get_membership_summary(room_id, api, room_store)
             _add_membership_summary(cached_data, membership_summary)
-            result[room_id] = (
-                _with_invited(cached_data, membership_summary)
-                if include_invited
-                else cached_data
+            result[room_id] = _with_invited(
+                cached_data, membership_summary, invited_for
             )
         else:
             rooms_to_fetch.append(room_id)
@@ -403,10 +408,6 @@ async def get_room_preview(
         _add_membership_summary(room_data, membership_summary)
 
         _cache_room_data(room_id, room_data)
-        result[room_id] = (
-            _with_invited(room_data, membership_summary)
-            if include_invited
-            else room_data
-        )
+        result[room_id] = _with_invited(room_data, membership_summary, invited_for)
 
     return result
