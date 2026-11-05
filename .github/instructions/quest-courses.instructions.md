@@ -7,7 +7,7 @@ description: "Quest courses, Synapse side: the three operator reads that tell th
 
 ## Purpose
 
-The CMS content review shows, for each quest, the course spaces built on it that people are in, and the course invitations for it that have no space yet. The CMS keeps its own copy of that list ([cms quest-courses](../../../cms/.github/instructions/quest-courses.instructions.md)). These three reads are how it fills that copy without scanning every room on the server each time.
+The CMS content review shows, for each quest, the course spaces built on it that people are in, and the course invitations for it that have no space yet. The CMS keeps its own copy of that list ([content review](../../../cms/.github/instructions/content-review.instructions.md#courses-using-a-quest)). These three reads are how it fills that copy without scanning every room on the server each time.
 
 ## The experience
 
