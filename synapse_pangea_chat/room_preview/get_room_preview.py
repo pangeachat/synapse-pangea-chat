@@ -245,13 +245,10 @@ def _with_invited(
 ) -> Dict[str, Any]:
     """
     The room's preview plus ``invited``: who holds a pending invite to this
-    activity room, sorted. Built from the membership already read for
+    room, sorted. Built from the membership already read for
     ``membership_summary`` (no extra query) on a shallow copy, so the shared
-    cache never carries it and the plain room preview never shows it. Rooms
-    without ``pangea.activity_roles`` get no list.
+    cache never carries it and the plain room preview never shows it.
     """
-    if PANGEA_ACTIVITY_ROLE_STATE_EVENT_TYPE not in room_data:
-        return room_data
     invited = sorted(
         user_id
         for user_id, membership in membership_summary.items()

@@ -107,11 +107,11 @@ class TestInvited(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("invited", await self._read(api, store, None))
         self.assertNotIn("invited", await self._read(api, store, False))
 
-    async def test_room_without_activity_roles_has_no_list(self) -> None:
+    async def test_session_without_roles_yet_still_lists_its_invites(self) -> None:
         store = _store()
         store.db_pool.execute = AsyncMock(return_value=[])
         room = await self._read(_api({"@asked:d": "invite"}), store, True)
-        self.assertNotIn("invited", room)
+        self.assertEqual(room["invited"], ["@asked:d"])
 
 
 if __name__ == "__main__":
