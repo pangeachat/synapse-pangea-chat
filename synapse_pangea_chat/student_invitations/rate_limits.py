@@ -13,6 +13,7 @@ from typing import Any, Dict, Mapping, Tuple
 DEFAULT_LIMITS: Dict[str, Tuple[int, int]] = {
     "student_invitations_add": (30, 60),
     "student_invitations_send": (20, 60),
+    "student_invitations_schedule": (20, 60),
     "student_invitations_list": (60, 60),
     "student_invitations_revoke": (60, 60),
     "student_invitations_pending_approvals": (60, 60),

@@ -23,6 +23,7 @@ SYSTEM = "system"
 _SEQUENCE = itertools.count()
 
 STUDENTS_ADDED = "students_added"
+INVITE_SCHEDULED = "invite_scheduled"
 INVITE_SENT = "invite_sent"
 INVITE_RESENT = "invite_resent"
 INVITATION_WITHDRAWN = "invitation_withdrawn"
@@ -37,6 +38,7 @@ CANVAS_ROSTER_IMPORTED = "canvas_roster_imported"
 ACTIONS = frozenset(
     {
         STUDENTS_ADDED,
+        INVITE_SCHEDULED,
         INVITE_SENT,
         INVITE_RESENT,
         INVITATION_WITHDRAWN,
