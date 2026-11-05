@@ -172,6 +172,8 @@ class TestGetActivitySessionPreviews(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, preview)
         mock_preview.assert_awaited_once()
         self.assertEqual(mock_preview.await_args_list[0].args[0], [SESSION_1])
+        # Only this membership-gated read asks for the pending invites.
+        self.assertIs(mock_preview.await_args_list[0].kwargs["include_invited"], True)
 
     async def test_no_sessions_skips_room_preview(self) -> None:
         store = _room_store(rows=[])
