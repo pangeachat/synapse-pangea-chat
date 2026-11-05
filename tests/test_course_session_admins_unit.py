@@ -211,6 +211,12 @@ class TestRaiseToInviteLevel(unittest.TestCase):
             return self.eligible
 
         module._admin_of_linking_course = AsyncMock(side_effect=eligible)
+        self.refusal: Optional[str] = None
+
+        async def refusal(space_id: str, room_id: str) -> Optional[str]:
+            return self.refusal
+
+        module._not_a_course_session = AsyncMock(side_effect=refusal)
         self.module = module
         self.select = AsyncMock(return_value=CREATOR)
 
@@ -268,11 +274,18 @@ class TestRaiseToInviteLevel(unittest.TestCase):
             SPACE, ROOM, TEACHER
         )
 
+    def test_a_room_that_no_longer_admits_the_course_is_not_written(self):
+        self.refusal = "its join rule does not admit the course"
+        self._raise()
+        self.assertEqual(self.sent, [])
+        self.module._not_a_course_session.assert_awaited_once_with(SPACE, ROOM)
+
     def test_eligibility_is_read_again_after_a_rate_limit_wait(self):
         for change in (
             lambda: setattr(self, "membership", "leave"),
             lambda: setattr(self, "membership", "ban"),
             lambda: setattr(self, "eligible", False),
+            lambda: setattr(self, "refusal", "its join rule does not admit the course"),
         ):
             with self.subTest():
                 self.setUp()

@@ -452,7 +452,8 @@ class CourseSessionAdmins:
         session is its creator; the bot holds 50 there and cannot. Every
         other key and user is kept as read, under a per-room lock. Whether she
         may still be raised is read again right before every attempt: she is
-        in the room, still a course admin, and the course still links it."""
+        in the room, still a course admin, the course still links it, and the
+        room still admits the course."""
 
         async def attempt() -> None:
             (
@@ -464,6 +465,7 @@ class CourseSessionAdmins:
             if (
                 membership != MEMBERSHIP_JOIN
                 or not await self._admin_of_linking_course(space_id, room_id, user_id)
+                or await self._not_a_course_session(space_id, room_id) is not None
             ):
                 return
             state = await self._api.get_room_state(
