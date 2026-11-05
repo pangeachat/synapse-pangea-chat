@@ -32,6 +32,7 @@ from synapse_pangea_chat.student_invitations.rooms import (
     ModuleCourseAdmins,
     ModuleCourseRooms,
 )
+from synapse_pangea_chat.student_invitations.scheduled_send import ScheduledInvites
 from synapse_pangea_chat.student_invitations.store import StudentInvitationStore
 
 __all__ = ["StudentInvitations", "register_student_invitations"]
@@ -87,6 +88,12 @@ def register_student_invitations(
             "POST",
             "teacher",
             h.send,
+        ),
+        "student_invitations_schedule": (
+            "student_invitations/schedule",
+            "POST",
+            "teacher",
+            h.schedule,
         ),
         "student_invitations_list": (
             "student_invitations/list",
@@ -188,4 +195,5 @@ def register_student_invitations(
     api.register_third_party_rules_callbacks(
         on_new_event=MembershipRelease(store, claims).on_new_event
     )
+    ScheduledInvites(api, store, rooms, mailer).start()
     return StudentInvitations(store, claims, mailer, handlers)

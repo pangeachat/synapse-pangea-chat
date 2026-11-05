@@ -18,18 +18,12 @@ from urllib.parse import urlencode
 # collection name is part of the Authorization scheme Payload expects.
 CMS_AUTH_COLLECTION = "service-users"
 
-# Where a course's target language lives, newest content model first.
-#
-# Course rooms reference v3 ``quest-plans`` — a quest id returns ZERO docs from
-# the v1 ``course-plans`` collection, so querying only v1 makes the backfill a
-# silent no-op for every real course. Legacy rooms may still hold a v1 id, so
-# both are tried and the ids that resolve in the first are not re-asked.
-#
-# The two collections spell the language differently: v3 keeps generation
-# inputs under ``req``, v1 has a flat ``l2``.
+# Where a course's target language lives. Course rooms pin a v3 ``quest-plans``
+# row id, and v3 keeps generation inputs under ``req``. A room still holding a
+# retired v1 plan id resolves nowhere and is skipped, like any other id the CMS
+# does not know (public-courses.instructions.md, "What appears").
 _PLAN_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("quest-plans", ("req", "target_language")),
-    ("course-plans", ("l2",)),
 )
 
 

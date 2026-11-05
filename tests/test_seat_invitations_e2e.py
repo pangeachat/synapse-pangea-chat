@@ -855,6 +855,9 @@ class TestSchemaMigrationOnPostgres(unittest.TestCase):
                     " course_room_id TEXT, invited_by TEXT NOT NULL,"
                     " since_ms BIGINT NOT NULL, PRIMARY KEY (user_id, course_room_id))",
                     "INSERT INTO pangea_managed_account VALUES ('u', 'r', 't', 7)",
+                    "CREATE TABLE pangea_seat_invitation (id TEXT PRIMARY KEY,"
+                    " state TEXT NOT NULL)",
+                    "INSERT INTO pangea_seat_invitation VALUES ('i', 'invited')",
                 ):
                     cur.execute(sql)
                 for _ in range(2):
@@ -875,8 +878,12 @@ class TestSchemaMigrationOnPostgres(unittest.TestCase):
                     columns["pangea_managed_account"],
                     ["user_id", "course_room_id", "created_at_ms"],
                 )
-                # The seat invitation table is not among the earlier shapes.
-                self.assertNotIn("pangea_seat_invitation", columns)
+                self.assertEqual(
+                    columns["pangea_seat_invitation"],
+                    ["id", "state", "send_at_ms", "first_due_ms"],
+                )
+                cur.execute("SELECT * FROM pangea_seat_invitation")
+                self.assertEqual(cur.fetchall(), [("i", "invited", None, None)])
                 cur.execute("SELECT * FROM pangea_invitation_ack")
                 self.assertEqual(cur.fetchall(), [("i", "u", 5, None)])
                 cur.execute("SELECT * FROM pangea_managed_account")

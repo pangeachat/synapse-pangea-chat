@@ -54,15 +54,13 @@ PAGE_SIZE = 50
 PAGE_PAUSE_SECONDS = 0.3
 MAX_PAGES = 200
 
-# Newest content model first, matching the backfill's own lookup order. A course
-# space pins a quest-plans row id; the retired v1 course-plans collection is only
-# a fallback for rooms old enough to reference it.
+# Matching the backfill's own lookup. A course space pins a quest-plans row id; a
+# room still holding a retired v1 plan id reports as not found.
 PLAN_SOURCES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("quest-plans", ("req", "target_language")),
-    ("course-plans", ("l2",)),
 )
 
-STATUS_NO_PLAN = "plan not found in either collection"
+STATUS_NO_PLAN = "plan not found in quest-plans"
 STATUS_NO_LANGUAGE = "plan found but carries no language"
 
 
@@ -109,7 +107,7 @@ def resolve_plan_languages(
 ) -> Dict[str, Optional[str]]:
     """plan id -> language, or ``None`` when the CMS has the row but no language.
 
-    Ids absent from the result did not resolve in either collection at all. The
+    Ids absent from the result did not resolve in ``quest-plans`` at all. The
     distinction matters: it is the difference between "fill in a field" and
     "this plan does not exist".
     """
