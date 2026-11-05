@@ -879,10 +879,11 @@ class TestSchemaMigrationOnPostgres(unittest.TestCase):
                     ["user_id", "course_room_id", "created_at_ms"],
                 )
                 self.assertEqual(
-                    columns["pangea_seat_invitation"], ["id", "state", "send_at_ms"]
+                    columns["pangea_seat_invitation"],
+                    ["id", "state", "send_at_ms", "first_due_ms"],
                 )
                 cur.execute("SELECT * FROM pangea_seat_invitation")
-                self.assertEqual(cur.fetchall(), [("i", "invited", None)])
+                self.assertEqual(cur.fetchall(), [("i", "invited", None, None)])
                 cur.execute("SELECT * FROM pangea_invitation_ack")
                 self.assertEqual(cur.fetchall(), [("i", "u", 5, None)])
                 cur.execute("SELECT * FROM pangea_managed_account")
