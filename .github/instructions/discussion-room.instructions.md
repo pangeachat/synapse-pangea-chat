@@ -57,6 +57,6 @@ Every 500 and 502 is reported to Sentry. The per-discussion lock lives in one pr
 
 The discussion bot is the account named by the user-activity filter's bot setting, shared with that filter; without it the endpoint answers 503. Room capacity defaults to 12, and request limits are in the shared per-route table.
 
-## Open questions
+## Blocked-join gate
 
-- Whether a student's own Join should respect the blocked-join gate.
+Placement doesn't apply the [blocked-join gate](blocked-join-gate.instructions.md). The gate counts the blocks of a room's full admins, and in a discussion room that is only the bot; no student starts the room, so nobody's block would decide.
