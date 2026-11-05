@@ -156,7 +156,7 @@ def with_invite_level(
     when she already holds it (a creator always does), so nothing is written.
     Nobody is ever lowered. A room with no power-levels event lets anyone
     invite, so it needs nothing."""
-    if content is None:
+    if content is None or user_id in creators:
         return None
     invite = _as_int(content.get("invite"), 0)
     level = effective_power_levels([user_id], content, set(creators))[user_id]
@@ -270,7 +270,7 @@ class CourseSessionAdmins:
                 _capture_exception(e)
                 continue
             try:
-                await self._raise_to_invite_level(session_id, user_id)
+                await self._raise_to_invite_level(space_id, session_id, user_id)
             except Exception as e:
                 # She is in the room and can read it; only inviting waits.
                 logger.warning(
@@ -417,6 +417,13 @@ class CourseSessionAdmins:
         )
         if membership not in (None, MEMBERSHIP_INVITE):
             return False
+        return await self._admin_of_linking_course(space_id, room_id, user_id)
+
+    async def _admin_of_linking_course(
+        self, space_id: str, room_id: str, user_id: str
+    ) -> bool:
+        """She is still a joined admin of the course, and it still links the
+        room."""
         state = await self._api.get_room_state(
             space_id,
             event_filter=[
@@ -433,7 +440,9 @@ class CourseSessionAdmins:
             and is_joined_instructor(state, user_id)
         )
 
-    async def _raise_to_invite_level(self, room_id: str, user_id: str) -> None:
+    async def _raise_to_invite_level(
+        self, space_id: str, room_id: str, user_id: str
+    ) -> None:
         """Raise a joined admin to the room's ``invite`` level, so she can
         invite her students: the client creates a session with ``invite`` at
         50 and only its creator and the bot listed. Applies to an admin joined
@@ -441,14 +450,22 @@ class CourseSessionAdmins:
         earlier join left at the default level). Sent as the room's own
         highest-powered local member able to change power levels, which in a
         session is its creator; the bot holds 50 there and cannot. Every
-        other key and user is kept as read, under a per-room lock."""
-        membership, _ = await self._store.get_local_current_membership_for_user_in_room(
-            user_id, room_id
-        )
-        if membership != MEMBERSHIP_JOIN:
-            return
+        other key and user is kept as read, under a per-room lock. Whether she
+        may still be raised is read again right before every attempt: she is
+        in the room, still a course admin, and the course still links it."""
 
         async def attempt() -> None:
+            (
+                membership,
+                _,
+            ) = await self._store.get_local_current_membership_for_user_in_room(
+                user_id, room_id
+            )
+            if (
+                membership != MEMBERSHIP_JOIN
+                or not await self._admin_of_linking_course(space_id, room_id, user_id)
+            ):
+                return
             state = await self._api.get_room_state(
                 room_id,
                 event_filter=[(EventTypes.Create, ""), (EventTypes.PowerLevels, "")],

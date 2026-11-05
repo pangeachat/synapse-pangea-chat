@@ -151,8 +151,12 @@ class TestWithInviteLevel(unittest.TestCase):
         self.assertIsNone(with_invite_level(content, TEACHER, frozenset()))
 
     def test_a_creator_with_creator_power_is_never_listed(self):
-        content = {**SESSION_POWER, "users": {BOT: 50}}
-        self.assertIsNone(with_invite_level(content, TEACHER, frozenset({TEACHER})))
+        for invite in (50, 150):
+            with self.subTest(invite=invite):
+                content = {**SESSION_POWER, "invite": invite, "users": {BOT: 50}}
+                self.assertIsNone(
+                    with_invite_level(content, TEACHER, frozenset({TEACHER}))
+                )
 
     def test_no_power_levels_or_no_invite_level_needs_nothing(self):
         self.assertIsNone(with_invite_level(None, TEACHER, frozenset()))
@@ -201,12 +205,18 @@ class TestRaiseToInviteLevel(unittest.TestCase):
             create_and_send_event_into_room=AsyncMock(side_effect=send),
         )
         module._room_locks = course_session_admins.Linearizer("test", clock=Mock())
+        self.eligible = True
+
+        async def eligible(space_id: str, room_id: str, user_id: str) -> bool:
+            return self.eligible
+
+        module._admin_of_linking_course = AsyncMock(side_effect=eligible)
         self.module = module
         self.select = AsyncMock(return_value=CREATOR)
 
     def _raise(self) -> None:
         with patch.object(course_session_admins, "select_state_sender", self.select):
-            asyncio.run(self.module._raise_to_invite_level(ROOM, TEACHER))
+            asyncio.run(self.module._raise_to_invite_level(SPACE, ROOM, TEACHER))
 
     def test_sends_the_merged_power_levels_as_the_creator(self):
         with self.assertLogs(course_session_admins.logger, "INFO") as logs:
@@ -250,6 +260,35 @@ class TestRaiseToInviteLevel(unittest.TestCase):
                 self._raise()
                 self.assertEqual(self.sent, [])
 
+    def test_an_admin_no_longer_admin_or_linked_is_not_written(self):
+        self.eligible = False
+        self._raise()
+        self.assertEqual(self.sent, [])
+        self.module._admin_of_linking_course.assert_awaited_once_with(
+            SPACE, ROOM, TEACHER
+        )
+
+    def test_eligibility_is_read_again_after_a_rate_limit_wait(self):
+        for change in (
+            lambda: setattr(self, "membership", "leave"),
+            lambda: setattr(self, "membership", "ban"),
+            lambda: setattr(self, "eligible", False),
+        ):
+            with self.subTest():
+                self.setUp()
+                calls = 0
+
+                async def limited(event: Dict[str, Any], change: Any = change) -> None:
+                    nonlocal calls
+                    calls += 1
+                    change()
+                    raise LimitExceededError("test", retry_after_ms=1)
+
+                self.module._api.create_and_send_event_into_room.side_effect = limited
+                self._raise()
+                self.assertEqual(calls, 1)
+                self.assertEqual(self.sent, [])
+
     def test_a_room_nobody_can_change_raises_without_writing(self):
         self.select = AsyncMock(return_value=None)
         with self.assertRaises(RuntimeError):
@@ -289,14 +328,14 @@ class TestJoinAdminsRaisesEachJoinedAdmin(unittest.TestCase):
     def test_a_joined_admin_is_raised(self):
         module = self._module()
         self.assertEqual(asyncio.run(module.join_admins(SPACE, ROOM)), [TEACHER])
-        module._raise_to_invite_level.assert_awaited_once_with(ROOM, TEACHER)
+        module._raise_to_invite_level.assert_awaited_once_with(SPACE, ROOM, TEACHER)
 
     def test_an_admin_already_in_is_raised_too(self):
         # A backfill reaches admins an earlier join left at the default level.
         module = self._module()
         module._join_admin = AsyncMock(return_value=False)
         self.assertEqual(asyncio.run(module.join_admins(SPACE, ROOM)), [])
-        module._raise_to_invite_level.assert_awaited_once_with(ROOM, TEACHER)
+        module._raise_to_invite_level.assert_awaited_once_with(SPACE, ROOM, TEACHER)
 
     def test_a_failed_raise_is_logged_and_keeps_the_join(self):
         module = self._module()
@@ -317,7 +356,7 @@ class TestJoinAdminsRaisesEachJoinedAdmin(unittest.TestCase):
         self.assertEqual(asyncio.run(module.backfill_course(SPACE, rooms)), 0)
         self.assertEqual(
             [c.args for c in module._raise_to_invite_level.await_args_list],
-            [(ROOM, TEACHER), (OTHER, TEACHER)],
+            [(SPACE, ROOM, TEACHER), (SPACE, OTHER, TEACHER)],
         )
 
     def test_a_failed_join_is_not_raised(self):
@@ -562,7 +601,9 @@ class TestOnlyThePushRulesWriterJoins(unittest.TestCase):
                 module.join.assert_awaited_once()
                 self.assertEqual(module.join.await_args.args[1:], (ROOM, TEACHER))
                 module._mute.assert_awaited_once_with(TEACHER, ROOM)
-                module._raise_to_invite_level.assert_awaited_once_with(ROOM, TEACHER)
+                module._raise_to_invite_level.assert_awaited_once_with(
+                    SPACE, ROOM, TEACHER
+                )
 
 
 class TestBackfillRunsOnlyOnThePushRulesWriter(unittest.TestCase):
