@@ -82,6 +82,7 @@ from synapse_pangea_chat.preview_with_code import (
 )
 from synapse_pangea_chat.public_courses import PublicCourses
 from synapse_pangea_chat.public_courses.backfill_l2 import PublicCoursesL2Backfill
+from synapse_pangea_chat.quest_courses import register_quest_courses
 from synapse_pangea_chat.register_email import RegisterEmailRequestToken
 from synapse_pangea_chat.room_code import KnockWithCode, RequestRoomCode
 from synapse_pangea_chat.room_preview import (
@@ -516,6 +517,11 @@ class PangeaChat:
             path="/_synapse/client/pangea/v1/set_course_plan",
             resource=self.set_course_plan_resource,
         )
+
+        # --- Quest Courses ---
+        # Which course spaces and unclaimed courses use each quest, read by
+        # the CMS content review (quest-courses.instructions.md).
+        self.quest_courses = register_quest_courses(api, config, course_claim_store)
 
         # --- Course Member Emails ---
         # Registered only when enabled, so the path does not exist otherwise.
@@ -1239,6 +1245,15 @@ class PangeaChat:
             raise ValueError(
                 'Config "open_session_notice_bot_user_id" must be a Matrix user id'
             )
+        quest_courses_bot_user_id = config.get("quest_courses_bot_user_id")
+        if quest_courses_bot_user_id is not None and (
+            not isinstance(quest_courses_bot_user_id, str)
+            or not quest_courses_bot_user_id.startswith("@")
+            or ":" not in quest_courses_bot_user_id
+        ):
+            raise ValueError(
+                'Config "quest_courses_bot_user_id" must be a Matrix user id'
+            )
         notice_token_secret = config.get("notice_token_secret")
         if notice_token_secret is not None and (
             not isinstance(notice_token_secret, str) or not notice_token_secret.strip()
@@ -1695,6 +1710,7 @@ class PangeaChat:
             notice_missed_message_unsubscribe_enabled=notice_missed_message_unsubscribe_enabled,
             notice_suppress_notice_push_rules=notice_suppress_notice_push_rules,
             open_session_notice_bot_user_id=open_session_notice_bot_user_id,
+            quest_courses_bot_user_id=quest_courses_bot_user_id,
             notice_token_secret=notice_token_secret,
             notice_token_ttl_days=notice_token_ttl_days,
             notice_email_postal_address=notice_email_postal_address,

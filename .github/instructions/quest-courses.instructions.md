@@ -27,7 +27,7 @@ A caller with no cursor, or whose cursor is older than the record Synapse still 
 
 ### Name and members, for spaces the caller holds
 
-Members join and leave without changing the course plan, so a second read takes a batch of room IDs and returns each room's name and number of joined members. The bot is not counted, because it is not a person in the course. A space is live when at least one member other than the bot is joined; the teacher counts.
+Members join and leave without changing the course plan, so a second read takes a batch of room IDs and returns each room's name and number of joined members. It answers only for rooms with a current course plan; any other room comes back as not a course, with no name or count, so the read cannot be used to look up other rooms. The bot is not counted, because it is not a person in the course. A space is live when at least one member other than the bot is joined; the teacher counts.
 
 ### Unclaimed courses, read whole
 

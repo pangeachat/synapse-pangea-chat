@@ -204,6 +204,11 @@ class PangeaChatConfig:
     # scheduled: turning it on is a rollout decision (deploy-note).
     open_session_notice_bot_user_id: Optional[str] = None
 
+    # --- quest_courses config ---
+    # The bot, left out of a course's joined members because it is not a
+    # person in the course. Unset, nobody is left out (logged at startup).
+    quest_courses_bot_user_id: Optional[str] = None
+
     # --- delayed_push config ---
     delayed_push_enabled: bool = False
     delayed_push_delay_ms: int = 60_000
