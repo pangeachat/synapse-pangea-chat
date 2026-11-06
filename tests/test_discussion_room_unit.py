@@ -724,3 +724,26 @@ class TestDirectJoinCheck(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestYoutubeId(unittest.TestCase):
+    """The room image's video id is read only from YouTube's own hosts."""
+
+    def test_youtube_hosts(self) -> None:
+        for url in (
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(discussion_room._youtube_id(url), "dQw4w9WgXcQ")
+
+    def test_lookalike_hosts_are_refused(self) -> None:
+        for url in (
+            "https://evilyoutube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtube.com.example.org/watch?v=dQw4w9WgXcQ",
+        ):
+            with self.subTest(url=url):
+                self.assertIsNone(discussion_room._youtube_id(url))

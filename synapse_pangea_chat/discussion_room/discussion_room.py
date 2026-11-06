@@ -181,7 +181,7 @@ def _youtube_id(url: Any) -> Optional[str]:
     host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
     if host == "youtu.be":
         candidate = parsed.path.lstrip("/").split("/", 1)[0]
-    elif host.endswith("youtube.com"):
+    elif host == "youtube.com" or host.endswith(".youtube.com"):
         parts = parsed.path.strip("/").split("/")
         if parts and parts[0] in ("embed", "shorts", "v") and len(parts) > 1:
             candidate = parts[1]
