@@ -89,10 +89,10 @@ class TestQuestCoursesE2E(BaseSynapseE2ETest):
                 return spaces
 
     def changes_until(
-        self, token: str, since: str, wanted: Dict[str, Optional[str]]
+        self, token: str, since: str, wanted: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Follow changes from ``since`` until each wanted room reports its
-        wanted quest; returns the last cursor and every room seen."""
+        """Follow changes from ``since`` until each wanted room last reported
+        the wanted fields; returns the last cursor and every room seen."""
         seen: Dict[str, Dict[str, Any]] = {}
         cursor = since
         for _ in range(50):
@@ -102,8 +102,8 @@ class TestQuestCoursesE2E(BaseSynapseE2ETest):
                 seen[space["room_id"]] = space
             cursor = page["cursor"]
             if all(
-                room in seen and seen[room]["quest_id"] == quest
-                for room, quest in wanted.items()
+                room in seen and fields.items() <= seen[room].items()
+                for room, fields in wanted.items()
             ):
                 return {"cursor": cursor, "seen": seen}
         self.fail(f"Changes never reached {wanted}; saw {seen}")
@@ -163,7 +163,6 @@ class TestQuestCoursesE2E(BaseSynapseE2ETest):
         checks: List[Tuple[str, str, Any]] = [
             ("GET", "space_changes", None),
             ("GET", "spaces", None),
-            ("POST", "rooms", {"room_ids": []}),
             ("GET", "unclaimed", None),
         ]
         for method, path, body in checks:
@@ -188,7 +187,14 @@ class TestQuestCoursesE2E(BaseSynapseE2ETest):
         chat = self.create_room(teacher, "Chat", None)
         spaces = self.all_spaces(admin)
         self.assertEqual(
-            spaces[private], {"room_id": private, "quest_id": quest + "-a", "l2": "es"}
+            spaces[private],
+            {
+                "room_id": private,
+                "quest_id": quest + "-a",
+                "l2": "es",
+                "name": "Private",
+                "joined_members": 1,
+            },
         )
         self.assertNotIn(chat, spaces)
 
@@ -200,14 +206,18 @@ class TestQuestCoursesE2E(BaseSynapseE2ETest):
         self.put_state(teacher, private, COURSE_PLAN, "other", {"uuid": quest + "-z"})
         legacy = self.create_room(teacher, "Legacy", {"course_plan_id": quest + "-c"})
         followed = self.changes_until(
-            admin, cursor, {private: quest + "-b", legacy: quest + "-c"}
+            admin,
+            cursor,
+            {private: {"quest_id": quest + "-b"}, legacy: {"quest_id": quest + "-c"}},
         )
         self.assertNotIn(chat, followed["seen"])
         self.assertEqual(followed["seen"][legacy]["l2"], None)
 
         # The last local member leaving is how a deleted space arrives.
         self.leave(teacher, private)
-        gone = self.changes_until(admin, followed["cursor"], {private: None})
+        gone = self.changes_until(
+            admin, followed["cursor"], {private: {"quest_id": None}}
+        )
         self.assertIsNone(gone["seen"][private]["l2"])
         self.assertNotIn(private, self.all_spaces(admin))
 
@@ -229,44 +239,34 @@ class TestQuestCoursesE2E(BaseSynapseE2ETest):
         )
         self.assertEqual(other.status_code, 409, other.text)
 
-    async def test_rooms_read_counts_people_and_answers_only_for_courses(self) -> None:
+    async def test_changes_report_names_and_people_but_not_the_bot(self) -> None:
         await self.setup_server()
         bot = await self.bot()
         _, admin = await self.new_user("admin", admin=True)
         student_id, student = await self.new_user("student")
         _, teacher = await self.new_user("teacher")
-        course = self.create_room(
-            teacher, "Spanish trip", {"uuid": f"q-{self.tag}"}, [student_id, BOT_ID]
+        quest = f"q-{self.tag}"
+        course = self.create_room(teacher, "Spanish trip", {"uuid": quest})
+        chat = self.create_room(teacher, "Chat", None, [student_id])
+        empty = self.create_room(bot, "Bot only", {"uuid": quest + "-2"})
+        cursor = self.changes(admin, None)["cursor"]
+        self.assertEqual(self.all_spaces(admin)[empty]["joined_members"], 0)
+
+        # A student joins, then the bot, then the course is renamed; a member
+        # joining a room that is not a course is not reported.
+        self.put_state(
+            teacher, course, "m.room.join_rules", "", {"join_rule": "public"}
         )
         self.join(student, course)
         self.join(bot, course)
-        chat = self.create_room(teacher, "Chat", None)
-        empty = self.create_room(bot, "Bot only", {"uuid": f"q2-{self.tag}"})
-
-        rooms = self.ok(
-            self.call(
-                "POST", QUEST + "rooms", admin, {"room_ids": [course, chat, empty]}
-            )
-        )["rooms"]
-        by_id = {r["room_id"]: r for r in rooms}
-        self.assertEqual(
-            by_id[course],
-            {
-                "room_id": course,
-                "course": True,
-                "name": "Spanish trip",
-                "joined_members": 2,
-            },
-        )
-        self.assertEqual(
-            by_id[chat],
-            {"room_id": chat, "course": False, "name": None, "joined_members": None},
-        )
-        self.assertEqual(by_id[empty]["joined_members"], 0)
-
-        for body in ({"room_ids": "nope"}, {"room_ids": ["!x"] * 501}, {}):
-            r = self.call("POST", QUEST + "rooms", admin, body)
-            self.assertEqual(r.status_code, 400, r.text)
+        self.put_state(teacher, course, "m.room.name", "", {"name": "Madrid trip"})
+        self.join(student, chat)
+        seen = self.changes_until(
+            admin,
+            cursor,
+            {course: {"name": "Madrid trip", "joined_members": 2, "quest_id": quest}},
+        )["seen"]
+        self.assertNotIn(chat, seen)
 
     async def test_unclaimed_lists_waiting_building_and_bot_held_courses(self) -> None:
         await self.setup_server()

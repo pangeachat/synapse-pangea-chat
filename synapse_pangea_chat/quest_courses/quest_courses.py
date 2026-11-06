@@ -3,15 +3,14 @@ quest, for the CMS content review's own copy.
 
 Design: quest-courses.instructions.md.
 
-- ``GET  /_synapse/client/pangea/v1/quest_courses/space_changes?since=``:
-  spaces whose course plan changed after a cursor, or ``resync`` when there
-  is no cursor or it no longer fits.
-- ``GET  /_synapse/client/pangea/v1/quest_courses/spaces?after=``: every
-  course space, by room id, for a start-over.
-- ``POST /_synapse/client/pangea/v1/quest_courses/rooms``: name and joined
-  people for a batch of course rooms.
-- ``GET  /_synapse/client/pangea/v1/quest_courses/unclaimed``: every course
-  no teacher has claimed yet.
+- ``GET /_synapse/client/pangea/v1/quest_courses/space_changes?since=``: each
+  course space whose course plan, name or members changed after a cursor,
+  with its quest, name and joined people; or ``resync`` when there is no
+  cursor or it no longer fits.
+- ``GET /_synapse/client/pangea/v1/quest_courses/spaces?after=``: every course
+  space, the same way, paged by room id, for a start-over.
+- ``GET /_synapse/client/pangea/v1/quest_courses/unclaimed``: every course no
+  teacher has claimed yet.
 
 A space's quest is read with the catalog's own field and state-key
 precedence (``public_courses``), over every room rather than the public
@@ -56,7 +55,6 @@ from synapse_pangea_chat.public_courses.get_public_courses import (
     _PLAN_ID_SQL,
     DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE,
 )
-from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -70,7 +68,6 @@ STUCK_AFTER_MS = 60 * 60 * 1000
 
 DEFAULT_LIMIT = 200
 MAX_LIMIT = 1000
-MAX_ROOM_IDS = 500
 
 
 # --------------------------------------------------------------------------
@@ -118,7 +115,11 @@ def cursor_is_current(
 
 
 class ChangePage(NamedTuple):
+    # Every room with a change in the page, in stream order.
     room_ids: List[str]
+    # The rooms among them whose course plan changed: the only ones reported
+    # when they are not a course (any more), so the caller drops them.
+    plan_room_ids: List[str]
     cursor: int
     caught_up: bool
     # A single stream position with more course-plan changes than one page:
@@ -126,21 +127,39 @@ class ChangePage(NamedTuple):
     read_whole: Optional[int]
 
 
-def page_changes(rows: Sequence[Tuple[int, str]], limit: int, upto: int) -> ChangePage:
-    """One page of changes from up to ``limit + 1`` rows in stream order.
+def page_changes(
+    rows: Sequence[Tuple[int, str, bool]], limit: int, upto: int
+) -> ChangePage:
+    """One page of changes from up to ``limit + 1`` rows in stream order, each
+    ``(stream position, room, whether it changed the course plan)``.
 
     A page never ends in the middle of a stream position: the cursor means
     "everything up to here", so splitting one would skip the rest of it.
     """
     if len(rows) <= limit:
-        return ChangePage(_unique(r for _, r in rows), upto, True, None)
+        return _page(rows, upto, True, None)
     boundary = rows[limit][0]
-    kept = [room for stream_id, room in rows if stream_id < boundary]
+    kept = [row for row in rows if row[0] < boundary]
     if not kept:
-        return ChangePage([], boundary, False, boundary)
+        return ChangePage([], [], boundary, False, boundary)
     # Positions between the last kept change and the boundary hold no
-    # course-plan change, or they would be in ``rows``.
-    return ChangePage(_unique(kept), boundary - 1, False, None)
+    # change of these kinds, or they would be in ``rows``.
+    return _page(kept, boundary - 1, False, None)
+
+
+def _page(
+    rows: Sequence[Tuple[int, str, bool]],
+    cursor: int,
+    caught_up: bool,
+    read_whole: Optional[int],
+) -> ChangePage:
+    return ChangePage(
+        _unique(room for _, room, _ in rows),
+        _unique(room for _, room, plan in rows if plan),
+        cursor,
+        caught_up,
+        read_whole,
+    )
 
 
 def _unique(room_ids: Iterable[str]) -> List[str]:
@@ -274,11 +293,15 @@ class QuestCoursesStore:
         return bool(lost)
 
     async def changes(self, since: int, upto: int, limit: int) -> ChangePage:
+        """Changes to course plans, room names and memberships: the plan says
+        which quest a space uses, and the other two are what the CMS shows of
+        it, so a room nobody touched is never read again."""
         rows = await self._db.execute(
             "quest_courses_changes",
             """
-            SELECT stream_id, room_id FROM current_state_delta_stream
-            WHERE stream_id > ? AND stream_id <= ? AND type = ?
+            SELECT stream_id, room_id, type FROM current_state_delta_stream
+            WHERE stream_id > ? AND stream_id <= ?
+                AND type IN (?, 'm.room.name', 'm.room.member')
             ORDER BY stream_id
             LIMIT ?
             """,
@@ -287,19 +310,44 @@ class QuestCoursesStore:
             self._event_type,
             limit + 1,
         )
-        page = page_changes([(int(s), r) for s, r in rows], limit, upto)
+        page = page_changes(
+            [(int(s), r, t == self._event_type) for s, r, t in rows], limit, upto
+        )
         if page.read_whole is None:
             return page
         whole = await self._db.execute(
             "quest_courses_changes_at",
             """
-            SELECT room_id FROM current_state_delta_stream
-            WHERE stream_id = ? AND type = ?
+            SELECT room_id, type FROM current_state_delta_stream
+            WHERE stream_id = ? AND type IN (?, 'm.room.name', 'm.room.member')
             """,
             page.read_whole,
             self._event_type,
         )
-        return page._replace(room_ids=_unique(r for (r,) in whole))
+        return _page(
+            [(page.read_whole, r, t == self._event_type) for r, t in whole],
+            page.cursor,
+            False,
+            page.read_whole,
+        )
+
+    async def describe(self, room_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """What the CMS shows of each room that is a course now: its quest,
+        language, name and joined people. Other rooms are absent."""
+        plans = await self.plans(room_ids)
+        courses = [r for r in room_ids if r in plans and plans[r].quest_id]
+        names = await self.names(courses)
+        people = await self.joined_people(courses)
+        return {
+            room: {
+                "room_id": room,
+                "quest_id": plans[room].quest_id,
+                "l2": plans[room].l2,
+                "name": names.get(room),
+                "joined_members": people[room],
+            }
+            for room in courses
+        }
 
     async def plans(self, room_ids: Sequence[str]) -> Dict[str, Plan]:
         """The current plan of each room that has one; a room with no plan
@@ -463,11 +511,14 @@ def _arg(request: SynapseRequest, name: str) -> Optional[str]:
     return values[0].decode("utf-8", "replace")
 
 
-def _space(room_id: str, plan: Optional[Plan]) -> Dict[str, Any]:
+def _gone(room_id: str) -> Dict[str, Any]:
+    """A room that is not a course any more: the caller drops it."""
     return {
         "room_id": room_id,
-        "quest_id": plan.quest_id if plan else None,
-        "l2": plan.l2 if plan and plan.quest_id else None,
+        "quest_id": None,
+        "l2": None,
+        "name": None,
+        "joined_members": None,
     }
 
 
@@ -482,14 +533,10 @@ class QuestCoursesResource(Resource):
         self._mode = mode
 
     def render_GET(self, request: SynapseRequest):
-        run_in_background(self._handle, request, "GET")
+        run_in_background(self._handle, request)
         return server.NOT_DONE_YET
 
-    def render_POST(self, request: SynapseRequest):
-        run_in_background(self._handle, request, "POST")
-        return server.NOT_DONE_YET
-
-    async def _handle(self, request: SynapseRequest, method: str) -> None:
+    async def _handle(self, request: SynapseRequest) -> None:
         try:
             requester = await self._auth.get_user_by_req(request)
         # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
@@ -514,12 +561,6 @@ class QuestCoursesResource(Resource):
                     403,
                     {"error": "Forbidden: server admin required"},
                     send_cors=True,
-                )
-                return
-            expected = "POST" if self._mode == "rooms" else "GET"
-            if method != expected:
-                respond_with_json(
-                    request, 405, {"error": "Method not allowed"}, send_cors=True
                 )
                 return
             body = await getattr(self, "_" + self._mode)(request)
@@ -569,10 +610,17 @@ class QuestCoursesResource(Resource):
             return {"resync": True, "cursor": format_cursor(here, written_up_to)}
         upto = min(written_up_to, since + CHANGE_WINDOW)
         page = await self._store.changes(since, upto, limit)
-        plans = await self._store.plans(page.room_ids)
+        described = await self._store.describe(page.room_ids)
+        plan_changed = set(page.plan_room_ids)
+        # A name or membership change in a room that is not a course is not
+        # reported: only rooms whose own plan changed can have stopped being one.
         return {
             "resync": False,
-            "spaces": [_space(room, plans.get(room)) for room in page.room_ids],
+            "spaces": [
+                described[room] if room in described else _gone(room)
+                for room in page.room_ids
+                if room in described or room in plan_changed
+            ],
             "cursor": format_cursor(here, page.cursor),
             "caught_up": page.caught_up and upto == written_up_to,
         }
@@ -581,46 +629,10 @@ class QuestCoursesResource(Resource):
         limit = _limit(request)
         after = _arg(request, "after") or ""
         rows = await self._store.all_spaces(after, limit)
+        described = await self._store.describe([room for room, _ in rows])
         return {
-            "spaces": [_space(room, plan) for room, plan in rows if plan.quest_id],
+            "spaces": [described[room] for room, _ in rows if room in described],
             "next_after": rows[-1][0] if len(rows) == limit else None,
-        }
-
-    async def _rooms(self, request: SynapseRequest) -> Dict[str, Any]:
-        body = await extract_body_json(request)
-        room_ids = body.get("room_ids") if isinstance(body, dict) else None
-        if not isinstance(room_ids, list) or not all(
-            isinstance(r, str) for r in room_ids
-        ):
-            raise _BadRequest("room_ids must be a list of room ids")
-        if len(room_ids) > MAX_ROOM_IDS:
-            raise _BadRequest(f"At most {MAX_ROOM_IDS} room ids per call")
-        room_ids = _unique(room_ids)
-        plans = await self._store.plans(room_ids)
-        # Only a room with a current course plan is answered for, so this read
-        # cannot be used to look up other rooms.
-        courses = [r for r in room_ids if r in plans and plans[r].quest_id]
-        names = await self._store.names(courses)
-        people = await self._store.joined_people(courses)
-        return {
-            "rooms": [
-                (
-                    {
-                        "room_id": room,
-                        "course": True,
-                        "name": names.get(room),
-                        "joined_members": people[room],
-                    }
-                    if room in people
-                    else {
-                        "room_id": room,
-                        "course": False,
-                        "name": None,
-                        "joined_members": None,
-                    }
-                )
-                for room in room_ids
-            ]
         }
 
     async def _unclaimed(self, request: SynapseRequest) -> Dict[str, Any]:
@@ -641,7 +653,7 @@ def register_quest_courses(
         config.course_plan_state_event_type or DEFAULT_REQUIRED_COURSE_STATE_EVENT_TYPE,
         config.quest_courses_bot_user_id,
     )
-    for mode in ("space_changes", "spaces", "rooms", "unclaimed"):
+    for mode in ("space_changes", "spaces", "unclaimed"):
         api.register_web_resource(
             path=PATH + mode, resource=QuestCoursesResource(api, store, mode)
         )

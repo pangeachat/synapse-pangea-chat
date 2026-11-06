@@ -36,24 +36,25 @@ class TestCursor(unittest.TestCase):
 
 class TestPageChanges(unittest.TestCase):
     def test_a_short_page_is_caught_up_to_what_is_written(self) -> None:
-        page = page_changes([(3, "!a"), (7, "!b")], limit=5, upto=90)
-        self.assertEqual(page, ChangePage(["!a", "!b"], 90, True, None))
+        page = page_changes([(3, "!a", True), (7, "!b", False)], limit=5, upto=90)
+        self.assertEqual(page, ChangePage(["!a", "!b"], ["!a"], 90, True, None))
 
     def test_a_full_page_never_splits_one_stream_position(self) -> None:
-        rows = [(3, "!a"), (4, "!b"), (6, "!c"), (6, "!d")]
+        rows = [(3, "!a", False), (4, "!b", True), (6, "!c", True), (6, "!d", False)]
         page = page_changes(rows, limit=3, upto=90)
         # Position 6 has a row past the limit, so all of 6 waits for the next
         # page, and the cursor stops just before it.
-        self.assertEqual(page, ChangePage(["!a", "!b"], 5, False, None))
+        self.assertEqual(page, ChangePage(["!a", "!b"], ["!b"], 5, False, None))
 
     def test_one_position_bigger_than_the_page_is_read_whole(self) -> None:
-        rows = [(6, "!a"), (6, "!b"), (6, "!c")]
+        rows = [(6, "!a", True), (6, "!b", False), (6, "!c", False)]
         page = page_changes(rows, limit=2, upto=90)
-        self.assertEqual(page, ChangePage([], 6, False, 6))
+        self.assertEqual(page, ChangePage([], [], 6, False, 6))
 
     def test_a_room_changed_twice_is_returned_once(self) -> None:
-        page = page_changes([(3, "!a"), (4, "!a")], limit=5, upto=9)
+        page = page_changes([(3, "!a", False), (4, "!a", True)], limit=5, upto=9)
         self.assertEqual(page.room_ids, ["!a"])
+        self.assertEqual(page.plan_room_ids, ["!a"])
 
 
 class TestUnclaimed(unittest.TestCase):

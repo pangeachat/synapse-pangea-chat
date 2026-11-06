@@ -17,17 +17,17 @@ Only a server admin may call these reads, because they read rooms the caller is 
 
 ### Space changes, from a cursor
 
-Knowing which quest each space uses means reading the `pangea.course_plan` state event of every room on the server. That is too slow to run often, so this read returns only the spaces whose course plan changed after the caller’s cursor, each with its current quest and language, and the cursor to send next time. A space’s quest is read with the same field and state-key precedence as public-courses, but for every room, not only those in the public directory, and a plan with no quest ID counts as no quest.
+Knowing which quest each space uses means reading the `pangea.course_plan` state event of every room on the server. That is too slow to run often, so this read returns only the spaces whose course plan, name or members changed after the caller’s cursor, each with its current quest, language, name and number of joined members, and the cursor to send next time. A room nobody touched is not read again, however many courses there are. A space’s quest is read with the same field and state-key precedence as public-courses, but for every room, not only those in the public directory, and a plan with no quest ID counts as no quest.
 
 The changes come from Synapse's own record of changes to room state, the same record its room statistics and user directory follow. The cursor is the point up to which Synapse has finished writing that record, never simply the newest change seen, because on a server with workers changes can finish writing out of order and a change behind the newest one would otherwise be skipped for good. Sending the same cursor again returns the same changes again, so a failed sync just repeats.
 
 A space comes back with no quest when its plan is removed, and also when the last member on this server leaves it, which is how a deleted space arrives, since deleting a space makes everyone leave. Either way the caller drops it. Nobody on this server can rejoin a room the server has left.
 
-A caller with no cursor, or whose cursor is older than the record Synapse still keeps, is told to start over: it takes the current cursor, reads every course space once, and follows changes from then on.
+A caller with no cursor, or whose cursor is older than the record Synapse still keeps, is told to start over: it takes the current cursor, reads every course space once, with the same details, and follows changes from then on. A cursor names the server it came from, and one sent to another server is refused, so a CMS pointed at the wrong Synapse cannot mistake that server's changes for its own.
 
-### Name and members, for spaces the caller holds
+### Name and members
 
-Members join and leave without changing the course plan, so a second read takes a batch of room IDs and returns each room's name and number of joined members. It answers only for rooms with a current course plan; any other room comes back as not a course, with no name or count, so the read cannot be used to look up other rooms. The bot is not counted, because it is not a person in the course. A space is live when at least one member other than the bot is joined; the teacher counts.
+Both reads give each space's name and number of joined members, and only for rooms with a current course plan: a name or membership change in any other room is not reported. The bot is not counted, because it is not a person in the course. A space is live when at least one member other than the bot is joined; the teacher counts.
 
 ### Unclaimed courses, read whole
 
