@@ -30,6 +30,15 @@ Room name, description, avatar, access code, and inviter identity are all read f
 
 The optional `message` field is included in the email as a personal note from the inviter.
 
+## Joining without the link
+
+The server matches invitations to students' accounts by their verified email addresses. The check runs when a user signs in, when a user verifies an email address, and when a teacher sends an invitation to an email address that is linked to an account. For each match, the server invites that account to the course, so a student who signed up without the link can still get in. When the student accepts, the dashboard shows them as joined. 
+
+Each invitation invites an account only once, so a student who declines or leaves is not invited again. Only invitations sent in the last 120 days match, so an account made long after a class ended is not invited into it.
+
+- **A course invite from the server, not a join.** Reason: it works on every installed version of the app, and accepting runs the app's own join, where analytics sharing and the join notices happen. Re-decided by: Will.
+- **Verified addresses only.** Reason: a mistyped address must not pull someone into a stranger's class. Re-decided by: Will.
+
 ## Email
 
 Uses Synapse's built-in email sending (SMTP via Exim → SES). Templates live in [synapse-templates](../../../synapse-templates/) — same deployment pattern as registration/password-reset emails. See [course-invite-by-email.instructions.md](../../../synapse-templates/.github/instructions/course-invite-by-email.instructions.md) for template design.
