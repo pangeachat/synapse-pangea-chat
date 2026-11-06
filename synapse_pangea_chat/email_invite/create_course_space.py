@@ -30,6 +30,7 @@ from synapse.module_api import ModuleApi
 from synapse.types import create_requester
 from twisted.web.resource import Resource
 
+from synapse_pangea_chat.course_trip.slicing import trip_slicer
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
@@ -141,7 +142,10 @@ class CreateCourseSpace(Resource):
         self._claim_store = claim_store
         self._mailer = mailer
         self._course_missions = CourseMissionsReader(
-            api, config.cms_base_url, config.cms_service_api_key
+            api,
+            config.cms_base_url,
+            config.cms_service_api_key,
+            slicer=trip_slicer(api, config),
         )
 
     def render_POST(self, request: SynapseRequest):
