@@ -8,12 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
 from typing import Any
 from uuid import uuid4
 
 from synapse.api.errors import SynapseError
-from synapse.storage.engines import PostgresEngine
 from synapse.util.threepids import canonicalise_email
 
 from synapse_pangea_chat.email_invite.course_claims import admin_code_digest
@@ -45,39 +43,6 @@ SCHEMA = (
         operator_id TEXT NOT NULL)""",
 )
 REPLACED_FIELDS = ("course_plan_id", "title", "description")
-
-
-def _add_claim_started_column(txn: Any) -> None:
-    """Add ``claim_started_at_ms`` to a table created before it existed.
-
-    Nullable, so no row is rewritten; a claim already building when it was
-    added has none and reads as stuck. Not in ``COLUMNS``: only quest-courses
-    reads it. Checked before altering: an ALTER takes the table's exclusive
-    lock even when the column is there, and every process runs this on start.
-    """
-    postgres = isinstance(getattr(txn, "database_engine", None), PostgresEngine)
-    if postgres:
-        txn.execute(
-            "SELECT 1 FROM information_schema.columns"
-            " WHERE table_schema = current_schema()"
-            " AND table_name = 'pangea_course_invitation'"
-            " AND column_name = 'claim_started_at_ms'"
-        )
-        if txn.fetchone() is None:
-            # Two processes starting at once: the second waits on the lock,
-            # then finds the column added.
-            txn.execute(
-                "ALTER TABLE pangea_course_invitation"
-                " ADD COLUMN IF NOT EXISTS claim_started_at_ms BIGINT"
-            )
-        return
-    txn.execute("SELECT name FROM pragma_table_info('pangea_course_invitation')")
-    if "claim_started_at_ms" not in [r[0] for r in txn.fetchall()]:
-        txn.execute(
-            "ALTER TABLE pangea_course_invitation ADD COLUMN claim_started_at_ms BIGINT"
-        )
-
-
 COLUMNS = (
     "invitation_id",
     "status",
@@ -144,7 +109,6 @@ class CourseInvitationStore:
         def create(txn):
             for sql in SCHEMA:
                 txn.execute(sql)
-            _add_claim_started_column(txn)
 
         await self.db.runInteraction("pangea_invitation_schema", create)
         self.ready = True
@@ -263,13 +227,10 @@ class CourseInvitationStore:
         await self.ensure()
 
         def reserve(txn):
-            # When the claim started, so quest-courses can report a build that
-            # never finished as stuck (quest-courses.instructions.md).
             txn.execute(
-                """UPDATE pangea_course_invitation
-                SET status = 'provisioning', claimant = ?, claim_started_at_ms = ?
+                """UPDATE pangea_course_invitation SET status = 'provisioning', claimant = ?
                 WHERE invitation_id = ? AND status = 'prepared' AND claimant IS NULL""",
-                (user, int(time.time() * 1000), invitation_id),
+                (user, invitation_id),
             )
             created = txn.rowcount == 1
             txn.execute(SELECT + "WHERE invitation_id = ?", (invitation_id,))

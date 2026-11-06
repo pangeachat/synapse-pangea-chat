@@ -3,11 +3,9 @@
 import unittest
 
 from synapse_pangea_chat.quest_courses.quest_courses import (
-    STUCK_AFTER_MS,
     ChangePage,
     cursor_is_current,
     format_cursor,
-    is_stuck,
     page_changes,
     parse_cursor,
     unclaimed_invitation,
@@ -58,29 +56,11 @@ class TestPageChanges(unittest.TestCase):
 
 
 class TestUnclaimed(unittest.TestCase):
-    NOW = 10 * STUCK_AFTER_MS
-
-    def test_a_waiting_invitation_is_never_stuck(self) -> None:
-        self.assertFalse(is_stuck("prepared", None, self.NOW))
-
-    def test_a_claim_building_past_the_limit_is_stuck(self) -> None:
-        self.assertFalse(is_stuck("provisioning", self.NOW - STUCK_AFTER_MS, self.NOW))
-        self.assertTrue(
-            is_stuck("provisioning", self.NOW - STUCK_AFTER_MS - 1, self.NOW)
-        )
-
-    def test_a_claim_with_no_start_time_is_stuck(self) -> None:
-        # Started before the start time was recorded.
-        self.assertTrue(is_stuck("provisioning", None, self.NOW))
-
     def test_an_invitation_reports_its_quest_language_and_title(self) -> None:
         course = unclaimed_invitation(
             "inv-1",
             {"course_plan_id": "q1", "target_language": "es", "title": "Trip"},
-            "provisioning",
             5,
-            self.NOW - 1,
-            self.NOW,
         )
         self.assertEqual(
             course,
@@ -92,13 +72,11 @@ class TestUnclaimed(unittest.TestCase):
                 "l2": "es",
                 "title": "Trip",
                 "created_at_ms": 5,
-                "claim_started_at_ms": self.NOW - 1,
-                "stuck": False,
             },
         )
 
     def test_a_malformed_specification_reports_no_quest(self) -> None:
-        course = unclaimed_invitation("inv-2", {}, "prepared", 5, None, self.NOW)
+        course = unclaimed_invitation("inv-2", {}, 5)
         self.assertIsNone(course["quest_id"])
         self.assertIsNone(course["title"])
 

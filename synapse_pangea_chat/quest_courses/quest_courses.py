@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -63,8 +62,6 @@ logger = logging.getLogger("synapse.module.synapse_pangea_chat.quest_courses")
 
 PATH = "/_synapse/client/pangea/v1/quest_courses/"
 
-# A claim building for longer than this has failed (quest-courses doc).
-STUCK_AFTER_MS = 60 * 60 * 1000
 
 DEFAULT_LIMIT = 200
 MAX_LIMIT = 1000
@@ -166,19 +163,6 @@ def _unique(room_ids: Iterable[str]) -> List[str]:
     return list(dict.fromkeys(room_ids))
 
 
-def is_stuck(status: str, claim_started_at_ms: Optional[int], now_ms: int) -> bool:
-    """Whether a claim has been building for longer than a build can take.
-
-    A claim with no start time began before the start was recorded, so it is
-    older than the limit.
-    """
-    if status != "provisioning":
-        return False
-    if claim_started_at_ms is None:
-        return True
-    return now_ms - claim_started_at_ms > STUCK_AFTER_MS
-
-
 def _text(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value != "" else None
 
@@ -186,10 +170,7 @@ def _text(value: Any) -> Optional[str]:
 def unclaimed_invitation(
     invitation_id: str,
     specification: Mapping[str, Any],
-    status: str,
     created_at_ms: int,
-    claim_started_at_ms: Optional[int],
-    now_ms: int,
 ) -> Dict[str, Any]:
     return {
         "kind": "invitation",
@@ -199,8 +180,6 @@ def unclaimed_invitation(
         "l2": _text(specification.get("target_language")),
         "title": _text(specification.get("title")),
         "created_at_ms": created_at_ms,
-        "claim_started_at_ms": claim_started_at_ms,
-        "stuck": is_stuck(status, claim_started_at_ms, now_ms),
     }
 
 
@@ -215,8 +194,6 @@ def unclaimed_room(
         "l2": plan.l2,
         "title": name,
         "created_at_ms": created_at_ms,
-        "claim_started_at_ms": None,
-        "stuck": False,
     }
 
 
@@ -418,28 +395,26 @@ class QuestCoursesStore:
         counts.update({room: int(count) for room, count in rows})
         return counts
 
-    async def unclaimed(self, now_ms: int) -> List[Dict[str, Any]]:
+    async def unclaimed(self) -> List[Dict[str, Any]]:
         # Both tables are made on first use by their own stores.
         await self._claims.invitations.ensure()
         await self._claims._ensure_table()
         invitations = await self._db.execute(
             "quest_courses_unclaimed_invitations",
             """
-            SELECT invitation_id, specification, status, created_at_ms,
-                claim_started_at_ms
+            SELECT invitation_id, specification, created_at_ms
             FROM pangea_course_invitation
             WHERE room_id IS NULL AND status IN ('prepared', 'provisioning')
             ORDER BY created_at_ms, invitation_id
             """,
         )
         courses = []
-        for invitation_id, spec, status, created, started in invitations:
+        # A claim whose build failed part way stays listed here; not
+        # telling it apart is deliberate for now (quest-courses doc, "Not
+        # covered").
+        for invitation_id, spec, created in invitations:
             specification = _specification(invitation_id, spec)
-            courses.append(
-                unclaimed_invitation(
-                    invitation_id, specification, status, created, started, now_ms
-                )
-            )
+            courses.append(unclaimed_invitation(invitation_id, specification, created))
 
         # Older courses were created with their space at once, held by the
         # bot until a teacher claims them.
@@ -636,7 +611,7 @@ class QuestCoursesResource(Resource):
         }
 
     async def _unclaimed(self, request: SynapseRequest) -> Dict[str, Any]:
-        return {"courses": await self._store.unclaimed(int(time.time() * 1000))}
+        return {"courses": await self._store.unclaimed()}
 
 
 def register_quest_courses(

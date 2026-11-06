@@ -300,10 +300,10 @@ class TestQuestCoursesE2E(BaseSynapseE2ETest):
         self.leave(bot, deleted)
         self.unclaimed(admin)  # creates the invitation and claim tables
         with psycopg2.connect(self.database_url) as conn, conn.cursor() as cur:
-            # A claim whose build never finished, and bot-held legacy courses.
+            # A claim still being built, and bot-held legacy courses.
             cur.execute(
                 "UPDATE pangea_course_invitation SET status = 'provisioning',"
-                " claimant = %s, claim_started_at_ms = 1 WHERE invitation_id = %s",
+                " claimant = %s WHERE invitation_id = %s",
                 ("@someone:" + SERVER_NAME, building),
             )
             for room, claimant in ((held, None), (claimed, "@t:x"), (deleted, None)):
@@ -322,9 +322,8 @@ class TestQuestCoursesE2E(BaseSynapseE2ETest):
         self.assertEqual(invitations[waiting]["quest_id"], f"qw-{self.tag}")
         self.assertEqual(invitations[waiting]["l2"], "fr")
         self.assertEqual(invitations[waiting]["title"], "Course waiting")
-        self.assertFalse(invitations[waiting]["stuck"])
-        self.assertIsNone(invitations[waiting]["claim_started_at_ms"])
-        self.assertTrue(invitations[building]["stuck"])
+        # Claimed but not yet built is still unclaimed: no space exists yet.
+        self.assertIn(building, invitations)
         self.assertNotIn(revoked, invitations)
         self.assertEqual(
             rooms[held],
@@ -336,8 +335,6 @@ class TestQuestCoursesE2E(BaseSynapseE2ETest):
                 "l2": "de",
                 "title": "Held course",
                 "created_at_ms": 7,
-                "claim_started_at_ms": None,
-                "stuck": False,
             },
         )
         self.assertNotIn(claimed, rooms)

@@ -36,10 +36,12 @@ An unclaimed course is one of the following:
 - a course invitation with no space made yet that has not been revoked, waiting to be claimed or claimed and still being built; it is unclaimed until its room is recorded, and from then on the space read covers it;
 - an older course created at once with its space, which the bot holds until a teacher claims it.
 
-Additional-instructor invitations are never listed, because their course already exists. The third read returns every unclaimed course with its quest, language, title, when it was made, and, for one still being built, when its claim started. A claim that has been building for more than an hour has failed, and is returned as stuck so the review does not show it as waiting forever. There are few unclaimed courses, so this read has no cursor. A quest replaced on an invitation shows as the new quest on the next read.
+Additional-instructor invitations are never listed, because their course already exists. The third read returns every unclaimed course with its quest, language, title and when it was made. There are few unclaimed courses, so this read has no cursor. A quest replaced on an invitation shows as the new quest on the next read.
 
 While a claimed course is being built, its space can get its course plan a moment before the invitation records the room. For that moment the course can show as both a space and an unclaimed course, or as neither; the next sync corrects it.
 
 ### Not covered
 
 Removing the content of a course plan event by redaction does not appear as a change. Course plans are not redacted in normal use.
+
+A claim whose build failed part way stays listed as unclaimed, because telling it apart would mean recording when each claim starts on the invitation itself. Revisit if failed builds pile up.
