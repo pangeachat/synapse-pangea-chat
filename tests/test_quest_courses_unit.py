@@ -6,6 +6,7 @@ from synapse_pangea_chat.quest_courses.quest_courses import (
     STUCK_AFTER_MS,
     ChangePage,
     cursor_is_current,
+    format_cursor,
     is_stuck,
     page_changes,
     parse_cursor,
@@ -14,10 +15,11 @@ from synapse_pangea_chat.quest_courses.quest_courses import (
 
 
 class TestCursor(unittest.TestCase):
-    def test_parse_accepts_only_non_negative_integers(self) -> None:
-        self.assertEqual(parse_cursor("42"), 42)
-        self.assertEqual(parse_cursor("0"), 0)
-        for bad in (None, "", "-1", "4.2", "abc", "1e3"):
+    def test_a_cursor_names_its_server_and_position(self) -> None:
+        self.assertEqual(format_cursor("pangea.chat", 42), "pangea.chat/42")
+        self.assertEqual(parse_cursor("pangea.chat/42"), ("pangea.chat", 42))
+        self.assertEqual(parse_cursor("host:8448/0"), ("host:8448", 0))
+        for bad in (None, "", "42", "/42", "x/-1", "x/4.2", "x/abc", "x/"):
             self.assertIsNone(parse_cursor(bad), bad)
 
     def test_a_cursor_ahead_of_the_server_starts_over(self) -> None:

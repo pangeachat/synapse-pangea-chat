@@ -218,10 +218,16 @@ class TestQuestCoursesE2E(BaseSynapseE2ETest):
     async def test_a_cursor_that_does_not_fit_starts_over(self) -> None:
         await self.setup_server()
         _, admin = await self.new_user("admin", admin=True)
-        ahead = self.changes(admin, str(10**15))
+        ahead = self.changes(admin, f"{SERVER_NAME}/{10**15}")
         self.assertTrue(ahead["resync"])
+        self.assertTrue(ahead["cursor"].startswith(SERVER_NAME + "/"))
         bad = self.call("GET", QUEST + "space_changes", admin, params={"since": "x"})
         self.assertEqual(bad.status_code, 400, bad.text)
+        # A cursor from another server is refused, not read as a position here.
+        other = self.call(
+            "GET", QUEST + "space_changes", admin, params={"since": "elsewhere.org/5"}
+        )
+        self.assertEqual(other.status_code, 409, other.text)
 
     async def test_rooms_read_counts_people_and_answers_only_for_courses(self) -> None:
         await self.setup_server()

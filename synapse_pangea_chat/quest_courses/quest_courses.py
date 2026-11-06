@@ -78,11 +78,27 @@ MAX_ROOM_IDS = 500
 # --------------------------------------------------------------------------
 
 
-def parse_cursor(value: Optional[str]) -> Optional[int]:
+# Stream positions read per call at most. Course-plan changes are rare and no
+# index covers the change type, so a call after a long gap would otherwise
+# scan every change since; capped, each call is bounded and the caller
+# continues from where it stopped.
+CHANGE_WINDOW = 100_000
+
+
+def format_cursor(server_name: str, position: int) -> str:
+    """A cursor names its server, so one sent to another server is refused
+    rather than read as a position there. Server names have no ``/``."""
+    return f"{server_name}/{position}"
+
+
+def parse_cursor(value: Optional[str]) -> Optional[Tuple[str, int]]:
     """A cursor as sent back by a caller, or None when it is not one."""
-    if value is None or not value.isdigit():
+    if value is None or "/" not in value:
         return None
-    return int(value)
+    server, _, position = value.rpartition("/")
+    if not server or not position.isdigit():
+        return None
+    return server, int(position)
 
 
 def cursor_is_current(
@@ -196,14 +212,18 @@ class Plan(NamedTuple):
 
 
 def _plans_sql(where: str) -> str:
-    """One row per room: its own (empty) state key first, else the lowest."""
+    """One row per room: its own (empty) state key first, else the lowest,
+    the catalog's precedence. The empty key sorts before every other, so the
+    order is plain ``(room_id, state_key)``: the primary key's own order with
+    the type fixed, which lets a paged read stop at its LIMIT instead of
+    sorting every row first."""
     return f"""
         SELECT DISTINCT ON (cse.room_id)
             cse.room_id, {_PLAN_ID_SQL} AS plan_id, {_L2_SQL} AS l2
         FROM current_state_events cse
         INNER JOIN event_json ej ON ej.event_id = cse.event_id
         WHERE cse.type = ? AND {where}
-        ORDER BY cse.room_id, (cse.state_key <> '') ASC, cse.state_key ASC
+        ORDER BY cse.room_id, cse.state_key
     """
 
 
@@ -296,14 +316,13 @@ class QuestCoursesStore:
         return {room: Plan(plan_id, l2) for room, plan_id, l2 in rows}
 
     async def all_spaces(self, after: str, limit: int) -> List[Tuple[str, Plan]]:
+        """Up to ``limit`` rooms with a course-plan event after ``after``, some
+        of them with no quest. The page is limited on rooms read, not on
+        courses found, so it stops where it should; the caller drops the rooms
+        with no quest and continues from the last room read."""
         rows = await self._db.execute(
             "quest_courses_all_spaces",
-            f"""
-            SELECT room_id, plan_id, l2 FROM ({_plans_sql("cse.room_id > ?")}) p
-            WHERE plan_id IS NOT NULL
-            ORDER BY room_id
-            LIMIT ?
-            """,
+            _plans_sql("cse.room_id > ?") + " LIMIT ?",
             self._event_type,
             after,
             limit,
@@ -423,6 +442,10 @@ class _BadRequest(Exception):
     pass
 
 
+class _WrongServer(Exception):
+    pass
+
+
 def _limit(request: SynapseRequest) -> int:
     raw = _arg(request, "limit")
     if raw is None:
@@ -504,6 +527,15 @@ class QuestCoursesResource(Resource):
         # silent-ok: the caller's malformed request, answered 400 with the reason
         except _BadRequest as e:
             respond_with_json(request, 400, {"error": str(e)}, send_cors=True)
+        # silent-ok: a cursor from another server, refused 409 with the reason
+        except _WrongServer as e:
+            logger.warning("quest_courses: %s", e)
+            respond_with_json(
+                request,
+                409,
+                {"error": str(e), "errcode": "ORG.PANGEA.WRONG_SERVER"},
+                send_cors=True,
+            )
         except Exception:
             logger.exception("quest_courses: %s read failed", self._mode)
             respond_with_json(
@@ -514,11 +546,17 @@ class QuestCoursesResource(Resource):
         raw = _arg(request, "since")
         limit = _limit(request)
         written_up_to = self._store.written_up_to()
+        here = self._api.server_name
         if raw is None:
-            return {"resync": True, "cursor": str(written_up_to)}
-        since = parse_cursor(raw)
-        if since is None:
+            return {"resync": True, "cursor": format_cursor(here, written_up_to)}
+        parsed = parse_cursor(raw)
+        if parsed is None:
             raise _BadRequest("since must be a cursor this endpoint returned")
+        server, since = parsed
+        if server != here:
+            raise _WrongServer(
+                f"since is a cursor from {server}, not from this server ({here})"
+            )
         lost = since <= written_up_to and await self._store.state_lost_before(since)
         if not cursor_is_current(since, written_up_to, lost):
             logger.warning(
@@ -528,14 +566,15 @@ class QuestCoursesResource(Resource):
                 written_up_to,
                 lost,
             )
-            return {"resync": True, "cursor": str(written_up_to)}
-        page = await self._store.changes(since, written_up_to, limit)
+            return {"resync": True, "cursor": format_cursor(here, written_up_to)}
+        upto = min(written_up_to, since + CHANGE_WINDOW)
+        page = await self._store.changes(since, upto, limit)
         plans = await self._store.plans(page.room_ids)
         return {
             "resync": False,
             "spaces": [_space(room, plans.get(room)) for room in page.room_ids],
-            "cursor": str(page.cursor),
-            "caught_up": page.caught_up,
+            "cursor": format_cursor(here, page.cursor),
+            "caught_up": page.caught_up and upto == written_up_to,
         }
 
     async def _spaces(self, request: SynapseRequest) -> Dict[str, Any]:
@@ -543,7 +582,7 @@ class QuestCoursesResource(Resource):
         after = _arg(request, "after") or ""
         rows = await self._store.all_spaces(after, limit)
         return {
-            "spaces": [_space(room, plan) for room, plan in rows],
+            "spaces": [_space(room, plan) for room, plan in rows if plan.quest_id],
             "next_after": rows[-1][0] if len(rows) == limit else None,
         }
 

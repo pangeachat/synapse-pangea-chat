@@ -52,16 +52,24 @@ def _add_claim_started_column(txn: Any) -> None:
 
     Nullable, so no row is rewritten; a claim already building when it was
     added has none and reads as stuck. Not in ``COLUMNS``: only quest-courses
-    reads it.
+    reads it. Checked before altering: an ALTER takes the table's exclusive
+    lock even when the column is there, and every process runs this on start.
     """
     postgres = isinstance(getattr(txn, "database_engine", None), PostgresEngine)
     if postgres:
-        # Every process runs this on first use; one that loses the race waits
-        # on the table lock and then finds the column added.
         txn.execute(
-            "ALTER TABLE pangea_course_invitation"
-            " ADD COLUMN IF NOT EXISTS claim_started_at_ms BIGINT"
+            "SELECT 1 FROM information_schema.columns"
+            " WHERE table_schema = current_schema()"
+            " AND table_name = 'pangea_course_invitation'"
+            " AND column_name = 'claim_started_at_ms'"
         )
+        if txn.fetchone() is None:
+            # Two processes starting at once: the second waits on the lock,
+            # then finds the column added.
+            txn.execute(
+                "ALTER TABLE pangea_course_invitation"
+                " ADD COLUMN IF NOT EXISTS claim_started_at_ms BIGINT"
+            )
         return
     txn.execute("SELECT name FROM pragma_table_info('pangea_course_invitation')")
     if "claim_started_at_ms" not in [r[0] for r in txn.fetchall()]:
