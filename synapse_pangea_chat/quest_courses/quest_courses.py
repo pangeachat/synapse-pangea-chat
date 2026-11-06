@@ -501,6 +501,7 @@ class QuestCoursesResource(Resource):
                 return
             body = await getattr(self, "_" + self._mode)(request)
             respond_with_json(request, 200, body, send_cors=True)
+        # silent-ok: the caller's malformed request, answered 400 with the reason
         except _BadRequest as e:
             respond_with_json(request, 400, {"error": str(e)}, send_cors=True)
         except Exception:
