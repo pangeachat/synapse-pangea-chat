@@ -217,7 +217,7 @@ class TestCourseMissionsReader(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import patch
 
         patcher = patch(
-            "synapse_pangea_chat.email_invite.course_missions.read_body_with_max_size",
+            "synapse_pangea_chat.cms_http.read_body_with_max_size",
             _read_body,
         )
         patcher.start()

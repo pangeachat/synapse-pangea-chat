@@ -12,6 +12,7 @@ from synapse_pangea_chat.blocked_join_gate.is_blocked_by_room_admin import (
     is_blocked_by_room_admin,
 )
 from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
+from synapse_pangea_chat.cms_http import canonical_activity_where
 
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.notice_delivery.eligibility"
@@ -364,8 +365,7 @@ class NoticeEligibility:
                 "?"
                 + urlencode(
                     {
-                        "where[res.plan.activity_id][equals]": plan["activity_id"],
-                        "where[req.source_request_hash][exists]": "false",
+                        **canonical_activity_where(plan["activity_id"]),
                         "limit": 2,
                         "depth": 0,
                     }

@@ -79,7 +79,8 @@ class PangeaChatConfig:
     user_activity_requests_per_burst: int = 10
     user_activity_burst_duration_seconds: int = 60
     # Bot user ID used by the notification_cooldown_ms filter to identify bot DM rooms.
-    # Required when using the notification_cooldown_ms query param.
+    # Required when using the notification_cooldown_ms query param. Also the
+    # discussion rooms' facilitator bot (discussion-room.instructions.md).
     user_activity_notification_bot_user_id: Optional[str] = None
     # How often the kept activity table is brought up to date (seconds); 0 turns the loop off, leaving
     # the refresh route. refresh_on_read rebuilds the table on every read: for a small server only.
@@ -99,6 +100,13 @@ class PangeaChatConfig:
     export_user_data_output_dir: str = "/tmp/pangea-export-user-data"
     cms_base_url: str = ""
     cms_service_api_key: str = ""
+
+    # --- discussion_room config ---
+    # Students a discussion room takes before the next student gets a new room.
+    discussion_room_capacity: int = 12
+    # The facilitator bot is user_activity_notification_bot_user_id (above),
+    # shared with the user-activity filter: it creates every discussion room
+    # and is the only writer of its seats. Unset, the endpoint answers 503.
 
     # --- limit_user_directory config ---
     limit_user_directory_public_attribute_search_path: Optional[str] = None
