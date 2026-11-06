@@ -270,12 +270,10 @@ class DiscussionRoom(Resource):
     async def _handle(self, request: SynapseRequest, *, preview: bool) -> None:
         try:
             status, body = 200, await self._answer(request, preview)
-        # silent-ok: the caller's own error, or the endpoint unconfigured
-        # (logged at startup), answered with its status
+        # silent-ok: the caller's own error, or the endpoint unconfigured (logged at startup), answered with its status
         except _Refused as e:
             status, body = e.status, e.body
-        # silent-ok: answered 404, a caller asking for an activity that is not
-        # one of this course's discussions
+        # silent-ok: answered 404, a caller asking for an activity that is not one of this course's discussions
         except DiscussionNotFound:
             status, body = 404, {"error": "Not a discussion of this course"}
         # silent-ok: answered 429, the room still refusing joins after every
