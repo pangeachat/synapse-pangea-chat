@@ -5,7 +5,7 @@ description: "Discussion rooms on the homeserver: which room a student is placed
 
 # Discussion Rooms — Synapse Module
 
-The homeserver places each student in a room for one of their course's discussions, writes their seat, and ends or reopens it when they tap "I'm done" or "Wait, I'm not done". The start page asks it where Join would place them. Product rules live in the org [discussions doc](../../../.github/.github/instructions/discussions.instructions.md).
+The homeserver places each student in a room for one of their course's discussions, writes their seat, and ends or reopens it when they tap "I'm done" or "Wait, I'm not done". The start page asks it where Join would place them. Product rules live in the org [activities doc, Mode: Discussion](../../../.github/.github/instructions/activities.instructions.md#mode-discussion).
 
 ## Which rooms are a discussion's
 

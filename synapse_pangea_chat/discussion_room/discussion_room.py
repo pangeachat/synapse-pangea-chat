@@ -13,7 +13,7 @@ The server is the only writer of a discussion room's seats, under one lock
 per discussion, so two requests never overfill a room or drop a seat.
 
 Design: discussion-room.instructions.md; product rules: org
-discussions.instructions.md.
+activities.instructions.md, "Mode: Discussion".
 """
 
 from __future__ import annotations
