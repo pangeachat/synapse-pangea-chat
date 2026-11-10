@@ -319,7 +319,12 @@
         "items": {
           "type": "string"
         },
-        "description": "Every rejected safety incident of the batch that carries a string incident_id, echoed exactly as sent (the answer is ASCII-escaped JSON). The ingest keeps the id, the reason and the refused updated_ms, never the record. The module parks each and re-sends it on start and daily; a reject closes only when an accept of that id at or after the refused updated_ms lands. Every other incident of the batch is accepted. A record with no string id is never named and keeps the Safety page's freshness off. Always present; empty when none."
+        "description": "Ids of the batch's rejected safety incidents that the ingest can name: every rejected record with a string incident_id up to 512 characters as ASCII-escaped JSON, echoed exactly as sent (the answer is ASCII-escaped JSON). The ingest keeps the id, the reason and the refused updated_ms, never the record. The module parks each named id and re-sends it on start and daily; a reject closes only when an accept of that id at or after the refused updated_ms lands. Always present; empty when none."
+      },
+      "safety_unnamed": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Rejected safety records of this batch the ingest cannot name in safety_rejected (no string incident_id, or one longer than 512 escaped characters). When above 0 the module parks EVERY incident it sent in this batch (a re-send is harmless: the upsert is idempotent). These stay open and keep the Safety page's freshness off. Always present; 0 when none."
       }
     }
   },
@@ -537,6 +542,7 @@
   "safety_response_example": {
     "delivered_through": 812360,
     "rejected": 0,
-    "safety_rejected": []
+    "safety_rejected": [],
+    "safety_unnamed": 0
   }
 }

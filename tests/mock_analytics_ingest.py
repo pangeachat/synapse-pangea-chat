@@ -81,6 +81,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "delivered_through": body["delivered_through"],
                     "rejected": 0,
                     "safety_rejected": [i for i in sent if i in refused],
+                    "safety_unnamed": 0,
                 },
             )
         else:

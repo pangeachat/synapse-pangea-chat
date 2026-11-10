@@ -265,6 +265,8 @@ class Ingest:
         self.on_post: Any = None
         #: Incident ids the ingest refuses, as the real one names a reject.
         self.reject_safety: Set[str] = set()
+        #: Rejects the ingest cannot name (no usable incident_id).
+        self.unnamed_safety = 0
 
     async def __call__(self, body: dict) -> Any:
         self.bodies.append(json.loads(json.dumps(body)))
@@ -279,6 +281,7 @@ class Ingest:
             "delivered_through": body["delivered_through"],
             "rejected": 0,
             "safety_rejected": [i for i in sent if i in self.reject_safety],
+            "safety_unnamed": self.unnamed_safety,
         }
 
 
@@ -1123,20 +1126,43 @@ class TestWire(unittest.TestCase):
         )
 
     def test_check_safety_ack(self) -> None:
+        both = {"safety_rejected": ["a", "z"], "safety_unnamed": 0}
+        # Named rejects park; ids the batch did not carry are ignored.
+        self.assertEqual(check_safety_ack(both, ["a", "b"]), {"a"})
+        # An unnamed reject could be any of them: every sent incident parks.
         self.assertEqual(
-            check_safety_ack({"safety_rejected": ["a", "z"]}, ["a", "b"]), {"a"}
+            check_safety_ack({"safety_rejected": [], "safety_unnamed": 1}, ["a", "b"]),
+            {"a", "b"},
         )
         # No incidents sent: an ingest that names none is fine.
         self.assertEqual(check_safety_ack({"delivered_through": 1}, []), set())
         bad: List[Any] = [
             {"delivered_through": 1},  # incidents sent, none accounted for
-            {"safety_rejected": "a"},
-            {"safety_rejected": [1]},
+            {"safety_rejected": []},  # safety_unnamed missing
+            {"safety_unnamed": 0},  # safety_rejected missing
+            {"safety_rejected": "a", "safety_unnamed": 0},
+            {"safety_rejected": [1], "safety_unnamed": 0},
+            {"safety_rejected": [], "safety_unnamed": -1},
+            {"safety_rejected": [], "safety_unnamed": True},
+            {"safety_rejected": [], "safety_unnamed": "0"},
             None,
         ]
         for answer in bad:
-            with self.assertRaises(BadAck):
+            with self.assertRaises(BadAck, msg=answer):
                 check_safety_ack(answer, ["a"])
+        # A present but malformed field is refused even with nothing sent.
+        with self.assertRaises(BadAck):
+            check_safety_ack({"safety_rejected": [], "safety_unnamed": -1}, [])
+
+    def test_a_non_ascii_id_is_echoed_back_exactly(self) -> None:
+        """The answer is ASCII-escaped JSON; the parsed id is the one sent."""
+        sent = "report:\u00e9t\u00e9-\U0001f600"
+        answer = json.loads(
+            json.dumps(
+                {"safety_rejected": [sent], "safety_unnamed": 0}, ensure_ascii=True
+            )
+        )
+        self.assertEqual(check_safety_ack(answer, [sent]), {sent})
 
 
 class TestConfig(unittest.TestCase):
@@ -1821,6 +1847,54 @@ class TestSafetyPush(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mod:$bad", _sent_incidents(ingest.bodies[-1]))
         self.assertEqual(store.outbox_row("mod:$bad"), (2, False, False))
         self.assertEqual(store.safety_watermark, 9_000)
+
+    async def test_an_unnamed_reject_parks_the_whole_batch(self) -> None:
+        store, ingest, _clock, fwd = await self._started()
+        await store.incidents.insert(_safety_incident("mod:$a", updated_ms=6_000))
+        await store.incidents.insert(_safety_incident("mod:$b", updated_ms=7_000))
+        ingest.unnamed_safety = 1
+        await fwd.step()
+        self.assertEqual(store.outbox_row("mod:$a"), (1, False, True))
+        self.assertEqual(store.outbox_row("mod:$b"), (1, False, True))
+        self.assertIsNone(store.safety_watermark, "a parked incident moved it")
+        ingest.unnamed_safety = 0
+        await fwd.daily_scan()
+        await fwd.step()
+        self.assertEqual(store.outbox_row("mod:$a"), (2, False, False))
+        self.assertEqual(store.outbox_row("mod:$b"), (2, False, False))
+        self.assertEqual(store.safety_watermark, 7_000)
+
+    async def test_a_parked_incident_is_resent_as_it_is_now(self) -> None:
+        """A reject closes on adapi only when an accept at or after the refused
+        updated_ms lands, so a re-send carries the CURRENT row."""
+        store, ingest, _clock, fwd = await self._started()
+        await store.incidents.insert(_safety_incident(updated_ms=6_000))
+        ingest.reject_safety = {"mod:$dm"}
+        await fwd.step()
+        self.assertEqual(store.outbox_row("mod:$dm"), (1, False, True))
+        # Changed while parked: the write itself re-marks it, current row.
+        store.safety_hs.clock.advance(10_000)
+        await store.incidents.upsert_verdict(
+            _safety_incident(action="redacted", top_score=0.95)
+        )
+        ingest.reject_safety = set()
+        await fwd.step()
+        (record,) = ingest.bodies[-1]["safety_incidents"]
+        current = await store.incidents.get("mod:$dm")
+        assert current is not None
+        self.assertEqual(record["updated_ms"], current.updated_ms)
+        self.assertGreater(record["updated_ms"], 6_000)
+        self.assertEqual(record["action"], "redacted")
+        self.assertEqual(store.outbox_row("mod:$dm"), (2, False, False))
+
+    async def test_an_ack_missing_safety_unnamed_moves_nothing(self) -> None:
+        store, ingest, _clock, fwd = await self._started()
+        await store.incidents.insert(_safety_incident())
+        ingest.answer = {"delivered_through": 0, "rejected": 0, "safety_rejected": []}
+        with self.assertRaises(DeliveryError) as raised:
+            await fwd.step()
+        self.assertEqual(raised.exception.reason, "bad_ack")
+        self.assertEqual(store.outbox_row("mod:$dm"), (1, True, False))
 
     async def test_twenty_per_batch_and_backlog_until_the_last(self) -> None:
         self.assertEqual(SAFETY_BATCH_MAX, 20)  # the spec's bound on one POST

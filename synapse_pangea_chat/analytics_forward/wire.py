@@ -160,22 +160,35 @@ def check_ack(body: Any, delivered_through: int) -> int:
 
 
 def check_safety_ack(body: Any, sent: Iterable[str]) -> Set[str]:
-    """The ids among ``sent`` the ingest set aside as rejects.
+    """The ids among ``sent`` to park: every one the ingest named in
+    ``safety_rejected`` (echoed exactly as sent), or EVERY sent one when it
+    counted a reject it could not name (``safety_unnamed`` > 0); a re-send is a
+    no-op at the ingest. Every other sent incident is stored.
 
-    Every other sent incident is stored. A batch that carried incidents must
-    be answered with ``safety_rejected``: an answer without it cannot say they
-    were stored, so it is no acknowledgement (``BadAck``) and the batch is sent
-    again. Ids the batch did not carry are ignored.
+    A batch that carried incidents must be answered with both fields: an
+    answer without either cannot say what was stored, so it is no
+    acknowledgement (``BadAck``) and the batch is sent again. A field that is
+    present but malformed is refused whatever was sent. Ids the batch did not
+    carry are ignored.
     """
     sent_ids = set(sent)
     if not isinstance(body, dict):
         raise BadAck("acknowledgement is not a JSON object")
     named = body.get("safety_rejected")
-    if named is None:
-        if sent_ids:
-            raise BadAck("acknowledgement does not list safety_rejected")
-        return set()
-    if not isinstance(named, list) or not all(isinstance(i, str) for i in named):
+    unnamed = body.get("safety_unnamed")
+    if named is not None and (
+        not isinstance(named, list) or not all(isinstance(i, str) for i in named)
+    ):
         raise BadAck("acknowledgement has an invalid safety_rejected list")
+    if unnamed is not None and (
+        isinstance(unnamed, bool) or not isinstance(unnamed, int) or unnamed < 0
+    ):
+        raise BadAck("acknowledgement has an invalid safety_unnamed count")
+    if named is None or unnamed is None:
+        if sent_ids:
+            raise BadAck("acknowledgement does not account for the safety incidents")
+        return set()
+    if unnamed > 0:
+        return sent_ids
     rejected: List[str] = [i for i in named if i in sent_ids]
     return set(rejected)
