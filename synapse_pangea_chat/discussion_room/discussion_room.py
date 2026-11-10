@@ -1043,6 +1043,13 @@ class DiscussionRoom(Resource):
                 )
             )
         except Exception as e:
+            # Logged here because the failure is raised (and captured) only if
+            # this request makes a room; placing in an existing room drops it.
+            logger.warning(
+                "discussion_room: choreo version check for %s failed: %s",
+                activity_id,
+                type(e).__name__,
+            )
             return _Version(
                 None, ChoreoUnavailable(f"{activity_id}: {type(e).__name__}: {e}")
             )
