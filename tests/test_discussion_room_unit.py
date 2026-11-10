@@ -17,7 +17,12 @@ from synapse.module_api import NOT_SPAM
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.discussion_room import discussion_room, join_check
 from synapse_pangea_chat.discussion_room.discussion_room import (
+    ERRCODE_REMOVED,
+    ERRCODE_UNKNOWN_VERSION,
+    ChoreoUnavailable,
     DiscussionRoom,
+    _Refused,
+    _Version,
     _version_id,
 )
 from synapse_pangea_chat.discussion_room.join_check import DiscussionJoinCheck
@@ -34,6 +39,7 @@ from synapse_pangea_chat.discussion_room.rooms import (
     ended_seat,
     find_seat,
     is_discussion_plan,
+    is_removal,
     mirrored_admin_levels,
     pick_room,
     room_view,
@@ -62,8 +68,20 @@ def _student(n: int) -> str:
     return f"@student{n}:example.com"
 
 
-def _member(user_id: str, membership: str, sender: Optional[str] = None) -> Any:
-    return SimpleNamespace(content={"membership": membership}, sender=sender or user_id)
+def _member(
+    user_id: str,
+    membership: str,
+    sender: Optional[str] = None,
+    prev: Optional[str] = None,
+) -> Any:
+    """A member event; ``prev`` is the membership it replaced, as the store
+    gives it with ``prev_content``."""
+    return SimpleNamespace(
+        content={"membership": membership},
+        sender=sender or user_id,
+        state_key=user_id,
+        unsigned={"prev_content": {"membership": prev}} if prev else {},
+    )
 
 
 def _roles(*user_ids: str, **seat_fields: Any) -> Any:
@@ -254,8 +272,8 @@ class TestSeats(unittest.TestCase):
 
 
 class TestRoomCount(unittest.TestCase):
-    def _view(self, members: Dict[str, Any], roles: Any) -> Any:
-        return room_view(ROOM, _state(members, roles), BOT, 0)
+    def _view(self, members: Dict[str, Any], roles: Any, joining=frozenset()) -> Any:
+        return room_view(ROOM, _state(members, roles), BOT, 0, joining)
 
     def test_joined_seat_holders_count(self):
         students = [_student(n) for n in range(3)]
@@ -267,10 +285,23 @@ class TestRoomCount(unittest.TestCase):
         roles = _roles(_student(1), finished_at="T", archived_at="T")
         self.assertEqual(self._view(members, roles).students, 1)
 
-    def test_a_seat_with_no_membership_yet_counts(self):
+    def test_a_seat_counts_while_its_join_is_under_way(self):
         # Written ahead of a join still on its way.
         members = {BOT: _member(BOT, "join")}
-        self.assertEqual(self._view(members, _roles(_student(1))).students, 1)
+        view = self._view(members, _roles(_student(1)), {_student(1)})
+        self.assertEqual(view.students, 1)
+        self.assertEqual(view.stale, frozenset())
+        self.assertTrue(view.is_own(_student(1)))
+
+    def test_a_seat_whose_join_never_landed_is_stale(self):
+        # Its join failed without the seat being taken back, or a restart cut
+        # it off: it neither counts nor makes the room the holder's own.
+        members = {BOT: _member(BOT, "join"), _student(2): _member(_student(2), "join")}
+        view = self._view(members, _roles(_student(1), _student(2)))
+        self.assertEqual(view.students, 1)
+        self.assertEqual(view.stale, {_student(1)})
+        self.assertFalse(view.is_own(_student(1)))
+        self.assertFalse(view.refuses(_student(1)))
 
     def test_admins_reading_along_and_the_bot_do_not_count(self):
         members = {u: _member(u, "join") for u in (TEACHER, BOT, _student(1))}
@@ -304,7 +335,9 @@ class TestRoomCount(unittest.TestCase):
             kicked: _member(kicked, "leave", sender=TEACHER),
             banned: _member(banned, "ban", sender=TEACHER),
         }
-        view = self._view(members, _roles(joined, pending, left, kicked, banned))
+        view = self._view(
+            members, _roles(joined, pending, left, kicked, banned), {pending}
+        )
         for user_id in (joined, pending, left):
             self.assertTrue(view.is_own(user_id), user_id)
             self.assertFalse(view.refuses(user_id), user_id)
@@ -313,6 +346,34 @@ class TestRoomCount(unittest.TestCase):
             self.assertTrue(view.refuses(user_id), user_id)
         self.assertFalse(view.is_own(stranger))
         self.assertFalse(view.refuses(stranger))
+
+    def test_an_unban_is_not_a_removal(self):
+        unbanned, kicked = _student(1), _student(2)
+        members = {
+            BOT: _member(BOT, "join"),
+            unbanned: _member(unbanned, "leave", sender=TEACHER, prev="ban"),
+            kicked: _member(kicked, "leave", sender=TEACHER, prev="join"),
+        }
+        view = self._view(members, _roles(unbanned, kicked))
+        self.assertFalse(view.refuses(unbanned))
+        self.assertTrue(view.is_own(unbanned))
+        self.assertTrue(view.refuses(kicked))
+        self.assertFalse(is_removal(members[unbanned]))
+        self.assertTrue(is_removal(members[kicked]))
+        self.assertTrue(is_removal(_member(kicked, "ban", sender=TEACHER)))
+        self.assertFalse(is_removal(_member(kicked, "leave")))
+
+    def test_a_withdrawn_invite_or_rejected_knock_is_not_a_removal(self):
+        withdrawn, rejected = _student(1), _student(2)
+        members = {
+            BOT: _member(BOT, "join"),
+            withdrawn: _member(withdrawn, "leave", sender=TEACHER, prev="invite"),
+            rejected: _member(rejected, "leave", sender=TEACHER, prev="knock"),
+        }
+        view = self._view(members, None)
+        for user_id in (withdrawn, rejected):
+            self.assertFalse(view.refuses(user_id), user_id)
+            self.assertFalse(is_removal(members[user_id]), user_id)
 
     def test_a_room_whose_bot_is_gone_reads_as_such(self):
         members = {BOT: _member(BOT, "leave", sender=TEACHER)}
@@ -344,13 +405,22 @@ class TestPowerLevels(unittest.TestCase):
         self.assertEqual(
             (levels["kick"], levels["ban"], levels["redact"]), (50, 50, 50)
         )
+        # Only the bot invites: Join is the only way in.
+        self.assertEqual(levels["invite"], 100)
         self.assertEqual(levels["events"]["m.room.power_levels"], 100)
         # Only the server writes the plan and the seats.
         self.assertEqual(levels["events"][ACTIVITY_PLAN_EVENT], 100)
         self.assertEqual(levels["events"][ACTIVITY_ROLES_EVENT], 100)
         self.assertEqual(levels["events"][ACTIVITY_SUMMARY_EVENT], 0)
         self.assertEqual(levels["events_default"], 0)
-        self.assertEqual(levels["state_default"], 50)
+        # Every room setting not listed (name, join rules, encryption, history
+        # visibility, tombstone) is the bot's alone.
+        self.assertEqual(levels["state_default"], 100)
+        for event_type, level in levels["events"].items():
+            if level < 100:
+                self.assertIn(
+                    event_type, (ACTIVITY_SUMMARY_EVENT, "m.room.pinned_events")
+                )
 
     def test_the_bot_stays_at_100_even_if_listed_as_an_admin(self):
         levels = discussion_power_levels(BOT, frozenset({BOT, TEACHER}))
@@ -518,6 +588,7 @@ class TestFetchPlan(unittest.IsolatedAsyncioTestCase):
             cms_base_url="http://cms.test",
             cms_service_api_key="key",
             user_activity_notification_bot_user_id=BOT,
+            discussion_room_choreo_base_url="http://choreo.test",
         )
         self.resource = DiscussionRoom(self.api, config)
         self.quest_lo_ids = AsyncMock(return_value=["lo-1", "lo-2"])
@@ -652,6 +723,237 @@ class TestFetchPlan(unittest.IsolatedAsyncioTestCase):
             await self.resource._fetch_plan(COURSE, ACTIVITY)
 
 
+# --- Placement and the preview ---------------------------------------------------
+
+SIGNATURE = "0123456789abcdef0123456789abcdef"
+
+
+def _course_room_state(
+    *, space: bool = True, plan: bool = True, membership: str = "join"
+) -> Dict[Tuple[str, str], Any]:
+    state: Dict[Tuple[str, str], Any] = {
+        ("m.room.create", ""): SimpleNamespace(
+            content={"type": "m.space"} if space else {}, sender=TEACHER
+        ),
+        ("m.room.member", _student(1)): _member(_student(1), membership),
+    }
+    if plan:
+        state[("pangea.course_plan", "")] = SimpleNamespace(
+            content={"uuid": "quest-1"}, sender=TEACHER
+        )
+    return state
+
+
+class TestPlacement(unittest.IsolatedAsyncioTestCase):
+    """Which room a tap reaches, decided from the rooms' state: refusals of a
+    removed caller, an own room without its bot, stale seats, the course
+    check and the version check."""
+
+    def setUp(self) -> None:
+        self.api = Mock()
+        config = PangeaChatConfig(
+            cms_base_url="http://cms.test",
+            cms_service_api_key="key",
+            user_activity_notification_bot_user_id=BOT,
+            discussion_room_choreo_base_url="http://choreo.test",
+        )
+        self.resource = DiscussionRoom(self.api, config)
+        self.resource._clock = Mock(time=Mock(return_value=1000.0))
+        self.views: List[Any] = []
+        for name, mock in (
+            ("_room_views", AsyncMock(side_effect=lambda *_: self.views)),
+            ("_create", AsyncMock(return_value="!new:example.com")),
+            ("_send_roles", AsyncMock()),
+        ):
+            patcher = patch.object(self.resource, name, mock)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.room_state: Dict[Tuple[str, str], Any] = {}
+        self.api.get_room_state = AsyncMock(
+            side_effect=lambda *_a, **_k: self.room_state
+        )
+
+    def _view(
+        self,
+        room_id: str,
+        members: Dict[str, Any],
+        roles: Any,
+        bot: bool = True,
+        joining=frozenset(),
+    ) -> Any:
+        members = dict(members)
+        members[BOT] = _member(BOT, "join" if bot else "leave", sender=TEACHER)
+        return room_view(room_id, _state(members, roles), BOT, 0, joining)
+
+    async def _reserve(self, version: Optional[_Version] = None) -> Any:
+        return await self.resource._reserve(
+            _student(1),
+            COURSE,
+            ACTIVITY,
+            _discussion_plan(),
+            version or _Version(SIGNATURE),
+            None,
+            BOT,
+            set(),
+        )
+
+    async def test_a_removed_or_banned_caller_is_refused_by_join_and_preview(self):
+        other = "!other:example.com"
+        for member in (
+            _member(_student(1), "leave", sender=TEACHER, prev="join"),
+            _member(_student(1), "ban", sender=TEACHER),
+        ):
+            with self.subTest(membership=member.content["membership"]):
+                self.resource._views.clear()
+                self.views = [
+                    self._view(ROOM, {_student(1): member}, _roles(_student(1))),
+                    self._view(other, {}, _roles()),
+                ]
+                with self.assertRaises(_Refused) as join:
+                    await self._reserve()
+                with self.assertRaises(_Refused) as preview:
+                    await self.resource._preview(_student(1), COURSE, ACTIVITY, BOT)
+                for refused in (join.exception, preview.exception):
+                    self.assertEqual(refused.status, 403)
+                    self.assertEqual(refused.body["errcode"], ERRCODE_REMOVED)
+                self.resource._create.assert_not_awaited()
+                self.resource._send_roles.assert_not_awaited()
+
+    async def test_an_unbanned_caller_returns_to_their_own_room(self):
+        member = _member(_student(1), "leave", sender=TEACHER, prev="ban")
+        self.views = [self._view(ROOM, {_student(1): member}, _roles(_student(1)))]
+        self.room_state = {(ACTIVITY_ROLES_EVENT, ""): _roles(_student(1))}
+        reservation = await self._reserve()
+        self.assertEqual((reservation.room_id, reservation.own), (ROOM, True))
+
+    async def test_an_own_room_without_its_bot_is_skipped(self):
+        member = _member(_student(1), "join")
+        self.views = [
+            self._view(ROOM, {_student(1): member}, _roles(_student(1)), bot=False)
+        ]
+        with self.assertLogs(discussion_room.logger, "WARNING"):
+            reservation = await self._reserve()
+        self.assertEqual(reservation.room_id, "!new:example.com")
+        self.assertTrue(reservation.created)
+        with self.assertLogs(discussion_room.logger, "WARNING"):
+            preview = await self.resource._preview(_student(1), COURSE, ACTIVITY, BOT)
+        self.assertEqual(preview, {"room_id": None, "students": 0, "joined": False})
+
+    async def test_a_seat_write_drops_the_rooms_stale_seats(self):
+        stale, joined = _student(7), _student(8)
+        roles = _roles(stale, joined)
+        self.views = [
+            self._view(ROOM, {joined: _member(joined, "join")}, roles),
+        ]
+        self.room_state = {(ACTIVITY_ROLES_EVENT, ""): roles}
+        reservation = await self._reserve()
+        self.assertEqual((reservation.room_id, reservation.wrote_seat), (ROOM, True))
+        content = self.resource._send_roles.await_args.args[1]
+        self.assertEqual(seat_holders(content), {joined, _student(1)})
+
+    async def test_a_stale_holder_who_joined_since_keeps_their_seat(self):
+        stale = _student(7)
+        roles = _roles(stale)
+        self.views = [self._view(ROOM, {}, roles)]
+        self.room_state = {
+            (ACTIVITY_ROLES_EVENT, ""): roles,
+            ("m.room.member", stale): _member(stale, "join"),
+        }
+        await self._reserve()
+        content = self.resource._send_roles.await_args.args[1]
+        self.assertEqual(seat_holders(content), {stale, _student(1)})
+
+    async def test_an_unknown_version_refuses_only_a_new_room(self):
+        refusal = _Refused(409, "changed", ERRCODE_UNKNOWN_VERSION)
+        with self.assertRaises(_Refused):
+            await self._reserve(_Version(None, refusal))
+        self.resource._create.assert_not_awaited()
+        # A room with space takes the caller whatever the version.
+        self.views = [self._view(ROOM, {}, _roles())]
+        self.room_state = {(ACTIVITY_ROLES_EVENT, ""): _roles()}
+        reservation = await self._reserve(_Version(None, refusal))
+        self.assertEqual(reservation.room_id, ROOM)
+
+    async def test_the_course_must_be_a_course_space_the_caller_is_in(self):
+        self.room_state = _course_room_state()
+        await self.resource._check_course(_student(1), COURSE)
+        for state, error in (
+            (_course_room_state(membership="leave"), "Not a member of this course"),
+            ({}, "Not a member of this course"),
+            (_course_room_state(space=False), "Not a course"),
+            (_course_room_state(plan=False), "Not a course"),
+        ):
+            with self.subTest(error=error, keys=sorted(state)):
+                self.room_state = state
+                with self.assertRaises(_Refused) as refused:
+                    await self.resource._check_course(_student(1), COURSE)
+                self.assertEqual(refused.exception.status, 403)
+                self.assertEqual(refused.exception.body["error"], error)
+
+    async def test_the_version_is_checked_with_choreo(self):
+        knows = AsyncMock(return_value=True)
+        with patch.object(self.resource, "_choreo_knows", knows):
+            self.assertEqual(
+                await self.resource._checked_version(SIGNATURE, ACTIVITY, "tok"),
+                _Version(SIGNATURE),
+            )
+            # Known versions are reused for a while.
+            await self.resource._checked_version(SIGNATURE, ACTIVITY, "tok")
+            knows.assert_awaited_once_with(ACTIVITY, SIGNATURE, "tok")
+            knows.return_value = False
+            unknown = await self.resource._checked_version("f" * 32, ACTIVITY, "tok")
+        self.assertIsNone(unknown.pin)
+        assert isinstance(unknown.refusal, _Refused)
+        self.assertEqual(unknown.refusal.status, 409)
+        self.assertEqual(unknown.refusal.body["errcode"], ERRCODE_UNKNOWN_VERSION)
+
+    async def test_a_choreo_that_cannot_be_asked_refuses_a_new_room_as_502(self):
+        down = AsyncMock(side_effect=ConnectionError("down"))
+        with patch.object(self.resource, "_choreo_knows", down):
+            version = await self.resource._checked_version(SIGNATURE, ACTIVITY, "t")
+        self.assertIsInstance(version.refusal, ChoreoUnavailable)
+
+    async def test_no_version_or_no_choreo_follows_the_latest(self):
+        with self.assertLogs(discussion_room.logger, "WARNING"):
+            self.assertEqual(
+                await self.resource._checked_version(None, ACTIVITY, "t"),
+                _Version(None),
+            )
+        self.resource._choreo_base_url = None
+        with self.assertLogs(discussion_room.logger, "WARNING"):
+            self.assertEqual(
+                await self.resource._checked_version(SIGNATURE, ACTIVITY, "t"),
+                _Version(None),
+            )
+
+    async def test_choreo_knows_a_version_it_serves_as_itself(self):
+        for body, known in (
+            ({"version_id": SIGNATURE, "used_fallback_version": False}, True),
+            ({"version_id": "f" * 32, "used_fallback_version": True}, False),
+            ({"version_id": SIGNATURE, "used_fallback_version": True}, False),
+        ):
+            cms = AsyncMock(return_value=(200, json.dumps(body).encode()))
+            with self.subTest(body=body), patch.object(
+                discussion_room, "cms_request", cms
+            ):
+                self.assertEqual(
+                    await self.resource._choreo_knows(ACTIVITY, SIGNATURE, "tok"),
+                    known,
+                )
+                url = cms.await_args.args[2]
+                self.assertEqual(
+                    url,
+                    f"http://choreo.test/choreo/v2/activity/{ACTIVITY}"
+                    f"?version={SIGNATURE}",
+                )
+                headers = cms.await_args.args[3]
+                self.assertEqual(headers.getRawHeaders("Authorization"), ["Bearer tok"])
+        cms = AsyncMock(return_value=(503, b"{}"))
+        with patch.object(discussion_room, "cms_request", cms):
+            with self.assertRaises(ValueError):
+                await self.resource._choreo_knows(ACTIVITY, SIGNATURE, "tok")
+
+
 # --- Direct joins ------------------------------------------------------------------
 
 
@@ -665,9 +967,12 @@ class TestDirectJoinCheck(unittest.IsolatedAsyncioTestCase):
             AsyncMock(side_effect=lambda *_: self.create)
         )
         self.room_state: Dict[Tuple[str, str], Any] = {}
-        self.api.get_room_state = AsyncMock(
-            side_effect=lambda *_a, **_k: self.room_state
+        self.read_state = AsyncMock(side_effect=lambda *_a, **_k: self.room_state)
+        state_patcher = patch.object(
+            join_check, "room_state_with_prev", self.read_state
         )
+        state_patcher.start()
+        self.addCleanup(state_patcher.stop)
         self.check = DiscussionJoinCheck(self.api, BOT)
         self.admins = AsyncMock(return_value=frozenset({TEACHER}))
         patcher = patch.object(join_check, "course_admins", self.admins)
@@ -692,6 +997,15 @@ class TestDirectJoinCheck(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(await self._may_join(_student(1)), Codes.FORBIDDEN)
 
+    async def test_an_unbanned_seat_holder_may_come_back(self):
+        self.room_state = {
+            (ACTIVITY_ROLES_EVENT, ""): _roles(_student(1)),
+            ("m.room.member", _student(1)): _member(
+                _student(1), "leave", TEACHER, prev="ban"
+            ),
+        }
+        self.assertEqual(await self._may_join(_student(1)), NOT_SPAM)
+
     async def test_a_seat_holder_who_left_on_their_own_may_come_back(self):
         self.room_state = {
             (ACTIVITY_ROLES_EVENT, ""): _roles(_student(1)),
@@ -714,7 +1028,7 @@ class TestDirectJoinCheck(unittest.IsolatedAsyncioTestCase):
         self.admins.assert_not_awaited()
 
     async def test_a_broken_check_fails_open_and_is_captured(self):
-        self.api.get_room_state.side_effect = RuntimeError("state unavailable")
+        self.read_state.side_effect = RuntimeError("state unavailable")
         with patch.object(join_check, "capture_exception") as capture, self.assertLogs(
             join_check.logger, "ERROR"
         ):

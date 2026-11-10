@@ -9,9 +9,20 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
+from typing import (
+    AbstractSet,
+    Any,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 
 from synapse.api.constants import EventTypes
+from synapse.types.state import StateFilter
 
 from synapse_pangea_chat.activity_session_previews.get_activity_session_previews import (
     has_valid_via,
@@ -39,7 +50,8 @@ DISCUSSION_ROLE_ID = "participant"
 DISCUSSION_ROLE_NAME = "Participant"
 
 BOT_POWER_LEVEL = 100
-# Course admins moderate students but cannot touch the bot or power levels.
+# Course admins moderate students but cannot touch the bot, the power levels
+# or the room's settings.
 ADMIN_POWER_LEVEL = 50
 
 MEMBERSHIP_JOIN = "join"
@@ -207,9 +219,51 @@ def utc_timestamp(seconds: float) -> str:
 @dataclass(frozen=True)
 class Member:
     membership: str
-    # A leave sent by someone else: the member was removed, not gone of their
-    # own accord.
+    # Removed by someone else: a leave they did not send that is not an
+    # unban or a withdrawn invite (see ``is_kick``).
     kicked: bool
+
+
+def is_kick(membership: Any, sender: Any, state_key: Any, prev_membership: Any) -> bool:
+    """A leave sent by someone else. A leave over a ban is an unban, and one
+    over an invite or a knock withdraws or rejects it: none of them removed
+    anyone from the room."""
+    return (
+        membership == MEMBERSHIP_LEAVE
+        and sender != state_key
+        and prev_membership not in (MEMBERSHIP_BAN, "invite", "knock")
+    )
+
+
+def prev_membership(event: Any) -> Any:
+    """The membership a member event replaced, from ``prev_content``, which
+    the store adds only when asked (``room_state_with_prev``)."""
+    # Synapse's ``unsigned`` is its own type, with ``get`` but not a Mapping.
+    unsigned: Any = getattr(event, "unsigned", None)
+    prev = unsigned.get("prev_content") if hasattr(unsigned, "get") else None
+    return prev.get("membership") if isinstance(prev, Mapping) else None
+
+
+def is_removal(event: Any) -> bool:
+    """A member event that removed its user: a ban, or a kick."""
+    membership = event.content.get("membership")
+    return membership == MEMBERSHIP_BAN or is_kick(
+        membership, event.sender, event.state_key, prev_membership(event)
+    )
+
+
+async def room_state_with_prev(
+    hs: Any, room_id: str, event_filter: Iterable[Tuple[str, Optional[str]]]
+) -> Dict[Tuple[str, str], Any]:
+    """The room's current state, as ``ModuleApi.get_room_state`` reads it,
+    with each event's ``prev_content``, so an unban can be told from a kick."""
+    state_ids = await hs.get_storage_controllers().state.get_current_state_ids(
+        room_id, StateFilter.from_types(event_filter)
+    )
+    events = await hs.get_datastores().main.get_events(
+        state_ids.values(), get_prev_content=True
+    )
+    return {key: events[eid] for key, eid in state_ids.items() if eid in events}
 
 
 @dataclass(frozen=True)
@@ -220,13 +274,16 @@ class RoomView:
     members: Mapping[str, Member]
     holders: FrozenSet[str]
     bot_user_id: str
+    # Seat holders whose join this process is making now: their seat was
+    # written ahead of a join that has not landed yet.
+    joining: FrozenSet[str] = frozenset()
 
     def joined(self, user_id: str) -> bool:
         member = self.members.get(user_id)
         return member is not None and member.membership == MEMBERSHIP_JOIN
 
     def refuses(self, user_id: str) -> bool:
-        """Banned or removed here: placement never puts them back."""
+        """Banned or removed here: placement never puts them anywhere."""
         member = self.members.get(user_id)
         return member is not None and (
             member.membership == MEMBERSHIP_BAN
@@ -234,28 +291,46 @@ class RoomView:
         )
 
     def is_own(self, user_id: str) -> bool:
-        """The caller's room: they hold a seat and are joined, not yet joined,
-        or left it of their own accord, so their next tap takes them back."""
+        """The caller's room: they hold a seat and are joined, on their way
+        in, or left it of their own accord, so their next tap takes them back.
+        A seat that was written for a join that never landed is not theirs."""
         if user_id not in self.holders:
             return False
         member = self.members.get(user_id)
-        return (
-            member is None
-            or member.membership == MEMBERSHIP_JOIN
-            or (member.membership == MEMBERSHIP_LEAVE and not member.kicked)
+        if member is None:
+            return user_id in self.joining
+        return member.membership == MEMBERSHIP_JOIN or (
+            member.membership == MEMBERSHIP_LEAVE and not member.kicked
+        )
+
+    @property
+    def stale(self) -> FrozenSet[str]:
+        """Seats written for a join that never landed and is no longer being
+        made: a join that failed without its seat being taken back, or one
+        cut off by a restart. They don't count, and the next seat write in
+        the room drops them."""
+        return frozenset(
+            user_id
+            for user_id in self.holders
+            if user_id != self.bot_user_id
+            and user_id not in self.members
+            and user_id not in self.joining
         )
 
     @property
     def students(self) -> int:
         """Seats that count toward capacity: held by a joined member, or
         written ahead of a join still on its way. A seat whose holder left,
-        was removed or was banned does not count; neither does a member
-        without a seat, such as a course admin reading along."""
+        was removed or was banned does not count, nor a stale one; neither
+        does a member without a seat, such as a course admin reading along."""
         return sum(
             1
             for user_id in self.holders
             if user_id != self.bot_user_id
-            and (user_id not in self.members or self.joined(user_id))
+            and (
+                self.joined(user_id)
+                or (user_id not in self.members and user_id in self.joining)
+            )
         )
 
 
@@ -264,6 +339,7 @@ def room_view(
     state: Mapping[Tuple[str, str], Any],
     bot_user_id: str,
     created_ts: int,
+    joining: AbstractSet[str] = frozenset(),
 ) -> RoomView:
     members: Dict[str, Member] = {}
     for (event_type, state_key), event in state.items():
@@ -274,7 +350,7 @@ def room_view(
             continue
         members[state_key] = Member(
             membership=membership,
-            kicked=membership == MEMBERSHIP_LEAVE and event.sender != state_key,
+            kicked=is_kick(membership, event.sender, state_key, prev_membership(event)),
         )
     roles = state.get((ACTIVITY_ROLES_EVENT, ""))
     bot = members.get(bot_user_id)
@@ -285,6 +361,7 @@ def room_view(
         members=members,
         holders=seat_holders(roles.content if roles is not None else None),
         bot_user_id=bot_user_id,
+        joining=frozenset(joining),
     )
 
 
@@ -305,14 +382,17 @@ def pick_room(student_counts: List[Tuple[str, int]], capacity: int) -> Optional[
 def discussion_power_levels(bot_user_id: str, admins: FrozenSet[str]) -> Dict[str, Any]:
     """The bot at 100 and never lowered, so no one can remove it; course
     admins at 50, enough to remove or ban a student; students at 0. Only the
-    server (as the bot) writes the plan and the seats. Differs from the
-    client's roleplay ``RoomDefaults`` on purpose: no student owns the room."""
+    bot invites, so Join is the only way in, and only the bot changes the
+    room's settings (every state event not listed below): admins moderate
+    students, nothing more. Only the server (as the bot) writes the plan and
+    the seats. Differs from the client's roleplay ``RoomDefaults`` on
+    purpose: no student owns the room."""
     users: Dict[str, int] = {admin: ADMIN_POWER_LEVEL for admin in admins}
     users[bot_user_id] = BOT_POWER_LEVEL
     return {
         "ban": 50,
         "kick": 50,
-        "invite": 50,
+        "invite": 100,
         "redact": 50,
         "events": {
             ACTIVITY_PLAN_EVENT: 100,
@@ -323,7 +403,7 @@ def discussion_power_levels(bot_user_id: str, admins: FrozenSet[str]) -> Dict[st
             "m.room.pinned_events": 50,
         },
         "events_default": 0,
-        "state_default": 50,
+        "state_default": 100,
         "users_default": 0,
         "notifications": {"room": 50},
         "users": users,

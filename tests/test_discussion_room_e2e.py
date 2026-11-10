@@ -24,6 +24,10 @@ BOT_PASSWORD = "bot-pw"
 QUEST = "quest-1"
 MISSION = "lo-1"
 VERSION = "0123456789abcdef0123456789abcdef"
+# The activity's latest version; VERSION is an older one choreo still keeps.
+LATEST = "fedcba9876543210fedcba9876543210"
+UNKNOWN_VERSION = "ffffffffffffffffffffffffffffffff"
+REMOVED = "PANGEA_DISCUSSION_REMOVED"
 ROLES = "pangea.activity_roles"
 PLAN = "pangea.activity_plan"
 
@@ -89,6 +93,8 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
             module_config={
                 "cms_base_url": self.cms_url,
                 "user_activity_notification_bot_user_id": BOT,
+                # The mock serves choreo's activity read too.
+                "discussion_room_choreo_base_url": self.cms_url,
             }
         )
         await self._ensure_bot()
@@ -110,6 +116,19 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
         if response.status_code != 200:
             await self.register_user("", "", BOT_LOCALPART, BOT_PASSWORD, admin=False)
 
+    def _bot_token(self) -> str:
+        response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/login",
+            json={
+                "type": "m.login.password",
+                "user": BOT_LOCALPART,
+                "password": BOT_PASSWORD,
+            },
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["access_token"]
+
     def _headers(self, token: str) -> Dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
 
@@ -119,9 +138,12 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
     def _room_url(self, room_id: str, rest: str) -> str:
         return self._url(f"/_matrix/client/v3/rooms/{quote(room_id, safe='')}/{rest}")
 
-    def _discussion(self, name: str, **row_fields: Any) -> str:
+    def _discussion(
+        self, name: str, plan: Optional[Dict[str, Any]] = None, **row_fields: Any
+    ) -> str:
         activity_id = f"{name}-{self.tag}"
-        self.cms.seed_activity(_row(_plan(activity_id), **row_fields))
+        self.cms.seed_activity(_row(_plan(activity_id, **(plan or {})), **row_fields))
+        self.cms.seed_activity_versions(activity_id, [LATEST, VERSION])
         return activity_id
 
     def _course(
@@ -211,13 +233,18 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
-    def _preview(self, token: str, course_id: str, activity_id: str) -> Dict[str, Any]:
-        response = requests.get(
+    def _preview_response(
+        self, token: str, course_id: str, activity_id: str
+    ) -> requests.Response:
+        return requests.get(
             self._url(ENDPOINT),
             headers=self._headers(token),
             params={"course_id": course_id, "activity_id": activity_id},
             timeout=30,
         )
+
+    def _preview(self, token: str, course_id: str, activity_id: str) -> Dict[str, Any]:
+        response = self._preview_response(token, course_id, activity_id)
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
@@ -400,6 +427,7 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
         self.assertEqual(power["users"], {BOT: 100, teacher_id: 50})
         self.assertEqual(power["events"][PLAN], 100)
         self.assertEqual(power["events"][ROLES], 100)
+        self.assertEqual((power["invite"], power["state_default"]), (100, 100))
         self.assertEqual(
             state[("m.room.join_rules", "")]["content"],
             {
@@ -422,6 +450,44 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
                 self._room_url(room_id, f"state/{event_type}/"),
                 headers=self._headers(s1_token),
                 json={},
+                timeout=10,
+            )
+            self.assertEqual(response.status_code, 403, event_type)
+
+        # The teacher is joined to read along and left at 50: raising her to
+        # the room's invite level would give her the bot's power.
+        await self._eventually(
+            lambda: self._membership(room_id, teacher_id) == "join",
+            "the teacher joined to read along",
+        )
+        time.sleep(1)
+        self.assertEqual(
+            self._state(room_id)[("m.room.power_levels", "")]["content"]["users"],
+            {BOT: 100, teacher_id: 50},
+        )
+
+        # The teacher can't invite anyone (Join is the only way in) or change
+        # the room's settings.
+        invite = requests.post(
+            self._room_url(room_id, "invite"),
+            headers=self._headers(teacher_token),
+            json={"user_id": s2},
+            timeout=10,
+        )
+        self.assertEqual(invite.status_code, 403, invite.text)
+        for event_type, content in (
+            ("m.room.name", {"name": "Renamed"}),
+            ("m.room.topic", {"topic": "Something else"}),
+            ("m.room.avatar", {"url": "mxc://example.org/x"}),
+            ("m.room.join_rules", {"join_rule": "public"}),
+            ("m.room.history_visibility", {"history_visibility": "joined"}),
+            ("m.room.encryption", {"algorithm": "m.megolm.v1.aes-sha2"}),
+            ("m.room.tombstone", {"body": "moved", "replacement_room": course_id}),
+        ):
+            response = requests.put(
+                self._room_url(room_id, f"state/{event_type}/"),
+                headers=self._headers(teacher_token),
+                json=content,
                 timeout=10,
             )
             self.assertEqual(response.status_code, 403, event_type)
@@ -449,6 +515,51 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
             timeout=10,
         )
         self.assertEqual(kick_student.status_code, 200, kick_student.text)
+
+    async def test_a_new_room_pins_only_a_version_choreo_knows(self):
+        _, course_id, activity_id = await self._setting()
+        (_, s1_token), (_, s2_token), (_, s3_token) = await self._students(course_id, 3)
+        # Not a version of the activity: no room is made on it.
+        unknown = self._place(s1_token, course_id, activity_id, UNKNOWN_VERSION)
+        self.assertEqual(unknown.status_code, 409, unknown.text)
+        self.assertEqual(unknown.json()["errcode"], "PANGEA_DISCUSSION_UNKNOWN_VERSION")
+        self.assertIsNone(self._preview(s1_token, course_id, activity_id)["room_id"])
+
+        # An older version choreo still keeps is pinned as it is.
+        room_id = self._placed(s2_token, course_id, activity_id)["room_id"]
+        plan = self._state(room_id)[(PLAN, "")]["content"]
+        self.assertEqual(plan["version_id"], VERSION)
+
+        # A room with space takes a student whatever version they send.
+        placed = self._place(s3_token, course_id, activity_id, UNKNOWN_VERSION)
+        self.assertEqual(placed.status_code, 200, placed.text)
+        self.assertEqual(placed.json(), {"room_id": room_id, "created": False})
+
+    async def test_the_room_image_never_holds_a_join(self):
+        _, course_id, _ = await self._setting()
+        (_, s1_token), (_, s2_token) = await self._students(course_id, 2)
+        fast, slow = f"img-fast-{self.tag}", f"img-slow-{self.tag}"
+        self.cms.seed_media(fast, {"sizes": {"medium": {"url": "/media/fast.jpg"}}})
+        self.cms.seed_media(
+            slow, {"sizes": {"medium": {"url": "/media/slow.jpg"}}}, delay_seconds=8
+        )
+        with_image = self._discussion(
+            "fast", plan={"media": [{"blockType": "image", "upload_id": fast}]}
+        )
+        slow_image = self._discussion(
+            "slow", plan={"media": [{"blockType": "image", "upload_id": slow}]}
+        )
+
+        room_id = self._placed(s1_token, course_id, with_image)["room_id"]
+        avatar = self._state(room_id)[("m.room.avatar", "")]["content"]["url"]
+        self.assertEqual(avatar, f"{self.cms_url}/media/fast.jpg")
+
+        # An image the CMS is slow to give is given up on: the room is made
+        # without one, well before the CMS answers.
+        started = time.monotonic()
+        room_id = self._placed(s2_token, course_id, slow_image)["room_id"]
+        self.assertLess(time.monotonic() - started, 7)
+        self.assertNotIn(("m.room.avatar", ""), self._state(room_id))
 
     async def test_a_room_with_no_version_follows_the_latest(self):
         _, course_id, activity_id = await self._setting()
@@ -507,6 +618,21 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
         self.assertEqual(
             self._place(outsider_token, course_id, activity_id).status_code, 403
         )
+        # A room the caller is in that is not a course: their own room, or a
+        # space without a course plan.
+        own_room = await self.create_private_room(member_token)
+        response = requests.post(
+            self._url("/_matrix/client/v3/createRoom"),
+            headers=self._headers(member_token),
+            json={"creation_content": {"type": "m.space"}},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        bare_space = response.json()["room_id"]
+        for room in (own_room, bare_space):
+            refused = self._place(member_token, room, activity_id)
+            self.assertEqual(refused.status_code, 403, room)
+            self.assertEqual(refused.json()["error"], "Not a course")
         unauthenticated = requests.post(
             self._url(ENDPOINT),
             json={"course_id": course_id, "activity_id": activity_id},
@@ -590,7 +716,7 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
             response = self._place(token, course_id, activity)
             self.assertEqual(response.status_code, 502, activity)
 
-    async def test_removed_and_banned_students_are_placed_elsewhere(self):
+    async def test_removed_and_banned_students_are_refused(self):
         (_, teacher_token), course_id, activity_id = await self._setting()
         (kicked, kicked_token), (banned, banned_token) = await self._students(
             course_id, 2
@@ -610,17 +736,87 @@ class TestDiscussionRoomE2E(BaseSynapseE2ETest):
             )
             self.assertEqual(response.status_code, 200, response.text)
 
-        # Never put back where they were removed, by placement or directly.
+        # Never put back where they were removed, and never placed elsewhere:
+        # Join and the preview both refuse them, so the app can say so.
+        for token in (kicked_token, banned_token):
+            for response in (
+                self._place(token, course_id, activity_id),
+                self._preview_response(token, course_id, activity_id),
+            ):
+                self.assertEqual(response.status_code, 403, response.text)
+                self.assertEqual(response.json()["errcode"], REMOVED)
         self.assertEqual(self._join(kicked_token, room_id).status_code, 403)
-        elsewhere = self._placed(kicked_token, course_id, activity_id)
-        self.assertNotEqual(elsewhere["room_id"], room_id)
-        self.assertTrue(elsewhere["created"])
-        self.assertEqual(
-            self._placed(banned_token, course_id, activity_id)["room_id"],
-            elsewhere["room_id"],
-        )
         self.assertEqual(self._membership(room_id, kicked), "leave")
         self.assertEqual(self._membership(room_id, banned), "ban")
+
+    async def test_an_unbanned_student_returns_to_their_own_room(self):
+        (_, teacher_token), course_id, activity_id = await self._setting()
+        ((student, token),) = await self._students(course_id, 1)
+        room_id = self._placed(token, course_id, activity_id)["room_id"]
+        self.assertEqual(self._join(teacher_token, room_id).status_code, 200)
+        for action in ("ban", "unban"):
+            response = requests.post(
+                self._room_url(room_id, action),
+                headers=self._headers(teacher_token),
+                json={"user_id": student},
+                timeout=10,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        self.assertEqual(
+            self._preview(token, course_id, activity_id)["room_id"], room_id
+        )
+        self.assertEqual(
+            self._placed(token, course_id, activity_id),
+            {"room_id": room_id, "created": False},
+        )
+        self.assertEqual(self._membership(room_id, student), "join")
+
+    async def test_an_own_room_that_lost_its_bot_is_skipped(self):
+        _, course_id, activity_id = await self._setting()
+        ((_, token),) = await self._students(course_id, 1)
+        room_id = self._placed(token, course_id, activity_id)["room_id"]
+        # Only a manual change takes the bot out: here the bot leaves.
+        left = requests.post(
+            self._room_url(room_id, "leave"),
+            headers=self._headers(self._bot_token()),
+            json={},
+            timeout=10,
+        )
+        self.assertEqual(left.status_code, 200, left.text)
+
+        self.assertIsNone(self._preview(token, course_id, activity_id)["room_id"])
+        placed = self._placed(token, course_id, activity_id)
+        self.assertTrue(placed["created"])
+        self.assertNotEqual(placed["room_id"], room_id)
+
+    async def test_a_seat_whose_join_never_landed_is_repaired(self):
+        _, course_id, activity_id = await self._setting()
+        (s1, s1_token), (_, s2_token) = await self._students(course_id, 2)
+        room_id = self._placed(s1_token, course_id, activity_id)["room_id"]
+        # A seat for a join that never happened, as a crash between the seat
+        # and the join would leave one.
+        ghost = f"@ghost-{self.tag}:{SERVER_NAME}"
+        roles = self._state(room_id)[(ROLES, "")]["content"]
+        roles["roles"][f"participant:{ghost}"] = {
+            "id": "participant",
+            "user_id": ghost,
+            "role": "Participant",
+        }
+        written = requests.put(
+            self._room_url(room_id, f"state/{ROLES}/"),
+            headers=self._headers(self._bot_token()),
+            json=roles,
+            timeout=10,
+        )
+        self.assertEqual(written.status_code, 200, written.text)
+
+        self.assertEqual(self._preview(s2_token, course_id, activity_id)["students"], 1)
+        self.assertEqual(
+            self._placed(s2_token, course_id, activity_id)["room_id"], room_id
+        )
+        self.assertNotIn(f"participant:{ghost}", self._seats(room_id))
+        self.assertIn(f"participant:{s1}", self._seats(room_id))
 
     async def test_direct_joins_need_a_seat(self):
         (_, teacher_token), course_id, activity_id = await self._setting()

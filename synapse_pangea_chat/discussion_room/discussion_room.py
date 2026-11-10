@@ -1,8 +1,8 @@
 """``/_synapse/client/pangea/v1/discussion_room``: a student's room for one of
 their course's discussions, and their seat in it.
 
-- ``POST {course_id, activity_id}`` places the caller and answers
-  ``{room_id, created}``.
+- ``POST {course_id, activity_id, version_id?}`` places the caller and
+  answers ``{room_id, created}``.
 - ``GET ?course_id=&activity_id=`` answers where a placement would put them
   now, without placing them: ``{room_id, students, joined}``, ``room_id``
   null meaning a new room.
@@ -51,6 +51,7 @@ from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.module_api import ModuleApi
 from synapse.types import create_requester
 from synapse.util.async_helpers import Linearizer, timeout_deferred
+from twisted.web.http_headers import Headers
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.blocked_join_gate.blocked_join_gate import (
@@ -78,6 +79,7 @@ from synapse_pangea_chat.discussion_room.rooms import (
     find_seat,
     is_discussion_plan,
     pick_room,
+    room_state_with_prev,
     room_view,
     utc_timestamp,
     with_seat,
@@ -90,6 +92,7 @@ from synapse_pangea_chat.email_invite.course_missions import (
     activity_lo_ids,
     course_copy_lo_ids,
 )
+from synapse_pangea_chat.moderation.courses import is_course
 from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
 from synapse_pangea_chat.public_courses.get_public_courses import extract_plan_id
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
@@ -107,6 +110,11 @@ logger = logging.getLogger("synapse.module.synapse_pangea_chat.discussion_room")
 
 CMS_TIMEOUT_SECONDS = 5
 CMS_MAX_BODY_BYTES = 1_000_000
+# The room's image is read before the lock and is never worth holding a Join
+# for: past this a new room is made without one.
+AVATAR_TIMEOUT_SECONDS = 3
+# The choreographer's answer on whether a version is one of the activity's.
+CHOREO_TIMEOUT_SECONDS = 5
 # A start page polls its preview every few seconds; a discussion's plan is
 # read from the CMS at most this often per course and discussion.
 DISCUSSION_CACHE_SECONDS = 60
@@ -129,6 +137,13 @@ ROUTE_SEAT = "discussion_room_seat"
 ACTION_END = "end"
 ACTION_CONTINUE = "continue"
 
+# A caller removed or banned from one of this course's rooms for the
+# discussion: refused by Join and by the preview, never placed elsewhere.
+ERRCODE_REMOVED = "PANGEA_DISCUSSION_REMOVED"
+# The version the start page sent is not one of the activity's, so a new
+# room can't pin it.
+ERRCODE_UNKNOWN_VERSION = "PANGEA_DISCUSSION_UNKNOWN_VERSION"
+
 # The room version every discussion room is created in: version 12 forbids
 # listing the creator in power levels, which these rooms do for the bot.
 DISCUSSION_ROOM_VERSION = "11"
@@ -147,6 +162,11 @@ class CmsUnavailable(Exception):
     """The CMS could not be asked whether the activity is a discussion."""
 
 
+class ChoreoUnavailable(Exception):
+    """The choreographer could not be asked whether a version is the
+    activity's."""
+
+
 class _Refused(Exception):
     """A request answered with a 4xx or 503, with no placement work done."""
 
@@ -156,6 +176,16 @@ class _Refused(Exception):
         self.body: Dict[str, Any] = {"error": error}
         if errcode:
             self.body["errcode"] = errcode
+
+
+@dataclass(frozen=True)
+class _Version:
+    """The version a new room pins, checked before the lock. ``refusal`` is
+    raised only if the request creates a room: placing a student in an
+    existing room never needs the version."""
+
+    pin: Optional[str]
+    refusal: Optional[Exception] = None
 
 
 @dataclass(frozen=True)
@@ -197,9 +227,9 @@ def _youtube_id(url: Any) -> Optional[str]:
 
 def _version_id(value: Any, activity_id: str) -> Optional[str]:
     """The activity version the start page read from choreo (its content
-    signature), which a new room pins as a roleplay session does. Only that
-    shape is pinned; anything else creates the room on the latest version,
-    which every reader also handles."""
+    signature) when it has that shape; it is then checked against the
+    activity's versions before a new room pins it. Anything else creates the
+    room on the latest version, which every reader also handles."""
     if isinstance(value, str) and VERSION_ID_PATTERN.fullmatch(value):
         return value
     logger.warning(
@@ -249,6 +279,20 @@ class DiscussionRoom(Resource):
             )
         # (course_id, activity_id) -> (expires at, plan)
         self._plans: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+        # (course_id, activity_id) -> (expires at, the room image)
+        self._images: Dict[Tuple[str, str], Tuple[float, Optional[str]]] = {}
+        # (activity_id, version_id) -> expires at, for versions choreo knows
+        self._versions: Dict[Tuple[str, str], float] = {}
+        # (room_id, user_id) of every join this process is making now: a seat
+        # written ahead of its join counts only while the join is under way,
+        # so a seat whose join never landed is not counted for ever.
+        self._joining: Set[Tuple[str, str]] = set()
+        self._choreo_base_url = config.discussion_room_choreo_base_url or None
+        if self._choreo_base_url is None:
+            logger.error(
+                "discussion_room: discussion_room_choreo_base_url is not set; "
+                "versions are not checked and new rooms follow the latest version"
+            )
         # (course_id, activity_id) -> (expires at, rooms), for previews only
         self._views: Dict[Tuple[str, str], Tuple[float, List[RoomView]]] = {}
         # Discussion rooms found without their bot, reported once per process.
@@ -282,8 +326,8 @@ class DiscussionRoom(Resource):
             logger.warning("discussion_room: joins still rate limited, answered busy")
             status = 429
             body = {"error": "Busy, try again", "errcode": "M_LIMIT_EXCEEDED"}
-        except CmsUnavailable as e:
-            logger.error("discussion_room: CMS unavailable: %s", e)
+        except (CmsUnavailable, ChoreoUnavailable) as e:
+            logger.error("discussion_room: %s: %s", type(e).__name__, e)
             capture_exception(e)
             status, body = 502, {"error": "Could not check the discussion"}
         except Exception as e:
@@ -336,22 +380,27 @@ class DiscussionRoom(Resource):
         if not (course_id and activity_id):
             raise _Refused(400, "'course_id' and 'activity_id' are required strings")
 
-        membership, _ = await self._store.get_local_current_membership_for_user_in_room(
-            user_id, course_id
-        )
-        if membership != "join":
-            raise _Refused(403, "Not a member of this course")
+        await self._check_course(user_id, course_id)
 
         plan = await self._discussion_plan(course_id, activity_id)
         if preview:
             return await self._preview(user_id, course_id, activity_id, bot_user_id)
 
+        # Read before the lock, so neither can hold every other Join of the
+        # discussion behind a slow service.
+        version = await self._checked_version(
+            args.get("version_id"),
+            activity_id,
+            self._auth.get_access_token_from_request(request),
+        )
+        avatar_url = await self._room_image(course_id, activity_id, plan)
         room_id, created = await self._place(
             user_id,
             course_id,
             activity_id,
             plan,
-            _version_id(args.get("version_id"), activity_id),
+            version,
+            avatar_url,
             bot_user_id,
         )
         logger.info(
@@ -367,6 +416,33 @@ class DiscussionRoom(Resource):
         if self._limiters[route].is_rate_limited(user_id):
             raise _Refused(429, "Rate limited", "M_LIMIT_EXCEEDED")
 
+    async def _check_course(self, user_id: str, course_id: str) -> None:
+        """The caller is joined to ``course_id``, and it is a course: a space
+        carrying a course plan, as every course is recognised in this module.
+        Any other room the caller is in would key a bot-made room to it, with
+        a join rule letting that room's members in."""
+        state = await self._api.get_room_state(
+            course_id,
+            event_filter=[
+                (EventTypes.Create, ""),
+                (COURSE_PLAN_EVENT, ""),
+                (EventTypes.Member, user_id),
+            ],
+        )
+        member = state.get((EventTypes.Member, user_id))
+        if member is None or member.content.get("membership") != "join":
+            raise _Refused(403, "Not a member of this course")
+        create = state.get((EventTypes.Create, ""))
+        if (
+            create is None
+            or create.content.get("type") != "m.space"
+            or not is_course(state)
+        ):
+            logger.info(
+                "discussion_room: refused %s, %s is not a course", user_id, course_id
+            )
+            raise _Refused(403, "Not a course")
+
     # --- Rooms ------------------------------------------------------------
 
     async def _room_views(
@@ -377,11 +453,15 @@ class DiscussionRoom(Resource):
         )
         views: List[RoomView] = []
         for ref in refs:
-            state = await self._api.get_room_state(
+            # With each member event's previous membership, so an unban is
+            # not read as a removal.
+            state = await room_state_with_prev(
+                self._api._hs,
                 ref.room_id,
-                event_filter=[(EventTypes.Member, None), (ACTIVITY_ROLES_EVENT, "")],
+                [(EventTypes.Member, None), (ACTIVITY_ROLES_EVENT, "")],
             )
-            view = room_view(ref.room_id, state, bot_user_id, ref.created_ts)
+            joining = {user for room, user in self._joining if room == ref.room_id}
+            view = room_view(ref.room_id, state, bot_user_id, ref.created_ts, joining)
             if not view.bot_joined and ref.room_id not in self._reported_botless:
                 # The bot can't be removed, so this is a bug or a manual change.
                 self._reported_botless.add(ref.room_id)
@@ -390,6 +470,39 @@ class DiscussionRoom(Resource):
                 capture_exception(error)
             views.append(view)
         return views
+
+    def _refuse_removed(self, user_id: str, views: List[RoomView]) -> None:
+        """A caller removed or banned from any of the discussion's rooms in
+        this course is refused, by Join and by the preview alike: never put
+        back, and never placed in another room. A caller who left on their
+        own, or was unbanned, is not refused."""
+        removed_from = [view.room_id for view in views if view.refuses(user_id)]
+        if removed_from:
+            logger.info(
+                "discussion_room: refused %s, removed from %s",
+                user_id,
+                ", ".join(removed_from),
+            )
+            raise _Refused(403, "You can't join this discussion", ERRCODE_REMOVED)
+
+    def _own(self, user_id: str, views: List[RoomView]) -> Optional[RoomView]:
+        """The caller's own room, when it still has its bot. One that lost it
+        is skipped, as every room without its bot is (reported once by
+        ``_room_views``): the caller is placed as if they had no room, rather
+        than refused on every tap."""
+        own: Optional[RoomView] = None
+        for view in views:
+            if not view.is_own(user_id):
+                continue
+            if not view.bot_joined:
+                logger.warning(
+                    "discussion_room: skipped %s's own room %s, which has no bot",
+                    user_id,
+                    view.room_id,
+                )
+                continue
+            own = own or view
+        return own
 
     def _choose(
         self, user_id: str, views: List[RoomView], excluded: Set[str]
@@ -414,7 +527,7 @@ class DiscussionRoom(Resource):
     ) -> Dict[str, Any]:
         """Read-only and unlocked: a placement that runs between this and the
         student's tap places them by the rooms' state then, never by this
-        answer."""
+        answer. A caller Join would refuse as removed is refused the same."""
         key = (course_id, activity_id)
         now = self._clock.time()
         cached = self._views.get(key)
@@ -424,7 +537,8 @@ class DiscussionRoom(Resource):
             views = await self._room_views(course_id, activity_id, bot_user_id)
             self._views = {k: v for k, v in self._views.items() if v[0] > now}
             self._views[key] = (now + PREVIEW_CACHE_SECONDS, views)
-        own = next((view for view in views if view.is_own(user_id)), None)
+        self._refuse_removed(user_id, views)
+        own = self._own(user_id, views)
         if own is not None:
             return {
                 "room_id": own.room_id,
@@ -444,13 +558,14 @@ class DiscussionRoom(Resource):
         course_id: str,
         activity_id: str,
         plan: Dict[str, Any],
-        version_id: Optional[str],
+        version: _Version,
+        avatar_url: Optional[str],
         bot_user_id: str,
     ) -> Tuple[str, bool]:
         """Seat the caller under the lock, then join them after it: the join
-        can wait out Synapse's join limit, and the seat already counts them.
-        A join the room refuses releases the seat this request wrote and
-        tries another room."""
+        can wait out Synapse's join limit, and the seat already counts them
+        while the join is under way. A join the room refuses releases the
+        seat this request wrote and tries another room."""
         key = (course_id, activity_id)
         excluded: Set[str] = set()
         for _ in range(PLACEMENT_ATTEMPTS):
@@ -460,13 +575,16 @@ class DiscussionRoom(Resource):
                     course_id,
                     activity_id,
                     plan,
-                    version_id,
+                    version,
+                    avatar_url,
                     bot_user_id,
                     excluded,
                 )
                 self._views.pop(key, None)
-            if reservation.joined:
-                return reservation.room_id, reservation.created
+                if reservation.joined:
+                    return reservation.room_id, reservation.created
+                joining = (reservation.room_id, user_id)
+                self._joining.add(joining)
             try:
                 await self._join(reservation.room_id, user_id)
                 return reservation.room_id, reservation.created
@@ -486,6 +604,8 @@ class DiscussionRoom(Resource):
                 capture_exception(e)
                 await self._release(key, reservation, user_id, bot_user_id)
                 excluded.add(reservation.room_id)
+            finally:
+                self._joining.discard(joining)
         raise _Refused(403, "No room for this discussion can take you")
 
     async def _reserve(
@@ -494,28 +614,37 @@ class DiscussionRoom(Resource):
         course_id: str,
         activity_id: str,
         plan: Dict[str, Any],
-        version_id: Optional[str],
+        version: _Version,
+        avatar_url: Optional[str],
         bot_user_id: str,
         excluded: Set[str],
     ) -> _Reservation:
         """Chooses the caller's room and writes their seat in it. Their own
-        room is chosen, ended or not, and even when it is full."""
+        room is chosen, ended or not, and even when it is full. A caller
+        removed from any of the rooms is refused."""
         views = await self._room_views(course_id, activity_id, bot_user_id)
-        own = next((view for view in views if view.is_own(user_id)), None)
+        self._refuse_removed(user_id, views)
+        own = self._own(user_id, views)
         if own is not None:
-            if not own.bot_joined:
-                raise RuntimeError(f"discussion room {own.room_id} has no bot")
-            wrote = await self._ensure_seat(own.room_id, user_id, bot_user_id)
+            wrote = await self._ensure_seat(own, user_id, bot_user_id)
             return _Reservation(
                 own.room_id, False, own.joined(user_id), wrote, own=True
             )
         room = self._choose(user_id, views, excluded)
         if room is None:
+            if version.refusal is not None:
+                raise version.refusal
             room_id = await self._create(
-                user_id, course_id, activity_id, plan, version_id, bot_user_id
+                user_id,
+                course_id,
+                activity_id,
+                plan,
+                version.pin,
+                avatar_url,
+                bot_user_id,
             )
             return _Reservation(room_id, True, False, True, own=False)
-        wrote = await self._ensure_seat(room.room_id, user_id, bot_user_id)
+        wrote = await self._ensure_seat(room, user_id, bot_user_id)
         return _Reservation(room.room_id, False, room.joined(user_id), wrote, own=False)
 
     async def _join(self, room_id: str, user_id: str) -> None:
@@ -544,7 +673,8 @@ class DiscussionRoom(Resource):
     ) -> None:
         """Removes the seat this request wrote for a join that never
         happened, so it stops counting. A failure here is captured and never
-        hides the join's own failure."""
+        hides the join's own failure; the seat then stops counting once the
+        join is no longer under way, and the next seat write drops it."""
         if not reservation.wrote_seat:
             return
         try:
@@ -574,19 +704,43 @@ class DiscussionRoom(Resource):
             )
             capture_exception(e)
 
-    async def _ensure_seat(self, room_id: str, user_id: str, bot_user_id: str) -> bool:
+    async def _ensure_seat(
+        self, view: RoomView, user_id: str, bot_user_id: str
+    ) -> bool:
         """Adds ``user_id``'s seat, written by the bot; whether it wrote one.
-        Called under the lock, and only the server writes seats, so the read
-        and the write cannot interleave with another writer."""
+        The same write drops the room's stale seats (written for a join that
+        never landed), so they are repaired rather than kept for ever; a
+        holder who joined since the room was read keeps theirs. Called under
+        the lock, and only the server writes seats, so the read and the write
+        cannot interleave with another writer."""
+        stale = view.stale - {user_id}
         state = await self._api.get_room_state(
-            room_id, event_filter=[(ACTIVITY_ROLES_EVENT, "")]
+            view.room_id,
+            event_filter=[(ACTIVITY_ROLES_EVENT, "")]
+            + [(EventTypes.Member, holder) for holder in sorted(stale)],
         )
         current = state.get((ACTIVITY_ROLES_EVENT, ""))
         content = current.content if current is not None else None
-        if find_seat(content, user_id) is not None:
+        dropped = [
+            holder
+            for holder in sorted(stale)
+            if (EventTypes.Member, holder) not in state
+            and find_seat(content, holder) is not None
+        ]
+        updated = content
+        for holder in dropped:
+            updated = without_seat(updated, holder)
+        wrote = find_seat(updated, user_id) is None
+        if not wrote and not dropped:
             return False
-        await self._send_roles(room_id, with_seat(content, user_id), bot_user_id)
-        return True
+        if dropped:
+            logger.info(
+                "discussion_room: dropped %d stale seat(s) in %s",
+                len(dropped),
+                view.room_id,
+            )
+        await self._send_roles(view.room_id, with_seat(updated, user_id), bot_user_id)
+        return wrote
 
     async def _send_roles(
         self, room_id: str, content: Mapping[str, Any], bot_user_id: str
@@ -644,11 +798,13 @@ class DiscussionRoom(Resource):
         activity_id: str,
         plan: Dict[str, Any],
         version_id: Optional[str],
+        avatar_url: Optional[str],
         bot_user_id: str,
     ) -> str:
         """A new room with the caller's seat in it. The bot creates it and the
         caller joins once it is set up, so their arrival comes after the
-        activity's own state, which the chat draws as its top block."""
+        activity's own state, which the chat draws as its top block. The
+        version and the image were read before the lock."""
         admins = await course_admins(self._api, course_id)
         initial_state: List[Dict[str, Any]] = [
             {
@@ -690,7 +846,6 @@ class DiscussionRoom(Resource):
                 "content": discussion_power_levels(bot_user_id, admins),
             },
         ]
-        avatar_url = await self._avatar_url(plan, activity_id)
         if avatar_url:
             initial_state.append(
                 {
@@ -766,35 +921,57 @@ class DiscussionRoom(Resource):
             capture_exception(e)
         raise RuntimeError(f"could not list {room_id} under {course_id}") from failure
 
-    async def _avatar_url(
-        self, plan: Mapping[str, Any], activity_id: str
+    async def _room_image(
+        self, course_id: str, activity_id: str, plan: Mapping[str, Any]
     ) -> Optional[str]:
-        """The room's image, from the plan rather than the caller: the first
-        visible media block's image or poster, as the client's start page
-        picks it, else the plan's single legacy image. None when it has none
-        or the image cannot be resolved (captured: the room is still made)."""
+        """The image a new room would get, read before the lock and bounded,
+        so a slow CMS never holds a Join. None when the plan has none, or when
+        it can't be read in time: the room is then made without one (logged
+        and captured). Reused while the plan is."""
+        key = (course_id, activity_id)
+        now = self._clock.time()
+        cached = self._images.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
         try:
-            media = plan.get("media")
-            for block in media if isinstance(media, list) else []:
-                if not isinstance(block, Mapping):
-                    continue
-                kind = block.get("blockType") or block.get("block_type")
-                if kind == "youtube":
-                    video_id = _youtube_id(block.get("url"))
-                    return _web_url(block.get("thumbnail_url")) or (
-                        YOUTUBE_POSTER.format(video_id) if video_id else None
-                    )
-                if kind in ("image", "video"):
-                    return await self._media_image(block.get("upload_id"), kind)
-            return _web_url(plan.get("image_url"))
+            url = await make_deferred_yieldable(
+                timeout_deferred(
+                    deferred=run_in_background(self._avatar_url, plan),
+                    timeout=AVATAR_TIMEOUT_SECONDS,
+                    clock=self._clock,
+                )
+            )
         except Exception as e:
             logger.warning(
-                "discussion_room: no room image for %s (%s)",
+                "discussion_room: no room image for %s (%s); a new room is made "
+                "without one",
                 activity_id,
                 type(e).__name__,
             )
             capture_exception(e)
             return None
+        self._images = {k: v for k, v in self._images.items() if v[0] > now}
+        self._images[key] = (now + DISCUSSION_CACHE_SECONDS, url)
+        return url
+
+    async def _avatar_url(self, plan: Mapping[str, Any]) -> Optional[str]:
+        """The room's image, from the plan rather than the caller: the first
+        visible media block's image or poster, as the client's start page
+        picks it, else the plan's single legacy image. None when it has none;
+        raises when an upload's image can't be read."""
+        media = plan.get("media")
+        for block in media if isinstance(media, list) else []:
+            if not isinstance(block, Mapping):
+                continue
+            kind = block.get("blockType") or block.get("block_type")
+            if kind == "youtube":
+                video_id = _youtube_id(block.get("url"))
+                return _web_url(block.get("thumbnail_url")) or (
+                    YOUTUBE_POSTER.format(video_id) if video_id else None
+                )
+            if kind in ("image", "video"):
+                return await self._media_image(block.get("upload_id"), kind)
+        return _web_url(plan.get("image_url"))
 
     async def _media_image(self, upload_id: Any, kind: str) -> Optional[str]:
         """An upload's CDN image: for an image its medium size or original, for
@@ -827,6 +1004,93 @@ class DiscussionRoom(Resource):
             if isinstance(url, str) and url:
                 return _web_url(urljoin(base + "/", url))
         return None
+
+    # --- The version a new room pins -------------------------------------------
+
+    async def _checked_version(
+        self, value: Any, activity_id: str, access_token: str
+    ) -> _Version:
+        """The version a new room pins: the start page's, once choreo, the
+        owner of activity versions, says it is the activity's current one or
+        one it still keeps. An unknown version, or a choreo that can't be
+        asked, refuses only a request that creates a room. Without a version,
+        or without a choreo to ask, a new room follows the latest version."""
+        version_id = _version_id(value, activity_id)
+        if version_id is None:
+            return _Version(None)
+        if self._choreo_base_url is None:
+            # silent-ok: unconfigured (logged at startup); the room follows
+            # the latest version, as a room made without a version does
+            logger.warning(
+                "discussion_room: version of %s not checked (no choreo URL); a "
+                "new room is unpinned",
+                activity_id,
+            )
+            return _Version(None)
+        key = (activity_id, version_id)
+        now = self._clock.time()
+        expires = self._versions.get(key)
+        if expires is not None and expires > now:
+            return _Version(version_id)
+        try:
+            known = await make_deferred_yieldable(
+                timeout_deferred(
+                    deferred=run_in_background(
+                        self._choreo_knows, activity_id, version_id, access_token
+                    ),
+                    timeout=CHOREO_TIMEOUT_SECONDS,
+                    clock=self._clock,
+                )
+            )
+        except Exception as e:
+            return _Version(
+                None, ChoreoUnavailable(f"{activity_id}: {type(e).__name__}: {e}")
+            )
+        if not known:
+            logger.warning(
+                "discussion_room: %s is not a version of %s", version_id, activity_id
+            )
+            return _Version(
+                None,
+                _Refused(
+                    409,
+                    "This activity has changed; reload it",
+                    ERRCODE_UNKNOWN_VERSION,
+                ),
+            )
+        self._versions = {k: v for k, v in self._versions.items() if v > now}
+        self._versions[key] = now + DISCUSSION_CACHE_SECONDS
+        return _Version(version_id)
+
+    async def _choreo_knows(
+        self, activity_id: str, version_id: str, access_token: str
+    ) -> bool:
+        """Whether choreo serves ``version_id`` as itself: the activity's
+        current version or one its history keeps. Asked as the caller, the
+        read their own start page makes; raises on any failure to ask."""
+        base = self._choreo_base_url
+        if base is None:
+            raise RuntimeError("discussion_room_choreo_base_url is not set")
+        url = (
+            f"{base}/choreo/v2/activity/"
+            f"{quote(activity_id, safe='')}?{urlencode({'version': version_id})}"
+        )
+        code, raw = await cms_request(
+            self._http,
+            "GET",
+            url,
+            Headers({"Authorization": [f"Bearer {access_token}"]}),
+            max_bytes=CMS_MAX_BODY_BYTES,
+        )
+        if code != 200:
+            raise ValueError(f"choreo answered {code}")
+        found = json.loads(raw)
+        if not isinstance(found, Mapping):
+            raise ValueError("choreo answered a non-object")
+        return (
+            found.get("version_id") == version_id
+            and found.get("used_fallback_version") is not True
+        )
 
     # --- The plan -------------------------------------------------------------
 

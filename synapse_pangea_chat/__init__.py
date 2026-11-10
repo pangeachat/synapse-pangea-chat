@@ -203,6 +203,25 @@ def _validate_choreo_host(hostname: Optional[str], netloc: str) -> None:
             )
 
 
+def _discussion_choreo_base_url(value: Any) -> Optional[str]:
+    """``discussion_room_choreo_base_url`` as a base URL the activity read's
+    path can be appended to, or None when unset."""
+    if value is None:
+        return None
+    name = 'Config "discussion_room_choreo_base_url"'
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string when set")
+    raw = value.strip()
+    parsed = urlparse(raw)
+    if parsed.scheme not in _CHOREO_URL_SCHEMES or not parsed.hostname:
+        raise ValueError(f"{name} must be an http or https URL with a host")
+    if "?" in raw or "#" in raw or "@" in parsed.netloc:
+        raise ValueError(
+            f"{name} must be a base URL with no query, fragment or credentials"
+        )
+    return raw.rstrip("/")
+
+
 def _validate_choreo_base_url(value: str) -> str:
     """Return the usable form of `value`, or raise saying why there is none.
 
@@ -692,7 +711,14 @@ class PangeaChat:
         # Joins a course's admins to each new activity session linked into the
         # course, hidden and muted in their app.
         if config.course_session_admins_enabled:
-            self.course_session_admins = CourseSessionAdmins(api)
+            # Discussion rooms keep their own power levels (the bot alone
+            # invites), so their admins are joined but never raised.
+            self.course_session_admins = CourseSessionAdmins(
+                api,
+                discussion_bot_user_id=(
+                    config.user_activity_notification_bot_user_id or None
+                ),
+            )
             self._api.register_web_resource(
                 path="/_synapse/client/pangea/v1/backfill_course_session_admins",
                 resource=BackfillCourseSessionAdmins(api, self.course_session_admins),
@@ -912,6 +938,9 @@ class PangeaChat:
             raise ValueError(
                 'Config "discussion_room_capacity" must be an integer >= 1'
             )
+        discussion_room_choreo_base_url = _discussion_choreo_base_url(
+            config.get("discussion_room_choreo_base_url", None)
+        )
 
         # --- room_code config ---
         knock_with_code_requests_per_burst = config.get(
@@ -1679,6 +1708,7 @@ class PangeaChat:
             room_preview_burst_duration_seconds=room_preview_burst_duration_seconds,
             room_preview_requests_per_burst=room_preview_requests_per_burst,
             discussion_room_capacity=discussion_room_capacity,
+            discussion_room_choreo_base_url=discussion_room_choreo_base_url,
             knock_with_code_requests_per_burst=knock_with_code_requests_per_burst,
             knock_with_code_burst_duration_seconds=knock_with_code_burst_duration_seconds,
             preview_with_code_requests_per_burst=preview_with_code_requests_per_burst,

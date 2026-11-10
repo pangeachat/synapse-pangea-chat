@@ -107,6 +107,11 @@ class PangeaChatConfig:
     # The facilitator bot is user_activity_notification_bot_user_id (above),
     # shared with the user-activity filter: it creates every discussion room
     # and is the only writer of its seats. Unset, the endpoint answers 503.
+    # The choreographer's base URL (e.g. https://api.staging.pangea.chat),
+    # asked whether the version a start page sends is one of the activity's
+    # before a new room pins it. Unset, versions can't be checked and new
+    # rooms follow the latest version (logged at startup).
+    discussion_room_choreo_base_url: Optional[str] = None
 
     # --- limit_user_directory config ---
     limit_user_directory_public_attribute_search_path: Optional[str] = None

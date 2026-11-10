@@ -1,8 +1,10 @@
 """Mock CMS HTTP server for E2E tests.
 
 Implements Payload-compatible routes for matrix-users, user-exports,
-activities-v2 (looked up by activity id) and quest-plans, backed by
-in-memory storage.
+activities-v2 (looked up by activity id), media and quest-plans, backed by
+in-memory storage, and the choreographer's activity read
+(``/choreo/v2/activity/<id>?version=``), which a test points the module's
+choreo URL at.
 """
 
 import json
@@ -11,7 +13,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 EXPECTED_AUTH_SCHEME = "service-users API-Key "
 
@@ -46,9 +48,14 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/choreo/v2/activity/"):
+            self._handle_choreo_activity(parsed.path.split("/")[-1], parsed.query)
+            return
         if not self._require_service_user_auth():
             return
-        if parsed.path == "/api/matrix-users":
+        if parsed.path.startswith("/api/media/"):
+            self._handle_get_media(parsed.path.split("/")[-1])
+        elif parsed.path == "/api/matrix-users":
             self._handle_get_matrix_users(parsed.query)
         elif parsed.path == "/api/activities-v2":
             self._handle_get_activities(parsed.query)
@@ -97,6 +104,42 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
             self._send_json(status, {"errors": [{"message": "CMS fault"}]})
             return
         self._send_json(200, {"docs": state.get_activities(activity_id)})
+
+    def _handle_get_media(self, upload_id: str) -> None:
+        state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
+        found = state.get_media(unquote(upload_id))
+        if found is None:
+            self._send_json(404, {"errors": [{"message": "Not found"}]})
+            return
+        doc, delay_seconds = found
+        if delay_seconds:
+            time.sleep(delay_seconds)
+        self._send_json(200, doc)
+
+    def _handle_choreo_activity(self, activity_id: str, query_string: str) -> None:
+        """The choreographer's read of one activity at a pinned version: the
+        pinned version when it is one of the activity's, else the latest with
+        ``used_fallback_version``. Any Matrix token is accepted, as choreo
+        checks it against the homeserver."""
+        if not self.headers.get("Authorization", "").startswith("Bearer "):
+            self._send_json(401, {"detail": "Unauthorized"})
+            return
+        state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
+        versions = state.get_activity_versions(unquote(activity_id))
+        if not versions:
+            self._send_json(404, {"detail": "No canonical activity"})
+            return
+        requested = parse_qs(query_string).get("version", [""])[0]
+        known = requested in versions
+        self._send_json(
+            200,
+            {
+                "plan": {},
+                "version_id": requested if known else versions[0],
+                "requested_version_id": requested or None,
+                "used_fallback_version": bool(requested) and not known,
+            },
+        )
 
     def _handle_get_quest(self, quest_id: str) -> None:
         state: "_MockCmsState" = self.server._state  # type: ignore[attr-defined]
@@ -169,6 +212,26 @@ class _MockCmsState:
         self._activities_by_id: Dict[str, List[Dict[str, Any]]] = {}
         self._activity_faults: Dict[str, Tuple[Optional[int], float]] = {}
         self._quests_by_id: Dict[str, Dict[str, Any]] = {}
+        self._activity_versions: Dict[str, List[str]] = {}
+        self._media_by_id: Dict[str, Tuple[Dict[str, Any], float]] = {}
+
+    def seed_activity_versions(self, activity_id: str, versions: List[str]) -> None:
+        with self._lock:
+            self._activity_versions[activity_id] = list(versions)
+
+    def get_activity_versions(self, activity_id: str) -> List[str]:
+        with self._lock:
+            return list(self._activity_versions.get(activity_id, []))
+
+    def seed_media(
+        self, upload_id: str, doc: Dict[str, Any], delay_seconds: float
+    ) -> None:
+        with self._lock:
+            self._media_by_id[upload_id] = (dict(doc), delay_seconds)
+
+    def get_media(self, upload_id: str) -> Optional[Tuple[Dict[str, Any], float]]:
+        with self._lock:
+            return self._media_by_id.get(upload_id)
 
     def seed_matrix_user(self, username: str) -> Dict[str, Any]:
         with self._lock:
@@ -316,6 +379,16 @@ class MockCmsServer:
 
     def seed_quest(self, quest: Dict[str, Any]) -> None:
         self._state.seed_quest(quest)
+
+    def seed_activity_versions(self, activity_id: str, versions: List[str]) -> None:
+        """The versions choreo knows for an activity, latest first."""
+        self._state.seed_activity_versions(activity_id, versions)
+
+    def seed_media(
+        self, upload_id: str, doc: Dict[str, Any], *, delay_seconds: float = 0.0
+    ) -> None:
+        """A ``media`` row, answered after ``delay_seconds``."""
+        self._state.seed_media(upload_id, doc, delay_seconds)
 
     def set_activity_fault(
         self,
