@@ -10,7 +10,10 @@ What these prove end to end, on Synapse's own tables:
   profiles clean, and an invite left pending is accepted at startup;
 * a consented analytics invite is accepted, and the join's position fences the
   batch that carries the invite; a co-teacher's invite is not;
-* the head and snapshot endpoints answer only with the shared secret.
+* the head and snapshot endpoints answer only with the shared secret;
+* a safety incident, a DM's included, is pushed whole and its outbox mark
+  cleared; a refused one is parked; a restart re-sends what code without the
+  outbox wrote, and the parked ones (admin-dash#300).
 """
 
 import asyncio
@@ -55,6 +58,7 @@ class _ForwardHelpers(BaseSynapseE2ETest):
     async def _start(self) -> None:
         self.ingest.set_status(200)
         self.ingest.set_on_post(None)
+        self.ingest.reject_safety(set())
         await self.homeserver(
             module_config=self._module_config(),
             # Room statistics can be switched off; nothing here may rely on them.
@@ -1045,4 +1049,141 @@ class TestAnalyticsForwardBarrierE2E(_ForwardHelpers):
         self.assertFalse(
             [line for line in self.server_log() if "delivery failed" in line]
         )
+        self._assert_no_forwarder_errors()
+
+
+class TestSafetyPushE2E(_ForwardHelpers):
+    """The outbox on Synapse's PostgreSQL, through the real report endpoint."""
+
+    def _incident_mark(self, incident_id: str) -> Optional[Tuple[int, bool, bool]]:
+        rows = self._sql(
+            "SELECT revision, dirty, parked FROM pangea_safety_incident_outbox "
+            "WHERE incident_id = %s",
+            (incident_id,),
+        )
+        if not rows:
+            return None
+        return (int(rows[0][0]), bool(rows[0][1]), bool(rows[0][2]))
+
+    def _pushed(self, incident_id: str) -> List[dict]:
+        return [
+            incident
+            for body in self.ingest.acknowledged()
+            for incident in body.get("safety_incidents", [])
+            if incident["incident_id"] == incident_id
+        ]
+
+    def _report(self, token: str, room_id: str, event_id: str) -> str:
+        report_id = uuid.uuid4().hex
+        resp = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/report",
+            json={
+                "report_id": report_id,
+                "room_id": room_id,
+                "event_id": event_id,
+                "reason": "unkind",
+            },
+            headers=self._h(token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return f"report:{report_id}"
+
+    async def test_a_dm_report_is_pushed_parked_and_reconciled(self) -> None:
+        await self._start()
+        teacher, teacher_token = await self.new_user("safetyteacher")
+        learner, learner_token = await self.new_user("safetylearner")
+        peer, peer_token = await self.new_user("safetypeer")
+        course = self._course(teacher_token, teacher, teacher, "es")
+        self._join(learner_token, course)
+        dm = self._create_room(peer_token, preset="private_chat", is_direct=True)
+        self._room_action(peer_token, dm, "invite", user_id=learner)
+        self._join(learner_token, dm)
+        secret_text = "a dm message only the safety page may show"
+        event_id = self._send(
+            learner_token,
+            dm,
+            "m.room.message",
+            {"msgtype": "m.text", "body": secret_text},
+        )
+
+        # --- pushed whole, mark cleared ---
+        incident_id = self._report(peer_token, dm, event_id)
+        # Possibly twice: the start's reconciliation may mark it again.
+        record = (
+            await self._until(lambda: self._pushed(incident_id), "the report pushed")
+        )[0]
+        self.assertEqual(record["text"], secret_text)
+        self.assertEqual(record["room_id"], dm)
+        self.assertEqual(record["subject_id"], learner)
+        self.assertEqual(record["reporter_id"], peer)
+        self.assertEqual(record["course_ids"], [course])
+        # Settled: not dirty, not parked. The revision can be 2: the start's
+        # reconciliation may run after the report and mark it once more.
+        await self._until(
+            lambda: (self._incident_mark(incident_id) or (0, True, True))[1:]
+            == (False, False),
+            "the mark cleared",
+        )
+        for body in self.ingest.acknowledged():
+            self.assertIsInstance(body["safety_backlog"], bool)
+            self.assertEqual(len(body["safety_order"]), 2)
+            self.assertFalse(
+                any(e["room_id"] == dm for e in body["events"]),
+                "a DM's events were forwarded",
+            )
+
+        # --- refused: parked, not re-sent every step ---
+        self.ingest.reject_safety({"report:refused"})
+        now_ms = int(time.time() * 1000)
+        self._sql(
+            "INSERT INTO pangea_safety_incidents (incident_id, source, action, "
+            "room_id, course_ids, categories, self_harm, created_ms, updated_ms, "
+            "text) VALUES ('report:refused', 'report', 'reported', %s, %s, '[]', "
+            "FALSE, %s, %s, 'refused text') RETURNING 1",
+            (dm, f'["{course}"]', now_ms, now_ms),
+        )
+        self._sql(
+            "INSERT INTO pangea_safety_incident_outbox (incident_id, revision, "
+            "dirty, parked, dirty_since) VALUES ('report:refused', 1, TRUE, FALSE, "
+            "%s) RETURNING 1",
+            (now_ms,),
+        )
+        await self._until(
+            lambda: self._incident_mark("report:refused") == (1, False, True),
+            "the refused incident parked",
+        )
+        sends = len(self._pushed("report:refused"))
+        await asyncio.sleep(3)  # three polls
+        self.assertEqual(len(self._pushed("report:refused")), sends)
+
+        # --- a rollback window: an incident written with no mark at all ---
+        self._sql(
+            "INSERT INTO pangea_safety_incidents (incident_id, source, action, "
+            "room_id, course_ids, categories, self_harm, created_ms, updated_ms, "
+            "text) VALUES ('report:unmarked', 'report', 'reported', %s, %s, '[]', "
+            "FALSE, %s, %s, 'unmarked text') RETURNING 1",
+            (dm, f'["{course}"]', now_ms + 1, now_ms + 1),
+        )
+        self.ingest.reject_safety(set())
+        await self._crash_and_restart()
+        await self._until(
+            lambda: self._pushed("report:unmarked"), "the unmarked incident pushed"
+        )
+        await self._until(
+            lambda: len(self._pushed("report:refused")) > sends,
+            "the parked incident re-sent",
+        )
+        await self._until(
+            lambda: (self._incident_mark("report:refused") or (0, True, True))[1:]
+            == (False, False),
+            "the re-sent incident cleared",
+        )
+        watermark = self._sql(
+            "SELECT stream_pos FROM pangea_analytics_forward_cursor "
+            "WHERE name = 'safety_acked_updated_ms'"
+        )
+        self.assertGreaterEqual(int(watermark[0][0]), now_ms + 1)
+        log = "\n".join(self.server_log())
+        for text in (secret_text, "refused text", "unmarked text"):
+            self.assertNotIn(text, log)
         self._assert_no_forwarder_errors()

@@ -21,15 +21,28 @@ from synapse_pangea_chat.analytics_forward.forwarder import (
     BUSY_PAUSE_SECONDS,
     MAX_BACKOFF_SECONDS,
     PROFILE_CLOCK_GRACE_MS,
+    SAFETY_BATCH_MAX,
     DeliveryError,
     Forwarder,
 )
+from synapse_pangea_chat.analytics_forward.store import SAFETY_RECONCILE_MARGIN_MS
 from synapse_pangea_chat.analytics_forward.wire import (
     BadAck,
     check_ack,
+    check_safety_ack,
+    incident_record,
     ingest_body,
     is_forwarded,
 )
+from synapse_pangea_chat.moderation.incidents import (
+    Incident,
+    IncidentStore,
+    read_outbox,
+    remark_outbox,
+    settle_outbox,
+)
+
+from .moderation_doubles import DbPoolDouble, EventStoreDouble, HomeServerDouble
 
 SECRET = "s" * 40
 
@@ -81,6 +94,17 @@ class FakeStore:
         #: The rooms the course filter passes; None passes every room.
         self.course_room_ids: Optional[Set[str]] = None
         self.filtered: List[Set[str]] = []
+        # The safety record and its outbox on a real SQLite database, written
+        # by the real IncidentStore and read by the same SQL the forwarder's
+        # store runs (moderation/incidents.py).
+        self.safety_pool = DbPoolDouble()
+        events_store = EventStoreDouble()
+        events_store.db_pool = self.safety_pool
+        self.safety_hs = HomeServerDouble(events_store)
+        self.incidents = IncidentStore(self.safety_hs)
+        self.safety_watermark: Optional[int] = None
+        self.reconcile_error: Optional[Exception] = None
+        self.reconciles = 0
 
     def head(self) -> int:
         return self.head_pos
@@ -110,7 +134,16 @@ class FakeStore:
             return asked
         return asked & self.course_room_ids
 
-    async def advance(self, cursor: int, acked, clean_before: int = 0) -> None:
+    async def advance(
+        self,
+        cursor: int,
+        acked,
+        clean_before: int = 0,
+        *,
+        incidents_accepted=(),
+        incidents_parked=(),
+        safety_watermark: Optional[int] = None,
+    ) -> None:
         self.delivered_clean = max(self.delivered_clean or clean_before, clean_before)
         self.cursor = max(self.cursor or 0, cursor)
         for user_id, revision in acked:
@@ -118,6 +151,56 @@ class FakeStore:
             if row["revision"] == revision:
                 row["dirty"] = False
                 row["dirty_since"] = None
+        await self.safety_pool.runInteraction(
+            "settle",
+            lambda txn: settle_outbox(txn, incidents_accepted, incidents_parked),
+        )
+        if safety_watermark is not None:
+            self.safety_watermark = max(self.safety_watermark or 0, safety_watermark)
+
+    async def dirty_outboxes(self, profile_limit: int, incident_limit: int):
+        dirty, rest = await self.dirty_profiles(profile_limit)
+        await self.incidents.ensure_table()
+        entries, more = await self.safety_pool.runInteraction(
+            "read", lambda txn: read_outbox(txn, incident_limit)
+        )
+        return dirty, rest, entries, more
+
+    async def reconcile_incidents(self) -> None:
+        self.reconciles += 1
+        if self.reconcile_error is not None:
+            raise self.reconcile_error
+        await self.incidents.ensure_table()
+        wm = self.safety_watermark
+        since = None if wm is None else wm - SAFETY_RECONCILE_MARGIN_MS
+        await self.safety_pool.runInteraction(
+            "reconcile", lambda txn: remark_outbox(txn, since)
+        )
+
+    def outbox_row(self, incident_id: str) -> Optional[Tuple[int, bool, bool]]:
+        row = self.safety_pool.connection.execute(
+            "SELECT revision, dirty, parked FROM pangea_safety_incident_outbox "
+            "WHERE incident_id = ?",
+            (incident_id,),
+        ).fetchone()
+        return None if row is None else (int(row[0]), bool(row[1]), bool(row[2]))
+
+    def write_unmarked(self, incident_id: str, updated_ms: int) -> None:
+        """A write by code without the outbox (a rolled-back module)."""
+        connection = self.safety_pool.connection
+        updated = connection.execute(
+            "UPDATE pangea_safety_incidents SET updated_ms = ? WHERE incident_id = ?",
+            (updated_ms, incident_id),
+        ).rowcount
+        if not updated:
+            connection.execute(
+                "INSERT INTO pangea_safety_incidents (incident_id, source, action, "
+                "room_id, course_ids, categories, self_harm, created_ms, "
+                "updated_ms, text) VALUES (?, 'moderation', 'kept', '!dm:hs', "
+                "'[\"!course:hs\"]', '[]', 0, ?, ?, 'unmarked text')",
+                (incident_id, updated_ms, updated_ms),
+            )
+        connection.commit()
 
     def change_profile(self, user_id: str, now_ms: int) -> None:
         row = self.outbox.get(user_id)
@@ -180,6 +263,8 @@ class Ingest:
         self.fail_with: Optional[Exception] = None
         self.answer: Any = None
         self.on_post: Any = None
+        #: Incident ids the ingest refuses, as the real one names a reject.
+        self.reject_safety: Set[str] = set()
 
     async def __call__(self, body: dict) -> Any:
         self.bodies.append(json.loads(json.dumps(body)))
@@ -189,7 +274,12 @@ class Ingest:
             raise self.fail_with
         if self.answer is not None:
             return self.answer
-        return {"delivered_through": body["delivered_through"], "rejected": 0}
+        sent = [i["incident_id"] for i in body.get("safety_incidents", [])]
+        return {
+            "delivered_through": body["delivered_through"],
+            "rejected": 0,
+            "safety_rejected": [i for i in sent if i in self.reject_safety],
+        }
 
 
 class Clock:
@@ -955,7 +1045,7 @@ class TestWire(unittest.TestCase):
         self.assertTrue(is_forwarded("pangea.course_progress", "!course:hs"))
         self.assertFalse(is_forwarded("pangea.course_progress", None))
 
-    def test_contract_fixture_matches_the_body(self) -> None:
+    def _contract(self) -> Dict[str, Any]:
         path = os.path.join(
             os.path.dirname(__file__),
             "fixtures",
@@ -963,7 +1053,10 @@ class TestWire(unittest.TestCase):
             "ingest_contract.json",
         )
         with open(path, encoding="utf-8") as f:
-            contract = json.load(f)
+            return json.load(f)
+
+    def test_contract_fixture_matches_the_body(self) -> None:
+        contract = self._contract()
         request_schema = contract["request_schema"]
         example = contract["request_example"]
         body = ingest_body(
@@ -977,7 +1070,7 @@ class TestWire(unittest.TestCase):
         )
         self.assertEqual(body, example)
         self.assertEqual(set(body), set(request_schema["required"]))
-        self.assertEqual(set(body), set(request_schema["properties"]))
+        self.assertLessEqual(set(body), set(request_schema["properties"]))
         event_schema = request_schema["properties"]["events"]["items"]
         for event in example["events"]:
             self.assertEqual(set(event), set(event_schema["required"]))
@@ -988,6 +1081,62 @@ class TestWire(unittest.TestCase):
         self.assertEqual(
             check_ack(answer, example["delivered_through"]), answer["rejected"]
         )
+
+    def test_safety_contract_round_trips(self) -> None:
+        """admin-dash-api's safety example (admin-dash#300) is exactly what the
+        forwarder builds from the incident it describes."""
+        contract = self._contract()
+        schema = contract["request_schema"]
+        example = contract["safety_request_example"]
+        (wire_incident,) = example["safety_incidents"]
+        fields = {
+            k: v
+            for k, v in wire_incident.items()
+            if k not in ("course_ids", "revision")
+        }
+        fields["categories"] = tuple(fields["categories"])
+        incident = Incident(course_ids=tuple(wire_incident["course_ids"]), **fields)
+        body = ingest_body(
+            events=example["events"],
+            profiles=example["profiles"],
+            delivered_through=example["delivered_through"],
+            profiles_clean_before=example["profiles_clean_before"],
+            accept_join_pos=example["accept_join_pos"],
+            pending_accepts=example["pending_accepts"],
+            pending_accepts_rev=example["pending_accepts_rev"],
+            safety_incidents=[incident_record(incident, wire_incident["revision"])],
+            safety_order=(example["safety_order"][0], example["safety_order"][1]),
+            safety_backlog=example["safety_backlog"],
+        )
+        self.assertEqual(body, example)
+        self.assertEqual(set(body), set(schema["properties"]))
+        item_schema = schema["properties"]["safety_incidents"]["items"]
+        self.assertLessEqual(set(item_schema["required"]), set(wire_incident))
+        self.assertEqual(set(wire_incident), set(item_schema["properties"]))
+        self.assertGreaterEqual(
+            schema["properties"]["safety_incidents"]["maxItems"], SAFETY_BATCH_MAX
+        )
+        answer = contract["safety_response_example"]
+        self.assertEqual(check_ack(answer, example["delivered_through"]), 0)
+        self.assertEqual(
+            check_safety_ack(answer, [wire_incident["incident_id"]]), set()
+        )
+
+    def test_check_safety_ack(self) -> None:
+        self.assertEqual(
+            check_safety_ack({"safety_rejected": ["a", "z"]}, ["a", "b"]), {"a"}
+        )
+        # No incidents sent: an ingest that names none is fine.
+        self.assertEqual(check_safety_ack({"delivered_through": 1}, []), set())
+        bad: List[Any] = [
+            {"delivered_through": 1},  # incidents sent, none accounted for
+            {"safety_rejected": "a"},
+            {"safety_rejected": [1]},
+            None,
+        ]
+        for answer in bad:
+            with self.assertRaises(BadAck):
+                check_safety_ack(answer, ["a"])
 
 
 class TestConfig(unittest.TestCase):
@@ -1526,3 +1675,285 @@ class TestSnapshotDeclaresForwardedTypes(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status, 200)
             self.assertEqual(answer["forwarded_types"], sorted(STATE_TYPES))
             self.assertIn("m.room.canonical_alias", answer["forwarded_types"])
+
+
+# ---------------------------------------------------------------------------
+# The safety push (admin-dash#300)
+# ---------------------------------------------------------------------------
+
+COURSE = "!course:hs"
+DM = "!dm:hs"
+SAFETY_KEYS = {"safety_incidents", "safety_backlog", "safety_order"}
+
+
+def _safety_incident(incident_id: str = "mod:$dm", **overrides: Any) -> Incident:
+    fields: Dict[str, Any] = {
+        "incident_id": incident_id,
+        "source": "moderation",
+        "action": "kept",
+        "outcome": None,
+        "subject_id": "@learner:hs",
+        "reporter_id": None,
+        "room_id": DM,
+        "event_id": "$dm",
+        "course_ids": (COURSE,),
+        "categories": ("harassment",),
+        "self_harm": False,
+        "rule": None,
+        "top_score": 0.4,
+        "text": "a direct message",
+        "reason": None,
+        "created_ms": 5_000,
+        "updated_ms": 5_000,
+    }
+    fields.update(overrides)
+    return Incident(**fields)
+
+
+def _sent_incidents(body: dict) -> List[str]:
+    return [i["incident_id"] for i in body.get("safety_incidents", [])]
+
+
+class TestSafetyPush(unittest.IsolatedAsyncioTestCase):
+    async def _started(
+        self, store: Optional[FakeStore] = None
+    ) -> Tuple[FakeStore, Ingest, Clock, Forwarder]:
+        store = store or FakeStore([], head=0)
+        ingest = Ingest()
+        clock = Clock()
+        fwd = _forwarder(store, ingest, clock)
+        await fwd.start()
+        return store, ingest, clock, fwd
+
+    async def test_a_dm_incident_rides_the_next_batch_whole(self) -> None:
+        store, ingest, _clock, fwd = await self._started()
+        await store.incidents.insert(_safety_incident())
+        await fwd.step()
+        body = ingest.bodies[-1]
+        (record,) = body["safety_incidents"]
+        self.assertEqual(record["text"], "a direct message")
+        self.assertEqual(record["room_id"], DM)
+        self.assertEqual(record["course_ids"], [COURSE])
+        self.assertEqual(record["revision"], 1)
+        self.assertEqual(store.outbox_row("mod:$dm"), (1, False, False))
+        self.assertEqual(store.safety_watermark, 5_000)
+        _clock.ms += fwd.poll_ms
+        await fwd.step()  # the next heartbeat: nothing left to carry
+        self.assertEqual(len(ingest.bodies), 2)
+        self.assertEqual(_sent_incidents(ingest.bodies[-1]), [])
+
+    async def test_a_failed_delivery_keeps_the_mark(self) -> None:
+        store, ingest, _clock, fwd = await self._started()
+        await store.incidents.insert(_safety_incident())
+        ingest.fail_with = DeliveryError("http", "HTTP 500")
+        with self.assertRaises(DeliveryError):
+            await fwd.step()
+        self.assertEqual(store.outbox_row("mod:$dm"), (1, True, False))
+        self.assertIsNone(store.safety_watermark)
+        ingest.fail_with = None
+        await fwd.step()
+        self.assertEqual(_sent_incidents(ingest.bodies[-1]), ["mod:$dm"])
+        self.assertEqual(store.outbox_row("mod:$dm"), (1, False, False))
+
+    async def test_an_ack_that_does_not_account_for_incidents_moves_nothing(
+        self,
+    ) -> None:
+        store = FakeStore(_events(3), head=3)
+        store, ingest, _clock, fwd = await self._started(store)
+        await store.incidents.insert(_safety_incident())
+        ingest.answer = {"delivered_through": 3, "rejected": 0}
+        with self.assertRaises(DeliveryError) as raised:
+            await fwd.step()
+        self.assertEqual(raised.exception.reason, "bad_ack")
+        self.assertEqual(store.cursor, 0)
+        self.assertEqual(store.outbox_row("mod:$dm"), (1, True, False))
+
+    async def test_a_write_during_the_send_is_sent_again(self) -> None:
+        store, ingest, _clock, fwd = await self._started()
+        await store.incidents.insert(_safety_incident())
+        writes: List[Any] = []
+
+        def verdict_in_flight(body: dict) -> None:
+            if body.get("safety_incidents"):
+                writes.append(
+                    store.incidents.upsert_verdict(
+                        _safety_incident(action="redacted", top_score=0.9)
+                    )
+                )
+
+        ingest.on_post = verdict_in_flight
+        await fwd.step()
+        ingest.on_post = None
+        # The in-flight write lands before the ack is settled.
+        await asyncio.gather(*writes)
+        self.assertEqual(store.outbox_row("mod:$dm"), (2, True, False))
+        await fwd.step()
+        (record,) = ingest.bodies[-1]["safety_incidents"]
+        self.assertEqual((record["revision"], record["action"]), (2, "redacted"))
+        self.assertEqual(store.outbox_row("mod:$dm"), (2, False, False))
+
+    async def test_a_refused_incident_is_parked_until_reconciliation(self) -> None:
+        store, ingest, _clock, fwd = await self._started()
+        await store.incidents.insert(_safety_incident("mod:$ok", updated_ms=6_000))
+        await store.incidents.insert(_safety_incident("mod:$bad", updated_ms=9_000))
+        ingest.reject_safety = {"mod:$bad"}
+        await fwd.step()
+        self.assertEqual(
+            sorted(_sent_incidents(ingest.bodies[-1])), ["mod:$bad", "mod:$ok"]
+        )
+        self.assertEqual(store.outbox_row("mod:$ok"), (1, False, False))
+        self.assertEqual(store.outbox_row("mod:$bad"), (1, False, True))
+        # The watermark counts only what was stored.
+        self.assertEqual(store.safety_watermark, 6_000)
+        self.assertFalse(ingest.bodies[-1]["safety_backlog"])
+
+        posted = len(ingest.bodies)
+        _clock.ms += fwd.poll_ms
+        await fwd.step()  # not re-sent every step
+        self.assertEqual(len(ingest.bodies), posted + 1)
+        self.assertEqual(_sent_incidents(ingest.bodies[-1]), [])
+
+        ingest.reject_safety = set()
+        await fwd.daily_scan()
+        await fwd.step()
+        # The parked one goes again (the stored one too, being inside the
+        # margin below the watermark; a re-send is a no-op at the ingest).
+        self.assertIn("mod:$bad", _sent_incidents(ingest.bodies[-1]))
+        self.assertEqual(store.outbox_row("mod:$bad"), (2, False, False))
+        self.assertEqual(store.safety_watermark, 9_000)
+
+    async def test_twenty_per_batch_and_backlog_until_the_last(self) -> None:
+        self.assertEqual(SAFETY_BATCH_MAX, 20)  # the spec's bound on one POST
+        store, ingest, _clock, fwd = await self._started()
+        total = SAFETY_BATCH_MAX + 5
+        for n in range(total):
+            await store.incidents.insert(
+                _safety_incident(f"mod:${n:03d}", updated_ms=10_000 + n)
+            )
+        self.assertTrue(await fwd.step(), "more incidents waiting is more to do")
+        first = ingest.bodies[-1]
+        self.assertEqual(len(first["safety_incidents"]), SAFETY_BATCH_MAX)
+        self.assertTrue(first["safety_backlog"])
+        self.assertFalse(await fwd.step())
+        second = ingest.bodies[-1]
+        self.assertEqual(len(second["safety_incidents"]), 5)
+        self.assertFalse(second["safety_backlog"])
+        sent = _sent_incidents(first) + _sent_incidents(second)
+        self.assertEqual(sent, [f"mod:${n:03d}" for n in range(total)])
+
+    async def test_a_heartbeat_carries_only_the_order_and_backlog(self) -> None:
+        store = FakeStore(_events(2, 4), head=5)
+        store, ingest, _clock, fwd = await self._started(store)
+        await fwd.step()
+        body = ingest.bodies[-1]
+        self.assertNotIn("safety_incidents", body)
+        self.assertIs(body["safety_backlog"], False)
+        self.assertEqual(len(body["safety_order"]), 2)
+        # Everything else is exactly the analytics batch it always was.
+        analytics = {k: v for k, v in body.items() if k not in SAFETY_KEYS}
+        expected = ingest_body(
+            events=analytics["events"],
+            profiles=analytics["profiles"],
+            delivered_through=5,
+            profiles_clean_before=analytics["profiles_clean_before"],
+            accept_join_pos=None,
+            pending_accepts=[],
+            pending_accepts_rev=analytics["pending_accepts_rev"],
+        )
+        self.assertEqual(analytics, expected)
+        self.assertEqual(_delivered_positions(ingest), [2, 4])
+        self.assertEqual(store.cursor, 5)
+
+    async def test_the_order_only_grows_within_and_across_processes(self) -> None:
+        store, ingest, clock, fwd = await self._started()
+        await fwd.step()
+        await store.incidents.insert(_safety_incident())
+        await fwd.step()  # same millisecond as the heartbeat before it
+        clock.ms -= 10_000  # and a clock stepped back
+        await store.incidents.upsert_verdict(_safety_incident(top_score=0.9))
+        await fwd.step()
+        orders = [tuple(b["safety_order"]) for b in ingest.bodies]
+        self.assertEqual(len(orders), 3)
+        self.assertEqual(orders, sorted(set(orders)), orders)
+
+        restarted = _forwarder(store, ingest, Clock())
+        restarted_clock_low = orders[-1][1] - 1  # a new process, an older clock
+        restarted._clock_ms = lambda: restarted_clock_low
+        await restarted.start()
+        await restarted.step()
+        self.assertGreater(tuple(ingest.bodies[-1]["safety_order"]), orders[-1])
+
+    async def test_first_start_backfills_every_incident(self) -> None:
+        store = FakeStore([], head=0)
+        await store.incidents.ensure_table()
+        # History written before the outbox existed: no marks at all.
+        store.write_unmarked("mod:$history1", 100)
+        store.write_unmarked("report:history2", 200)
+        store, ingest, _clock, fwd = await self._started(store)
+        await fwd.step()
+        self.assertEqual(
+            sorted(_sent_incidents(ingest.bodies[-1])),
+            ["mod:$history1", "report:history2"],
+        )
+
+    async def test_a_restart_heals_a_rollback_window(self) -> None:
+        store, ingest, _clock, fwd = await self._started()
+        await store.incidents.insert(_safety_incident("mod:$a", updated_ms=1_000_000))
+        await store.incidents.insert(_safety_incident("mod:$long_ago", updated_ms=1))
+        await fwd.step()
+        self.assertEqual(store.safety_watermark, 1_000_000)
+
+        # The module is rolled back: the old code writes without marks.
+        store.write_unmarked("mod:$a", 2_000_000)  # an update to a sent one
+        store.write_unmarked("mod:$during", 1_500_000)  # a new one
+        # Committed late by another worker: nine minutes older than the
+        # watermark, inside the spec's ten-minute margin.
+        self.assertEqual(SAFETY_RECONCILE_MARGIN_MS, 10 * 60 * 1000)
+        store.write_unmarked("mod:$late", 1_000_000 - 9 * 60 * 1000)
+        # Outside the margin: delivered long ago and never touched again.
+        self.assertEqual(store.outbox_row("mod:$long_ago"), (1, False, False))
+
+        redeployed = _forwarder(store, ingest, Clock())
+        await redeployed.start()
+        await redeployed.step()
+        self.assertEqual(
+            sorted(_sent_incidents(ingest.bodies[-1])),
+            ["mod:$a", "mod:$during", "mod:$late"],
+        )
+        self.assertEqual(store.outbox_row("mod:$long_ago"), (1, False, False))
+        self.assertEqual(store.safety_watermark, 2_000_000)
+
+    async def test_a_failed_reconciliation_never_holds_the_stream(self) -> None:
+        store = FakeStore(_events(2), head=2)
+        store.reconcile_error = RuntimeError("database hiccup")
+        with self.assertLogs(
+            "synapse.modules.synapse_pangea_chat.analytics_forward", "ERROR"
+        ):
+            store, ingest, clock, fwd = await self._started(store)
+        await store.incidents.insert(_safety_incident())
+        await fwd.step()
+        body = ingest.bodies[-1]
+        self.assertEqual(_delivered_positions(ingest), [2])
+        self.assertEqual(_sent_incidents(body), ["mod:$dm"])  # marks still flow
+        self.assertTrue(body["safety_backlog"], "a missed reconciliation said clear")
+        attempts = store.reconciles
+
+        await fwd.step()  # within the poll: not retried on every step
+        self.assertEqual(store.reconciles, attempts)
+
+        store.reconcile_error = None
+        clock.ms += fwd.poll_ms
+        await fwd.step()
+        self.assertEqual(store.reconciles, attempts + 1)
+        self.assertFalse(ingest.bodies[-1]["safety_backlog"])
+
+    async def test_a_mark_without_its_row_is_cleared_unsent(self) -> None:
+        store, ingest, _clock, fwd = await self._started()
+        await store.incidents.insert(_safety_incident())
+        store.safety_pool.connection.execute("DELETE FROM pangea_safety_incidents")
+        store.safety_pool.connection.commit()
+        await fwd.step()
+        self.assertEqual(_sent_incidents(ingest.bodies[-1]), [])
+        self.assertEqual(store.outbox_row("mod:$dm"), (1, False, False))
+        self.assertFalse(ingest.bodies[-1]["safety_backlog"])
+        self.assertIsNone(store.safety_watermark)

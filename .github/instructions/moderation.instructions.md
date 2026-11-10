@@ -51,6 +51,7 @@ Re-decider in brackets.
 
 - **Captured at the incident, never recomputed**: sender, full text, room name, the learner's courses then. [unassigned]
 - **Moderation never waits on the record**: enforcement first, the row after; repeat verdicts merge and never erase. [unassigned]
+- **Every incident write marks the forward outbox in the same transaction**, so the analytics forwarder pushes it to the dashboard and no write lands unmarked (admin-dash#300). [unassigned]
 - **An admin sees only their course's incidents**, never a learner's other courses; every refusal looks the same. [unassigned]
 - **Accepted limits**: a row lost to a restart mid-retry or long outage; a course misattributed in rare room-graph cases. Revisit if lost rows (`pangea_safety_incident_lost_total`) are ever non-zero; other reopening conditions sit beside the code. [owner]
 - **Out of scope**: notifications, retention, opt-out and age-based strictness are the org doc's.
