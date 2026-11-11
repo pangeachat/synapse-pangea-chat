@@ -9,7 +9,7 @@ something while a delivery is in flight.
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Set, Tuple
 
 INGEST_PATH = "/api/internal/matrix-events"
 
@@ -33,6 +33,9 @@ class _IngestServer(ThreadingHTTPServer):
         # (status answered, body) per request, in arrival order.
         self.requests: List[Tuple[int, dict]] = []
         self.on_post: Optional[Callable[[dict], None]] = None
+        # Safety incident ids to refuse, named in ``safety_rejected`` as the
+        # real ingest names a reject (admin-dash#300).
+        self.reject_safety: Set[str] = set()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -69,8 +72,18 @@ class _Handler(BaseHTTPRequestHandler):
         with server.lock:
             status = server.status
             server.requests.append((status, body))
+            refused = set(server.reject_safety)
         if status == 200:
-            self._send(200, {"delivered_through": body["delivered_through"]})
+            sent = [i["incident_id"] for i in body.get("safety_incidents", [])]
+            self._send(
+                200,
+                {
+                    "delivered_through": body["delivered_through"],
+                    "rejected": 0,
+                    "safety_rejected": [i for i in sent if i in refused],
+                    "safety_unnamed": 0,
+                },
+            )
         else:
             self._send(status, {"error": "unavailable"})
 
@@ -103,6 +116,10 @@ class MockIngest:
 
     def set_on_post(self, hook: Optional[Callable[[dict], None]]) -> None:
         self._server.on_post = hook
+
+    def reject_safety(self, incident_ids: Set[str]) -> None:
+        with self._server.lock:
+            self._server.reject_safety = set(incident_ids)
 
     def drop_next(self, count: int = 1) -> None:
         with self._server.lock:

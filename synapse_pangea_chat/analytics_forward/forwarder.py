@@ -8,6 +8,16 @@ after committing it. Nothing is held in memory: during an outage the backlog
 stays in Synapse's tables and the loop resumes from the cursor, retrying
 forever with a capped backoff. A batch re-sent after a crash is a no-op at the
 ingest, whose every write is idempotent.
+
+Safety incidents ride the same batches (admin-dash#300): every incident write
+marks an outbox in its own transaction, each step carries up to
+``SAFETY_BATCH_MAX`` marked incidents, and the acknowledgement clears the
+stored ones and parks the refused ones. Every batch carries ``safety_backlog``
+and ``safety_order`` so the ingest can tell a caught-up feed from a lagging
+one. Reconciliation on every start and daily re-marks everything changed
+since the acked watermark and every parked incident; it never holds back the
+analytics stream (a failed one is retried at the next poll, and every batch
+says backlog until it lands).
 """
 
 from __future__ import annotations
@@ -21,7 +31,9 @@ from synapse_pangea_chat.analytics_forward.config import START_AT_CURRENT
 from synapse_pangea_chat.analytics_forward.wire import (
     BadAck,
     check_ack,
+    check_safety_ack,
     event_record,
+    incident_record,
     ingest_body,
     is_forwarded,
     profile_record,
@@ -48,6 +60,9 @@ CONNECT_TIMEOUT_SECONDS = 5
 #: The largest answer read. The ingest's acknowledgement is a few dozen bytes;
 #: anything bigger is not it, and is refused without being buffered.
 MAX_ANSWER_BYTES = 64 * 1024
+#: Incidents per batch. A text can be an event's whole 64 KB, so twenty keep
+#: one POST bounded; the rest follow at the busy pace.
+SAFETY_BATCH_MAX = 20
 
 
 class DeliveryError(Exception):
@@ -102,6 +117,13 @@ class Forwarder:
         self._rev = 0
         self._saved_rev = 0
         self._failures = 0
+        #: The second half of ``safety_order``: the read time, kept strictly
+        #: increasing within this process (the first half orders processes).
+        self._last_order_ms = 0
+        #: A safety reconciliation that failed and is still owed; while it
+        #: is, every batch says ``safety_backlog``.
+        self._reconcile_due = False
+        self._last_reconcile_try_ms: Optional[int] = None
         self._running = False
         self._woken = False
         self._send_due = False
@@ -118,6 +140,9 @@ class Forwarder:
         """Before anything is sent: re-send every profile, load the cursor,
         accept invites that were pending before the stream reaches them."""
         await self._store.mark_all_for_resend()
+        # Before the cursor is set, like the profile re-send; a failure never
+        # fails the start (the analytics stream must not wait on it).
+        await self._reconcile_safety()
         if self._start_position == START_AT_CURRENT:
             initial = self._store.head()
         else:
@@ -151,6 +176,18 @@ class Forwarder:
             await self.scan_pending_invites()
         except Exception:  # silent-ok: logged; what is already owed stays owed
             logger.exception("analytics forwarder: pending invite scan failed")
+        await self._reconcile_safety()
+
+    async def _reconcile_safety(self) -> None:
+        """Re-mark the incidents the ingest may not hold. Never raises."""
+        self._last_reconcile_try_ms = self._clock_ms()
+        try:
+            await self._store.reconcile_incidents()
+        except Exception:  # silent-ok: logged; retried each poll, batches say backlog
+            logger.exception("analytics forwarder: safety reconciliation failed")
+            self._reconcile_due = True
+            return
+        self._reconcile_due = False
 
     def _owe(self, room_id: str, user_id: str) -> None:
         if (room_id, user_id) in self._owed:
@@ -273,14 +310,23 @@ class Forwarder:
                 self._owe(event.room_id, state_key)
 
         read_ms = self._clock_ms()
-        dirty, oldest_rest = await self._store.dirty_profiles(self._batch_max)
+        if self._reconcile_due and (
+            self._last_reconcile_try_ms is None
+            or read_ms - self._last_reconcile_try_ms >= self._poll_ms
+        ):
+            await self._reconcile_safety()
+        dirty, oldest_rest, marks, safety_more = await self._store.dirty_outboxes(
+            self._batch_max, SAFETY_BATCH_MAX
+        )
         heartbeat_due = (
             self._last_post_ms is None or read_ms - self._last_post_ms >= self._poll_ms
         )
         fence, owed, rev = self._fence, sorted(self._owed), self._rev
         full = len(events) >= self._batch_max
         send_due, self._send_due = self._send_due, False
-        if not (records or dirty or fence or full or heartbeat_due or send_due):
+        if not (
+            records or dirty or marks or fence or full or heartbeat_due or send_due
+        ):
             return False
 
         profiles = await self._store.profiles([user_id for user_id, _ in dirty])
@@ -290,6 +336,11 @@ class Forwarder:
             read_ms if oldest_rest is None else min(oldest_rest - 1, read_ms)
         )
         clean_before = oldest_change - PROFILE_CLOCK_GRACE_MS
+        # A mark whose incident row is gone carries nothing and is cleared.
+        incidents = [m for m in marks if m.incident is not None]
+        sent_ids = {m.incident_id for m in incidents}
+        order_ms = max(read_ms, self._last_order_ms + 1)
+        self._last_order_ms = order_ms
         body = ingest_body(
             events=records,
             profiles=[
@@ -301,6 +352,14 @@ class Forwarder:
             accept_join_pos=fence or None,
             pending_accepts=owed,
             pending_accepts_rev=rev,
+            safety_incidents=[
+                incident_record(m.incident, m.revision) for m in incidents
+            ],
+            # rev is stored before the send (below) and bumped past the stored
+            # value on start, so a newer process's batches order after an
+            # older one's; order_ms orders them within this process.
+            safety_order=(rev, order_ms),
+            safety_backlog=safety_more or self._reconcile_due,
         )
         if rev > self._saved_rev:
             await self._store.save_pending_rev(rev)
@@ -309,9 +368,26 @@ class Forwarder:
             response = await self._post(body)
             try:
                 rejected = check_ack(response, reached)
+                safety_rejected = check_safety_ack(response, sent_ids)
             except BadAck as exc:
                 raise DeliveryError("bad_ack", str(exc)) from exc
-            await self._store.advance(reached, dirty, clean_before)
+            accepted = [m for m in marks if m.incident_id not in safety_rejected]
+            await self._store.advance(
+                reached,
+                dirty,
+                clean_before,
+                incidents_accepted=[(m.incident_id, m.revision) for m in accepted],
+                incidents_parked=[
+                    (m.incident_id, m.revision)
+                    for m in marks
+                    if m.incident_id in safety_rejected
+                ],
+                # Over the stored ones only: a parked one is re-marked anyway.
+                safety_watermark=max(
+                    (m.incident.updated_ms for m in accepted if m.incident),
+                    default=None,
+                ),
+            )
         except Exception:
             if send_due:
                 self._send_due = True  # still owed to the head read
@@ -322,8 +398,19 @@ class Forwarder:
             self._fence = 0
         if rejected:
             metrics.REJECTED.inc(rejected)
+        if incidents:
+            metrics.SAFETY_SENT.inc(len(incidents))
+        if safety_rejected:
+            # Ids only reach the log, never a word of an incident.
+            metrics.SAFETY_PARKED.inc(len(safety_rejected))
+            logger.warning(
+                "analytics forwarder: the ingest refused %d safety incident(s), "
+                "parked until the next reconciliation: %s",
+                len(safety_rejected),
+                ", ".join(sorted(safety_rejected)),
+            )
         metrics.LAG.set(max(0, head - self._cursor))
-        return full or len(dirty) >= self._batch_max
+        return full or len(dirty) >= self._batch_max or safety_more
 
 
 def refresh_barrier(

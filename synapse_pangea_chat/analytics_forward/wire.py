@@ -9,7 +9,7 @@ test against; a field changed here without changing that file fails
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 #: The one room-timeline (non-state) type forwarded: a student's construct uses.
 CONSTRUCT_TYPE = "pangea.construct"
@@ -90,6 +90,16 @@ def profile_record(user_id: str, revision: int, profile: Any) -> Dict[str, Any]:
     }
 
 
+def incident_record(incident: Any, revision: int) -> Dict[str, Any]:
+    """One safety incident as the ingest takes it (admin-dash#300): the read
+    endpoint's shape plus the courses it is stored under, which the ingest
+    uses only as a key and never serves, and the outbox revision."""
+    record = dict(incident.to_json())
+    record["course_ids"] = list(incident.course_ids or ())
+    record["revision"] = int(revision)
+    return record
+
+
 def ingest_body(
     *,
     events: Sequence[Dict[str, Any]],
@@ -99,12 +109,17 @@ def ingest_body(
     accept_join_pos: Optional[int],
     pending_accepts: Sequence[Any] = (),
     pending_accepts_rev: int = 0,
+    safety_incidents: Sequence[Dict[str, Any]] = (),
+    safety_order: Optional[Tuple[int, int]] = None,
+    safety_backlog: bool = False,
 ) -> Dict[str, Any]:
+    """The batch. ``safety_backlog`` and ``safety_order`` go together, and only
+    when ``safety_order`` is given; ``safety_incidents`` only when not empty."""
     owed = [
         {"room_id": item[0], "user_id": item[1]} if isinstance(item, tuple) else item
         for item in pending_accepts
     ]
-    return {
+    body: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "events": list(events),
         "profiles": list(profiles),
@@ -114,6 +129,12 @@ def ingest_body(
         "pending_accepts": owed,
         "pending_accepts_rev": int(pending_accepts_rev),
     }
+    if safety_incidents:
+        body["safety_incidents"] = list(safety_incidents)
+    if safety_order is not None:
+        body["safety_backlog"] = bool(safety_backlog)
+        body["safety_order"] = [int(safety_order[0]), int(safety_order[1])]
+    return body
 
 
 class BadAck(Exception):
@@ -136,3 +157,38 @@ def check_ack(body: Any, delivered_through: int) -> int:
     if isinstance(rejected, bool) or not isinstance(rejected, int) or rejected < 0:
         raise BadAck("acknowledgement has an invalid rejected count")
     return rejected
+
+
+def check_safety_ack(body: Any, sent: Iterable[str]) -> Set[str]:
+    """The ids among ``sent`` to park: every one the ingest named in
+    ``safety_rejected`` (echoed exactly as sent), or EVERY sent one when it
+    counted a reject it could not name (``safety_unnamed`` > 0); a re-send is a
+    no-op at the ingest. Every other sent incident is stored.
+
+    A batch that carried incidents must be answered with both fields: an
+    answer without either cannot say what was stored, so it is no
+    acknowledgement (``BadAck``) and the batch is sent again. A field that is
+    present but malformed is refused whatever was sent. Ids the batch did not
+    carry are ignored.
+    """
+    sent_ids = set(sent)
+    if not isinstance(body, dict):
+        raise BadAck("acknowledgement is not a JSON object")
+    named = body.get("safety_rejected")
+    unnamed = body.get("safety_unnamed")
+    if named is not None and (
+        not isinstance(named, list) or not all(isinstance(i, str) for i in named)
+    ):
+        raise BadAck("acknowledgement has an invalid safety_rejected list")
+    if unnamed is not None and (
+        isinstance(unnamed, bool) or not isinstance(unnamed, int) or unnamed < 0
+    ):
+        raise BadAck("acknowledgement has an invalid safety_unnamed count")
+    if named is None or unnamed is None:
+        if sent_ids:
+            raise BadAck("acknowledgement does not account for the safety incidents")
+        return set()
+    if unnamed > 0:
+        return sent_ids
+    rejected: List[str] = [i for i in named if i in sent_ids]
+    return set(rejected)

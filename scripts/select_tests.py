@@ -45,6 +45,7 @@ MEASURED_SECONDS = {
     "tests.test_export_user_data_e2e.TestExportUserDataProcessor": 10,
     "tests.test_create_course_space_e2e.TestCreateCourseSpaceE2E": 8,
     "tests.test_logcontext_e2e.TestModerationLogcontext": 6,
+    "tests.test_analytics_forward_e2e.TestSafetyPushE2E": 20,
 }
 
 

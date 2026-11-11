@@ -10,6 +10,13 @@
   earliest undelivered change (milliseconds; 0 for "unknown, as old as
   anything").
 
+The safety incident outbox, ``pangea_safety_incident_outbox``, is the
+moderation record's own table (``moderation/incidents.py`` owns its SQL and
+marks it in every incident write); the forwarder reads and settles it here,
+in the same interactions as the profile outbox and the cursor. Its acked
+watermark, the newest ``updated_ms`` the ingest stored, is a fourth row of the
+cursor table.
+
 PostgreSQL only: the startup re-send reads custom profile fields as JSONB.
 """
 
@@ -19,6 +26,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from synapse_pangea_chat.analytics_forward.consent import PROFILE_KEY
 from synapse_pangea_chat.analytics_forward.wire import FORWARDED_TYPES
+from synapse_pangea_chat.moderation.incidents import (
+    OutboxEntry,
+    create_tables,
+    read_outbox,
+    remark_outbox,
+    settle_outbox,
+)
 
 _CURSOR_NAME = "analytics_forward"
 #: The pending_accepts revision, kept in the cursor table as a second row.
@@ -26,6 +40,12 @@ _PENDING_REV_NAME = "pending_accepts_rev"
 #: The profiles_clean_before of the last acknowledged batch, a third row: what
 #: the ingest holds, so the head can tell a Refresh it need not wait.
 _DELIVERED_CLEAN_NAME = "profiles_clean_before"
+#: The newest updated_ms among the safety incidents the ingest stored, a
+#: fourth row: reconciliation re-marks everything changed since (less margin).
+_SAFETY_WATERMARK_NAME = "safety_acked_updated_ms"
+#: How far reconciliation reaches below the watermark: writers on other
+#: workers commit out of updated_ms order, and a re-send is a no-op.
+SAFETY_RECONCILE_MARGIN_MS = 10 * 60 * 1000
 _UPSERT_GREATEST_SQL = """
     INSERT INTO pangea_analytics_forward_cursor (name, stream_pos) VALUES (?, ?)
     ON CONFLICT (name) DO UPDATE SET stream_pos = GREATEST(
@@ -264,6 +284,9 @@ class ForwardStore:
             txn.execute(_CREATE_CURSOR_SQL)
             txn.execute(_CREATE_OUTBOX_SQL)
             txn.execute(_CREATE_OUTBOX_INDEX_SQL)
+            # The incident record and its outbox, so the forwarder never reads
+            # a table moderation has not created yet.
+            create_tables(txn)
 
         await self._pool.runInteraction("pangea_analytics_forward_create", _create)
         self._ready = True
@@ -371,9 +394,13 @@ class ForwardStore:
         cursor: int,
         acked: Sequence[Tuple[str, int]],
         clean_before: Optional[int] = None,
+        *,
+        incidents_accepted: Sequence[Tuple[str, int]] = (),
+        incidents_parked: Sequence[Tuple[str, int]] = (),
+        safety_watermark: Optional[int] = None,
     ) -> None:
-        """After an acknowledgement: the new cursor and the delivered profiles,
-        in one transaction."""
+        """After an acknowledgement: the new cursor, the delivered profiles and
+        the settled incident marks, in one transaction."""
 
         def _ack(txn: Any) -> None:
             txn.execute(_ADVANCE_CURSOR_SQL, (cursor, _CURSOR_NAME))
@@ -381,6 +408,11 @@ class ForwardStore:
                 txn.execute(_ACK_PROFILE_SQL, (user_id, revision))
             if clean_before is not None:
                 txn.execute(_UPSERT_GREATEST_SQL, (_DELIVERED_CLEAN_NAME, clean_before))
+            settle_outbox(txn, incidents_accepted, incidents_parked)
+            if safety_watermark is not None:
+                txn.execute(
+                    _UPSERT_GREATEST_SQL, (_SAFETY_WATERMARK_NAME, safety_watermark)
+                )
 
         await self._pool.runInteraction("pangea_analytics_forward_ack", _ack)
 
@@ -402,28 +434,52 @@ class ForwardStore:
 
         await self._pool.runInteraction("pangea_analytics_profile_resend", _resend)
 
-    async def dirty_profiles(
-        self, limit: int
-    ) -> Tuple[List[Tuple[str, int]], Optional[int]]:
-        """The ``limit`` oldest dirty rows, and the oldest ``dirty_since`` of
-        the dirty rows NOT among them (``None`` when there are none).
+    async def dirty_outboxes(
+        self, profile_limit: int, incident_limit: int
+    ) -> Tuple[List[Tuple[str, int]], Optional[int], List[OutboxEntry], bool]:
+        """Both outboxes in one read.
 
-        Once a batch carrying those rows is acknowledged they are delivered at
-        the revision read, and a change made since bumped the revision after
-        this read, so the rest is what holds ``profiles_clean_before`` back.
-        """
+        First the ``profile_limit`` oldest dirty profile rows, and the oldest
+        ``dirty_since`` of the dirty rows NOT among them (``None`` when there
+        are none): once a batch carrying those rows is acknowledged they are
+        delivered at the revision read, and a change made since bumped the
+        revision after this read, so the rest is what holds
+        ``profiles_clean_before`` back. Then the ``incident_limit`` oldest
+        dirty incident marks with their incidents, and whether more are dirty
+        (a parked mark is not)."""
 
-        def _select(txn: Any) -> Tuple[List[Tuple[str, int]], Optional[int]]:
-            txn.execute(_SELECT_DIRTY_SQL, (limit + 1,))
+        def _select(
+            txn: Any,
+        ) -> Tuple[List[Tuple[str, int]], Optional[int], List[OutboxEntry], bool]:
+            txn.execute(_SELECT_DIRTY_SQL, (profile_limit + 1,))
             found = [
                 (str(uid), int(rev), int(since)) for uid, rev, since in txn.fetchall()
             ]
-            rest = found[limit][2] if len(found) > limit else None
-            return [(uid, rev) for uid, rev, _ in found[:limit]], rest
+            rest = found[profile_limit][2] if len(found) > profile_limit else None
+            entries, more = read_outbox(txn, incident_limit)
+            return (
+                [(uid, rev) for uid, rev, _ in found[:profile_limit]],
+                rest,
+                entries,
+                more,
+            )
 
         return await self._pool.runInteraction(
-            "pangea_analytics_profile_dirty_read", _select
+            "pangea_analytics_outbox_dirty_read", _select
         )
+
+    async def reconcile_incidents(self) -> None:
+        """Mark again every incident changed since the acked watermark (less
+        the margin), all of them when there is none, and every parked one."""
+        await self.ensure_tables()
+
+        def _reconcile(txn: Any) -> None:
+            txn.execute(_SELECT_CURSOR_SQL, (_SAFETY_WATERMARK_NAME,))
+            row = txn.fetchone()
+            since = None if row is None else int(row[0]) - SAFETY_RECONCILE_MARGIN_MS
+            remark_outbox(txn, since)
+
+        await self._pool.runInteraction("pangea_analytics_safety_reconcile", _reconcile)
 
     async def bump_revisions(self, user_ids: Iterable[str]) -> Dict[str, int]:
         """A fresh revision for each user, for a snapshot read after it."""
