@@ -457,7 +457,8 @@ class TestCoursePlanReplacement(unittest.IsolatedAsyncioTestCase):
 
         self.room_plan.apply.side_effect = revoked_meanwhile
         with self.assertLogs(
-            "synapse_pangea_chat.email_invite.course_invitation_api", "ERROR"
+            "synapse.module.synapse_pangea_chat.email_invite.course_invitation_api",
+            "ERROR",
         ):
             with self.assertRaises(SynapseError) as error:
                 await self.resource.replace("@operator:x", self.body())

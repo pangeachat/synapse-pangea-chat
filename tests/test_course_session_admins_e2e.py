@@ -67,6 +67,13 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
         }
         if create_type is not None:
             body["creation_content"] = {"type": create_type}
+            # The client's session power levels: inviting takes 50, changing
+            # power levels 100, and only the creator holds either.
+            body["power_level_content_override"] = {
+                "invite": 50,
+                "users_default": 0,
+                "events": {"m.room.power_levels": 100},
+            }
         return self._create_room(token, body)
 
     def _link(
@@ -92,6 +99,18 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
         content["users"] = {**content.get("users", {}), user_id: level}
         response = requests.put(url, headers=self._headers(token), json=content)
         self.assertEqual(response.status_code, 200, response.text)
+
+    def _power(self, room_id: str, token: str) -> Dict[str, Any]:
+        response = requests.get(
+            self._state_url(room_id, "m.room.power_levels"),
+            headers=self._headers(token),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def _level(self, room_id: str, user_id: str, token: str) -> int:
+        power = self._power(room_id, token)
+        return power.get("users", {}).get(user_id, power.get("users_default", 0))
 
     def _membership(self, room_id: str, user_id: str, token: str) -> Optional[str]:
         """``user_id``'s membership, read by a joined member; None when the
@@ -146,11 +165,13 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
         )
 
     def _admitted(self, room_id: str, user_id: str, token: str, reader: str) -> bool:
-        """Joined, on their review list and muted: the whole outcome, polled
-        together because the mute is written after the join."""
+        """Joined, on their review list, muted and able to invite: the whole
+        outcome, polled together so a missing listing, mute or power level
+        fails the wait, not just a missing join."""
         rule = self._mute_rule(room_id, token)
         return (
             self._membership(room_id, user_id, reader) == "join"
+            and self._level(room_id, user_id, reader) >= 50
             and room_id in self._review_list(user_id, token)
             and rule is not None
             and rule.get("actions") == []
@@ -197,6 +218,25 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
         # is not on any list of theirs.
         self.assertEqual(self._membership(session_id, s1_id, s1), "join")
         self.assertNotIn(session_id, self._review_list(s1_id, s1))
+        # The admins sit exactly at the invite level; the creator and every
+        # other key are as the room was created.
+        power = self._power(session_id, s1)
+        self.assertEqual(
+            power["users"],
+            {s1_id: 100, users["teacher"][0]: 50, users["co"][0]: 50},
+        )
+        self.assertEqual(power["invite"], 50)
+        self.assertEqual(power["events"]["m.room.power_levels"], 100)
+
+        # A teacher can now invite a classmate who is not in the session.
+        response = requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/"
+            f"{quote(session_id, safe='')}/invite",
+            headers=self._headers(users["teacher"][1]),
+            json={"user_id": s2_id},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self._membership(session_id, s2_id, s1), "invite")
 
     async def test_other_rooms_and_unlinked_sessions_are_left_alone(self):
         space_id, users = await self._course()
@@ -306,6 +346,10 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
         s3_id, s3 = await self.new_user("s3")
         self._join(space_id, s3)
 
+        # The teacher is in the session at the default level, as an earlier
+        # join left her before admins were raised: the backfill raises her.
+        self._set_power(old_id, teacher_id, 0, s1)
+
         # Only a server admin may run it.
         self.assertEqual(self._backfill(s1, space_id).status_code, 403)
 
@@ -316,6 +360,8 @@ class TestCourseSessionAdminsE2E(BaseSynapseE2ETest):
             f"course_session_admins backfill of {space_id} finished: 1 joins"
         )
         self.assertTrue(self._admitted(old_id, s2_id, s2, s1))
+        self.assertTrue(self._admitted(old_id, teacher_id, teacher, s1))
+        self.assertEqual(self._level(old_id, s3_id, s1), 0)
         self.assertIsNone(self._membership(old_id, s3_id, s1))
         self.assertIsNone(self._membership(public_id, s2_id, s1))
         self.assertNotIn(public_id, self._review_list(s2_id, s2))

@@ -1,4 +1,4 @@
-"""A local SMTP server that accepts every message and keeps it, for e2e tests.
+"""A local SMTP server that keeps every message it accepts, for e2e tests.
 
 The test homeserver is pointed at it through its ``email`` config, so a test
 can read back what Synapse actually sent: the rendered templates, through
@@ -17,7 +17,7 @@ import socketserver
 import threading
 import time
 from email.message import Message
-from typing import List, Optional
+from typing import List, Optional, Set
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -42,6 +42,9 @@ class _Handler(socketserver.StreamRequestHandler):
                 self._reply("250 OK")
             elif verb == "RCPT":
                 address = command.split(":", 1)[1].strip().strip("<>")
+                if sink.is_held(address):
+                    self._reply("452 4.2.2 Mailbox full")
+                    continue
                 recipients.append(address)
                 self._reply("250 OK")
             elif verb == "DATA":
@@ -78,6 +81,7 @@ class SmtpSink:
         self.port: int = self._server.server_address[1]
         self._lock = threading.Lock()
         self._messages: List[tuple[List[str], Message]] = []
+        self._held: Set[str] = set()
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     def start(self) -> "SmtpSink":
@@ -87,6 +91,19 @@ class SmtpSink:
     def stop(self) -> None:
         self._server.shutdown()
         self._server.server_close()
+
+    def hold(self, address: str) -> None:
+        """Answer this address with a full mailbox's 452, until ``release``."""
+        with self._lock:
+            self._held.add(address)
+
+    def release(self, address: str) -> None:
+        with self._lock:
+            self._held.discard(address)
+
+    def is_held(self, address: str) -> bool:
+        with self._lock:
+            return address in self._held
 
     def _add(self, recipients: List[str], message: Message) -> None:
         with self._lock:

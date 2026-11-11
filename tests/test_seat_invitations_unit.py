@@ -1022,6 +1022,7 @@ class TestAddAndSend(_Base):
                 "created_at_ms",
                 "joined_at_ms",
                 "canvas_identity",
+                "send_at_ms",
                 "pending_count",
                 "same_student_as",
             },

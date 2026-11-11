@@ -28,11 +28,7 @@ Nothing else is checked: not the member count, the join rule or the quest's cont
 
 Only current room state counts, so a room that once had a course plan and no longer does is not a course.
 
-The id is a `quest-plans` row id — that is what a course space pins (see the
-cross-repo [quests and learning objectives](../../../.github/.github/instructions/quests-and-learning-objectives.instructions.md)
-spec). Anything resolving a plan id against the CMS asks `quest-plans` first; the
-retired v1 `course-plans` collection is only a fallback for rooms old enough to
-reference it.
+The id is a `quest-plans` row id — that is what a course space pins (see the cross-repo [quests and learning objectives](../../../.github/.github/instructions/quests-and-learning-objectives.instructions.md) spec). Anything resolving a plan id against the CMS asks `quest-plans` alone. A room still holding an id from the retired v1 collection does not resolve, so the CMS gives it no language.
 
 ## Language
 
@@ -52,14 +48,9 @@ There are no `language_of_instructions` or `cefr_level` filters. They had no cal
 and serving them would put a CMS lookup back on the read path. A client that wants a
 course's L1 or level reads them from the plan it already fetches to render the card.
 
-## Central courses
+## The central mark
 
-A central course is the one Pangea-run course per language for learners who aren't in a teacher's course ([central courses](../../../.github/.github/instructions/central-courses.instructions.md)). The catalog marks which courses are central, so the client can send a learner to one without a second lookup.
-
-- **The mark.** A course is central when its current `pangea.course_settings` state event carries `"central": true`. Every course in the response has a `central` field, which is `false` for all other courses.
-- **Only a Pangea admin can make a course central.** The mark counts only when the `pangea.course_settings` event was sent by an account listed in `central_course_admin_user_ids`, which defaults to `@support:<server name>`. Any course admin can write that event, so without this check a teacher could mark their course central and receive every learner the client sends there. A mark from anyone else is ignored, not refused: the course is reported as not central.
-- **The catalog doesn't enforce one central course per language.** If two courses in the same language are marked, both are reported as central. Only Pangea admins can set the mark, so a second one is an operations mistake to fix in room state, and the server doesn't guess which course was meant.
-- **Whether a course appears doesn't change.** The mark only adds a field.
+Where a learner lands is the org [course spaces](../../../.github/.github/instructions/course-spaces.instructions.md#where-a-learner-lands) doc's, and nothing routes on a catalog mark any more. The catalog still reports a `central` field for every course, true only when the course's own settings event says so and that event was written by a central admin's account; a mark from anyone else is ignored rather than refused, and the catalog reports the course as not central. Retiring the field is later work.
 
 ## Pagination
 

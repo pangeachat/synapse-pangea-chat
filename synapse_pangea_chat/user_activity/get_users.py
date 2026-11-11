@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Set
 from synapse.module_api import ModuleApi
 from synapse.storage.databases.main.room import RoomStore
 
-logger = logging.getLogger("synapse_pangea_chat.user_activity.get_users")
+logger = logging.getLogger("synapse.module.synapse_pangea_chat.user_activity.get_users")
 
 USER_ACTIVITY_SORT_BY_VALUES = {
     "user_id",

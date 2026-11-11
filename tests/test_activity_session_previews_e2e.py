@@ -67,6 +67,9 @@ class TestActivitySessionPreviewsE2E(BaseSynapseE2ETest):
         )
         await self._test_no_rooms_param(member_token)
         await self._test_many_children_all_found(member_token)
+        await self._test_pending_invites(
+            member_id, member_token, outsider_token, space_id
+        )
 
     # --- scenario helpers -------------------------------------------------
 
@@ -162,6 +165,59 @@ class TestActivitySessionPreviewsE2E(BaseSynapseE2ETest):
         rooms = self._get_previews(token, rooms=big_space)
         self.assertEqual(set(rooms.keys()), {late_session})
 
+    async def _test_pending_invites(
+        self,
+        member_id: str,
+        member_token: str,
+        outsider_token: str,
+        space_id: str,
+    ) -> None:
+        """A session lists who holds a pending invite to it, read afresh each
+        time (a joined invitee drops off even from the cached room), only to a
+        caller joined to the session itself, and the plain room preview never
+        carries the list."""
+        invitee_id, invitee_token = await self.new_user("invitee")
+        session = await self._create_session_room(
+            member_token,
+            "act-invite",
+            roles={"r1": {"user_id": member_id}},
+        )
+        self._add_child(member_token, space_id, session)
+        rooms = self._get_previews(member_token, rooms=space_id, activity="act-invite")
+        self.assertEqual(rooms[session]["invited"], [])
+
+        self.assertTrue(
+            await self.invite_user_to_room(session, invitee_id, member_token)
+        )
+        rooms = self._get_previews(member_token, rooms=space_id, activity="act-invite")
+        self.assertEqual(rooms[session]["invited"], [invitee_id])
+        self.assertEqual(rooms[session]["membership_summary"], {member_id: "join"})
+
+        # Anyone can link a known session into a space of their own; they get
+        # its preview as before, but not who was invited to it.
+        own_space = await self._create_space(outsider_token)
+        self._add_child(outsider_token, own_space, session)
+        linked = self._get_previews(
+            outsider_token, rooms=own_space, activity="act-invite"
+        )
+        self.assertNotIn("invited", linked[session])
+        member_view = dict(rooms[session])
+        member_view.pop("invited")
+        self.assertEqual(linked[session], member_view)
+
+        plain = requests.get(
+            f"{self.server_url}/_synapse/client/unstable/org.pangea/room_preview",
+            headers={"Authorization": f"Bearer {member_token}"},
+            params={"rooms": session},
+            timeout=10,
+        )
+        self.assertEqual(plain.status_code, 200)
+        self.assertNotIn("invited", plain.json()["rooms"][session])
+
+        self.assertTrue(await self.accept_room_invitation(session, invitee_token))
+        rooms = self._get_previews(member_token, rooms=space_id, activity="act-invite")
+        self.assertEqual(rooms[session]["invited"], [])
+
     # --- request helpers --------------------------------------------------
 
     def _get_previews(
@@ -193,20 +249,34 @@ class TestActivitySessionPreviewsE2E(BaseSynapseE2ETest):
         self.assertEqual(response.status_code, 200)
         return response.json()["room_id"]
 
-    async def _create_session_room(self, token: str, activity_id: str) -> str:
+    async def _create_session_room(
+        self,
+        token: str,
+        activity_id: str,
+        roles: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        initial_state: list[Dict[str, Any]] = [
+            {
+                "type": "pangea.activity_plan",
+                "state_key": "",
+                "content": {"activity_id": activity_id},
+            }
+        ]
+        if roles is not None:
+            initial_state.append(
+                {
+                    "type": "pangea.activity_roles",
+                    "state_key": "",
+                    "content": {"roles": roles},
+                }
+            )
         response = requests.post(
             f"{self.server_url}/_matrix/client/v3/createRoom",
             headers={"Authorization": f"Bearer {token}"},
             json={
                 "visibility": "private",
                 "preset": "private_chat",
-                "initial_state": [
-                    {
-                        "type": "pangea.activity_plan",
-                        "state_key": "",
-                        "content": {"activity_id": activity_id},
-                    }
-                ],
+                "initial_state": initial_state,
             },
             timeout=10,
         )

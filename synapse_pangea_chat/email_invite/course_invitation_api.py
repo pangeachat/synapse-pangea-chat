@@ -25,7 +25,9 @@ from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.set_course_plan.set_course_plan import parse_request
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(
+    "synapse.module.synapse_pangea_chat.email_invite.course_invitation_api"
+)
 
 
 class CourseInvitationAPI(Resource):

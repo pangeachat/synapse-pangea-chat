@@ -138,6 +138,163 @@
         "type": "integer",
         "minimum": 1,
         "description": "Grows whenever the module's owed-join set changes; durable across module restarts (stored before any batch carrying it is sent, and moved past on start). Replace the stored pending_accepts only when this is greater than the stored rev, so an older request landing late (after a newer heartbeat with the same delivered_through) cannot overwrite a newer set."
+      },
+      "safety_incidents": {
+        "description": "Optional (admin-dash#300). Incidents the module's outbox marks as changed, each the WHOLE current incident (Incident.to_json() plus course_ids), at most 100 per batch (the module sends at most 20). A stored incident is replaced only by a strictly newer updated_ms. One bad incident is a reject named in safety_rejected, never a failed batch. Unknown keys inside an incident are ignored.",
+        "type": "array",
+        "maxItems": 100,
+        "items": {
+          "type": "object",
+          "required": [
+            "incident_id",
+            "source",
+            "action",
+            "outcome",
+            "subject_id",
+            "reporter_id",
+            "room_id",
+            "room_name",
+            "event_id",
+            "categories",
+            "self_harm",
+            "rule",
+            "top_score",
+            "text",
+            "reason",
+            "created_ms",
+            "updated_ms",
+            "course_ids"
+          ],
+          "properties": {
+            "incident_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "source": {
+              "enum": [
+                "moderation",
+                "report"
+              ]
+            },
+            "action": {
+              "enum": [
+                "blocked",
+                "redacted",
+                "preserved",
+                "kept",
+                "reported"
+              ]
+            },
+            "outcome": {
+              "enum": [
+                "pending",
+                "removed",
+                "failed",
+                "skipped",
+                "unknown",
+                null
+              ]
+            },
+            "subject_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reporter_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "room_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "room_name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "event_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "categories": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "self_harm": {
+              "type": "boolean"
+            },
+            "rule": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "top_score": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "created_ms": {
+              "type": "integer"
+            },
+            "updated_ms": {
+              "type": "integer"
+            },
+            "course_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "The course spaces the incident is stored under; used only to key rows, never served. Empty: accepted and stored nowhere."
+            },
+            "revision": {
+              "type": "integer",
+              "description": "The module's outbox revision; the ingest ignores it."
+            }
+          }
+        }
+      },
+      "safety_backlog": {
+        "description": "Optional, sent together with safety_order. Whether any incident is still marked after this batch (parked ones excluded). Only a batch carrying both fields moves the Safety page's freshness.",
+        "type": "boolean"
+      },
+      "safety_order": {
+        "description": "Optional, sent together with safety_backlog: [pending_accepts_rev, read_ms]. Compared lexicographically; the freshness row takes a batch only when it orders at or after the stored one.",
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "minItems": 2,
+        "maxItems": 2
       }
     }
   },
@@ -156,6 +313,18 @@
         "type": "integer",
         "minimum": 0,
         "description": "Records of this batch set aside in matrix_ingest_rejects. Optional, 0 when absent."
+      },
+      "safety_rejected": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Ids of the batch's rejected safety incidents that the ingest can name: every rejected record with a string incident_id up to 512 characters as ASCII-escaped JSON, echoed exactly as sent (the answer is ASCII-escaped JSON). The ingest keeps the id, the reason and the refused updated_ms, never the record. The module parks each named id and re-sends it on start and daily; a reject closes only when an accept of that id at or after the refused updated_ms lands. Always present; empty when none."
+      },
+      "safety_unnamed": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Rejected safety records of this batch the ingest cannot name in safety_rejected (no string incident_id, or one longer than 512 escaped characters). When above 0 the module parks EVERY incident it sent in this batch (a re-send is harmless: the upsert is idempotent). These stay open and keep the Safety page's freshness off. Always present; 0 when none."
       }
     }
   },
@@ -327,5 +496,53 @@
       "pangea.orchestrator_awarded_goals",
       "pangea.teacher_mode"
     ]
+  },
+  "safety_request_example": {
+    "schema_version": 1,
+    "events": [],
+    "profiles": [],
+    "delivered_through": 812360,
+    "profiles_clean_before": 1761199998000,
+    "accept_join_pos": null,
+    "pending_accepts": [],
+    "pending_accepts_rev": 12,
+    "safety_incidents": [
+      {
+        "incident_id": "mod:$flagged",
+        "source": "moderation",
+        "action": "kept",
+        "outcome": null,
+        "subject_id": "@student:pangea.chat",
+        "reporter_id": null,
+        "room_id": "!dm:pangea.chat",
+        "room_name": null,
+        "event_id": "$flagged",
+        "categories": [
+          "harassment"
+        ],
+        "self_harm": false,
+        "rule": null,
+        "top_score": 0.42,
+        "text": "a flagged message",
+        "reason": null,
+        "created_ms": 1761200000000,
+        "updated_ms": 1761200000000,
+        "course_ids": [
+          "!course:pangea.chat"
+        ],
+        "revision": 3
+      }
+    ],
+    "safety_backlog": false,
+    "safety_order": [
+      12,
+      1761200002000
+    ]
+  },
+  "safety_response_example": {
+    "delivered_through": 812360,
+    "rejected": 0,
+    "safety_rejected": [],
+    "safety_unnamed": 0
   }
 }
