@@ -5,7 +5,7 @@ description: "The homeserver's part of a course as a trip: slicing an existing c
 
 # Course trip (Synapse module)
 
-A course is a trip through cities, one per Can-Do (org [quests and learning objectives](../../../.github/.github/instructions/quests-and-learning-objectives.instructions.md), "A course is a trip" and "Progression"; plan of record pangeachat/.github#780). The course's own copy, `pangea.course_missions` version 2, carries each Can-Do's pins and their city (name and position in integer microdegrees, since Matrix event content has no decimals), and a `start_date` on a dated course. This module slices courses into cities and places the ship of a course that runs by progress.
+A course is a trip through cities, one per Can-Do (org [quests and learning objectives](../../../.github/.github/instructions/quests.instructions.md), "A course is a trip" and "Progression"; plan of record pangeachat/.github#780). The course's own copy, `pangea.course_missions` version 2, carries each Can-Do's pins and their city (name and position in integer microdegrees, since Matrix event content has no decimals), and a `start_date` on a dated course. This module slices courses into cities and places the ship of a course that runs by progress.
 
 ## The experience
 
