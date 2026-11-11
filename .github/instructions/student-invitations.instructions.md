@@ -7,7 +7,7 @@ description: "What the Synapse module does for student invitations: keeping each
 
 ## Purpose
 
-The module is where a student invitation lives: it keeps the invitation a teacher adds, emails the student, runs the one claim that joins them to the course, and records that the course manages them. The rules a teacher or student meets are the org [student invitations](../../../.github/.github/instructions/student-invitations.instructions.md) doc's; what management means is the org [managed accounts](../../../.github/.github/instructions/managed-accounts.instructions.md) doc's; seats are the choreographer's, which asks the module which invitations a student has claimed. This doc covers only what the module decides on its own.
+The module is where a student invitation lives: it keeps the invitation a teacher adds, emails the student, runs the one claim that joins them to the course, and records that the course manages them. The rules a teacher or student meets are the org [joining courses](../../../.github/.github/instructions/joining-courses.instructions.md) doc's; what management means is the org [managed accounts](../../../.github/.github/instructions/managed-accounts.instructions.md) doc's; seats are the choreographer's, which asks the module which invitations a student has claimed. This doc covers only what the module decides on its own.
 
 ## The experience
 
