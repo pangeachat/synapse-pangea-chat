@@ -25,7 +25,7 @@ public room directory and has a current `pangea.course_plan` state event carryin
 plan id.
 
 Nothing else is checked — not the member count, not the join rule, and above all not
-the contents of the quest. A quest with zero missions is a published course and
+the contents of the quest. A quest with zero Can-Dos is a published course and
 appears. Synapse cannot see quest content and must not be taught to: holding the rule
 to Matrix state is what keeps it one rule, applied the same way whether or not a
 filter is passed. Two code paths that each decided eligibility separately are how the
@@ -36,7 +36,7 @@ writes `uuid`; the fallback is for rooms created before that and is what the one
 backfill normalises. Only current room state counts, so a room that once had a course
 plan and no longer does is not a course.
 
-The id is a `quest-plans` row id — that is what a course space pins (see the cross-repo [quests and learning objectives](../../../.github/.github/instructions/quests.instructions.md) spec). Anything resolving a plan id against the CMS asks `quest-plans` alone. A room still holding an id from the retired v1 collection does not resolve, so the CMS gives it no language.
+The id is a `quest-plans` row id — that is what a course space pins (see the cross-repo [quests](../../../.github/.github/instructions/quests.instructions.md) spec). Anything resolving a plan id against the CMS asks `quest-plans` alone. A room still holding an id from the retired v1 collection does not resolve, so the CMS gives it no language.
 
 ## Language
 

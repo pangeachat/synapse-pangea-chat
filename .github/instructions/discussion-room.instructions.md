@@ -12,7 +12,7 @@ The homeserver places each student in a room for one of their course's discussio
 - A discussion room is one the discussion bot created and marked, at creation, with its course and discussion. That mark can't be changed later and only the server can make the bot create a room, so a room a student made to look like one is never used.
 - The course must be a course space (a space with a course plan) the caller is joined to; a bot-made room keyed to any other room would admit that room's members.
 - Only rooms linked into the course count. A room that can't be linked is left by the bot and the request fails, since nobody could find it.
-- The activity must be a Discussion-mode activity with one shared role that this course may use: a catalog discussion filed under one of the course's Missions, as a roleplay is, or the course's own edited copy. The course's Missions are those of its quest (named by `uuid`, or `course_plan_id` in older spaces) and those its own Can-Do list adds; that list counts only when a course admin wrote it, as the client reads it. Another course's copy, or anything else, answers not found. Two courses that share a discussion never share a room.
+- The activity must be a Discussion-mode activity with one shared role that this course may use: a catalog discussion filed under one of the course's Can-Dos, as a roleplay is, or the course's own edited copy. The course's Can-Dos are those of its quest (named by `uuid`, or `course_plan_id` in older spaces) and those its own Can-Do list adds; that list counts only when a course admin wrote it, as the client reads it. Another course's copy, or anything else, answers not found. Two courses that share a discussion never share a room.
 
 ## Placement
 

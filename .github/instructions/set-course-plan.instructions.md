@@ -32,7 +32,7 @@ A dry run does everything except the writes, including the CMS read, and reports
 
 ## What the teacher sees
 
-The space's new name and description in the app. The course plan change itself shows nowhere: the client doesn't show `pangea.course_plan` events in the timeline, and nothing sends a notification. The next time the teacher opens the course page, it shows the new quest. In the dashboard's Content Studio the course shows the new quest's list; the old copy's notes, due dates, order and removals are gone. Stars carry over only for activities under the new quest's Missions. Teacher pins are keyed by Mission ID, so they stop applying to Missions the new quest doesn't share (see the client's [quests](../../../client/.github/instructions/quests.instructions.md) design).
+The space's new name and description in the app. The course plan change itself shows nowhere: the client doesn't show `pangea.course_plan` events in the timeline, and nothing sends a notification. The next time the teacher opens the course page, it shows the new quest. In the dashboard's Content Studio the course shows the new quest's list; the old copy's notes, due dates, order and removals are gone. Stars carry over only for activities under the new quest's Can-Dos. Teacher pins are keyed by Can-Do ID, so they stop applying to Can-Dos the new quest doesn't share (see the client's [quests](../../../client/.github/instructions/quests.instructions.md) design).
 
 ## Not in scope
 
