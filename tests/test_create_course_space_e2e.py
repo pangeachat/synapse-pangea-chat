@@ -300,8 +300,13 @@ class _QuestCmsHandler(BaseHTTPRequestHandler):
                 "req": {"target_language": "es"},
                 "res": {
                     "learning_objective_sequence": [
-                        {"learning_objective": "lo-b"},
-                        {"learning_objective": "lo-a"},
+                        # The plan's selection and note start the copy.
+                        {
+                            "learning_objective": "lo-b",
+                            "activity_ids": ["act-b2"],
+                            "note": "Unit 3",
+                        },
+                        {"learning_objective": "lo-a", "activity_ids": None},
                     ]
                 },
             }
@@ -320,6 +325,14 @@ class _QuestCmsHandler(BaseHTTPRequestHandler):
                         "id": "row-2",
                         "req": {},
                         "res": {"plan": {"activity_id": "act-b", "l2": "es"}},
+                        "learningObjectiveRefs": ["lo-b"],
+                        "hidden": False,
+                        "visibility": "public",
+                    },
+                    {
+                        "id": "row-3",
+                        "req": {},
+                        "res": {"plan": {"activity_id": "act-b2", "l2": "es"}},
                         "learningObjectiveRefs": ["lo-b"],
                         "hidden": False,
                         "visibility": "public",
@@ -392,7 +405,7 @@ class TestCourseCopyAtCreationE2E(BaseSynapseE2ETest):
                 "version": 1,
                 "revision": 1,
                 "missions": [
-                    {"lo_id": "lo-b", "activity_ids": ["act-b"]},
+                    {"lo_id": "lo-b", "activity_ids": ["act-b2"], "note": "Unit 3"},
                     {"lo_id": "lo-a", "activity_ids": ["act-a"]},
                 ],
             },

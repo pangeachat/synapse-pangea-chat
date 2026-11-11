@@ -8,7 +8,7 @@ leaves the course without a copy instead of failing creation.
 
 import json
 import unittest
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock
 from urllib.parse import parse_qsl, urlparse
 
@@ -178,6 +178,80 @@ class TestBuildCourseMissionsContent(unittest.TestCase):
     def test_quest_without_target_language_cannot_be_copied(self) -> None:
         with self.assertRaises(CourseMissionsError):
             build_course_missions_content(_quest(["lo-a"], l2=None), [])
+
+
+def _entry_quest(*entries: Dict[str, Any]) -> Dict[str, Any]:
+    quest = _quest([])
+    quest["res"]["learning_objective_sequence"] = list(entries)
+    return quest
+
+
+LISTED = [_activity(a, ["lo-a"]) for a in ("act-1", "act-2", "act-3")]
+
+
+class TestPlanEntrySelectionAndNote(unittest.TestCase):
+    """A new copy starts from the plan entry's selected activities and note
+    (org quests.instructions.md, "Each entry in the Can-Do sequence")."""
+
+    def _mission(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        content = build_course_missions_content(
+            _entry_quest({"learning_objective": "lo-a", **entry}), LISTED
+        )
+        return content["missions"][0]
+
+    def test_the_selection_is_copied_in_its_order(self) -> None:
+        mission = self._mission({"activity_ids": ["act-3", "act-1"]})
+        self.assertEqual(mission["activity_ids"], ["act-3", "act-1"])
+
+    def test_a_selected_activity_the_library_does_not_return_is_skipped(
+        self,
+    ) -> None:
+        mission = self._mission({"activity_ids": ["gone", "act-2"]})
+        self.assertEqual(mission["activity_ids"], ["act-2"])
+
+    def test_no_selection_or_an_empty_one_copies_every_activity(self) -> None:
+        selections: Tuple[Optional[List[str]], ...] = (None, [])
+        for selected in selections:
+            mission = self._mission({"activity_ids": selected})
+            self.assertEqual(mission["activity_ids"], ["act-1", "act-2", "act-3"])
+
+    def test_a_selection_the_library_returns_none_of_copies_every_activity(
+        self,
+    ) -> None:
+        mission = self._mission({"activity_ids": ["gone"]})
+        self.assertEqual(mission["activity_ids"], ["act-1", "act-2", "act-3"])
+
+    def test_the_note_is_copied(self) -> None:
+        mission = self._mission({"note": "Textbook unit 3"})
+        self.assertEqual(mission["note"], "Textbook unit 3")
+
+    def test_no_note_or_a_blank_one_is_left_out(self) -> None:
+        for note in (None, "", "   "):
+            self.assertNotIn("note", self._mission({"note": note}))
+
+    def test_a_note_readers_would_refuse_is_left_out(self) -> None:
+        # 141 emoji are 141 characters but 282 UTF-16 units, the length the
+        # readers count; the copy stays valid without it.
+        with self.assertLogs(
+            "synapse.module.synapse_pangea_chat.email_invite.course_missions",
+            level="WARNING",
+        ):
+            mission = self._mission({"note": "\U0001f600" * 141})
+        self.assertNotIn("note", mission)
+        self.assertEqual(self._mission({"note": "x" * 280})["note"], "x" * 280)
+
+    def test_a_mission_listed_twice_keeps_its_first_entry(self) -> None:
+        content = build_course_missions_content(
+            _entry_quest(
+                {"learning_objective": "lo-a", "activity_ids": ["act-2"], "note": "1"},
+                {"learning_objective": "lo-a", "activity_ids": ["act-3"], "note": "2"},
+            ),
+            LISTED,
+        )
+        self.assertEqual(
+            content["missions"],
+            [{"lo_id": "lo-a", "activity_ids": ["act-2"], "note": "1"}],
+        )
 
 
 class _Response:
