@@ -15,6 +15,7 @@ Tier 2 are driven through the real `ChatModeration` handlers.
 """
 
 import logging
+import sqlite3
 import unittest
 from types import SimpleNamespace
 from typing import (
@@ -52,6 +53,7 @@ from synapse_pangea_chat.moderation.incidents import (
     ACTION_PRESERVED,
     ACTION_REDACTED,
     ACTION_REPORTED,
+    CREATE_STATEMENTS,
     OUTCOME_FAILED,
     OUTCOME_PENDING,
     OUTCOME_REMOVED,
@@ -61,10 +63,15 @@ from synapse_pangea_chat.moderation.incidents import (
     STATEMENTS,
     Incident,
     IncidentStore,
+    IncidentWriteError,
+    create_tables,
     merge_action,
     merge_incident,
     merge_outcome,
     next_updated_ms,
+    read_outbox,
+    remark_outbox,
+    settle_outbox,
 )
 from synapse_pangea_chat.moderation.recorder import IncidentRecorder
 from synapse_pangea_chat.moderation.room_names import (
@@ -435,7 +442,7 @@ class TestIncidentSqlRunsOnSqlite(unittest.TestCase):
 
         connection = sqlite3.connect(":memory:")
         try:
-            for sql in STATEMENTS[:4]:
+            for sql in CREATE_STATEMENTS:
                 connection.execute(sqlite_engine().convert_param_style(sql))
         finally:
             connection.close()
@@ -554,6 +561,224 @@ class TestIncidentStore(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             await store.set_outcome("mod:$e1", OUTCOME_REMOVED, only_if=OUTCOME_PENDING)
         )
+
+
+# ---------------------------------------------------------------------------
+# The forward outbox (admin-dash#300)
+# ---------------------------------------------------------------------------
+
+
+class _RollbackPool(DbPoolDouble):
+    """The shared double, plus the rollback a real transaction does when its
+    function raises: what makes "the same transaction" testable."""
+
+    async def runInteraction(self, desc: str, func: Any, *args: Any, **kw: Any) -> Any:
+        try:
+            return await super().runInteraction(desc, func, *args, **kw)
+        except BaseException:
+            self.connection.rollback()
+            raise
+
+
+def _outbox(db_pool: DbPoolDouble) -> Dict[str, Tuple[int, bool, bool]]:
+    rows = db_pool.connection.execute(
+        "SELECT incident_id, revision, dirty, parked "
+        "FROM pangea_safety_incident_outbox"
+    ).fetchall()
+    return {row[0]: (int(row[1]), bool(row[2]), bool(row[3])) for row in rows}
+
+
+async def _in_txn(db_pool: DbPoolDouble, func: Callable[[Any], Any]) -> Any:
+    return await db_pool.runInteraction("test", func)
+
+
+class TestForwardOutbox(unittest.IsolatedAsyncioTestCase):
+    async def test_every_write_path_marks_the_outbox(self) -> None:
+        db_pool = DbPoolDouble()
+        store, homeserver = _store(db_pool)
+        await store.insert(_incident(outcome=OUTCOME_PENDING, attempt_id="a"))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (1, True, False))
+        await store.insert(_incident(text="again"))  # an existing row: no write
+        self.assertEqual(_outbox(db_pool)["mod:$e1"][0], 1)
+
+        await _in_txn(db_pool, lambda txn: settle_outbox(txn, [("mod:$e1", 1)], []))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (1, False, False))
+
+        await store.upsert_verdict(_incident(top_score=0.9))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (2, True, False))
+        await store.upsert_verdict(_incident(top_score=0.9))  # nothing new
+        self.assertEqual(_outbox(db_pool)["mod:$e1"][0], 2)
+
+        homeserver.clock.advance(1.0)
+        self.assertTrue(
+            await store.set_outcome("mod:$e1", OUTCOME_UNKNOWN, attempt_id="a")
+        )
+        self.assertEqual(_outbox(db_pool)["mod:$e1"][0], 3)
+
+        await store.upsert_verdict(
+            _incident(outcome=OUTCOME_PENDING, attempt_id="b", top_score=0.9)
+        )
+        self.assertEqual(_outbox(db_pool)["mod:$e1"][0], 4)
+        self.assertTrue(await store.abandon_attempt("mod:$e1", "b"))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (5, True, False))
+
+        await store.upsert_verdict(_incident(incident_id="mod:$new"))
+        self.assertEqual(_outbox(db_pool)["mod:$new"], (1, True, False))
+
+    async def test_a_failed_mark_undoes_the_incident_write(self) -> None:
+        db_pool = _RollbackPool()
+        store, _hs = _store(db_pool)
+        await store.ensure_table()
+
+        def refuse_the_mark(sql: str, _args: Any) -> None:
+            if "INSERT INTO pangea_safety_incident_outbox" in sql:
+                raise RuntimeError("outbox write refused")
+
+        db_pool.on_statement = refuse_the_mark
+        with self.assertRaises(RuntimeError):
+            await store.insert(_incident())
+        db_pool.on_statement = None
+        self.assertEqual(_rows(db_pool), [], "an incident was stored without a mark")
+        self.assertEqual(_outbox(db_pool), {})
+
+        await store.insert(_incident())
+        db_pool.on_statement = refuse_the_mark
+        with self.assertRaises(RuntimeError):
+            await store.upsert_verdict(_incident(top_score=0.99))
+        db_pool.on_statement = None
+        row = await store.get("mod:$e1")
+        assert row is not None
+        self.assertEqual(row.top_score, 0.3, "an update was stored without a mark")
+
+    async def test_a_failed_incident_write_leaves_no_mark(self) -> None:
+        db_pool = _RollbackPool()
+        store, _hs = _store(db_pool)
+        await store.ensure_table()
+
+        def refuse_the_row(sql: str, _args: Any) -> None:
+            # The incident row's own INSERT, not the course index or the mark.
+            if sql.lstrip().startswith("INSERT INTO pangea_safety_incidents\n"):
+                raise sqlite3.IntegrityError("refused")
+
+        db_pool.on_statement = refuse_the_row
+        with self.assertRaises(IncidentWriteError):
+            await store.insert(_incident())
+        db_pool.on_statement = None
+        self.assertEqual(_outbox(db_pool), {})
+
+    async def test_the_read_is_oldest_first_bounded_and_whole(self) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident(incident_id="mod:$c", updated_ms=30))
+        await store.insert(_incident(incident_id="mod:$a", updated_ms=10))
+        await store.insert(
+            _incident(
+                incident_id="report:r1",
+                updated_ms=20,
+                text="dm text",
+                course_ids=(COURSE_A, COURSE_B),
+            )
+        )
+        entries, more = await _in_txn(db_pool, lambda txn: read_outbox(txn, 2))
+        self.assertTrue(more)
+        self.assertEqual([e.incident_id for e in entries], ["mod:$a", "report:r1"])
+        second = entries[1].incident
+        assert second is not None
+        self.assertEqual(second.text, "dm text")
+        self.assertEqual(second.course_ids, (COURSE_A, COURSE_B))
+        self.assertEqual(entries[1].revision, 1)
+        entries, more = await _in_txn(db_pool, lambda txn: read_outbox(txn, 3))
+        self.assertFalse(more)
+        self.assertEqual(len(entries), 3)
+
+    async def test_a_mark_whose_row_is_gone_is_read_without_an_incident(
+        self,
+    ) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident())
+        db_pool.connection.execute("DELETE FROM pangea_safety_incidents")
+        entries, _more = await _in_txn(db_pool, lambda txn: read_outbox(txn, 20))
+        self.assertEqual(
+            [(e.incident_id, e.incident) for e in entries], [("mod:$e1", None)]
+        )
+
+    async def test_settle_clears_only_the_revision_sent(self) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident())
+        entries, _ = await _in_txn(db_pool, lambda txn: read_outbox(txn, 20))
+        await store.upsert_verdict(_incident(top_score=0.8))  # lands in flight
+        sent = [(e.incident_id, e.revision) for e in entries]
+        await _in_txn(db_pool, lambda txn: settle_outbox(txn, sent, []))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (2, True, False))
+
+    async def test_a_parked_mark_waits_for_reconciliation(self) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident(updated_ms=10))
+        await _in_txn(db_pool, lambda txn: settle_outbox(txn, [], [("mod:$e1", 1)]))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (1, False, True))
+        entries, more = await _in_txn(db_pool, lambda txn: read_outbox(txn, 20))
+        self.assertEqual((entries, more), ([], False))
+        # Reconciliation bounded well above the row's change still unparks it.
+        await _in_txn(db_pool, lambda txn: remark_outbox(txn, 10**12))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (2, True, False))
+        entries, _ = await _in_txn(db_pool, lambda txn: read_outbox(txn, 20))
+        self.assertEqual([e.revision for e in entries], [2])
+
+    async def test_a_new_write_unparks(self) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident())
+        await _in_txn(db_pool, lambda txn: settle_outbox(txn, [], [("mod:$e1", 1)]))
+        await store.upsert_verdict(_incident(top_score=0.7))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (2, True, False))
+
+    async def test_reconciliation_marks_what_unmarked_code_wrote(self) -> None:
+        """A rollback window: code without the outbox wrote an incident and
+        changed another; neither has a mark. Re-marking from the bound finds
+        both and leaves an older delivered one alone."""
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident(incident_id="mod:$old", updated_ms=100))
+        await store.insert(_incident(incident_id="mod:$changed", updated_ms=200))
+        await _in_txn(
+            db_pool,
+            lambda txn: settle_outbox(txn, [("mod:$old", 1), ("mod:$changed", 1)], []),
+        )
+        # The reverted code: plain writes, no mark.
+        db_pool.connection.execute(
+            "UPDATE pangea_safety_incidents SET updated_ms = 900 "
+            "WHERE incident_id = 'mod:$changed'"
+        )
+        db_pool.connection.execute(
+            "INSERT INTO pangea_safety_incidents (incident_id, source, action, "
+            "room_id, course_ids, categories, self_harm, created_ms, updated_ms) "
+            "VALUES ('mod:$unmarked', 'moderation', 'kept', '!r:hs', '[]', '[]', "
+            "0, 950, 950)"
+        )
+        db_pool.connection.commit()
+        await _in_txn(db_pool, lambda txn: remark_outbox(txn, 500))
+        outbox = _outbox(db_pool)
+        self.assertEqual(outbox["mod:$old"], (1, False, False))
+        self.assertEqual(outbox["mod:$changed"], (2, True, False))
+        self.assertEqual(outbox["mod:$unmarked"], (1, True, False))
+
+    async def test_no_watermark_marks_everything(self) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident(incident_id="mod:$a", updated_ms=1))
+        await _in_txn(db_pool, lambda txn: settle_outbox(txn, [("mod:$a", 1)], []))
+        await _in_txn(db_pool, lambda txn: remark_outbox(txn, None))
+        self.assertEqual(_outbox(db_pool)["mod:$a"], (2, True, False))
+
+    async def test_the_forwarder_can_create_the_tables_first(self) -> None:
+        db_pool = DbPoolDouble()
+        await _in_txn(db_pool, create_tables)
+        await _in_txn(db_pool, create_tables)  # idempotent
+        entries, more = await _in_txn(db_pool, lambda txn: read_outbox(txn, 20))
+        self.assertEqual((entries, more), ([], False))
 
 
 # ---------------------------------------------------------------------------

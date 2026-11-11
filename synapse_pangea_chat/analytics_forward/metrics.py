@@ -36,6 +36,18 @@ REJECTED = _get_or_create(
     "pangea_analytics_forward_rejected",
     "Events the ingest acknowledged but set aside as rejects.",
 )
+SAFETY_SENT = _get_or_create(
+    Counter,
+    "pangea_analytics_forward_safety_sent",
+    "Safety incidents sent in acknowledged batches (re-sends included).",
+)
+SAFETY_PARKED = _get_or_create(
+    Counter,
+    "pangea_analytics_forward_safety_parked",
+    "Safety incidents the ingest refused, parked until the next "
+    "reconciliation. Alert when it grows: the Safety page says it could not "
+    "refresh while any is open.",
+)
 FAILURES = _get_or_create(
     Counter,
     "pangea_analytics_forward_failures",
