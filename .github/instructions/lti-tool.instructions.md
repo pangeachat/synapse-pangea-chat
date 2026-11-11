@@ -5,7 +5,7 @@ description: "What the module decides for the Canvas connection (LTI 1.3): it is
 
 # Canvas tool (LTI)
 
-The module is how a school's Canvas (or another LMS) connects to Pangea: a teacher links a Canvas course to a Pangea course, imports the class list as seat invitations, and students open Pangea from Canvas. The flows are in the org [lms-integration](../../../.github/.github/instructions/lms-integration.instructions.md) doc; the invitations an import creates are in the org [student invitations](../../../.github/.github/instructions/student-invitations.instructions.md) doc.
+The module is how a school's Canvas (or another LMS) connects to Pangea: a teacher links a Canvas course to a Pangea course, imports the class list as seat invitations, and students open Pangea from Canvas. The flows are in the org [lms-integration](../../../.github/.github/instructions/lms-integration.instructions.md) doc; the invitations an import creates are in the org [joining courses](../../../.github/.github/instructions/joining-courses.instructions.md) doc.
 
 Canvas is not released: the tool runs only when the module is configured for it, no environment is, and admin-dash shows nothing Canvas.
 
