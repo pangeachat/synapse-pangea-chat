@@ -15,7 +15,7 @@ dependencies = [
   "phonenumbers",
   # LTI 1.3 launch validation and the tool's RS256 signing (synapse_pangea_chat/lti).
   # Pinned: it is on the security-critical path, so upgrades are deliberate.
-  "PyJWT[crypto] == 2.15.0",
+  "PyJWT[crypto] == 2.15.1",
   # The share kit's QR code. Pure Python with no dependencies; writes PNG itself.
   "segno >= 1.6, < 2",
 ]
@@ -23,8 +23,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   # for tests
-  "matrix-synapse == 1.159.0",
-  "prometheus-client == 0.22.1",
+  "matrix-synapse == 1.164.2",
+  "prometheus-client == 0.26.0",
   "tox",
   "twisted == 24.7.0",
   "aiounittest",
@@ -32,7 +32,7 @@ dev = [
   "psycopg2",
   "requests",
   "testing.postgresql",
-  "locust == 2.42.0",
+  "locust == 2.46.0",
   # For the Tier 1 collision gate (tests/test_moderation_tier1_terms.py) only.
   # NEVER a runtime dependency: it carries ~324 MB of frequency data with the
   # [cjk] extra, which is what supplies the Japanese, Korean and Chinese
@@ -43,7 +43,7 @@ dev = [
   "mypy == 1.6.1",
   # for linting
   "black == 23.10.0",
-  "ruff == 0.1.1",
+  "ruff == 0.17.4",
 ]
 
 [build-system]
