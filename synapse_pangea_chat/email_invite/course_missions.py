@@ -16,17 +16,19 @@ from __future__ import annotations
 
 import json
 import logging
-from io import BytesIO
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypeGuard
 from urllib.parse import quote, urlencode
 
-from synapse.http.client import read_body_with_max_size
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.module_api import ModuleApi
 from synapse.util.async_helpers import timeout_deferred
-from twisted.web.http_headers import Headers
+
+from synapse_pangea_chat.cms_http import cms_request, service_headers
+from synapse_pangea_chat.room_code.instructor_access import user_power
 
 COURSE_MISSIONS_STATE_EVENT_TYPE = "pangea.course_missions"
+# Only a course admin may write the copy; a copy from anyone else is ignored.
+COURSE_ADMIN_POWER = 100
 
 # The whole read (both CMS requests) is bounded: course creation and a claim
 # wait on it, and a caller that times out and retries a creation would make a
@@ -97,6 +99,104 @@ def _visible_at(doc: Mapping[str, Any], l2: str) -> bool:
     )
 
 
+def activity_lo_ids(doc: Mapping[str, Any]) -> List[str]:
+    """The Missions an ``activities-v2`` row is filed under."""
+    refs = doc.get("learningObjectiveRefs")
+    return [
+        lo_id
+        for lo_id in (_ref_id(ref) for ref in (refs if isinstance(refs, list) else []))
+        if lo_id is not None
+    ]
+
+
+def _string_list(value: Any) -> TypeGuard[List[str]]:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _copy_lo_ids(content: Mapping[str, Any]) -> Optional[List[str]]:
+    """Every Mission a course copy names, shown and removed, or None when the
+    copy is malformed. The client's strict parse (``CourseMissionsEvent
+    .tryParse``) decides which records count; this checks the same structure
+    (version, revision, each Mission's id and activity lists, the removed
+    Missions), so a copy the client ignores names nothing here. A note, due
+    date or time zone the client would refuse is not checked: none of them
+    changes which Missions the course lists."""
+    revision = content.get("revision")
+    missions = content.get("missions")
+    if (
+        content.get("version") != 1
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+        or not isinstance(missions, list)
+    ):
+        return None
+    shown: List[str] = []
+    for mission in missions:
+        if not isinstance(mission, Mapping):
+            return None
+        lo_id = mission.get("lo_id")
+        removed_ids = mission.get("removed_activity_ids")
+        if (
+            not isinstance(lo_id, str)
+            or not lo_id
+            or lo_id in shown
+            or not _string_list(mission.get("activity_ids"))
+            or (removed_ids is not None and not _string_list(removed_ids))
+        ):
+            return None
+        shown.append(lo_id)
+    removed: List[str] = []
+    removed_missions = content.get("removed_missions")
+    if removed_missions is not None:
+        if not isinstance(removed_missions, list):
+            return None
+        for mission in removed_missions:
+            if not isinstance(mission, Mapping):
+                return None
+            lo_id = mission.get("lo_id")
+            ids = mission.get("activity_ids")
+            shown_count = mission.get("shown_count")
+            if (
+                not isinstance(lo_id, str)
+                or not lo_id
+                or not _string_list(ids)
+                or not isinstance(shown_count, int)
+                or isinstance(shown_count, bool)
+                or not 0 <= shown_count <= len(ids)
+            ):
+                return None
+            removed.append(lo_id)
+    return shown + [lo_id for lo_id in removed if lo_id not in shown]
+
+
+def course_copy_lo_ids(state: Mapping[Tuple[str, str], Any]) -> List[str]:
+    """The Missions a course's own copy names, as the client reads it: empty
+    unless the course has a well-formed ``pangea.course_missions`` sent by
+    someone who is a course admin (power level 100, creators count) now, so
+    a student can never add a Mission to their course. ``state`` must hold
+    the copy, the create event and the power levels."""
+    event = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
+    # Empty content is the copy a failed read leaves (set_course_plan):
+    # no copy, by design.
+    if event is None or not event.content:
+        return []
+    if user_power(state, event.sender) < COURSE_ADMIN_POWER:
+        logger.info(
+            "course copy in %s was not sent by a course admin; ignored",
+            getattr(event, "room_id", "?"),
+        )
+        return []
+    lo_ids = _copy_lo_ids(event.content)
+    if lo_ids is None:
+        logger.warning(
+            "course copy in %s is malformed; ignored, as the client does",
+            getattr(event, "room_id", "?"),
+        )
+        return []
+    return lo_ids
+
+
 def build_course_missions_content(
     quest: Mapping[str, Any], activities: Sequence[Mapping[str, Any]]
 ) -> Dict[str, Any]:
@@ -119,11 +219,8 @@ def build_course_missions_content(
         if not isinstance(activity_id, str) or not activity_id or activity_id in seen:
             continue
         seen.add(activity_id)
-        refs = doc.get("learningObjectiveRefs")
-        for ref in refs if isinstance(refs, list) else []:
-            lo_id = _ref_id(ref)
-            if lo_id is not None:
-                by_lo.setdefault(lo_id, []).append(activity_id)
+        for lo_id in activity_lo_ids(doc):
+            by_lo.setdefault(lo_id, []).append(activity_id)
 
     return {
         "version": 1,
@@ -161,28 +258,32 @@ class CourseMissionsReader:
         self._http = api.http_client
         self._clock = api._hs.get_clock()
         self._base = cms_base_url.rstrip("/") + "/api/"
-        self._headers = Headers(
-            {"Authorization": [f"service-users API-Key {cms_api_key}"]}
-        )
+        self._headers = service_headers(cms_api_key)
 
     async def _get(self, path: str) -> Any:
-        response = await self._http.request(
-            "GET", self._base + path, headers=self._headers
+        code, raw = await cms_request(
+            self._http,
+            "GET",
+            self._base + path,
+            self._headers,
+            max_bytes=MAX_BODY_BYTES,
         )
-        buffer = BytesIO()
-        await make_deferred_yieldable(
-            read_body_with_max_size(response, buffer, MAX_BODY_BYTES)
-        )
-        if response.code != 200:
-            raise CourseMissionsError(
-                f"CMS {path.split('?')[0]} answered {response.code}"
-            )
-        return json.loads(buffer.getvalue())
+        if code != 200:
+            raise CourseMissionsError(f"CMS {path.split('?')[0]} answered {code}")
+        return json.loads(raw)
 
-    async def _build(self, quest_id: str) -> Dict[str, Any]:
+    async def _quest(self, quest_id: str) -> Mapping[str, Any]:
         quest = await self._get(f"quest-plans/{quote(quest_id, safe='')}?depth=0")
         if not isinstance(quest, Mapping):
             raise CourseMissionsError("quest read returned no document")
+        return quest
+
+    async def quest_lo_ids(self, quest_id: str) -> List[str]:
+        """The quest's Missions, in order; raises when the CMS cannot say."""
+        return quest_lo_ids(await self._quest(quest_id))
+
+    async def _build(self, quest_id: str) -> Dict[str, Any]:
+        quest = await self._quest(quest_id)
         l2 = quest_target_language(quest)
         lo_ids = quest_lo_ids(quest)
         if l2 is None:

@@ -1,4 +1,5 @@
-"""Per-route request limits for the student invitation routes.
+"""Per-route request limits for the student invitation, Canvas and
+discussion room routes.
 
 Each route reads ``<route>_requests_per_burst`` and
 ``<route>_burst_duration_seconds`` from the module config. Authenticated
@@ -35,6 +36,12 @@ DEFAULT_LIMITS: Dict[str, Tuple[int, int]] = {
     "lti_connect": (20, 60),
     "lti_course_status": (60, 60),
     "lti_import": (10, 60),
+    # Discussion rooms (discussion-room.instructions.md), per caller. A start
+    # page polls its preview every few seconds, so previews get their own,
+    # larger allowance and never use up joins.
+    "discussion_room_place": (10, 60),
+    "discussion_room_preview": (30, 60),
+    "discussion_room_seat": (20, 60),
 }
 
 
