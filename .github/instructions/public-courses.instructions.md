@@ -36,7 +36,7 @@ writes `uuid`; the fallback is for rooms created before that and is what the one
 backfill normalises. Only current room state counts, so a room that once had a course
 plan and no longer does is not a course.
 
-The id is a `quest-plans` row id — that is what a course space pins (see the cross-repo [quests and learning objectives](../../../.github/.github/instructions/quests-and-learning-objectives.instructions.md) spec). Anything resolving a plan id against the CMS asks `quest-plans` alone. A room still holding an id from the retired v1 collection does not resolve, so the CMS gives it no language.
+The id is a `quest-plans` row id — that is what a course space pins (see the cross-repo [quests and learning objectives](../../../.github/.github/instructions/quests.instructions.md) spec). Anything resolving a plan id against the CMS asks `quest-plans` alone. A room still holding an id from the retired v1 collection does not resolve, so the CMS gives it no language.
 
 ## Language
 
