@@ -1,8 +1,25 @@
-from typing import List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 
 class CourseFilters(TypedDict, total=False):
     target_language: str
+
+
+class CourseAdmin(TypedDict):
+    """Someone who runs a course: a course admin who is not a bot and is
+    still in it, with the name and avatar (an mxc URI) they show there."""
+
+    user_id: str
+    display_name: Optional[str]
+    avatar_url: Optional[str]
+
+
+class CourseInstitution(TypedDict):
+    """The school a course names: its display name and, when one was picked,
+    its ROR or NCES id."""
+
+    name: str
+    id: Optional[str]
 
 
 class Course(TypedDict):
@@ -19,6 +36,10 @@ class Course(TypedDict):
     target_language: Optional[str]
     topic: Optional[str]
     world_readable: bool
+    course_missions: Optional[Dict[str, Any]]
+    course_position: Optional[Dict[str, Any]]
+    admins: List[CourseAdmin]
+    institution: Optional[CourseInstitution]
 
 
 class PublicCoursesResponse(TypedDict):

@@ -92,6 +92,18 @@ class FakeCatalog:
             ]
         if name == "get_public_courses_room_stats":
             return []
+        if name == "get_public_courses_admins":
+            # args: member type, then room and user ids. Every member event of
+            # the rooms asked about; the catalog keeps the ones it named, or
+            # the admins among them where every member may be one. The real
+            # query is covered end to end.
+            return [
+                (room_id, state_key, event)
+                for room_id, events in self.state.items()
+                if room_id in args
+                for event_type, state_key, event in events
+                if event_type == args[0]
+            ]
         raise AssertionError(f"Unexpected query name: {name}")
 
 
@@ -275,6 +287,233 @@ class TestGetPublicCourses(unittest.IsolatedAsyncioTestCase):
         page = await self._get(catalog, limit=0)
         self.assertEqual(len(page["chunk"]), mod.DEFAULT_LIMIT)
 
+    async def test_limit_above_the_cap_is_served_at_the_cap(self) -> None:
+        catalog = FakeCatalog(
+            [(f"!r{i:03d}:test", f"plan-{i}", "es") for i in range(mod.MAX_LIMIT + 5)]
+        )
+        page = await self._get(catalog, limit=10_000)
+        self.assertEqual(len(page["chunk"]), mod.MAX_LIMIT)
+        self.assertEqual(page["next_batch"], page["chunk"][-1]["room_id"])
+
+    async def test_a_capped_page_continues_from_a_legacy_offset(self) -> None:
+        catalog = FakeCatalog(
+            [(f"!r{i:03d}:test", f"plan-{i}", "es") for i in range(mod.MAX_LIMIT + 10)]
+        )
+        page = await self._get(catalog, limit=10_000, since="5")
+        self.assertEqual(len(page["chunk"]), mod.MAX_LIMIT)
+        self.assertEqual(page["chunk"][0]["room_id"], "!r005:test")
+        rest = await self._get(catalog, limit=10_000, since=page["next_batch"])
+        self.assertEqual(len(rest["chunk"]), 5)
+        self.assertIsNone(rest["next_batch"])
+
+    async def _trip(
+        self, events: List[Tuple[str, str, Dict[str, Any]]]
+    ) -> Dict[str, Any]:
+        catalog = FakeCatalog(
+            [("!trip:test", "plan-1", "es")], state={"!trip:test": events}
+        )
+        return (await self._get(catalog))["chunk"][0]
+
+    async def test_a_course_carries_the_public_part_of_its_trip(self) -> None:
+        copy = {
+            "version": 2,
+            "revision": 3,
+            "time_zone": "America/Mexico_City",
+            "start_date": "2026-11-02",
+            "removed_missions": [
+                {"lo_id": "lo9", "activity_ids": ["z"], "shown_count": 1}
+            ],
+            "later_field": "members only",
+            "missions": [
+                {
+                    "lo_id": "lo1",
+                    "activity_ids": ["a1"],
+                    "removed_activity_ids": ["a2"],
+                    "note": "Bring your notebook",
+                    "due_at": "2026-11-09T00:00:00Z",
+                    "city": {"name": "Oaxaca", "lat_e6": 17065400, "lng_e6": -96726600},
+                }
+            ],
+        }
+        position = {"stop": 0, "from_stop": 0, "since": 1, "revision": 3}
+        course = await self._trip(
+            [
+                power_levels({TEACHER: 100}),
+                trip_event("pangea.course_missions", TEACHER, copy),
+                trip_event("pangea.course_position", TEACHER, position),
+            ]
+        )
+        self.assertEqual(
+            course["course_missions"],
+            {
+                "version": 2,
+                "revision": 3,
+                "time_zone": "America/Mexico_City",
+                "start_date": "2026-11-02",
+                "missions": [
+                    {
+                        "lo_id": "lo1",
+                        "activity_ids": ["a1"],
+                        "due_at": "2026-11-09T00:00:00Z",
+                        "city": {
+                            "name": "Oaxaca",
+                            "lat_e6": 17065400,
+                            "lng_e6": -96726600,
+                        },
+                    }
+                ],
+            },
+        )
+        self.assertEqual(course["course_position"], position)
+
+    async def test_a_course_without_a_trip_carries_none(self) -> None:
+        course = await self._trip([power_levels({TEACHER: 100})])
+        self.assertIsNone(course["course_missions"])
+        self.assertIsNone(course["course_position"])
+
+    async def test_a_trip_from_someone_not_a_course_admin_now_is_left_out(
+        self,
+    ) -> None:
+        """The app ignores it in a course the learner is in; so does the catalog."""
+        course = await self._trip(
+            [
+                power_levels({TEACHER: 50}),
+                trip_event("pangea.course_missions", TEACHER, {"version": 2}),
+                trip_event("pangea.course_position", TEACHER, {"stop": 0}),
+            ]
+        )
+        self.assertIsNone(course["course_missions"])
+        self.assertIsNone(course["course_position"])
+
+    async def test_a_creator_of_a_room_with_creator_power_is_a_course_admin(
+        self,
+    ) -> None:
+        course = await self._trip(
+            [
+                (
+                    "m.room.create",
+                    "",
+                    {"sender": TEACHER, "content": {"room_version": "12"}},
+                ),
+                power_levels({}),
+                trip_event("pangea.course_position", TEACHER, {"stop": 0}),
+            ]
+        )
+        self.assertEqual(course["course_position"], {"stop": 0})
+
+    async def test_who_runs_a_course_is_its_joined_human_admins(self) -> None:
+        bot = "@bot:test"
+        left = "@left:test"
+        course = await self._trip(
+            [
+                power_levels({TEACHER: 100, bot: 100, left: 100, "@ta:test": 50}),
+                member(TEACHER, "join", "Ms. Rivera", "mxc://test/rivera"),
+                member(bot, "join", "Pangea Bot"),
+                member(left, "leave", "Gone"),
+                member("@ta:test", "join", "Assistant"),
+            ]
+        )
+        self.assertEqual(
+            course["admins"],
+            [
+                {
+                    "user_id": TEACHER,
+                    "display_name": "Ms. Rivera",
+                    "avatar_url": "mxc://test/rivera",
+                }
+            ],
+        )
+
+    async def test_a_default_level_of_100_makes_every_joined_human_an_admin(
+        self,
+    ) -> None:
+        course = await self._trip(
+            [
+                (
+                    "m.room.power_levels",
+                    "",
+                    {
+                        "sender": TEACHER,
+                        "content": {"users_default": 100, "users": {"@low:test": 50}},
+                    },
+                ),
+                member(TEACHER, "join", "Ms. Rivera"),
+                member("@aide:test", "join", "Aide"),
+                member("@bot:test", "join", "Pangea Bot"),
+                member("@gone:test", "leave", "Gone"),
+                member("@low:test", "join", "Lowered"),
+            ]
+        )
+        self.assertEqual(
+            [a["user_id"] for a in course["admins"]], ["@aide:test", TEACHER]
+        )
+
+    async def test_a_creator_with_creator_power_runs_the_course(self) -> None:
+        course = await self._trip(
+            [
+                (
+                    "m.room.create",
+                    "",
+                    {"sender": TEACHER, "content": {"room_version": "12"}},
+                ),
+                power_levels({}),
+                member(TEACHER, "join", None),
+            ]
+        )
+        self.assertEqual(
+            course["admins"],
+            [{"user_id": TEACHER, "display_name": None, "avatar_url": None}],
+        )
+
+    async def test_a_course_names_its_school_from_a_course_admin(self) -> None:
+        course = await self._trip(
+            [
+                power_levels({TEACHER: 100}),
+                trip_event(
+                    "pangea.course_institution",
+                    TEACHER,
+                    {"name": " Universidad de Oaxaca ", "id": "ror:abc123"},
+                ),
+            ]
+        )
+        self.assertEqual(
+            course["institution"],
+            {"name": "Universidad de Oaxaca", "id": "ror:abc123"},
+        )
+        mod.reset_caches()
+        named_only = await self._trip(
+            [
+                power_levels({TEACHER: 100}),
+                trip_event("pangea.course_institution", TEACHER, {"name": "A School"}),
+            ]
+        )
+        self.assertEqual(named_only["institution"], {"name": "A School", "id": None})
+
+    async def test_a_school_from_someone_not_a_course_admin_or_unnamed_is_left_out(
+        self,
+    ) -> None:
+        for events in (
+            [
+                power_levels({TEACHER: 50}),
+                trip_event("pangea.course_institution", TEACHER, {"name": "X"}),
+            ],
+            [
+                power_levels({TEACHER: 100}),
+                trip_event("pangea.course_institution", TEACHER, {"name": " "}),
+            ],
+            [power_levels({TEACHER: 100})],
+        ):
+            mod.reset_caches()
+            course = await self._trip(events)
+            self.assertIsNone(course["institution"])
+
+    async def test_a_trip_under_another_state_key_is_left_out(self) -> None:
+        stray = trip_event("pangea.course_missions", TEACHER, {"version": 2})
+        course = await self._trip(
+            [power_levels({TEACHER: 100}), (stray[0], "other", stray[2])]
+        )
+        self.assertIsNone(course["course_missions"])
+
     async def test_empty_catalog_returns_no_cursor(self) -> None:
         catalog = FakeCatalog([])
         page = await self._get(catalog)
@@ -335,6 +574,33 @@ if __name__ == "__main__":
 
 
 SUPPORT = "@support:test"
+
+
+TEACHER = "@teacher:test"
+
+
+def power_levels(users: Dict[str, int]) -> Tuple[str, str, Any]:
+    return ("m.room.power_levels", "", {"sender": TEACHER, "content": {"users": users}})
+
+
+def member(
+    user_id: str,
+    membership: str,
+    name: Optional[str],
+    avatar: Optional[str] = None,
+) -> Tuple[str, str, Any]:
+    content: Dict[str, Any] = {"membership": membership}
+    if name is not None:
+        content["displayname"] = name
+    if avatar is not None:
+        content["avatar_url"] = avatar
+    return ("m.room.member", user_id, {"sender": user_id, "content": content})
+
+
+def trip_event(
+    event_type: str, sender: str, content: Dict[str, Any]
+) -> Tuple[str, str, Any]:
+    return (event_type, "", {"type": event_type, "sender": sender, "content": content})
 
 
 def course_settings(sender: str, content: Dict[str, Any]) -> Tuple[str, str, Any]:
