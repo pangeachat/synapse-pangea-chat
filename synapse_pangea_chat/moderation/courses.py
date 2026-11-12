@@ -264,6 +264,12 @@ async def _load(
     the incident - replaced by a new one, say - was in force at the
     incident's position, and pruned to an empty content it would read as no
     course at all, moving the incident off the course it belonged to.
+
+    What it cannot do is read a course plan that Synapse's retention has
+    physically pruned after its redaction: an incident whose course is looked
+    up after that prune lands on no course. Owner-accepted
+    (.github/instructions/moderation.instructions.md, Decisions); revisit if
+    the product ever redacts a course plan, which it does not today.
     """
     from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 

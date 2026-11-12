@@ -19,7 +19,8 @@ context only Tier 2 has.
 
 Phone numbers use `phonenumbers` (a libphonenumber port), matching VALID
 numbers only, so a bare year or house count does not trip it. Profanity is
-matched across all our learner languages (see `profanity.py`). Design:
+matched across all our learner languages (see `tier1_terms.py`). The
+decisions this tier implements are in
 .github/instructions/moderation.instructions.md.
 """
 
@@ -47,8 +48,8 @@ logger = scrubbing_logger(
 # a neutral diagnostic: it asserts what a particular message contained, which
 # is the kind of record this module keeps out of plaintext logs. The rule
 # family is what an operator debugging a false positive actually needs, and
-# there is one rule per family, so nothing is lost: `contact_details` is the
-# phone-number check and `profanity` is the wordlist.
+# there is one rule per family, so nothing is lost - the mapping from
+# identifier to check is `_RULES` below.
 REASON_CONTACT_DETAILS = "contact_details"
 REASON_PROFANITY = "profanity"
 
