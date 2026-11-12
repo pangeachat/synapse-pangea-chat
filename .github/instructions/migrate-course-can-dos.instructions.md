@@ -5,7 +5,7 @@ description: "One-off operator endpoint and script that move each course space f
 
 # Migrate Course Can-Dos
 
-Step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pangeachat/.github/issues/832)): merged Can-Dos replace the old ones, one per family. A course space names Can-Dos in its Can-Do list (`pangea.course_missions`, see [content-studio](../../../admin-dash/.github/instructions/content-studio.instructions.md)) and in its pins (`pinned_activities_by_objective` in `pangea.teacher_mode`). This operation moves both to the merged Can-Dos. It runs on each environment right after that environment's plans are migrated, and is removed once the old Can-Dos are deleted. A course with neither a Can-Do list of its own nor pins reads its plan, which is already moved.
+Step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pangeachat/.github/issues/832)): merged Can-Dos replace the old ones, one per family. A course space names Can-Dos in its Can-Do list (`pangea.course_missions`, see [content-studio](../../../admin-dash/.github/instructions/content-studio.instructions.md)) and in its pins (`pinned_activities_by_objective` in `pangea.teacher_mode`). This operation moves both to the merged Can-Dos. It runs on each environment right after that environment's plans are migrated, and is removed after the last progress pass. A course with neither a Can-Do list of its own nor pins reads its plan, which is already moved.
 
 ## Contract
 

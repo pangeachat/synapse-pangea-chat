@@ -27,7 +27,8 @@ Then, right after, the learners' progress records (``--progress``), each sent
 as its learner. The dry run writes counts per course; the apply merges every
 record again from its current state and history, so it needs no expectations,
 and a re-run changes nothing. Run it again a few days later for apps that
-wrote old ids back.
+wrote old ids back, again right before the old Can-Dos are deleted, and once
+more a few weeks after, with the same map.
 
        MATRIX_ADMIN_TOKEN=... python scripts/migrate_course_can_dos.py --progress \\
            --homeserver https://matrix.staging.pangea.chat \\

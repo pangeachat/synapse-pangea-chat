@@ -5,7 +5,7 @@ description: "One-off operator endpoint that moves each learner's course progres
 
 # Migrate Course Progress
 
-Part of step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pangeachat/.github/issues/832)). A learner's progress in a course is a `pangea.course_progress` state event in their analytics room, with the course room ID as its state key. Its `can_dos` are keyed by Can-Do id, and the dashboard shows them as the app's own figures. This operation moves each record to the merged Can-Dos. It runs on each environment right after the course spaces ([migrate-course-can-dos](migrate-course-can-dos.instructions.md)), runs again a few days later, and is removed with that operation. It runs on the server rather than in the app (Gabby, 2026-11-11).
+Part of step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pangeachat/.github/issues/832)). A learner's progress in a course is a `pangea.course_progress` state event in their analytics room, with the course room ID as its state key. Its `can_dos` are keyed by Can-Do id, and the dashboard shows them as the app's own figures. This operation moves each record to the merged Can-Dos. It runs on each environment right after the course spaces ([migrate-course-can-dos](migrate-course-can-dos.instructions.md)), runs again a few days later, again before the old Can-Dos are deleted and once more a few weeks after, and is removed with that operation after that last pass. It runs on the server rather than in the app (Gabby, 2026-11-11).
 
 ## Contract
 
@@ -26,9 +26,9 @@ Part of step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.
 
 A dry run does everything except the sends.
 
-## Re-runs and the second pass
+## Re-runs and the later passes
 
-Every run merges from the current record and its history, so a second run changes nothing. An app that loaded a course's outline before the switch keeps the old ids until the `revision` of the course's Can-Do list changes or the app restarts, and in that time it can write old ids back. The course-space migration bumps the revision. A course without a Can-Do list of its own gives the app no such signal. The second pass, a few days later, merges those records again from history, and a last pass runs before the old Can-Dos are deleted. Reading a record and sending it are not one atomic step: an app write in the moment between them is replaced, and the app restores its figures on its next write.
+Every run merges from the current record and its history, so a second run changes nothing. An app that loaded a course's outline before the switch keeps the old ids until the `revision` of the course's Can-Do list changes or the app restarts, and in that time it can write old ids back. The course-space migration bumps the revision. A course without a Can-Do list of its own gives the app no such signal. The second pass, a few days later, merges those records again from history. Another runs right before the old Can-Dos are deleted, and the last a few weeks after the deletion, for an app that had not restarted by then. The environment's map is kept until that last pass. Reading a record and sending it are not one atomic step: an app write in the moment between them is replaced, and the app restores its figures on its next write.
 
 ## Not in scope
 
