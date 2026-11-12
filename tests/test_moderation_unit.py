@@ -26,7 +26,7 @@ import traceback
 import unittest
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, cast
-from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+from unittest.mock import AsyncMock, MagicMock, call, create_autospec, patch
 
 from synapse.api.errors import Codes
 from synapse.events import EventBase
@@ -4858,23 +4858,46 @@ class TestCallbackRegistration(unittest.TestCase):
                 moderation_choreo_access_token="syt_x",
             ),
         )
-        api.register_spam_checker_callbacks.assert_called_once_with(
-            check_event_for_spam=mod.check_event_for_spam
+        self.addCleanup(_stop_tier2, mod)
+        self.assertEqual(
+            api.register_spam_checker_callbacks.call_args_list,
+            [
+                call(check_event_for_spam=mod.refuse_encrypted_event),
+                call(check_event_for_spam=mod.check_event_for_spam),
+            ],
         )
-        api.register_third_party_rules_callbacks.assert_called_once_with(
-            on_new_event=mod.on_new_event
+        self.assertEqual(
+            api.register_third_party_rules_callbacks.call_args_list,
+            [
+                call(
+                    check_event_allowed=mod.check_event_allowed,
+                    on_create_room=mod.on_create_room,
+                ),
+                call(on_new_event=mod.on_new_event),
+            ],
         )
 
     def test_a_disabled_tier_registers_nothing(self) -> None:
         """Both directions, because a test that only ever disables Tier 2
-        passes when Tier-1 registration is made unconditional."""
+        passes when Tier-1 registration is made unconditional. The encryption
+        refusal is registered whichever tier is on, and nothing else is."""
         tier1_only = _module_api()
-        ChatModeration(tier1_only, _config(moderation_tier1_enabled=True))
-        tier1_only.register_spam_checker_callbacks.assert_called_once()
-        tier1_only.register_third_party_rules_callbacks.assert_not_called()
+        mod = ChatModeration(tier1_only, _config(moderation_tier1_enabled=True))
+        self.assertEqual(
+            tier1_only.register_spam_checker_callbacks.call_args_list,
+            [
+                call(check_event_for_spam=mod.refuse_encrypted_event),
+                call(check_event_for_spam=mod.check_event_for_spam),
+            ],
+        )
+        tier1_only.register_third_party_rules_callbacks.assert_called_once_with(
+            check_event_allowed=mod.check_event_allowed,
+            on_create_room=mod.on_create_room,
+        )
 
         tier2_only = _module_api()
-        ChatModeration(
+        mod = _tier2_module(
+            self,
             tier2_only,
             _config(
                 moderation_tier1_enabled=False,
@@ -4883,8 +4906,19 @@ class TestCallbackRegistration(unittest.TestCase):
                 moderation_choreo_access_token="syt_x",
             ),
         )
-        tier2_only.register_spam_checker_callbacks.assert_not_called()
-        tier2_only.register_third_party_rules_callbacks.assert_called_once()
+        tier2_only.register_spam_checker_callbacks.assert_called_once_with(
+            check_event_for_spam=mod.refuse_encrypted_event
+        )
+        self.assertEqual(
+            tier2_only.register_third_party_rules_callbacks.call_args_list,
+            [
+                call(
+                    check_event_allowed=mod.check_event_allowed,
+                    on_create_room=mod.on_create_room,
+                ),
+                call(on_new_event=mod.on_new_event),
+            ],
+        )
 
 
 class TestExemptGlobContainer(unittest.TestCase):

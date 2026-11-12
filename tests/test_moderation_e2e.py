@@ -131,7 +131,7 @@ class TestModerationE2E(BaseSynapseE2ETest):
             time.sleep(0.5)
         self.fail(f"event {event_id} was never redacted; last seen: {last}")
 
-    async def test_tier1_blocks_and_tier2_redacts(self) -> None:
+    async def _moderated_homeserver(self) -> None:
         await self.homeserver(
             module_config={
                 "moderation": {
@@ -144,6 +144,85 @@ class TestModerationE2E(BaseSynapseE2ETest):
                 },
             }
         )
+
+    def _recheck_rows(self, event_id: str) -> int:
+        with psycopg2.connect(**parse_dsn(self.database_url)) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT to_regclass('public.pangea_moderation_recheck')")
+                fetched = cursor.fetchone()
+                if fetched is None or fetched[0] is None:
+                    return 0
+                cursor.execute(
+                    "SELECT count(*) FROM pangea_moderation_recheck WHERE event_id = %s",
+                    (event_id,),
+                )
+                row = cursor.fetchone()
+        return 0 if row is None else int(row[0])
+
+    async def test_an_encrypted_room_cannot_be_created_or_turned_on(self) -> None:
+        await self._moderated_homeserver()
+        _user_id, token = await self.new_user("encrypter")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.post(
+            f"{self.server_url}/_matrix/client/v3/createRoom",
+            json={
+                "preset": "private_chat",
+                "initial_state": [
+                    {
+                        "type": "m.room.encryption",
+                        "state_key": "",
+                        "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                    }
+                ],
+            },
+            headers=headers,
+        )
+        self.assertEqual(resp.status_code, 403, resp.text)
+        self.assertEqual(resp.json().get("errcode"), "M_FORBIDDEN")
+
+        room_id = await self.create_private_room(token)
+        resp = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}"
+            "/state/m.room.encryption/",
+            json={"algorithm": "m.megolm.v1.aes-sha2"},
+            headers=headers,
+        )
+        self.assertEqual(resp.status_code, 403, resp.text)
+        resp = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}"
+            "/send/m.room.encrypted/txn-enc",
+            json={"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "x"},
+            headers=headers,
+        )
+        self.assertEqual(resp.status_code, 403, resp.text)
+
+    async def test_a_message_sent_during_an_outage_is_rechecked(self) -> None:
+        await self._moderated_homeserver()
+        _user_id, token = await self.new_user("outage")
+        room_id = await self.create_private_room(token)
+        self.mock_moderation.fail_with(503)
+        resp = self._send_message(
+            room_id, token, f"something awful {FLAG_MARKER}", "txn-outage"
+        )
+        self.assertEqual(resp.status_code, 200)
+        event_id = resp.json()["event_id"]
+        deadline = time.monotonic() + 30
+        while not self._recheck_rows(event_id) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        self.assertEqual(self._recheck_rows(event_id), 1, "never queued")
+        event = self._get_event(room_id, event_id, token)
+        assert event is not None
+        self.assertTrue(event.get("content"), "removed with no verdict")
+
+        self.mock_moderation.fail_with(0)
+        self._wait_for_redaction(room_id, event_id, token, timeout_s=75)
+        deadline = time.monotonic() + 10
+        while self._recheck_rows(event_id) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        self.assertEqual(self._recheck_rows(event_id), 0, "row left behind")
+
+    async def test_tier1_blocks_and_tier2_redacts(self) -> None:
+        await self._moderated_homeserver()
 
         user_id, token = await self.new_user("learner")
         room_id = await self.create_private_room(token)

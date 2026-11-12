@@ -5,7 +5,7 @@ description: "What the homeserver blocks before send, what it removes after, why
 
 # Server-Side Chat Moderation
 
-The homeserver checks every unencrypted message twice: Tier 1 refuses unmistakable content before send, and Tier 2 asks the choreographer's moderation service afterwards and removes what it flags. Everything caught, and every learner report, reaches the learner's course admins on the Safety page. The why is the org [trust-and-safety doc](../../../.github/.github/instructions/trust-and-safety.instructions.md)'s.
+The homeserver checks every message twice: Tier 1 refuses unmistakable content before send, and Tier 2 asks the choreographer's moderation service afterwards and removes what it flags. Everything caught, and every learner report, reaches the learner's course admins on the Safety page. The why is the org [trust-and-safety doc](../../../.github/.github/instructions/trust-and-safety.instructions.md)'s.
 
 ## The experience, step by step
 
@@ -23,9 +23,9 @@ Re-decider in brackets.
 - **Ships dark; refuses to start misconfigured**: a silently dark tier looks like a clean room. [engineer]
 - **Bots and listed senders are exempt**, by exact pattern, never regular expression: an exemption is a security boundary. [engineer]
 - **Moderation reads everything a reader sees**: missing displayed text is a bypass, extra text costs one false positive. [engineer]
-- **A failure lets the message through, counted**, so a bug never blocks all sends. [engineer]
+- **A failure never blocks sends.** A Tier 1 failure passes the message, counted, and Tier 2 still checks it; a Tier 2 failure leaves it up and re-checks it every 30 seconds for up to 7 days, shown on the Safety page only once checked. [owner]
 - **Logs never carry a Matrix ID or message text**: logs are not access-controlled. Synapse's own lines are beyond reach. [engineer]
-- **Encrypted rooms are not moderated**; their share is counted, expected zero since the app never enables encryption. [unassigned]
+- **Encryption is refused** for every sender while either tier is on: neither can read it, and the app never enables it. [owner]
 
 ### Tier 1: blocks before send
 
