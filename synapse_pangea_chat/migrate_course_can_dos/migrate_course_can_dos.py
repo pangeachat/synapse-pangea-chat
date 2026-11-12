@@ -3,8 +3,8 @@ to the merged Can-Dos that replace them, keeping every teacher edit.
 
 ``POST /_synapse/client/pangea/v1/migrate_course_can_dos``
 
-Design: migrate-course-can-dos.instructions.md. The course's own copy
-(``pangea.course_missions``) is rewritten as raw JSON, so fields this module
+Design: migrate-course-can-dos.instructions.md. The course space's Can-Do
+list (``pangea.course_missions``) is rewritten as raw JSON, so fields this module
 does not model, Content Studio's included, survive; old Can-Dos that map to one
 merged Can-Do combine into one entry. The pins in ``pangea.teacher_mode`` are
 re-keyed the same way, every other field kept. Both are sent as the space's
@@ -118,7 +118,7 @@ def _pool(lists: Iterable[Any]) -> List[str]:
 
 
 def copy_problem(content: Any) -> Optional[str]:
-    """Why the app would refuse this course copy, or None when it reads it.
+    """Why the app would refuse this Can-Do list, or None when it reads it.
 
     The checks of the client's strict parse (``CourseMissionsEvent.tryParse``)
     on every field a rewrite touches, plus the dashboard's type of

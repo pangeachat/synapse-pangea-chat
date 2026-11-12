@@ -62,7 +62,10 @@ from synapse_pangea_chat.limit_user_directory import LimitUserDirectory
 from synapse_pangea_chat.lti import register_lti
 from synapse_pangea_chat.lti.keys import LtiConfigError, LtiSettings, parse_lti_config
 from synapse_pangea_chat.member_analytics_profiles import MemberAnalyticsProfiles
-from synapse_pangea_chat.migrate_course_can_dos import MigrateCourseCanDos
+from synapse_pangea_chat.migrate_course_can_dos import (
+    MigrateCourseCanDos,
+    MigrateCourseProgress,
+)
 from synapse_pangea_chat.moderation import ChatModeration, tier1_prefilter
 from synapse_pangea_chat.moderation import exempt as moderation_exempt
 from synapse_pangea_chat.moderation import refusal as moderation_refusal
@@ -525,6 +528,12 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/migrate_course_can_dos",
             resource=MigrateCourseCanDos(api),
+        )
+        # Then each learner's progress record, sent as the learner
+        # (migrate-course-progress.instructions.md).
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/migrate_course_progress",
+            resource=MigrateCourseProgress(api),
         )
 
         # --- Quest Courses ---

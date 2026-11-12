@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Move the course spaces on one homeserver from old Can-Do ids to merged ones.
+"""Move the course spaces on one homeserver, then the learners' progress records,
+from old Can-Do ids to merged ones.
 
 Step 8 of the Can-Do migration (pangeachat/.github#832), run on each
-environment right after that environment's plans are migrated. Two runs:
+environment right after that environment's plans are migrated. Course spaces
+first, in two runs:
 
 1. The dry run is READ-ONLY. It walks every space on the homeserver (or only
    the ``--room-id`` ones), asks the endpoint what it would change in each, and
@@ -21,15 +23,30 @@ environment right after that environment's plans are migrated. Two runs:
            --homeserver https://matrix.staging.pangea.chat \\
            --apply staging-report.json --results staging-results.json
 
+Then, right after, the learners' progress records (``--progress``), each sent
+as its learner. The dry run writes counts per course; the apply merges every
+record again from its current state and history, so it needs no expectations,
+and a re-run changes nothing. Run it again a few days later for apps that
+wrote old ids back.
+
+       MATRIX_ADMIN_TOKEN=... python scripts/migrate_course_can_dos.py --progress \\
+           --homeserver https://matrix.staging.pangea.chat \\
+           --map staging-can-do-map.json --report staging-progress.json
+       MATRIX_ADMIN_TOKEN=... python scripts/migrate_course_can_dos.py --progress \\
+           --homeserver https://matrix.staging.pangea.chat \\
+           --apply staging-progress.json --results staging-progress-results.json
+
 The map file is one JSON object: old Can-Do row id -> merged row id, for THIS
-environment, since row ids differ between environments. The report records the
-homeserver and the map, and an apply refuses a report made on another
-homeserver. Reports quote teachers' notes: keep them out of the repo.
+environment, since row ids differ between environments. A report records the
+homeserver, the map and which operation made it, and an apply refuses a
+report made on another homeserver or by the other operation. Space reports
+quote teachers' notes: keep them out of the repo.
 
 ``MATRIX_ADMIN_TOKEN`` is a server admin's access token, supplied out-of-band
 (org ``access-controls.instructions.md``). It is never printed.
 
-Design: .github/instructions/migrate-course-can-dos.instructions.md
+Design: .github/instructions/migrate-course-can-dos.instructions.md and
+migrate-course-progress.instructions.md
 """
 
 from __future__ import annotations
@@ -46,6 +63,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 ADMIN_ROOMS_PATH = "/_synapse/admin/v1/rooms"
 MIGRATE_PATH = "/_synapse/client/pangea/v1/migrate_course_can_dos"
+PROGRESS_PATH = "/_synapse/client/pangea/v1/migrate_course_progress"
 SPACE_ROOM_TYPE = "m.space"
 PAGE_SIZE = 500
 MAX_PAGES = 1000
@@ -109,19 +127,30 @@ def dry_run(
         )
         spaces.append({"room_id": room_id, "status": status, "body": body})
         time.sleep(PAUSE_SECONDS)
-    return {"homeserver": homeserver, "can_do_map": can_do_map, "spaces": spaces}
+    return {
+        "kind": "spaces",
+        "homeserver": homeserver,
+        "can_do_map": can_do_map,
+        "spaces": spaces,
+    }
 
 
 def to_write(space: Dict[str, Any]) -> bool:
     return space["status"] == 200 and bool(space["body"].get("writes"))
 
 
-def apply(homeserver: str, token: str, report: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Write each space the report says would change, as its dry run saw it."""
+def _check_report(report: Dict[str, Any], homeserver: str, kind: str) -> None:
     if report["homeserver"] != homeserver:
         raise SystemExit(
             f"The report was made on {report['homeserver']}, not {homeserver}"
         )
+    if report.get("kind") != kind:
+        raise SystemExit(f"The report is not a {kind} report")
+
+
+def apply(homeserver: str, token: str, report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Write each space the report says would change, as its dry run saw it."""
+    _check_report(report, homeserver, "spaces")
     results = []
     for space in filter(to_write, report["spaces"]):
         status, body = _call(
@@ -157,7 +186,7 @@ def summarize_report(report: Dict[str, Any]) -> List[str]:
     for label, matches in (
         ("refused, no local instructor", lambda s: s["status"] == 409),
         (
-            "copy left alone, readers ignore it",
+            "Can-Do list left alone, readers ignore it",
             lambda s: (s["body"].get("course_missions") or {}).get("outcome")
             in ("ignored_by_readers", "rewrite_failed"),
         ),
@@ -195,6 +224,69 @@ def summarize_results(results: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
+def run_progress(
+    homeserver: str, token: str, can_do_map: Dict[str, str], dry_run: bool
+) -> List[Dict[str, Any]]:
+    """Every progress record, page by page; a failed page stops the run."""
+    records: List[Dict[str, Any]] = []
+    after = None
+    while True:
+        body: Dict[str, Any] = {"can_do_map": can_do_map, "dry_run": dry_run}
+        if after is not None:
+            body["after"] = after
+        status, page = _call(f"{homeserver}{PROGRESS_PATH}", token, body)
+        if status != 200:
+            raise RuntimeError(f"A page failed after {after}: HTTP {status}: {page}")
+        records.extend(page["records"])
+        after = page["next"]
+        if after is None:
+            return records
+        time.sleep(PAUSE_SECONDS)
+
+
+def per_course(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    """Counts per course: records, rewrites, keys moved, completions kept."""
+    counts: Dict[str, Dict[str, int]] = {}
+    for record in records:
+        course = counts.setdefault(
+            record["course_id"],
+            {"records": 0, "rewrite": 0, "keys_moved": 0, "completions_kept": 0},
+        )
+        course["records"] += 1
+        course["rewrite"] += record["outcome"] == "rewrite"
+        course["keys_moved"] += record["keys_moved"]
+        course["completions_kept"] += record["completions_kept"]
+    return counts
+
+
+def summarize_progress(records: List[Dict[str, Any]], dry_run: bool) -> List[str]:
+    courses = per_course(records)
+    lines = [
+        f"{len(records)} records in {len(courses)} courses",
+        f"{sum(r['outcome'] == 'rewrite' for r in records)} "
+        + ("to rewrite" if dry_run else "rewritten")
+        + f", in {sum(1 for c in courses.values() if c['rewrite'])} courses",
+        f"{sum(r['keys_moved'] for r in records)} keys moved, "
+        f"{sum(r['completions_kept'] for r in records)} completions kept",
+    ]
+    for outcome in (
+        "deactivated",
+        "refused",
+        "not_learners_own",
+        "not_local",
+        "failed",
+    ):
+        ids = [
+            f"{r['user_id']} {r['room_id']} {r['course_id']}"
+            for r in records
+            if r["outcome"] == outcome
+        ]
+        if ids:
+            lines.append(f"{len(ids)} {outcome}:")
+            lines.extend(f"  {line}" for line in ids)
+    return lines
+
+
 def _write_json(path: str, value: Any) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(value, f, indent=1, ensure_ascii=False)
@@ -215,6 +307,11 @@ def main() -> int:
     )
     parser.add_argument("--apply", help="A dry run's report, to write.")
     parser.add_argument("--results", help="Apply: where to write the results.")
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="The learners' progress records instead of the course spaces.",
+    )
     args = parser.parse_args()
     homeserver = args.homeserver.rstrip("/")
     token = os.environ.get("MATRIX_ADMIN_TOKEN")
@@ -222,6 +319,8 @@ def main() -> int:
         print("MATRIX_ADMIN_TOKEN is not set", file=sys.stderr)
         return 2
 
+    if args.progress:
+        return _progress(args, parser, homeserver, token)
     if args.apply:
         if not args.results:
             parser.error("--apply needs --results")
@@ -239,6 +338,43 @@ def main() -> int:
     report = dry_run(homeserver, token, can_do_map, args.room_id)
     _write_json(args.report, report)
     print("\n".join(summarize_report(report)))
+    return 0
+
+
+def _progress(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    homeserver: str,
+    token: str,
+) -> int:
+    if args.apply:
+        if not args.results:
+            parser.error("--apply needs --results")
+        with open(args.apply, encoding="utf-8") as f:
+            report = json.load(f)
+        _check_report(report, homeserver, "progress")
+        records = run_progress(homeserver, token, report["can_do_map"], False)
+        _write_json(
+            args.results, {"records": records, "per_course": per_course(records)}
+        )
+        print("\n".join(summarize_progress(records, dry_run=False)))
+        return 0 if all(r["outcome"] != "failed" for r in records) else 1
+    if not args.map or not args.report:
+        parser.error("a dry run needs --map and --report")
+    with open(args.map, encoding="utf-8") as f:
+        can_do_map = json.load(f)
+    records = run_progress(homeserver, token, can_do_map, True)
+    _write_json(
+        args.report,
+        {
+            "kind": "progress",
+            "homeserver": homeserver,
+            "can_do_map": can_do_map,
+            "records": records,
+            "per_course": per_course(records),
+        },
+    )
+    print("\n".join(summarize_progress(records, dry_run=True)))
     return 0
 
 
