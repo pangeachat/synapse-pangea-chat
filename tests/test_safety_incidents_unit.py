@@ -25,6 +25,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Set,
     Tuple,
     cast,
@@ -42,9 +43,14 @@ from synapse_pangea_chat.moderation.courses import (
     CREATE_EVENT_TYPE,
     MEMBER_EVENT_TYPE,
     POWER_LEVELS_EVENT_TYPE,
-    StudentCourses,
+    ChatCourses,
     is_course_admin_in,
-    is_student_in,
+)
+from synapse_pangea_chat.moderation.courses import (
+    SPACE_CHILD_EVENT_TYPE as SPACE_CHILD,
+)
+from synapse_pangea_chat.moderation.courses import (
+    SPACE_PARENT_EVENT_TYPE as SPACE_PARENT,
 )
 from synapse_pangea_chat.moderation.dispatch import ModerationJob
 from synapse_pangea_chat.moderation.incidents import (
@@ -136,7 +142,9 @@ class CourseWorld:
         self.created: Dict[str, int] = {}
         self.timeline: List[Tuple[int, str, str, bool]] = []
         self.position = 0
-        self.reads: List[Tuple[str, str]] = []
+        self.links: List[Tuple[int, str, str, bool, bool]] = []
+        self.dead_parents: Set[Tuple[str, str]] = set()
+        self.reads: List[str] = []
         self.error: Optional[Exception] = None
         self.names: List[Tuple[int, str, str]] = []
         self.display_names: Dict[str, str] = {}
@@ -173,22 +181,30 @@ class CourseWorld:
                 result.setdefault(user, set()).add(room)
         return result
 
-    async def rooms_ever_joined(self, user_id: str) -> Set[str]:
-        if self.error is not None:
-            raise self.error
-        return {
-            room
-            for _at, user, room, is_join in self.timeline
-            if user == user_id and is_join
-        }
+    def link(
+        self, parent: str, child: str, *, back: bool = True, live: bool = True
+    ) -> None:
+        """`child` names `parent` in `m.space.parent` (emptied unless `live`);
+        with `back`, the parent also lists it in a live `m.space.child`."""
+        self.links.append((self._tick(), parent, child, True, back))
+        if not live:
+            self.dead_parents.add((parent, child))
 
-    async def is_course_now(self, room_id: str) -> bool:
-        return bool(self.plans.get(room_id))
+    def unlink(self, parent: str, child: str) -> None:
+        self.links.append((self._tick(), parent, child, False, False))
 
-    async def state_at(
-        self, room_id: str, user_id: str, position: int
-    ) -> Dict[Any, Any]:
-        self.reads.append((room_id, user_id))
+    def _links_at(self, position: int) -> Dict[Tuple[str, str], bool]:
+        """`(parent, child) -> linked back` for each live link at `position`."""
+        live: Dict[Tuple[str, str], bool] = {}
+        for at, parent, child, on, back in self.links:
+            if at <= position:
+                if on:
+                    live[(parent, child)] = back
+                else:
+                    live.pop((parent, child), None)
+        return live
+
+    def _state(self, room_id: str, position: int) -> Dict[Any, Any]:
         if self.error is not None:
             raise self.error
         if self.created.get(room_id, 10**9) > position:
@@ -201,11 +217,30 @@ class CourseWorld:
         }
         if self.plans.get(room_id):
             state[(COURSE_PLAN_EVENT_TYPE, "")] = _state_event({"uuid": "plan"})
-        if self.joined_at(user_id, room_id, position):
-            state[(MEMBER_EVENT_TYPE, user_id)] = _state_event(
-                {"membership": "join"}, sender=user_id
-            )
+        for (parent, child), back in self._links_at(position).items():
+            if child == room_id:
+                via = {} if (parent, child) in self.dead_parents else {"via": ["x"]}
+                state[(SPACE_PARENT, parent)] = _state_event(via)
+            if parent == room_id and back:
+                state[(SPACE_CHILD, child)] = _state_event({"via": ["example.org"]})
+        for user in {user for _at, user, room, _join in self.timeline}:
+            if self.joined_at(user, room_id, position):
+                state[(MEMBER_EVENT_TYPE, user)] = _state_event(
+                    {"membership": "join"}, sender=user
+                )
         return state
+
+    async def state_at(
+        self, room_id: str, keys: Sequence[Tuple[str, Optional[str]]], position: int
+    ) -> Dict[Any, Any]:
+        """The given keys of the room's state at `position`; a key with no
+        state key reads every state key of its type."""
+        self.reads.append(room_id)
+        return {
+            key: event
+            for key, event in self._state(room_id, position).items()
+            if any(t == key[0] and k in (None, key[1]) for t, k in keys)
+        }
 
     def rename(self, room_id: str, name: str) -> None:
         self.names.append((self._tick(), room_id, name))
@@ -235,27 +270,22 @@ class CourseWorld:
 
     async def read_state(self, room_id: str, user_id: str) -> Dict[Any, Any]:
         """Current state, for the read endpoint's admin check."""
-        return await self.state_at(room_id, user_id, self.position)
+        return self._state(room_id, self.position)
 
-    def courses(
-        self, is_exempt: Callable[[str], bool] = lambda _user: False
-    ) -> StudentCourses:
-        return StudentCourses(
-            rooms_ever_joined=self.rooms_ever_joined,
-            is_course_now=self.is_course_now,
-            state_at=self.state_at,
-            current_position=lambda: self.position,
-            is_exempt=is_exempt,
+    def courses(self) -> ChatCourses:
+        return ChatCourses(
+            state_at=self.state_at, current_position=lambda: self.position
         )
 
 
 def _classroom() -> CourseWorld:
     """A learner and a teacher in course A; the teacher also teaches B and
-    is a learner in nothing; the learner also sits in an ordinary room."""
+    is a learner in nothing; both sit in ROOM, a chat of course A."""
     world = CourseWorld()
     world.room(COURSE_A, course=True, teacher=100)
     world.room(COURSE_B, course=True, teacher=100)
     world.room(ROOM, course=False)
+    world.link(COURSE_A, ROOM)
     for room in (COURSE_A, ROOM):
         world.join(STUDENT, room)
     for room in (COURSE_A, COURSE_B, ROOM):
@@ -786,96 +816,73 @@ class TestForwardOutbox(unittest.IsolatedAsyncioTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestStudentCourses(unittest.IsolatedAsyncioTestCase):
-    async def test_a_student_course_is_a_joined_course_below_100(self) -> None:
+DM = "!dm:example.org"
+
+
+class TestChatCourses(unittest.IsolatedAsyncioTestCase):
+    async def test_a_course_chat_reaches_only_its_own_course(self) -> None:
+        """The learner is in A and B; a chat of A reaches A, never B."""
         world = _classroom()
-        courses = world.courses()
-        self.assertEqual(await courses.for_user(STUDENT, world.position), (COURSE_A,))
+        world.join(STUDENT, COURSE_B)
         self.assertEqual(
-            await courses.for_user(TEACHER, world.position),
-            (),
-            "a course admin is nobody's student",
+            await world.courses().for_room(ROOM, world.position), (COURSE_A,)
         )
 
-    async def test_a_room_without_a_course_plan_is_not_a_course(self) -> None:
+    async def test_the_course_space_itself_is_its_own_course(self) -> None:
         world = _classroom()
-        world.room(ROOM, course=False)
-        self.assertNotIn(ROOM, await world.courses().for_user(STUDENT, world.position))
+        self.assertEqual(
+            await world.courses().for_room(COURSE_A, world.position), (COURSE_A,)
+        )
 
-    async def test_exempt_users_and_bots_are_nobodys_students(self) -> None:
+    async def test_a_chat_no_course_owns_reaches_no_course(self) -> None:
+        """A direct message between two learners of course A."""
         world = _classroom()
-        bot = "@bot:example.org"
-        world.join(bot, COURSE_A)
-        exempt = world.courses(is_exempt=lambda user: user == STUDENT)
-        self.assertEqual(await exempt.for_user(STUDENT, world.position), ())
-        self.assertEqual(await world.courses().for_user(bot, world.position), ())
+        world.room(DM, course=False)
+        world.join(STUDENT, DM)
+        world.join(OUTSIDER, DM)
+        self.assertEqual(await world.courses().for_room(DM, world.position), ())
 
-    async def test_a_read_that_fails_is_an_error_and_not_a_student_nowhere(
+    async def test_a_parent_the_course_does_not_link_back_is_no_course(
         self,
     ) -> None:
+        """A room can name any space its parent; only the course's own
+        `m.space.child` makes it the course's chat."""
+        world = _classroom()
+        world.room(DM, course=False)
+        world.link(COURSE_B, DM, back=False)
+        self.assertEqual(await world.courses().for_room(DM, world.position), ())
+
+    async def test_a_removed_parent_link_is_no_course(self) -> None:
+        """The chat's `m.space.parent` was emptied; the course's own child
+        link alone does not make it the course's chat."""
+        world = _classroom()
+        world.room(DM, course=False)
+        world.link(COURSE_B, DM, live=False)
+        self.assertEqual(await world.courses().for_room(DM, world.position), ())
+
+    async def test_a_parent_without_a_course_plan_is_no_course(self) -> None:
+        world = _classroom()
+        space = "!space:example.org"
+        world.room(space, course=False)
+        world.room(DM, course=False)
+        world.link(space, DM)
+        self.assertEqual(await world.courses().for_room(DM, world.position), ())
+
+    async def test_the_parent_is_read_as_of_the_position_not_now(self) -> None:
+        """The chat moved from A to B after the incident: it stays A's."""
+        world = _classroom()
+        at_incident = world.position
+        world.unlink(COURSE_A, ROOM)
+        world.link(COURSE_B, ROOM)
+        courses = world.courses()
+        self.assertEqual(await courses.for_room(ROOM, at_incident), (COURSE_A,))
+        self.assertEqual(await courses.for_room(ROOM, world.position), (COURSE_B,))
+
+    async def test_a_read_that_fails_is_an_error_and_not_no_course(self) -> None:
         world = _classroom()
         world.error = RuntimeError("store down")
         with self.assertRaises(RuntimeError):
-            await world.courses().for_user(STUDENT, world.position)
-
-    async def test_a_teachers_report_reaches_only_the_learners_course(self) -> None:
-        """The teacher teaches A and B; the learner is in A. A report the
-        teacher files about the learner must reach A only - B's admins have
-        no business seeing a message from a learner who is not theirs."""
-        world = _classroom()
-        self.assertEqual(
-            await world.courses().for_report(STUDENT, TEACHER, world.position),
-            (COURSE_A,),
-        )
-
-    async def test_a_reporters_own_student_courses_are_not_added(self) -> None:
-        """The reporter is a LEARNER in another course too. Their own
-        courses are a fallback for a subject who is a student nowhere, never
-        an addition: course C's admins must not see a message from course A."""
-        world = _classroom()
-        course_c = "!course-c:example.org"
-        world.room(course_c, course=True, someone=100)
-        world.join(TEACHER, course_c)
-        self.assertEqual(
-            await world.courses().for_user(TEACHER, world.position), (course_c,)
-        )
-        self.assertEqual(
-            await world.courses().for_report(STUDENT, TEACHER, world.position),
-            (COURSE_A,),
-        )
-
-    async def test_a_report_about_an_outsider_goes_to_the_reporters_courses(
-        self,
-    ) -> None:
-        world = _classroom()
-        world.join(OUTSIDER, ROOM)
-        self.assertEqual(
-            await world.courses().for_report(OUTSIDER, STUDENT, world.position),
-            (COURSE_A,),
-        )
-
-    async def test_nobodys_report_reaches_no_course(self) -> None:
-        world = _classroom()
-        self.assertEqual(
-            await world.courses().for_report(OUTSIDER, TEACHER, world.position), ()
-        )
-
-    async def test_courses_are_read_as_of_the_position_not_now(self) -> None:
-        """The learner was in A at the incident, then left A and joined B as
-        a learner. Asked at the incident's position, the answer is A - and
-        only A - however late the question is asked."""
-        world = _classroom()
-        at_incident = world.position
-        world.leave(STUDENT, COURSE_A)
-        course_c = "!course-c:example.org"
-        world.room(course_c, course=True, teacher=100)
-        world.join(STUDENT, COURSE_B)
-        world.join(STUDENT, course_c)
-        courses = world.courses()
-        self.assertEqual(await courses.for_user(STUDENT, at_incident), (COURSE_A,))
-        self.assertEqual(
-            await courses.for_user(STUDENT, world.position), (COURSE_B, course_c)
-        )
+            await world.courses().for_room(ROOM, world.position)
 
     async def test_a_creator_with_no_power_levels_event_is_an_admin(self) -> None:
         """No `m.room.power_levels` in the room: the spec gives the creator
@@ -895,16 +902,12 @@ class TestStudentCourses(unittest.IsolatedAsyncioTestCase):
             (MEMBER_EVENT_TYPE, STUDENT): _state_event({"membership": "join"}),
         }
         self.assertTrue(is_course_admin_in(state, TEACHER))
-        self.assertFalse(is_student_in(state, TEACHER))
-        self.assertTrue(is_student_in(state, STUDENT))
 
     async def test_admin_and_student_predicates(self) -> None:
         world = _classroom()
         state = await world.read_state(COURSE_A, TEACHER)
         self.assertTrue(is_course_admin_in(state, TEACHER))
-        self.assertFalse(is_student_in(state, TEACHER))
         state = await world.read_state(COURSE_A, STUDENT)
-        self.assertTrue(is_student_in(state, STUDENT))
         self.assertFalse(is_course_admin_in(state, STUDENT))
         world.leave(TEACHER, COURSE_A)
         departed = await world.read_state(COURSE_A, TEACHER)
@@ -1375,15 +1378,15 @@ class TestCourseIsFrozenAtQueueTime(Tier2Case):
             "the course was read at verdict time, after the learner had left",
         )
 
-    async def test_leaving_and_joining_another_course_before_the_read(self) -> None:
-        """The window a lookup scheduled for later cannot close: the learner
-        leaves A and joins B between the queue and ANY read. The answer must
+    async def test_a_chat_moved_to_another_course_before_the_read(self) -> None:
+        """The window a lookup scheduled for later cannot close: the chat
+        moves from A to B between the queue and ANY read. The answer must
         still be A, and only A."""
         world = _classroom()
         module, _api, _hs, _db = self._module(world)
         job = await self._queue(module, _sent_event(world, "you are awful"))
-        world.leave(STUDENT, COURSE_A)
-        world.join(STUDENT, COURSE_B)
+        world.unlink(COURSE_A, ROOM)
+        world.link(COURSE_B, ROOM)
         with patch(MODERATE_TEXT, _verdict("harassment")):
             await module._check_and_redact(job)
         self.assertEqual((await self._row(module)).course_ids, (COURSE_A,))
@@ -1922,7 +1925,6 @@ class TestCreatorsByRoomVersion(unittest.TestCase):
         }
         self.assertTrue(is_course_admin_in(state, TEACHER))
         self.assertFalse(is_course_admin_in(state, STUDENT))
-        self.assertTrue(is_student_in(state, STUDENT))
 
 
 class TestAFailedWriteNeverCarriesTheRow(unittest.IsolatedAsyncioTestCase):
@@ -1960,36 +1962,6 @@ class TestAFailedWriteNeverCarriesTheRow(unittest.IsolatedAsyncioTestCase):
         homeserver.store.db_pool.on_statement = _locked
         with self.assertRaises(sqlite3.OperationalError):
             await store.insert(_incident())
-
-
-class TestCandidatesWithoutCurrentState(unittest.IsolatedAsyncioTestCase):
-    async def test_a_room_with_no_current_state_stays_a_candidate(self) -> None:
-        """Synapse drops a room's current state when its last local member
-        leaves. That says nothing about whether the room was a course at the
-        incident's position, so it must not exclude it."""
-        from synapse_pangea_chat.moderation import courses as courses_module
-
-        answers: Dict[str, Dict[Any, str]] = {
-            "!gone:example.org": {},
-            "!course:example.org": {
-                (CREATE_EVENT_TYPE, ""): "$c",
-                (COURSE_PLAN_EVENT_TYPE, ""): "$p",
-            },
-            "!chat:example.org": {(CREATE_EVENT_TYPE, ""): "$c"},
-        }
-
-        async def _current(room_id: str, state_filter: Any) -> Dict[Any, str]:
-            return answers[room_id]
-
-        homeserver = SimpleNamespace(
-            get_storage_controllers=lambda: SimpleNamespace(
-                state=SimpleNamespace(get_current_state_ids=_current)
-            )
-        )
-        check = courses_module._is_course_now(homeserver)
-        self.assertTrue(await check("!gone:example.org"))
-        self.assertTrue(await check("!course:example.org"))
-        self.assertFalse(await check("!chat:example.org"))
 
 
 class TestRoundThreeFindings(Tier2Case):
@@ -2064,7 +2036,7 @@ class TestHistoricalStateIsReadAsSent(unittest.IsolatedAsyncioTestCase):
         seen: List[Any] = []
         ids = {
             (COURSE_PLAN_EVENT_TYPE, ""): "$plan",
-            (CREATE_EVENT_TYPE, ""): "$create",
+            (SPACE_CHILD, ROOM): "$link",
         }
 
         async def _ids(_target: str, _filter: Any) -> Dict[Any, str]:
@@ -2073,7 +2045,7 @@ class TestHistoricalStateIsReadAsSent(unittest.IsolatedAsyncioTestCase):
         async def _get_events(
             event_ids: List[str], redact_behaviour: Any = EventRedactBehaviour.redact
         ) -> Dict[str, Any]:
-            seen.append(redact_behaviour)
+            seen.append((tuple(event_ids), redact_behaviour))
             return {}
 
         homeserver = SimpleNamespace(
@@ -2087,17 +2059,26 @@ class TestHistoricalStateIsReadAsSent(unittest.IsolatedAsyncioTestCase):
             ),
         )
         if historical:
-            await courses_module.state_after_event_reader(homeserver)("$e", STUDENT)
+            await courses_module.state_after_event_reader(homeserver)(
+                "$e", [(COURSE_PLAN_EVENT_TYPE, "")]
+            )
         else:
             await courses_module.current_state_reader(homeserver)("!r", STUDENT)
-        return seen[0]
+        return seen
 
     async def test_a_later_redaction_does_not_rewrite_the_past(self) -> None:
         from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 
-        self.assertEqual(await self._behaviour(True), EventRedactBehaviour.as_is)
         self.assertEqual(
-            await self._behaviour(False),
+            await self._behaviour(True),
+            [
+                (("$plan",), EventRedactBehaviour.as_is),
+                (("$link",), EventRedactBehaviour.redact),
+            ],
+            "only the plan is read as sent; a redacted child link is removed",
+        )
+        self.assertEqual(
+            (await self._behaviour(False))[0][1],
             EventRedactBehaviour.redact,
             "the read endpoint's gate must see the room as it is now",
         )

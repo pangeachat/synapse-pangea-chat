@@ -3,8 +3,8 @@
 What the unit tests cannot pin: Synapse's own event handler deciding
 visibility and room binding for a report, the course rule over real room
 state, the incident table on Postgres, and a Tier 1 block and a Tier 2
-redaction each landing on the learner's course - read back through the
-endpoint a course admin uses.
+redaction each landing on the course whose chat it was - and a direct
+message's on none - read back through the endpoint a course admin uses.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Dict, List
 from urllib.parse import quote
 
+import psycopg2
 import requests
 
 from .base_e2e import BaseSynapseE2ETest
@@ -134,6 +135,27 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
             time.sleep(0.5)
         self.fail(f"no matching incident; last seen: {last}")
 
+    def _stored_course_ids(self, incident_id: str, timeout_s: float = 30.0) -> str:
+        """The row's stored `course_ids`, once the row is written."""
+        deadline = time.monotonic() + timeout_s
+        conn = psycopg2.connect(self.database_url)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                while time.monotonic() < deadline:
+                    cur.execute(
+                        "SELECT course_ids FROM pangea_safety_incidents "
+                        "WHERE incident_id = %s",
+                        (incident_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        return str(row[0])
+                    time.sleep(0.5)
+        finally:
+            conn.close()
+        self.fail(f"{incident_id} was never written")
+
     async def test_reports_moderation_and_the_course_admin_read(self) -> None:
         await self.homeserver(
             module_config={
@@ -154,6 +176,7 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
         course = self._course(teacher)
         other_course = self._course(teacher)
         self._join(course, learner)
+        server = teacher_id.split(":", 1)[1]
         chat = self._create_room(
             teacher,
             name="Week 3 chat",
@@ -163,9 +186,21 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
                     "type": "m.room.history_visibility",
                     "state_key": "",
                     "content": {"history_visibility": "joined"},
-                }
+                },
+                {
+                    "type": "m.space.parent",
+                    "state_key": course,
+                    "content": {"via": [server], "canonical": True},
+                },
             ],
         )
+        linked = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{quote(course, safe='')}"
+            f"/state/m.space.child/{quote(chat, safe='')}",
+            json={"via": [server]},
+            headers=self._headers(teacher),
+        )
+        self.assertEqual(linked.status_code, 200, linked.text)
         requests.post(
             f"{self.server_url}/_matrix/client/v3/rooms/{quote(chat, safe='')}/invite",
             json={"user_id": learner_id},
@@ -213,7 +248,24 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
             403,
         )
 
-        # --- Tier 1 and Tier 2 land on the learner's course ---
+        # --- A direct message between two learners of the course ---
+        (classmate_id, classmate) = await self.new_user("classmate")
+        self._join(course, classmate)
+        dm = self._create_room(learner, preset="private_chat", is_direct=True)
+        requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{quote(dm, safe='')}/invite",
+            json={"user_id": classmate_id},
+            headers=self._headers(learner),
+        )
+        self._join(dm, classmate)
+        dm_flagged = self._send(dm, learner, "FLAGME in a direct message")
+        self.assertEqual(dm_flagged.status_code, 200, dm_flagged.text)
+        dm_flagged_id = dm_flagged.json()["event_id"]
+        dm_report_id = str(uuid.uuid4())
+        resp = self._report(classmate, dm, dm_flagged_id, dm_report_id, "rude")
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        # --- Tier 1 and Tier 2 in the course's chat land on the course ---
         blocked = self._send(chat, learner, "text me at 415-555-2671")
         self.assertEqual(blocked.status_code, 403, blocked.text)
         flagged = self._send(chat, learner, "FLAGME you are awful")
@@ -250,6 +302,16 @@ class TestSafetyIncidentsE2E(BaseSynapseE2ETest):
         )
         # The teacher's other course gets none of it.
         self.assertEqual(self._incidents(teacher, other_course).json()["incidents"], [])
+        # The direct message is no course's chat: its flag and its report are
+        # recorded, on no course, and the learner's course lists neither.
+        self.assertEqual(
+            self._stored_course_ids(f"mod:{dm_flagged_id}"), "[]", "flag in a DM"
+        )
+        self.assertEqual(
+            self._stored_course_ids(f"report:{dm_report_id}"), "[]", "DM report"
+        )
+        rows = self._incidents(teacher, course).json()["incidents"]
+        self.assertFalse([r for r in rows if r["event_id"] == dm_flagged_id])
 
         # --- Refusals: the same 403 for each ---
         denied = self._incidents(learner, course)

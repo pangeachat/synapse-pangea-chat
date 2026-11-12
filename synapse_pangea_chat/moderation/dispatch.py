@@ -100,8 +100,8 @@ class ModerationJob:
     text: str
     enqueued_at: float
     #: The message's stream position, captured when it was queued. The
-    #: Safety page reads the sender's courses AS OF this position, so a
-    #: learner who leaves a course before the verdict still lands on it.
+    #: Safety page reads the chat's course AS OF this position, so a chat
+    #: moved to another course before the verdict still lands on its own.
     #: None when the event carried none; the verdict then anchors to now.
     position: Optional[int] = None
     #: A `pangea.call_transcript`: a flag is recorded, never redacted (#872).
