@@ -1129,9 +1129,8 @@ class ChatModeration:
                 position=_stream_position(event),
             )
             if not self._dispatcher.enqueue(job) and self._dispatcher.is_full:
-                # Dropped unchecked: put it on the re-check list, detached so
-                # the notifier never waits on the write.
-                run_in_background(self._queue_recheck, (job,))
+                # Dropped unchecked: put it on the re-check list.
+                self._queue_recheck((job,))
         except Exception as exc:
             reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract; observe-only hook, so the
@@ -1200,10 +1199,10 @@ class ChatModeration:
             except Exception as exc:
                 reraise_if_cancelled(exc)
                 # Not swallowed: re-raised for the dispatcher to count and log.
-                await self._queue_recheck(jobs)
+                self._queue_recheck(jobs)
                 raise
             if not decided:
-                await self._queue_recheck(jobs)
+                self._queue_recheck(jobs)
             return
         for job in jobs:
             self._count_truncation(job)
@@ -1212,7 +1211,7 @@ class ChatModeration:
         except Exception as exc:
             reraise_if_cancelled(exc)
             # Not swallowed: re-raised for the dispatcher to count and log.
-            await self._queue_recheck(jobs)
+            self._queue_recheck(jobs)
             raise
         # `strict=True` is the last line of defence and it is deliberately a
         # RAISE rather than a shorter loop: a silent truncation here pairs
@@ -1242,7 +1241,7 @@ class ChatModeration:
             # row.
             try:
                 if not await self._decide_screened(job, result, verdicts.confirmed):
-                    await self._queue_recheck((job,))
+                    self._queue_recheck((job,))
             except Exception as exc:
                 # A cancellation ends the loop, and the jobs behind this one
                 # have answers in hand that would go with it: each flagged
@@ -1269,7 +1268,7 @@ class ChatModeration:
                     error_site(exc),
                     type(exc).__name__,
                 )
-                await self._queue_recheck((job,))
+                self._queue_recheck((job,))
 
     async def _decide_screened(
         self,
@@ -2131,9 +2130,15 @@ class ChatModeration:
     # Re-check — messages Tier 2 could not check
     # ------------------------------------------------------------------
 
-    async def _queue_recheck(self, jobs: Sequence[ModerationJob]) -> None:
-        """Put messages Tier 2 could not check on the re-check list. Never
-        raises: a row that cannot be written is counted lost and logged."""
+    def _queue_recheck(self, jobs: Sequence[ModerationJob]) -> None:
+        """Put messages Tier 2 could not check on the re-check list, detached:
+        nothing waits on the write, so a worker finishes its job at once and
+        the shutdown drain is never held by it."""
+        run_in_background(self._write_recheck, jobs)
+
+    async def _write_recheck(self, jobs: Sequence[ModerationJob]) -> None:
+        """Never raises: a row that cannot be written is counted lost and
+        logged."""
         for job in jobs:
             try:
                 await self._recheck.add(
