@@ -160,7 +160,7 @@ A room appears in the catalog if, and only if, **both** of the following are tru
 1. `rooms.is_public` is true (it is published in the public room directory).
 2. Its **current** room state carries the course-plan state event (default `pangea.course_plan`) with a plan id — read from `uuid`, falling back to `course_plan_id`.
 
-Nothing else is checked: not member count, not join rule, and not the contents of the quest. A quest with zero missions is a published course and appears. Because only current state is consulted, a room that once had a course plan and no longer does is not a course.
+Nothing else is checked: not member count, not join rule, and not the contents of the quest. A quest with zero Can-Dos is a published course and appears. Because only current state is consulted, a room that once had a course plan and no longer does is not a course.
 
 ---
 
