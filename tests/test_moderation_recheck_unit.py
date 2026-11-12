@@ -299,6 +299,23 @@ class TestAnUncheckedMessageIsQueued(_Base):
             await mod._screen_batch((_job("$a"), _job("$b")))
         self.assertEqual(self._rows(), [("$a", ROOM, 0)])
 
+    async def test_a_message_dropped_by_a_full_queue_is_queued(self) -> None:
+        mod = self._module()
+        assert mod._dispatcher is not None
+        mod._dispatcher._queue_size = 1
+        self.metrics.snapshot(
+            "pangea_moderation_tier2_dropped_total", cause="queue_full"
+        )
+        await mod.on_new_event(_event(event_id="$a"), {})
+        await mod.on_new_event(_event(event_id="$b"), {})
+        self.assertEqual(
+            self.metrics.delta(
+                "pangea_moderation_tier2_dropped_total", cause="queue_full"
+            ),
+            1,
+        )
+        self.assertEqual(self._rows(), [("$b", ROOM, 0)])
+
     async def test_queueing_twice_keeps_one_row(self) -> None:
         mod = self._module()
         with self._check(mod, None, None):

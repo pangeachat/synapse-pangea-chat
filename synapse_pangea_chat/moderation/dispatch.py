@@ -246,6 +246,10 @@ class Tier2Dispatcher:
     # Admission
     # ------------------------------------------------------------------
 
+    @property
+    def is_full(self) -> bool:
+        return len(self._queue) >= self._queue_size
+
     def enqueue(self, job: ModerationJob) -> bool:
         """Accept ``job``, or refuse it and say why. Never raises, never waits.
 

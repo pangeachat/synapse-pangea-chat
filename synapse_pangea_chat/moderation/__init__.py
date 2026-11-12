@@ -1116,20 +1116,22 @@ class ChatModeration:
                 # a visible product regression, so the exemption has to win
                 # over the room's inclusion.
                 return
-            self._dispatcher.enqueue(
-                ModerationJob(
-                    event_id=event.event_id,
-                    room_id=event.room_id,
-                    sender=event.sender,
-                    text=text,
-                    enqueued_at=self._clock.time(),
-                    # Where the message sits in the stream. The Safety page
-                    # reads the sender's courses as of HERE, not as of the
-                    # verdict, so a learner who leaves before it still lands
-                    # on their course - and no state is read on this path.
-                    position=_stream_position(event),
-                )
+            job = ModerationJob(
+                event_id=event.event_id,
+                room_id=event.room_id,
+                sender=event.sender,
+                text=text,
+                enqueued_at=self._clock.time(),
+                # Where the message sits in the stream. The Safety page
+                # reads the sender's courses as of HERE, not as of the
+                # verdict, so a learner who leaves before it still lands
+                # on their course - and no state is read on this path.
+                position=_stream_position(event),
             )
+            if not self._dispatcher.enqueue(job) and self._dispatcher.is_full:
+                # Dropped unchecked: put it on the re-check list, detached so
+                # the notifier never waits on the write.
+                run_in_background(self._queue_recheck, (job,))
         except Exception as exc:
             reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract; observe-only hook, so the
