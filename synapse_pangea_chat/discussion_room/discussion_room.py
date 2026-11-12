@@ -90,7 +90,7 @@ from synapse_pangea_chat.email_invite.course_missions import (
     COURSE_MISSIONS_STATE_EVENT_TYPE,
     CourseMissionsReader,
     activity_lo_ids,
-    course_copy_lo_ids,
+    can_do_list_lo_ids,
 )
 from synapse_pangea_chat.moderation.courses import is_course
 from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimiter
@@ -258,7 +258,8 @@ class DiscussionRoom(Resource):
         self._state = api._hs.get_storage_controllers().state
         self._clock = api._hs.get_clock()
         self._http = api.http_client
-        # The course's quest and its Missions, read as the course copy reads them.
+        # The course's quest and its Can-Dos, read as the course space's Can-Do
+        # list reads them.
         self._quests = CourseMissionsReader(
             api, config.cms_base_url, config.cms_service_api_key
         )
@@ -1198,7 +1199,7 @@ class DiscussionRoom(Resource):
         """Whether one of these Missions is one of the course's: in the course's
         own Can-Do list (``pangea.course_missions``, read as the client reads
         it, so only a course admin's list counts), or in the quest the course
-        follows (``pangea.course_plan``). The copy can add Missions the quest
+        follows (``pangea.course_plan``). The list can add Can-Dos the quest
         does not carry, and the client lists their activities. A course with
         neither uses none."""
         if not lo_ids:
@@ -1213,7 +1214,7 @@ class DiscussionRoom(Resource):
             ],
         )
         wanted = set(lo_ids)
-        if not wanted.isdisjoint(course_copy_lo_ids(state)):
+        if not wanted.isdisjoint(can_do_list_lo_ids(state)):
             return True
         course_plan = state.get((COURSE_PLAN_EVENT, ""))
         # The quest id under either key the course plan has carried, by the

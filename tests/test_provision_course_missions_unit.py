@@ -1,8 +1,9 @@
-"""The v2 deferred path writes the course copy when the claim creates the space.
+"""The v2 deferred path writes the course space's Can-Do list when the claim
+creates the space.
 
 Runs the real invitation store and provisioner over an in-memory database, with
 Synapse's room creation and room state stubbed, as test_claim_by_email_unit
-does. The copy is built by the same reader v1 create_course_space uses; a
+does. The list is built by the same reader v1 create_course_space uses; a
 failed read (None) creates the course without it.
 """
 
@@ -15,15 +16,15 @@ from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
 from tests.moderation_doubles import DbPoolDouble
 from tests.test_claim_by_email_unit import SPEC, TEACHER, _claimed_room_state
 
-COPY = {
+CAN_DO_LIST = {
     "version": 1,
     "revision": 1,
     "missions": [{"lo_id": "lo-a", "activity_ids": ["act-1"]}],
 }
 
 
-class TestProvisionCourseCopy(unittest.IsolatedAsyncioTestCase):
-    async def _claim(self, copy: Any) -> tuple[Any, Any, str]:
+class TestProvisionCanDoList(unittest.IsolatedAsyncioTestCase):
+    async def _claim(self, can_do_list: Any) -> tuple[Any, Any, str]:
         api = MagicMock()
         api.server_name = "x"
         api._hs.get_datastores.return_value.main.db_pool = DbPoolDouble()
@@ -34,7 +35,7 @@ class TestProvisionCourseCopy(unittest.IsolatedAsyncioTestCase):
         claims = CourseClaimStore(api._hs)
         await claims._ensure_table()
         reader = MagicMock()
-        reader.read = AsyncMock(return_value=copy)
+        reader.read = AsyncMock(return_value=can_do_list)
         provisioner = CourseProvisioner(
             api, claims.invitations, claims, MagicMock(), course_missions=reader
         )
@@ -57,15 +58,15 @@ class TestProvisionCourseCopy(unittest.IsolatedAsyncioTestCase):
         config = create_room.await_args.kwargs["config"]
         return {event["type"]: event for event in config["initial_state"]}
 
-    async def test_claim_writes_the_copy_sent_by_the_claimant(self) -> None:
-        create_room, reader, room = await self._claim(COPY)
+    async def test_claim_writes_the_can_do_list_sent_by_the_claimant(self) -> None:
+        create_room, reader, room = await self._claim(CAN_DO_LIST)
 
         self.assertEqual(room, "!room:x")
         reader.read.assert_awaited_once_with("quest")
         state = self._state(create_room)
         event = state["pangea.course_missions"]
         self.assertEqual(event["state_key"], "")
-        self.assertEqual(event["content"], COPY)
+        self.assertEqual(event["content"], CAN_DO_LIST)
         self.assertEqual(
             create_room.await_args.kwargs["requester"].user.to_string(), TEACHER
         )

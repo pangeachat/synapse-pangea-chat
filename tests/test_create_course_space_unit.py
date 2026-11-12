@@ -573,18 +573,18 @@ class TestShareKitQrCode(unittest.IsolatedAsyncioTestCase):
             self.assertIn(name, params)
 
 
-class TestCourseCopyAtCreation(unittest.IsolatedAsyncioTestCase):
-    """The course copy rides in the space's initial state, sent by the
+class TestCanDoListAtCreation(unittest.IsolatedAsyncioTestCase):
+    """The course space's Can-Do list rides in the space's initial state, sent by the
     requester at power level 100; without one the course is created as before
     (create-course-space.instructions.md, Content Studio CONTRACT)."""
 
-    COPY = {
+    CAN_DO_LIST = {
         "version": 1,
         "revision": 1,
         "missions": [{"lo_id": "lo-a", "activity_ids": ["act-1"]}],
     }
 
-    async def _create(self, copy: Any) -> tuple[Any, Any, Any]:
+    async def _create(self, can_do_list: Any) -> tuple[Any, Any, Any]:
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from synapse_pangea_chat.config import PangeaChatConfig
@@ -609,7 +609,7 @@ class TestCourseCopyAtCreation(unittest.IsolatedAsyncioTestCase):
             claim_store,
             MagicMock(),
         )
-        read = AsyncMock(return_value=copy)
+        read = AsyncMock(return_value=can_do_list)
         prefix = "synapse_pangea_chat.email_invite.create_course_space."
         with (
             patch(
@@ -628,16 +628,16 @@ class TestCourseCopyAtCreation(unittest.IsolatedAsyncioTestCase):
         config = create_room.await_args.kwargs["config"]
         return {event["type"]: event for event in config["initial_state"]}
 
-    async def test_copy_is_written_in_initial_state(self) -> None:
-        create_room, respond, read = await self._create(self.COPY)
+    async def test_can_do_list_is_written_in_initial_state(self) -> None:
+        create_room, respond, read = await self._create(self.CAN_DO_LIST)
 
         read.assert_awaited_once_with("q1")
         state = self._state(create_room)
         event = state["pangea.course_missions"]
         self.assertEqual(event["state_key"], "")
-        self.assertEqual(event["content"], self.COPY)
+        self.assertEqual(event["content"], self.CAN_DO_LIST)
         # Sent by the room creator, who holds 100 in the initial power levels,
-        # and only that level may write the copy.
+        # and only that level may write the Can-Do list.
         self.assertEqual(
             create_room.await_args.kwargs["requester"].user.to_string(), "@bot:x"
         )
@@ -646,7 +646,7 @@ class TestCourseCopyAtCreation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(power["events"]["pangea.course_missions"], 100)
         self.assertEqual(respond.call_args.args[1], 200)
 
-    async def test_no_copy_still_creates_the_course(self) -> None:
+    async def test_no_can_do_list_still_creates_the_course(self) -> None:
         create_room, respond, _ = await self._create(None)
 
         state = self._state(create_room)
@@ -660,8 +660,8 @@ class TestCourseCopyAtCreation(unittest.IsolatedAsyncioTestCase):
 
 
 class TestHungCmsStillCreatesTheCourse(unittest.TestCase):
-    """A CMS that never answers costs course creation at most 3 s: the copy
-    read gives up and the course is created without it. Driven on a fake
+    """A CMS that never answers costs course creation at most 3 s: the Can-Do
+    list read gives up and the course is created without it. Driven on a fake
     reactor clock, so the test takes no real time."""
 
     def test_course_created_within_the_cap(self) -> None:

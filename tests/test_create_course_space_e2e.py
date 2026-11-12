@@ -282,7 +282,7 @@ COURSE_MISSIONS_EVENT_TYPE = "pangea.course_missions"
 
 
 class _QuestCmsHandler(BaseHTTPRequestHandler):
-    """Answers the two reads a course copy is built from."""
+    """Answers the two reads a course space's Can-Do list is built from."""
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass
@@ -300,7 +300,7 @@ class _QuestCmsHandler(BaseHTTPRequestHandler):
                 "req": {"target_language": "es"},
                 "res": {
                     "learning_objective_sequence": [
-                        # The plan's selection and note start the copy.
+                        # The plan's selection and note start the Can-Do list.
                         {
                             "learning_objective": "lo-b",
                             "activity_ids": ["act-b2"],
@@ -349,8 +349,8 @@ class _QuestCmsHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
-class TestCourseCopyAtCreationE2E(BaseSynapseE2ETest):
-    """The course copy lands in room state, sent by the requester, when the
+class TestCanDoListAtCreationE2E(BaseSynapseE2ETest):
+    """The course space's Can-Do list lands in room state, sent by the requester, when the
     CMS answers; without it the course is created exactly as before."""
 
     _cms: HTTPServer
@@ -387,7 +387,9 @@ class TestCourseCopyAtCreationE2E(BaseSynapseE2ETest):
         self.assertEqual(response.status_code, 200, response.text)
         return {(e["type"], e["state_key"]): e for e in response.json()}
 
-    async def test_copy_written_at_creation_and_absent_when_cms_fails(self) -> None:
+    async def test_can_do_list_written_at_creation_and_absent_when_cms_fails(
+        self,
+    ) -> None:
         port = self._cms.server_address[1]
         await self.homeserver(
             module_config={"cms_base_url": f"http://127.0.0.1:{port}"}
@@ -415,7 +417,7 @@ class TestCourseCopyAtCreationE2E(BaseSynapseE2ETest):
         self.assertEqual(power["events"][COURSE_MISSIONS_EVENT_TYPE], 100)
 
         # A quest the CMS does not know: the course is still created, with
-        # its plan, and without a copy.
+        # its plan, and without a Can-Do list.
         room_id = self._create(token, "missing-quest")["room_id"]
         state = self._state_events(token, room_id)
         self.assertNotIn((COURSE_MISSIONS_EVENT_TYPE, ""), state)
