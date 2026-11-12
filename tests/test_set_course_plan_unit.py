@@ -18,8 +18,8 @@ from synapse_pangea_chat.set_course_plan.set_course_plan import (
     PlanUpdate,
     SetCoursePlan,
     SetCoursePlanRequest,
-    course_missions_content,
-    missions_revision,
+    can_do_list_content,
+    can_do_list_revision,
     parse_request,
     plan_update,
     planned_writes,
@@ -75,29 +75,29 @@ class TestPlanUpdate(unittest.TestCase):
         self.assertEqual(update.content, {"uuid": "new", "l2": "es"})
 
 
-_MISSIONS = {
+_CAN_DO_LIST = {
     "version": 1,
     "revision": 2,
     "missions": [{"lo_id": "lo", "activity_ids": []}],
 }
 
 
-class TestCourseMissions(unittest.TestCase):
+class TestCanDoList(unittest.TestCase):
     _BUILT = {"version": 1, "revision": 1, "missions": []}
 
     def test_a_readable_revision(self) -> None:
-        self.assertEqual(missions_revision({"version": 1, "revision": 3}), 3)
+        self.assertEqual(can_do_list_revision({"version": 1, "revision": 3}), 3)
 
     def test_the_first_can_do_list_is_revision_one(self) -> None:
-        self.assertEqual(course_missions_content(self._BUILT, None)["revision"], 1)
+        self.assertEqual(can_do_list_content(self._BUILT, None)["revision"], 1)
 
     def test_a_replacement_is_one_above_the_old_can_do_list(self) -> None:
         old = {"version": 1, "revision": 3, "missions": []}
 
-        self.assertEqual(course_missions_content(self._BUILT, old)["revision"], 4)
+        self.assertEqual(can_do_list_content(self._BUILT, old)["revision"], 4)
 
     def test_a_can_do_list_that_could_not_be_built_is_empty(self) -> None:
-        self.assertEqual(course_missions_content(None, {"revision": 3}), {})
+        self.assertEqual(can_do_list_content(None, {"revision": 3}), {})
 
     def test_an_unreadable_old_revision_counts_as_none(self) -> None:
         olds: List[Optional[Dict[str, Any]]] = [
@@ -109,10 +109,8 @@ class TestCourseMissions(unittest.TestCase):
         ]
         for old in olds:
             with self.subTest(old=old):
-                self.assertIsNone(missions_revision(old))
-                self.assertEqual(
-                    course_missions_content(self._BUILT, old)["revision"], 1
-                )
+                self.assertIsNone(can_do_list_revision(old))
+                self.assertEqual(can_do_list_content(self._BUILT, old)["revision"], 1)
 
 
 class TestPlannedWrites(unittest.TestCase):
@@ -122,7 +120,7 @@ class TestPlannedWrites(unittest.TestCase):
         writes = planned_writes(
             self._MOVE,
             "pangea.course_plan",
-            _MISSIONS,
+            _CAN_DO_LIST,
             "Old title",
             "Old text",
             "New",
@@ -132,7 +130,7 @@ class TestPlannedWrites(unittest.TestCase):
         self.assertEqual(
             writes,
             [
-                ("pangea.course_missions", _MISSIONS),
+                ("pangea.course_missions", _CAN_DO_LIST),
                 ("pangea.course_plan", {"uuid": "new", "l2": "es"}),
                 ("m.room.name", {"name": "New"}),
                 ("m.room.topic", topic_content("Text")),
@@ -147,7 +145,7 @@ class TestPlannedWrites(unittest.TestCase):
         writes = planned_writes(
             self._MOVE,
             "pangea.course_plan",
-            _MISSIONS,
+            _CAN_DO_LIST,
             "Teacher's name",
             "",
             "Teacher's name",
@@ -177,14 +175,14 @@ class TestPlannedWrites(unittest.TestCase):
         writes = planned_writes(
             PlanUpdate(UNCHANGED, "new"),
             "pangea.course_plan",
-            _MISSIONS,
+            _CAN_DO_LIST,
             "New",
             "Text",
             "New",
             "Text",
         )
 
-        self.assertEqual(writes, [("pangea.course_missions", _MISSIONS)])
+        self.assertEqual(writes, [("pangea.course_missions", _CAN_DO_LIST)])
 
     def test_nothing_differs_nothing_written(self) -> None:
         writes = planned_writes(
@@ -266,7 +264,7 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         "title": "New title",
         "description": "New text",
     }
-    _OLD_MISSIONS = {"version": 1, "revision": 3, "missions": []}
+    _OLD_CAN_DO_LIST = {"version": 1, "revision": 3, "missions": []}
     _BUILT = {
         "version": 1,
         "revision": 1,
@@ -275,7 +273,7 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
 
     def _endpoint(
         self,
-        missions: Optional[Dict[str, Any]] = _OLD_MISSIONS,
+        can_do_list: Optional[Dict[str, Any]] = _OLD_CAN_DO_LIST,
         built: Optional[Dict[str, Any]] = _BUILT,
         on: str = "old",
     ) -> tuple[SetCoursePlan, MagicMock]:
@@ -292,8 +290,8 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
             ),
             ("m.room.name", ""): SimpleNamespace(content={"name": "Old title"}),
         }
-        if missions is not None:
-            state[("pangea.course_missions", "")] = SimpleNamespace(content=missions)
+        if can_do_list is not None:
+            state[("pangea.course_missions", "")] = SimpleNamespace(content=can_do_list)
         api.get_room_state = AsyncMock(return_value=state)
         api.create_and_send_event_into_room = AsyncMock()
         config = SimpleNamespace(
@@ -349,20 +347,20 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({e["sender"] for e in sent}, {"@teacher:test"})
         self.assertEqual(sent[0]["content"]["revision"], 4)
         self.assertEqual(
-            body["course_missions"],
+            body["can_do_list"],
             {"built": True, "previous_revision": 3, "revision": 4, "missions": 1},
         )
         self.assertEqual(body["previous_name"], "Old title")
         self.assertIsNone(body["previous_topic"])
 
     async def test_a_space_with_no_can_do_list_gets_revision_one(self) -> None:
-        endpoint, api = self._endpoint(missions=None)
+        endpoint, api = self._endpoint(can_do_list=None)
 
         status, body = await self._post(endpoint)
 
         self.assertEqual(status, 200, body)
         self.assertEqual(self._sent(api)[0]["content"]["revision"], 1)
-        self.assertIsNone(body["course_missions"]["previous_revision"])
+        self.assertIsNone(body["can_do_list"]["previous_revision"])
 
     async def test_a_can_do_list_that_cannot_be_built_is_written_empty(self) -> None:
         endpoint, api = self._endpoint(built=None)
@@ -376,12 +374,12 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent[0]["content"], {})
         self.assertEqual(sent[1]["type"], "pangea.course_plan")
         self.assertEqual(
-            body["course_missions"],
+            body["can_do_list"],
             {"built": False, "previous_revision": 3, "revision": None, "missions": 0},
         )
 
     async def test_an_empty_can_do_list_on_the_new_quest_is_rebuilt(self) -> None:
-        endpoint, api = self._endpoint(missions={}, on="new")
+        endpoint, api = self._endpoint(can_do_list={}, on="new")
 
         status, body = await self._post(endpoint, expected="new")
 
@@ -392,17 +390,17 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
             ["pangea.course_missions", "m.room.name", "m.room.topic"],
         )
         self.assertEqual(sent[0]["content"]["revision"], 1)
-        self.assertTrue(body["course_missions"]["built"])
+        self.assertTrue(body["can_do_list"]["built"])
 
     async def test_a_failed_rebuild_leaves_the_empty_can_do_list(self) -> None:
-        endpoint, api = self._endpoint(missions={}, built=None, on="new")
+        endpoint, api = self._endpoint(can_do_list={}, built=None, on="new")
 
         with self.assertLogs(module.logger, level="ERROR"):
             status, body = await self._post(endpoint, expected="new")
 
         self.assertEqual(status, 200, body)
         self.assertNotIn("pangea.course_missions", [e["type"] for e in self._sent(api)])
-        self.assertFalse(body["course_missions"]["built"])
+        self.assertFalse(body["can_do_list"]["built"])
 
     async def test_a_can_do_list_with_content_on_the_new_quest_is_left_alone(
         self,
@@ -413,7 +411,7 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, 200, body)
         self.assertNotIn("pangea.course_missions", [e["type"] for e in self._sent(api)])
-        self.assertIsNone(body["course_missions"])
+        self.assertIsNone(body["can_do_list"])
         endpoint._course_missions.read.assert_not_awaited()  # type: ignore[attr-defined]
 
     async def test_a_space_that_changed_during_the_read_is_refused(self) -> None:

@@ -153,7 +153,7 @@ class TestBuildCourseMissionsContent(unittest.TestCase):
         )
 
     def test_a_mission_listed_twice_keeps_its_first_place(self) -> None:
-        # Readers reject a Can-Do list that names the same Mission twice.
+        # Readers reject a Can-Do list that names the same Can-Do twice.
         content = build_course_missions_content(
             _quest(["lo-a", "lo-b", "lo-a"]), [_activity("act-1", ["lo-a"])]
         )

@@ -86,7 +86,7 @@ def _quest_entries(quest: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
         if isinstance(step, Mapping):
             lo_id = _ref_id(step.get("learning_objective"))
             # A Mission listed twice keeps its first place: readers reject a
-            # Can-Do list that names the same Mission twice.
+            # Can-Do list that names the same Can-Do twice.
             if lo_id is not None and lo_id not in entries:
                 entries[lo_id] = step
     return entries
@@ -150,12 +150,12 @@ def _string_list(value: Any) -> TypeGuard[List[str]]:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
-def _missions_lo_ids(content: Mapping[str, Any]) -> Optional[List[str]]:
-    """Every Mission a Can-Do list names, shown and removed, or None when the
+def _can_do_list_lo_ids(content: Mapping[str, Any]) -> Optional[List[str]]:
+    """Every Can-Do a list names, shown and removed, or None when the
     list is malformed. The client's strict parse (``CourseMissionsEvent
     .tryParse``) decides which records count; this checks the same structure
-    (version, revision, each Mission's id and activity lists, the removed
-    Missions), so a list the client ignores names nothing here. A note, due
+    (version, revision, each Can-Do's id and activity lists, the removed
+    Can-Dos), so a list the client ignores names nothing here. A note, due
     date or time zone the client would refuse is not checked: none of them
     changes which Missions the course lists."""
     revision = content.get("revision")
@@ -207,11 +207,11 @@ def _missions_lo_ids(content: Mapping[str, Any]) -> Optional[List[str]]:
     return shown + [lo_id for lo_id in removed if lo_id not in shown]
 
 
-def course_missions_lo_ids(state: Mapping[Tuple[str, str], Any]) -> List[str]:
-    """The Missions the course space's Can-Do list names, as the client reads
+def can_do_list_lo_ids(state: Mapping[Tuple[str, str], Any]) -> List[str]:
+    """The Can-Dos the course space's Can-Do list names, as the client reads
     it: empty unless the course has a well-formed ``pangea.course_missions``
     sent by someone who is a course admin (power level 100, creators count)
-    now, so a student can never add a Mission to their course. ``state`` must
+    now, so a student can never add a Can-Do to their course. ``state`` must
     hold the list, the create event and the power levels."""
     event = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
     # Empty content is the list a failed read leaves (set_course_plan):
@@ -224,7 +224,7 @@ def course_missions_lo_ids(state: Mapping[Tuple[str, str], Any]) -> List[str]:
             getattr(event, "room_id", "?"),
         )
         return []
-    lo_ids = _missions_lo_ids(event.content)
+    lo_ids = _can_do_list_lo_ids(event.content)
     if lo_ids is None:
         logger.warning(
             "Can-Do list in %s is malformed; ignored, as the client does",

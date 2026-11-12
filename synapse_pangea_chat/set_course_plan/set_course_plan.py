@@ -100,7 +100,7 @@ def plan_update(
     return PlanUpdate(UPDATE, current, new_content)
 
 
-def missions_revision(content: Optional[Mapping[str, Any]]) -> Optional[int]:
+def can_do_list_revision(content: Optional[Mapping[str, Any]]) -> Optional[int]:
     """A Can-Do list's revision, or None when there is no readable list."""
     revision = content.get("revision") if content is not None else None
     if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 1:
@@ -108,7 +108,7 @@ def missions_revision(content: Optional[Mapping[str, Any]]) -> Optional[int]:
     return None
 
 
-def course_missions_content(
+def can_do_list_content(
     built: Optional[Mapping[str, Any]], current: Optional[Mapping[str, Any]]
 ) -> Dict[str, Any]:
     """The new quest's Can-Do list at one revision above the current list's (1
@@ -117,7 +117,7 @@ def course_missions_content(
     the new shared quest rather than the old quest's Can-Dos."""
     if built is None:
         return {}
-    return {**built, "revision": (missions_revision(current) or 0) + 1}
+    return {**built, "revision": (can_do_list_revision(current) or 0) + 1}
 
 
 def _content(event: Any) -> Optional[Dict[str, Any]]:
@@ -134,7 +134,7 @@ def topic_content(text: str) -> Dict[str, Any]:
 def planned_writes(
     update: PlanUpdate,
     plan_event_type: str,
-    course_missions: Optional[Dict[str, Any]],
+    can_do_list: Optional[Dict[str, Any]],
     current_name: Optional[str],
     current_topic: Optional[str],
     title: str,
@@ -144,16 +144,16 @@ def planned_writes(
     one is given, the course plan when it changes, then the name, then the
     topic, each only when it differs from what the space has.
 
-    ``course_missions`` is the Can-Do list to write, or None to leave the
+    ``can_do_list`` is the Can-Do list to write, or None to leave the
     space's list alone. A plan change always carries one. Once the plan points
     at the new quest, only an empty list (left by a failed read) is given, so a
     re-run does not wipe edits the teacher has published since. The list goes
     first so a refusal part-way leaves the plan on the old quest."""
     writes: List[Tuple[str, Dict[str, Any]]] = []
-    if update.outcome == UPDATE and course_missions is None:
+    if update.outcome == UPDATE and can_do_list is None:
         raise ValueError("a plan change needs the new quest's Can-Do list")
-    if course_missions is not None:
-        writes.append((COURSE_MISSIONS_STATE_EVENT_TYPE, course_missions))
+    if can_do_list is not None:
+        writes.append((COURSE_MISSIONS_STATE_EVENT_TYPE, can_do_list))
     if update.outcome == UPDATE and update.content is not None:
         writes.append((plan_event_type, update.content))
     if current_name != title:
@@ -311,12 +311,12 @@ class SetCoursePlan(Resource):
 
         current_name = _state_text(state.get((EventTypes.Name, "")), "name")
         current_topic = _state_text(state.get((EventTypes.Topic, "")), "topic")
-        current_missions = _content(state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
-        new_missions: Optional[Dict[str, Any]] = None
+        current_list = _content(state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
+        new_list: Optional[Dict[str, Any]] = None
         built: Optional[Dict[str, Any]] = None
         # A switch builds the new quest's Can-Do list; a space already on the
         # quest whose list is empty (a failed read) gets it rebuilt.
-        if update.outcome == UPDATE or current_missions == {}:
+        if update.outcome == UPDATE or current_list == {}:
             built = await self._course_missions.read(req.quest_id)
             if built is None:
                 logger.error(
@@ -342,7 +342,7 @@ class SetCoursePlan(Resource):
             if (
                 _content(again.get((self._event_type, ""))) != _content(event)
                 or _content(again.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
-                != current_missions
+                != current_list
             ):
                 logger.warning(
                     "set_course_plan: %s changed while its Can-Do list was "
@@ -354,11 +354,11 @@ class SetCoursePlan(Resource):
                     {"error": "The space changed while its Can-Do list was built"},
                 )
             if update.outcome == UPDATE or built is not None:
-                new_missions = course_missions_content(built, current_missions)
+                new_list = can_do_list_content(built, current_list)
         writes = planned_writes(
             update,
             self._event_type,
-            new_missions,
+            new_list,
             current_name,
             current_topic,
             req.title,
@@ -373,14 +373,14 @@ class SetCoursePlan(Resource):
             "changes": [event_type for event_type, _ in writes],
             # Reported whenever a Can-Do list was built or tried, so a failed
             # rebuild of an empty list is visible too.
-            "course_missions": (
+            "can_do_list": (
                 {
                     "built": built is not None,
-                    "previous_revision": missions_revision(current_missions),
-                    "revision": missions_revision(new_missions),
-                    "missions": len((new_missions or {}).get("missions") or []),
+                    "previous_revision": can_do_list_revision(current_list),
+                    "revision": can_do_list_revision(new_list),
+                    "missions": len((new_list or {}).get("missions") or []),
                 }
-                if update.outcome == UPDATE or current_missions == {}
+                if update.outcome == UPDATE or current_list == {}
                 else None
             ),
             "dry_run": req.dry_run,

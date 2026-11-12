@@ -14,7 +14,7 @@ It is the room half of the course plan replacement in [create-course-space](crea
 - `POST /_synapse/client/pangea/v1/set_course_plan`
 - **Auth:** server admins only.
 - **Input:** the space's room ID, the quest ID it should point at, the quest ID the operator expects it to point at now, the new quest's title and description, and an optional dry run.
-- **Response:** the old and new quest IDs, the space's name and topic before the call, which of the course space's Can-Do list, course plan, name and topic changed, the Can-Do list's old and new revision and whether it could be built (under `course_missions`), and the member the events were sent as.
+- **Response:** the old and new quest IDs, the space's name and topic before the call, which of the course space's Can-Do list, course plan, name and topic changed, the Can-Do list's old and new revision and whether it could be built (under `can_do_list`), and the member the events were sent as.
 
 ## What it does
 

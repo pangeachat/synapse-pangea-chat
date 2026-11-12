@@ -349,7 +349,7 @@ class _QuestCmsHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
-class TestCourseMissionsAtCreationE2E(BaseSynapseE2ETest):
+class TestCanDoListAtCreationE2E(BaseSynapseE2ETest):
     """The course space's Can-Do list lands in room state, sent by the requester, when the
     CMS answers; without it the course is created exactly as before."""
 
