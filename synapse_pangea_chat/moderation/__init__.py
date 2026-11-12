@@ -2176,8 +2176,6 @@ class ChatModeration:
                 )
                 return
             for event_id, room_id, queued_at_ms in rows:
-                if self._breaker is not None and self._breaker.is_shedding():
-                    return
                 try:
                     await self._recheck_one(event_id, room_id, queued_at_ms)
                 except Exception as exc:
@@ -2221,6 +2219,9 @@ class ChatModeration:
                 room_id,
                 MAX_AGE_SECONDS // 86400,
             )
+            return
+        if self._breaker is not None and self._breaker.is_shedding():
+            # After the expiry check, so an outage still ages rows out.
             return
         store = self._api._hs.get_datastores().main
         event = await store.get_event(event_id, allow_none=True)

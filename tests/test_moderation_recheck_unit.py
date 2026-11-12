@@ -449,6 +449,23 @@ class TestTheRecheckPass(_Base):
             await mod._recheck_pass()
         self.assertEqual(self._rows(), [("$a", ROOM, 1)])
 
+    async def test_an_open_breaker_still_expires_old_rows(self) -> None:
+        mod = self._module()
+        await self._queue(mod, "$old")
+        self.store.events["$old"] = _Event(event_id="$old")
+        self.homeserver.clock.now += MAX_AGE_SECONDS + 1
+        assert mod._breaker is not None
+        for _ in range(50):
+            mod._breaker.record_failure(mod._breaker.check()[1])
+        self.metrics.snapshot(RECHECK, outcome="expired")
+        with self._check(mod) as check, self.assertLogs(
+            "synapse.modules.synapse_pangea_chat", "WARNING"
+        ):
+            await mod._recheck_pass()
+        check.assert_not_awaited()
+        self.assertEqual(self._rows(), [])
+        self.assertEqual(self.metrics.delta(RECHECK, outcome="expired"), 1)
+
     async def test_an_open_breaker_skips_the_pass(self) -> None:
         mod = self._module()
         await self._queue(mod, "$a")
