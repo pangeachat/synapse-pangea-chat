@@ -310,6 +310,67 @@ class TestModerationE2E(BaseSynapseE2ETest):
             f"clean message never reached moderation: {self.mock_moderation.seen_texts}",
         )
 
+    def _wait_for_incident(
+        self, event_id: str, timeout_s: float = 30.0
+    ) -> Dict[str, Any]:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            with psycopg2.connect(**parse_dsn(self.database_url)) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT to_regclass('public.pangea_safety_incidents')"
+                    )
+                    fetched = cursor.fetchone()
+                    row = None
+                    if fetched is not None and fetched[0] is not None:
+                        cursor.execute(
+                            "SELECT action, outcome, subject_id "
+                            "FROM pangea_safety_incidents WHERE event_id = %s",
+                            (event_id,),
+                        )
+                        row = cursor.fetchone()
+            if row is not None:
+                return {"action": row[0], "outcome": row[1], "subject_id": row[2]}
+            time.sleep(0.5)
+        self.fail(f"no safety incident was ever recorded for {event_id}")
+
+    async def test_a_flagged_call_transcript_is_recorded_not_redacted(self) -> None:
+        """#872: a transcript is checked by Tier 2; a flag writes a Safety
+        row and the transcript stays as it was."""
+        await self.homeserver(
+            module_config={
+                "moderation": {
+                    "tier1_enabled": True,
+                    "tier1_phone_regions": ["US"],
+                    "tier2_enabled": True,
+                    "choreo_base_url": self.mock_moderation.base_url,
+                    "choreo_access_token": "syt_mock_service_token",
+                },
+            }
+        )
+        user_id, token = await self.new_user("caller")
+        room_id = await self.create_private_room(token)
+        segments = [
+            {"text": "call me at 415-555-2671", "at_ms": 0},
+            {"text": f"something awful {FLAG_MARKER}", "at_ms": 1000},
+        ]
+        resp = requests.put(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}"
+            "/send/pangea.call_transcript/txn-transcript",
+            json={"segments": segments},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        event_id = resp.json()["event_id"]
+
+        incident = self._wait_for_incident(event_id)
+        self.assertEqual(incident["action"], "kept")
+        self.assertIsNone(incident["outcome"])
+        self.assertEqual(incident["subject_id"], user_id)
+        event = self._get_event(room_id, event_id, token)
+        assert event is not None
+        self.assertEqual(event["content"].get("segments"), segments)
+
 
 if __name__ == "__main__":
     import unittest

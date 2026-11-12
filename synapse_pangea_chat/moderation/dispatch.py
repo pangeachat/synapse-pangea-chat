@@ -104,6 +104,8 @@ class ModerationJob:
     #: learner who leaves a course before the verdict still lands on it.
     #: None when the event carried none; the verdict then anchors to now.
     position: Optional[int] = None
+    #: A `pangea.call_transcript`: a flag is recorded, never redacted (#872).
+    transcript: bool = False
 
 
 class Tier2Dispatcher:

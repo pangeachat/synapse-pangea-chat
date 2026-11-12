@@ -377,6 +377,23 @@ class TestTheRecheckPass(_Base):
         self.assertEqual(self._rows(), [])
         self.assertEqual(self.metrics.delta(RECHECK, outcome="decided"), 1)
 
+    async def test_a_rechecked_transcript_is_recorded_and_not_redacted(
+        self,
+    ) -> None:
+        mod = self._module()
+        await self._queue(mod, "$t")
+        transcript = _Event(event_type="pangea.call_transcript", event_id="$t")
+        transcript.content = {"segments": [{"text": "you suck"}]}
+        self.store.events["$t"] = transcript
+        with self._check(mod, FLAGGED) as check, patch.object(
+            mod._recorder, "record_verdict", AsyncMock()
+        ) as record:
+            await mod._recheck_pass()
+        check.assert_awaited_once_with("you suck")
+        record.assert_awaited_once()
+        self._sent().assert_not_awaited()
+        self.assertEqual(self._rows(), [])
+
     async def test_still_no_verdict_keeps_the_row_and_writes_no_incident(
         self,
     ) -> None:

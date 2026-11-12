@@ -505,6 +505,30 @@ ENCRYPTION_REFUSAL = (
 RECHECK_INTERVAL_SECONDS = 30
 RECHECK_BATCH = 25
 
+#: A call's transcript, one event per recording device (pangeachat/.github#872).
+#: Tier 2 only, and a flag only writes the Safety page's row: never redacted,
+#: never blocked.
+CALL_TRANSCRIPT_EVENT_TYPE = "pangea.call_transcript"
+
+
+def transcript_text(raw_content: Any) -> Optional[str]:
+    """The spoken text of a call transcript: its segments' `text`, in order.
+
+    Attributed to the event's sender. `spoken_by` names another speaker only as
+    an unverified claim (the client checks it against the call's audio), so it
+    is not used to name the subject of an incident.
+    """
+    content = raw_content if isinstance(raw_content, Mapping) else {}
+    segments = content.get("segments")
+    if not isinstance(segments, list):
+        return None
+    parts = [
+        segment["text"]
+        for segment in segments
+        if isinstance(segment, Mapping) and isinstance(segment.get("text"), str)
+    ]
+    return "\n".join(parts).strip() or None
+
 
 def _encryption_state(event: EventBase) -> Optional[str]:
     """Which message-bearing event this is, in the counter's vocabulary, or
@@ -1091,7 +1115,11 @@ class ChatModeration:
             encryption = _encryption_state(event)
             if encryption is not None:
                 metrics.record_message_event("tier2", encryption)
-            extracted = self._extract_text(event)
+            is_transcript = event.type == CALL_TRANSCRIPT_EVENT_TYPE
+            if is_transcript:
+                extracted = _Extracted(transcript_text(event.content), False)
+            else:
+                extracted = self._extract_text(event)
             if extracted.incomplete:
                 metrics.record_extraction_incomplete("tier2")
             text = extracted.text
@@ -1127,6 +1155,7 @@ class ChatModeration:
                 # verdict, so a learner who leaves before it still lands
                 # on their course - and no state is read on this path.
                 position=_stream_position(event),
+                transcript=is_transcript,
             )
             if not self._dispatcher.enqueue(job) and self._dispatcher.is_full:
                 # Dropped unchecked: put it on the re-check list.
@@ -1494,6 +1523,20 @@ class ChatModeration:
             )
             return False
         category = _summarize_categories(categories)
+        if job.transcript:
+            # A call transcript is never redacted (#872): the flag reaches the
+            # Safety page as a row, and the transcript stays as it was.
+            kept = self._capture_verdict(job, ACTION_KEPT, None, result)
+            if kept is not None:
+                await self._recorder.record_verdict(kept)
+            logger.info(
+                "tier2 flagged transcript %s in %s (category=%s); recorded, "
+                "not redacted",
+                job.event_id,
+                job.room_id,
+                category,
+            )
+            return True
         if _keeps_for_self_harm(categories, result.get("category_scores")):
             # Deleting a disclosure of self-harm is itself a harm: the learner
             # is asking for help, the message is the only record that they did,
@@ -2231,8 +2274,12 @@ class ChatModeration:
         store = self._api._hs.get_datastores().main
         event = await store.get_event(event_id, allow_none=True)
         text = None
+        is_transcript = event is not None and event.type == CALL_TRANSCRIPT_EVENT_TYPE
         if event is not None and not event.internal_metadata.is_redacted():
-            text = self._extract_text(event).text
+            if is_transcript:
+                text = transcript_text(event.content)
+            else:
+                text = self._extract_text(event).text
         if event is None or text is None:
             # Gone, already removed, or nothing left to read.
             await self._recheck.delete(event_id)
@@ -2245,6 +2292,7 @@ class ChatModeration:
             text=text,
             enqueued_at=self._clock.time(),
             position=_stream_position(event),
+            transcript=is_transcript,
         )
         if await self._check_and_redact(job):
             await self._recheck.delete(event_id)
