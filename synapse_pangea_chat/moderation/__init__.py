@@ -74,7 +74,7 @@ from synapse_pangea_chat.moderation.compat import (
     looping_call_interval,
     reraise_if_cancelled,
 )
-from synapse_pangea_chat.moderation.courses import StudentCourses
+from synapse_pangea_chat.moderation.courses import ChatCourses
 from synapse_pangea_chat.moderation.dispatch import ModerationJob, Tier2Dispatcher
 from synapse_pangea_chat.moderation.disposition import (
     GRANTED,
@@ -687,7 +687,7 @@ class ChatModeration:
         self._recorder = IncidentRecorder(
             api._hs,
             self._incidents,
-            StudentCourses.from_homeserver(api._hs, self._is_exempt_sender),
+            ChatCourses.from_homeserver(api._hs),
         )
 
         self._tier2_active = False
@@ -1151,9 +1151,9 @@ class ChatModeration:
                 text=text,
                 enqueued_at=self._clock.time(),
                 # Where the message sits in the stream. The Safety page
-                # reads the sender's courses as of HERE, not as of the
-                # verdict, so a learner who leaves before it still lands
-                # on their course - and no state is read on this path.
+                # reads the chat's course as of HERE, not as of the
+                # verdict, so a chat moved before it still lands on its
+                # own course - and no state is read on this path.
                 position=_stream_position(event),
                 transcript=is_transcript,
             )

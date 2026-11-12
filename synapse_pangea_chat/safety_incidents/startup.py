@@ -17,11 +17,9 @@ already written is never overwritten.
 - Sender and text come from `event_json` while they are not yet pruned. A
   redacted event keeps its original JSON until Synapse's retention prunes it;
   after that the content is empty and `text` is NULL.
-- `course_ids` is the course spaces where, AT THE INCIDENT EVENT'S position,
-  the sender was joined below power level 100 - `StudentCourses.for_user` at
-  the event's own stream ordering, which reads each space's state after its
-  last event at or before that position, never current state. A learner who
-  has since left still lands on the course they were in.
+- `course_ids` is the course that owned the chat AT THE INCIDENT EVENT'S
+  position - `ChatCourses.for_room` at the event's own stream ordering, never
+  current state. A chat moved since still lands on the course it was in.
 - `outcome` is `removed` when the event is redacted now, `unknown` for a
   legacy redaction whose event is still standing (a claim that was kept or
   stranded), and empty otherwise.
@@ -41,7 +39,7 @@ from synapse_pangea_chat.moderation.compat import (
     background_process_args,
     reraise_if_cancelled,
 )
-from synapse_pangea_chat.moderation.courses import StudentCourses
+from synapse_pangea_chat.moderation.courses import ChatCourses
 from synapse_pangea_chat.moderation.disposition import CREATE_TABLE_SQL
 from synapse_pangea_chat.moderation.incidents import (
     ACTION_PRESERVED,
@@ -86,7 +84,7 @@ class SafetyIncidentsStartup:
         self,
         homeserver: Any,
         store: IncidentStore,
-        courses: StudentCourses,
+        courses: ChatCourses,
         room_names: Optional[RoomNames] = None,
     ) -> None:
         self._hs = homeserver
@@ -258,7 +256,7 @@ class SafetyIncidentsStartup:
                 text = extract_message_text(event_type, content, event_id).text
             # The same position-anchored rule every live incident uses, at the
             # incident event's own position rather than now.
-            courses = await self._courses.for_user(sender, int(stream_ordering))
+            courses = await self._courses.for_room(room_id, int(stream_ordering))
             # The room's name as it was at the incident event, too.
             room_name = await self._room_names.label(
                 room_id, sender, int(stream_ordering)

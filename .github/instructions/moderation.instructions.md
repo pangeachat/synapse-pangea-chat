@@ -5,14 +5,14 @@ description: "What the homeserver blocks before send, what it removes after, why
 
 # Server-Side Chat Moderation
 
-The homeserver checks every message twice: Tier 1 refuses unmistakable content before send, and Tier 2 asks the choreographer's moderation service afterwards and removes what it flags. Everything caught, and every learner report, reaches the learner's course admins on the Safety page. The why is the org [trust-and-safety doc](../../../.github/.github/instructions/trust-and-safety.instructions.md)'s.
+The homeserver checks every message twice: Tier 1 refuses unmistakable content before send, and Tier 2 asks the choreographer's moderation service afterwards and removes what it flags. Everything caught, and every learner report, reaches the Safety page of the chat's course. The why is the org [trust-and-safety doc](../../../.github/.github/instructions/trust-and-safety.instructions.md)'s.
 
 ## The experience, step by step
 
 1. A phone number or a blocking-wordlist term refuses a message; the learner is told the rule and that a machine decided, never the word.
 2. Otherwise it appears, and seconds later Tier 2 removes it if flagged. A flagged edit loses only the edit.
 3. A message reading most strongly as self-harm stays up, pinned as urgent on the Safety page.
-4. A course admin sees every incident and report in their course, with full text.
+4. A course admin sees every incident and report in their course's chats, with full text.
 
 ## Decisions
 
@@ -50,10 +50,11 @@ Re-decider in brackets.
 
 ### The Safety page's record
 
-- **Captured at the incident, never recomputed**: sender, full text, room name, the learner's courses then. [unassigned]
+- **Captured at the incident, never recomputed**: sender, full text, room name, the chat's course then. [unassigned]
 - **Moderation never waits on the record**: enforcement first, the row after; repeat verdicts merge and never erase. [unassigned]
 - **Every incident write marks the forward outbox in the same transaction**, so the analytics forwarder pushes it to the dashboard and no write lands unmarked (admin-dash#300). [unassigned]
-- **An admin sees only their course's incidents**, never a learner's other courses; every refusal looks the same. [unassigned]
+- **An incident goes only to the course owning its chat**, the space itself or one linked to it as parent and child; a direct message reaches no admin ([#874](https://github.com/pangeachat/.github/issues/874)). [owner]
+- **An admin sees only their course's incidents**; every refusal looks the same. [unassigned]
 - **Accepted limits**: a row lost to a restart mid-retry or long outage; a course misattributed in rare room-graph cases. Revisit if lost rows (`pangea_safety_incident_lost_total`) are ever non-zero; other reopening conditions sit beside the code. [owner]
 - **Out of scope**: notifications, retention, opt-out and age-based strictness are the org doc's.
 

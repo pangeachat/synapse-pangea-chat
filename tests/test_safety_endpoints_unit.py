@@ -232,7 +232,7 @@ class TestReportAdmission(ReportCase):
 
 
 class TestReportSnapshot(ReportCase):
-    async def test_a_report_snapshots_sender_text_reason_and_the_subjects_course(
+    async def test_a_report_snapshots_sender_text_reason_and_the_chats_course(
         self,
     ) -> None:
         status, payload = await self._report()
@@ -253,8 +253,19 @@ class TestReportSnapshot(ReportCase):
         self.assertEqual(
             row.course_ids,
             (COURSE_A,),
-            "a teacher's report reached a course other than the learner's",
+            "a report reached a course other than the chat's",
         )
+
+    async def test_a_report_in_a_chat_no_course_owns_reaches_no_course(
+        self,
+    ) -> None:
+        """The learner is a student of A, but the chat is no course's."""
+        self.world.unlink(COURSE_A, ROOM)
+        status, payload = await self._report()
+        self.assertEqual(status, 200)
+        row = await self.store.get(payload["incident_id"])
+        assert row is not None
+        self.assertEqual(row.course_ids, ())
 
     async def test_a_retry_with_the_same_id_is_idempotent(self) -> None:
         first = await self._report()
@@ -657,13 +668,13 @@ class TestBackfill(StartupCase):
     async def test_the_legacy_decisions_are_copied_with_the_courses_of_their_time(
         self,
     ) -> None:
-        """The learner was in course A when the message was sent and has left
-        since; they joined course B after it. The row belongs to A only."""
+        """The chat was course A's when the message was sent and has moved to
+        course B since. The row belongs to A only."""
         self.world.rename(ROOM, "Then")
         sent_at = self.world.position
         self.world.rename(ROOM, "Now")
-        self.world.leave(STUDENT, COURSE_A)
-        self.world.join(STUDENT, COURSE_B)
+        self.world.unlink(COURSE_A, ROOM)
+        self.world.link(COURSE_B, ROOM)
         self._event(
             "$msg", ROOM, sent_at, content={"msgtype": "m.text", "body": "awful"}
         )
