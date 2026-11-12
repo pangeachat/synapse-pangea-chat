@@ -5,7 +5,10 @@ own copy of its outline lives in this state event; a course without one reads
 the shared quest order, exactly as before the copy existed. Building a copy is
 a snapshot of that shared list: the quest plan's learning objectives in order,
 each with the visible library activities at the course's target language that
-reference it, as the client's course outline shows them.
+reference it, as the client's course outline shows them. An entry that selects
+activities (``activity_ids``) lists those of them the library returns, in its
+order, and all of them when it returns none; the entry's note is copied too
+(org quests.instructions.md, "Each entry in the Can-Do sequence").
 
 The copy is optional. A CMS read that fails leaves the course without one and
 the Studio writes it on first publish, so a failure here is logged and never
@@ -37,6 +40,9 @@ FETCH_TIMEOUT_SECONDS = 3
 # The course listing's own page size (choreo list_activity_plans_for_los).
 ACTIVITY_LIMIT = 200
 MAX_BODY_BYTES = 16_000_000
+# Readers refuse a whole copy whose note is longer, counted in UTF-16 units as
+# the client and the CMS count it.
+MAX_NOTE_LENGTH = 280
 
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.email_invite.course_missions"
@@ -68,21 +74,51 @@ def quest_target_language(quest: Mapping[str, Any]) -> Optional[str]:
     return l2 if isinstance(l2, str) and l2 else None
 
 
-def quest_lo_ids(quest: Mapping[str, Any]) -> List[str]:
-    """The quest's learning objectives, in its order, each once."""
+def _quest_entries(quest: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
+    """The quest's entries by learning objective, in its order, each once."""
     res = quest.get("res")
     steps = res.get("learning_objective_sequence") if isinstance(res, Mapping) else None
     if not isinstance(steps, list):
-        return []
-    ids: List[str] = []
+        return {}
+    entries: Dict[str, Mapping[str, Any]] = {}
     for step in steps:
         if isinstance(step, Mapping):
             lo_id = _ref_id(step.get("learning_objective"))
             # A Mission listed twice keeps its first place: readers reject a
             # copy that names the same Mission twice.
-            if lo_id is not None and lo_id not in ids:
-                ids.append(lo_id)
-    return ids
+            if lo_id is not None and lo_id not in entries:
+                entries[lo_id] = step
+    return entries
+
+
+def quest_lo_ids(quest: Mapping[str, Any]) -> List[str]:
+    """The quest's learning objectives, in its order, each once."""
+    return list(_quest_entries(quest))
+
+
+def _selected(entry: Mapping[str, Any]) -> List[str]:
+    """The entry's selected activity ids, each once; empty for no selection
+    (null and ``[]`` alike)."""
+    ids = entry.get("activity_ids")
+    if not isinstance(ids, list):
+        return []
+    return list(dict.fromkeys(a for a in ids if isinstance(a, str) and a))
+
+
+def _note(entry: Mapping[str, Any], lo_id: str) -> Optional[str]:
+    """The entry's note, or None when it has none. A note longer than readers
+    accept is left out, so it cannot invalidate the whole copy."""
+    note = entry.get("note")
+    if not isinstance(note, str) or not note.strip():
+        return None
+    if len(note.encode("utf-16-le")) // 2 > MAX_NOTE_LENGTH:
+        logger.warning(
+            "Course copy left out the quest's note for %s: longer than %d",
+            lo_id,
+            MAX_NOTE_LENGTH,
+        )
+        return None
+    return note
 
 
 def _visible_at(doc: Mapping[str, Any], l2: str) -> bool:
@@ -205,6 +241,9 @@ def build_course_missions_content(
     ``activities`` are ``activities-v2`` rows in the listing's order. Each
     activity is identified by its content id (``res.plan.activity_id``), never
     its row id, and the first row per activity wins, as the client dedupes.
+    An entry's selection keeps those of its activities the listing returns, in
+    the selection's order; one the listing returns none of keeps them all, so
+    a stale selection never empties a Can-Do.
     """
     l2 = quest_target_language(quest)
     if l2 is None:
@@ -222,14 +261,17 @@ def build_course_missions_content(
         for lo_id in activity_lo_ids(doc):
             by_lo.setdefault(lo_id, []).append(activity_id)
 
-    return {
-        "version": 1,
-        "revision": 1,
-        "missions": [
-            {"lo_id": lo_id, "activity_ids": list(by_lo.get(lo_id, []))}
-            for lo_id in quest_lo_ids(quest)
-        ],
-    }
+    missions: List[Dict[str, Any]] = []
+    for lo_id, entry in _quest_entries(quest).items():
+        listed = by_lo.get(lo_id, [])
+        available = set(listed)
+        chosen = [a for a in _selected(entry) if a in available]
+        mission: Dict[str, Any] = {"lo_id": lo_id, "activity_ids": chosen or listed}
+        note = _note(entry, lo_id)
+        if note is not None:
+            mission["note"] = note
+        missions.append(mission)
+    return {"version": 1, "revision": 1, "missions": missions}
 
 
 def activities_query(lo_ids: Sequence[str], l2: str) -> str:
