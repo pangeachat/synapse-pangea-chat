@@ -1116,7 +1116,9 @@ class TestSafetyPushE2E(_ForwardHelpers):
         self.assertEqual(record["room_id"], dm)
         self.assertEqual(record["subject_id"], learner)
         self.assertEqual(record["reporter_id"], peer)
-        self.assertEqual(record["course_ids"], [course])
+        # A DM is owned by no course, so its report reaches no course (#874),
+        # though the learner is a student of `course`.
+        self.assertEqual(record["course_ids"], [])
         # Settled: not dirty, not parked. The revision can be 2: the start's
         # reconciliation may run after the report and mark it once more.
         await self._until(
