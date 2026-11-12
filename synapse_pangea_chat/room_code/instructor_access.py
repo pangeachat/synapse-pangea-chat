@@ -1,7 +1,10 @@
 """Current instructor authority, including creator power in newer rooms."""
 import logging
+from typing import FrozenSet
 
 from synapse.api.constants import EventTypes
+
+from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
 
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.room_code.instructor_access"
@@ -60,3 +63,21 @@ def joined_local_instructors(api, state):
         and is_joined_instructor(state, key)
     ]
     return sorted(candidates, key=lambda user: (-user_power(state, user), user))
+
+
+async def course_admins(api, space_id) -> FrozenSet[str]:
+    """A course's admins: its joined, local, non-bot members at instructor
+    power. Reads the create event too, so a room-version-12 creator counts."""
+    state = await api.get_room_state(
+        space_id,
+        event_filter=[
+            (EventTypes.Create, ""),
+            (EventTypes.PowerLevels, ""),
+            (EventTypes.Member, None),
+        ],
+    )
+    return frozenset(
+        user_id
+        for user_id in joined_local_instructors(api, state)
+        if isinstance(user_id, str) and not is_probable_bot_user_id(user_id)
+    )

@@ -57,11 +57,7 @@ from synapse_pangea_chat.room_code.get_inviter_user import (
     persist_without_auth_checks,
 )
 from synapse_pangea_chat.room_code.instructor_access import is_joined_instructor
-
-try:
-    import sentry_sdk  # type: ignore[import-not-found]
-except ImportError:  # pragma: no cover - sentry is optional at runtime
-    sentry_sdk = None
+from synapse_pangea_chat.sentry_capture import capture_exception
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.course_default_chats")
 
@@ -290,7 +286,12 @@ def plan_recovery(
 
 
 async def wait_out_rate_limits(
-    clock: Any, action: Callable[[], Awaitable[Any]], name: str
+    clock: Any,
+    action: Callable[[], Awaitable[Any]],
+    name: str,
+    *,
+    max_waits: int = MAX_RATE_LIMIT_WAITS,
+    max_wait_ms: Optional[int] = None,
 ) -> None:
     """Run a membership or state write, waiting out Synapse's rate limits.
 
@@ -298,24 +299,25 @@ async def wait_out_rate_limits(
     limit (burst 10, then one a second by default) is what a class joining
     one chat hits. Waiting is correct here: this runs in the background,
     and a dropped member is the failure this module exists to prevent.
+
+    A caller answering a request bounds the wait with ``max_waits`` and
+    ``max_wait_ms``, so a client is answered busy instead of held open.
     """
-    for _ in range(MAX_RATE_LIMIT_WAITS):
+    for _ in range(max_waits):
         try:
             await action()
             return
         except LimitExceededError as e:
             wait_ms = e.retry_after_ms or 1000
+            if max_wait_ms is not None:
+                wait_ms = min(wait_ms, max_wait_ms)
             logger.info("%s waiting %d ms for %s", name, wait_ms, e.limiter_name)
             await clock.sleep(Duration(milliseconds=wait_ms))
     raise LimitExceededError(limiter_name=name, retry_after_ms=None)
 
 
 def _capture_exception(e: Exception) -> None:
-    # Background tasks and respond_with_json paths never reach Synapse's
-    # request-level Sentry capture, so a failure absorbed here is invisible
-    # unless captured explicitly.
-    if sentry_sdk is not None:
-        sentry_sdk.capture_exception(e)
+    capture_exception(e)
 
 
 class CourseDefaultChats:

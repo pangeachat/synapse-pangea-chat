@@ -16,6 +16,7 @@ from synapse_pangea_chat.course_session_admins.course_session_admins import (
     with_invite_level,
     with_room_listed,
 )
+from synapse_pangea_chat.discussion_room.rooms import creation_content
 
 ROOM = "!session:example.com"
 OTHER = "!other:example.com"
@@ -185,7 +186,7 @@ class TestRaiseToInviteLevel(unittest.TestCase):
 
         async def room_state(room_id: str, event_filter: Any) -> Dict[Any, Any]:
             return {
-                ("m.room.create", ""): _ev({}, sender=CREATOR),
+                ("m.room.create", ""): self.create,
                 ("m.room.power_levels", ""): _ev(self.power, sender=CREATOR),
             }
 
@@ -205,6 +206,8 @@ class TestRaiseToInviteLevel(unittest.TestCase):
             create_and_send_event_into_room=AsyncMock(side_effect=send),
         )
         module._room_locks = course_session_admins.Linearizer("test", clock=Mock())
+        module._discussion_bot_user_id = BOT
+        self.create = _ev({}, sender=CREATOR)
         self.eligible = True
 
         async def eligible(space_id: str, room_id: str, user_id: str) -> bool:
@@ -301,6 +304,20 @@ class TestRaiseToInviteLevel(unittest.TestCase):
                 self._raise()
                 self.assertEqual(calls, 1)
                 self.assertEqual(self.sent, [])
+
+    def test_an_admin_in_a_discussion_room_is_never_raised(self):
+        # Only the bot invites there, at 100: raising an admin to the invite
+        # level would hand them the bot's own power.
+        self.create = _ev(creation_content(SPACE, "act-1"), sender=BOT)
+        self.power = {**SESSION_POWER, "invite": 100, "users": {BOT: 100}}
+        self._raise()
+        self.assertEqual(self.sent, [])
+        self.select.assert_not_awaited()
+
+    def test_a_student_made_room_with_the_discussion_mark_is_raised(self):
+        self.create = _ev(creation_content(SPACE, "act-1"), sender=CREATOR)
+        self._raise()
+        self.assertEqual(len(self.sent), 1)
 
     def test_a_room_nobody_can_change_raises_without_writing(self):
         self.select = AsyncMock(return_value=None)

@@ -40,7 +40,6 @@ from synapse_pangea_chat.activity_session_previews.get_activity_session_previews
     has_valid_via,
 )
 from synapse_pangea_chat.blocked_join_gate import server_initiated_join
-from synapse_pangea_chat.bot_user_ids import is_probable_bot_user_id
 from synapse_pangea_chat.course_default_chats.course_default_chats import (
     SPACE_ROOM_TYPE,
     wait_out_rate_limits,
@@ -51,7 +50,10 @@ from synapse_pangea_chat.public_courses.select_state_sender import (
 )
 from synapse_pangea_chat.push_rules_writer import push_rules_writer, writes_push_rules
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
-from synapse_pangea_chat.room_code.instructor_access import is_joined_instructor
+from synapse_pangea_chat.room_code.instructor_access import (
+    course_admins,
+    is_joined_instructor,
+)
 
 try:
     import sentry_sdk  # type: ignore[import-not-found]
@@ -184,8 +186,12 @@ def _capture_exception(e: Exception) -> None:
 class CourseSessionAdmins:
     """The hook and the joins. One instance per Synapse process."""
 
-    def __init__(self, api: ModuleApi):
+    def __init__(self, api: ModuleApi, discussion_bot_user_id: Optional[str] = None):
         self._api = api
+        # A discussion room's power levels are its own: only its bot invites,
+        # so its admins are joined to read along and never raised to invite
+        # (discussion-room.instructions.md, "Power levels and the bot").
+        self._discussion_bot_user_id = discussion_bot_user_id
         # The hook fires on every Synapse process, and a push rule can only be
         # written on the push rules writer ("master" on a single process), so
         # that one process does all the joins and the others nothing.
@@ -370,23 +376,7 @@ class CourseSessionAdmins:
         """Joined, local, non-bot members of the space at admin power."""
         if not await self.is_space(space_id):
             return frozenset()
-        state = await self._api.get_room_state(
-            space_id,
-            event_filter=[
-                (EventTypes.Create, ""),
-                (EventTypes.PowerLevels, ""),
-                (EventTypes.Member, None),
-            ],
-        )
-        return frozenset(
-            user_id
-            for (event_type, user_id), _ in state.items()
-            if event_type == EventTypes.Member
-            and isinstance(user_id, str)
-            and self._api.is_mine(user_id)
-            and not is_probable_bot_user_id(user_id)
-            and is_joined_instructor(state, user_id)
-        )
+        return await course_admins(self._api, space_id)
 
     async def _join_admin(self, space_id: str, room_id: str, user_id: str) -> bool:
         """List, mute, then join. Whether the admin may still be joined is read
@@ -474,6 +464,14 @@ class CourseSessionAdmins:
             )
             power = state.get((EventTypes.PowerLevels, ""))
             create = state.get((EventTypes.Create, ""))
+            if self._is_discussion_room(create):
+                logger.info(
+                    "course_session_admins left %s at its level in discussion "
+                    "room %s: only the bot invites there",
+                    user_id,
+                    room_id,
+                )
+                return
             creators: FrozenSet[str] = frozenset()
             if create is not None and getattr(
                 create.room_version, "msc4289_creator_power_enabled", False
@@ -512,6 +510,17 @@ class CourseSessionAdmins:
 
         async with self._room_locks.queue(room_id):
             await wait_out_rate_limits(self._clock, attempt, "course_session_admins")
+
+    def _is_discussion_room(self, create: Optional[EventBase]) -> bool:
+        # Imported here: the discussion module imports this one.
+        from synapse_pangea_chat.discussion_room.rooms import discussion_marker
+
+        return create is not None and (
+            discussion_marker(
+                create.sender, create.content, self._discussion_bot_user_id
+            )
+            is not None
+        )
 
     async def _list(self, user_id: str, room_id: str) -> None:
         async with self._user_locks.queue(user_id):

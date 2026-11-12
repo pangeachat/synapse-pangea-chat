@@ -37,6 +37,11 @@ from synapse_pangea_chat.delete_room import DeleteRoom
 from synapse_pangea_chat.delete_user import DeleteUser
 from synapse_pangea_chat.direct_message import EnsureDirectMessage
 from synapse_pangea_chat.direct_push import DirectPush
+from synapse_pangea_chat.discussion_room import (
+    DiscussionAdminMirror,
+    DiscussionJoinCheck,
+    DiscussionRoom,
+)
 from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
 from synapse_pangea_chat.email_invite.claim_by_email import ClaimByEmail
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
@@ -202,6 +207,25 @@ def _validate_choreo_host(hostname: Optional[str], netloc: str) -> None:
             )
 
 
+def _discussion_choreo_base_url(value: Any) -> Optional[str]:
+    """``discussion_room_choreo_base_url`` as a base URL the activity read's
+    path can be appended to, or None when unset."""
+    if value is None:
+        return None
+    name = 'Config "discussion_room_choreo_base_url"'
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string when set")
+    raw = value.strip()
+    parsed = urlparse(raw)
+    if parsed.scheme not in _CHOREO_URL_SCHEMES or not parsed.hostname:
+        raise ValueError(f"{name} must be an http or https URL with a host")
+    if "?" in raw or "#" in raw or "@" in parsed.netloc:
+        raise ValueError(
+            f"{name} must be a base URL with no query, fragment or credentials"
+        )
+    return raw.rstrip("/")
+
+
 def _validate_choreo_base_url(value: str) -> str:
     """Return the usable form of `value`, or raise saying why there is none.
 
@@ -361,6 +385,26 @@ class PangeaChat:
         self._api.register_third_party_rules_callbacks(
             on_new_event=self._on_new_event_room_preview,
         )
+
+        # --- Discussion rooms ---
+        # Places a student in a room for one of their course's discussions and
+        # ends or reopens their seat; the server is the only writer of seats.
+        # The join check and the admin mirror need the discussion bot
+        # (discussion-room.instructions.md).
+        self.discussion_room_resource = DiscussionRoom(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/discussion_room",
+            resource=self.discussion_room_resource,
+        )
+        # The discussion bot is user_activity_notification_bot_user_id, shared
+        # with the user-activity filter.
+        if config.user_activity_notification_bot_user_id:
+            self.discussion_join_check = DiscussionJoinCheck(
+                api, config.user_activity_notification_bot_user_id
+            )
+            self.discussion_admin_mirror = DiscussionAdminMirror(
+                api, config.user_activity_notification_bot_user_id
+            )
 
         # --- Activity Session Previews ---
         # Space-scoped session discovery: a thin front on the room_preview
@@ -685,7 +729,14 @@ class PangeaChat:
         # Joins a course's admins to each new activity session linked into the
         # course, hidden and muted in their app.
         if config.course_session_admins_enabled:
-            self.course_session_admins = CourseSessionAdmins(api)
+            # Discussion rooms keep their own power levels (the bot alone
+            # invites), so their admins are joined but never raised.
+            self.course_session_admins = CourseSessionAdmins(
+                api,
+                discussion_bot_user_id=(
+                    config.user_activity_notification_bot_user_id or None
+                ),
+            )
             self._api.register_web_resource(
                 path="/_synapse/client/pangea/v1/backfill_course_session_admins",
                 resource=BackfillCourseSessionAdmins(api, self.course_session_admins),
@@ -892,6 +943,21 @@ class PangeaChat:
         )
         room_preview_requests_per_burst = config.get(
             "room_preview_requests_per_burst", 10
+        )
+
+        # --- discussion_room config ---
+        # Request limits are in the shared table (student_invitations/rate_limits.py).
+        discussion_room_capacity = config.get("discussion_room_capacity", 12)
+        if (
+            not isinstance(discussion_room_capacity, int)
+            or isinstance(discussion_room_capacity, bool)
+            or discussion_room_capacity < 1
+        ):
+            raise ValueError(
+                'Config "discussion_room_capacity" must be an integer >= 1'
+            )
+        discussion_room_choreo_base_url = _discussion_choreo_base_url(
+            config.get("discussion_room_choreo_base_url", None)
         )
 
         # --- room_code config ---
@@ -1659,6 +1725,8 @@ class PangeaChat:
             room_preview_state_event_types=all_event_types,
             room_preview_burst_duration_seconds=room_preview_burst_duration_seconds,
             room_preview_requests_per_burst=room_preview_requests_per_burst,
+            discussion_room_capacity=discussion_room_capacity,
+            discussion_room_choreo_base_url=discussion_room_choreo_base_url,
             knock_with_code_requests_per_burst=knock_with_code_requests_per_burst,
             knock_with_code_burst_duration_seconds=knock_with_code_burst_duration_seconds,
             preview_with_code_requests_per_burst=preview_with_code_requests_per_burst,
