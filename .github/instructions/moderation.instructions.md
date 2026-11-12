@@ -41,6 +41,7 @@ Re-decider in brackets.
 - **The visible window is accepted** and measured: an AI call in the send path is what the split avoids. [unassigned]
 - **Confidence is weighed per category**: classroom swearing stays, targeted abuse goes, sexual content involving minors goes on any flag, a missing score removes. [unassigned]
 - **Self-harm is preserved, not redacted, when it is the strongest flag, and the decision is durable.** A learner disclosing self-harm is asking for help, and the message is the only record of it. Abuse that also reads as self-harm, when another flag scores higher, is decided like any other flag; a tie, an unreadable self-harm score, or no score for the other flags keeps it. No setting controls it. [unassigned; [#310](https://github.com/pangeachat/synapse-pangea-chat/issues/310)]
+- **Call transcripts are checked too; a flag only writes a Safety row**, never a removal or block, attributed to the sender. [owner; [.github#872](https://github.com/pangeachat/.github/issues/872)]
 - **The learner's own account sends the removal**: no service account is in every room. [engineer]
 - **Activity rooms are moderated**: the orchestrator no longer moderates them. [unassigned]
 - **The local wordlist runs beside Tier 2 and only counts** until measured agreement justifies more. [unassigned]

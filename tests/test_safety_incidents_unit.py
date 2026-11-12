@@ -32,7 +32,7 @@ from typing import (
 from unittest.mock import AsyncMock, create_autospec, patch
 
 from synapse.logging.context import LoggingContext, current_context
-from synapse.module_api import ModuleApi
+from synapse.module_api import NOT_SPAM, ModuleApi
 from twisted.internet import defer
 
 from synapse_pangea_chat.moderation import ChatModeration
@@ -1474,6 +1474,52 @@ class TestACancellationDoesNotLoseTheFinding(Tier2Case):
         homeserver.clock.advance(1.0)
         row = await self._row(module)
         self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_SKIPPED))
+
+
+def _transcript(*texts: str, **extra: Any) -> Any:
+    """A `pangea.call_transcript` event as the client writes it (#872)."""
+    content = {"segments": [{"text": text, "at_ms": 0} for text in texts], **extra}
+    return _event(sender=STUDENT, event_type="pangea.call_transcript", content=content)
+
+
+class TestCallTranscriptsAreRecordedNotRedacted(Tier2Case):
+    """A flagged call transcript writes a Safety row and is never redacted or
+    blocked (pangeachat/.github#872)."""
+
+    async def test_a_transcript_is_queued_as_its_sender(self) -> None:
+        module, _api, _hs, _db = self._module()
+        event = _transcript("hello", "you are awful", spoken_by="@peer:example.org")
+        job = await self._queue(module, event)
+        self.assertEqual(job.text, "hello\nyou are awful")
+        self.assertEqual(job.sender, STUDENT)
+        self.assertTrue(job.transcript)
+
+    async def test_a_transcript_with_no_text_is_not_queued(self) -> None:
+        module, _api, _hs, _db = self._module()
+        assert module._dispatcher is not None
+        queued: List[ModerationJob] = []
+        with patch.object(
+            module._dispatcher, "enqueue", side_effect=_accepting(queued)
+        ):
+            await module.on_new_event(_transcript(" "), {})
+            await module.on_new_event(_event(sender=STUDENT, content={}), {})
+        self.assertEqual(queued, [])
+
+    async def test_a_flagged_transcript_is_recorded_and_not_redacted(self) -> None:
+        module, api, _hs, _db = self._module()
+        with patch(MODERATE_TEXT, _verdict("harassment")):
+            await module._check_and_redact(_job(transcript=True))
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        row = await self._row(module)
+        self.assertEqual((row.action, row.outcome), (ACTION_KEPT, None))
+        self.assertEqual(row.subject_id, STUDENT)
+        self.assertEqual(row.categories, ("harassment",))
+
+    async def test_tier1_never_blocks_a_transcript(self) -> None:
+        module, _hs, db_pool = _tier1(_classroom())
+        result = await module.check_event_for_spam(_transcript(PHONE_TEXT))
+        self.assertIs(result, NOT_SPAM)
+        self.assertEqual(db_pool.interactions, [])
 
 
 class TestAnUnconfirmedScreenIsStillRecorded(Tier2Case):
