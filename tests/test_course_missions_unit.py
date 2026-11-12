@@ -1,9 +1,10 @@
-"""Unit tests for the course copy a server-created course starts with.
+"""Unit tests for the course space's Can-Do list a server-created course starts
+with.
 
-The copy is a snapshot of the shared course list: the quest's learning
+The list is a snapshot of the shared course list: the quest's learning
 objectives in order, each with the visible library activities at the course's
-target language that reference it (CONTRACT "Building a copy"). A CMS failure
-leaves the course without a copy instead of failing creation.
+target language that reference it (create-course-space.instructions.md). A CMS
+failure leaves the course without a Can-Do list instead of failing creation.
 """
 
 import json
@@ -152,7 +153,7 @@ class TestBuildCourseMissionsContent(unittest.TestCase):
         )
 
     def test_a_mission_listed_twice_keeps_its_first_place(self) -> None:
-        # Readers reject a copy that names the same Mission twice.
+        # Readers reject a Can-Do list that names the same Mission twice.
         content = build_course_missions_content(
             _quest(["lo-a", "lo-b", "lo-a"]), [_activity("act-1", ["lo-a"])]
         )
@@ -190,7 +191,7 @@ LISTED = [_activity(a, ["lo-a"]) for a in ("act-1", "act-2", "act-3")]
 
 
 class TestPlanEntrySelectionAndNote(unittest.TestCase):
-    """A new copy starts from the plan entry's selected activities and note
+    """A new Can-Do list starts from the plan entry's selected activities and note
     (org quests.instructions.md, "Each entry in the Can-Do sequence")."""
 
     def _mission(self, entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -231,7 +232,7 @@ class TestPlanEntrySelectionAndNote(unittest.TestCase):
 
     def test_a_note_readers_would_refuse_is_left_out(self) -> None:
         # 141 emoji are 141 characters but 282 UTF-16 units, the length the
-        # readers count; the copy stays valid without it.
+        # readers count; the list stays valid without it.
         with self.assertLogs(
             "synapse.module.synapse_pangea_chat.email_invite.course_missions",
             level="WARNING",
@@ -297,7 +298,9 @@ class TestCourseMissionsReader(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    async def test_builds_the_copy_from_the_quest_and_its_activities(self) -> None:
+    async def test_builds_the_can_do_list_from_the_quest_and_its_activities(
+        self,
+    ) -> None:
         calls: List[str] = []
         reader = _reader(
             {
@@ -345,7 +348,7 @@ class TestCourseMissionsReader(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(query["sort"], "-updatedAt")
         self.assertEqual(query["depth"], "0")
 
-    async def test_cms_error_yields_no_copy_and_is_logged(self) -> None:
+    async def test_cms_error_yields_no_can_do_list_and_is_logged(self) -> None:
         reader = _reader({"/api/quest-plans/": _Response(500, {"errors": []})}, [])
 
         with self.assertLogs(
@@ -355,17 +358,17 @@ class TestCourseMissionsReader(unittest.IsolatedAsyncioTestCase):
             content = await reader.read("quest-1")
 
         self.assertIsNone(content)
-        self.assertIn("No course copy written for quest quest-1", logs.output[0])
+        self.assertIn("No Can-Do list written for quest quest-1", logs.output[0])
 
-    async def test_unreachable_cms_yields_no_copy(self) -> None:
+    async def test_unreachable_cms_yields_no_can_do_list(self) -> None:
         with self.assertLogs(
             "synapse.module.synapse_pangea_chat.email_invite.course_missions",
             "WARNING",
         ):
             self.assertIsNone(await _reader({}, []).read("quest-1"))
 
-    async def test_failed_activity_read_yields_no_copy(self) -> None:
-        """A partial read is not a copy: an empty course would replace the
+    async def test_failed_activity_read_yields_no_can_do_list(self) -> None:
+        """A partial read is not a Can-Do list: an empty course would replace the
         shared list for every member."""
         reader = _reader(
             {

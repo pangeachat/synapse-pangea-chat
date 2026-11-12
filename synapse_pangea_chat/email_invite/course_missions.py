@@ -1,16 +1,17 @@
-"""The course copy (``pangea.course_missions``) a server-created course starts with.
+"""The course space's Can-Do list (``pangea.course_missions``) a server-created
+course starts with.
 
-Content Studio lets a teacher reorder and trim a course's Can-Dos. The course's
-own copy of its outline lives in this state event; a course without one reads
-the shared quest order, exactly as before the copy existed. Building a copy is
-a snapshot of that shared list: the quest plan's learning objectives in order,
+Content Studio lets a teacher reorder and trim a course's Can-Dos. The course
+space's Can-Do list lives in this state event; a course without one reads the
+shared quest order, exactly as before the list existed. Building a list is a
+snapshot of that shared list: the quest plan's learning objectives in order,
 each with the visible library activities at the course's target language that
 reference it, as the client's course outline shows them. An entry that selects
 activities (``activity_ids``) lists those of them the library returns, in its
 order, and all of them when it returns none; the entry's note is copied too
 (org quests.instructions.md, "Each entry in the Can-Do sequence").
 
-The copy is optional. A CMS read that fails leaves the course without one and
+The list is optional. A CMS read that fails leaves the course without one and
 the Studio writes it on first publish, so a failure here is logged and never
 blocks course creation. See create-course-space.instructions.md.
 """
@@ -30,7 +31,7 @@ from synapse_pangea_chat.cms_http import cms_request, service_headers
 from synapse_pangea_chat.room_code.instructor_access import user_power
 
 COURSE_MISSIONS_STATE_EVENT_TYPE = "pangea.course_missions"
-# Only a course admin may write the copy; a copy from anyone else is ignored.
+# Only a course admin may write the list; a list from anyone else is ignored.
 COURSE_ADMIN_POWER = 100
 
 # The whole read (both CMS requests) is bounded: course creation and a claim
@@ -40,7 +41,7 @@ FETCH_TIMEOUT_SECONDS = 3
 # The course listing's own page size (choreo list_activity_plans_for_los).
 ACTIVITY_LIMIT = 200
 MAX_BODY_BYTES = 16_000_000
-# Readers refuse a whole copy whose note is longer, counted in UTF-16 units as
+# Readers refuse a whole list whose note is longer, counted in UTF-16 units as
 # the client and the CMS count it.
 MAX_NOTE_LENGTH = 280
 
@@ -50,7 +51,7 @@ logger = logging.getLogger(
 
 
 class CourseMissionsError(RuntimeError):
-    """The CMS could not supply what a copy is built from."""
+    """The CMS could not supply what a Can-Do list is built from."""
 
 
 def _ref_id(value: Any) -> Optional[str]:
@@ -85,7 +86,7 @@ def _quest_entries(quest: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
         if isinstance(step, Mapping):
             lo_id = _ref_id(step.get("learning_objective"))
             # A Mission listed twice keeps its first place: readers reject a
-            # copy that names the same Mission twice.
+            # Can-Do list that names the same Mission twice.
             if lo_id is not None and lo_id not in entries:
                 entries[lo_id] = step
     return entries
@@ -107,13 +108,13 @@ def _selected(entry: Mapping[str, Any]) -> List[str]:
 
 def _note(entry: Mapping[str, Any], lo_id: str) -> Optional[str]:
     """The entry's note, or None when it has none. A note longer than readers
-    accept is left out, so it cannot invalidate the whole copy."""
+    accept is left out, so it cannot invalidate the whole list."""
     note = entry.get("note")
     if not isinstance(note, str) or not note.strip():
         return None
     if len(note.encode("utf-16-le")) // 2 > MAX_NOTE_LENGTH:
         logger.warning(
-            "Course copy left out the quest's note for %s: longer than %d",
+            "Can-Do list left out the quest's note for %s: longer than %d",
             lo_id,
             MAX_NOTE_LENGTH,
         )
@@ -124,7 +125,7 @@ def _note(entry: Mapping[str, Any], lo_id: str) -> Optional[str]:
 def _visible_at(doc: Mapping[str, Any], l2: str) -> bool:
     """The library row a learner sees: canonical, not hidden, not private,
     at the course's target language. The CMS query applies the same clauses;
-    they are checked again here so a looser answer cannot widen the copy."""
+    they are checked again here so a looser answer cannot widen the list."""
     req = doc.get("req")
     if isinstance(req, Mapping) and req.get("source_request_hash"):
         return False
@@ -149,12 +150,12 @@ def _string_list(value: Any) -> TypeGuard[List[str]]:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
-def _copy_lo_ids(content: Mapping[str, Any]) -> Optional[List[str]]:
-    """Every Mission a course copy names, shown and removed, or None when the
-    copy is malformed. The client's strict parse (``CourseMissionsEvent
+def _missions_lo_ids(content: Mapping[str, Any]) -> Optional[List[str]]:
+    """Every Mission a Can-Do list names, shown and removed, or None when the
+    list is malformed. The client's strict parse (``CourseMissionsEvent
     .tryParse``) decides which records count; this checks the same structure
     (version, revision, each Mission's id and activity lists, the removed
-    Missions), so a copy the client ignores names nothing here. A note, due
+    Missions), so a list the client ignores names nothing here. A note, due
     date or time zone the client would refuse is not checked: none of them
     changes which Missions the course lists."""
     revision = content.get("revision")
@@ -206,27 +207,27 @@ def _copy_lo_ids(content: Mapping[str, Any]) -> Optional[List[str]]:
     return shown + [lo_id for lo_id in removed if lo_id not in shown]
 
 
-def course_copy_lo_ids(state: Mapping[Tuple[str, str], Any]) -> List[str]:
-    """The Missions a course's own copy names, as the client reads it: empty
-    unless the course has a well-formed ``pangea.course_missions`` sent by
-    someone who is a course admin (power level 100, creators count) now, so
-    a student can never add a Mission to their course. ``state`` must hold
-    the copy, the create event and the power levels."""
+def course_missions_lo_ids(state: Mapping[Tuple[str, str], Any]) -> List[str]:
+    """The Missions the course space's Can-Do list names, as the client reads
+    it: empty unless the course has a well-formed ``pangea.course_missions``
+    sent by someone who is a course admin (power level 100, creators count)
+    now, so a student can never add a Mission to their course. ``state`` must
+    hold the list, the create event and the power levels."""
     event = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
-    # Empty content is the copy a failed read leaves (set_course_plan):
-    # no copy, by design.
+    # Empty content is the list a failed read leaves (set_course_plan):
+    # no list, by design.
     if event is None or not event.content:
         return []
     if user_power(state, event.sender) < COURSE_ADMIN_POWER:
         logger.info(
-            "course copy in %s was not sent by a course admin; ignored",
+            "Can-Do list in %s was not sent by a course admin; ignored",
             getattr(event, "room_id", "?"),
         )
         return []
-    lo_ids = _copy_lo_ids(event.content)
+    lo_ids = _missions_lo_ids(event.content)
     if lo_ids is None:
         logger.warning(
-            "course copy in %s is malformed; ignored, as the client does",
+            "Can-Do list in %s is malformed; ignored, as the client does",
             getattr(event, "room_id", "?"),
         )
         return []
@@ -236,7 +237,7 @@ def course_copy_lo_ids(state: Mapping[Tuple[str, str], Any]) -> List[str]:
 def build_course_missions_content(
     quest: Mapping[str, Any], activities: Sequence[Mapping[str, Any]]
 ) -> Dict[str, Any]:
-    """The copy: each learning objective in quest order with its activities.
+    """The Can-Do list: each learning objective in quest order with its activities.
 
     ``activities`` are ``activities-v2`` rows in the listing's order. Each
     activity is identified by its content id (``res.plan.activity_id``), never
@@ -339,9 +340,9 @@ class CourseMissionsReader:
         return build_course_missions_content(quest, docs)
 
     async def read(self, quest_id: str) -> Optional[Dict[str, Any]]:
-        """The copy for ``quest_id``, or None when it cannot be built."""
+        """The Can-Do list for ``quest_id``, or None when it cannot be built."""
         if not quest_id:
-            logger.warning("No course copy written: the request names no quest")
+            logger.warning("No Can-Do list written: the request names no quest")
             return None
         try:
             return await make_deferred_yieldable(
@@ -351,10 +352,10 @@ class CourseMissionsReader:
                     clock=self._clock,
                 )
             )
-        # silent-ok: the copy is optional; without it the course reads the shared quest order and the Studio writes it on first publish
+        # silent-ok: the Can-Do list is optional; without it the course reads the shared quest order and the Studio writes it on first publish
         except Exception as e:
             logger.warning(
-                "No course copy written for quest %s: %s: %s",
+                "No Can-Do list written for quest %s: %s: %s",
                 quest_id,
                 type(e).__name__,
                 e,
