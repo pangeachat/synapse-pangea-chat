@@ -83,10 +83,12 @@ def _call(
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
             status, raw = response.status, response.read()
+    # silent-ok: an error status is returned with its body, and every caller records or raises on it
     except urllib.error.HTTPError as e:
         status, raw = e.code, e.read()
     try:
         return status, json.loads(raw.decode("utf-8", "replace"))
+    # silent-ok: a body that is not JSON is returned as the error text, with its status
     except ValueError:
         return status, {"error": raw.decode("utf-8", "replace")[:300]}
 
