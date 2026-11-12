@@ -16,15 +16,13 @@ The requester must be authenticated, a joined member of the room, and hold the r
 
 Ties qualify: any member at the top power level may delete. This is intentional — the bot holds admin power level in the rooms it manages, and pangea-bot's cleanup deletes through this same rule.
 
-The comparison covers every member's effective power level, including members who only hold the room's default level.
-
-A room with no power-levels state event denies the request cleanly. It must never return a server error.
+Power held by members who have left still counts, except for a server admin, who is compared only with members still in the room. This lets the bot clear out a session whose creator left.
 
 The client hides delete buttons from non-admins and in direct chats, but the server-side check is the authority.
 
 ### What deletion does
 
-Space link cleanup, best effort. The room's child link in each parent space is removed, sent as the requester. If the requester lacks permission in a parent space, the failure is logged and deletion continues — a leftover child link in the space is accepted rather than blocking deletion.
+Space link cleanup, best effort. The room's child link in each parent space is removed. It is sent as the requester when they may change that space's children. Otherwise it is sent as the space's highest-ranked member still in it on this server, so the bot can unlink a session from a course it never joined. The unlink then shows in the space's history as that member's change; this is accepted because the app does not display it. If no one in the space may make the change, the link is left behind, a warning is logged and deletion continues: a leftover link to a deleted room is accepted rather than blocking deletion.
 
 Every joined local member leaves the room. Each leave is a self-leave (sender is the member) whose content carries `"pangea.room_deleted": true` and a fixed English `reason` — the marker is how clients tell "this room was deleted" apart from a voluntary leave, which is otherwise byte-identical (a kick is already distinguishable by its sender). Delivery of the marker is only as reliable as delivery of the leave itself (see the purge delay below). Members on other homeservers cannot be removed this way; this is accepted because deployment is effectively single-homeserver.
 

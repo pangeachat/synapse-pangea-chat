@@ -9,12 +9,15 @@ Unified configuration combining all previously separate synapse module configs:
 - limit_user_directory (from synapse-limit-user-directory)
 """
 
-from typing import List, Mapping, Optional
+from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple
 
 import attr
 
+from synapse_pangea_chat.analytics_forward.config import AnalyticsForwardConfig
 from synapse_pangea_chat.delayed_push.delayed_push import AUDITED_SYNAPSE_VERSION
 
+if TYPE_CHECKING:
+    from synapse_pangea_chat.lti.keys import LtiSettings
 #: Hosts a notice's external destination may point at. A notice link is a
 #: signed redirect, so an unlisted host would turn our mail into an open
 #: redirect; the list is the booking page and the teacher dashboards.
@@ -76,7 +79,8 @@ class PangeaChatConfig:
     user_activity_requests_per_burst: int = 10
     user_activity_burst_duration_seconds: int = 60
     # Bot user ID used by the notification_cooldown_ms filter to identify bot DM rooms.
-    # Required when using the notification_cooldown_ms query param.
+    # Required when using the notification_cooldown_ms query param. Also the
+    # discussion rooms' facilitator bot (discussion-room.instructions.md).
     user_activity_notification_bot_user_id: Optional[str] = None
     # How often the kept activity table is brought up to date (seconds); 0 turns the loop off, leaving
     # the refresh route. refresh_on_read rebuilds the table on every read: for a small server only.
@@ -96,6 +100,18 @@ class PangeaChatConfig:
     export_user_data_output_dir: str = "/tmp/pangea-export-user-data"
     cms_base_url: str = ""
     cms_service_api_key: str = ""
+
+    # --- discussion_room config ---
+    # Students a discussion room takes before the next student gets a new room.
+    discussion_room_capacity: int = 12
+    # The facilitator bot is user_activity_notification_bot_user_id (above),
+    # shared with the user-activity filter: it creates every discussion room
+    # and is the only writer of its seats. Unset, the endpoint answers 503.
+    # The choreographer's base URL (e.g. https://api.staging.pangea.chat),
+    # asked whether the version a start page sends is one of the activity's
+    # before a new room pins it. Unset, versions can't be checked and new
+    # rooms follow the latest version (logged at startup).
+    discussion_room_choreo_base_url: Optional[str] = None
 
     # --- limit_user_directory config ---
     limit_user_directory_public_attribute_search_path: Optional[str] = None
@@ -133,6 +149,11 @@ class PangeaChatConfig:
     course_member_emails_requests_per_burst: int = 20
     course_member_emails_burst_duration_seconds: int = 60
 
+    # --- analytics_forward config ---
+    # The dashboard's Matrix inputs pushed to admin-dash-api. None when the
+    # block (ingest URL + shared secret) is not configured.
+    analytics_forward: Optional[AnalyticsForwardConfig] = None
+
     # --- member_analytics_profiles config ---
     # A room member reads every joined member's analytics profile at once.
     member_analytics_profiles_requests_per_burst: int = 30
@@ -145,10 +166,18 @@ class PangeaChatConfig:
     safety_incidents_requests_per_burst: int = 60
     safety_incidents_burst_duration_seconds: int = 60
 
+    # --- student_invitations config ---
+    # Per-route (requests per burst, burst seconds), keyed by route name; see
+    # student_invitations/rate_limits.py for the routes and their defaults.
+    student_invitation_rate_limits: Mapping[str, Tuple[int, int]] = attr.Factory(dict)
+
     # --- invite_by_email config ---
     invite_by_email_requests_per_burst: int = 5
     invite_by_email_burst_duration_seconds: int = 60
     app_base_url: str = "https://app.pangea.chat"
+    # admin-dash, where an instructor's Canvas launch completes the course
+    # connect (`<admin_dash_base_url>/canvas-connect`).
+    admin_dash_base_url: str = "https://admin.pangea.chat"
 
     # --- send_push config ---
     send_push_requests_per_burst: int = 10
@@ -184,6 +213,14 @@ class PangeaChatConfig:
     notice_external_link_hosts: List[str] = attr.Factory(
         lambda: list(DEFAULT_NOTICE_EXTERNAL_LINK_HOSTS)
     )
+    # The bot that sends the open-session notice. Unset, no notice is
+    # scheduled: turning it on is a rollout decision (deploy-note).
+    open_session_notice_bot_user_id: Optional[str] = None
+
+    # --- quest_courses config ---
+    # The bot, left out of a course's joined members because it is not a
+    # person in the course. Unset, nobody is left out (logged at startup).
+    quest_courses_bot_user_id: Optional[str] = None
 
     # --- delayed_push config ---
     delayed_push_enabled: bool = False
@@ -201,6 +238,11 @@ class PangeaChatConfig:
     # admins as chat admins) and serves the repair endpoint. The off switch
     # exists so a bad rollout can be stopped from Ansible without a deploy.
     course_default_chats_enabled: bool = True
+
+    # --- course_session_admins config ---
+    # Joins a course's admins to each new activity session linked into the
+    # course, hidden and muted in their app. Off switch only, for a bad rollout.
+    course_session_admins_enabled: bool = True
 
     # --- moderation config (server-side, trust-and-safety) ---
     # Both tiers ship dark: nothing runs until an operator enables a tier.
@@ -332,3 +374,11 @@ class PangeaChatConfig:
     moderation_tier2_drain_timeout_seconds: float = 10.0
     # How often the supervisor looks for a worker that died.
     moderation_tier2_supervisor_interval_seconds: float = 30.0
+
+    # --- lti (LTI 1.3 tool core) ---
+    # Built from the module config's `lti` block, whose private key Ansible
+    # fills from Secrets Manager. None when the block is absent or unusable:
+    # then the LTI endpoints are not registered, and `lti_config_error` says
+    # why (never the key itself).
+    lti: Optional["LtiSettings"] = None
+    lti_config_error: Optional[str] = None

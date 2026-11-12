@@ -1,10 +1,15 @@
+from typing import Collection, Optional
+
 from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.delete_room.constants import EVENT_TYPE_M_ROOM_POWER_LEVELS
 
 
 async def user_has_highest_power_level(
-    api: ModuleApi, user_id: str, room_id: str
+    api: ModuleApi,
+    user_id: str,
+    room_id: str,
+    joined_members: Optional[Collection[str]] = None,
 ) -> bool:
     """
     Check if the user is at the room's highest power level (ties qualify).
@@ -12,6 +17,9 @@ async def user_has_highest_power_level(
     Members not listed in `users` hold `users_default`, so the default is both
     the unlisted user's own level and a floor for the room's highest level.
     A room with no m.room.power_levels state event denies cleanly.
+
+    With `joined_members`, only those members' levels count, so power still
+    listed for members who have left is ignored.
     """
     room_state = await api.get_room_state(
         room_id=room_id,
@@ -27,5 +35,11 @@ async def user_has_highest_power_level(
     users_default = power_levels.get("users_default", 0)
     user_power_levels = power_levels.get("users", {})
     user_power_level = user_power_levels.get(user_id, users_default)
-    highest_power_level = max([users_default, *user_power_levels.values()])
+    if joined_members is None:
+        highest_power_level = max([users_default, *user_power_levels.values()])
+    else:
+        highest_power_level = max(
+            (user_power_levels.get(member, users_default) for member in joined_members),
+            default=users_default,
+        )
     return user_power_level >= highest_power_level

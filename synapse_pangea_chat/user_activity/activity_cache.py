@@ -20,7 +20,9 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple, overload
 
-logger = logging.getLogger("synapse_pangea_chat.user_activity.activity_cache")
+logger = logging.getLogger(
+    "synapse.module.synapse_pangea_chat.user_activity.activity_cache"
+)
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS pangea_user_activity (

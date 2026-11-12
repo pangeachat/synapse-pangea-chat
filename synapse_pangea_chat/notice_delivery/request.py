@@ -18,7 +18,9 @@ from synapse_pangea_chat.notice_delivery.common import (
 )
 from synapse_pangea_chat.notice_delivery.eligibility import validate_eligibility
 
-EMAIL_ONLY = frozenset({"teacher_setup", "weekly_class_report", "campaigns"})
+EMAIL_ONLY = frozenset(
+    {"teacher_setup", "weekly_class_report", "class_messages", "campaigns"}
+)
 METHODS = frozenset({"use-available", "email-only", "push-only", "in-app-only"})
 LINK_SLOTS = ("{{cta_url}}", "{{unsubscribe_url}}")
 SECONDARY_SLOT = "{{cta2_url}}"
@@ -213,12 +215,12 @@ class DecisionContext:
             key: string(run, key)
             for key in ("run_id", "runner", "funnel", "decided_at")
         }
-        if clean["runner"] not in {"bot", "skill"} or clean["funnel"] not in {
-            "learner",
-            "teacher",
-        }:
+        # synapse: a notice this module schedules itself, the open-session notice.
+        if clean["runner"] not in {"bot", "skill", "synapse"} or clean[
+            "funnel"
+        ] not in {"learner", "teacher"}:
             raise ValueError(
-                "log.run requires runner bot/skill and funnel learner/teacher"
+                "log.run requires runner bot/skill/synapse and funnel learner/teacher"
             )
         try:
             stamp = datetime.fromisoformat(clean["decided_at"].replace("Z", "+00:00"))

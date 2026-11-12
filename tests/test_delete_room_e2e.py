@@ -141,6 +141,55 @@ class TestE2E(BaseSynapseE2ETest):
             joined_rooms = resp.json().get("joined_rooms", [])
             self.assertEqual(len(joined_rooms), 0)
 
+    async def test_server_admin_deletes_after_room_admin_left(self):
+        await self.homeserver()
+
+        creator_id, creator_token = await self.new_user("creator")
+        bot_id, bot_token = await self.new_user("bot", admin=True)
+        member_id, member_token = await self.new_user("member")
+        room_id = await self.create_private_room(creator_token)
+        for user_id, token in [(bot_id, bot_token), (member_id, member_token)]:
+            self.assertTrue(
+                await self.invite_user_to_room(room_id, user_id, creator_token)
+            )
+            self.assertTrue(await self.accept_room_invitation(room_id, token))
+            self.assertTrue(
+                await self.set_member_power_level(room_id, user_id, 50, creator_token)
+            )
+
+        # The creator's 100 stays in m.room.power_levels after they leave
+        resp = requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/leave",
+            json={},
+            headers={"Authorization": f"Bearer {creator_token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        delete_url = f"{self.server_url}/_synapse/client/pangea/v1/delete_room"
+        # Everyone else still counts the departed creator
+        response = requests.post(
+            delete_url,
+            json={"room_id": room_id},
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("highest power level", response.json().get("error", ""))
+
+        # A server admin is compared only with the members still in the room
+        response = requests.post(
+            delete_url,
+            json={"room_id": room_id},
+            headers={"Authorization": f"Bearer {bot_token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message"], "Deleted")
+        resp = requests.get(
+            f"{self.server_url}/_matrix/client/v3/joined_rooms",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn(room_id, resp.json().get("joined_rooms", []))
+
     async def set_member_power_level(
         self, room_id: str, user_id: str, power_level: int, access_token: str
     ):
@@ -356,3 +405,55 @@ class TestE2E(BaseSynapseE2ETest):
             child_room_ids_after,
             "Room should no longer be a child of the space after deletion",
         )
+
+    async def test_server_admin_delete_unlinks_from_a_space_it_is_not_in(self):
+        await self.homeserver()
+
+        teacher_id, teacher_token = await self.new_user("spaceteacher")
+        creator_id, creator_token = await self.new_user("sessioncreator")
+        bot_id, bot_token = await self.new_user("bot", admin=True)
+
+        # A course the bot never joined, and a session the creator launched
+        space_id = await self.create_space(teacher_token, "Course")
+        self.assertTrue(
+            await self.invite_user_to_room(space_id, creator_id, teacher_token)
+        )
+        self.assertTrue(await self.accept_room_invitation(space_id, creator_token))
+        room_id = await self.create_private_room(creator_token)
+        self.assertTrue(await self.add_child_to_space(space_id, room_id, teacher_token))
+        self.assertTrue(await self.add_parent_to_room(room_id, space_id, creator_token))
+
+        # The bot is in the session; its creator leaves it
+        self.assertTrue(await self.invite_user_to_room(room_id, bot_id, creator_token))
+        self.assertTrue(await self.accept_room_invitation(room_id, bot_token))
+        self.assertTrue(
+            await self.set_member_power_level(room_id, bot_id, 50, creator_token)
+        )
+        resp = requests.post(
+            f"{self.server_url}/_matrix/client/v3/rooms/{room_id}/leave",
+            json={},
+            headers={"Authorization": f"Bearer {creator_token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        response = requests.post(
+            f"{self.server_url}/_synapse/client/pangea/v1/delete_room",
+            json={"room_id": room_id},
+            headers={"Authorization": f"Bearer {bot_token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+
+        # The course's top member, not the bot, removed the link
+        resp = requests.get(
+            f"{self.server_url}/_matrix/client/v3/rooms/{space_id}/state",
+            headers={"Authorization": f"Bearer {teacher_token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        links = [
+            event
+            for event in resp.json()
+            if event["type"] == "m.space.child" and event["state_key"] == room_id
+        ]
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]["content"], {})
+        self.assertEqual(links[0]["sender"], teacher_id)

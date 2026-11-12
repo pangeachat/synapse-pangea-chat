@@ -9,7 +9,9 @@ from synapse.push.httppusher import HttpPusher
 from synapse.storage.database import LoggingTransaction
 from twisted.internet.error import AlreadyCalled, AlreadyCancelled
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(
+    "synapse.module.synapse_pangea_chat.delayed_push.delayed_push"
+)
 
 
 AUDITED_SYNAPSE_VERSION = "1.159.0"

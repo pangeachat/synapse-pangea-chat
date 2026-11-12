@@ -53,7 +53,7 @@ class CourseProvisioner:
         blocked_join_gate_enabled=True,
     ):
         self.api = api
-        # Builds the course copy, as for v1 create_course_space.
+        # Builds the course space's Can-Do list, as for v1 create_course_space.
         self.course_missions = course_missions
         self.invitations = invitations
         self.claims = claims
@@ -156,8 +156,9 @@ class CourseProvisioner:
                     "content": {"require_analytics_access": True},
                 },
             ]
-            # The course copy. Optional: a failed read is logged and the
-            # course is created without it (create-course-space.instructions.md).
+            # The course space's Can-Do list. Optional: a failed read is logged
+            # and the course is created without it
+            # (create-course-space.instructions.md).
             course_missions = await self.course_missions.read(spec["course_plan_id"])
             if course_missions is not None:
                 initial.append(

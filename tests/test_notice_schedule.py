@@ -143,7 +143,7 @@ class TestSchedule(unittest.IsolatedAsyncioTestCase):
         self.execute.side_effect = RuntimeError("connection lost after SMTP accepted")
         self.api._hs.get_clock.return_value.time_msec.return_value = NOW_MS + 60000
         with self.assertLogs(
-            "synapse_pangea_chat.notice_delivery.schedule", level="ERROR"
+            "synapse.module.synapse_pangea_chat.notice_delivery.schedule", level="ERROR"
         ):
             await self.queue.run_due()
         await self.queue.run_due()
@@ -152,6 +152,20 @@ class TestSchedule(unittest.IsolatedAsyncioTestCase):
             (await self.queue.get(accepted["schedule_id"]))["status"],
             "pending_reconciliation",
         )
+
+    def test_only_the_push_rules_writer_claims_notices(self):
+        """A first notice installs a push rule, which no other worker can write."""
+        self.api._hs.config.worker.writers.push_rules = ["master"]
+        looping_call = self.api._hs.get_clock.return_value.looping_call
+        for instance, claims in (
+            ("matrix-synapse-worker-stream-writer-1-typing", False),
+            ("master", True),
+        ):
+            looping_call.reset_mock()
+            self.api._hs.get_instance_name.return_value = instance
+            NoticeSchedule(self.api, self.execute).start()
+            with self.subTest(instance=instance):
+                self.assertEqual(looping_call.called, claims)
 
     def test_rejects_existing_event_missing_timezone_or_missing_content(self):
         for changes in (

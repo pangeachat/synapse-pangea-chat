@@ -7,6 +7,13 @@ requesting address claims it without the link, through the same first claim
 It runs when the account signs in, and when a verified address is added to it:
 email sign-up stores the address during registration and the app signs in from
 that response without a separate login, so a sign-in check alone would miss it.
+
+The same two moments claim every live student invitation whose address the
+account has verified (``student_invitations.claim``; no confirmation, seats
+amendment 2026-10-10).
+Each sign-in also re-applies the managed-record rule to the account's joined
+invitations (managed exactly while not a course admin there), repairing a
+missed power-level event.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from synapse.module_api import ModuleApi
 from synapse_pangea_chat.email_invite.course_invitations import CourseInvitationStore
 from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
 from synapse_pangea_chat.room_code.constants import ERRCODE_CODE_NOT_FOUND
+from synapse_pangea_chat.student_invitations.claim import StudentClaims
 
 try:
     import sentry_sdk  # type: ignore[import-not-found]
@@ -34,9 +42,12 @@ logger = logging.getLogger(
 EMAIL_MEDIUM = "email"
 
 
-def _capture_exception(e: Exception) -> None:
+def _report(what: str, e: Exception) -> None:
+    """Sentry gets a message with the exception type only. Never
+    ``capture_exception``: it ships each frame's local variables, and these
+    frames hold the account's user id and addresses."""
     if sentry_sdk is not None:
-        sentry_sdk.capture_exception(e)
+        sentry_sdk.capture_message(f"{what} failed: {type(e).__name__}", level="error")
 
 
 class ClaimByEmail:
@@ -45,10 +56,12 @@ class ClaimByEmail:
         api: ModuleApi,
         invitations: CourseInvitationStore,
         provisioner: CourseProvisioner,
+        student_claims: Optional[StudentClaims] = None,
     ) -> None:
         self._store = api._hs.get_datastores().main
         self._invitations = invitations
         self._provisioner = provisioner
+        self._student_claims = student_claims
         api.register_account_validity_callbacks(on_user_login=self.on_user_login)
         api.register_third_party_rules_callbacks(
             on_add_user_third_party_identifier=self.on_add_user_third_party_identifier
@@ -61,12 +74,45 @@ class ClaimByEmail:
         auth_provider_id: Optional[str],
     ) -> None:
         await self.claim_for(user_id)
+        await self._claim_student_invitations(user_id)
+        await self._repair_managed_records(user_id)
 
     async def on_add_user_third_party_identifier(
         self, user_id: str, medium: str, address: str
     ) -> None:
         if medium == EMAIL_MEDIUM:
             await self.claim_for(user_id)
+            await self._claim_student_invitations(user_id)
+
+    async def _repair_managed_records(self, user_id: str) -> None:
+        if self._student_claims is None:
+            return
+        # repair_managed_for reports its own failures; this guard is for
+        # anything it did not foresee, since nothing may fail the sign-in.
+        try:
+            await self._student_claims.repair_managed_for(user_id)
+        except Exception as e:
+            logger.error("Managed record repair failed: %s", type(e).__name__)
+            if sentry_sdk is not None:
+                sentry_sdk.capture_message(
+                    f"managed record repair failed: {type(e).__name__}",
+                    level="error",
+                )
+
+    async def _claim_student_invitations(self, user_id: str) -> None:
+        if self._student_claims is None:
+            return
+        # claim_matching_for reports its own failures; this guard is for
+        # anything it did not foresee, since nothing may fail the sign-in.
+        try:
+            await self._student_claims.claim_matching_for(user_id)
+        except Exception as e:
+            logger.error("Student invitation claims failed: %s", type(e).__name__)
+            if sentry_sdk is not None:
+                sentry_sdk.capture_message(
+                    f"student invitation claims failed: {type(e).__name__}",
+                    level="error",
+                )
 
     async def claim_for(self, user_id: str) -> None:
         # Synapse awaits these callbacks inside the sign-in or registration
@@ -84,12 +130,8 @@ class ClaimByEmail:
             emails = [t.address for t in threepids if t.medium == EMAIL_MEDIUM]
             invitations = await self._invitations.prepared_for_emails(emails)
         except Exception as e:
-            logger.error(
-                "Could not look up prepared courses for %s: %s",
-                user_id,
-                type(e).__name__,
-            )
-            _capture_exception(e)
+            logger.error("Could not look up prepared courses: %s", type(e).__name__)
+            _report("prepared course lookup", e)
             return
         for invitation in invitations:
             ident = invitation["invitation_id"]
@@ -101,34 +143,22 @@ class ClaimByEmail:
                 if e.errcode == ERRCODE_CODE_NOT_FOUND:
                     # Revoked, or claimed by another account's link, since the
                     # lookup: the same outcome the link would give.
-                    logger.info(
-                        "Invitation %s is no longer claimable for %s", ident, user_id
-                    )
+                    logger.info("Invitation %s is no longer claimable", ident)
                     continue
                 logger.error(
-                    "Claim of %s by verified address failed for %s: %s",
-                    ident,
-                    user_id,
-                    e.errcode,
+                    "Claim of %s by verified address failed: %s", ident, e.errcode
                 )
-                _capture_exception(e)
+                _report(f"prepared course claim {ident}", e)
                 continue
             except Exception as e:
                 logger.error(
-                    "Claim of %s by verified address failed for %s: %s",
+                    "Claim of %s by verified address failed: %s",
                     ident,
-                    user_id,
                     type(e).__name__,
                 )
-                _capture_exception(e)
+                _report(f"prepared course claim {ident}", e)
                 continue
             if room is None:
-                logger.info(
-                    "Invitation %s is being claimed for %s by another request",
-                    ident,
-                    user_id,
-                )
+                logger.info("Invitation %s is being claimed by another request", ident)
                 continue
-            logger.info(
-                "Claimed invitation %s for %s by verified address", ident, user_id
-            )
+            logger.info("Claimed invitation %s by verified address", ident)

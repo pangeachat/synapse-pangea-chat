@@ -12,6 +12,7 @@ from synapse_pangea_chat.notice_delivery.missed_message_unsubscribe import (
     MISSED_MESSAGE_UNSUBSCRIBE_PATH,
     MissedMessageUnsubscribe,
 )
+from synapse_pangea_chat.notice_delivery.open_session_notice import OpenSessionNotice
 from synapse_pangea_chat.notice_delivery.prepare import PrepareNotice
 from synapse_pangea_chat.notice_delivery.refusal_store import RefusalStore
 from synapse_pangea_chat.notice_delivery.unsubscribe import NoticeUnsubscribe
@@ -22,6 +23,7 @@ __all__ = [
     "MissedMessageUnsubscribe",
     "NoticeClick",
     "NoticeUnsubscribe",
+    "OpenSessionNotice",
     "PrepareNotice",
     "RefusalStore",
 ]

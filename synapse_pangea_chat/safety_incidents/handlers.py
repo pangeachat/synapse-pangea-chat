@@ -30,7 +30,7 @@ from synapse.types import RoomID, UserID
 
 from synapse_pangea_chat.moderation import extract_message_text
 from synapse_pangea_chat.moderation.courses import (
-    StudentCourses,
+    ChatCourses,
     current_state_reader,
     is_course_admin_in,
 )
@@ -81,7 +81,7 @@ class ReportHandler:
         self,
         homeserver: Any,
         store: IncidentStore,
-        courses: StudentCourses,
+        courses: ChatCourses,
         room_names: Optional[RoomNames] = None,
     ) -> None:
         self._hs = homeserver
@@ -140,7 +140,7 @@ class ReportHandler:
         # At report time: there is no send-time snapshot for a message that
         # was never flagged.
         position = self._courses.position_now()
-        courses = await self._courses.for_report(subject_id, reporter_id, position)
+        courses = await self._courses.for_room(room_id, position)
         room_name = await self._room_names.label(room_id, subject_id, position)
         now_ms = self._store.now_ms()
         incident_id = report_incident_id(report_id)

@@ -168,11 +168,12 @@ async def get_activity_session_previews(
     api: ModuleApi,
     room_store: RoomStore,
     config: "PangeaChatConfig",
-) -> Dict[str, Dict[str, Dict[str, Any]]]:
+) -> Dict[str, Dict[str, Any]]:
     """
     Preview data for the activity-session rooms under the requester's joined
     course spaces, in the same shape as get_room_preview (room_id ->
-    state_event_type -> state_key -> event JSON, plus membership_summary).
+    state_event_type -> state_key -> event JSON, plus membership_summary
+    and, in rooms the requester is joined to, the pending invitees as invited).
 
     A thin front on the room_preview reader: resolve each space's direct
     children, gate on the requester's space membership, keep the children
@@ -192,4 +193,6 @@ async def get_activity_session_previews(
     session_ids = await _activity_session_ids(child_ids, activity_id, room_store)
     if not session_ids:
         return {}
-    return await get_room_preview(session_ids, api, room_store, config)
+    return await get_room_preview(
+        session_ids, api, room_store, config, invited_for=requester_id
+    )

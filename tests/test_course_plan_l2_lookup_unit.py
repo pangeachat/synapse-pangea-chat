@@ -4,12 +4,12 @@ These pin the two things the rest of the backfill's tests cannot see, because
 they stub ``fetch_plan_languages`` wholesale: **which collection** is asked,
 and **where in the document** the language is read from.
 
-That blind spot is not hypothetical. The lookup originally asked only the v1
-``course-plans`` collection and read a flat ``l2``. Course rooms reference v3
-``quest-plans``, where a quest id returns zero documents and the language lives
-at ``req.target_language`` — so the backfill resolved nothing, skipped every
-room, and logged a clean-looking summary. Every existing test passed, because
-they all mocked the response shape rather than the request.
+That blind spot is not hypothetical. The lookup originally asked only the
+retired v1 ``course-plans`` collection and read a flat ``l2``. Course rooms
+reference v3 ``quest-plans``, where the language lives at
+``req.target_language`` — so the backfill resolved nothing, skipped every room,
+and logged a clean-looking summary. Every existing test passed, because they
+all mocked the response shape rather than the request.
 """
 
 from __future__ import annotations
@@ -31,11 +31,6 @@ LEGACY_ID = "legacy-v1-course-plan"
 def _quest_doc(plan_id: str, language: Any) -> Dict[str, Any]:
     """A v3 quest-plans row: language nested under the generation request."""
     return {"id": plan_id, "req": {"target_language": language}}
-
-
-def _course_plan_doc(plan_id: str, language: Any) -> Dict[str, Any]:
-    """A v1 course-plans row: flat ``l2``."""
-    return {"id": plan_id, "l2": language}
 
 
 class FakeCms:
@@ -71,8 +66,8 @@ async def _fetch(fake: FakeCms, ids: Sequence[str]) -> Dict[str, str]:
 
 
 class CoursePlanL2LookupTestCase(unittest.IsolatedAsyncioTestCase):
-    async def test_asks_quest_plans_first(self) -> None:
-        """v3 is the live content model; asking v1 first resolves nothing."""
+    async def test_asks_quest_plans(self) -> None:
+        """v3 is the live content model; asking v1 resolves nothing."""
         fake = FakeCms({"quest-plans": [_quest_doc(QUEST_ID, "es")]})
         result = await _fetch(fake, [QUEST_ID])
 
@@ -84,39 +79,20 @@ class CoursePlanL2LookupTestCase(unittest.IsolatedAsyncioTestCase):
         fake = FakeCms({"quest-plans": [_quest_doc(QUEST_ID, "de")]})
         self.assertEqual(await _fetch(fake, [QUEST_ID]), {QUEST_ID: "de"})
 
-    async def test_falls_back_to_course_plans_for_legacy_ids(self) -> None:
-        fake = FakeCms(
-            {
-                "quest-plans": [],
-                "course-plans": [_course_plan_doc(LEGACY_ID, "fr")],
-            }
-        )
-        result = await _fetch(fake, [LEGACY_ID])
-
-        self.assertEqual(result, {LEGACY_ID: "fr"})
-        self.assertEqual(fake.collections_asked, ["quest-plans", "course-plans"])
-
-    async def test_does_not_re_ask_for_ids_already_resolved(self) -> None:
-        """Only the unresolved remainder reaches the fallback collection."""
-        fake = FakeCms(
-            {
-                "quest-plans": [_quest_doc(QUEST_ID, "es")],
-                "course-plans": [_course_plan_doc(LEGACY_ID, "fr")],
-            }
-        )
+    async def test_legacy_v1_id_is_absent_and_no_other_collection_is_asked(
+        self,
+    ) -> None:
+        """The retired v1 ``course-plans`` collection is never asked; a room
+        still pinning a v1 id is skipped like any other unknown id."""
+        fake = FakeCms({"quest-plans": [_quest_doc(QUEST_ID, "es")]})
         result = await _fetch(fake, [QUEST_ID, LEGACY_ID])
 
-        self.assertEqual(result, {QUEST_ID: "es", LEGACY_ID: "fr"})
-        self.assertEqual(fake.calls[1], ("course-plans", (LEGACY_ID,)))
-
-    async def test_skips_the_fallback_entirely_when_nothing_outstanding(self) -> None:
-        fake = FakeCms({"quest-plans": [_quest_doc(QUEST_ID, "es")]})
-        await _fetch(fake, [QUEST_ID])
-        self.assertEqual(fake.collections_asked, ["quest-plans"])
+        self.assertEqual(result, {QUEST_ID: "es"})
+        self.assertEqual(fake.calls, [("quest-plans", (QUEST_ID, LEGACY_ID))])
 
     async def test_unresolvable_id_is_absent_never_guessed(self) -> None:
         """Absent from the map means 'skip this room', never a default."""
-        fake = FakeCms({"quest-plans": [], "course-plans": []})
+        fake = FakeCms({"quest-plans": []})
         self.assertEqual(await _fetch(fake, ["no-such-plan"]), {})
 
     async def test_blank_or_non_string_language_does_not_resolve(self) -> None:
@@ -127,7 +103,6 @@ class CoursePlanL2LookupTestCase(unittest.IsolatedAsyncioTestCase):
                     _quest_doc("missing", None),
                     _quest_doc("numeric", 42),
                 ],
-                "course-plans": [],
             }
         )
         self.assertEqual(await _fetch(fake, ["blank", "missing", "numeric"]), {})
@@ -137,12 +112,7 @@ class CoursePlanL2LookupTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await _fetch(fake, [QUEST_ID]), {QUEST_ID: "es-MX"})
 
     async def test_malformed_document_is_skipped_not_fatal(self) -> None:
-        fake = FakeCms(
-            {
-                "quest-plans": [_quest_doc(QUEST_ID, "es")],
-                "course-plans": [],
-            }
-        )
+        fake = FakeCms({"quest-plans": [_quest_doc(QUEST_ID, "es")]})
         fake._by_collection["quest-plans"].append({"id": "shaped-wrong"})
         self.assertEqual(
             await _fetch(fake, [QUEST_ID, "shaped-wrong"]), {QUEST_ID: "es"}

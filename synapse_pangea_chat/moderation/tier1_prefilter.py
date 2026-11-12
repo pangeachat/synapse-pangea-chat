@@ -17,9 +17,11 @@ where you live is an A1 lesson. Tier 1 rejects before persist, so each of
 those was a learner silenced mid-sentence. Judging an address needs the
 context only Tier 2 has.
 
-The decisions this tier implements are in
-.github/instructions/moderation.instructions.md. Profanity is matched across
-all our learner languages (see `tier1_terms.py`).
+Phone numbers use `phonenumbers` (a libphonenumber port), matching VALID
+numbers only, so a bare year or house count does not trip it. Profanity is
+matched across all our learner languages (see `tier1_terms.py`). The
+decisions this tier implements are in
+.github/instructions/moderation.instructions.md.
 """
 
 from typing import Callable, Iterable, List, Optional, Tuple

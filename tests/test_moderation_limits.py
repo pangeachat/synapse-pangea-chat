@@ -775,12 +775,16 @@ class TestSeverityGatesTheRedaction(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.reader.delta(SUPPRESSED, category="self_harm"), 1.0)
 
     async def test_a_severe_second_category_cannot_redact_a_disclosure(self) -> None:
+        """Self-harm is the strongest flag, so a second category over its own
+        threshold still cannot redact. (When the second category scores
+        higher, the message is not kept for self-harm - see
+        `TestSelfHarmMustBeTheStrongestFlag`.)"""
         module = self._module()
         await self._run(
             module,
             _verdict(
                 categories=["harassment", "self-harm/intent"],
-                category_scores={"harassment": 1.0, "self-harm/intent": 0.01},
+                category_scores={"harassment": 0.9, "self-harm/intent": 0.95},
             ),
         )
         self._sent().assert_not_awaited()

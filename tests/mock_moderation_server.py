@@ -43,6 +43,9 @@ class _RecordingHTTPServer(ThreadingHTTPServer):
         # stops the homeserver. Without it a drain has nothing to drain and a
         # test that claims to exercise one proves nothing.
         self.delay_seconds = 0.0
+        # Answer every request with this status instead of a verdict, so a
+        # test can put the service in an outage. 0 answers normally.
+        self.fail_status = 0
 
 
 class _MockModerationHandler(BaseHTTPRequestHandler):
@@ -66,6 +69,9 @@ class _MockModerationHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         text = body.get("text", "")
         server.seen_texts.append(text)
+        if server.fail_status:
+            self._send(server.fail_status, {"detail": "outage"})
+            return
         if server.delay_seconds:
             time.sleep(server.delay_seconds)
         preserve = PRESERVE_MARKER in text
@@ -108,11 +114,16 @@ class MockModerationServer:
         homeserver with checks genuinely in flight."""
         self._httpd.delay_seconds = seconds
 
+    def fail_with(self, status: int) -> None:
+        """Answer every later request with ``status`` (0 to answer normally)."""
+        self._httpd.fail_status = status
+
     def reset(self) -> None:
         """Forget the texts seen so far and answer without delay again, for a
         server that outlives one test."""
         self._httpd.seen_texts.clear()
         self._httpd.delay_seconds = 0.0
+        self._httpd.fail_status = 0
 
     @property
     def base_url(self) -> str:

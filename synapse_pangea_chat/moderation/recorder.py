@@ -38,7 +38,7 @@ from synapse_pangea_chat.moderation.compat import (
     background_process_args,
     reraise_if_cancelled,
 )
-from synapse_pangea_chat.moderation.courses import StudentCourses
+from synapse_pangea_chat.moderation.courses import ChatCourses
 from synapse_pangea_chat.moderation.incidents import Incident, IncidentStore
 from synapse_pangea_chat.moderation.log_safety import error_site, scrubbing_logger
 from synapse_pangea_chat.moderation.room_names import RoomNames
@@ -59,7 +59,7 @@ class IncidentRecorder:
         self,
         homeserver: Any,
         store: IncidentStore,
-        courses: StudentCourses,
+        courses: ChatCourses,
         *,
         room_names: Optional[RoomNames] = None,
         attempts: int = RETRY_ATTEMPTS,
@@ -114,15 +114,7 @@ class IncidentRecorder:
         written either way, because an incident with no course is still an
         incident."""
         try:
-            if incident.reporter_id is not None and incident.subject_id is not None:
-                return tuple(
-                    await self.courses.for_report(
-                        incident.subject_id, incident.reporter_id, position
-                    )
-                )
-            if incident.subject_id is not None:
-                return tuple(await self.courses.for_user(incident.subject_id, position))
-            return ()
+            return await self.courses.for_room(incident.room_id, position)
         except Exception as exc:
             reraise_if_cancelled(exc)
             # silent-ok: the row is written with no courses; counted and

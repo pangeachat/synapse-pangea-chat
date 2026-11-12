@@ -34,7 +34,10 @@ TEST_SECONDS = 0.4
 # stale entry only costs balance. Refresh from the "Slowest test durations"
 # section of the E2E jobs' logs (a class's time is the sum of its tests').
 MEASURED_SECONDS = {
+    "tests.test_scheduled_invitations_e2e.TestScheduledInvitationsE2E": 300,
     "tests.test_activity_session_previews_e2e.TestActivitySessionPreviewsE2E": 35,
+    # Measured locally (25 s); refresh from CI.
+    "tests.test_discussion_room_e2e.TestDiscussionRoomE2E": 25,
     "tests.test_delayed_push_e2e.TestDelayedPushRingE2E": 19,
     "tests.test_room_code_e2e.TestE2E": 16,
     "tests.test_logcontext_e2e.TestOutboundCallLogcontext": 13,
@@ -44,6 +47,7 @@ MEASURED_SECONDS = {
     "tests.test_export_user_data_e2e.TestExportUserDataProcessor": 10,
     "tests.test_create_course_space_e2e.TestCreateCourseSpaceE2E": 8,
     "tests.test_logcontext_e2e.TestModerationLogcontext": 6,
+    "tests.test_analytics_forward_e2e.TestSafetyPushE2E": 20,
 }
 
 

@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import json
-from io import BytesIO
 from typing import Any, Dict, Optional
 from urllib.parse import quote, urlencode
 
-from synapse.http.client import read_body_with_max_size
-from synapse.logging.context import make_deferred_yieldable
 from synapse.module_api import ModuleApi
-from twisted.web.http_headers import Headers
 
+from synapse_pangea_chat.cms_http import cms_request, service_headers
 from synapse_pangea_chat.config import PangeaChatConfig
 from synapse_pangea_chat.notice_delivery.request import DecisionContext, NoticeRequest
 
@@ -29,14 +26,7 @@ class DeliveryLog:
         self._http = api.http_client
         self._reactor = api._hs.get_reactor()
         self._url = config.cms_base_url.rstrip("/") + "/api/notification-log"
-        self._headers = Headers(
-            {
-                "Authorization": [
-                    f"service-users API-Key {config.cms_service_api_key}"
-                ],
-                "Content-Type": ["application/json"],
-            }
-        )
+        self._headers = service_headers(config.cms_service_api_key, json_body=True)
 
     async def _request(
         self,
@@ -46,32 +36,23 @@ class DeliveryLog:
         *,
         collection: str = "notification-log",
     ):
-        if collection not in {
-            "notification-log",
-            "activities-v2",
-            "activities-v2/versions",
-        }:
+        if collection not in {"notification-log", "activities-v2"}:
             raise ValueError("Unsupported notice CMS collection")
-        response = await self._http.request(
+        code, raw = await cms_request(
+            self._http,
             method,
             self._url.removesuffix("notification-log") + collection + suffix,
-            data=json.dumps(body).encode() if body is not None else None,
-            headers=self._headers,
+            self._headers,
+            max_bytes=256_000,
+            body=body,
+            timeout_seconds=20,
+            reactor=self._reactor,
         )
-        buffer = BytesIO()
-        await make_deferred_yieldable(
-            read_body_with_max_size(response, buffer, 256_000).addTimeout(
-                20, self._reactor
-            )
-        )
-        raw = buffer.getvalue()
         try:
             payload = json.loads(raw)
         except (ValueError, UnicodeDecodeError) as error:
-            raise DeliveryLogError(
-                f"CMS returned non-JSON ({response.code})"
-            ) from error
-        return response.code, payload
+            raise DeliveryLogError(f"CMS returned non-JSON ({code})") from error
+        return code, payload
 
     @staticmethod
     def _context(req: NoticeRequest) -> DecisionContext:

@@ -28,6 +28,16 @@ transaction, so the read endpoint answers "every incident of this course"
 with an indexed join rather than a scan of a JSON column. Course ids are
 frozen at the first write and never change, so the two cannot drift.
 
+**Every write marks the forward outbox in the same transaction.** The
+analytics forwarder (`analytics_forward`) pushes each changed incident to
+admin-dash-api from `pangea_safety_incident_outbox`: one row per incident,
+whose `revision` grows on every write and whose `dirty` says the current
+revision is not yet acknowledged. Both write helpers (`_write_new`,
+`_write_update`) mark it, so no write path can change an incident without the
+mark, and a mark is never lost to a crash between the two (pangeachat/
+admin-dash#300). A mark the ingest refused is `parked`: not re-sent every
+step, but re-marked by the forwarder's reconciliation on start and daily.
+
 **Placeholders are `?`**, for the reason in `moderation.disposition`: only
 Synapse's Postgres engine rewrites them, and `%s` would fail on SQLite.
 
@@ -49,6 +59,7 @@ import attr
 INCIDENTS_TABLE = "pangea_safety_incidents"
 INCIDENT_COURSES_TABLE = "pangea_safety_incident_courses"
 INCIDENTS_META_TABLE = "pangea_safety_incidents_meta"
+OUTBOX_TABLE = "pangea_safety_incident_outbox"
 
 SOURCE_MODERATION = "moderation"
 SOURCE_REPORT = "report"
@@ -191,6 +202,13 @@ def merge_outcome(existing: Optional[str], new: Optional[str]) -> Optional[str]:
     - `removed` is final: the message is gone and nothing can say otherwise.
     - An actual attempt's result replaces whatever an earlier attempt left.
     - `skipped` fills an empty outcome only.
+
+    Owner-accepted limit (moderation.instructions.md, "The Safety page's
+    record"): rows from two attempts on one message are written detached and
+    retried, so they are not ordered. If attempt A's send and its row write
+    both fail and attempt B then records `unknown`, A's delayed retry can
+    overwrite it with `failed`. Both mean "removal not confirmed". Revisit if
+    the Safety page ever acts on the difference.
     """
     if new is None:
         return existing
@@ -316,6 +334,24 @@ _CREATE_OUTCOME_INDEX_SQL = """
     ON pangea_safety_incidents (outcome)
 """
 
+# The forward outbox (module docstring). `dirty_since` orders the send, oldest
+# change first, and is NULL whenever the row is not dirty.
+_CREATE_OUTBOX_SQL = """
+    CREATE TABLE IF NOT EXISTS pangea_safety_incident_outbox (
+        incident_id TEXT PRIMARY KEY,
+        revision BIGINT NOT NULL,
+        dirty BOOLEAN NOT NULL,
+        parked BOOLEAN NOT NULL,
+        dirty_since BIGINT
+    )
+"""
+
+# The forwarder probes this every step; it is empty when nothing is owed.
+_CREATE_OUTBOX_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS pangea_safety_incident_outbox_dirty
+    ON pangea_safety_incident_outbox (dirty_since, incident_id) WHERE dirty
+"""
+
 _SELECT_ONE_SQL = """
     SELECT incident_id, source, action, outcome, subject_id, reporter_id,
         room_id, event_id, course_ids, categories, self_harm, rule, top_score,
@@ -376,12 +412,82 @@ _INSERT_META_SQL = """
     ON CONFLICT (name) DO NOTHING
 """
 
-#: Every statement above, for the drift test.
-STATEMENTS = (
+# A write: one more revision, dirty, unparked, the EARLIEST undelivered change
+# kept. The booleans are parameters (TRUE, FALSE): SQLite before 3.23 has no
+# boolean literals.
+_MARK_OUTBOX_SQL = """
+    INSERT INTO pangea_safety_incident_outbox
+        (incident_id, revision, dirty, parked, dirty_since)
+    VALUES (?, 1, ?, ?, ?)
+    ON CONFLICT (incident_id) DO UPDATE SET
+        revision = pangea_safety_incident_outbox.revision + 1,
+        dirty = EXCLUDED.dirty,
+        parked = EXCLUDED.parked,
+        dirty_since = COALESCE(
+            pangea_safety_incident_outbox.dirty_since, EXCLUDED.dirty_since
+        )
+"""
+
+# The oldest marks with each incident as it is now. LEFT: a mark whose row is
+# gone (never expected) is still read, so it can be cleared and not hold the
+# backlog flag up for ever.
+_SELECT_OUTBOX_SQL = """
+    SELECT o.incident_id, o.revision,
+        i.incident_id, i.source, i.action, i.outcome, i.subject_id,
+        i.reporter_id, i.room_id, i.event_id, i.course_ids, i.categories,
+        i.self_harm, i.rule, i.top_score, i.text, i.reason, i.created_ms,
+        i.updated_ms, i.attempt_id, i.prior_outcome, i.prior_attempt_id,
+        i.room_name
+    FROM pangea_safety_incident_outbox AS o
+    LEFT JOIN pangea_safety_incidents AS i ON i.incident_id = o.incident_id
+    WHERE o.dirty
+    ORDER BY o.dirty_since, o.incident_id
+    LIMIT ?
+"""
+
+# An acknowledgement settles only the revision it sent: a write that landed
+# while the send was in flight bumped the revision and stays dirty.
+_SETTLE_OUTBOX_SQL = """
+    UPDATE pangea_safety_incident_outbox
+    SET dirty = ?, parked = ?, dirty_since = NULL
+    WHERE incident_id = ? AND revision = ?
+"""
+
+# Reconciliation: every incident changed at or after the bound is marked again.
+# The WHERE also settles SQLite's INSERT ... SELECT ... ON CONFLICT parse.
+_REMARK_SINCE_SQL = """
+    INSERT INTO pangea_safety_incident_outbox
+        (incident_id, revision, dirty, parked, dirty_since)
+    SELECT incident_id, 1, ?, ?, updated_ms FROM pangea_safety_incidents
+    WHERE updated_ms >= ?
+    ON CONFLICT (incident_id) DO UPDATE SET
+        revision = pangea_safety_incident_outbox.revision + 1,
+        dirty = EXCLUDED.dirty,
+        parked = EXCLUDED.parked,
+        dirty_since = COALESCE(
+            pangea_safety_incident_outbox.dirty_since, EXCLUDED.dirty_since
+        )
+"""
+
+# Reconciliation: every parked mark is offered once more, first in line.
+_UNPARK_SQL = """
+    UPDATE pangea_safety_incident_outbox
+    SET revision = revision + 1, dirty = ?, parked = ?, dirty_since = 0
+    WHERE parked
+"""
+
+#: The tables and indexes, in creation order.
+CREATE_STATEMENTS = (
     _CREATE_INCIDENTS_SQL,
     _CREATE_COURSES_SQL,
     _CREATE_META_SQL,
     _CREATE_OUTCOME_INDEX_SQL,
+    _CREATE_OUTBOX_SQL,
+    _CREATE_OUTBOX_INDEX_SQL,
+)
+
+#: Every statement above, for the drift test.
+STATEMENTS = CREATE_STATEMENTS + (
     _SELECT_ONE_SQL,
     _INSERT_SQL,
     _INSERT_COURSE_SQL,
@@ -390,6 +496,11 @@ STATEMENTS = (
     _SELECT_PENDING_SQL,
     _SELECT_META_SQL,
     _INSERT_META_SQL,
+    _MARK_OUTBOX_SQL,
+    _SELECT_OUTBOX_SQL,
+    _SETTLE_OUTBOX_SQL,
+    _REMARK_SINCE_SQL,
+    _UNPARK_SQL,
 )
 
 
@@ -462,14 +573,8 @@ class IncidentStore:
         if self._table_ready:
             return
 
-        def _create(txn: Any) -> None:
-            txn.execute(_CREATE_INCIDENTS_SQL)
-            txn.execute(_CREATE_COURSES_SQL)
-            txn.execute(_CREATE_META_SQL)
-            txn.execute(_CREATE_OUTCOME_INDEX_SQL)
-
         await self._pool().runInteraction(
-            "pangea_safety_incidents_create_tables", _create
+            "pangea_safety_incidents_create_tables", create_tables
         )
         self._table_ready = True
 
@@ -727,10 +832,22 @@ class IncidentWriteError(Exception):
     nothing else, because the driver's message can quote the row."""
 
 
+def create_tables(txn: Any) -> None:
+    """Every table of the record, the forward outbox included. Idempotent; the
+    forwarder runs it too, so it never reads a table that is not there yet."""
+    for sql in CREATE_STATEMENTS:
+        txn.execute(sql)
+
+
+def _mark_outbox(txn: Any, incident_id: str, changed_ms: int) -> None:
+    txn.execute(_MARK_OUTBOX_SQL, (incident_id, True, False, changed_ms))
+
+
 def _write_new(txn: Any, incident: Incident) -> None:
     _execute_private(txn, _INSERT_SQL, _insert_args(incident))
     for course_id in incident.course_ids or ():
         txn.execute(_INSERT_COURSE_SQL, (course_id, incident.incident_id))
+    _mark_outbox(txn, incident.incident_id, incident.updated_ms)
 
 
 def _write_update(txn: Any, incident: Incident, updated_ms: int) -> None:
@@ -753,6 +870,60 @@ def _write_update(txn: Any, incident: Incident, updated_ms: int) -> None:
             incident.incident_id,
         ),
     )
+    _mark_outbox(txn, incident.incident_id, updated_ms)
+
+
+# ---------------------------------------------------------------------------
+# The forward outbox, read and settled by `analytics_forward` inside its own
+# transactions. Plain functions over a transaction, so the forwarder can put
+# the read in the same interaction as its profile read and the settle in the
+# same one as its cursor.
+# ---------------------------------------------------------------------------
+
+
+@attr.s(auto_attribs=True, frozen=True, slots=True)
+class OutboxEntry:
+    """A dirty mark, with the incident as it is now (None: the row is gone)."""
+
+    incident_id: str
+    revision: int
+    incident: Optional[Incident]
+
+
+def read_outbox(txn: Any, limit: int) -> Tuple[List[OutboxEntry], bool]:
+    """The ``limit`` oldest dirty marks, and whether more are dirty."""
+    txn.execute(_SELECT_OUTBOX_SQL, (limit + 1,))
+    rows = txn.fetchall()
+    entries = [
+        OutboxEntry(
+            incident_id=str(row[0]),
+            revision=int(row[1]),
+            incident=None if row[2] is None else _row_to_incident(row[2:]),
+        )
+        for row in rows[:limit]
+    ]
+    return entries, len(rows) > limit
+
+
+def settle_outbox(
+    txn: Any,
+    accepted: Iterable[Tuple[str, int]],
+    parked: Iterable[Tuple[str, int]],
+) -> None:
+    """After an acknowledgement: clear what the ingest stored, park what it
+    refused, each only at the revision that was sent."""
+    for incident_id, revision in accepted:
+        txn.execute(_SETTLE_OUTBOX_SQL, (False, False, incident_id, revision))
+    for incident_id, revision in parked:
+        txn.execute(_SETTLE_OUTBOX_SQL, (False, True, incident_id, revision))
+
+
+def remark_outbox(txn: Any, since_ms: Optional[int]) -> None:
+    """Mark again every incident changed at or after ``since_ms`` (every
+    incident when None), and every parked one."""
+    bound = since_ms if since_ms is not None else -(2**62)
+    txn.execute(_REMARK_SINCE_SQL, (True, False, bound))
+    txn.execute(_UNPARK_SQL, (True, False))
 
 
 def unique(values: Iterable[str]) -> Tuple[str, ...]:

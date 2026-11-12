@@ -18,8 +18,11 @@ from synapse_pangea_chat.moderation.compat import (
 )
 from synapse_pangea_chat.notice_delivery.delivery_log import DeliveryConflict
 from synapse_pangea_chat.notice_delivery.request import NoticeRequest
+from synapse_pangea_chat.push_rules_writer import writes_push_rules
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(
+    "synapse.module.synapse_pangea_chat.notice_delivery.schedule"
+)
 TABLE = "pangea_notice_schedule"
 
 
@@ -40,6 +43,12 @@ class NoticeSchedule:
         self._running = False
 
     def start(self) -> None:
+        # A person's first notice installs their bot-notice push rule, so only the
+        # process that can write it claims notices. Claimed by another worker, a
+        # first notice failed after its Notification_Log row was reserved, and an
+        # uncertain delivery is never retried.
+        if not writes_push_rules(self._api):
+            return
         self._clock.looping_call(
             cast(Any, run_as_background_process),
             cast(Any, looping_call_interval(5)),

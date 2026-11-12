@@ -48,6 +48,7 @@ from typing import (
     Tuple,
     TypeGuard,
     Union,
+    cast,
 )
 
 import attr
@@ -69,8 +70,11 @@ from synapse_pangea_chat.moderation.choreo_client import (
     assert_no_proxy_in_front_of,
     install_proxy_log_guard,
 )
-from synapse_pangea_chat.moderation.compat import reraise_if_cancelled
-from synapse_pangea_chat.moderation.courses import StudentCourses
+from synapse_pangea_chat.moderation.compat import (
+    looping_call_interval,
+    reraise_if_cancelled,
+)
+from synapse_pangea_chat.moderation.courses import ChatCourses
 from synapse_pangea_chat.moderation.dispatch import ModerationJob, Tier2Dispatcher
 from synapse_pangea_chat.moderation.disposition import (
     GRANTED,
@@ -106,6 +110,7 @@ from synapse_pangea_chat.moderation.log_safety import (
     sender_digest,
 )
 from synapse_pangea_chat.moderation.profanity import contains_profanity
+from synapse_pangea_chat.moderation.recheck import MAX_AGE_SECONDS, RecheckStore
 from synapse_pangea_chat.moderation.recorder import IncidentRecorder
 from synapse_pangea_chat.moderation.refusal import refusal_body
 from synapse_pangea_chat.moderation.refusal import (
@@ -487,30 +492,60 @@ def _displayed_reading(formatted: str) -> Tuple[str, bool]:
 #: is inside it is read field by field, and nothing outside it is a message.
 MESSAGE_EVENT_TYPE = "m.room.message"
 #: The event type carrying a megolm envelope. Synapse holds the ciphertext and
-#: no plaintext, so neither tier can moderate one - see `_encryption_state`.
+#: no plaintext, so neither tier can moderate one; it is refused while
+#: moderation is on - see `ChatModeration.refuse_encrypted_event`.
 ENCRYPTED_EVENT_TYPE = "m.room.encrypted"
+#: The state event that turns end-to-end encryption on for a room.
+ENCRYPTION_STATE_EVENT_TYPE = "m.room.encryption"
+_ENCRYPTION_TYPES = frozenset({ENCRYPTED_EVENT_TYPE, ENCRYPTION_STATE_EVENT_TYPE})
+#: What a sender is told when encryption is refused. Our app never turns
+#: encryption on, so this reaches only another Matrix client.
+ENCRYPTION_REFUSAL = (
+    "Encryption is turned off on this server: messages are checked for "
+    "safety, and an encrypted message cannot be."
+)
+
+#: How often the Tier-2 instance re-checks messages it could not check, and
+#: how many it takes per pass.
+RECHECK_INTERVAL_SECONDS = 30
+RECHECK_BATCH = 25
+
+#: A call's transcript, one event per recording device (pangeachat/.github#872).
+#: Tier 2 only, and a flag only writes the Safety page's row: never redacted,
+#: never blocked.
+CALL_TRANSCRIPT_EVENT_TYPE = "pangea.call_transcript"
+
+
+def transcript_text(raw_content: Any) -> Optional[str]:
+    """The spoken text of a call transcript: its segments' `text`, in order.
+
+    Attributed to the event's sender. `spoken_by` names another speaker only as
+    an unverified claim (the client checks it against the call's audio), so it
+    is not used to name the subject of an incident.
+    """
+    content = raw_content if isinstance(raw_content, Mapping) else {}
+    segments = content.get("segments")
+    if not isinstance(segments, list):
+        return None
+    parts = [
+        segment["text"]
+        for segment in segments
+        if isinstance(segment, Mapping) and isinstance(segment.get("text"), str)
+    ]
+    return "\n".join(parts).strip() or None
 
 
 def _encryption_state(event: EventBase) -> Optional[str]:
     """Which message-bearing event this is, in the counter's vocabulary, or
     None when it is not a message at all.
 
-    **The limit this makes visible is structural and is not closed here.** In
-    an end-to-end encrypted room the homeserver receives an `m.room.encrypted`
-    event whose payload is a megolm envelope; it holds no key and no
-    plaintext, so there is nothing for a rule to match or for a classifier to
-    read. Neither tier can moderate one, and this module does not try: handing
-    a base64 envelope to `/choreo/moderate` would spend a request on
-    ciphertext and publish an encrypted room's traffic pattern to a third
-    party, and refusing the event instead would punish a sender who did
-    nothing wrong.
-
-    What WAS wrong is that the limit was silent. An operator who switched
-    moderation on had no series that distinguished "this room is clean" from
-    "we never read a word of it", and no way to put a number on the share of
-    traffic in the second state. The counter carries both halves of a ratio -
-    `encrypted / (encrypted + plaintext)` - because a numerator with no
-    denominator answers no question anybody asks.
+    In an end-to-end encrypted room the homeserver holds a megolm envelope and
+    no plaintext, so neither tier could moderate an `m.room.encrypted` event.
+    Encryption is therefore refused while moderation is on (pangeachat/.github
+    #870). An encrypted event can still be counted on a path that runs before
+    the refusal - federation's pruning route is an accepted gap - so the
+    counter keeps both halves of the ratio `encrypted / (encrypted +
+    plaintext)`, which should now read zero.
 
     A state event is neither. `check_event_for_spam` is offered every event on
     the homeserver, and counting topic changes and membership as readable
@@ -674,7 +709,7 @@ class ChatModeration:
         self._recorder = IncidentRecorder(
             api._hs,
             self._incidents,
-            StudentCourses.from_homeserver(api._hs, self._is_exempt_sender),
+            ChatCourses.from_homeserver(api._hs),
         )
 
         self._tier2_active = False
@@ -682,7 +717,22 @@ class ChatModeration:
         self._checker: Optional[ChoreoChecker] = None
         self._disposition: Optional[DispositionStore] = None
         self._clock: Any = None
+        self._breaker: Optional[CircuitBreaker] = None
+        self._recheck = RecheckStore(api._hs)
+        self._rechecking = False
 
+        # Encryption is refused whichever tier is on, for every sender: an
+        # encrypted message is one neither tier can read. `on_create_room`
+        # refuses an encrypted room before anything exists; the event check
+        # covers every locally created event, initial state and upgrades
+        # included; the spam check covers what arrives over federation.
+        api.register_third_party_rules_callbacks(
+            check_event_allowed=self.check_event_allowed,
+            on_create_room=self.on_create_room,
+        )
+        api.register_spam_checker_callbacks(
+            check_event_for_spam=self.refuse_encrypted_event,
+        )
         if config.moderation_tier1_enabled:
             api.register_spam_checker_callbacks(
                 check_event_for_spam=self.check_event_for_spam,
@@ -756,6 +806,20 @@ class ChatModeration:
         # one that runs it: the guard protects a log, and the log belongs to
         # the process rather than to the worker pool.
         install_proxy_log_guard()
+        # One instance runs all of Tier 2; batching clears the 33 msg/s target
+        # with ~2.8x headroom, so sharding is not needed now (see
+        # moderation.instructions.md, "Decisions"). Schedule it on any
+        # steady-state `queue_full` drop, a mean queue depth above a quarter
+        # of capacity, a screened rate above ~50 msg/s, or a flag rate above
+        # 10%. The plan: a stateless `hash(event_id) % N == index` split
+        # (`on_new_event` already fires on every instance), config for N and
+        # this instance's index refusing startup unless the indices form a
+        # complete 0..N-1 set, per-shard gauge labels, and an "active" alert
+        # redefined as "two instances claim one shard". The disposition
+        # table's atomic claim already resolves two instances deciding one
+        # event, including during a shard-count change. Alerting today: a sum
+        # of `pangea_moderation_tier2_active` above 1 means two instances run
+        # Tier 2; 0 means nothing does.
         self._tier2_active = bool(self._api.should_run_background_tasks())
         metrics.TIER2_ACTIVE.set(1 if self._tier2_active else 0)
         if not self._tier2_active:
@@ -806,6 +870,14 @@ class ChatModeration:
             batch_max_wait_seconds=config.moderation_tier2_batch_max_wait_seconds,
         )
         self._dispatcher.start()
+        self._breaker = breaker
+        self._clock.looping_call(
+            cast(Any, run_as_background_process),
+            cast(Any, looping_call_interval(RECHECK_INTERVAL_SECONDS)),
+            *_background_process_args(
+                homeserver, "pangea_moderation_tier2_recheck", self._recheck_pass
+            ),
+        )
         logger.info(
             "tier2 moderation is active on this instance: %d workers, queue "
             "%d, batches of up to %d messages or %d characters",
@@ -875,6 +947,53 @@ class ChatModeration:
     def _sender_digest(self, sender: str) -> str:
         """A log-safe stand-in for a sender's Matrix ID."""
         return sender_digest(sender, self._log_digest_key)
+
+    # ------------------------------------------------------------------
+    # Encryption — refused while moderation is on
+    # ------------------------------------------------------------------
+
+    def _refuses_encryption(self, event_type: Any, room_id: Any, hook: str) -> bool:
+        """True, counted and logged, when `event_type` is encryption. Every
+        sender, exempt ones included: turning encryption on is room-wide and
+        permanent, so an exempt bot doing it would hide every learner after
+        it."""
+        if event_type not in _ENCRYPTION_TYPES:
+            return False
+        metrics.record_encryption_refused(hook)
+        logger.info("moderation refused %s in %s (hook=%s)", event_type, room_id, hook)
+        return True
+
+    async def refuse_encrypted_event(
+        self, event: EventBase
+    ) -> Union[str, Codes, bool, Tuple[Codes, Dict[str, Any]]]:
+        """The spam check: covers encrypted events arriving over federation."""
+        if self._refuses_encryption(event.type, event.room_id, "spam_check"):
+            return Codes.FORBIDDEN, {"error": ENCRYPTION_REFUSAL}
+        return NOT_SPAM
+
+    async def check_event_allowed(
+        self,
+        event: EventBase,
+        state_events: Mapping[Tuple[str, str], EventBase],
+    ) -> Tuple[bool, Optional[dict]]:
+        """Every locally created event, a new room's initial state included."""
+        if self._refuses_encryption(event.type, event.room_id, "event_allowed"):
+            return False, None
+        return True, None
+
+    async def on_create_room(
+        self, requester: Any, request_content: Dict[str, Any], is_admin: bool
+    ) -> None:
+        """Refuse a createRoom whose initial state turns encryption on, before
+        anything is created. Raising is how this callback refuses."""
+        initial_state = request_content.get("initial_state")
+        if not isinstance(initial_state, list):
+            return
+        for state in initial_state:
+            if isinstance(state, dict) and self._refuses_encryption(
+                state.get("type"), None, "create_room"
+            ):
+                raise SynapseError(403, ENCRYPTION_REFUSAL, Codes.FORBIDDEN)
 
     # ------------------------------------------------------------------
     # Tier 1 — deterministic pre-filter (blocks before persist)
@@ -1045,7 +1164,11 @@ class ChatModeration:
             encryption = _encryption_state(event)
             if encryption is not None:
                 metrics.record_message_event("tier2", encryption)
-            extracted = self._extract_text(event)
+            is_transcript = event.type == CALL_TRANSCRIPT_EVENT_TYPE
+            if is_transcript:
+                extracted = _Extracted(transcript_text(event.content), False)
+            else:
+                extracted = self._extract_text(event)
             if extracted.incomplete:
                 metrics.record_extraction_incomplete("tier2")
             text = extracted.text
@@ -1070,20 +1193,22 @@ class ChatModeration:
                 # a visible product regression, so the exemption has to win
                 # over the room's inclusion.
                 return
-            self._dispatcher.enqueue(
-                ModerationJob(
-                    event_id=event.event_id,
-                    room_id=event.room_id,
-                    sender=event.sender,
-                    text=text,
-                    enqueued_at=self._clock.time(),
-                    # Where the message sits in the stream. The Safety page
-                    # reads the sender's courses as of HERE, not as of the
-                    # verdict, so a learner who leaves before it still lands
-                    # on their course - and no state is read on this path.
-                    position=_stream_position(event),
-                )
+            job = ModerationJob(
+                event_id=event.event_id,
+                room_id=event.room_id,
+                sender=event.sender,
+                text=text,
+                enqueued_at=self._clock.time(),
+                # Where the message sits in the stream. The Safety page
+                # reads the chat's course as of HERE, not as of the
+                # verdict, so a chat moved before it still lands on its
+                # own course - and no state is read on this path.
+                position=_stream_position(event),
+                transcript=is_transcript,
             )
+            if not self._dispatcher.enqueue(job) and self._dispatcher.is_full:
+                # Dropped unchecked: put it on the re-check list.
+                self._queue_recheck((job,))
         except Exception as exc:
             reraise_if_cancelled(exc)
             # silent-ok: fail-open by contract; observe-only hook, so the
@@ -1147,11 +1272,25 @@ class ChatModeration:
             # One message needs no screen, and a batch of one against an
             # un-upgraded endpoint would cost a refused round trip before the
             # single call it was always going to make.
-            await self._check_and_redact(jobs[0])
+            try:
+                decided = await self._check_and_redact(jobs[0])
+            except Exception as exc:
+                reraise_if_cancelled(exc)
+                # Not swallowed: re-raised for the dispatcher to count and log.
+                self._queue_recheck(jobs)
+                raise
+            if not decided:
+                self._queue_recheck(jobs)
             return
         for job in jobs:
             self._count_truncation(job)
-        verdicts = await self._checker.check_batch([job.text for job in jobs])
+        try:
+            verdicts = await self._checker.check_batch([job.text for job in jobs])
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # Not swallowed: re-raised for the dispatcher to count and log.
+            self._queue_recheck(jobs)
+            raise
         # `strict=True` is the last line of defence and it is deliberately a
         # RAISE rather than a shorter loop: a silent truncation here pairs
         # every verdict after the shortfall with the wrong message. The raise
@@ -1179,7 +1318,8 @@ class ChatModeration:
             # extraction applies per surface and the disposition applies per
             # row.
             try:
-                await self._decide_screened(job, result, verdicts.confirmed)
+                if not await self._decide_screened(job, result, verdicts.confirmed):
+                    self._queue_recheck((job,))
             except Exception as exc:
                 # A cancellation ends the loop, and the jobs behind this one
                 # have answers in hand that would go with it: each flagged
@@ -1206,21 +1346,22 @@ class ChatModeration:
                     error_site(exc),
                     type(exc).__name__,
                 )
+                self._queue_recheck((job,))
 
     async def _decide_screened(
         self,
         job: ModerationJob,
         result: Optional[Dict[str, Any]],
         confirmed: bool,
-    ) -> None:
+    ) -> bool:
+        """True when this message got a usable verdict; see `_decide`."""
         if confirmed:
             # This answer came back from a request carrying only its own text,
             # so it is already the verdict a confirmation would fetch. This is
             # the single-text fallback against an un-upgraded endpoint; asking
             # again would double every flagged message's provider calls
             # against the deployment with the least capacity to spare.
-            await self._decide(job, result)
-            return
+            return await self._decide(job, result)
         if result is not None and result.get("flagged"):
             # A screen result, not a decision. Ask again about this one
             # message alone; `_check_and_redact` records its own matcher
@@ -1230,12 +1371,14 @@ class ChatModeration:
             # cancellation while the confirmation is out does not lose it.
             screened = self._capture_screen(job, result)
             try:
-                await self._check_and_redact(job, count_truncation=False, screen=result)
+                return await self._check_and_redact(
+                    job, count_truncation=False, screen=result
+                )
             except Exception as exc:
                 reraise_if_cancelled(exc, partial(self._retry_captured, screened))
                 raise
-            return
         self._record_matcher_agreement(job, result)
+        return result is not None
 
     def _stop_batching(self) -> None:
         if self._dispatcher is None or self._dispatcher.max_batch == 1:
@@ -1263,8 +1406,9 @@ class ChatModeration:
         *,
         count_truncation: bool = True,
         screen: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        """Ask about one message, then act on the answer.
+    ) -> bool:
+        """Ask about one message, then act on the answer. True when it got a
+        usable verdict; see `_decide`.
 
         Split from `_decide` so the batched path can reach the decision with a
         verdict it already has. The split is a seam and not a behaviour
@@ -1273,7 +1417,7 @@ class ChatModeration:
         the drain check - lives below it in `_decide`, untouched.
         """
         if self._checker is None:
-            return
+            return False
         if count_truncation:
             # False when a batched screen has already counted this message.
             # The counter is one per MESSAGE Tier 2 read only part of, and a
@@ -1289,7 +1433,7 @@ class ChatModeration:
             # to the message. A confirmation that answers CLEAN is a verdict,
             # and governs.
             await self._record_unconfirmed_screen(job, screen)
-        await self._decide(job, result)
+        return await self._decide(job, result)
 
     async def _record_unconfirmed_screen(
         self, job: ModerationJob, screen: Mapping[str, Any]
@@ -1331,7 +1475,7 @@ class ChatModeration:
             if (
                 confirmed
                 and _usable_categories(categories)
-                and _should_preserve(categories)
+                and _keeps_for_self_harm(categories, result.get("category_scores"))
             ):
                 run_in_background(
                     self._record_preserved, job, _summarize_categories(categories)
@@ -1387,8 +1531,10 @@ class ChatModeration:
 
     async def _decide(
         self, job: ModerationJob, result: Optional[Dict[str, Any]]
-    ) -> None:
-        """Everything that follows from one message's own verdict.
+    ) -> bool:
+        """Everything that follows from one message's own verdict. True when
+        there was a usable verdict to act on; False when the message is still
+        unchecked and belongs on the re-check list.
 
         `result` must be a verdict about THIS message and nothing else - the
         answer to a request that carried only `job.text`. A positionally
@@ -1402,10 +1548,10 @@ class ChatModeration:
             # a bad token, an open breaker, `evaluated: false` - is already
             # counted and logged by the checker, and every one of them means
             # the same thing: leave the message alone.
-            return
+            return False
 
         if not result.get("flagged"):
-            return
+            return True
         categories = result.get("categories")
         if not _usable_categories(categories):
             # A flagged verdict whose categories we cannot read is NOT a
@@ -1429,9 +1575,23 @@ class ChatModeration:
                 job.event_id,
                 job.room_id,
             )
-            return
+            return False
         category = _summarize_categories(categories)
-        if _should_preserve(categories):
+        if job.transcript:
+            # A call transcript is never redacted (#872): the flag reaches the
+            # Safety page as a row, and the transcript stays as it was.
+            kept = self._capture_verdict(job, ACTION_KEPT, None, result)
+            if kept is not None:
+                await self._recorder.record_verdict(kept)
+            logger.info(
+                "tier2 flagged transcript %s in %s (category=%s); recorded, "
+                "not redacted",
+                job.event_id,
+                job.room_id,
+                category,
+            )
+            return True
+        if _keeps_for_self_harm(categories, result.get("category_scores")):
             # Deleting a disclosure of self-harm is itself a harm: the learner
             # is asking for help, the message is the only record that they did,
             # and a redaction removes it from the room while telling nobody.
@@ -1473,11 +1633,17 @@ class ChatModeration:
                 job.room_id,
                 category,
             )
-            return
+            return True
         # Severity, and only now. The preserve branch above has already
         # returned, so a self-harm disclosure never reaches a threshold and no
         # value an operator can configure takes part in that decision - which
         # is asserted directly rather than left to this comment.
+        #
+        # A verdict still carrying self-harm here is abuse that also reads as
+        # self-harm, with another flag scoring higher. It is decided on its
+        # other flags alone, like any message with only those flags.
+        categories = [name for name in categories if not _preserves(name)]
+        category = _summarize_categories(categories)
         decision = severity.decide(
             categories, result.get("category_scores"), self._category_thresholds
         )
@@ -1509,7 +1675,7 @@ class ChatModeration:
                 driver.score if driver else 0.0,
                 driver.threshold if driver else 0.0,
             )
-            return
+            return True
         # The ORDER matters. The re-read comes first and the claim second, so
         # there is no `await` between taking the claim and sending: a claim
         # taken and then abandoned at an await - a cancellation, a shutdown -
@@ -1536,7 +1702,7 @@ class ChatModeration:
                         else OUTCOME_SKIPPED
                     ),
                 )
-                return
+                return True
             claim = await self._may_redact(job, category)
         except Exception as exc:
             reraise_if_cancelled(
@@ -1548,7 +1714,7 @@ class ChatModeration:
             # Declined. `skipped` fills an empty outcome only, so what an
             # earlier attempt established stands.
             self._record_attempt(captured, OUTCOME_SKIPPED)
-            return
+            return True
         # Bound after the narrowing, because the release below runs inside a
         # closure and a captured Optional does not carry the narrowing with
         # it.
@@ -1635,7 +1801,7 @@ class ChatModeration:
                 error_site(exc),
                 type(exc).__name__,
             )
-            return
+            return True
         # OUTSIDE the try, and deliberately: anything that raised in here
         # while inside it would be read as a failed send, and the module would
         # release a claim and count a failure on a redaction that had already
@@ -1671,6 +1837,7 @@ class ChatModeration:
             max(self._clock.time() - job.enqueued_at, 0.0)
         )
         await self._warn_if_preserved_meanwhile(job)
+        return True
 
     def _record_matcher_agreement(
         self, job: ModerationJob, result: Optional[Mapping[str, Any]]
@@ -2066,6 +2233,137 @@ class ChatModeration:
             as_of=job.position,
         )
 
+    # ------------------------------------------------------------------
+    # Re-check — messages Tier 2 could not check
+    # ------------------------------------------------------------------
+
+    def _queue_recheck(self, jobs: Sequence[ModerationJob]) -> None:
+        """Put messages Tier 2 could not check on the re-check list, detached:
+        nothing waits on the write, so a worker finishes its job at once and
+        the shutdown drain is never held by it."""
+        run_in_background(self._write_recheck, jobs)
+
+    async def _write_recheck(self, jobs: Sequence[ModerationJob]) -> None:
+        """Never raises: a row that cannot be written is counted lost and
+        logged."""
+        for job in jobs:
+            try:
+                await self._recheck.add(
+                    job.event_id, job.room_id, self._clock.time_msec()
+                )
+            except Exception as exc:
+                reraise_if_cancelled(exc)
+                # silent-ok: counted lost and logged at ERROR; the message
+                # stays up unchecked, which is what an unqueued failure means.
+                metrics.record_recheck("lost")
+                logger.error(
+                    "tier2 could not queue %s in %s for a re-check at %s (%s); "
+                    "it will not be checked",
+                    job.event_id,
+                    job.room_id,
+                    error_site(exc),
+                    type(exc).__name__,
+                )
+                continue
+            metrics.record_recheck("queued")
+
+    async def _recheck_pass(self) -> None:
+        """Re-check the oldest messages on the list through the same
+        single-message check and decision as a new message. Runs every
+        `RECHECK_INTERVAL_SECONDS` on the Tier-2 instance; a pass still
+        running when the next is due makes the next one a no-op."""
+        if self._rechecking or self._checker is None:
+            return
+        self._rechecking = True
+        try:
+            try:
+                rows = await self._recheck.oldest(RECHECK_BATCH)
+            except Exception as exc:
+                reraise_if_cancelled(exc)
+                # silent-ok: logged; the rows stay and the next pass reads them.
+                logger.warning(
+                    "tier2 could not read the re-check list at %s (%s)",
+                    error_site(exc),
+                    type(exc).__name__,
+                )
+                return
+            for event_id, room_id, queued_at_ms in rows:
+                try:
+                    await self._recheck_one(event_id, room_id, queued_at_ms)
+                except Exception as exc:
+                    reraise_if_cancelled(exc)
+                    # silent-ok: logged and counted as an attempt, so a row
+                    # that keeps failing yields its turn to the rows behind it.
+                    logger.warning(
+                        "tier2 re-check of %s in %s failed at %s (%s)",
+                        event_id,
+                        room_id,
+                        error_site(exc),
+                        type(exc).__name__,
+                    )
+                    await self._bump_recheck(event_id)
+        finally:
+            self._rechecking = False
+
+    async def _bump_recheck(self, event_id: str) -> None:
+        try:
+            await self._recheck.bump(event_id)
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok: logged; the row keeps its place and is retried.
+            logger.warning(
+                "tier2 could not count a re-check attempt for %s at %s (%s)",
+                event_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
+
+    async def _recheck_one(
+        self, event_id: str, room_id: str, queued_at_ms: int
+    ) -> None:
+        if self._clock.time_msec() - queued_at_ms > MAX_AGE_SECONDS * 1000:
+            await self._recheck.delete(event_id)
+            metrics.record_recheck("expired")
+            logger.warning(
+                "tier2 gave up re-checking %s in %s after %d days; it was never "
+                "checked",
+                event_id,
+                room_id,
+                MAX_AGE_SECONDS // 86400,
+            )
+            return
+        if self._breaker is not None and self._breaker.is_shedding():
+            # After the expiry check, so an outage still ages rows out.
+            return
+        store = self._api._hs.get_datastores().main
+        event = await store.get_event(event_id, allow_none=True)
+        text = None
+        is_transcript = event is not None and event.type == CALL_TRANSCRIPT_EVENT_TYPE
+        if event is not None and not event.internal_metadata.is_redacted():
+            if is_transcript:
+                text = transcript_text(event.content)
+            else:
+                text = self._extract_text(event).text
+        if event is None or text is None:
+            # Gone, already removed, or nothing left to read.
+            await self._recheck.delete(event_id)
+            metrics.record_recheck("gone")
+            return
+        job = ModerationJob(
+            event_id=event_id,
+            room_id=room_id,
+            sender=event.sender,
+            text=text,
+            enqueued_at=self._clock.time(),
+            position=_stream_position(event),
+            transcript=is_transcript,
+        )
+        if await self._check_and_redact(job):
+            await self._recheck.delete(event_id)
+            metrics.record_recheck("decided")
+        else:
+            await self._recheck.bump(event_id)
+
     async def shutdown(self) -> None:
         """Drain Tier 2. Registered with the homeserver by the dispatcher;
         exposed here so a test can drive it without reaching into privates."""
@@ -2267,15 +2565,43 @@ def _should_preserve(categories: Iterable[Any]) -> bool:
     — and deciding on the summary would have redacted a self-harm disclosure
     because a second label sorted ahead of it.
 
-    Preserving therefore wins over redacting when a verdict carries both. A
-    message that is genuinely both is the hardest case and the reasoning is
-    the same as for the simple one: a learner in crisis who is also being
-    abusive still needs the disclosure to survive, and the abuse is answerable
-    by a human who can see it. The cost is that a redaction the room wanted
-    does not happen, which stays true until somebody is notified — see
-    `_check_and_redact`.
+    This says whether the verdict reads as self-harm at all, which is what the
+    Safety record's self-harm label shows. Whether the message is KEPT for it
+    is `_keeps_for_self_harm`.
     """
     return any(_preserves(category) for category in categories)
+
+
+def _keeps_for_self_harm(categories: Sequence[Any], scores: Any) -> bool:
+    """Is this verdict kept up as a self-harm disclosure?
+
+    Only when self-harm is its strongest flag. Abuse aimed at someone else,
+    such as "you need to die", is tagged harassment and self-harm at once, and
+    keeping every message with any self-harm label left that abuse up. So a
+    verdict whose other flag scores strictly higher than every self-harm flag
+    is not kept for self-harm. A tie, an unreadable self-harm score, or no
+    readable score for any other flag keeps the message: without that
+    evidence the disclosure is not shown to be the weaker reading. See moderation.instructions.md, "Self-harm is
+    preserved".
+    """
+    if not _should_preserve(categories):
+        return False
+    self_harm: List[float] = []
+    others: List[float] = []
+    for name in categories:
+        score = severity.readable_score(scores, name)
+        if _preserves(name):
+            if score is None:
+                # A self-harm label we cannot score - an unknown sub-category,
+                # a spelling we only recognise by prefix - may be the strongest
+                # flag, so it keeps the message.
+                return True
+            self_harm.append(score)
+        elif score is not None:
+            others.append(score)
+    if not others:
+        return True
+    return max(self_harm) >= max(others)
 
 
 def _preserves(category: Any) -> bool:

@@ -15,6 +15,7 @@ Tier 2 are driven through the real `ChatModeration` handlers.
 """
 
 import logging
+import sqlite3
 import unittest
 from types import SimpleNamespace
 from typing import (
@@ -24,6 +25,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Set,
     Tuple,
     cast,
@@ -31,7 +33,7 @@ from typing import (
 from unittest.mock import AsyncMock, create_autospec, patch
 
 from synapse.logging.context import LoggingContext, current_context
-from synapse.module_api import ModuleApi
+from synapse.module_api import NOT_SPAM, ModuleApi
 from twisted.internet import defer
 
 from synapse_pangea_chat.moderation import ChatModeration
@@ -41,9 +43,14 @@ from synapse_pangea_chat.moderation.courses import (
     CREATE_EVENT_TYPE,
     MEMBER_EVENT_TYPE,
     POWER_LEVELS_EVENT_TYPE,
-    StudentCourses,
+    ChatCourses,
     is_course_admin_in,
-    is_student_in,
+)
+from synapse_pangea_chat.moderation.courses import (
+    SPACE_CHILD_EVENT_TYPE as SPACE_CHILD,
+)
+from synapse_pangea_chat.moderation.courses import (
+    SPACE_PARENT_EVENT_TYPE as SPACE_PARENT,
 )
 from synapse_pangea_chat.moderation.dispatch import ModerationJob
 from synapse_pangea_chat.moderation.incidents import (
@@ -52,6 +59,7 @@ from synapse_pangea_chat.moderation.incidents import (
     ACTION_PRESERVED,
     ACTION_REDACTED,
     ACTION_REPORTED,
+    CREATE_STATEMENTS,
     OUTCOME_FAILED,
     OUTCOME_PENDING,
     OUTCOME_REMOVED,
@@ -61,10 +69,15 @@ from synapse_pangea_chat.moderation.incidents import (
     STATEMENTS,
     Incident,
     IncidentStore,
+    IncidentWriteError,
+    create_tables,
     merge_action,
     merge_incident,
     merge_outcome,
     next_updated_ms,
+    read_outbox,
+    remark_outbox,
+    settle_outbox,
 )
 from synapse_pangea_chat.moderation.recorder import IncidentRecorder
 from synapse_pangea_chat.moderation.room_names import (
@@ -129,7 +142,9 @@ class CourseWorld:
         self.created: Dict[str, int] = {}
         self.timeline: List[Tuple[int, str, str, bool]] = []
         self.position = 0
-        self.reads: List[Tuple[str, str]] = []
+        self.links: List[Tuple[int, str, str, bool, bool]] = []
+        self.dead_parents: Set[Tuple[str, str]] = set()
+        self.reads: List[str] = []
         self.error: Optional[Exception] = None
         self.names: List[Tuple[int, str, str]] = []
         self.display_names: Dict[str, str] = {}
@@ -166,22 +181,30 @@ class CourseWorld:
                 result.setdefault(user, set()).add(room)
         return result
 
-    async def rooms_ever_joined(self, user_id: str) -> Set[str]:
-        if self.error is not None:
-            raise self.error
-        return {
-            room
-            for _at, user, room, is_join in self.timeline
-            if user == user_id and is_join
-        }
+    def link(
+        self, parent: str, child: str, *, back: bool = True, live: bool = True
+    ) -> None:
+        """`child` names `parent` in `m.space.parent` (emptied unless `live`);
+        with `back`, the parent also lists it in a live `m.space.child`."""
+        self.links.append((self._tick(), parent, child, True, back))
+        if not live:
+            self.dead_parents.add((parent, child))
 
-    async def is_course_now(self, room_id: str) -> bool:
-        return bool(self.plans.get(room_id))
+    def unlink(self, parent: str, child: str) -> None:
+        self.links.append((self._tick(), parent, child, False, False))
 
-    async def state_at(
-        self, room_id: str, user_id: str, position: int
-    ) -> Dict[Any, Any]:
-        self.reads.append((room_id, user_id))
+    def _links_at(self, position: int) -> Dict[Tuple[str, str], bool]:
+        """`(parent, child) -> linked back` for each live link at `position`."""
+        live: Dict[Tuple[str, str], bool] = {}
+        for at, parent, child, on, back in self.links:
+            if at <= position:
+                if on:
+                    live[(parent, child)] = back
+                else:
+                    live.pop((parent, child), None)
+        return live
+
+    def _state(self, room_id: str, position: int) -> Dict[Any, Any]:
         if self.error is not None:
             raise self.error
         if self.created.get(room_id, 10**9) > position:
@@ -194,11 +217,30 @@ class CourseWorld:
         }
         if self.plans.get(room_id):
             state[(COURSE_PLAN_EVENT_TYPE, "")] = _state_event({"uuid": "plan"})
-        if self.joined_at(user_id, room_id, position):
-            state[(MEMBER_EVENT_TYPE, user_id)] = _state_event(
-                {"membership": "join"}, sender=user_id
-            )
+        for (parent, child), back in self._links_at(position).items():
+            if child == room_id:
+                via = {} if (parent, child) in self.dead_parents else {"via": ["x"]}
+                state[(SPACE_PARENT, parent)] = _state_event(via)
+            if parent == room_id and back:
+                state[(SPACE_CHILD, child)] = _state_event({"via": ["example.org"]})
+        for user in {user for _at, user, room, _join in self.timeline}:
+            if self.joined_at(user, room_id, position):
+                state[(MEMBER_EVENT_TYPE, user)] = _state_event(
+                    {"membership": "join"}, sender=user
+                )
         return state
+
+    async def state_at(
+        self, room_id: str, keys: Sequence[Tuple[str, Optional[str]]], position: int
+    ) -> Dict[Any, Any]:
+        """The given keys of the room's state at `position`; a key with no
+        state key reads every state key of its type."""
+        self.reads.append(room_id)
+        return {
+            key: event
+            for key, event in self._state(room_id, position).items()
+            if any(t == key[0] and k in (None, key[1]) for t, k in keys)
+        }
 
     def rename(self, room_id: str, name: str) -> None:
         self.names.append((self._tick(), room_id, name))
@@ -228,27 +270,22 @@ class CourseWorld:
 
     async def read_state(self, room_id: str, user_id: str) -> Dict[Any, Any]:
         """Current state, for the read endpoint's admin check."""
-        return await self.state_at(room_id, user_id, self.position)
+        return self._state(room_id, self.position)
 
-    def courses(
-        self, is_exempt: Callable[[str], bool] = lambda _user: False
-    ) -> StudentCourses:
-        return StudentCourses(
-            rooms_ever_joined=self.rooms_ever_joined,
-            is_course_now=self.is_course_now,
-            state_at=self.state_at,
-            current_position=lambda: self.position,
-            is_exempt=is_exempt,
+    def courses(self) -> ChatCourses:
+        return ChatCourses(
+            state_at=self.state_at, current_position=lambda: self.position
         )
 
 
 def _classroom() -> CourseWorld:
     """A learner and a teacher in course A; the teacher also teaches B and
-    is a learner in nothing; the learner also sits in an ordinary room."""
+    is a learner in nothing; both sit in ROOM, a chat of course A."""
     world = CourseWorld()
     world.room(COURSE_A, course=True, teacher=100)
     world.room(COURSE_B, course=True, teacher=100)
     world.room(ROOM, course=False)
+    world.link(COURSE_A, ROOM)
     for room in (COURSE_A, ROOM):
         world.join(STUDENT, room)
     for room in (COURSE_A, COURSE_B, ROOM):
@@ -435,7 +472,7 @@ class TestIncidentSqlRunsOnSqlite(unittest.TestCase):
 
         connection = sqlite3.connect(":memory:")
         try:
-            for sql in STATEMENTS[:4]:
+            for sql in CREATE_STATEMENTS:
                 connection.execute(sqlite_engine().convert_param_style(sql))
         finally:
             connection.close()
@@ -557,100 +594,295 @@ class TestIncidentStore(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
+# The forward outbox (admin-dash#300)
+# ---------------------------------------------------------------------------
+
+
+class _RollbackPool(DbPoolDouble):
+    """The shared double, plus the rollback a real transaction does when its
+    function raises: what makes "the same transaction" testable."""
+
+    async def runInteraction(self, desc: str, func: Any, *args: Any, **kw: Any) -> Any:
+        try:
+            return await super().runInteraction(desc, func, *args, **kw)
+        except BaseException:
+            self.connection.rollback()
+            raise
+
+
+def _outbox(db_pool: DbPoolDouble) -> Dict[str, Tuple[int, bool, bool]]:
+    rows = db_pool.connection.execute(
+        "SELECT incident_id, revision, dirty, parked "
+        "FROM pangea_safety_incident_outbox"
+    ).fetchall()
+    return {row[0]: (int(row[1]), bool(row[2]), bool(row[3])) for row in rows}
+
+
+async def _in_txn(db_pool: DbPoolDouble, func: Callable[[Any], Any]) -> Any:
+    return await db_pool.runInteraction("test", func)
+
+
+class TestForwardOutbox(unittest.IsolatedAsyncioTestCase):
+    async def test_every_write_path_marks_the_outbox(self) -> None:
+        db_pool = DbPoolDouble()
+        store, homeserver = _store(db_pool)
+        await store.insert(_incident(outcome=OUTCOME_PENDING, attempt_id="a"))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (1, True, False))
+        await store.insert(_incident(text="again"))  # an existing row: no write
+        self.assertEqual(_outbox(db_pool)["mod:$e1"][0], 1)
+
+        await _in_txn(db_pool, lambda txn: settle_outbox(txn, [("mod:$e1", 1)], []))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (1, False, False))
+
+        await store.upsert_verdict(_incident(top_score=0.9))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (2, True, False))
+        await store.upsert_verdict(_incident(top_score=0.9))  # nothing new
+        self.assertEqual(_outbox(db_pool)["mod:$e1"][0], 2)
+
+        homeserver.clock.advance(1.0)
+        self.assertTrue(
+            await store.set_outcome("mod:$e1", OUTCOME_UNKNOWN, attempt_id="a")
+        )
+        self.assertEqual(_outbox(db_pool)["mod:$e1"][0], 3)
+
+        await store.upsert_verdict(
+            _incident(outcome=OUTCOME_PENDING, attempt_id="b", top_score=0.9)
+        )
+        self.assertEqual(_outbox(db_pool)["mod:$e1"][0], 4)
+        self.assertTrue(await store.abandon_attempt("mod:$e1", "b"))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (5, True, False))
+
+        await store.upsert_verdict(_incident(incident_id="mod:$new"))
+        self.assertEqual(_outbox(db_pool)["mod:$new"], (1, True, False))
+
+    async def test_a_failed_mark_undoes_the_incident_write(self) -> None:
+        db_pool = _RollbackPool()
+        store, _hs = _store(db_pool)
+        await store.ensure_table()
+
+        def refuse_the_mark(sql: str, _args: Any) -> None:
+            if "INSERT INTO pangea_safety_incident_outbox" in sql:
+                raise RuntimeError("outbox write refused")
+
+        db_pool.on_statement = refuse_the_mark
+        with self.assertRaises(RuntimeError):
+            await store.insert(_incident())
+        db_pool.on_statement = None
+        self.assertEqual(_rows(db_pool), [], "an incident was stored without a mark")
+        self.assertEqual(_outbox(db_pool), {})
+
+        await store.insert(_incident())
+        db_pool.on_statement = refuse_the_mark
+        with self.assertRaises(RuntimeError):
+            await store.upsert_verdict(_incident(top_score=0.99))
+        db_pool.on_statement = None
+        row = await store.get("mod:$e1")
+        assert row is not None
+        self.assertEqual(row.top_score, 0.3, "an update was stored without a mark")
+
+    async def test_a_failed_incident_write_leaves_no_mark(self) -> None:
+        db_pool = _RollbackPool()
+        store, _hs = _store(db_pool)
+        await store.ensure_table()
+
+        def refuse_the_row(sql: str, _args: Any) -> None:
+            # The incident row's own INSERT, not the course index or the mark.
+            if sql.lstrip().startswith("INSERT INTO pangea_safety_incidents\n"):
+                raise sqlite3.IntegrityError("refused")
+
+        db_pool.on_statement = refuse_the_row
+        with self.assertRaises(IncidentWriteError):
+            await store.insert(_incident())
+        db_pool.on_statement = None
+        self.assertEqual(_outbox(db_pool), {})
+
+    async def test_the_read_is_oldest_first_bounded_and_whole(self) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident(incident_id="mod:$c", updated_ms=30))
+        await store.insert(_incident(incident_id="mod:$a", updated_ms=10))
+        await store.insert(
+            _incident(
+                incident_id="report:r1",
+                updated_ms=20,
+                text="dm text",
+                course_ids=(COURSE_A, COURSE_B),
+            )
+        )
+        entries, more = await _in_txn(db_pool, lambda txn: read_outbox(txn, 2))
+        self.assertTrue(more)
+        self.assertEqual([e.incident_id for e in entries], ["mod:$a", "report:r1"])
+        second = entries[1].incident
+        assert second is not None
+        self.assertEqual(second.text, "dm text")
+        self.assertEqual(second.course_ids, (COURSE_A, COURSE_B))
+        self.assertEqual(entries[1].revision, 1)
+        entries, more = await _in_txn(db_pool, lambda txn: read_outbox(txn, 3))
+        self.assertFalse(more)
+        self.assertEqual(len(entries), 3)
+
+    async def test_a_mark_whose_row_is_gone_is_read_without_an_incident(
+        self,
+    ) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident())
+        db_pool.connection.execute("DELETE FROM pangea_safety_incidents")
+        entries, _more = await _in_txn(db_pool, lambda txn: read_outbox(txn, 20))
+        self.assertEqual(
+            [(e.incident_id, e.incident) for e in entries], [("mod:$e1", None)]
+        )
+
+    async def test_settle_clears_only_the_revision_sent(self) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident())
+        entries, _ = await _in_txn(db_pool, lambda txn: read_outbox(txn, 20))
+        await store.upsert_verdict(_incident(top_score=0.8))  # lands in flight
+        sent = [(e.incident_id, e.revision) for e in entries]
+        await _in_txn(db_pool, lambda txn: settle_outbox(txn, sent, []))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (2, True, False))
+
+    async def test_a_parked_mark_waits_for_reconciliation(self) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident(updated_ms=10))
+        await _in_txn(db_pool, lambda txn: settle_outbox(txn, [], [("mod:$e1", 1)]))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (1, False, True))
+        entries, more = await _in_txn(db_pool, lambda txn: read_outbox(txn, 20))
+        self.assertEqual((entries, more), ([], False))
+        # Reconciliation bounded well above the row's change still unparks it.
+        await _in_txn(db_pool, lambda txn: remark_outbox(txn, 10**12))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (2, True, False))
+        entries, _ = await _in_txn(db_pool, lambda txn: read_outbox(txn, 20))
+        self.assertEqual([e.revision for e in entries], [2])
+
+    async def test_a_new_write_unparks(self) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident())
+        await _in_txn(db_pool, lambda txn: settle_outbox(txn, [], [("mod:$e1", 1)]))
+        await store.upsert_verdict(_incident(top_score=0.7))
+        self.assertEqual(_outbox(db_pool)["mod:$e1"], (2, True, False))
+
+    async def test_reconciliation_marks_what_unmarked_code_wrote(self) -> None:
+        """A rollback window: code without the outbox wrote an incident and
+        changed another; neither has a mark. Re-marking from the bound finds
+        both and leaves an older delivered one alone."""
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident(incident_id="mod:$old", updated_ms=100))
+        await store.insert(_incident(incident_id="mod:$changed", updated_ms=200))
+        await _in_txn(
+            db_pool,
+            lambda txn: settle_outbox(txn, [("mod:$old", 1), ("mod:$changed", 1)], []),
+        )
+        # The reverted code: plain writes, no mark.
+        db_pool.connection.execute(
+            "UPDATE pangea_safety_incidents SET updated_ms = 900 "
+            "WHERE incident_id = 'mod:$changed'"
+        )
+        db_pool.connection.execute(
+            "INSERT INTO pangea_safety_incidents (incident_id, source, action, "
+            "room_id, course_ids, categories, self_harm, created_ms, updated_ms) "
+            "VALUES ('mod:$unmarked', 'moderation', 'kept', '!r:hs', '[]', '[]', "
+            "0, 950, 950)"
+        )
+        db_pool.connection.commit()
+        await _in_txn(db_pool, lambda txn: remark_outbox(txn, 500))
+        outbox = _outbox(db_pool)
+        self.assertEqual(outbox["mod:$old"], (1, False, False))
+        self.assertEqual(outbox["mod:$changed"], (2, True, False))
+        self.assertEqual(outbox["mod:$unmarked"], (1, True, False))
+
+    async def test_no_watermark_marks_everything(self) -> None:
+        db_pool = DbPoolDouble()
+        store, _hs = _store(db_pool)
+        await store.insert(_incident(incident_id="mod:$a", updated_ms=1))
+        await _in_txn(db_pool, lambda txn: settle_outbox(txn, [("mod:$a", 1)], []))
+        await _in_txn(db_pool, lambda txn: remark_outbox(txn, None))
+        self.assertEqual(_outbox(db_pool)["mod:$a"], (2, True, False))
+
+    async def test_the_forwarder_can_create_the_tables_first(self) -> None:
+        db_pool = DbPoolDouble()
+        await _in_txn(db_pool, create_tables)
+        await _in_txn(db_pool, create_tables)  # idempotent
+        entries, more = await _in_txn(db_pool, lambda txn: read_outbox(txn, 20))
+        self.assertEqual((entries, more), ([], False))
+
+
+# ---------------------------------------------------------------------------
 # The course rule
 # ---------------------------------------------------------------------------
 
 
-class TestStudentCourses(unittest.IsolatedAsyncioTestCase):
-    async def test_a_student_course_is_a_joined_course_below_100(self) -> None:
+DM = "!dm:example.org"
+
+
+class TestChatCourses(unittest.IsolatedAsyncioTestCase):
+    async def test_a_course_chat_reaches_only_its_own_course(self) -> None:
+        """The learner is in A and B; a chat of A reaches A, never B."""
         world = _classroom()
-        courses = world.courses()
-        self.assertEqual(await courses.for_user(STUDENT, world.position), (COURSE_A,))
+        world.join(STUDENT, COURSE_B)
         self.assertEqual(
-            await courses.for_user(TEACHER, world.position),
-            (),
-            "a course admin is nobody's student",
+            await world.courses().for_room(ROOM, world.position), (COURSE_A,)
         )
 
-    async def test_a_room_without_a_course_plan_is_not_a_course(self) -> None:
+    async def test_the_course_space_itself_is_its_own_course(self) -> None:
         world = _classroom()
-        world.room(ROOM, course=False)
-        self.assertNotIn(ROOM, await world.courses().for_user(STUDENT, world.position))
+        self.assertEqual(
+            await world.courses().for_room(COURSE_A, world.position), (COURSE_A,)
+        )
 
-    async def test_exempt_users_and_bots_are_nobodys_students(self) -> None:
+    async def test_a_chat_no_course_owns_reaches_no_course(self) -> None:
+        """A direct message between two learners of course A."""
         world = _classroom()
-        bot = "@bot:example.org"
-        world.join(bot, COURSE_A)
-        exempt = world.courses(is_exempt=lambda user: user == STUDENT)
-        self.assertEqual(await exempt.for_user(STUDENT, world.position), ())
-        self.assertEqual(await world.courses().for_user(bot, world.position), ())
+        world.room(DM, course=False)
+        world.join(STUDENT, DM)
+        world.join(OUTSIDER, DM)
+        self.assertEqual(await world.courses().for_room(DM, world.position), ())
 
-    async def test_a_read_that_fails_is_an_error_and_not_a_student_nowhere(
+    async def test_a_parent_the_course_does_not_link_back_is_no_course(
         self,
     ) -> None:
+        """A room can name any space its parent; only the course's own
+        `m.space.child` makes it the course's chat."""
+        world = _classroom()
+        world.room(DM, course=False)
+        world.link(COURSE_B, DM, back=False)
+        self.assertEqual(await world.courses().for_room(DM, world.position), ())
+
+    async def test_a_removed_parent_link_is_no_course(self) -> None:
+        """The chat's `m.space.parent` was emptied; the course's own child
+        link alone does not make it the course's chat."""
+        world = _classroom()
+        world.room(DM, course=False)
+        world.link(COURSE_B, DM, live=False)
+        self.assertEqual(await world.courses().for_room(DM, world.position), ())
+
+    async def test_a_parent_without_a_course_plan_is_no_course(self) -> None:
+        world = _classroom()
+        space = "!space:example.org"
+        world.room(space, course=False)
+        world.room(DM, course=False)
+        world.link(space, DM)
+        self.assertEqual(await world.courses().for_room(DM, world.position), ())
+
+    async def test_the_parent_is_read_as_of_the_position_not_now(self) -> None:
+        """The chat moved from A to B after the incident: it stays A's."""
+        world = _classroom()
+        at_incident = world.position
+        world.unlink(COURSE_A, ROOM)
+        world.link(COURSE_B, ROOM)
+        courses = world.courses()
+        self.assertEqual(await courses.for_room(ROOM, at_incident), (COURSE_A,))
+        self.assertEqual(await courses.for_room(ROOM, world.position), (COURSE_B,))
+
+    async def test_a_read_that_fails_is_an_error_and_not_no_course(self) -> None:
         world = _classroom()
         world.error = RuntimeError("store down")
         with self.assertRaises(RuntimeError):
-            await world.courses().for_user(STUDENT, world.position)
-
-    async def test_a_teachers_report_reaches_only_the_learners_course(self) -> None:
-        """The teacher teaches A and B; the learner is in A. A report the
-        teacher files about the learner must reach A only - B's admins have
-        no business seeing a message from a learner who is not theirs."""
-        world = _classroom()
-        self.assertEqual(
-            await world.courses().for_report(STUDENT, TEACHER, world.position),
-            (COURSE_A,),
-        )
-
-    async def test_a_reporters_own_student_courses_are_not_added(self) -> None:
-        """The reporter is a LEARNER in another course too. Their own
-        courses are a fallback for a subject who is a student nowhere, never
-        an addition: course C's admins must not see a message from course A."""
-        world = _classroom()
-        course_c = "!course-c:example.org"
-        world.room(course_c, course=True, someone=100)
-        world.join(TEACHER, course_c)
-        self.assertEqual(
-            await world.courses().for_user(TEACHER, world.position), (course_c,)
-        )
-        self.assertEqual(
-            await world.courses().for_report(STUDENT, TEACHER, world.position),
-            (COURSE_A,),
-        )
-
-    async def test_a_report_about_an_outsider_goes_to_the_reporters_courses(
-        self,
-    ) -> None:
-        world = _classroom()
-        world.join(OUTSIDER, ROOM)
-        self.assertEqual(
-            await world.courses().for_report(OUTSIDER, STUDENT, world.position),
-            (COURSE_A,),
-        )
-
-    async def test_nobodys_report_reaches_no_course(self) -> None:
-        world = _classroom()
-        self.assertEqual(
-            await world.courses().for_report(OUTSIDER, TEACHER, world.position), ()
-        )
-
-    async def test_courses_are_read_as_of_the_position_not_now(self) -> None:
-        """The learner was in A at the incident, then left A and joined B as
-        a learner. Asked at the incident's position, the answer is A - and
-        only A - however late the question is asked."""
-        world = _classroom()
-        at_incident = world.position
-        world.leave(STUDENT, COURSE_A)
-        course_c = "!course-c:example.org"
-        world.room(course_c, course=True, teacher=100)
-        world.join(STUDENT, COURSE_B)
-        world.join(STUDENT, course_c)
-        courses = world.courses()
-        self.assertEqual(await courses.for_user(STUDENT, at_incident), (COURSE_A,))
-        self.assertEqual(
-            await courses.for_user(STUDENT, world.position), (COURSE_B, course_c)
-        )
+            await world.courses().for_room(ROOM, world.position)
 
     async def test_a_creator_with_no_power_levels_event_is_an_admin(self) -> None:
         """No `m.room.power_levels` in the room: the spec gives the creator
@@ -670,16 +902,12 @@ class TestStudentCourses(unittest.IsolatedAsyncioTestCase):
             (MEMBER_EVENT_TYPE, STUDENT): _state_event({"membership": "join"}),
         }
         self.assertTrue(is_course_admin_in(state, TEACHER))
-        self.assertFalse(is_student_in(state, TEACHER))
-        self.assertTrue(is_student_in(state, STUDENT))
 
     async def test_admin_and_student_predicates(self) -> None:
         world = _classroom()
         state = await world.read_state(COURSE_A, TEACHER)
         self.assertTrue(is_course_admin_in(state, TEACHER))
-        self.assertFalse(is_student_in(state, TEACHER))
         state = await world.read_state(COURSE_A, STUDENT)
-        self.assertTrue(is_student_in(state, STUDENT))
         self.assertFalse(is_course_admin_in(state, STUDENT))
         world.leave(TEACHER, COURSE_A)
         departed = await world.read_state(COURSE_A, TEACHER)
@@ -1150,15 +1378,15 @@ class TestCourseIsFrozenAtQueueTime(Tier2Case):
             "the course was read at verdict time, after the learner had left",
         )
 
-    async def test_leaving_and_joining_another_course_before_the_read(self) -> None:
-        """The window a lookup scheduled for later cannot close: the learner
-        leaves A and joins B between the queue and ANY read. The answer must
+    async def test_a_chat_moved_to_another_course_before_the_read(self) -> None:
+        """The window a lookup scheduled for later cannot close: the chat
+        moves from A to B between the queue and ANY read. The answer must
         still be A, and only A."""
         world = _classroom()
         module, _api, _hs, _db = self._module(world)
         job = await self._queue(module, _sent_event(world, "you are awful"))
-        world.leave(STUDENT, COURSE_A)
-        world.join(STUDENT, COURSE_B)
+        world.unlink(COURSE_A, ROOM)
+        world.link(COURSE_B, ROOM)
         with patch(MODERATE_TEXT, _verdict("harassment")):
             await module._check_and_redact(job)
         self.assertEqual((await self._row(module)).course_ids, (COURSE_A,))
@@ -1249,6 +1477,52 @@ class TestACancellationDoesNotLoseTheFinding(Tier2Case):
         homeserver.clock.advance(1.0)
         row = await self._row(module)
         self.assertEqual((row.action, row.outcome), (ACTION_REDACTED, OUTCOME_SKIPPED))
+
+
+def _transcript(*texts: str, **extra: Any) -> Any:
+    """A `pangea.call_transcript` event as the client writes it (#872)."""
+    content = {"segments": [{"text": text, "at_ms": 0} for text in texts], **extra}
+    return _event(sender=STUDENT, event_type="pangea.call_transcript", content=content)
+
+
+class TestCallTranscriptsAreRecordedNotRedacted(Tier2Case):
+    """A flagged call transcript writes a Safety row and is never redacted or
+    blocked (pangeachat/.github#872)."""
+
+    async def test_a_transcript_is_queued_as_its_sender(self) -> None:
+        module, _api, _hs, _db = self._module()
+        event = _transcript("hello", "you are awful", spoken_by="@peer:example.org")
+        job = await self._queue(module, event)
+        self.assertEqual(job.text, "hello\nyou are awful")
+        self.assertEqual(job.sender, STUDENT)
+        self.assertTrue(job.transcript)
+
+    async def test_a_transcript_with_no_text_is_not_queued(self) -> None:
+        module, _api, _hs, _db = self._module()
+        assert module._dispatcher is not None
+        queued: List[ModerationJob] = []
+        with patch.object(
+            module._dispatcher, "enqueue", side_effect=_accepting(queued)
+        ):
+            await module.on_new_event(_transcript(" "), {})
+            await module.on_new_event(_event(sender=STUDENT, content={}), {})
+        self.assertEqual(queued, [])
+
+    async def test_a_flagged_transcript_is_recorded_and_not_redacted(self) -> None:
+        module, api, _hs, _db = self._module()
+        with patch(MODERATE_TEXT, _verdict("harassment")):
+            await module._check_and_redact(_job(transcript=True))
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+        row = await self._row(module)
+        self.assertEqual((row.action, row.outcome), (ACTION_KEPT, None))
+        self.assertEqual(row.subject_id, STUDENT)
+        self.assertEqual(row.categories, ("harassment",))
+
+    async def test_tier1_never_blocks_a_transcript(self) -> None:
+        module, _hs, db_pool = _tier1(_classroom())
+        result = await module.check_event_for_spam(_transcript(PHONE_TEXT))
+        self.assertIs(result, NOT_SPAM)
+        self.assertEqual(db_pool.interactions, [])
 
 
 class TestAnUnconfirmedScreenIsStillRecorded(Tier2Case):
@@ -1651,7 +1925,6 @@ class TestCreatorsByRoomVersion(unittest.TestCase):
         }
         self.assertTrue(is_course_admin_in(state, TEACHER))
         self.assertFalse(is_course_admin_in(state, STUDENT))
-        self.assertTrue(is_student_in(state, STUDENT))
 
 
 class TestAFailedWriteNeverCarriesTheRow(unittest.IsolatedAsyncioTestCase):
@@ -1689,36 +1962,6 @@ class TestAFailedWriteNeverCarriesTheRow(unittest.IsolatedAsyncioTestCase):
         homeserver.store.db_pool.on_statement = _locked
         with self.assertRaises(sqlite3.OperationalError):
             await store.insert(_incident())
-
-
-class TestCandidatesWithoutCurrentState(unittest.IsolatedAsyncioTestCase):
-    async def test_a_room_with_no_current_state_stays_a_candidate(self) -> None:
-        """Synapse drops a room's current state when its last local member
-        leaves. That says nothing about whether the room was a course at the
-        incident's position, so it must not exclude it."""
-        from synapse_pangea_chat.moderation import courses as courses_module
-
-        answers: Dict[str, Dict[Any, str]] = {
-            "!gone:example.org": {},
-            "!course:example.org": {
-                (CREATE_EVENT_TYPE, ""): "$c",
-                (COURSE_PLAN_EVENT_TYPE, ""): "$p",
-            },
-            "!chat:example.org": {(CREATE_EVENT_TYPE, ""): "$c"},
-        }
-
-        async def _current(room_id: str, state_filter: Any) -> Dict[Any, str]:
-            return answers[room_id]
-
-        homeserver = SimpleNamespace(
-            get_storage_controllers=lambda: SimpleNamespace(
-                state=SimpleNamespace(get_current_state_ids=_current)
-            )
-        )
-        check = courses_module._is_course_now(homeserver)
-        self.assertTrue(await check("!gone:example.org"))
-        self.assertTrue(await check("!course:example.org"))
-        self.assertFalse(await check("!chat:example.org"))
 
 
 class TestRoundThreeFindings(Tier2Case):
@@ -1793,7 +2036,7 @@ class TestHistoricalStateIsReadAsSent(unittest.IsolatedAsyncioTestCase):
         seen: List[Any] = []
         ids = {
             (COURSE_PLAN_EVENT_TYPE, ""): "$plan",
-            (CREATE_EVENT_TYPE, ""): "$create",
+            (SPACE_CHILD, ROOM): "$link",
         }
 
         async def _ids(_target: str, _filter: Any) -> Dict[Any, str]:
@@ -1802,7 +2045,7 @@ class TestHistoricalStateIsReadAsSent(unittest.IsolatedAsyncioTestCase):
         async def _get_events(
             event_ids: List[str], redact_behaviour: Any = EventRedactBehaviour.redact
         ) -> Dict[str, Any]:
-            seen.append(redact_behaviour)
+            seen.append((tuple(event_ids), redact_behaviour))
             return {}
 
         homeserver = SimpleNamespace(
@@ -1816,17 +2059,26 @@ class TestHistoricalStateIsReadAsSent(unittest.IsolatedAsyncioTestCase):
             ),
         )
         if historical:
-            await courses_module.state_after_event_reader(homeserver)("$e", STUDENT)
+            await courses_module.state_after_event_reader(homeserver)(
+                "$e", [(COURSE_PLAN_EVENT_TYPE, "")]
+            )
         else:
             await courses_module.current_state_reader(homeserver)("!r", STUDENT)
-        return seen[0]
+        return seen
 
     async def test_a_later_redaction_does_not_rewrite_the_past(self) -> None:
         from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 
-        self.assertEqual(await self._behaviour(True), EventRedactBehaviour.as_is)
         self.assertEqual(
-            await self._behaviour(False),
+            await self._behaviour(True),
+            [
+                (("$plan",), EventRedactBehaviour.as_is),
+                (("$link",), EventRedactBehaviour.redact),
+            ],
+            "only the plan is read as sent; a redacted child link is removed",
+        )
+        self.assertEqual(
+            (await self._behaviour(False))[0][1],
             EventRedactBehaviour.redact,
             "the read endpoint's gate must see the room as it is now",
         )

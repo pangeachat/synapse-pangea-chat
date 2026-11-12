@@ -134,6 +134,11 @@ class CircuitBreaker:
         self._probe_outstanding = True
         return None, self._generation
 
+    def is_shedding(self) -> bool:
+        """True while open and inside its cooldown, when a check would be
+        refused without a call. Reads only; moves no state."""
+        return self._state == BREAKER_OPEN and self._clock.time() < self._open_until
+
     def _is_current(self, ticket: Optional[int]) -> bool:
         return ticket is not None and ticket == self._generation
 

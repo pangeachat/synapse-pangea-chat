@@ -11,8 +11,7 @@ from typing import Any
 
 from synapse.module_api import ModuleApi
 
-from synapse_pangea_chat.moderation.courses import StudentCourses
-from synapse_pangea_chat.moderation.exempt import glob_match
+from synapse_pangea_chat.moderation.courses import ChatCourses
 from synapse_pangea_chat.moderation.incidents import IncidentStore
 from synapse_pangea_chat.safety_incidents.handlers import ReadHandler, ReportHandler
 from synapse_pangea_chat.safety_incidents.resources import (
@@ -32,13 +31,8 @@ def register_safety_incidents(api: ModuleApi, config: Any) -> None:
     """Register both endpoints, and - on the background-tasks instance - the
     one-time backfill and the startup sweep."""
     homeserver = api._hs
-    globs = list(config.moderation_exempt_user_id_globs)
-
-    def _is_exempt(user_id: str) -> bool:
-        return any(glob_match(pattern, user_id) for pattern in globs)
-
     store = IncidentStore(homeserver)
-    courses = StudentCourses.from_homeserver(homeserver, _is_exempt)
+    courses = ChatCourses.from_homeserver(homeserver)
     api.register_web_resource(
         path=REPORT_PATH,
         resource=SafetyReport(

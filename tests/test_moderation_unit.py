@@ -26,7 +26,7 @@ import traceback
 import unittest
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, cast
-from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+from unittest.mock import AsyncMock, MagicMock, call, create_autospec, patch
 
 from synapse.api.errors import Codes
 from synapse.events import EventBase
@@ -2810,6 +2810,115 @@ class TestSelfHarmIsNeverRedacted(unittest.IsolatedAsyncioTestCase):
         self.assertIn("self_harm", flattened)
 
 
+class TestSelfHarmMustBeTheStrongestFlag(unittest.IsolatedAsyncioTestCase):
+    """A message is kept for self-harm only when self-harm is the verdict's
+    strongest flag. Abuse aimed at someone else - "you need to die" - is
+    tagged harassment and self-harm at once, and keeping every message with
+    any self-harm label left that abuse up (pangeachat/synapse-pangea-chat#310).
+    """
+
+    MODERATE = MODERATE_TEXT
+
+    def _module(self, api: ModuleApi, homeserver: HomeServerDouble) -> ChatModeration:
+        return _tier2_module(self, api, _tier2_config())
+
+    def _pair(
+        self, db_pool: Optional[DbPoolDouble] = None
+    ) -> Tuple[ModuleApi, HomeServerDouble]:
+        store = EventStoreDouble()
+        if db_pool is not None:
+            store.db_pool = db_pool
+        homeserver = HomeServerDouble(store)
+        return _module_api(homeserver), homeserver
+
+    def _job(self) -> ModerationJob:
+        return ModerationJob(
+            event_id="$e1",
+            room_id="!room:example.org",
+            sender="@learner:example.org",
+            text="x",
+            enqueued_at=0.0,
+        )
+
+    def _scored(self, scores: Dict[str, float]) -> AsyncMock:
+        mock = create_autospec(moderate_text)
+        mock.return_value = {
+            "flagged": True,
+            "categories": list(scores),
+            "category_scores": scores,
+        }
+        return cast(AsyncMock, mock)
+
+    async def _decide(self, scores: Dict[str, float]) -> Tuple[AsyncMock, DbPoolDouble]:
+        db_pool = DbPoolDouble()
+        api, homeserver = self._pair(db_pool)
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, self._scored(scores)):
+            await mod._check_and_redact(self._job())
+        return cast(AsyncMock, api.create_and_send_event_into_room), db_pool
+
+    def _preserved(self, db_pool: DbPoolDouble) -> int:
+        table = db_pool.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = ?", (DISPOSITION_TABLE,)
+        ).fetchone()
+        if table is None:
+            return 0
+        row = db_pool.connection.execute(
+            f"SELECT count(*) FROM {DISPOSITION_TABLE} "
+            f"WHERE disposition = 'preserved'"
+        ).fetchone()
+        return int(row[0])
+
+    async def test_abuse_that_outscores_self_harm_is_removed(self) -> None:
+        send, db_pool = await self._decide(
+            {"harassment": 0.95, "violence": 0.6, "self-harm": 0.4}
+        )
+        send.assert_awaited_once()
+        self.assertEqual(self._preserved(db_pool), 0)
+
+    async def test_a_disclosure_that_outscores_abuse_is_kept(self) -> None:
+        send, db_pool = await self._decide({"self-harm/intent": 0.9, "harassment": 0.5})
+        send.assert_not_awaited()
+        self.assertEqual(self._preserved(db_pool), 1)
+
+    async def test_a_tie_is_kept(self) -> None:
+        send, db_pool = await self._decide({"self-harm": 0.7, "harassment": 0.7})
+        send.assert_not_awaited()
+        self.assertEqual(self._preserved(db_pool), 1)
+
+    async def test_a_missing_self_harm_score_is_kept(self) -> None:
+        mock = create_autospec(moderate_text)
+        mock.return_value = {
+            "flagged": True,
+            "categories": ["harassment", "self-harm"],
+            "category_scores": {"harassment": 0.95},
+        }
+        api, homeserver = self._pair()
+        mod = self._module(api, homeserver)
+        with patch(self.MODERATE, mock):
+            await mod._check_and_redact(self._job())
+        cast(AsyncMock, api.create_and_send_event_into_room).assert_not_awaited()
+
+    async def test_an_unscorable_self_harm_label_keeps_the_message(self) -> None:
+        """A self-harm sub-category we cannot score may be the strongest flag:
+        here it carries 0.99 beside a known self-harm label at 0.40 and
+        harassment at 0.95. It keeps the message rather than being ignored."""
+        send, db_pool = await self._decide(
+            {"self-harm": 0.40, "self-harm/new": 0.99, "harassment": 0.95}
+        )
+        send.assert_not_awaited()
+        self.assertEqual(self._preserved(db_pool), 1)
+
+    async def test_mild_abuse_that_outscores_self_harm_uses_its_own_threshold(
+        self,
+    ) -> None:
+        """Not kept for self-harm, and below harassment's own bar: left up
+        without a self-harm preserve, like any mild harassment."""
+        send, db_pool = await self._decide({"harassment": 0.05, "self-harm": 0.01})
+        send.assert_not_awaited()
+        self.assertEqual(self._preserved(db_pool), 0)
+
+
 class TestExtractionFailureIsNotACleanNegative(unittest.IsolatedAsyncioTestCase):
     """ "We could not read this" and "there is nothing here" are different
     facts, and the extractor used to report them the same way.
@@ -4749,23 +4858,46 @@ class TestCallbackRegistration(unittest.TestCase):
                 moderation_choreo_access_token="syt_x",
             ),
         )
-        api.register_spam_checker_callbacks.assert_called_once_with(
-            check_event_for_spam=mod.check_event_for_spam
+        self.addCleanup(_stop_tier2, mod)
+        self.assertEqual(
+            api.register_spam_checker_callbacks.call_args_list,
+            [
+                call(check_event_for_spam=mod.refuse_encrypted_event),
+                call(check_event_for_spam=mod.check_event_for_spam),
+            ],
         )
-        api.register_third_party_rules_callbacks.assert_called_once_with(
-            on_new_event=mod.on_new_event
+        self.assertEqual(
+            api.register_third_party_rules_callbacks.call_args_list,
+            [
+                call(
+                    check_event_allowed=mod.check_event_allowed,
+                    on_create_room=mod.on_create_room,
+                ),
+                call(on_new_event=mod.on_new_event),
+            ],
         )
 
     def test_a_disabled_tier_registers_nothing(self) -> None:
         """Both directions, because a test that only ever disables Tier 2
-        passes when Tier-1 registration is made unconditional."""
+        passes when Tier-1 registration is made unconditional. The encryption
+        refusal is registered whichever tier is on, and nothing else is."""
         tier1_only = _module_api()
-        ChatModeration(tier1_only, _config(moderation_tier1_enabled=True))
-        tier1_only.register_spam_checker_callbacks.assert_called_once()
-        tier1_only.register_third_party_rules_callbacks.assert_not_called()
+        mod = ChatModeration(tier1_only, _config(moderation_tier1_enabled=True))
+        self.assertEqual(
+            tier1_only.register_spam_checker_callbacks.call_args_list,
+            [
+                call(check_event_for_spam=mod.refuse_encrypted_event),
+                call(check_event_for_spam=mod.check_event_for_spam),
+            ],
+        )
+        tier1_only.register_third_party_rules_callbacks.assert_called_once_with(
+            check_event_allowed=mod.check_event_allowed,
+            on_create_room=mod.on_create_room,
+        )
 
         tier2_only = _module_api()
-        ChatModeration(
+        mod = _tier2_module(
+            self,
             tier2_only,
             _config(
                 moderation_tier1_enabled=False,
@@ -4774,8 +4906,19 @@ class TestCallbackRegistration(unittest.TestCase):
                 moderation_choreo_access_token="syt_x",
             ),
         )
-        tier2_only.register_spam_checker_callbacks.assert_not_called()
-        tier2_only.register_third_party_rules_callbacks.assert_called_once()
+        tier2_only.register_spam_checker_callbacks.assert_called_once_with(
+            check_event_for_spam=mod.refuse_encrypted_event
+        )
+        self.assertEqual(
+            tier2_only.register_third_party_rules_callbacks.call_args_list,
+            [
+                call(
+                    check_event_allowed=mod.check_event_allowed,
+                    on_create_room=mod.on_create_room,
+                ),
+                call(on_new_event=mod.on_new_event),
+            ],
+        )
 
 
 class TestExemptGlobContainer(unittest.TestCase):

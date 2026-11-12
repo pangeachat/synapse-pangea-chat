@@ -17,16 +17,16 @@ import requests
 from .base_e2e import BaseSynapseE2ETest
 
 _COURSE_PLAN = "pangea.course_plan"
-_COURSE_COPY = "pangea.course_missions"
-_NEW_COPY_MISSIONS = [
+_CAN_DO_LIST_EVENT = "pangea.course_missions"
+_NEW_LIST_ENTRIES = [
     {"lo_id": "lo-b", "activity_ids": ["act-b"]},
     {"lo_id": "lo-a", "activity_ids": ["act-a"]},
 ]
 
 
 class _QuestCmsHandler(BaseHTTPRequestHandler):
-    """Answers the two reads the new quest's course copy is built from; any
-    other quest is unknown, so its copy cannot be built. While ``down`` is
+    """Answers the two reads the new quest's Can-Do list is built from; any
+    other quest is unknown, so its list cannot be built. While ``down`` is
     set, every read fails, as an unavailable CMS would."""
 
     down = False
@@ -117,7 +117,7 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         plan: Dict[str, Any],
         name: str = "Old course",
         topic: str = "Old text",
-        copy: Optional[Dict[str, Any]] = None,
+        can_do_list: Optional[Dict[str, Any]] = None,
     ) -> str:
         resp = requests.post(
             f"{self.server_url}/_matrix/client/v3/createRoom",
@@ -131,8 +131,14 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
                     {"type": _COURSE_PLAN, "state_key": "", "content": plan}
                 ]
                 + (
-                    [{"type": _COURSE_COPY, "state_key": "", "content": copy}]
-                    if copy is not None
+                    [
+                        {
+                            "type": _CAN_DO_LIST_EVENT,
+                            "state_key": "",
+                            "content": can_do_list,
+                        }
+                    ]
+                    if can_do_list is not None
                     else []
                 ),
             },
@@ -188,9 +194,9 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         self.assertEqual(resp.json()["current_quest_id"], "quest-old")
 
         # A dry run names the sender, reports the current name and topic and
-        # the copy it would write, and writes nothing.
-        all_four = [_COURSE_COPY, _COURSE_PLAN, "m.room.name", "m.room.topic"]
-        first_copy = {
+        # the Can-Do list it would write, and writes nothing.
+        all_four = [_CAN_DO_LIST_EVENT, _COURSE_PLAN, "m.room.name", "m.room.topic"]
+        first_list = {
             "built": True,
             "previous_revision": None,
             "revision": 1,
@@ -202,12 +208,12 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         self.assertEqual(resp.json()["previous_name"], "Old course")
         self.assertEqual(resp.json()["previous_topic"], "Old text")
         self.assertEqual(resp.json()["changes"], all_four)
-        self.assertEqual(resp.json()["course_copy"], first_copy)
+        self.assertEqual(resp.json()["can_do_list"], first_list)
         self.assertFalse(resp.json()["changed"])
         state = self._admin_state(admin_token, space)
         self.assertEqual(state[(_COURSE_PLAN, "")]["content"]["uuid"], "quest-old")
         self.assertEqual(state[("m.room.name", "")]["content"]["name"], "Old course")
-        self.assertNotIn((_COURSE_COPY, ""), state)
+        self.assertNotIn((_CAN_DO_LIST_EVENT, ""), state)
 
         # The real write: new quest, same language, the quest's title and
         # description, all sent as the teacher.
@@ -222,19 +228,19 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
                 "previous_name": "Old course",
                 "previous_topic": "Old text",
                 "changes": all_four,
-                "course_copy": first_copy,
+                "can_do_list": first_list,
                 "sender": teacher_id,
                 "changed": True,
                 "dry_run": False,
             },
         )
         after = self._admin_state(admin_token, space)
-        copy = after[(_COURSE_COPY, "")]
+        can_do_list_event = after[(_CAN_DO_LIST_EVENT, "")]
         self.assertEqual(
-            copy["content"],
-            {"version": 1, "revision": 1, "missions": _NEW_COPY_MISSIONS},
+            can_do_list_event["content"],
+            {"version": 1, "revision": 1, "missions": _NEW_LIST_ENTRIES},
         )
-        self.assertEqual(copy["sender"], teacher_id)
+        self.assertEqual(can_do_list_event["sender"], teacher_id)
         plan = after[(_COURSE_PLAN, "")]
         self.assertEqual(plan["content"], {"uuid": "quest-new", "l2": "es"})
         self.assertEqual(plan["sender"], teacher_id)
@@ -259,13 +265,13 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         self.assertEqual(resp.json()["changes"], [])
 
         # The legacy plan-id spelling is read, then normalised to uuid. Passing
-        # the teacher's own name back as the title keeps it. The course's own
-        # copy is replaced at one revision above the old one.
+        # the teacher's own name back as the title keeps it. The course space's
+        # Can-Do list is replaced at one revision above the old one.
         legacy = self._create_course_space(
             teacher_token,
             {"course_plan_id": "legacy-old", "l2": "fr"},
             name="Period 3",
-            copy={"version": 1, "revision": 3, "missions": []},
+            can_do_list={"version": 1, "revision": 3, "missions": []},
         )
         resp = self._call(
             {
@@ -278,12 +284,12 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(
-            resp.json()["changes"], [_COURSE_COPY, _COURSE_PLAN, "m.room.topic"]
+            resp.json()["changes"], [_CAN_DO_LIST_EVENT, _COURSE_PLAN, "m.room.topic"]
         )
         legacy_state = self._admin_state(admin_token, legacy)
         self.assertEqual(
-            legacy_state[(_COURSE_COPY, "")]["content"],
-            {"version": 1, "revision": 4, "missions": _NEW_COPY_MISSIONS},
+            legacy_state[(_CAN_DO_LIST_EVENT, "")]["content"],
+            {"version": 1, "revision": 4, "missions": _NEW_LIST_ENTRIES},
         )
         self.assertEqual(
             legacy_state[(_COURSE_PLAN, "")]["content"],
@@ -293,13 +299,13 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
             legacy_state[("m.room.name", "")]["content"]["name"], "Period 3"
         )
 
-        # With the CMS down, the switch still lands and the copy is written
-        # empty, so readers fall back to the shared quest. Sending the request
-        # again with the new quest as the expected one rebuilds the copy.
+        # With the CMS down, the switch still lands and the Can-Do list is
+        # written empty, so readers fall back to the shared quest. Sending the
+        # request again with the new quest as the expected one rebuilds it.
         unbuilt = self._create_course_space(
             teacher_token,
             {"uuid": "quest-old", "l2": "es"},
-            copy={"version": 1, "revision": 2, "missions": []},
+            can_do_list={"version": 1, "revision": 2, "missions": []},
         )
         _QuestCmsHandler.down = True
         try:
@@ -308,11 +314,11 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
             _QuestCmsHandler.down = False
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(
-            resp.json()["course_copy"],
+            resp.json()["can_do_list"],
             {"built": False, "previous_revision": 2, "revision": None, "missions": 0},
         )
         unbuilt_state = self._admin_state(admin_token, unbuilt)
-        self.assertEqual(unbuilt_state[(_COURSE_COPY, "")]["content"], {})
+        self.assertEqual(unbuilt_state[(_CAN_DO_LIST_EVENT, "")]["content"], {})
         self.assertEqual(
             unbuilt_state[(_COURSE_PLAN, "")]["content"]["uuid"], "quest-new"
         )
@@ -321,10 +327,12 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
             admin_token,
         )
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(resp.json()["changes"], [_COURSE_COPY])
+        self.assertEqual(resp.json()["changes"], [_CAN_DO_LIST_EVENT])
         self.assertEqual(
-            self._admin_state(admin_token, unbuilt)[(_COURSE_COPY, "")]["content"],
-            {"version": 1, "revision": 1, "missions": _NEW_COPY_MISSIONS},
+            self._admin_state(admin_token, unbuilt)[(_CAN_DO_LIST_EVENT, "")][
+                "content"
+            ],
+            {"version": 1, "revision": 1, "missions": _NEW_LIST_ENTRIES},
         )
 
         # With only a student left, nobody can send the event: refused,
@@ -357,7 +365,7 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         self.assertEqual(
             orphan_after[("m.room.name", "")]["content"]["name"], "Old course"
         )
-        self.assertNotIn((_COURSE_COPY, ""), orphan_after)
+        self.assertNotIn((_CAN_DO_LIST_EVENT, ""), orphan_after)
         self.assertEqual(
             orphan_after[("m.room.power_levels", "")]["content"],
             orphan_before[("m.room.power_levels", "")]["content"],
