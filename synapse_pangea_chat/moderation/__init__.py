@@ -2180,8 +2180,8 @@ class ChatModeration:
                     await self._recheck_one(event_id, room_id, queued_at_ms)
                 except Exception as exc:
                     reraise_if_cancelled(exc)
-                    # silent-ok: logged; the row stays for the next pass, and
-                    # one bad row must not stop the rows behind it.
+                    # silent-ok: logged and counted as an attempt, so a row
+                    # that keeps failing yields its turn to the rows behind it.
                     logger.warning(
                         "tier2 re-check of %s in %s failed at %s (%s)",
                         event_id,
@@ -2189,8 +2189,22 @@ class ChatModeration:
                         error_site(exc),
                         type(exc).__name__,
                     )
+                    await self._bump_recheck(event_id)
         finally:
             self._rechecking = False
+
+    async def _bump_recheck(self, event_id: str) -> None:
+        try:
+            await self._recheck.bump(event_id)
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok: logged; the row keeps its place and is retried.
+            logger.warning(
+                "tier2 could not count a re-check attempt for %s at %s (%s)",
+                event_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
 
     async def _recheck_one(
         self, event_id: str, room_id: str, queued_at_ms: int
@@ -2224,15 +2238,7 @@ class ChatModeration:
             enqueued_at=self._clock.time(),
             position=_stream_position(event),
         )
-        try:
-            decided = await self._check_and_redact(job)
-        except Exception as exc:
-            reraise_if_cancelled(exc)
-            # Not swallowed: counted as an attempt, then re-raised for the
-            # pass to log.
-            await self._recheck.bump(event_id)
-            raise
-        if decided:
+        if await self._check_and_redact(job):
             await self._recheck.delete(event_id)
             metrics.record_recheck("decided")
         else:

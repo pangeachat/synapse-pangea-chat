@@ -2,7 +2,7 @@
 
 One row per message that ended with no usable verdict - the service was
 down, timed out, answered something unreadable, or the handler raised. The
-Tier-2 instance re-checks the oldest rows on a timer through the ordinary
+Tier-2 instance re-checks the least-tried, oldest rows on a timer through the ordinary
 single-message path, and deletes a row once that path has a verdict, once the
 message is gone, or once the row is a week old.
 """
@@ -33,7 +33,7 @@ _ADD_SQL = """
 
 _OLDEST_SQL = """
     SELECT event_id, room_id, queued_at FROM pangea_moderation_recheck
-    ORDER BY queued_at, event_id LIMIT ?
+    ORDER BY attempts, queued_at, event_id LIMIT ?
 """
 
 _DELETE_SQL = "DELETE FROM pangea_moderation_recheck WHERE event_id = ?"

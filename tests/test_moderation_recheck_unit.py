@@ -386,6 +386,18 @@ class TestTheRecheckPass(_Base):
             await mod._recheck_pass()
         self.assertEqual(self._rows(), [("$a", ROOM, 1)])
 
+    async def test_rows_behind_the_first_batch_still_get_their_turn(self) -> None:
+        mod = self._module()
+        ids = [f"$e{n:02d}" for n in range(26)]
+        await self._queue(mod, *ids)
+        for event_id in ids:
+            self.store.events[event_id] = _Event(event_id=event_id)
+        with self._check(mod, *([UNUSABLE] * 50)):
+            await mod._recheck_pass()
+            await mod._recheck_pass()
+        attempts = {row[0]: row[2] for row in self._rows()}
+        self.assertGreaterEqual(attempts["$e25"], 1, "row 26 was never retried")
+
     async def test_a_gone_or_redacted_message_is_dropped_unchecked(self) -> None:
         mod = self._module()
         await self._queue(mod, "$gone", "$redacted")
@@ -418,7 +430,7 @@ class TestTheRecheckPass(_Base):
             "synapse.modules.synapse_pangea_chat", "WARNING"
         ):
             await mod._recheck_pass()
-        self.assertEqual(self._rows(), [("$a", ROOM, 0)])
+        self.assertEqual(self._rows(), [("$a", ROOM, 1)])
 
     async def test_an_open_breaker_skips_the_pass(self) -> None:
         mod = self._module()
