@@ -696,6 +696,44 @@ def record_severity_basis(basis: str) -> None:
     TIER2_SEVERITY_BASIS.labels(basis=basis).inc()
 
 
+# Encryption is refused while moderation is on, because neither tier can read
+# an encrypted message. Labelled by which hook refused it.
+ENCRYPTION_REFUSED_HOOKS = frozenset({"create_room", "event_allowed", "spam_check"})
+
+ENCRYPTION_REFUSED = _get_or_create(
+    Counter,
+    "pangea_moderation_encryption_refused_total",
+    "Attempts to turn on or send encryption that moderation refused.",
+    ["hook"],
+)
+
+# What became of a message Tier 2 could not check. `queued` is a message put
+# on the re-check list; `decided` and `gone` take one off it; `expired` is one
+# given up on unchecked after a week; `lost` is one that could not be put on
+# the list at all.
+RECHECK_OUTCOMES = frozenset({"queued", "decided", "gone", "expired", "lost"})
+
+TIER2_RECHECK = _get_or_create(
+    Counter,
+    "pangea_moderation_tier2_recheck_total",
+    "Messages Tier 2 could not check, by what became of them on the re-check "
+    "list. `expired` and `lost` are messages that were never checked.",
+    ["outcome"],
+)
+
+
+def record_encryption_refused(hook: str) -> None:
+    if hook not in ENCRYPTION_REFUSED_HOOKS:
+        raise ValueError(f"unknown encryption refusal hook {hook!r}")
+    ENCRYPTION_REFUSED.labels(hook=hook).inc()
+
+
+def record_recheck(outcome: str) -> None:
+    if outcome not in RECHECK_OUTCOMES:
+        raise ValueError(f"unknown recheck outcome {outcome!r}")
+    TIER2_RECHECK.labels(outcome=outcome).inc()
+
+
 def set_breaker_state(state: str) -> None:
     value: Optional[int] = BREAKER_STATE_VALUES.get(state)
     if value is None:
