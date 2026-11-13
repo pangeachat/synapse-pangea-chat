@@ -1,6 +1,6 @@
 """Integration tests for the course-space Can-Do migration: the endpoint and
 its operator script, against a local Synapse + PostgreSQL
-(migrate-course-can-dos.instructions.md)."""
+(see migrate_course_can_dos.py's docstring)."""
 
 from __future__ import annotations
 
