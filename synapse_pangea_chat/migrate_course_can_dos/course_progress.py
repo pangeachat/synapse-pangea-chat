@@ -127,8 +127,8 @@ def merge_progress(
     record has them under the merged id, else come from the old entry with
     the most XP. Its first completion is the earliest found anywhere, with
     the threshold and replay mark stored beside it, and it is completed
-    whenever any old entry it stands for was, or a completion came back from
-    an earlier version. Everything else in the record is left as it is.
+    whenever any old entry it stands for was or a first completion is kept.
+    Everything else in the record is left as it is.
     """
     report: Dict[str, Any] = {"keys_moved": 0, "completions_kept": 0}
     record: Dict[str, Any] = unfreeze(content)
@@ -190,14 +190,15 @@ def merge_progress(
                 report["completions_kept"] += 1
         # Completed whenever any entry it stands for was: the figures can come
         # from an old entry that was still in progress, and the record must
-        # never say "not completed" beside a first completion. The app's own
-        # entry under the merged id keeps the flag the app gave it.
+        # never say "not completed" beside a first completion. The app writes
+        # a dated entry as completed too (a completed Mission stays complete),
+        # so a kept date always means completed.
         completed_olds = [
             old
             for old in olds
             if isinstance(old, Mapping) and old.get(COMPLETED_KEY) is True
         ]
-        if completed_olds or (best is not None and not best_from_current):
+        if completed_olds or best is not None:
             entry[COMPLETED_KEY] = True
             # Complete with no date found: keep the mark that lets the app
             # replay its date from history.

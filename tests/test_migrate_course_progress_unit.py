@@ -192,15 +192,25 @@ class TestMergeProgress(unittest.TestCase):
         self.assertIs(merged["completed"], False)
         self.assertEqual(report, {"keys_moved": 2, "completions_kept": 0})
 
-    def test_the_apps_own_merged_entry_keeps_its_completed_flag(self) -> None:
-        # Written by the app under the merged id: dated, and no longer
-        # complete because its XP fell. Nothing to merge, so nothing changes.
-        current = _entry(20, SEEN, 100)
+    def test_a_dated_entry_under_the_merged_id_is_never_left_not_completed(
+        self,
+    ) -> None:
+        # What an earlier run of this migration could leave behind: the date
+        # kept, the flag taken from the entry that was still in progress. The
+        # app never writes this; it writes a dated entry as completed.
+        current = _entry(140, SEEN, 100)
         current["completed"] = False
         content, report = _merge({"M": current})
 
-        self.assertIsNone(content)
+        assert content is not None
+        merged = content["can_dos"]["M"]
+        self.assertIs(merged["completed"], True)
+        self.assertEqual(merged["first_completed_at"], SEEN)
+        self.assertEqual(merged["xp"], 140)
         self.assertEqual(report, {"keys_moved": 0, "completions_kept": 0})
+
+        again, _ = _merge(content["can_dos"])
+        self.assertIsNone(again)
 
     def test_an_earlier_date_under_the_merged_id_is_kept(self) -> None:
         content, report = _merge(
