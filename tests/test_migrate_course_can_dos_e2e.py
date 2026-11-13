@@ -199,6 +199,8 @@ class TestMigrateCourseCanDos(BaseSynapseE2ETest):
                 "removed_combined": [],
                 "removed_into_missions": [{"lo_id": "lo-m", "from": ["lo-b1"]}],
                 "notes_trimmed": [],
+                "notes_added": [],
+                "no_statement": [],
             },
         )
         self.assertEqual(
@@ -313,6 +315,68 @@ class TestMigrateCourseCanDos(BaseSynapseE2ETest):
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertTrue(any(dropped in line for line in self.server_log()))
+
+    async def test_an_entry_without_a_note_gains_the_old_wording(self) -> None:
+        await self.homeserver()
+        (_, admin) = await self.new_user("op", admin=True)
+        (_, teacher) = await self.new_user("teacher")
+        script = _load_script()
+        statements = {
+            "lo-a1": "Can order food at a market.",
+            "lo-a2": "Can ask what something costs.",
+            "lo-z1": "Can read a menu.",
+            "lo-m": "Can buy food and drink.",
+            "lo-z": "Can read a menu",
+        }
+        old_copy = {
+            "version": 1,
+            "revision": 2,
+            "missions": [
+                {"lo_id": "lo-a1", "activity_ids": ["act-1"]},
+                {"lo_id": "lo-a2", "activity_ids": ["act-2"]},
+                {"lo_id": "lo-z1", "activity_ids": ["act-z"], "note": "Menus"},
+                {"lo_id": "lo-keep", "activity_ids": ["act-k"]},
+            ],
+        }
+        space = self._space(teacher, copy=old_copy)
+
+        report = script.dry_run(self.server_url, admin, MAP, [space], statements)
+        copy_report = report["spaces"][0]["body"]["course_missions"]
+        self.assertEqual(
+            copy_report["notes_added"],
+            [
+                {
+                    "lo_id": "lo-m",
+                    "note": "Can order food at a market. / Can ask what something costs.",
+                    "from": ["lo-a1", "lo-a2"],
+                }
+            ],
+        )
+        self.assertIn(
+            "1 entries gain a note from the old wording",
+            script.summarize_report(report),
+        )
+        self.assertEqual(self._state(admin, space)[(_COPY, "")]["content"], old_copy)
+
+        results = script.apply(self.server_url, admin, report)
+        self.assertEqual(script.summarize_results(results), ["1 written"])
+        content = self._state(admin, space)[(_COPY, "")]["content"]
+        self.assertEqual(
+            content["missions"],
+            [
+                {
+                    "lo_id": "lo-m",
+                    "activity_ids": ["act-1", "act-2"],
+                    "note": "Can order food at a market. / Can ask what something costs.",
+                },
+                {"lo_id": "lo-z", "activity_ids": ["act-z"], "note": "Menus"},
+                {"lo_id": "lo-keep", "activity_ids": ["act-k"]},
+            ],
+        )
+
+        # A second run changes nothing.
+        again = script.dry_run(self.server_url, admin, MAP, [space], statements)
+        self.assertEqual(again["spaces"][0]["body"]["writes"], [])
 
     async def test_a_space_with_no_local_instructor_is_refused(self) -> None:
         await self.homeserver()

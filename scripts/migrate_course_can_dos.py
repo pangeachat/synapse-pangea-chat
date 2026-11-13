@@ -13,7 +13,8 @@ first, in two runs:
 
        MATRIX_ADMIN_TOKEN=... python scripts/migrate_course_can_dos.py \\
            --homeserver https://matrix.staging.pangea.chat \\
-           --map staging-can-do-map.json --report staging-report.json
+           --map staging-can-do-map.json --statements staging-statements.json \\
+           --report staging-report.json
 
 2. The apply writes exactly the spaces the report says would change, each only
    while it still holds the events the dry run read. A space a teacher edited
@@ -38,7 +39,11 @@ more a few weeks after, with the same map.
            --apply staging-progress.json --results staging-progress-results.json
 
 The map file is one JSON object: old Can-Do row id -> merged row id, for THIS
-environment, since row ids differ between environments. A report records the
+environment, since row ids differ between environments. The statements file is
+one JSON object: Can-Do row id -> its statement, for every old and merged
+Can-Do in the map, leaving out the old Can-Dos on the quest step's no-note
+list. An entry with no note gets its old Can-Dos' statements as one, and the
+report counts them as notes added. A report records the
 homeserver, the map and which operation made it, and an apply refuses a
 report made on another homeserver or by the other operation. Space reports
 quote teachers' notes: keep them out of the repo.
@@ -86,7 +91,8 @@ def _call(
             status, raw = response.status, response.read()
     # silent-ok: an error status is returned with its body, and every caller records or raises on it
     except urllib.error.HTTPError as e:
-        status, raw = e.code, e.read()
+        with e:
+            status, raw = e.code, e.read()
     try:
         return status, json.loads(raw.decode("utf-8", "replace"))
     # silent-ok: a body that is not JSON is returned as the error text, with its status
@@ -119,14 +125,21 @@ def dry_run(
     token: str,
     can_do_map: Dict[str, str],
     room_ids: Optional[List[str]] = None,
+    statements: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """The report: the endpoint's dry-run answer for each space."""
+    statements = statements or {}
     spaces = []
     for room_id in room_ids or walk_spaces(homeserver, token):
         status, body = _call(
             f"{homeserver}{MIGRATE_PATH}",
             token,
-            {"room_id": room_id, "can_do_map": can_do_map, "dry_run": True},
+            {
+                "room_id": room_id,
+                "can_do_map": can_do_map,
+                "statements": statements,
+                "dry_run": True,
+            },
         )
         spaces.append({"room_id": room_id, "status": status, "body": body})
         time.sleep(PAUSE_SECONDS)
@@ -134,6 +147,7 @@ def dry_run(
         "kind": "spaces",
         "homeserver": homeserver,
         "can_do_map": can_do_map,
+        "statements": statements,
         "spaces": spaces,
     }
 
@@ -162,6 +176,7 @@ def apply(homeserver: str, token: str, report: Dict[str, Any]) -> List[Dict[str,
             {
                 "room_id": space["room_id"],
                 "can_do_map": report["can_do_map"],
+                "statements": report.get("statements") or {},
                 "expected": space["body"]["expected"],
             },
         )
@@ -180,6 +195,8 @@ def summarize_report(report: Dict[str, Any]) -> List[str]:
         f"{sum(len(c.get('combined', [])) for c in copies)} entries combined, "
         f"{sum(len(e['slots_given_up']) for c in copies for e in c.get('combined', []))}"
         " slots given up",
+        f"{sum(len(c.get('notes_added', [])) for c in copies)} entries gain a note "
+        "from the old wording",
         f"{sum(len(c.get('notes_trimmed', [])) for c in copies)} notes trimmed",
         f"{sum(len(c.get('removed_combined', [])) for c in copies)} removed Can-Dos "
         f"combined, {sum(len(c.get('removed_into_missions', [])) for c in copies)} "
@@ -198,6 +215,12 @@ def summarize_report(report: Dict[str, Any]) -> List[str]:
         rooms = [s["room_id"] for s in spaces if matches(s)]
         if rooms:
             lines.append(f"{len(rooms)} {label}: {' '.join(rooms)}")
+    missing = sorted({i for c in copies for i in c.get("no_statement", [])})
+    if missing:
+        lines.append(
+            f"{len(missing)} old Can-Dos listed with no statement, so no wording: "
+            + " ".join(missing)
+        )
     return lines
 
 
@@ -301,6 +324,10 @@ def main() -> int:
     )
     parser.add_argument("--homeserver", required=True)
     parser.add_argument("--map", help="Dry run: the old -> merged Can-Do id map.")
+    parser.add_argument(
+        "--statements",
+        help="Dry run: Can-Do row id -> statement, for the old Can-Dos' notes.",
+    )
     parser.add_argument("--report", help="Dry run: where to write the report.")
     parser.add_argument(
         "--room-id",
@@ -334,11 +361,13 @@ def main() -> int:
         print("\n".join(summarize_results(results)))
         return 0 if all(r["status"] == 200 for r in results) else 1
 
-    if not args.map or not args.report:
-        parser.error("a dry run needs --map and --report")
+    if not args.map or not args.statements or not args.report:
+        parser.error("a dry run needs --map, --statements and --report")
     with open(args.map, encoding="utf-8") as f:
         can_do_map = json.load(f)
-    report = dry_run(homeserver, token, can_do_map, args.room_id)
+    with open(args.statements, encoding="utf-8") as f:
+        statements = json.load(f)
+    report = dry_run(homeserver, token, can_do_map, args.room_id, statements)
     _write_json(args.report, report)
     print("\n".join(summarize_report(report)))
     return 0

@@ -70,6 +70,8 @@ ELLIPSIS = "…"
 
 MAX_ID_LENGTH = 255
 MAX_MAP_ENTRIES = 20_000
+# A Can-Do statement is one sentence; this bounds a malformed input.
+MAX_STATEMENT_LENGTH = 2000
 
 COPY = "course_missions"
 PINS = "teacher_mode"
@@ -210,6 +212,78 @@ def join_notes(notes: Sequence[Any]) -> Tuple[Optional[str], List[str]]:
     return kept + ELLIPSIS + suffix, [first[len(kept) :], *parts[1:]]
 
 
+def _same_statement(a: str, b: str) -> bool:
+    """The quest step's test (choreo migrate_to_merged_can_dos): case, outer
+    space and a final full stop do not count."""
+    return a.strip().rstrip(".").casefold() == b.strip().rstrip(".").casefold()
+
+
+def _has_note(entry: Mapping[str, Any]) -> bool:
+    note = entry.get("note")
+    return isinstance(note, str) and bool(note.strip())
+
+
+class OldWording(NamedTuple):
+    # The old Can-Dos whose statement makes the note, in entry order.
+    from_ids: List[str]
+    texts: List[str]
+    # Old Can-Dos this course lists that have no statement to write.
+    no_statement: List[str]
+
+
+def old_wording(
+    lo_id: str,
+    sources: Sequence[Mapping[str, Any]],
+    can_do_map: Mapping[str, str],
+    statements: Mapping[str, str],
+) -> OldWording:
+    """The old Can-Dos' wording for an entry that lands on ``lo_id`` with no
+    note, by the rule the quests follow: each moved entry's statement in entry
+    order, leaving out one that only repeats the merged Can-Do's own. Empty
+    when any of ``sources`` already has a note: a teacher's note is never
+    added to."""
+    if any(_has_note(source) for source in sources):
+        return OldWording([], [], [])
+    merged = statements.get(lo_id)
+    out = OldWording([], [], [])
+    for source in sources:
+        old_id = source["lo_id"]
+        if old_id not in can_do_map:
+            continue
+        text = statements.get(old_id)
+        if text is None or not text.strip():
+            out.no_statement.append(old_id)
+            continue
+        if merged is not None and _same_statement(text, merged):
+            continue
+        out.from_ids.append(old_id)
+        out.texts.append(text.strip())
+    return out
+
+
+def _add_old_wording(
+    entry: Dict[str, Any],
+    sources: Sequence[Mapping[str, Any]],
+    can_do_map: Mapping[str, str],
+    statements: Mapping[str, str],
+    report: Dict[str, Any],
+) -> None:
+    """Gives ``entry`` a note from the old wording where it has none."""
+    wording = old_wording(entry["lo_id"], sources, can_do_map, statements)
+    report["no_statement"].extend(wording.no_statement)
+    note, dropped = join_notes(wording.texts)
+    if note is None:
+        return
+    entry["note"] = note
+    report["notes_added"].append(
+        {"lo_id": entry["lo_id"], "note": note, "from": wording.from_ids}
+    )
+    if dropped:
+        report["notes_trimmed"].append(
+            {"lo_id": entry["lo_id"], "note": note, "dropped": dropped}
+        )
+
+
 def _combine(
     lo_id: str, sources: Sequence[Dict[str, Any]], span: Sequence[Dict[str, Any]]
 ) -> Tuple[Dict[str, Any], List[str]]:
@@ -259,6 +333,7 @@ def _combine(
 def _rewrite_missions(
     missions: List[Dict[str, Any]],
     can_do_map: Mapping[str, str],
+    statements: Mapping[str, str],
     report: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     new_ids = [can_do_map.get(entry["lo_id"], entry["lo_id"]) for entry in missions]
@@ -272,7 +347,9 @@ def _rewrite_missions(
         if group[0] != place:
             continue  # combined into its first occurrence
         if len(group) == 1:
-            out.append({**entry, "lo_id": new_id})
+            moved = {**entry, "lo_id": new_id}
+            _add_old_wording(moved, [entry], can_do_map, statements, report)
+            out.append(moved)
             continue
         span = [group[0]]
         for later in group[1:]:
@@ -282,6 +359,8 @@ def _rewrite_missions(
         combined, dropped = _combine(
             new_id, [missions[p] for p in group], [missions[p] for p in span]
         )
+        sources = [missions[p] for p in group]
+        _add_old_wording(combined, sources, can_do_map, statements, report)
         out.append(combined)
         report["combined"].append(
             {
@@ -363,10 +442,15 @@ class Rewrite(NamedTuple):
     report: Dict[str, Any]
 
 
-def rewrite_copy(content: Mapping[str, Any], can_do_map: Mapping[str, str]) -> Rewrite:
+def rewrite_copy(
+    content: Mapping[str, Any],
+    can_do_map: Mapping[str, str],
+    statements: Optional[Mapping[str, str]] = None,
+) -> Rewrite:
     """The copy with every old Can-Do id replaced, entries that now name the
-    same Can-Do combined, at one revision above. ``content`` must pass
-    ``copy_problem``."""
+    same Can-Do combined, at one revision above. An entry left with no note
+    gets the old Can-Dos' wording from ``statements`` (Can-Do row id to its
+    statement, old and merged). ``content`` must pass ``copy_problem``."""
     copy: Dict[str, Any] = unfreeze(content)
     missions: List[Dict[str, Any]] = copy["missions"]
     removed: List[Dict[str, Any]] = copy.get("removed_missions") or []
@@ -378,10 +462,12 @@ def rewrite_copy(content: Mapping[str, Any], can_do_map: Mapping[str, str]) -> R
         "removed_combined": [],
         "removed_into_missions": [],
         "notes_trimmed": [],
+        "notes_added": [],
+        "no_statement": [],
     }
     if not report["ids_changed"]:
         return Rewrite(None, report)
-    new_missions = _rewrite_missions(missions, can_do_map, report)
+    new_missions = _rewrite_missions(missions, can_do_map, statements or {}, report)
     new_removed = _rewrite_removed(
         removed,
         can_do_map,
@@ -437,6 +523,25 @@ def parse_can_do_map(value: Any) -> Tuple[Optional[Dict[str, str]], Optional[str
     return dict(value), None
 
 
+def parse_statements(value: Any) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """``(statements, None)`` or ``(None, error)``; absent is empty."""
+    if value is None:
+        return {}, None
+    if not isinstance(value, dict):
+        return None, "'statements' must be an object of Can-Do id to statement"
+    if len(value) > 2 * MAX_MAP_ENTRIES:
+        return None, f"'statements' holds more than {2 * MAX_MAP_ENTRIES} ids"
+    for lo_id, text in value.items():
+        if _valid_id(lo_id) is None:
+            return None, "'statements' ids must be non-empty strings"
+        if not isinstance(text, str) or len(text) > MAX_STATEMENT_LENGTH:
+            return None, (
+                f"'statements' values must be text of at most "
+                f"{MAX_STATEMENT_LENGTH} characters"
+            )
+    return dict(value), None
+
+
 def _valid_id(value: Any) -> Optional[str]:
     if isinstance(value, str) and 0 < len(value) <= MAX_ID_LENGTH:
         return value
@@ -449,6 +554,8 @@ class MigrateRequest(NamedTuple):
     dry_run: bool
     # The event ids the dry run read, by COPY and PINS; None in a dry run.
     expected: Optional[Dict[str, Optional[str]]]
+    # Can-Do row id to its statement, old and merged; empty writes no wording.
+    statements: Dict[str, str]
 
 
 def parse_request(body: Any) -> Tuple[Optional[MigrateRequest], Optional[str]]:
@@ -461,11 +568,14 @@ def parse_request(body: Any) -> Tuple[Optional[MigrateRequest], Optional[str]]:
     can_do_map, error = parse_can_do_map(body.get("can_do_map"))
     if can_do_map is None:
         return None, error
+    statements, error = parse_statements(body.get("statements"))
+    if statements is None:
+        return None, error
     dry_run = body.get("dry_run", False)
     if not isinstance(dry_run, bool):
         return None, "'dry_run' must be a boolean"
     if dry_run:
-        return MigrateRequest(room_id, can_do_map, True, None), None
+        return MigrateRequest(room_id, can_do_map, True, None, statements), None
     expected = body.get("expected")
     if (
         not isinstance(expected, dict)
@@ -476,7 +586,10 @@ def parse_request(body: Any) -> Tuple[Optional[MigrateRequest], Optional[str]]:
             "A write needs 'expected': the event ids its dry run read, "
             f"as {{'{COPY}': id or null, '{PINS}': id or null}}"
         )
-    return MigrateRequest(room_id, can_do_map, False, dict(expected)), None
+    return (
+        MigrateRequest(room_id, can_do_map, False, dict(expected), statements),
+        None,
+    )
 
 
 class Plan(NamedTuple):
@@ -486,7 +599,9 @@ class Plan(NamedTuple):
 
 
 def plan_space(
-    state: Mapping[Tuple[str, str], Any], can_do_map: Mapping[str, str]
+    state: Mapping[Tuple[str, str], Any],
+    can_do_map: Mapping[str, str],
+    statements: Optional[Mapping[str, str]] = None,
 ) -> Plan:
     """What the migration would do to one space, from its current state."""
     copy_event = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
@@ -506,7 +621,7 @@ def plan_space(
             # Readers already ignore it; it is left as it is.
             copy_answer.update(outcome="ignored_by_readers", reason=problem)
         else:
-            rewrite = rewrite_copy(content, can_do_map)
+            rewrite = rewrite_copy(content, can_do_map, statements)
             copy_answer.update(rewrite.report, revision=content["revision"])
             if rewrite.content is None:
                 copy_answer["outcome"] = "unchanged"
@@ -612,7 +727,7 @@ class MigrateCourseCanDos(Resource):
         state = await self._api.get_room_state(room_id)
         if (EventTypes.Create, "") not in state:
             return (404, {"error": "No such room on this server"})
-        plan = plan_space(state, req.can_do_map)
+        plan = plan_space(state, req.can_do_map, req.statements)
         answer = {"room_id": room_id, "dry_run": req.dry_run, **plan.answer}
         if not plan.writes:
             return (200, {**answer, "sender": None, "changed": False})
@@ -711,12 +826,13 @@ class MigrateCourseCanDos(Resource):
             )
         logger.info(
             "migrate_course_can_dos: operator=%s room=%s writes=%s sent_as=%s "
-            "combined=%d notes_trimmed=%d pins_pooled=%d",
+            "combined=%d notes_added=%d notes_trimmed=%d pins_pooled=%d",
             operator,
             room_id,
             written,
             sender,
             len(copy_answer.get("combined", [])),
+            len(copy_answer.get("notes_added", [])),
             len(copy_answer.get("notes_trimmed", [])),
             len((answer[PINS] or {}).get("pooled", [])),
         )

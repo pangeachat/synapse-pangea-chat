@@ -325,6 +325,214 @@ class TestRewriteCopy(unittest.TestCase):
         self.assertEqual(_ids(rewrite.content), ["M", "Z"])
 
 
+# Each Can-Do's statement by row id: the old ones, and the merged ones so a
+# statement that only repeats its merged Can-Do is recognised.
+STATEMENTS = {
+    "a1": "Can order food at a market.",
+    "a2": "Can ask what something costs.",
+    "b1": "Can bargain politely.",
+    "z1": "Can read a menu.",
+    "M": "Can buy food and drink.",
+    "Z": "Can read a menu",
+}
+
+
+class TestOldWordingNotes(unittest.TestCase):
+    """Where an entry has no note, the old Can-Do's wording becomes one, by
+    the rule the quests follow (Will, 2026-11-13)."""
+
+    def test_a_moved_entry_without_a_note_gains_its_old_statement(self) -> None:
+        rewrite = rewrite_copy(
+            _copy([{"lo_id": "a1", "activity_ids": ["x"]}]), MAP, STATEMENTS
+        )
+
+        assert rewrite.content is not None
+        self.assertEqual(
+            rewrite.content["missions"],
+            [
+                {
+                    "lo_id": "M",
+                    "activity_ids": ["x"],
+                    "note": "Can order food at a market.",
+                }
+            ],
+        )
+        self.assertEqual(
+            rewrite.report["notes_added"],
+            [{"lo_id": "M", "note": "Can order food at a market.", "from": ["a1"]}],
+        )
+
+    def test_a_teachers_note_is_left_exactly_as_it_is(self) -> None:
+        rewrite = rewrite_copy(
+            _copy([{"lo_id": "a1", "activity_ids": [], "note": " Unit 3 "}]),
+            MAP,
+            STATEMENTS,
+        )
+
+        assert rewrite.content is not None
+        self.assertEqual(rewrite.content["missions"][0]["note"], " Unit 3 ")
+        self.assertEqual(rewrite.report["notes_added"], [])
+
+    def test_combined_entries_join_their_statements_in_entry_order(self) -> None:
+        rewrite = rewrite_copy(
+            _copy(
+                [
+                    {"lo_id": "b1", "activity_ids": []},
+                    {"lo_id": "a1", "activity_ids": [], "note": "   "},
+                ]
+            ),
+            MAP,
+            STATEMENTS,
+        )
+
+        assert rewrite.content is not None
+        self.assertEqual(
+            rewrite.content["missions"][0]["note"],
+            "Can bargain politely. / Can order food at a market.",
+        )
+        self.assertEqual(rewrite.report["notes_added"][0]["from"], ["b1", "a1"])
+
+    def test_a_mix_keeps_the_teachers_notes_and_adds_no_old_wording(self) -> None:
+        rewrite = rewrite_copy(
+            _copy(
+                [
+                    {"lo_id": "a1", "activity_ids": []},
+                    {"lo_id": "a2", "activity_ids": [], "note": "Unit 3"},
+                    {"lo_id": "b1", "activity_ids": []},
+                ]
+            ),
+            MAP,
+            STATEMENTS,
+        )
+
+        assert rewrite.content is not None
+        self.assertEqual(rewrite.content["missions"][0]["note"], "Unit 3")
+        self.assertEqual(rewrite.report["notes_added"], [])
+
+    def test_only_old_can_dos_this_course_lists_give_wording(self) -> None:
+        # The entry already on the merged Can-Do and the removed old one add
+        # nothing; neither is an old Can-Do this course shows.
+        rewrite = rewrite_copy(
+            _copy(
+                [
+                    {"lo_id": "M", "activity_ids": ["m"]},
+                    {"lo_id": "a2", "activity_ids": ["x"]},
+                ],
+                removed=[{"lo_id": "b1", "activity_ids": ["r"], "shown_count": 1}],
+            ),
+            MAP,
+            STATEMENTS,
+        )
+
+        assert rewrite.content is not None
+        self.assertEqual(
+            rewrite.content["missions"][0]["note"], "Can ask what something costs."
+        )
+
+    def test_a_statement_repeating_the_merged_can_dos_is_not_written(self) -> None:
+        # Compared as the quest step compares: case, outer space and a final
+        # full stop do not count.
+        rewrite = rewrite_copy(
+            _copy([{"lo_id": "z1", "activity_ids": []}]),
+            MAP,
+            {**STATEMENTS, "z1": " can read a MENU. "},
+        )
+
+        assert rewrite.content is not None
+        self.assertNotIn("note", rewrite.content["missions"][0])
+        self.assertEqual(rewrite.report["notes_added"], [])
+
+    def test_an_old_can_do_with_no_statement_gives_no_wording(self) -> None:
+        # The operator leaves out the Can-Dos on the quest step's no-note list.
+        statements = {k: v for k, v in STATEMENTS.items() if k != "a1"}
+        rewrite = rewrite_copy(
+            _copy(
+                [
+                    {"lo_id": "a1", "activity_ids": []},
+                    {"lo_id": "a2", "activity_ids": []},
+                ]
+            ),
+            MAP,
+            statements,
+        )
+
+        assert rewrite.content is not None
+        self.assertEqual(
+            rewrite.content["missions"][0]["note"], "Can ask what something costs."
+        )
+        self.assertEqual(rewrite.report["no_statement"], ["a1"])
+
+    def test_long_wording_is_cut_by_the_same_rule_and_reported(self) -> None:
+        long = {**STATEMENTS, "a1": "A" * 200, "a2": "B" * 100}
+        rewrite = rewrite_copy(
+            _copy(
+                [
+                    {"lo_id": "a1", "activity_ids": []},
+                    {"lo_id": "a2", "activity_ids": []},
+                ]
+            ),
+            MAP,
+            long,
+        )
+
+        assert rewrite.content is not None
+        note = rewrite.content["missions"][0]["note"]
+        self.assertEqual(note, "A" * 200 + " (+1 more)")
+        self.assertLessEqual(utf16_len(note), MAX_NOTE_UTF16)
+        self.assertEqual(
+            rewrite.report["notes_trimmed"],
+            [{"lo_id": "M", "note": note, "dropped": ["B" * 100]}],
+        )
+        self.assertIsNone(copy_problem(rewrite.content))
+
+    def test_without_statements_no_note_is_written(self) -> None:
+        rewrite = rewrite_copy(_copy([{"lo_id": "a1", "activity_ids": []}]), MAP)
+
+        assert rewrite.content is not None
+        self.assertNotIn("note", rewrite.content["missions"][0])
+        self.assertEqual(rewrite.report["notes_added"], [])
+
+    def test_a_second_run_changes_nothing(self) -> None:
+        first = rewrite_copy(
+            _copy(
+                [
+                    {"lo_id": "a1", "activity_ids": []},
+                    {"lo_id": "a2", "activity_ids": []},
+                ]
+            ),
+            MAP,
+            STATEMENTS,
+        )
+        assert first.content is not None
+
+        second = rewrite_copy(first.content, MAP, STATEMENTS)
+
+        self.assertIsNone(second.content)
+        self.assertEqual(second.report["notes_added"], [])
+
+    def test_the_plan_reports_how_many_entries_gain_a_note(self) -> None:
+        plan = plan_space(
+            _state(
+                copy=_event(
+                    "$c",
+                    "@teacher:x",
+                    _copy(
+                        [
+                            {"lo_id": "a1", "activity_ids": []},
+                            {"lo_id": "z1", "activity_ids": [], "note": "Menus"},
+                        ]
+                    ),
+                )
+            ),
+            MAP,
+            STATEMENTS,
+        )
+
+        self.assertEqual(plan.answer[COPY]["outcome"], "rewrite")
+        self.assertEqual(len(plan.answer[COPY]["notes_added"]), 1)
+        self.assertEqual(plan.answer[COPY]["notes_added"][0]["lo_id"], "M")
+
+
 class TestJoinNotes(unittest.TestCase):
     def test_none_and_blank_give_no_note(self) -> None:
         self.assertEqual(join_notes([None, "", "  "]), (None, []))
@@ -432,6 +640,21 @@ class TestParsing(unittest.TestCase):
 
         self.assertIsNone(parse_request({**base, "room_id": "r"})[0])
         self.assertIsNone(parse_request({**base, "dry_run": "yes"})[0])
+
+    def test_statements_are_an_optional_object_of_id_to_text(self) -> None:
+        base = {"room_id": "!r:x", "can_do_map": {"a": "b"}, "dry_run": True}
+        req, error = parse_request(base)
+        assert req is not None, error
+        self.assertEqual(req.statements, {})
+
+        req, error = parse_request({**base, "statements": {"a": "Can order."}})
+        assert req is not None, error
+        self.assertEqual(req.statements, {"a": "Can order."})
+
+        values: List[Any] = [[], "a", {"a": 1}, {"": "x"}, {"a": "x" * 2001}]
+        for value in values:
+            with self.subTest(value=value):
+                self.assertIsNone(parse_request({**base, "statements": value})[0])
 
 
 def _event(event_id: str, sender: str, content: Dict[str, Any]) -> SimpleNamespace:
