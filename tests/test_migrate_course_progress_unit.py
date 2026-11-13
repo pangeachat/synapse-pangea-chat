@@ -1,5 +1,5 @@
 """Unit tests for the learner progress migration's merge
-(migrate-course-progress.instructions.md)."""
+(see course_progress.py's docstring)."""
 
 from __future__ import annotations
 

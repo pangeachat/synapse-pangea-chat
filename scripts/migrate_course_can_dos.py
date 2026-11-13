@@ -51,8 +51,9 @@ quote teachers' notes: keep them out of the repo.
 ``MATRIX_ADMIN_TOKEN`` is a server admin's access token, supplied out-of-band
 (org ``access-controls.instructions.md``). It is never printed.
 
-Design: .github/instructions/migrate-course-can-dos.instructions.md and
-migrate-course-progress.instructions.md
+Design: the module docstrings of
+synapse_pangea_chat/migrate_course_can_dos/migrate_course_can_dos.py and
+course_progress.py.
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 """Unit tests for the course-space Can-Do migration's rewrite rules
-(migrate-course-can-dos.instructions.md)."""
+(see migrate_course_can_dos.py's docstring)."""
 
 from __future__ import annotations
 
