@@ -118,6 +118,90 @@ class TestMergeProgress(unittest.TestCase):
         self.assertNotIn("completed_before_tracking", merged)
         self.assertEqual(report, {"keys_moved": 0, "completions_kept": 1})
 
+    def test_the_merged_entry_is_completed_when_any_old_entry_was(self) -> None:
+        # One old Can-Do completed, the other still in progress with more XP.
+        # The figures come from the one with more XP, which is not completed.
+        done = _entry(110, SEEN, 100)
+        in_progress = _entry(140)
+        self.assertIs(in_progress["completed"], False)
+        content, report = _merge({"x1": done, "x2": in_progress})
+
+        assert content is not None
+        merged = content["can_dos"]["M"]
+        self.assertEqual(merged["xp"], 140)
+        self.assertEqual(merged["first_completed_at"], SEEN)
+        self.assertEqual(merged["xp_to_complete_at_first_completion"], 100)
+        self.assertNotIn("completed_before_tracking", merged)
+        # Never "not completed, first completed on a date".
+        self.assertIs(merged["completed"], True)
+        self.assertEqual(report, {"keys_moved": 2, "completions_kept": 1})
+
+        # A second run changes nothing.
+        again, _ = _merge(content["can_dos"])
+        self.assertIsNone(again)
+
+    def test_a_completion_found_only_in_history_completes_the_merged_entry(
+        self,
+    ) -> None:
+        # The app rebuilt the record and dropped the completed old entry; the
+        # one it kept is not completed.
+        content, report = _merge(
+            {"x2": _entry(40)},
+            [
+                (
+                    "x1",
+                    {
+                        "first_completed_at": EARLIER,
+                        "xp_to_complete_at_first_completion": 100,
+                    },
+                )
+            ],
+        )
+
+        assert content is not None
+        merged = content["can_dos"]["M"]
+        self.assertEqual(merged["xp"], 40)
+        self.assertEqual(merged["first_completed_at"], EARLIER)
+        self.assertEqual(merged["xp_to_complete_at_first_completion"], 100)
+        self.assertIs(merged["completed"], True)
+        self.assertEqual(report, {"keys_moved": 1, "completions_kept": 1})
+
+    def test_a_completed_old_entry_with_no_date_completes_the_merged_entry(
+        self,
+    ) -> None:
+        # Completed before tracking, with no date yet, beside one in progress
+        # with more XP.
+        content, _ = _merge({"x1": _entry(110, replayed=True), "x2": _entry(140)})
+
+        assert content is not None
+        merged = content["can_dos"]["M"]
+        self.assertEqual(merged["xp"], 140)
+        self.assertIs(merged["completed"], True)
+        self.assertIsNone(merged["first_completed_at"])
+        # Still marked for the app to replay its date from history.
+        self.assertIs(merged["completed_before_tracking"], True)
+
+    def test_no_completion_anywhere_leaves_the_merged_entry_not_completed(
+        self,
+    ) -> None:
+        content, report = _merge({"x1": _entry(30), "x2": _entry(60)})
+
+        assert content is not None
+        merged = content["can_dos"]["M"]
+        self.assertEqual(merged, _entry(60))
+        self.assertIs(merged["completed"], False)
+        self.assertEqual(report, {"keys_moved": 2, "completions_kept": 0})
+
+    def test_the_apps_own_merged_entry_keeps_its_completed_flag(self) -> None:
+        # Written by the app under the merged id: dated, and no longer
+        # complete because its XP fell. Nothing to merge, so nothing changes.
+        current = _entry(20, SEEN, 100)
+        current["completed"] = False
+        content, report = _merge({"M": current})
+
+        self.assertIsNone(content)
+        self.assertEqual(report, {"keys_moved": 0, "completions_kept": 0})
+
     def test_an_earlier_date_under_the_merged_id_is_kept(self) -> None:
         content, report = _merge(
             {"M": _entry(900, EARLIER, 400)},
