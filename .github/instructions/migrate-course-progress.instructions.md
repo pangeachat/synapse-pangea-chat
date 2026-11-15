@@ -5,7 +5,7 @@ description: "One-off operator endpoint that moves each learner's course progres
 
 # Migrate Course Progress
 
-Part of step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pangeachat/.github/issues/832)). A learner's progress in a course is a `pangea.course_progress` state event in their analytics room, with the course room ID as its state key. Its `can_dos` are keyed by Can-Do id, and the dashboard shows them as the app's own figures. This operation moves each record to the merged Can-Dos. It runs on each environment right after the course spaces ([migrate-course-can-dos](migrate-course-can-dos.instructions.md)), runs again a few days later, again before the old Can-Dos are deleted and once more a few weeks after, and is removed with that operation after that last pass. It runs on the server rather than in the app (Gabby, 2026-11-11).
+Part of step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pangeachat/.github/issues/832)). A learner's progress in a course is a `pangea.course_progress` state event in their analytics room, with the course room ID as its state key. Its `can_dos` are keyed by Can-Do id, and the dashboard shows them as the app's own figures. This operation moves each record to the merged Can-Dos. It runs on each environment right after the course spaces ([migrate-course-can-dos](migrate-course-can-dos.instructions.md)), then in the later passes below, and is removed with that operation after the last. It runs on the server rather than in the app (Gabby, 2026-11-11).
 
 ## Contract
 
@@ -28,7 +28,15 @@ A dry run does everything except the sends.
 
 ## Re-runs and the later passes
 
-Every run merges from the current record and its history, so a second run changes nothing. An app that loaded a course's outline before the switch keeps the old ids until the `revision` of the course's Can-Do list changes or the app restarts, and in that time it can write old ids back. The course-space migration bumps the revision. A course without a Can-Do list of its own gives the app no such signal. The second pass, a few days later, merges those records again from history. Another runs right before the old Can-Dos are deleted, and the last a few weeks after the deletion, for an app that had not restarted by then. The environment's map is kept until that last pass. Reading a record and sending it are not one atomic step: an app write in the moment between them is replaced, and the app restores its figures on its next write.
+Every run merges from the current record and its history, so a second run changes nothing. An app that loaded a course's outline before the switch keeps the old ids until the `revision` of the course's Can-Do list changes or the app restarts, and in that time it can write old ids back. The course-space migration bumps the revision. A course without a Can-Do list of its own gives the app no such signal. Later passes merge those records again from history: nightly for two weeks (below), right before the old Can-Dos are deleted, and a few weeks after the deletion, for an app that had not restarted by then. The environment's map is kept until that last pass. Reading a record and sending it are not one atomic step: an app write in the moment between them is replaced, and the app restores its figures on its next write.
+
+## The nightly pass
+
+For two weeks after an environment's switch, a scheduled workflow in this repository runs the pass nightly, and can be started by hand (Will, 2026-11-15). Only staging is configured, through 2026-11-28; production is a separate decision. Its map and statements are committed in a temporary folder deleted with these endpoints. It dry-runs the course spaces without applying them, dry-runs the progress records, applies only when some need rewriting, then dry-runs again.
+
+- **Counts only.** Reports name learners and quote teachers' notes, and this repository's Actions logs are public, so nothing else is printed, written or uploaded; an error shows only its type.
+- **It fails for a person** on a failed call, more than five failed or refused records (nothing is applied), a course space still naming old Can-Dos (the space apply stays manual), or a second dry run that still finds rewrites.
+- **Credentials.** The admin token is minted in memory from the bot's credentials, read through a role limited to that one secret and this repository's main branch.
 
 ## Not in scope
 
