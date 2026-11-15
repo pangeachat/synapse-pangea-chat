@@ -4,62 +4,73 @@
 #
 # This repository is public, so its Actions logs are too: the runner prints counts
 # only, and nothing is uploaded as an artifact.
+#
+# The schedule runs every environment whose nightly window (ENVIRONMENTS in
+# scripts/nightly_can_do_progress.py) includes today; production has none until a
+# person sets one, so it runs only when started by hand.
 name: Nightly Can-Do progress pass
-run-name: "Can-Do progress pass · ${{ inputs.environment || 'staging' }}"
+run-name: "Can-Do progress pass · ${{ inputs.environment || 'scheduled' }}"
 
 on:
   schedule:
-    # 10:17 UTC, before the laptop job it replaces (11:00 UTC) so the two never overlap.
     - cron: "17 10 * * *"
   workflow_dispatch:
     inputs:
       environment:
         description: "Environment to run the pass on"
         type: choice
-        options: [staging]
+        options: [staging, prod]
         default: staging
 
 permissions:
   contents: read
   id-token: write
 
-concurrency:
-  group: can-do-nightly-progress-${{ inputs.environment || 'staging' }}
-  cancel-in-progress: false
-
 jobs:
   progress:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.environment) || '["staging","prod"]') }}
+    concurrency:
+      group: can-do-nightly-progress-${{ matrix.environment }}
+      cancel-in-progress: false
     env:
-      ENVIRONMENT: ${{ inputs.environment || 'staging' }}
+      ENVIRONMENT: ${{ matrix.environment }}
+      DUE_MODE: ${{ github.event_name == 'workflow_dispatch' && 'manual' || 'scheduled' }}
     steps:
-      - name: Check that the environment's role is configured
-        env:
-          ROLE_ARN: ${{ secrets.CAN_DO_NIGHTLY_ROLE_ARN_STAGING }}
-        run: |
-          set -euo pipefail
-          if [[ "$ENVIRONMENT" != staging ]]; then
-            echo "::error::only staging is configured"
-            exit 1
-          fi
-          if [[ -z "$ROLE_ARN" ]]; then
-            echo "::error::Set the CAN_DO_NIGHTLY_ROLE_ARN_STAGING repository secret"
-            exit 1
-          fi
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
       - uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
           python-version: "3.13"
-      - name: Assume the staging nightly-pass role
+      - name: Is the pass due tonight (contacts nothing)
+        id: due
+        run: python scripts/nightly_can_do_progress.py --environment "$ENVIRONMENT" --due "$DUE_MODE"
+      - name: Check that the environment's role is configured
+        if: steps.due.outputs.due == 'true'
+        env:
+          # Each environment has its own secret; a missing one stops the run here
+          # rather than falling back to another environment's role.
+          ROLE_ARN: ${{ matrix.environment == 'prod' && secrets.CAN_DO_NIGHTLY_ROLE_ARN_PROD || matrix.environment == 'staging' && secrets.CAN_DO_NIGHTLY_ROLE_ARN_STAGING || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$ROLE_ARN" ]]; then
+            echo "::error::Set the CAN_DO_NIGHTLY_ROLE_ARN_${ENVIRONMENT^^} repository secret"
+            exit 1
+          fi
+      - name: Assume the environment's nightly-pass role
+        if: steps.due.outputs.due == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.CAN_DO_NIGHTLY_ROLE_ARN_STAGING }}
+          role-to-assume: ${{ matrix.environment == 'prod' && secrets.CAN_DO_NIGHTLY_ROLE_ARN_PROD || matrix.environment == 'staging' && secrets.CAN_DO_NIGHTLY_ROLE_ARN_STAGING || '' }}
           aws-region: us-east-1
           mask-aws-account-id: true
       - name: Run the pass (counts only)
+        if: steps.due.outputs.due == 'true'
         # Standard library only: no install step. Exit 1 means a person is needed.
         run: python scripts/nightly_can_do_progress.py --environment "$ENVIRONMENT"

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime
 import importlib.util
 import io
@@ -13,7 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 from unittest import mock
 
 _SCRIPT = os.path.join(
@@ -35,6 +36,7 @@ LEARNER = "@learner_name:staging.pangea.chat"
 NOTE = "Teacher's private note about the unit"
 SENSITIVE = (TOKEN, PASSWORD, ROOM, COURSE, LEARNER, NOTE, "staging.pangea.chat:")
 STAGING = nightly.ENVIRONMENTS["staging"]
+PROD = nightly.ENVIRONMENTS["prod"]
 BEFORE_END = datetime.date(2026, 11, 20)
 
 
@@ -402,11 +404,17 @@ class TestCountsOnly(unittest.TestCase):
 
 
 class TestEnvironments(unittest.TestCase):
-    def test_only_staging_is_accepted(self) -> None:
-        self.assertEqual(sorted(nightly.ENVIRONMENTS), ["staging"])
+    def test_staging_and_prod_are_the_only_environments(self) -> None:
+        self.assertEqual(sorted(nightly.ENVIRONMENTS), ["prod", "staging"])
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 nightly.main(["--environment", "production"], make_steps=lambda e: None)
+
+    def test_each_environment_logs_in_on_its_own_fixed_device(self) -> None:
+        self.assertEqual(STAGING.device_id, "admin-script-can-do-switch-staging")
+        self.assertEqual(PROD.device_id, "admin-script-can-do-switch-prod")
+        self.assertEqual(PROD.homeserver, "https://matrix.pangea.chat")
+        self.assertEqual(PROD.secret_id, "/prod/bot/matrix-credentials")
 
     def test_staging_data_files_are_committed_and_consistent(self) -> None:
         with open(STAGING.map_path, encoding="utf-8") as f:
@@ -418,6 +426,114 @@ class TestEnvironments(unittest.TestCase):
         # A merged id is never itself mapped (migrate-course-can-dos, Contract).
         self.assertFalse(merged & set(can_do_map))
         self.assertTrue(merged <= set(statements))
+
+
+def _run(argv: List[str], today: datetime.date = BEFORE_END, **kw: Any) -> tuple:
+    stdout = io.StringIO()
+    with tempfile.NamedTemporaryFile("r", suffix=".out") as output:
+        with tempfile.NamedTemporaryFile("r", suffix=".md") as summary:
+            env = {"GITHUB_OUTPUT": output.name, "GITHUB_STEP_SUMMARY": summary.name}
+            with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(stdout):
+                code = nightly.main(argv, today=today, **kw)
+            return code, stdout.getvalue(), output.read(), summary.read()
+
+
+@contextlib.contextmanager
+def _prod_files() -> Iterator[None]:
+    with tempfile.TemporaryDirectory() as data:
+        os.makedirs(os.path.join(data, "prod"))
+        for name in ("can-do-map.json", "can-do-statements.json"):
+            with open(os.path.join(data, "prod", name), "w") as f:
+                f.write("{}")
+        with mock.patch.object(nightly, "DATA_DIR", data):
+            yield
+
+
+def _never(env: Any) -> Any:
+    raise AssertionError("nothing may be contacted")
+
+
+class TestDue(unittest.TestCase):
+    """The workflow asks first, contacting nothing, whether tonight's pass runs."""
+
+    def due(self, name: str, mode: str, today: datetime.date = BEFORE_END) -> str:
+        code, _, output, _ = _run(
+            ["--environment", name, "--due", mode], today=today, make_steps=_never
+        )
+        self.assertEqual(code, 0)
+        return output.strip()
+
+    def test_staging_is_scheduled_inside_its_window(self) -> None:
+        self.assertEqual(self.due("staging", "scheduled"), "due=true")
+        self.assertEqual(
+            self.due("staging", "scheduled", STAGING.first_night), "due=true"
+        )
+
+    def test_staging_is_not_due_after_its_last_night(self) -> None:
+        after = STAGING.last_night + datetime.timedelta(days=1)
+        self.assertEqual(self.due("staging", "scheduled", after), "due=false")
+        self.assertEqual(self.due("staging", "manual", after), "due=false")
+
+    def test_prod_has_no_schedule_until_a_window_is_set(self) -> None:
+        self.assertIsNone(PROD.first_night)
+        self.assertEqual(self.due("prod", "scheduled"), "due=false")
+        _, out, _, summary = _run(
+            ["--environment", "prod", "--due", "scheduled"], make_steps=_never
+        )
+        self.assertIn("no nightly window is set", out)
+        self.assertIn("no nightly window is set", summary)
+
+    def test_prod_by_hand_without_its_files_stops_before_credentials(self) -> None:
+        code, out, output, _ = _run(
+            ["--environment", "prod", "--due", "manual"], make_steps=_never
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("prod has no committed map or statements yet", out)
+
+    def test_prod_by_hand_with_its_files_is_due(self) -> None:
+        with _prod_files():
+            self.assertEqual(self.due("prod", "manual"), "due=true")
+
+    def test_a_set_prod_window_schedules_it(self) -> None:
+        window = dataclasses.replace(
+            PROD,
+            first_night=datetime.date(2026, 12, 1),
+            last_night=datetime.date(2026, 12, 14),
+        )
+        with mock.patch.dict(nightly.ENVIRONMENTS, {"prod": window}), _prod_files():
+            self.assertEqual(
+                self.due("prod", "scheduled", datetime.date(2026, 11, 30)), "due=false"
+            )
+            self.assertEqual(
+                self.due("prod", "scheduled", datetime.date(2026, 12, 1)), "due=true"
+            )
+            self.assertEqual(
+                self.due("prod", "scheduled", datetime.date(2026, 12, 15)), "due=false"
+            )
+
+
+class TestProdDataFiles(unittest.TestCase):
+    def test_prod_files_are_not_committed_yet(self) -> None:
+        self.assertFalse(os.path.exists(PROD.map_path))
+        self.assertFalse(os.path.exists(PROD.statements_path))
+
+    def test_prod_without_its_files_fails_clearly_and_contacts_nothing(self) -> None:
+        code, out, _, summary = _run(["--environment", "prod"], make_steps=_never)
+        self.assertEqual(code, 1)
+        for text in (out, summary):
+            self.assertIn("prod has no committed map or statements yet", text)
+            self.assertIn("can_do_switch_data/prod/can-do-map.json", text)
+            self.assertIn("Nothing was run", text)
+
+    def test_prod_with_its_files_runs(self) -> None:
+        fake = FakeHomeserver([_records(unchanged=1)])
+        with _prod_files():
+            code, out, _, _ = _run(
+                ["--environment", "prod"], make_steps=lambda env: fake.steps()
+            )
+        self.assertEqual(code, 0, out)
+        self.assertEqual(fake.calls, ["spaces", "dry run"])
 
 
 if __name__ == "__main__":
