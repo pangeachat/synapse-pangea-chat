@@ -484,9 +484,11 @@ class TestDue(unittest.TestCase):
         self.assertIn("no nightly window is set", summary)
 
     def test_prod_by_hand_without_its_files_stops_before_credentials(self) -> None:
-        code, out, output, _ = _run(
-            ["--environment", "prod", "--due", "manual"], make_steps=_never
-        )
+        with tempfile.TemporaryDirectory() as empty:
+            with mock.patch.object(nightly, "DATA_DIR", empty):
+                code, out, output, _ = _run(
+                    ["--environment", "prod", "--due", "manual"], make_steps=_never
+                )
         self.assertEqual(code, 1)
         self.assertEqual(output, "")
         self.assertIn("prod has no committed map or statements yet", out)
@@ -514,16 +516,16 @@ class TestDue(unittest.TestCase):
 
 
 class TestProdDataFiles(unittest.TestCase):
-    def test_prod_files_are_not_committed_yet(self) -> None:
-        self.assertFalse(os.path.exists(PROD.map_path))
-        self.assertFalse(os.path.exists(PROD.statements_path))
-
     def test_prod_without_its_files_fails_clearly_and_contacts_nothing(self) -> None:
-        code, out, _, summary = _run(["--environment", "prod"], make_steps=_never)
+        with tempfile.TemporaryDirectory() as empty:
+            with mock.patch.object(nightly, "DATA_DIR", empty):
+                code, out, _, summary = _run(
+                    ["--environment", "prod"], make_steps=_never
+                )
         self.assertEqual(code, 1)
         for text in (out, summary):
             self.assertIn("prod has no committed map or statements yet", text)
-            self.assertIn("can_do_switch_data/prod/can-do-map.json", text)
+            self.assertIn("prod/can-do-map.json", text)
             self.assertIn("Nothing was run", text)
 
     def test_prod_with_its_files_runs(self) -> None:
