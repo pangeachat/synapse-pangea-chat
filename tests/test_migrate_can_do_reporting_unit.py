@@ -73,7 +73,8 @@ class TestOperatorScript(unittest.TestCase):
             (_record("unchanged"), False),
             (_record("unreadable"), False),
             (_record("unchanged", old_keys_left=1), True),
-            (_record("deactivated"), True),
+            # Counted on their own, outside the limit (coordinator, 2026-11-15).
+            (_record("deactivated"), False),
             (_record("not_local"), True),
             (_record("not_learners_own"), True),
             (_record("refused"), True),
@@ -92,6 +93,12 @@ class TestOperatorScript(unittest.TestCase):
         self.assertIn("1 restored", text)
         self.assertIn("1 with an old key left in place", text)
         self.assertIn("1 unreadable", text)
+
+    def test_deactivated_learners_are_listed_but_do_not_fail_the_apply(self) -> None:
+        text = "\n".join(
+            script.summarize_progress([_record("deactivated")], dry_run=False)
+        )
+        self.assertIn("1 deactivated (outside the limit)", text)
 
     def test_the_space_summary_counts_what_combining_leaves_out(self) -> None:
         report = {

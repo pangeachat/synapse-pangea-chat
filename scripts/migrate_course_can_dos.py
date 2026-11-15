@@ -57,8 +57,10 @@ reported as lengths and counts; its text stays in the room's history, in the
 event the dry run read.
 
 The progress apply exits 1 when any record is left with old ids or a lost
-completion (refused, deactivated, on another server, not the learner's own,
-failed, or an old key left in place), so a person decides what to do with it.
+completion (refused, on another server, not the learner's own, failed, or an
+old key left in place), so a person decides what to do with it. Deactivated
+learners' records are listed on their own and do not fail it: their old ids
+stay in rooms no app or account can read or write.
 
 ``MATRIX_ADMIN_TOKEN`` is a server admin's access token, supplied out-of-band
 (org ``access-controls.instructions.md``). It is never printed.
@@ -317,7 +319,6 @@ def run_progress(
 
 
 UNRESOLVED_OUTCOMES = (
-    "deactivated",
     "refused",
     "not_learners_own",
     "not_local",
@@ -326,7 +327,10 @@ UNRESOLVED_OUTCOMES = (
 
 
 def unresolved(record: Dict[str, Any]) -> bool:
-    """Left with old ids or a lost completion."""
+    """Left with old ids or a lost completion; a deactivated learner's record
+    is counted on its own instead."""
+    if record["outcome"] == "deactivated":
+        return False
     return record["outcome"] in UNRESOLVED_OUTCOMES or bool(record.get("old_keys_left"))
 
 
@@ -374,6 +378,14 @@ def summarize_progress(records: List[Dict[str, Any]], dry_run: bool) -> List[str
     if left:
         lines.append(f"{len(left)} with an old key left in place:")
         lines.extend(f"  {line}" for line in left)
+    deactivated = [
+        f"{r['user_id']} {r['room_id']} {r['course_id']}"
+        for r in records
+        if r["outcome"] == "deactivated"
+    ]
+    if deactivated:
+        lines.append(f"{len(deactivated)} deactivated (outside the limit):")
+        lines.extend(f"  {line}" for line in deactivated)
     for outcome in ("unreadable", *UNRESOLVED_OUTCOMES):
         ids = [
             f"{r['user_id']} {r['room_id']} {r['course_id']}"

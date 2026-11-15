@@ -15,9 +15,10 @@ In order, against the environment's homeserver:
 3. after an apply, a second progress dry run, which must find nothing left.
 
 Whether or not anything was applied, more than FAILURE_LIMIT records left with
-old ids or a lost completion (refused, deactivated, on another server, not the
-learner's own, failed, or an old key left in place) in the last dry run needs a
-person.
+old ids or a lost completion (refused, on another server, not the learner's own,
+failed, or an old key left in place) in the last dry run needs a person.
+Deactivated learners' records are counted on their own, outside that limit:
+their old ids stay in rooms no app or account can read or write.
 
 It prints counts only. The reports name rooms, courses and learners and quote
 teachers' notes, and this repository's Actions logs are public, so no report is
@@ -51,15 +52,21 @@ DATA_DIR = os.path.join(
 # More than this many failed or refused progress records in a run, records left
 # undone, or course spaces refused or left with old ids, needs a person.
 FAILURE_LIMIT = 5
-# Outcomes that leave a record holding old ids or missing a completion.
+# Outcomes that leave a record holding old ids or missing a completion. A
+# deactivated learner's record is reported on its own, outside the limit.
 UNRESOLVED_OUTCOMES = (
-    "deactivated",
     "refused",
     "not_learners_own",
     "not_local",
     "failed",
 )
-PROGRESS_OUTCOMES = ("rewrite", "unchanged", "unreadable", *UNRESOLVED_OUTCOMES)
+PROGRESS_OUTCOMES = (
+    "rewrite",
+    "unchanged",
+    "unreadable",
+    "deactivated",
+    *UNRESOLVED_OUTCOMES,
+)
 
 
 @dataclass(frozen=True)
@@ -119,8 +126,8 @@ def progress_counts(records: List[Dict[str, Any]]) -> Dict[str, int]:
     result["unresolved"] = sum(
         1
         for r in records
-        if r["outcome"] not in ("rewrite", "unchanged", "unreadable")
-        or r.get("old_keys_left")
+        if r["outcome"] in UNRESOLVED_OUTCOMES
+        or (r["outcome"] != "deactivated" and r.get("old_keys_left"))
     )
     return result
 
@@ -232,6 +239,11 @@ def run_night(steps: Steps) -> Outcome:
 
 
 def _check_unresolved(out: Outcome, counts: Dict[str, int]) -> None:
+    if counts["deactivated"]:
+        out.say(
+            f"{counts['deactivated']} deactivated learners' records still name old "
+            "ids (outside the limit)"
+        )
     if counts["unresolved"] > FAILURE_LIMIT:
         out.problems.append(
             f"{counts['unresolved']} progress records left with old ids or a lost "

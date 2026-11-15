@@ -23,8 +23,8 @@ Part of step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.
 6. Gives the merged Can-Do the earliest first completion it finds, in the current record and in every earlier version, with the threshold and the replay mark stored beside that date. It is completed whenever any entry it stands for, now or earlier, was completed or dated, so a record never says "not completed" beside a first completion. A completion found with no date anywhere (an early app wrote `completed` alone) gets no date and the replay mark, so the app dates it from the learner's history, as it does any completion it never saw; a made-up date, such as the migration's own day, could never be corrected.
 7. Leaves every other field and entry as it is.
 8. Sends the record as the learner in an ordinary state event, at about ten records a second. The dashboard then counts it, and the analytics forwarder delivers it. It notifies nobody, because no push rule matches the event type ([analytics-room-push-suppression](analytics-room-push-suppression.instructions.md)).
-9. Skips and reports a deactivated learner, a learner on another server, and a room that refuses the send.
-10. Logs and reports ids, counts and error types, never a record's content. A refused or failed send reaches Sentry with its room, course and error type; a written page that left anything unmoved reaches Sentry with its counts.
+9. Skips and reports a deactivated learner, a learner on another server, and a room that refuses the send. A deactivated learner's record keeps its old ids and is counted on its own, never toward a failure limit: it sits in a room the learner has left, which no app or account reads or writes again, and the dashboard's stored figures for that student are moved on the dashboard's side ([admin-dash-api#494](https://github.com/pangeachat/admin-dash-api/pull/494)). No record is redacted.
+10. Logs and reports ids, counts and error types, never a record's content. A refused or failed send reaches Sentry with its room, course and error type; a written page that left anything unmoved, deactivated learners' records aside, reaches Sentry with its counts.
 
 A dry run does everything except the sends and the page's Sentry report.
 
@@ -37,10 +37,10 @@ Every run merges from the current record and its history, so a second run change
 For two weeks after an environment's switch, a scheduled workflow in this repository runs the pass nightly, and can be started by hand (Will, 2026-11-15). Only staging is configured, through 2026-11-28; production is a separate decision. With the guard live it is a safety net, and its end date stays as set: a run that finds rewrites after the map is loaded means a stale write got past the guard. Its map and statements are committed in a temporary folder deleted with these endpoints. It dry-runs the course spaces without applying them, dry-runs the progress records, applies only when some need rewriting, then dry-runs again.
 
 - **Counts only.** Reports name learners, and this repository's Actions logs are public, so nothing else is printed, written or uploaded; an error shows only its type.
-- **It fails for a person** on a failed call; a course space still naming old Can-Dos (the space apply stays manual); more than five course spaces refused or left with old ids; more than five failed or refused records in a run (in the dry run, nothing is applied); a second dry run that still finds rewrites; or more than five records left with old ids or a lost completion in the last dry run (refused, deactivated, on another server, not the learner's own, failed, or an old key left in place), whether or not anything was applied.
+- **It fails for a person** on a failed call; a course space still naming old Can-Dos (the space apply stays manual); more than five course spaces refused or left with old ids; more than five failed or refused records in a run (in the dry run, nothing is applied); a second dry run that still finds rewrites; or more than five records left with old ids or a lost completion in the last dry run (refused, on another server, not the learner's own, failed, or an old key left in place), whether or not anything was applied. Deactivated learners' records are reported as their own count and never fail it.
 - **Credentials.** The admin token is minted in memory from the bot's credentials, read through a role limited to that one secret and this repository's main branch.
 
-The operator script's progress apply exits non-zero on any record left undone in that sense.
+The operator script's progress apply exits non-zero on any record left undone in that sense, and lists deactivated learners' records apart.
 
 ## Not in scope
 

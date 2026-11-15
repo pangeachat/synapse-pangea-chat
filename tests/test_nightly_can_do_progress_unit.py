@@ -252,7 +252,7 @@ class TestUnresolved(unittest.TestCase):
 
     def test_records_left_undone_fail_even_with_nothing_to_rewrite(self) -> None:
         fake = FakeHomeserver(
-            [_records(unchanged=3, deactivated=3, not_local=2, not_learners_own=1)]
+            [_records(unchanged=3, not_local=3, not_learners_own=3, deactivated=2)]
         )
         code, out, _ = _main(fake)
         self.assertEqual(code, 1)
@@ -260,10 +260,23 @@ class TestUnresolved(unittest.TestCase):
         self.assertIn("6 progress records left with old ids or a lost completion", out)
 
     def test_records_left_undone_at_the_limit_pass_and_are_counted(self) -> None:
-        fake = FakeHomeserver([_records(unchanged=3, deactivated=5)])
+        fake = FakeHomeserver([_records(unchanged=3, not_local=5)])
         code, out, _ = _main(fake)
         self.assertEqual(code, 0, out)
-        self.assertIn("deactivated 5", out)
+        self.assertIn("not_local 5", out)
+
+    def test_deactivated_learners_are_counted_outside_the_limit(self) -> None:
+        # Coordinator, 2026-11-15: their records keep old ids in rooms nobody
+        # can read or write; counted on their own, never failing the night.
+        fake = FakeHomeserver([_records(unchanged=3, deactivated=40)])
+        code, out, summary = _main(fake)
+        self.assertEqual(code, 0, out)
+        self.assertIn("deactivated 40", out)
+        self.assertIn(
+            "40 deactivated learners' records still name old ids (outside the limit)",
+            out,
+        )
+        self.assertIn("ok", summary.splitlines()[0])
 
     def test_records_left_undone_after_the_apply_fail(self) -> None:
         fake = FakeHomeserver(

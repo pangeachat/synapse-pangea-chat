@@ -367,10 +367,11 @@ _EARLIER_SQL = """
 """
 
 # Outcomes that leave a record holding old ids or missing a completion: the
-# nightly runner fails over a limit of them.
+# nightly runner fails over a limit of them. A deactivated learner's record is
+# counted on its own instead: its old ids stay in a room no app or account can
+# read or write (coordinator, 2026-11-15).
 UNRESOLVED_OUTCOMES = (
     "refused",
-    "deactivated",
     "not_local",
     "not_learners_own",
     "failed",
@@ -587,7 +588,13 @@ class MigrateCourseProgress(Resource):
 def page_counts(records: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
     """The page's records by outcome, and its summed counts."""
     counts: Dict[str, int] = {"records": len(records)}
-    for outcome in ("rewrite", "unchanged", "unreadable", *UNRESOLVED_OUTCOMES):
+    for outcome in (
+        "rewrite",
+        "unchanged",
+        "unreadable",
+        "deactivated",
+        *UNRESOLVED_OUTCOMES,
+    ):
         counts[outcome] = sum(1 for r in records if r["outcome"] == outcome)
     for key in empty_report():
         counts[key] = sum(r.get(key, 0) for r in records)
