@@ -17,8 +17,10 @@ from __future__ import annotations
 import logging
 import re
 from typing import (
+    AbstractSet,
     Any,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     Mapping,
@@ -565,30 +567,77 @@ class Rewrite(NamedTuple):
     report: Dict[str, Any]
 
 
+def _unknown(
+    lo_id: str, can_do_map: Mapping[str, str], valid_ids: Optional[AbstractSet[str]]
+) -> bool:
+    """An id that is no Can-Do on the environment: neither an old id the map
+    moves nor one of the environment's Can-Dos. Never, without valid ids."""
+    return valid_ids is not None and lo_id not in can_do_map and lo_id not in valid_ids
+
+
+def _drop_unknown(
+    entries: List[Dict[str, Any]],
+    where: str,
+    can_do_map: Mapping[str, str],
+    valid_ids: Optional[AbstractSet[str]],
+    report: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    kept = []
+    for entry in entries:
+        if not _unknown(entry["lo_id"], can_do_map, valid_ids):
+            kept.append(entry)
+            continue
+        # Ids and counts only: what the teacher had set on it, never its text.
+        report["unknown_removed"].append(
+            {
+                "lo_id": entry["lo_id"],
+                "list": where,
+                "activities": len(entry.get("activity_ids") or []),
+                "note": _has_note(entry),
+                "due_at": entry.get("due_at") is not None,
+            }
+        )
+    return kept
+
+
 def rewrite_copy(
     content: Mapping[str, Any],
     can_do_map: Mapping[str, str],
     statements: Optional[Mapping[str, str]] = None,
+    valid_ids: Optional[AbstractSet[str]] = None,
 ) -> Rewrite:
     """The copy with every old Can-Do id replaced, entries that now name the
     same Can-Do combined, at one revision above. An entry left with no note
     gets the old Can-Dos' wording from ``statements`` (Can-Do row id to its
-    statement, old and merged). ``content`` must pass ``copy_problem``."""
+    statement, old and merged). With ``valid_ids`` (every Can-Do id on the
+    environment), an entry naming no Can-Do there is removed first.
+    ``content`` must pass ``copy_problem``."""
     copy: Dict[str, Any] = unfreeze(content)
-    missions: List[Dict[str, Any]] = copy["missions"]
-    removed: List[Dict[str, Any]] = copy.get("removed_missions") or []
-    report: Dict[str, Any] = {
-        "ids_changed": sum(
-            1 for entry in (*missions, *removed) if entry["lo_id"] in can_do_map
-        ),
-        "combined": [],
-        "removed_combined": [],
-        "removed_into_missions": [],
-        "notes_trimmed": [],
-        "notes_added": [],
-        "no_statement": [],
-    }
-    if not report["ids_changed"]:
+    report: Dict[str, Any] = {"unknown_removed": []}
+    missions: List[Dict[str, Any]] = _drop_unknown(
+        copy["missions"], "missions", can_do_map, valid_ids, report
+    )
+    removed: List[Dict[str, Any]] = _drop_unknown(
+        copy.get("removed_missions") or [],
+        "removed_missions",
+        can_do_map,
+        valid_ids,
+        report,
+    )
+    report.update(
+        {
+            "ids_changed": sum(
+                1 for entry in (*missions, *removed) if entry["lo_id"] in can_do_map
+            ),
+            "combined": [],
+            "removed_combined": [],
+            "removed_into_missions": [],
+            "notes_trimmed": [],
+            "notes_added": [],
+            "no_statement": [],
+        }
+    )
+    if not report["ids_changed"] and not report["unknown_removed"]:
         return Rewrite(None, report)
     new_missions = _rewrite_missions(missions, can_do_map, statements or {}, report)
     new_removed = _rewrite_removed(
@@ -610,6 +659,7 @@ def rewrite_pins(
     content: Mapping[str, Any],
     can_do_map: Mapping[str, str],
     listed: Sequence[str] = (),
+    valid_ids: Optional[AbstractSet[str]] = None,
 ) -> Rewrite:
     """``pangea.teacher_mode`` with its pins re-keyed to the merged Can-Dos;
     pins that land on one Can-Do pool. Every other field is kept. ``listed``
@@ -622,11 +672,21 @@ def rewrite_pins(
         "pooled": [],
         "unpinned_siblings": [],
         "pin_values_dropped": 0,
+        "unknown_removed": [],
     }
     if not isinstance(pins, Mapping):
         return Rewrite(None, report)
+    report["unknown_removed"] = [
+        key for key in pins if _unknown(key, can_do_map, valid_ids)
+    ]
+    if report["unknown_removed"]:
+        pins = {
+            key: value
+            for key, value in pins.items()
+            if key not in report["unknown_removed"]
+        }
     report["keys_changed"] = sum(1 for key in pins if key in can_do_map)
-    if not report["keys_changed"]:
+    if not report["keys_changed"] and not report["unknown_removed"]:
         return Rewrite(None, report)
     sources: Dict[str, List[str]] = {}
     for key in pins:
@@ -702,6 +762,8 @@ class MigrateRequest(NamedTuple):
     expected: Optional[Dict[str, Optional[str]]]
     # Can-Do row id to its statement, old and merged; empty writes no wording.
     statements: Dict[str, str]
+    # Every Can-Do id on the environment; None removes no unknown id.
+    valid_ids: Optional[FrozenSet[str]] = None
 
 
 def parse_request(body: Any) -> Tuple[Optional[MigrateRequest], Optional[str]]:
@@ -717,11 +779,17 @@ def parse_request(body: Any) -> Tuple[Optional[MigrateRequest], Optional[str]]:
     statements, error = parse_statements(body.get("statements"))
     if statements is None:
         return None, error
+    valid_ids, error = parse_valid_ids(body.get("valid_ids"), can_do_map)
+    if error is not None:
+        return None, error
     dry_run = body.get("dry_run", False)
     if not isinstance(dry_run, bool):
         return None, "'dry_run' must be a boolean"
     if dry_run:
-        return MigrateRequest(room_id, can_do_map, True, None, statements), None
+        return (
+            MigrateRequest(room_id, can_do_map, True, None, statements, valid_ids),
+            None,
+        )
     expected = body.get("expected")
     if (
         not isinstance(expected, dict)
@@ -733,9 +801,37 @@ def parse_request(body: Any) -> Tuple[Optional[MigrateRequest], Optional[str]]:
             f"as {{'{COPY}': id or null, '{PINS}': id or null}}"
         )
     return (
-        MigrateRequest(room_id, can_do_map, False, dict(expected), statements),
+        MigrateRequest(
+            room_id, can_do_map, False, dict(expected), statements, valid_ids
+        ),
         None,
     )
+
+
+MAX_VALID_IDS = 100_000
+
+
+def parse_valid_ids(
+    value: Any, can_do_map: Mapping[str, str]
+) -> Tuple[Optional[FrozenSet[str]], Optional[str]]:
+    """``(ids or None, None)`` or ``(None, error)``; absent removes nothing.
+    It must hold every merged id, so a wrong file can never empty a course."""
+    if value is None:
+        return None, None
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > MAX_VALID_IDS
+        or not all(_valid_id(item) for item in value)
+    ):
+        return None, (f"'valid_ids' must be a list of 1 to {MAX_VALID_IDS} Can-Do ids")
+    ids = frozenset(value)
+    missing = sorted(set(can_do_map.values()) - ids)
+    if missing:
+        return None, (
+            f"'valid_ids' leaves out {len(missing)} merged ids, e.g. {missing[0]}"
+        )
+    return ids, None
 
 
 class Plan(NamedTuple):
@@ -748,6 +844,7 @@ def plan_space(
     state: Mapping[Tuple[str, str], Any],
     can_do_map: Mapping[str, str],
     statements: Optional[Mapping[str, str]] = None,
+    valid_ids: Optional[AbstractSet[str]] = None,
 ) -> Plan:
     """What the migration would do to one space, from its current state."""
     copy_event = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
@@ -771,7 +868,7 @@ def plan_space(
                 old_ids_left=_old_ids_in_copy(content, can_do_map),
             )
         else:
-            rewrite = rewrite_copy(content, can_do_map, statements)
+            rewrite = rewrite_copy(content, can_do_map, statements, valid_ids)
             copy_answer.update(rewrite.report, revision=content["revision"])
             if rewrite.content is None:
                 copy_answer["outcome"] = "unchanged"
@@ -808,7 +905,7 @@ def plan_space(
                 for entry in missions
                 if isinstance(entry, Mapping) and isinstance(entry.get("lo_id"), str)
             ]
-        rewrite = rewrite_pins(mode, can_do_map, listed)
+        rewrite = rewrite_pins(mode, can_do_map, listed, valid_ids)
         outcome = "unchanged" if rewrite.content is None else "rewrite"
         pins = mode.get(PINS_KEY) if isinstance(mode, Mapping) else None
         if pins is not None and not isinstance(pins, Mapping):
@@ -898,7 +995,7 @@ class MigrateCourseCanDos(Resource):
         state = await self._api.get_room_state(room_id)
         if (EventTypes.Create, "") not in state:
             return (404, {"error": "No such room on this server"})
-        plan = plan_space(state, req.can_do_map, req.statements)
+        plan = plan_space(state, req.can_do_map, req.statements, req.valid_ids)
         answer = {"room_id": room_id, "dry_run": req.dry_run, **plan.answer}
         _report_left(room_id, answer)
         if not plan.writes:
@@ -1051,6 +1148,8 @@ def _report_dropped(room_id: str, answer: Mapping[str, Any]) -> None:
         ),
         "removed_into_missions": len(copy_answer.get("removed_into_missions", [])),
         "notes_trimmed": len(copy_answer.get("notes_trimmed", [])),
+        "unknown_removed": len(copy_answer.get("unknown_removed", []))
+        + len(pins_answer.get("unknown_removed", [])),
         "pin_values_dropped": pins_answer.get("pin_values_dropped", 0),
         "unpinned_siblings": len(pins_answer.get("unpinned_siblings", [])),
     }

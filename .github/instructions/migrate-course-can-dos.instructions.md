@@ -10,19 +10,20 @@ Step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pang
 ## Contract
 
 - `POST /_synapse/client/pangea/v1/migrate_course_can_dos`, server admins only, one space per call.
-- **Input:** the room ID; the environment's map of old Can-Do row id to merged row id (row ids differ between environments; a merged id is never itself mapped); and either `dry_run: true` or `expected`, the ids of the list and pins events the dry run read.
-- **Response:** what would change, as ids and counts: entries combined, slots given up, and for each combined entry the due dates, cities and other fields it leaves out and the hidden activities it shows; notes trimmed, as lengths; pin sets pooled, old Can-Dos left unpinned, pin values dropped; how many old ids a list left alone still names; the events to send and their sender.
+- **Input:** the room ID; the environment's map of old Can-Do row id to merged row id (row ids differ between environments; a merged id is never itself mapped); optionally `valid_ids`, every Can-Do id on the environment (refused unless it holds every merged id, so a wrong file can never empty a course); and either `dry_run: true` or `expected`, the ids of the list and pins events the dry run read.
+- **Response:** what would change, as ids and counts: entries combined, slots given up, and for each combined entry the due dates, cities and other fields it leaves out and the hidden activities it shows; notes trimmed, as lengths; pin sets pooled, old Can-Dos left unpinned, pin values dropped; how many old ids a list left alone still names; each entry or pin removed for naming no Can-Do, by id, with counts of the activities, note and due date the teacher had set on it; the events to send and their sender.
 - **Refused (409):** no local instructor; a write whose space changed since its dry run; a write the room refuses.
 
 ## What it does
 
 1. Rewrites the list as raw JSON, so every field it does not change stays, Content Studio's included (`start_date`, `holidays`, `city`, `deleted_activity_ids`, later ones).
 2. Replaces each old id with its merged id in `missions` and `removed_missions`. A Can-Do appears once per list, so old Can-Dos in one course that map to one merged Can-Do combine (Gabby, 2026-11-11), by the rules below.
-3. Bumps `revision`, so Studio refuses a publish from a draft opened before the migration.
-4. Re-keys the pins and keeps every other `pangea.teacher_mode` field, `xp_to_complete_objective` included.
-5. Leaves alone, and reports with the count of old ids it still names, a list readers already ignore: one that fails the app's strict parse, or whose sender is no longer at power level 100. The strict parse is the client's own, field for field; a `due_at` must be text with a `T` and then `Z` or a `±hh:mm` offset at its very end, that Dart's date parser reads (it rolls an out-of-range day or hour over, and refuses an instant past ±8.64e15 ms). A list with an unreadable date therefore stays ignored, never made readable by a rewrite. Pins that are not an object are left alone and reported as unreadable. Other pins are re-keyed whoever sent them, since the app reads them from any sender.
-6. Sends the list, then the pins, as ordinary state events from the space's strongest local instructor, as [set-course-plan](set-course-plan.instructions.md) does, so readers accept the list and the [analytics forwarder](analytics-forward.instructions.md) updates the dashboard's mirror. Nobody joins and no power level changes.
-7. Writes only while the space still holds both events its dry run read. A teacher's edit always makes a new event, so an edited space is skipped and reported, never overwritten. A re-run reads current state, so it never undoes an edit, and a space with no old id left has nothing to write. The check and the send are not atomic: a publish in the moment between them is lost.
+3. With `valid_ids`, removes from `missions`, `removed_missions` and the pins every id that is neither an old id the map moves nor a Can-Do on the environment (Will, 2026-11-15). The app already shows nothing for such an id, so a learner sees no change; the teacher's note, due date and activities on it are gone. Without `valid_ids`, unknown ids are left as they are.
+4. Bumps `revision`, so Studio refuses a publish from a draft opened before the migration.
+5. Re-keys the pins and keeps every other `pangea.teacher_mode` field, `xp_to_complete_objective` included.
+6. Leaves alone, and reports with the count of old ids it still names, a list readers already ignore: one that fails the app's strict parse, or whose sender is no longer at power level 100. The strict parse is the client's own, field for field; a `due_at` must be text with a `T` and then `Z` or a `±hh:mm` offset at its very end, that Dart's date parser reads (it rolls an out-of-range day or hour over, and refuses an instant past ±8.64e15 ms). A list with an unreadable date therefore stays ignored, never made readable by a rewrite. Pins that are not an object are left alone and reported as unreadable. Other pins are re-keyed whoever sent them, since the app reads them from any sender.
+7. Sends the list, then the pins, as ordinary state events from the space's strongest local instructor, as [set-course-plan](set-course-plan.instructions.md) does, so readers accept the list and the [analytics forwarder](analytics-forward.instructions.md) updates the dashboard's mirror. Nobody joins and no power level changes.
+8. Writes only while the space still holds both events its dry run read. A teacher's edit always makes a new event, so an edited space is skipped and reported, never overwritten. A re-run reads current state, so it never undoes an edit, and a space with no old id left has nothing to write. The check and the send are not atomic: a publish in the moment between them is lost.
 
 After the switch, a list or pins event that still names an old Can-Do is accepted as sent and reported to Sentry by the stale progress guard (`synapse_pangea_chat/stale_progress_guard/`); a later dry run finds it.
 
@@ -38,7 +39,7 @@ After the switch, a list or pins event that still names an old Can-Do is accepte
 
 ## What a teacher loses, and how often
 
-Every rule above that drops something is counted in the response, so the operator sees it before applying: due dates, notes cut, cities and other fields, hidden activities now shown, removed Can-Dos folded into a shown one, old Can-Dos left unpinned, pin values dropped. On staging (2026-11-14, 48 of 1034 spaces rewritten) the report recorded 37 combined entries with 25 slots given up, no notes cut, no removed Can-Dos combined or folded, and 1 pin set pooled; it did not yet count dropped dates, cities, fields, hidden activities or unpinned Can-Dos. Whether each loss is acceptable for production is open on #832.
+Every rule above that drops something is counted in the response, so the operator sees it before applying: due dates, notes cut, cities and other fields, hidden activities now shown, removed Can-Dos folded into a shown one, old Can-Dos left unpinned, pin values dropped, and entries removed for naming no Can-Do. On staging (2026-11-14, 48 of 1034 spaces rewritten) the report recorded 37 combined entries with 25 slots given up, no notes cut, no removed Can-Dos combined or folded, and 1 pin set pooled; it did not yet count dropped dates, cities, fields, hidden activities or unpinned Can-Dos. Whether each loss is acceptable for production is open on #832.
 
 ## Reporting
 
@@ -46,7 +47,7 @@ Responses, logs and Sentry carry ids, counts, lengths and error types, never a t
 
 ## The operator script
 
-`scripts/migrate_course_can_dos.py` dry-runs every space on the homeserver, or the ones named, and writes a report to read. `--apply` then writes only the spaces the report says would change, each with its dry run's `expected`, and refuses a report made on another homeserver. Reports name rooms: keep them out of the repo. The nightly progress pass runs this dry run every night and never applies it; a space left to rewrite, or more than five refused or left with old ids, stops the run for a person ([migrate-course-progress](migrate-course-progress.instructions.md#the-nightly-pass)).
+`scripts/migrate_course_can_dos.py` dry-runs every space on the homeserver, or the ones named, and writes a report to read; `--valid-ids` passes the environment's Can-Do ids, and the apply uses the same. `--apply` then writes only the spaces the report says would change, each with its dry run's `expected`, and refuses a report made on another homeserver. Reports name rooms: keep them out of the repo. The nightly progress pass runs this dry run every night and never applies it; a space left to rewrite, or more than five refused or left with old ids, stops the run for a person ([migrate-course-progress](migrate-course-progress.instructions.md#the-nightly-pass)).
 
 ## Not in scope
 

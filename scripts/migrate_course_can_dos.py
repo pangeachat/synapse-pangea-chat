@@ -38,6 +38,12 @@ more a few weeks after, with the same map.
            --homeserver https://matrix.staging.pangea.chat \\
            --apply staging-progress.json --results staging-progress-results.json
 
+With ``--valid-ids`` (one JSON list: every Can-Do row id on THIS environment,
+merged ones included), the dry run also removes from course lists and pins
+every Can-Do id that is no Can-Do there, and reports each by id with counts of
+what the teacher had set on it; the apply writes the same. Without it, unknown
+ids are left as they are.
+
 The map file is one JSON object: old Can-Do row id -> merged row id, for THIS
 environment, since row ids differ between environments. The statements file is
 one JSON object: Can-Do row id -> its statement, for every old and merged
@@ -132,21 +138,21 @@ def dry_run(
     can_do_map: Dict[str, str],
     room_ids: Optional[List[str]] = None,
     statements: Optional[Dict[str, str]] = None,
+    valid_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """The report: the endpoint's dry-run answer for each space."""
     statements = statements or {}
     spaces = []
     for room_id in room_ids or walk_spaces(homeserver, token):
-        status, body = _call(
-            f"{homeserver}{MIGRATE_PATH}",
-            token,
-            {
-                "room_id": room_id,
-                "can_do_map": can_do_map,
-                "statements": statements,
-                "dry_run": True,
-            },
-        )
+        request: Dict[str, Any] = {
+            "room_id": room_id,
+            "can_do_map": can_do_map,
+            "statements": statements,
+            "dry_run": True,
+        }
+        if valid_ids is not None:
+            request["valid_ids"] = valid_ids
+        status, body = _call(f"{homeserver}{MIGRATE_PATH}", token, request)
         spaces.append({"room_id": room_id, "status": status, "body": body})
         time.sleep(PAUSE_SECONDS)
     return {
@@ -154,6 +160,7 @@ def dry_run(
         "homeserver": homeserver,
         "can_do_map": can_do_map,
         "statements": statements,
+        "valid_ids": valid_ids,
         "spaces": spaces,
     }
 
@@ -176,16 +183,15 @@ def apply(homeserver: str, token: str, report: Dict[str, Any]) -> List[Dict[str,
     _check_report(report, homeserver, "spaces")
     results = []
     for space in filter(to_write, report["spaces"]):
-        status, body = _call(
-            f"{homeserver}{MIGRATE_PATH}",
-            token,
-            {
-                "room_id": space["room_id"],
-                "can_do_map": report["can_do_map"],
-                "statements": report.get("statements") or {},
-                "expected": space["body"]["expected"],
-            },
-        )
+        request: Dict[str, Any] = {
+            "room_id": space["room_id"],
+            "can_do_map": report["can_do_map"],
+            "statements": report.get("statements") or {},
+            "expected": space["body"]["expected"],
+        }
+        if report.get("valid_ids") is not None:
+            request["valid_ids"] = report["valid_ids"]
+        status, body = _call(f"{homeserver}{MIGRATE_PATH}", token, request)
         results.append({"room_id": space["room_id"], "status": status, "body": body})
         time.sleep(PAUSE_SECONDS)
     return results
@@ -221,6 +227,17 @@ def summarize_report(report: Dict[str, Any]) -> List[str]:
         f"old Can-Do, {sum(p.get('pin_values_dropped', 0) for p in pins)} pin "
         "values dropped",
     ]
+    unknown = [e for c in copies for e in c.get("unknown_removed", [])]
+    unknown_pins = sum(len(p.get("unknown_removed", [])) for p in pins)
+    if unknown or unknown_pins:
+        lines.append(
+            f"{len(unknown)} entries naming no Can-Do removed from lists "
+            f"({sum(e['activities'] for e in unknown)} activities, "
+            f"{sum(e['note'] for e in unknown)} notes, "
+            f"{sum(e['due_at'] for e in unknown)} due dates), "
+            f"{unknown_pins} from pins: "
+            + " ".join(sorted({e["lo_id"] for e in unknown}))
+        )
     for label, matches in (
         ("refused, no local instructor", lambda s: s["status"] == 409),
         (
@@ -386,6 +403,10 @@ def main() -> int:
     )
     parser.add_argument("--report", help="Dry run: where to write the report.")
     parser.add_argument(
+        "--valid-ids",
+        help="Dry run: every Can-Do row id on this environment, to remove the rest.",
+    )
+    parser.add_argument(
         "--room-id",
         action="append",
         default=[],
@@ -423,7 +444,11 @@ def main() -> int:
         can_do_map = json.load(f)
     with open(args.statements, encoding="utf-8") as f:
         statements = json.load(f)
-    report = dry_run(homeserver, token, can_do_map, args.room_id, statements)
+    valid_ids = None
+    if args.valid_ids:
+        with open(args.valid_ids, encoding="utf-8") as f:
+            valid_ids = json.load(f)
+    report = dry_run(homeserver, token, can_do_map, args.room_id, statements, valid_ids)
     _write_json(args.report, report)
     print("\n".join(summarize_report(report)))
     return 0

@@ -996,5 +996,121 @@ class TestReportDropped(unittest.TestCase):
         )
 
 
+VALID = frozenset({"M", "Z", "keep"})
+
+
+class TestUnknownIds(unittest.TestCase):
+    """Will, 2026-11-15: a Can-Do id that is no Can-Do on the environment is
+    removed from course lists and pins, when the operator passes the
+    environment's valid ids."""
+
+    def test_unknown_entries_leave_the_list_and_are_reported(self) -> None:
+        rewrite = rewrite_copy(
+            _copy(
+                [
+                    {"lo_id": "keep", "activity_ids": ["k"]},
+                    {
+                        "lo_id": "gone",
+                        "activity_ids": ["g1", "g2"],
+                        "note": "Teacher words",
+                        "due_at": "2026-09-10T21:00:00Z",
+                    },
+                    {"lo_id": "a1", "activity_ids": ["x"]},
+                ],
+                [{"lo_id": "lost", "activity_ids": ["l"], "shown_count": 1}],
+            ),
+            MAP,
+            valid_ids=VALID,
+        )
+
+        assert rewrite.content is not None
+        self.assertEqual(_ids(rewrite.content), ["keep", "M"])
+        self.assertNotIn("removed_missions", rewrite.content)
+        self.assertEqual(rewrite.content["revision"], 5)
+        self.assertEqual(
+            rewrite.report["unknown_removed"],
+            [
+                {
+                    "lo_id": "gone",
+                    "list": "missions",
+                    "activities": 2,
+                    "note": True,
+                    "due_at": True,
+                },
+                {
+                    "lo_id": "lost",
+                    "list": "removed_missions",
+                    "activities": 1,
+                    "note": False,
+                    "due_at": False,
+                },
+            ],
+        )
+        self.assertNotIn("Teacher words", repr(rewrite.report))
+        self.assertIsNone(copy_problem(rewrite.content))
+
+    def test_a_list_with_only_unknown_ids_is_still_rewritten(self) -> None:
+        rewrite = rewrite_copy(
+            _copy([{"lo_id": "gone", "activity_ids": []}]), MAP, valid_ids=VALID
+        )
+
+        assert rewrite.content is not None
+        self.assertEqual(rewrite.content["missions"], [])
+        self.assertEqual(rewrite.report["ids_changed"], 0)
+
+    def test_without_valid_ids_unknown_entries_stay(self) -> None:
+        content = _copy([{"lo_id": "gone", "activity_ids": []}])
+        self.assertIsNone(rewrite_copy(content, MAP).content)
+        rewrite = rewrite_copy(
+            _copy(
+                [
+                    {"lo_id": "gone", "activity_ids": []},
+                    {"lo_id": "a1", "activity_ids": []},
+                ]
+            ),
+            MAP,
+        )
+        assert rewrite.content is not None
+        self.assertEqual(_ids(rewrite.content), ["gone", "M"])
+        self.assertEqual(rewrite.report["unknown_removed"], [])
+
+    def test_unknown_pin_keys_are_removed(self) -> None:
+        rewrite = rewrite_pins(
+            {"enabled": True, PINS_KEY: {"gone": ["g"], "keep": ["k"]}},
+            MAP,
+            valid_ids=VALID,
+        )
+
+        assert rewrite.content is not None
+        self.assertEqual(rewrite.content, {"enabled": True, PINS_KEY: {"keep": ["k"]}})
+        self.assertEqual(rewrite.report["unknown_removed"], ["gone"])
+
+    def test_the_plan_writes_a_space_whose_only_change_is_unknown_ids(self) -> None:
+        plan = plan_space(
+            _state(
+                copy=_event(
+                    "$c", "@teacher:x", _copy([{"lo_id": "gone", "activity_ids": []}])
+                ),
+                mode=_event("$m", "@teacher:x", {PINS_KEY: {"gone": ["g"]}}),
+            ),
+            MAP,
+            valid_ids=VALID,
+        )
+        self.assertEqual(
+            [event_type for event_type, _ in plan.writes],
+            ["pangea.course_missions", "pangea.teacher_mode"],
+        )
+
+    def test_valid_ids_must_hold_every_merged_id(self) -> None:
+        base = {"room_id": "!r:x", "can_do_map": {"a1": "M"}, "dry_run": True}
+        req, error = parse_request({**base, "valid_ids": ["M", "keep"]})
+        assert req is not None, error
+        self.assertEqual(req.valid_ids, frozenset({"M", "keep"}))
+        self.assertIsNone(parse_request(base)[0].valid_ids)  # type: ignore[union-attr]
+        for bad in (["keep"], [], "M", ["M", 1]):
+            with self.subTest(bad=bad):
+                self.assertIsNone(parse_request({**base, "valid_ids": bad})[0])
+
+
 if __name__ == "__main__":
     unittest.main()

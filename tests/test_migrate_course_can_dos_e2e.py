@@ -5,6 +5,7 @@ its operator script, against a local Synapse + PostgreSQL
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import quote
@@ -16,6 +17,7 @@ from .base_e2e import BaseSynapseE2ETest
 _COPY = "pangea.course_missions"
 _MODE = "pangea.teacher_mode"
 _PATH = "/_synapse/client/pangea/v1/migrate_course_can_dos"
+PINS = "pinned_activities_by_objective"
 
 MAP = {"lo-a1": "lo-m", "lo-a2": "lo-m", "lo-b1": "lo-m", "lo-z1": "lo-z"}
 CITY = {"name": "Lima", "lat_e6": -12046374, "lng_e6": -77042793}
@@ -212,6 +214,7 @@ class TestMigrateCourseCanDos(BaseSynapseE2ETest):
                 "notes_trimmed": [],
                 "notes_added": [],
                 "no_statement": [],
+                "unknown_removed": [],
             },
         )
         self.assertEqual(
@@ -223,6 +226,7 @@ class TestMigrateCourseCanDos(BaseSynapseE2ETest):
                 "pooled": [{"lo_id": "lo-m", "from": ["lo-a1", "lo-a2"]}],
                 "unpinned_siblings": [],
                 "pin_values_dropped": 0,
+                "unknown_removed": [],
             },
         )
         self.assertEqual(_ids(self._state(admin, space)), _ids(before))
@@ -487,3 +491,59 @@ class TestMigrateCourseCanDos(BaseSynapseE2ETest):
             script.summarize_results(again)[:2],
             ["0 written", f"1 already had nothing left to change: {old}"],
         )
+
+    async def test_the_script_removes_ids_that_are_no_can_do(self) -> None:
+        await self.homeserver()
+        (_, admin) = await self.new_user("op", admin=True)
+        (_, teacher) = await self.new_user("teacher")
+        script = _load_script()
+        gone = f"lo-gone-{self.tag}"
+        copy = {
+            "version": 1,
+            "revision": 2,
+            "missions": [
+                {"lo_id": "lo-keep", "activity_ids": ["act-k"]},
+                {"lo_id": gone, "activity_ids": ["act-g"], "note": f"note-{self.tag}"},
+            ],
+        }
+        space = self._space(
+            teacher, copy=copy, mode={PINS: {gone: ["act-g"], "lo-keep": []}}
+        )
+        valid = ["lo-m", "lo-z", "lo-keep"]
+
+        # Refused without every merged id: a wrong file never empties a course.
+        resp = self._call(
+            {"room_id": space, "can_do_map": MAP, "dry_run": True, "valid_ids": ["x"]},
+            admin,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+
+        report = script.dry_run(self.server_url, admin, MAP, [space], {}, valid)
+        [answer] = report["spaces"]
+        self.assertEqual(
+            answer["body"]["course_missions"]["unknown_removed"],
+            [
+                {
+                    "lo_id": gone,
+                    "list": "missions",
+                    "activities": 1,
+                    "note": True,
+                    "due_at": False,
+                }
+            ],
+        )
+        self.assertIn(
+            f"1 entries naming no Can-Do removed from lists (1 activities, 1 notes, "
+            f"0 due dates), 1 from pins: {gone}",
+            script.summarize_report(report),
+        )
+        self.assertNotIn(f"note-{self.tag}", json.dumps(report))
+
+        results = script.apply(self.server_url, admin, report)
+        self.assertEqual([r["status"] for r in results], [200])
+        state = self._state(admin, space)
+        self.assertEqual(
+            state[(_COPY, "")]["content"]["missions"],
+            [{"lo_id": "lo-keep", "activity_ids": ["act-k"]}],
+        )
+        self.assertEqual(state[(_MODE, "")]["content"], {PINS: {"lo-keep": []}})
