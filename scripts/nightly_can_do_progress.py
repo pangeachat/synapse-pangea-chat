@@ -8,10 +8,16 @@ Run by .github/workflows/nightly-can-do-progress.yml; design in
 In order, against the environment's homeserver:
 
 1. course spaces, DRY RUN only: never applied here; a space left to rewrite
-   needs a person.
+   needs a person, and so do more than FAILURE_LIMIT spaces refused or left
+   with old ids.
 2. learners' progress, dry run; applied only when it finds records to rewrite
    and no more than FAILURE_LIMIT records failed or were refused.
 3. after an apply, a second progress dry run, which must find nothing left.
+
+Whether or not anything was applied, more than FAILURE_LIMIT records left with
+old ids or a lost completion (refused, deactivated, on another server, not the
+learner's own, failed, or an old key left in place) in the last dry run needs a
+person.
 
 It prints counts only. The reports name rooms, courses and learners and quote
 teachers' notes, and this repository's Actions logs are public, so no report is
@@ -42,17 +48,18 @@ import migrate_course_can_dos as migration  # noqa: E402
 DATA_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "can_do_switch_data"
 )
-# More failed or refused progress records than this, in any run, needs a person.
+# More than this many failed or refused progress records in a run, records left
+# undone, or course spaces refused or left with old ids, needs a person.
 FAILURE_LIMIT = 5
-PROGRESS_OUTCOMES = (
-    "rewrite",
-    "unchanged",
+# Outcomes that leave a record holding old ids or missing a completion.
+UNRESOLVED_OUTCOMES = (
     "deactivated",
     "refused",
     "not_learners_own",
     "not_local",
     "failed",
 )
+PROGRESS_OUTCOMES = ("rewrite", "unchanged", "unreadable", *UNRESOLVED_OUTCOMES)
 
 
 @dataclass(frozen=True)
@@ -106,9 +113,24 @@ def progress_counts(records: List[Dict[str, Any]]) -> Dict[str, int]:
     result = {o: counts.get(o, 0) for o in PROGRESS_OUTCOMES}
     result["records"] = len(records)
     result["courses"] = len({r["course_id"] for r in records})
-    result["keys_moved"] = sum(r.get("keys_moved", 0) for r in records)
-    result["completions_kept"] = sum(r.get("completions_kept", 0) for r in records)
+    for key in ("keys_moved", "completions_kept", "completions_restored"):
+        result[key] = sum(r.get(key, 0) for r in records)
+    result["old_keys_left"] = sum(1 for r in records if r.get("old_keys_left"))
+    result["unresolved"] = sum(
+        1
+        for r in records
+        if r["outcome"] not in ("rewrite", "unchanged", "unreadable")
+        or r.get("old_keys_left")
+    )
     return result
+
+
+def _left_with_old_ids(space: Dict[str, Any]) -> bool:
+    body = space["body"] if space["status"] == 200 else {}
+    return bool(
+        (body.get("course_missions") or {}).get("old_ids_left")
+        or (body.get("teacher_mode") or {}).get("outcome") == "unreadable"
+    )
 
 
 def space_counts(report: Dict[str, Any]) -> Dict[str, int]:
@@ -117,6 +139,7 @@ def space_counts(report: Dict[str, Any]) -> Dict[str, int]:
         "checked": len(spaces),
         "to_rewrite": sum(map(migration.to_write, spaces)),
         "refused_no_local_instructor": sum(s["status"] == 409 for s in spaces),
+        "left_with_old_ids": sum(map(_left_with_old_ids, spaces)),
         "failed": sum(s["status"] not in (200, 409) for s in spaces),
     }
 
@@ -154,6 +177,12 @@ def run_night(steps: Steps) -> Outcome:
                 f"{spaces['to_rewrite']} course spaces still name old Can-Dos; "
                 "the space apply is run by a person"
             )
+        left = spaces["refused_no_local_instructor"] + spaces["left_with_old_ids"]
+        if left > FAILURE_LIMIT:
+            out.problems.append(
+                f"{left} course spaces refused or left with old ids "
+                f"(limit {FAILURE_LIMIT})"
+            )
 
     try:
         first = progress_counts(steps.progress(True))
@@ -171,6 +200,7 @@ def run_night(steps: Steps) -> Outcome:
         return out
     if not first["rewrite"]:
         out.say("nothing to rewrite; not applied")
+        _check_unresolved(out, first)
         return out
 
     try:
@@ -197,7 +227,16 @@ def run_night(steps: Steps) -> Outcome:
         out.problems.append(
             f"second dry run still finds {second['rewrite']} records to rewrite"
         )
+    _check_unresolved(out, second)
     return out
+
+
+def _check_unresolved(out: Outcome, counts: Dict[str, int]) -> None:
+    if counts["unresolved"] > FAILURE_LIMIT:
+        out.problems.append(
+            f"{counts['unresolved']} progress records left with old ids or a lost "
+            f"completion (limit {FAILURE_LIMIT})"
+        )
 
 
 def read_secret(secret_id: str) -> Dict[str, str]:

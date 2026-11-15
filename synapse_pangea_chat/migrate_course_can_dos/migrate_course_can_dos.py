@@ -15,6 +15,7 @@ only while both events are still the ones the operator's dry run read.
 from __future__ import annotations
 
 import logging
+import re
 from typing import (
     Any,
     Dict,
@@ -45,6 +46,7 @@ from twisted.web.resource import Resource
 from synapse_pangea_chat.email_invite.course_missions import (
     COURSE_MISSIONS_STATE_EVENT_TYPE,
 )
+from synapse_pangea_chat.migrate_course_can_dos.report import report, report_failure
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.instructor_access import (
     joined_local_instructors,
@@ -105,6 +107,52 @@ def _is_id_list(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
+# The client's due-date rule (CourseMissionsEvent.tryParse): an instant, so a
+# "T" and then an offset or "Z" at the very end, that Dart's DateTime.tryParse
+# reads. Dart's grammar is ported as written; it rolls out-of-range fields over
+# (a 30 February is 2 March) and refuses an instant past +-8.64e15 ms.
+_HAS_UTC_OFFSET = re.compile(r"T.*(Z|[+-]\d{2}:?\d{2})\Z", re.ASCII)
+_DART_DATE_TIME = re.compile(
+    r"([+-]?\d{4,6})-?(\d\d)-?(\d\d)"
+    r"(?:[ T](\d\d)(?::?(\d\d)(?::?(\d\d)(?:[.,](\d+))?)?)?"
+    r"( ?[zZ]| ?([-+])(\d\d)(?::?(\d\d))?)?)?\Z",
+    re.ASCII,
+)
+_DART_MAX_MS = 8_640_000_000_000_000
+
+
+def _days_from_civil(year: int, month: int, day: int) -> int:
+    """Days from 1970-01-01, proleptic Gregorian, any year."""
+    year -= month <= 2
+    era = (year if year >= 0 else year - 399) // 400
+    yoe = year - era * 400
+    doy = (153 * (month + (-3 if month > 2 else 9)) + 2) // 5 + day - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def due_at_readable(value: Any) -> bool:
+    """Whether the app reads ``value`` as a due date."""
+    if not isinstance(value, str) or not _HAS_UTC_OFFSET.search(value):
+        return False
+    match = _DART_DATE_TIME.match(value)
+    if match is None:
+        return False
+    year, month, day, hour, minute, second, fraction = (
+        match.group(i) for i in range(1, 8)
+    )
+    month_index = int(month) - 1
+    days = _days_from_civil(int(year) + month_index // 12, month_index % 12 + 1, 1)
+    days += int(day) - 1
+    ms = (
+        ((days * 24 + int(hour or 0)) * 60 + int(minute or 0)) * 60 + int(second or 0)
+    ) * 1000 + int((fraction or "0")[:3].ljust(3, "0"))
+    if match.group(9):
+        offset = int(match.group(10)) * 60 + int(match.group(11) or 0)
+        ms -= (1 if match.group(9) == "+" else -1) * offset * 60_000
+    return abs(ms) <= _DART_MAX_MS
+
+
 def _pool(lists: Iterable[Any]) -> List[str]:
     """Every id once, in the order first seen: the first list's order, then
     each later list's new ids."""
@@ -162,8 +210,8 @@ def copy_problem(content: Any) -> Optional[str]:
             not isinstance(note, str) or utf16_len(note) > MAX_NOTE_UTF16
         ):
             return f"{lo_id}: note is not text of at most {MAX_NOTE_UTF16}"
-        if entry.get("due_at") is not None and not isinstance(entry["due_at"], str):
-            return f"{lo_id}: due_at is not text"
+        if entry.get("due_at") is not None and not due_at_readable(entry["due_at"]):
+            return f"{lo_id}: due_at is not an instant the app reads"
     removed = content.get("removed_missions")
     if removed is not None:
         if not isinstance(removed, list):
@@ -279,17 +327,49 @@ def _add_old_wording(
         {"lo_id": entry["lo_id"], "note": note, "from": wording.from_ids}
     )
     if dropped:
-        report["notes_trimmed"].append(
-            {"lo_id": entry["lo_id"], "note": note, "dropped": dropped}
-        )
+        report["notes_trimmed"].append(_trimmed(entry["lo_id"], note, dropped))
+
+
+def _trimmed(lo_id: str, note: Optional[str], dropped: Sequence[str]) -> Dict[str, Any]:
+    """A trimmed note as lengths and counts: the report leaves the server, and
+    the text stays in the room's history, in the event the dry run read."""
+    return {
+        "lo_id": lo_id,
+        "kept_length": utf16_len(note or ""),
+        "dropped_count": len(dropped),
+        "dropped_length": sum(utf16_len(text) for text in dropped),
+    }
+
+
+_MODELLED = frozenset(
+    (
+        "lo_id",
+        "activity_ids",
+        "removed_activity_ids",
+        "deleted_activity_ids",
+        "note",
+        "due_at",
+        "city",
+    )
+)
+
+
+def _distinct_others(values: Iterable[Any], kept: Any) -> int:
+    """How many distinct set values differ from the one kept."""
+    seen: List[Any] = []
+    for value in values:
+        if value is not None and value != kept and value not in seen:
+            seen.append(value)
+    return len(seen)
 
 
 def _combine(
     lo_id: str, sources: Sequence[Dict[str, Any]], span: Sequence[Dict[str, Any]]
-) -> Tuple[Dict[str, Any], List[str]]:
+) -> Tuple[Dict[str, Any], List[str], Dict[str, Any]]:
     """One entry for the old entries ``sources`` (in list order) that map to
     ``lo_id``; ``span`` is the run of them next to the first. Fields this
-    module does not model come from the first. Returns the note text dropped.
+    module does not model come from the first. Returns the note text dropped
+    and the counts of what else the teacher set that the entry leaves out.
     """
     entry = dict(sources[0])
     entry["lo_id"] = lo_id
@@ -327,7 +407,28 @@ def _combine(
             entry[key] = value
         else:
             entry.pop(key, None)
-    return entry, dropped
+    hid = set(_pool(source.get("removed_activity_ids") for source in sources))
+    drops = {
+        "due_dates_dropped": _distinct_others(
+            (source.get("due_at") for source in sources), due_at
+        ),
+        "cities_dropped": _distinct_others(
+            (source.get("city") for source in sources), city
+        ),
+        "fields_dropped": sorted(
+            {
+                key
+                for source in sources[1:]
+                for key, value in source.items()
+                if key not in _MODELLED and entry.get(key, _MISSING) != value
+            }
+        ),
+        "hidden_now_shown": len(hid & shown_set),
+    }
+    return entry, dropped, drops
+
+
+_MISSING = object()
 
 
 def _rewrite_missions(
@@ -356,7 +457,7 @@ def _rewrite_missions(
             if later != span[-1] + 1:
                 break
             span.append(later)
-        combined, dropped = _combine(
+        combined, dropped, drops = _combine(
             new_id, [missions[p] for p in group], [missions[p] for p in span]
         )
         sources = [missions[p] for p in group]
@@ -367,11 +468,12 @@ def _rewrite_missions(
                 "lo_id": new_id,
                 "from": [missions[p]["lo_id"] for p in group],
                 "slots_given_up": [missions[p]["lo_id"] for p in group[len(span) :]],
+                **drops,
             }
         )
         if dropped:
             report["notes_trimmed"].append(
-                {"lo_id": new_id, "note": combined.get("note"), "dropped": dropped}
+                _trimmed(new_id, combined.get("note"), dropped)
             )
     return out
 
@@ -404,10 +506,16 @@ def _rewrite_removed(
                 )
                 if a not in shown
             ]
+            before = set(shown_entry.get("removed_activity_ids") or [])
             if hidden:
                 shown_entry["removed_activity_ids"] = hidden
             report["removed_into_missions"].append(
-                {"lo_id": new_id, "from": [source["lo_id"] for source in sources]}
+                {
+                    "lo_id": new_id,
+                    "from": [source["lo_id"] for source in sources],
+                    # Hidden there now, no longer a removed Can-Do to restore.
+                    "activities_hidden": len(set(hidden) - before),
+                }
             )
             continue
         if len(sources) == 1:
@@ -434,6 +542,19 @@ def _rewrite_removed(
             {"lo_id": new_id, "from": [source["lo_id"] for source in sources]}
         )
     return out
+
+
+def _old_ids_in_copy(content: Any, can_do_map: Mapping[str, str]) -> int:
+    """Old ids a copy left as it is still names."""
+    if not isinstance(content, Mapping):
+        return 0
+    return sum(
+        1
+        for key in ("missions", "removed_missions")
+        if isinstance(content.get(key), list)
+        for entry in content[key]
+        if isinstance(entry, Mapping) and entry.get("lo_id") in can_do_map
+    )
 
 
 class Rewrite(NamedTuple):
@@ -483,11 +604,23 @@ def rewrite_copy(
     return Rewrite(copy, report)
 
 
-def rewrite_pins(content: Mapping[str, Any], can_do_map: Mapping[str, str]) -> Rewrite:
+def rewrite_pins(
+    content: Mapping[str, Any],
+    can_do_map: Mapping[str, str],
+    listed: Sequence[str] = (),
+) -> Rewrite:
     """``pangea.teacher_mode`` with its pins re-keyed to the merged Can-Dos;
-    pins that land on one Can-Do pool. Every other field is kept."""
+    pins that land on one Can-Do pool. Every other field is kept. ``listed``
+    is the old Can-Do ids the course's list names, to count the old Can-Dos
+    that had no pins and so show nothing of their own under a pinned merged
+    Can-Do."""
     pins = content.get(PINS_KEY)
-    report: Dict[str, Any] = {"keys_changed": 0, "pooled": []}
+    report: Dict[str, Any] = {
+        "keys_changed": 0,
+        "pooled": [],
+        "unpinned_siblings": [],
+        "pin_values_dropped": 0,
+    }
     if not isinstance(pins, Mapping):
         return Rewrite(None, report)
     report["keys_changed"] = sum(1 for key in pins if key in can_do_map)
@@ -503,6 +636,17 @@ def rewrite_pins(content: Mapping[str, Any], can_do_map: Mapping[str, str]) -> R
         else:
             new_pins[new_key] = _pool(pins[key] for key in keys)
             report["pooled"].append({"lo_id": new_key, "from": keys})
+            report["pin_values_dropped"] += sum(
+                1 for key in keys if not _is_id_list(pins[key])
+            )
+        if any(key in can_do_map for key in keys):
+            unpinned = [
+                old
+                for old in dict.fromkeys(listed)
+                if can_do_map.get(old) == new_key and old not in pins
+            ]
+            if unpinned:
+                report["unpinned_siblings"].append({"lo_id": new_key, "from": unpinned})
     mode: Dict[str, Any] = unfreeze(content)
     mode[PINS_KEY] = new_pins
     return Rewrite(mode, report)
@@ -619,7 +763,11 @@ def plan_space(
             problem = "its sender is no longer a course admin"
         if problem is not None:
             # Readers already ignore it; it is left as it is.
-            copy_answer.update(outcome="ignored_by_readers", reason=problem)
+            copy_answer.update(
+                outcome="ignored_by_readers",
+                reason=problem,
+                old_ids_left=_old_ids_in_copy(content, can_do_map),
+            )
         else:
             rewrite = rewrite_copy(content, can_do_map, statements)
             copy_answer.update(rewrite.report, revision=content["revision"])
@@ -628,13 +776,17 @@ def plan_space(
             elif copy_problem(rewrite.content) is not None:
                 # Never expected: a copy the app refuses hides the course's
                 # list, so it is never written.
-                logger.error(
-                    "migrate_course_can_dos: the rewrite of %s fails the app's "
-                    "parse (%s); not written",
-                    copy_event.room_id,
-                    copy_problem(rewrite.content),
+                report(
+                    "migrate_course_can_dos: a rewrite fails the app's parse; "
+                    "not written",
+                    "error",
+                    room_id=copy_event.room_id,
+                    reason=copy_problem(rewrite.content),
                 )
-                copy_answer["outcome"] = "rewrite_failed"
+                copy_answer.update(
+                    outcome="rewrite_failed",
+                    old_ids_left=_old_ids_in_copy(content, can_do_map),
+                )
             else:
                 copy_answer.update(
                     outcome="rewrite", new_revision=rewrite.content["revision"]
@@ -642,10 +794,23 @@ def plan_space(
                 writes.append((COURSE_MISSIONS_STATE_EVENT_TYPE, rewrite.content))
     pins_answer: Optional[Dict[str, Any]] = None
     if mode_event is not None:
-        rewrite = rewrite_pins(unfreeze(mode_event.content), can_do_map)
+        mode = unfreeze(mode_event.content)
+        listed: List[str] = []
+        if copy_event is not None:
+            listed = [
+                entry["lo_id"]
+                for entry in unfreeze(copy_event.content).get("missions") or []
+                if isinstance(entry, Mapping) and isinstance(entry.get("lo_id"), str)
+            ]
+        rewrite = rewrite_pins(mode, can_do_map, listed)
+        outcome = "unchanged" if rewrite.content is None else "rewrite"
+        pins = mode.get(PINS_KEY) if isinstance(mode, Mapping) else None
+        if pins is not None and not isinstance(pins, Mapping):
+            # The app reads no pins from it; nothing to re-key.
+            outcome = "unreadable"
         pins_answer = {
             "event_id": mode_event.event_id,
-            "outcome": "unchanged" if rewrite.content is None else "rewrite",
+            "outcome": outcome,
             **rewrite.report,
         }
         if rewrite.content is not None:
@@ -713,8 +878,8 @@ class MigrateCourseCanDos(Resource):
                 return
             code, answer = await self.apply(req, operator)
             respond_with_json(request, code, answer, send_cors=True)
-        except Exception:
-            logger.exception("Error migrating a course space's Can-Dos")
+        except Exception as e:
+            report_failure("migrate_course_can_dos: the call failed", e)
             respond_with_json(
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
@@ -729,15 +894,16 @@ class MigrateCourseCanDos(Resource):
             return (404, {"error": "No such room on this server"})
         plan = plan_space(state, req.can_do_map, req.statements)
         answer = {"room_id": room_id, "dry_run": req.dry_run, **plan.answer}
+        _report_left(room_id, answer)
         if not plan.writes:
             return (200, {**answer, "sender": None, "changed": False})
 
         if req.expected is not None and req.expected != answer["expected"]:
             # A teacher edited the space since the operator's dry run: what
             # was approved is not what would be written.
-            logger.info(
-                "migrate_course_can_dos: %s changed since its dry run; skipped",
-                room_id,
+            report(
+                "migrate_course_can_dos: the space changed since its dry run; skipped",
+                room_id=room_id,
             )
             return (
                 409,
@@ -750,11 +916,11 @@ class MigrateCourseCanDos(Resource):
 
         instructors = joined_local_instructors(self._api, state)
         if not instructors:
-            logger.warning(
-                "migrate_course_can_dos: no local instructor in %s can send %s; "
-                "refused, nothing written",
-                room_id,
-                answer["writes"],
+            report(
+                "migrate_course_can_dos: no local instructor can send the events; "
+                "refused",
+                room_id=room_id,
+                writes=",".join(answer["writes"]),
             )
             return (
                 409,
@@ -784,14 +950,13 @@ class MigrateCourseCanDos(Resource):
                 )
             except AuthError as e:
                 # The sender left or lost power since they were chosen.
-                logger.error(
-                    "migrate_course_can_dos: %s refused %s sent as %s; "
-                    "already written: %s: %s",
-                    room_id,
-                    event_type,
-                    sender,
-                    written,
-                    e,
+                report(
+                    "migrate_course_can_dos: the room refused a write",
+                    "error",
+                    room_id=room_id,
+                    event_type=event_type,
+                    errcode=e.errcode,
+                    written=",".join(written),
                 )
                 return (
                     409,
@@ -804,26 +969,30 @@ class MigrateCourseCanDos(Resource):
                         "changed": bool(written),
                     },
                 )
-            except Exception:
-                logger.exception(
-                    "migrate_course_can_dos: writing %s to %s failed; "
-                    "already written: %s",
-                    event_type,
-                    room_id,
-                    written,
+            except Exception as e:
+                report_failure(
+                    "migrate_course_can_dos: a write failed",
+                    e,
+                    room_id=room_id,
+                    event_type=event_type,
+                    written=",".join(written),
                 )
                 return (500, {"error": "Internal server error", "written": written})
             written.append(event_type)
 
         copy_answer = answer[COPY] or {}
         for trimmed in copy_answer.get("notes_trimmed", []):
+            # Ids, lengths and counts: never a teacher's words.
             logger.warning(
-                "migrate_course_can_dos: %s %s: combined note kept as %r; dropped %r",
+                "migrate_course_can_dos: room=%s lo_id=%s note trimmed: "
+                "kept_length=%d dropped_count=%d dropped_length=%d",
                 room_id,
                 trimmed["lo_id"],
-                trimmed["note"],
-                trimmed["dropped"],
+                trimmed["kept_length"],
+                trimmed["dropped_count"],
+                trimmed["dropped_length"],
             )
+        _report_dropped(room_id, answer)
         logger.info(
             "migrate_course_can_dos: operator=%s room=%s writes=%s sent_as=%s "
             "combined=%d notes_added=%d notes_trimmed=%d pins_pooled=%d",
@@ -837,3 +1006,47 @@ class MigrateCourseCanDos(Resource):
             len((answer[PINS] or {}).get("pooled", [])),
         )
         return (200, {**answer, "changed": True})
+
+
+def _report_left(room_id: str, answer: Mapping[str, Any]) -> None:
+    """A space left with old ids, or a teacher's settings left out, reaches
+    the team as well as the operator's report."""
+    copy_answer = answer.get(COPY) or {}
+    pins_answer = answer.get(PINS) or {}
+    if copy_answer.get("old_ids_left"):
+        report(
+            "migrate_course_can_dos: a Can-Do list readers ignore still names old ids",
+            room_id=room_id,
+            outcome=copy_answer.get("outcome"),
+            old_ids_left=copy_answer["old_ids_left"],
+        )
+    if pins_answer.get("outcome") == "unreadable":
+        report(
+            "migrate_course_can_dos: unreadable pins left as they are", room_id=room_id
+        )
+
+
+def _report_dropped(room_id: str, answer: Mapping[str, Any]) -> None:
+    """What combining left out, once it is written."""
+    copy_answer = answer.get(COPY) or {}
+    pins_answer = answer.get(PINS) or {}
+    dropped = {
+        "due_dates_dropped": sum(
+            c.get("due_dates_dropped", 0) for c in copy_answer.get("combined", [])
+        ),
+        "cities_dropped": sum(
+            c.get("cities_dropped", 0) for c in copy_answer.get("combined", [])
+        ),
+        "fields_dropped": sum(
+            len(c.get("fields_dropped", [])) for c in copy_answer.get("combined", [])
+        ),
+        "notes_trimmed": len(copy_answer.get("notes_trimmed", [])),
+        "pin_values_dropped": pins_answer.get("pin_values_dropped", 0),
+        "unpinned_siblings": len(pins_answer.get("unpinned_siblings", [])),
+    }
+    if any(dropped.values()):
+        report(
+            "migrate_course_can_dos: combining left out teacher settings",
+            room_id=room_id,
+            **{key: value for key, value in dropped.items() if value},
+        )

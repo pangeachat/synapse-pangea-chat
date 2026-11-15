@@ -118,7 +118,17 @@ class TestRewriteCopy(unittest.TestCase):
         self.assertEqual(merged["due_at"], "2026-09-17T21:00:00Z")
         self.assertEqual(
             rewrite.report["combined"],
-            [{"lo_id": "M", "from": ["a1", "a2"], "slots_given_up": []}],
+            [
+                {
+                    "lo_id": "M",
+                    "from": ["a1", "a2"],
+                    "slots_given_up": [],
+                    "due_dates_dropped": 1,
+                    "cities_dropped": 0,
+                    "fields_dropped": [],
+                    "hidden_now_shown": 0,
+                }
+            ],
         )
 
     def test_a_later_occurrence_gives_up_its_slot(self) -> None:
@@ -151,7 +161,17 @@ class TestRewriteCopy(unittest.TestCase):
         self.assertEqual(merged["due_at"], "2026-09-10T21:00:00Z")
         self.assertEqual(
             rewrite.report["combined"],
-            [{"lo_id": "M", "from": ["a1", "b1"], "slots_given_up": ["b1"]}],
+            [
+                {
+                    "lo_id": "M",
+                    "from": ["a1", "b1"],
+                    "slots_given_up": ["b1"],
+                    "due_dates_dropped": 1,
+                    "cities_dropped": 0,
+                    "fields_dropped": [],
+                    "hidden_now_shown": 0,
+                }
+            ],
         )
 
     def test_a_span_and_a_far_occurrence_together(self) -> None:
@@ -253,9 +273,17 @@ class TestRewriteCopy(unittest.TestCase):
 
         assert rewrite.content is not None
         self.assertEqual(rewrite.content["missions"][0]["note"], first + " (+2 more)")
+        # Lengths and counts only: the report leaves the server.
         self.assertEqual(
             rewrite.report["notes_trimmed"],
-            [{"lo_id": "M", "note": first + " (+2 more)", "dropped": [second, third]}],
+            [
+                {
+                    "lo_id": "M",
+                    "kept_length": 210,
+                    "dropped_count": 2,
+                    "dropped_length": 110,
+                }
+            ],
         )
 
     def test_removed_missions_map_and_combine(self) -> None:
@@ -310,7 +338,8 @@ class TestRewriteCopy(unittest.TestCase):
         )
         self.assertNotIn("removed_missions", rewrite.content)
         self.assertEqual(
-            rewrite.report["removed_into_missions"], [{"lo_id": "M", "from": ["a2"]}]
+            rewrite.report["removed_into_missions"],
+            [{"lo_id": "M", "from": ["a2"], "activities_hidden": 1}],
         )
 
     def test_every_rewrite_passes_the_apps_parse(self) -> None:
@@ -481,7 +510,14 @@ class TestOldWordingNotes(unittest.TestCase):
         self.assertLessEqual(utf16_len(note), MAX_NOTE_UTF16)
         self.assertEqual(
             rewrite.report["notes_trimmed"],
-            [{"lo_id": "M", "note": note, "dropped": ["B" * 100]}],
+            [
+                {
+                    "lo_id": "M",
+                    "kept_length": 210,
+                    "dropped_count": 1,
+                    "dropped_length": 100,
+                }
+            ],
         )
         self.assertIsNone(copy_problem(rewrite.content))
 
@@ -745,6 +781,170 @@ class TestPlanSpace(unittest.TestCase):
                 self.assertEqual(plan.writes, [])
                 self.assertEqual(plan.answer[COPY]["outcome"], "ignored_by_readers")
                 self.assertEqual(plan.answer["expected"][COPY], "$c")
+
+
+class TestDueAtParity(unittest.TestCase):
+    """Audit finding 12: a due date the app cannot read makes the list one
+    readers ignore, so the migration leaves it alone."""
+
+    def _with(self, due_at: Any) -> Dict[str, Any]:
+        return _copy([{"lo_id": "a1", "activity_ids": [], "due_at": due_at}])
+
+    def test_instants_the_app_reads(self) -> None:
+        for value in (
+            "2026-09-10T21:00:00Z",
+            "2026-09-10T21:00:00.123Z",
+            "2026-09-10T21:00:00+02:00",
+            "2026-09-10T21:00-0500",
+            "20260910T210000Z",
+            # Dart reads out-of-range fields and rolls them over.
+            "2026-02-30T10:00:00Z",
+            "2026-13-01T10:00:00Z",
+            "2026-09-10T25:61:00Z",
+            "2026-09-10T21Z",
+            "2026-09-10T21:00:00 +02:00",
+            "2026-09-10T21:00:00.1234567890Z",
+            "+275760-09-13T00:00:00Z",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(copy_problem(self._with(value)))
+
+    def test_text_the_app_refuses(self) -> None:
+        for value in (
+            "next Friday",
+            "2026-09-10",
+            "2026-09-10T21:00:00",
+            "2026-09-10 21:00:00Z",
+            "2026-09-10T21:00:00z",
+            "2026-09-10T21:00:00Z\n",
+            "2026-09-10T21:00:00+2",
+            "\u0662026-09-10T21:00:00Z",
+            "",
+            "xT2026-09-10T21:00:00Z",
+            # Past the last instant a Dart DateTime holds.
+            "+275760-09-14T00:00:00Z",
+            1,
+        ):
+            with self.subTest(value=value):
+                self.assertIsNotNone(copy_problem(self._with(value)))
+
+    def test_an_unreadable_date_leaves_the_list_and_its_old_ids(self) -> None:
+        event = _event("$c", "@teacher:x", self._with("next Friday"))
+        plan = plan_space(_state(copy=event), MAP)
+
+        self.assertEqual(plan.writes, [])
+        self.assertEqual(plan.answer[COPY]["outcome"], "ignored_by_readers")
+        self.assertEqual(plan.answer[COPY]["old_ids_left"], 1)
+
+
+class TestWhatCombiningDrops(unittest.TestCase):
+    """Audit finding 6: behaviour unchanged, every drop counted."""
+
+    def test_dates_cities_and_fields_combining_drops_are_counted(self) -> None:
+        lima = {"name": "Lima", "lat_e6": 1, "lng_e6": 2}
+        cusco = {"name": "Cusco", "lat_e6": 3, "lng_e6": 4}
+        rewrite = rewrite_copy(
+            _copy(
+                [
+                    {
+                        "lo_id": "a1",
+                        "activity_ids": ["x"],
+                        "removed_activity_ids": ["y"],
+                        "due_at": "2026-09-10T21:00:00Z",
+                        "city": lima,
+                        "extra": 1,
+                    },
+                    {
+                        "lo_id": "a2",
+                        "activity_ids": ["y"],
+                        "due_at": "2026-09-17T21:00:00Z",
+                        "extra": 2,
+                        "more": True,
+                    },
+                    {"lo_id": "keep", "activity_ids": []},
+                    {
+                        "lo_id": "b1",
+                        "activity_ids": [],
+                        "due_at": "2026-10-01T21:00:00Z",
+                        "city": cusco,
+                    },
+                ]
+            ),
+            MAP,
+        )
+
+        assert rewrite.content is not None
+        merged = rewrite.content["missions"][0]
+        self.assertEqual(merged["due_at"], "2026-09-17T21:00:00Z")
+        self.assertEqual(merged["city"], lima)
+        self.assertEqual(merged["extra"], 1)
+        self.assertNotIn("more", merged)
+        self.assertNotIn("removed_activity_ids", merged)
+        [combined] = rewrite.report["combined"]
+        self.assertEqual(combined["slots_given_up"], ["b1"])
+        # The span's earlier date and the far occurrence's date.
+        self.assertEqual(combined["due_dates_dropped"], 2)
+        self.assertEqual(combined["cities_dropped"], 1)
+        self.assertEqual(combined["fields_dropped"], ["extra", "more"])
+        self.assertEqual(combined["hidden_now_shown"], 1)
+
+    def test_nothing_dropped_counts_zero(self) -> None:
+        rewrite = rewrite_copy(
+            _copy(
+                [
+                    {"lo_id": "a1", "activity_ids": ["x"]},
+                    {"lo_id": "a2", "activity_ids": ["y"]},
+                ]
+            ),
+            MAP,
+        )
+        [combined] = rewrite.report["combined"]
+        self.assertEqual(
+            {k: combined[k] for k in ("due_dates_dropped", "cities_dropped")},
+            {"due_dates_dropped": 0, "cities_dropped": 0},
+        )
+        self.assertEqual(combined["fields_dropped"], [])
+        self.assertEqual(combined["hidden_now_shown"], 0)
+
+    def test_a_removed_entry_folded_into_a_shown_one_is_counted(self) -> None:
+        rewrite = rewrite_copy(
+            _copy(
+                [{"lo_id": "a1", "activity_ids": ["x"]}],
+                [{"lo_id": "a2", "activity_ids": ["y", "z"], "shown_count": 1}],
+            ),
+            MAP,
+        )
+        self.assertEqual(
+            rewrite.report["removed_into_missions"],
+            [{"lo_id": "M", "from": ["a2"], "activities_hidden": 2}],
+        )
+
+
+class TestPinsDrops(unittest.TestCase):
+    def test_a_sibling_the_course_lists_without_pins_is_counted(self) -> None:
+        rewrite = rewrite_pins({PINS_KEY: {"a1": ["x"]}}, MAP, ["a1", "a2", "keep"])
+
+        assert rewrite.content is not None
+        self.assertEqual(rewrite.content[PINS_KEY], {"M": ["x"]})
+        self.assertEqual(
+            rewrite.report["unpinned_siblings"], [{"lo_id": "M", "from": ["a2"]}]
+        )
+
+    def test_pin_values_that_are_not_id_lists_are_counted(self) -> None:
+        rewrite = rewrite_pins({PINS_KEY: {"a1": ["x"], "a2": "y", "b1": [1]}}, MAP)
+
+        assert rewrite.content is not None
+        self.assertEqual(rewrite.content[PINS_KEY], {"M": ["x"]})
+        self.assertEqual(rewrite.report["pin_values_dropped"], 2)
+
+    def test_pins_that_are_not_an_object_are_reported_unreadable(self) -> None:
+        for pins in ([["a1", "x"]], "a1"):
+            with self.subTest(pins=pins):
+                plan = plan_space(
+                    _state(mode=_event("$m", "@teacher:x", {PINS_KEY: pins})), MAP
+                )
+                self.assertEqual(plan.writes, [])
+                self.assertEqual(plan.answer[PINS]["outcome"], "unreadable")
 
 
 if __name__ == "__main__":
