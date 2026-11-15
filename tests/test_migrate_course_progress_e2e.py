@@ -365,6 +365,8 @@ class TestMigrateCourseProgress(BaseSynapseE2ETest):
         self._put(gil, room, course, _record({old1: _entry(300, SEEN)}))
         self._put(gil, room, course, _record({old1: _entry(310, SEEN)}))
         self._put(gil, room, course, _record({old2: {**_entry(50), "completed": True}}))
+        # x2 then went on, not complete, to more XP than any completed entry.
+        self._put(gil, room, course, _record({old2: _entry(400)}))
         self._put(gil, room, course, _record({}))
 
         # Hal's only completion was flagged with no date, and then dropped.
@@ -383,9 +385,9 @@ class TestMigrateCourseProgress(BaseSynapseE2ETest):
 
         gil_now = self._current(admin, room, course)
         self.assertEqual(gil_now["sender"], gil_id)
-        # The figures of the history entry with the most XP, its date the
-        # earliest found.
-        self.assertEqual(gil_now["content"]["can_dos"], {merged: _entry(310, SEEN)})
+        # The figures of the history entry with the most XP, complete or not,
+        # its date the earliest found.
+        self.assertEqual(gil_now["content"]["can_dos"], {merged: _entry(400, SEEN)})
         hal_now = self._current(admin, hal_room, course)
         self.assertEqual(
             hal_now["content"]["can_dos"],

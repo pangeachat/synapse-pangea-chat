@@ -345,9 +345,11 @@ _RECORDS_SQL = """
     LIMIT ?
 """
 
-# The entries that show a completion (a date, or the completed flag), under the
-# given Can-Do ids, of every version of one record the learner sent: rejected
-# and redacted events left out.
+# Every entry, under the given Can-Do ids, of every version of one record the
+# learner sent: rejected and redacted events left out. Incomplete ones too: a
+# Can-Do restored from history takes the figures of its entry with the most XP,
+# whether or not that one was complete; merge_progress decides whether any
+# completion warrants the restore.
 _EARLIER_SQL = """
     SELECT DISTINCT c.key, c.value::text
     FROM events e
@@ -362,8 +364,6 @@ _EARLIER_SQL = """
         AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.redacts = e.event_id)
         AND c.key = ANY(?)
         AND jsonb_typeof(c.value) = 'object'
-        AND (c.value ->> 'first_completed_at' IS NOT NULL
-            OR c.value -> 'completed' = 'true'::jsonb)
 """
 
 # Outcomes that leave a record holding old ids or missing a completion: the
