@@ -295,9 +295,8 @@ def main(
 
     try:
         steps = make_steps(env)
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 - reported and fails the run; message withheld
+    # silent-ok: not silent - recorded as a problem that fails the run; the message is withheld because the Actions logs are public
+    except Exception as e:
         out = Outcome(problems=[f"minting the admin token failed ({type(e).__name__})"])
     else:
         out = run_night(steps)
