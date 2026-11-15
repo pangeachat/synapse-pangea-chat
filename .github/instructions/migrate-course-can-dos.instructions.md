@@ -32,7 +32,7 @@ Step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pang
 
 ## The operator script
 
-`scripts/migrate_course_can_dos.py` dry-runs every space on the homeserver, or the ones named, and writes a report to read. `--apply` then writes only the spaces the report says would change, each with its dry run's `expected`, and refuses a report made on another homeserver. Reports quote teachers' notes: keep them out of the repo.
+`scripts/migrate_course_can_dos.py` dry-runs every space on the homeserver, or the ones named, and writes a report to read. `--apply` then writes only the spaces the report says would change, each with its dry run's `expected`, and refuses a report made on another homeserver. Reports quote teachers' notes: keep them out of the repo. The nightly progress pass runs this dry run every night and never applies it; a space left to rewrite stops the run for a person ([migrate-course-progress](migrate-course-progress.instructions.md#the-nightly-pass)).
 
 ## Not in scope
 
