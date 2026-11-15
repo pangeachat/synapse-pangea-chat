@@ -956,12 +956,13 @@ class TestMalformedCopiesBesidePins(unittest.TestCase):
 
     def test_a_malformed_list_is_left_and_valid_pins_still_move(self) -> None:
         mode = _event("$m", "@teacher:x", {PINS_KEY: {"a1": ["x"]}})
-        for content in (
+        contents: List[Any] = [
             {"version": 1, "revision": 2, "missions": 1},
             _copy([{"lo_id": [], "activity_ids": []}]),
             _copy([{"lo_id": {"a1": 1}, "activity_ids": []}]),
             ["not", "an", "object"],
-        ):
+        ]
+        for content in contents:
             with self.subTest(content=content):
                 plan = plan_space(
                     _state(copy=_event("$c", "@teacher:x", content), mode=mode), MAP
