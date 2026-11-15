@@ -2,7 +2,34 @@
 that corrects a ``pangea.course_progress`` write naming a retired Can-Do id,
 and the server-admin endpoint that loads the environment's map.
 
-Design: stale-progress-guard.instructions.md.
+Part of the Can-Do migration (pangeachat/.github#832). An app that loaded a
+course's outline before the switch keeps the old ids until it restarts, and on
+its next analytics upload writes the learner's record under them with none of
+the dates the progress migration kept. Restarting does not repair the record.
+
+The write is corrected, not refused (Will, 2026-11-15). Today's app reports a
+refused write to Sentry, retries it after every upload, and stops checking the
+learner's other courses in that language for that run, so a refusal would also
+stop the dashboard's figures for courses that were never stale. A repair after
+the write would store and forward the stale record first. Corrected here, the
+send succeeds: the learner sees nothing (the app shows the old outline until it
+restarts), and the dashboard keeps the migrated Can-Dos and dates and gains a
+completion reached on the stale app. XP earned on the stale app reaches the
+dashboard once the app restarts and recomputes the record. The rules are in
+``correct.correct_record``.
+
+Synapse builds the replacement before storing the event, on whichever worker
+creates it, from the room's state, so no stale record is stored or forwarded.
+
+Course lists and pins naming a retired id are accepted and reported only:
+Content Studio refuses a publish from a pre-switch draft (the migration bumps
+the list's revision), correcting a list would repeat the migration's combining
+rules, and refusing pins would show a teacher an error.
+
+The map (``retired_map``) is loaded right after an environment's progress
+migration, never before its switch: before it the old ids are current and every
+normal write would be rewritten. With no map the guard does nothing; clearing
+it turns the guard off.
 """
 
 from __future__ import annotations

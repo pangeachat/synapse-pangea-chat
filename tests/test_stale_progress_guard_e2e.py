@@ -1,5 +1,5 @@
 """Integration tests for the stale course progress guard, against a local
-Synapse + PostgreSQL (stale-progress-guard.instructions.md)."""
+Synapse + PostgreSQL (synapse_pangea_chat/stale_progress_guard/guard.py)."""
 
 from __future__ import annotations
 

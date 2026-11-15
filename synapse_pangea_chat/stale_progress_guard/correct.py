@@ -1,6 +1,6 @@
 """Pure decisions for the stale course progress guard.
 
-Design: stale-progress-guard.instructions.md. An app that loaded a course's
+Design: guard.py's docstring. An app that loaded a course's
 outline before its Can-Dos were merged writes the learner's
 ``pangea.course_progress`` with retired Can-Do ids and no completion dates.
 The guard corrects such a write against the record already stored, so it

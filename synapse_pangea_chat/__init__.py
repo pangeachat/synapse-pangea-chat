@@ -838,7 +838,7 @@ class PangeaChat:
 
         # --- Stale course progress guard ---
         # Last of the check_event_allowed callbacks: Synapse stops at the first
-        # one that replaces an event (stale-progress-guard.instructions.md).
+        # one that replaces an event (stale_progress_guard/guard.py).
         self.stale_progress_guard = register_stale_progress_guard(api)
 
     async def _on_new_event_room_preview(

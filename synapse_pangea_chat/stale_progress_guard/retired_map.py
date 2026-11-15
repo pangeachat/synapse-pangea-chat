@@ -1,6 +1,6 @@
 """The environment's retired Can-Do map: old Can-Do row id to merged row id.
 
-Design: stale-progress-guard.instructions.md. Kept in a table of its own in
+Design: guard.py's docstring. Kept in a table of its own in
 the homeserver's database, so every worker reads the same map and it outlives
 the deletion of the old Can-Dos. Each process keeps a copy and reads the
 table again at most once a minute; a change made through this process is read

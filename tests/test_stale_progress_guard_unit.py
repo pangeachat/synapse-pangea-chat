@@ -1,5 +1,5 @@
 """Unit tests for the stale course progress guard
-(stale-progress-guard.instructions.md)."""
+(synapse_pangea_chat/stale_progress_guard/guard.py)."""
 
 from __future__ import annotations
 
