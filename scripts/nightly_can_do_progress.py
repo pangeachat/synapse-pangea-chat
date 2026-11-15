@@ -142,7 +142,8 @@ def run_night(steps: Steps) -> Outcome:
 
     try:
         spaces = space_counts(steps.space_dry_run())
-    except Exception as e:  # noqa: BLE001 - recorded as a problem; message withheld
+    # silent-ok: not silent - recorded as a problem that fails the run; the message is withheld because the Actions logs are public
+    except Exception as e:
         out.problems.append(f"course-space dry run failed ({type(e).__name__})")
     else:
         out.say(f"course spaces (dry run only): {format_counts(spaces)}")
@@ -156,7 +157,8 @@ def run_night(steps: Steps) -> Outcome:
 
     try:
         first = progress_counts(steps.progress(True))
-    except Exception as e:  # noqa: BLE001 - recorded as a problem; message withheld
+    # silent-ok: not silent - recorded as a problem that fails the run; the message is withheld because the Actions logs are public
+    except Exception as e:
         out.problems.append(f"progress dry run failed ({type(e).__name__})")
         return out
     out.say(f"progress dry run: {format_counts(first)}")
@@ -173,7 +175,8 @@ def run_night(steps: Steps) -> Outcome:
 
     try:
         applied = progress_counts(steps.progress(False))
-    except Exception as e:  # noqa: BLE001 - recorded as a problem; message withheld
+    # silent-ok: not silent - recorded as a problem that fails the run; the message is withheld because the Actions logs are public
+    except Exception as e:
         out.problems.append(f"progress apply failed ({type(e).__name__})")
     else:
         out.say(f"progress apply: {format_counts(applied)}")
@@ -185,7 +188,8 @@ def run_night(steps: Steps) -> Outcome:
 
     try:
         second = progress_counts(steps.progress(True))
-    except Exception as e:  # noqa: BLE001 - recorded as a problem; message withheld
+    # silent-ok: not silent - recorded as a problem that fails the run; the message is withheld because the Actions logs are public
+    except Exception as e:
         out.problems.append(f"second progress dry run failed ({type(e).__name__})")
         return out
     out.say(f"second progress dry run: {format_counts(second)}")
