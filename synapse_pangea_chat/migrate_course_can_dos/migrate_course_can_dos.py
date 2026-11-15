@@ -553,7 +553,9 @@ def _old_ids_in_copy(content: Any, can_do_map: Mapping[str, str]) -> int:
         for key in ("missions", "removed_missions")
         if isinstance(content.get(key), list)
         for entry in content[key]
-        if isinstance(entry, Mapping) and entry.get("lo_id") in can_do_map
+        if isinstance(entry, Mapping)
+        and isinstance(entry.get("lo_id"), str)
+        and entry["lo_id"] in can_do_map
     )
 
 
@@ -796,10 +798,14 @@ def plan_space(
     if mode_event is not None:
         mode = unfreeze(mode_event.content)
         listed: List[str] = []
-        if copy_event is not None:
+        copy_content = unfreeze(copy_event.content) if copy_event is not None else None
+        missions = (
+            copy_content.get("missions") if isinstance(copy_content, Mapping) else None
+        )
+        if isinstance(missions, list):
             listed = [
                 entry["lo_id"]
-                for entry in unfreeze(copy_event.content).get("missions") or []
+                for entry in missions
                 if isinstance(entry, Mapping) and isinstance(entry.get("lo_id"), str)
             ]
         rewrite = rewrite_pins(mode, can_do_map, listed)
@@ -1040,6 +1046,10 @@ def _report_dropped(room_id: str, answer: Mapping[str, Any]) -> None:
         "fields_dropped": sum(
             len(c.get("fields_dropped", [])) for c in copy_answer.get("combined", [])
         ),
+        "hidden_now_shown": sum(
+            c.get("hidden_now_shown", 0) for c in copy_answer.get("combined", [])
+        ),
+        "removed_into_missions": len(copy_answer.get("removed_into_missions", [])),
         "notes_trimmed": len(copy_answer.get("notes_trimmed", [])),
         "pin_values_dropped": pins_answer.get("pin_values_dropped", 0),
         "unpinned_siblings": len(pins_answer.get("unpinned_siblings", [])),

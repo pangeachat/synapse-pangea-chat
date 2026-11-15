@@ -6,9 +6,13 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+from unittest import mock
 
 from synapse.util.frozenutils import freeze
 
+from synapse_pangea_chat.migrate_course_can_dos import (
+    migrate_course_can_dos as migration,
+)
 from synapse_pangea_chat.migrate_course_can_dos.migrate_course_can_dos import (
     COPY,
     MAX_NOTE_UTF16,
@@ -945,6 +949,50 @@ class TestPinsDrops(unittest.TestCase):
                 )
                 self.assertEqual(plan.writes, [])
                 self.assertEqual(plan.answer[PINS]["outcome"], "unreadable")
+
+
+class TestMalformedCopiesBesidePins(unittest.TestCase):
+    """Codex review: a list readers ignore never breaks the plan."""
+
+    def test_a_malformed_list_is_left_and_valid_pins_still_move(self) -> None:
+        mode = _event("$m", "@teacher:x", {PINS_KEY: {"a1": ["x"]}})
+        for content in (
+            {"version": 1, "revision": 2, "missions": 1},
+            _copy([{"lo_id": [], "activity_ids": []}]),
+            _copy([{"lo_id": {"a1": 1}, "activity_ids": []}]),
+            ["not", "an", "object"],
+        ):
+            with self.subTest(content=content):
+                plan = plan_space(
+                    _state(copy=_event("$c", "@teacher:x", content), mode=mode), MAP
+                )
+                self.assertEqual(plan.answer[COPY]["outcome"], "ignored_by_readers")
+                self.assertEqual(plan.answer[COPY]["old_ids_left"], 0)
+                self.assertEqual(
+                    [event_type for event_type, _ in plan.writes],
+                    ["pangea.teacher_mode"],
+                )
+
+
+class TestReportDropped(unittest.TestCase):
+    """Codex review: every loss counted in the answer reaches Sentry."""
+
+    def test_activity_visibility_losses_are_reported(self) -> None:
+        answer = {
+            COPY: {
+                "combined": [{"hidden_now_shown": 2}],
+                "removed_into_missions": [{"lo_id": "M", "activities_hidden": 1}],
+            },
+            PINS: None,
+        }
+        with mock.patch.object(migration, "report") as report:
+            migration._report_dropped("!r:x", answer)
+        report.assert_called_once_with(
+            "migrate_course_can_dos: combining left out teacher settings",
+            room_id="!r:x",
+            hidden_now_shown=2,
+            removed_into_missions=1,
+        )
 
 
 if __name__ == "__main__":
