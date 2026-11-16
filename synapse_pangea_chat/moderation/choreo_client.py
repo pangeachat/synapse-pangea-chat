@@ -356,14 +356,15 @@ class BatchVerdicts:
     Two fields because they are two different facts, and collapsing them is
     the mistake this type exists to prevent. `results` is one entry per
     requested text, in request order, `None` where there is no verdict.
-    `confirmed` says whether each entry came back from a request carrying
-    exactly its own text - so a caller may act on it directly - or was mapped
-    by position out of one batched response, in which case it is a screen and
-    anything it flags has to be asked again on its own.
+    `confirmed` is one flag per entry: whether that entry came back from a
+    request carrying exactly its own text - so a caller may act on it
+    directly - or was mapped by position out of one batched response, in
+    which case it is a screen and anything it flags has to be asked again on
+    its own. Per entry because a split batch mixes the two (#245).
     """
 
     results: List[Optional[Dict[str, Any]]]
-    confirmed: bool
+    confirmed: List[bool]
 
 
 class ModerationCheckError(Exception):
@@ -1283,7 +1284,7 @@ class ChoreoChecker:
         from synapse_pangea_chat.moderation import metrics
 
         if not texts:
-            return BatchVerdicts([], confirmed=True)
+            return BatchVerdicts([], confirmed=[])
         if len(texts) == 1 or not self._batch_supported:
             # A batch of one buys nothing and, against an un-upgraded
             # endpoint, costs a refused round trip before the single call it
@@ -1293,7 +1294,8 @@ class ChoreoChecker:
             # implementation of it - and each of its answers is confirmed by
             # construction, because each request carried one text.
             return BatchVerdicts(
-                [await self.check(text) for text in texts], confirmed=True
+                [await self.check(text) for text in texts],
+                confirmed=[True] * len(texts),
             )
 
         refusal, ticket = self._breaker.check()
@@ -1302,7 +1304,7 @@ class ChoreoChecker:
             # unmoderated, and a shed batch reported as one drop understates
             # the gap by the size of the batch.
             metrics.record_drop(refusal, len(texts))
-            return BatchVerdicts([None] * len(texts), confirmed=False)
+            return BatchVerdicts([None] * len(texts), confirmed=[False] * len(texts))
 
         try:
             results = await self._batch_admitted(texts, ticket)
@@ -1316,7 +1318,7 @@ class ChoreoChecker:
             # as singles, unlike a refusal: thirty-two more calls against a
             # service that is already failing is the opposite of what the
             # breaker exists for. These messages fail open per item, counted.
-            return BatchVerdicts([None] * len(texts), confirmed=False)
+            return BatchVerdicts([None] * len(texts), confirmed=[False] * len(texts))
         if results is _BATCH_UNSUPPORTED:
             self._demote_batching()
             # Re-asked immediately and one at a time. Never wedge and never
@@ -1324,7 +1326,8 @@ class ChoreoChecker:
             # ordinary state of a deployment that has not been upgraded, and
             # the messages in this batch still have to be moderated.
             return BatchVerdicts(
-                [await self.check(text) for text in texts], confirmed=True
+                [await self.check(text) for text in texts],
+                confirmed=[True] * len(texts),
             )
         if results is _BATCH_REFUSED:
             return await self._split_refused(texts)
@@ -1341,7 +1344,7 @@ class ChoreoChecker:
             metrics.record_check("clean", clean)
         if flagged:
             metrics.record_screen("flagged", flagged)
-        return BatchVerdicts(list(verdicts), confirmed=False)
+        return BatchVerdicts(list(verdicts), confirmed=[False] * len(verdicts))
 
     async def _split_refused(self, texts: Sequence[str]) -> "BatchVerdicts":
         """Halve a refused batch and ask again. Never a demotion on its own.
@@ -1388,15 +1391,14 @@ class ChoreoChecker:
         # path at length one, and the length guarantee on the way out.
         first = await self.check_batch(texts[:middle])
         second = await self.check_batch(texts[middle:])
+        # Each half keeps its own flags: a half answered by single-text calls
+        # is confirmed and a half answered positionally is a screen. Folding
+        # them into one flag either redacts on a positional mapping or re-asks
+        # a confirmed verdict, and a clean second answer would then erase a
+        # confirmed self-harm finding (#245).
         return BatchVerdicts(
             list(first.results) + list(second.results),
-            # AND, which is the conservative direction: a half answered by a
-            # single-text call is confirmed, a half answered positionally is a
-            # screen, and reporting the pair as a screen costs one extra call
-            # per FLAGGED message. Reporting it as confirmed would redact on a
-            # positional mapping, which is the one thing this type exists to
-            # prevent.
-            confirmed=first.confirmed and second.confirmed,
+            confirmed=list(first.confirmed) + list(second.confirmed),
         )
 
     def _explained_by_size(self, texts: Sequence[str]) -> bool:

@@ -258,7 +258,7 @@ class TestAnUncheckedMessageIsQueued(_Base):
     async def test_a_batch_entry_with_no_verdict_is_queued(self) -> None:
         mod = self._module()
         assert mod._checker is not None
-        verdicts = BatchVerdicts(results=[CLEAN, None], confirmed=False)
+        verdicts = BatchVerdicts(results=[CLEAN, None], confirmed=[False, False])
         with patch.object(
             mod._checker, "check_batch", AsyncMock(return_value=verdicts)
         ):
@@ -268,7 +268,7 @@ class TestAnUncheckedMessageIsQueued(_Base):
     async def test_a_confirmed_batch_entry_with_no_verdict_is_queued(self) -> None:
         mod = self._module()
         assert mod._checker is not None
-        verdicts = BatchVerdicts(results=[UNUSABLE, CLEAN], confirmed=True)
+        verdicts = BatchVerdicts(results=[UNUSABLE, CLEAN], confirmed=[True, True])
         with patch.object(
             mod._checker, "check_batch", AsyncMock(return_value=verdicts)
         ):
@@ -278,7 +278,7 @@ class TestAnUncheckedMessageIsQueued(_Base):
     async def test_a_decision_error_in_a_batch_queues_that_message(self) -> None:
         mod = self._module()
         assert mod._checker is not None
-        verdicts = BatchVerdicts(results=[FLAGGED, CLEAN], confirmed=False)
+        verdicts = BatchVerdicts(results=[FLAGGED, CLEAN], confirmed=[False, False])
         with patch.object(
             mod._checker, "check_batch", AsyncMock(return_value=verdicts)
         ), patch.object(
@@ -292,7 +292,7 @@ class TestAnUncheckedMessageIsQueued(_Base):
     async def test_a_screen_flag_whose_confirmation_fails_is_queued(self) -> None:
         mod = self._module()
         assert mod._checker is not None
-        verdicts = BatchVerdicts(results=[FLAGGED, CLEAN], confirmed=False)
+        verdicts = BatchVerdicts(results=[FLAGGED, CLEAN], confirmed=[False, False])
         with patch.object(
             mod._checker, "check_batch", AsyncMock(return_value=verdicts)
         ), self._check(mod, None):

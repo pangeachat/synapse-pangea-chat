@@ -518,7 +518,7 @@ class BatchCheckerTestCase(unittest.TestCase):
         verdicts = _run(checker.check_batch(["bad", "fine"]))
         self.assertEqual([r and r["flagged"] for r in verdicts.results], [True, False])
         self.assertTrue(
-            verdicts.confirmed,
+            all(verdicts.confirmed),
             "the fallback's answers were reported as a screen, so every "
             "flagged message would be asked about twice",
         )
@@ -707,6 +707,26 @@ class BatchCheckerTestCase(unittest.TestCase):
             "the refused batch was not split in half and retried",
         )
 
+    def test_a_split_keeps_each_half_confirmed_or_screened(self) -> None:
+        """#245: a split answers one half by a single-text call and the other
+        positionally. Each answer keeps its own kind; the single-text one is
+        a verdict and must not be re-asked (a clean second answer would erase
+        a confirmed self-harm finding)."""
+        agent = _Agent(
+            [
+                _Response(422, _too_large_body(["a", "b", "c"])),
+                _Response(
+                    200, json.dumps(_verdict(True, ["self-harm/intent"])).encode()
+                ),
+                _Response(200, _body([_verdict(False), _verdict(True, ["hate"])])),
+            ]
+        )
+        verdicts = _run(self._checker(agent).check_batch(["a", "b", "c"]))
+        self.assertEqual(
+            [r and r["flagged"] for r in verdicts.results], [True, False, True]
+        )
+        self.assertEqual(verdicts.confirmed, [True, False, False])
+
     def test_one_learner_cannot_switch_batching_off_for_everybody(self) -> None:
         """A long message is ordinary traffic, not a contract negotiation.
 
@@ -760,7 +780,7 @@ class BatchCheckerTestCase(unittest.TestCase):
             "treated as one that understands `texts`",
         )
         self.assertEqual([r and r["flagged"] for r in verdicts.results], [False, True])
-        self.assertTrue(verdicts.confirmed)
+        self.assertTrue(all(verdicts.confirmed))
         self.assertEqual(
             sum(1 for body in agent.bodies if "texts" in body),
             1,
@@ -790,7 +810,7 @@ class BatchCheckerTestCase(unittest.TestCase):
             all(result is not None for result in verdicts.results),
             "messages went unmoderated while the shape was being established",
         )
-        self.assertTrue(verdicts.confirmed)
+        self.assertTrue(all(verdicts.confirmed))
         self.assertFalse(
             checker.batch_supported,
             "an endpoint that refuses even a two-text batch was asked for one "
@@ -870,8 +890,9 @@ class BatchOrderingTestCase(unittest.TestCase):
         )
         verdicts = _run(self._checker(agent).check_batch(texts))
         self.assertEqual(agent.bodies[0]["texts"], texts)
-        self.assertFalse(
+        self.assertEqual(
             verdicts.confirmed,
+            [False] * 32,
             "a positionally mapped batch reported itself as confirmed, so the "
             "caller would redact on it without asking again",
         )

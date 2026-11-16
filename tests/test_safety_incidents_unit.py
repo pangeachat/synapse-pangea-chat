@@ -1844,6 +1844,44 @@ class TestRoundTwoFindings(Tier2Case):
         self.assertEqual(row.action, ACTION_KEPT)
         self.assertTrue(row.self_harm)
 
+    async def test_a_split_batch_keeps_a_confirmed_self_harm_verdict(
+        self,
+    ) -> None:
+        """#245: a split batch answers one message by a single-text call and
+        another positionally. The confirmed self-harm verdict is acted on as
+        it stands; only the screened flag is asked again, so a clean second
+        answer cannot erase the self-harm finding."""
+        module, _api, homeserver, _db = self._module()
+        jobs = (_job("$e1", text="i want to hurt myself"), _job("$e2"))
+        batch = SimpleNamespace(
+            results=[
+                {
+                    "flagged": True,
+                    "categories": ["self-harm/intent"],
+                    "evaluated": True,
+                },
+                {"flagged": True, "categories": ["harassment"], "evaluated": True},
+            ],
+            confirmed=[True, False],
+        )
+        asked: List[str] = []
+
+        async def _check_batch(texts: Any) -> Any:
+            return batch
+
+        async def _check(text: str) -> Any:
+            asked.append(text)
+            return {"flagged": False, "categories": [], "evaluated": True}
+
+        with patch.object(module._checker, "check_batch", _check_batch):
+            with patch.object(module._checker, "check", _check):
+                await module._screen_batch(jobs)
+        homeserver.clock.advance(1.0)
+        self.assertEqual(asked, [jobs[1].text])
+        first = await self._row(module, "$e1")
+        self.assertEqual(first.action, ACTION_PRESERVED)
+        self.assertTrue(first.self_harm)
+
     async def test_a_cancelled_batch_hands_on_the_answers_it_did_not_reach(
         self,
     ) -> None:
@@ -1855,7 +1893,7 @@ class TestRoundTwoFindings(Tier2Case):
             {"flagged": False, "categories": [], "evaluated": True},
         ]
         assert module._checker is not None
-        batch = SimpleNamespace(results=results, confirmed=True)
+        batch = SimpleNamespace(results=results, confirmed=[True] * len(results))
 
         async def _check_batch(texts: Any) -> Any:
             return batch
@@ -1883,7 +1921,7 @@ class TestRoundTwoFindings(Tier2Case):
             {"flagged": True, "categories": ["self-harm/intent"], "evaluated": True},
         ]
         assert module._checker is not None
-        batch = SimpleNamespace(results=results, confirmed=False)
+        batch = SimpleNamespace(results=results, confirmed=[False] * len(results))
 
         async def _check_batch(texts: Any) -> Any:
             return batch
@@ -1975,7 +2013,7 @@ class TestRoundThreeFindings(Tier2Case):
             {"flagged": True, "categories": ["self-harm/intent"], "evaluated": True},
         ]
         assert module._checker is not None
-        batch = SimpleNamespace(results=results, confirmed=True)
+        batch = SimpleNamespace(results=results, confirmed=[True] * len(results))
 
         async def _check_batch(texts: Any) -> Any:
             return batch
