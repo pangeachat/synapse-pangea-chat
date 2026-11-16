@@ -1,0 +1,121 @@
+"""Unit tests for the operator script that gives course spaces with no Can-Do
+list of their own one (scripts/write_course_copies.py, admin-dash-api#472)."""
+
+from __future__ import annotations
+
+import importlib.util
+import io
+import os
+import unittest
+from contextlib import redirect_stdout
+from typing import Any, Dict, List, Optional
+from unittest import mock
+
+_SCRIPT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "scripts",
+    "write_course_copies.py",
+)
+_spec = importlib.util.spec_from_file_location("write_course_copies", _SCRIPT)
+assert _spec is not None and _spec.loader is not None
+script: Any = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(script)
+
+HS = "https://matrix.staging.pangea.chat"
+
+
+def _space(
+    quest: Optional[str] = "q1",
+    name: str = "My class",
+    topic: str = "Mine",
+    has_list: bool = False,
+) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = [
+        {"type": "m.room.name", "state_key": "", "content": {"name": name}},
+        {"type": "m.room.topic", "state_key": "", "content": {"topic": topic}},
+    ]
+    if quest is not None:
+        events.append(
+            {"type": "pangea.course_plan", "state_key": "", "content": {"uuid": quest}}
+        )
+    if has_list:
+        events.append(
+            {"type": "pangea.course_missions", "state_key": "", "content": {}}
+        )
+    return events
+
+
+class TestWriteCourseCopies(unittest.TestCase):
+    def _run(
+        self,
+        rooms: Dict[str, Optional[List[Dict[str, Any]]]],
+        commit: bool = False,
+        answer: tuple = (200, {"can_do_list": {"built": True, "missions": 3}}),
+    ) -> tuple:
+        posts: List[Dict[str, Any]] = []
+
+        def call(url: str, token: str, body: Optional[Dict[str, Any]] = None) -> tuple:
+            if body is not None:
+                posts.append(body)
+                return answer
+            room = next(
+                r for r in rooms if r.replace("!", "%21").replace(":", "%3A") in url
+            )
+            state = rooms[room]
+            return (200, {"state": state}) if state is not None else (500, {})
+
+        with mock.patch.object(script, "_call", side_effect=call), mock.patch.object(
+            script, "walk_spaces", return_value=iter(rooms)
+        ), mock.patch.object(script.time, "sleep"), redirect_stdout(io.StringIO()):
+            code = script.run(HS, "t", commit)
+        return code, posts
+
+    def test_only_a_course_with_no_list_is_sent_its_own_quest_name_and_topic(
+        self,
+    ) -> None:
+        code, posts = self._run(
+            {
+                "!a:x": _space("q1"),
+                "!b:x": _space("q2", has_list=True),
+                "!c:x": _space(None),
+            },
+            commit=True,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            posts,
+            [
+                {
+                    "room_id": "!a:x",
+                    "quest_id": "q1",
+                    "expected_quest_id": "q1",
+                    "title": "My class",
+                    "description": "Mine",
+                    "dry_run": False,
+                }
+            ],
+        )
+
+    def test_the_default_is_a_dry_run(self) -> None:
+        _, posts = self._run({"!a:x": _space()})
+        self.assertTrue(posts[0]["dry_run"])
+
+    def test_a_refusal_or_an_unbuilt_list_exits_1(self) -> None:
+        unbuilt = (200, {"can_do_list": {"built": False}})
+        self.assertEqual(self._run({"!a:x": _space()}, answer=unbuilt)[0], 1)
+        self.assertEqual(
+            self._run({"!a:x": _space()}, answer=(409, {"error": "x"}))[0], 1
+        )
+
+    def test_an_unreadable_or_unnamed_space_exits_1_and_sends_nothing(self) -> None:
+        self.assertEqual(self._run({"!a:x": None}), (1, []))
+        self.assertEqual(self._run({"!a:x": _space(name="")}), (1, []))
+
+    def test_production_needs_confirmation(self) -> None:
+        with mock.patch.dict(os.environ, {"MATRIX_ADMIN_TOKEN": "t"}):
+            with self.assertRaises(SystemExit):
+                script.main(["--homeserver", "https://matrix.pangea.chat"])
+
+
+if __name__ == "__main__":
+    unittest.main()
