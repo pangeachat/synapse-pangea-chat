@@ -30,6 +30,8 @@ Step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pang
 6. Sends the list, then the pins, as ordinary state events from the space's strongest local instructor, as [set-course-plan](set-course-plan.instructions.md) does, so readers accept the list and the [analytics forwarder](analytics-forward.instructions.md) updates the dashboard's mirror. Nobody joins and no power level changes.
 7. Writes only while the space still holds both events its dry run read. A teacher's edit always makes a new event, so an edited space is skipped and reported, never overwritten. A re-run reads current state, so it never undoes an edit, and a space with no old id left has nothing to write. The check and the send are not atomic: a publish in the moment between them is lost.
 
+After the switch, a list or pins event that still names an old Can-Do is accepted as sent and reported to Sentry by the stale progress guard (`synapse_pangea_chat/stale_progress_guard/`); a later dry run finds it.
+
 ## The operator script
 
 `scripts/migrate_course_can_dos.py` dry-runs every space on the homeserver, or the ones named, and writes a report to read. `--apply` then writes only the spaces the report says would change, each with its dry run's `expected`, and refuses a report made on another homeserver. Reports quote teachers' notes: keep them out of the repo. The nightly progress pass runs this dry run every night and never applies it; a space left to rewrite stops the run for a person ([migrate-course-progress](migrate-course-progress.instructions.md#the-nightly-pass)).

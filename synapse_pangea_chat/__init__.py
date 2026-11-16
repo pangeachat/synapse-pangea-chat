@@ -103,6 +103,7 @@ from synapse_pangea_chat.room_preview import (
 )
 from synapse_pangea_chat.safety_incidents import register_safety_incidents
 from synapse_pangea_chat.set_course_plan import SetCoursePlan
+from synapse_pangea_chat.stale_progress_guard import register_stale_progress_guard
 from synapse_pangea_chat.student_invitations import register_student_invitations
 from synapse_pangea_chat.student_invitations.rate_limits import parse_rate_limits
 from synapse_pangea_chat.user_activity import (
@@ -834,6 +835,11 @@ class PangeaChat:
         # Registered only with a usable private key in config; otherwise the
         # paths do not exist and the reason is logged.
         self.lti_store = register_lti(api, config, self.student_invitations)
+
+        # --- Stale course progress guard ---
+        # Last of the check_event_allowed callbacks: Synapse stops at the first
+        # one that replaces an event (stale_progress_guard/guard.py).
+        self.stale_progress_guard = register_stale_progress_guard(api)
 
     async def _on_new_event_room_preview(
         self,
