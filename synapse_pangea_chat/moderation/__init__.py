@@ -1307,8 +1307,8 @@ class ChatModeration:
             # is entirely latency, and it is reachable during a rolling choreo
             # upgrade where production load meets an endpoint answering 422.
             self._stop_batching()
-        pairs = list(zip(jobs, verdicts.results, strict=True))
-        for index, (job, result) in enumerate(pairs):
+        triples = list(zip(jobs, verdicts.results, verdicts.confirmed, strict=True))
+        for index, (job, result, confirmed) in enumerate(triples):
             # Each job inside its own guard. Sharing one provider call is a
             # transport decision and must not widen a blast radius: before
             # batching every job was its own handler call, so a failure cost
@@ -1318,7 +1318,7 @@ class ChatModeration:
             # extraction applies per surface and the disposition applies per
             # row.
             try:
-                if not await self._decide_screened(job, result, verdicts.confirmed):
+                if not await self._decide_screened(job, result, confirmed):
                     self._queue_recheck((job,))
             except Exception as exc:
                 # A cancellation ends the loop, and the jobs behind this one
@@ -1329,8 +1329,7 @@ class ChatModeration:
                     exc,
                     partial(
                         self._rescue_unscreened,
-                        pairs[index + 1 :],
-                        verdicts.confirmed,
+                        triples[index + 1 :],
                     ),
                 )
                 # silent-ok: fail-open by contract, and the loop has to
@@ -1453,8 +1452,7 @@ class ChatModeration:
 
     def _rescue_unscreened(
         self,
-        pairs: Sequence[Tuple[ModerationJob, Optional[Dict[str, Any]]]],
-        confirmed: bool,
+        triples: Sequence[Tuple[ModerationJob, Optional[Dict[str, Any]], bool]],
     ) -> None:
         """Hand every flagged answer a cancelled batch did not reach to the
         retry. Nothing was enforced on any of them, so each is recorded as
@@ -1468,7 +1466,7 @@ class ChatModeration:
         answers that call had not yet handed back; nothing is enforced on
         them, and it is the shutdown counterpart of the crash between a send
         and its row's write (`_decide`)."""
-        for job, result in pairs:
+        for job, result, confirmed in triples:
             if result is None or not result.get("flagged"):
                 continue
             categories = result.get("categories")
