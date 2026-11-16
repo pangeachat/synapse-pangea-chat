@@ -26,6 +26,9 @@ written to disk, no room, course or learner id is printed, and an error is
 printed as its type, never its message. The admin token is minted in memory from
 the bot's Matrix credentials in AWS Secrets Manager and never printed.
 
+Environments: staging, and production built but not enabled (manual runs only,
+and none until its map and statements are committed).
+
 Exit codes: 0 done or nothing to do, 1 something needs a person.
 """
 
@@ -75,7 +78,20 @@ class Environment:
     homeserver: str
     secret_id: str
     device_id: str
-    last_night: datetime.date
+    # The scheduled window, both inclusive. With no first night the schedule
+    # never runs this environment; a person starts it by hand.
+    first_night: Optional[datetime.date]
+    last_night: Optional[datetime.date]
+
+    def over(self, today: datetime.date) -> bool:
+        return self.last_night is not None and today > self.last_night
+
+    def scheduled(self, today: datetime.date) -> bool:
+        return (
+            self.first_night is not None
+            and self.first_night <= today
+            and not self.over(today)
+        )
 
     @property
     def map_path(self) -> str:
@@ -86,16 +102,30 @@ class Environment:
         return os.path.join(DATA_DIR, self.name, "can-do-statements.json")
 
 
-# Staging switched on 2026-11-14 (pangeachat/.github#832); two weeks of nightly passes.
+# Each environment's login device is fixed, so the homeserver reuses it and no
+# login fans out a device-list change; it is never logged out or deleted (org
+# access-controls.instructions.md, "Matrix service-account sessions").
 ENVIRONMENTS = {
     "staging": Environment(
         name="staging",
         homeserver="https://matrix.staging.pangea.chat",
         secret_id="/staging/bot/matrix-credentials",
-        # The device the laptop pass already uses, so no new device fans out
-        # (org access-controls.instructions.md, "Matrix service-account sessions").
+        # The device the laptop pass already used.
         device_id="admin-script-can-do-switch-staging",
+        # Staging switched on 2026-11-14 (pangeachat/.github#832); two weeks.
+        first_night=datetime.date(2026, 11, 15),
         last_night=datetime.date(2026, 11, 28),
+    ),
+    # Built, not enabled: manual runs only until a person sets the window on the
+    # night production switches, and its map and statements are committed by the
+    # production switch itself.
+    "prod": Environment(
+        name="prod",
+        homeserver="https://matrix.pangea.chat",
+        secret_id="/prod/bot/matrix-credentials",
+        device_id="admin-script-can-do-switch-prod",
+        first_night=None,
+        last_night=None,
     ),
 }
 
@@ -333,16 +363,47 @@ def main(
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--environment", required=True, choices=sorted(ENVIRONMENTS))
+    parser.add_argument(
+        "--due",
+        choices=("scheduled", "manual"),
+        help="Only say whether the pass runs tonight (due=true|false, also to "
+        "GITHUB_OUTPUT); contacts nothing.",
+    )
     args = parser.parse_args(argv)
     env = ENVIRONMENTS[args.environment]
     today = today or datetime.datetime.now(datetime.timezone.utc).date()
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
 
-    if today > env.last_night:
+    if args.due:
+        due = not env.over(today) and (args.due == "manual" or env.scheduled(today))
+        missing = _missing_data(env) if due else None
+        if missing:
+            # Stops the job before any credentials are assumed.
+            _report(env, missing, summary)
+            return 1
+        _write_output("due", "true" if due else "false")
+        print(f"due={str(due).lower()}")
+        if not due:
+            reason = (
+                f"past {env.last_night}: the nightly passes are over"
+                if env.over(today)
+                else "not scheduled: no nightly window is set for this environment"
+            )
+            print(reason)
+            write_summary(env, Outcome(lines=[reason]), summary)
+        return 0
+
+    if env.over(today):
         out = Outcome(lines=[f"past {env.last_night}: the nightly passes are over"])
         print(out.lines[0])
         write_summary(env, out, summary)
         return 0
+
+    missing = _missing_data(env)
+    if missing:
+        # Checked before any token is minted, so a run without them contacts nothing.
+        _report(env, missing, summary)
+        return 1
 
     try:
         steps = make_steps(env)
@@ -352,6 +413,28 @@ def main(
     else:
         out = run_night(steps)
 
+    _report(env, out, summary)
+    return 1 if out.problems else 0
+
+
+def _missing_data(env: Environment) -> Optional[Outcome]:
+    missing = [
+        os.path.relpath(path, os.path.dirname(DATA_DIR))
+        for path in (env.map_path, env.statements_path)
+        if not os.path.exists(path)
+    ]
+    if not missing:
+        return None
+    return Outcome(
+        problems=[
+            f"{env.name} has no committed map or statements yet ("
+            + ", ".join(missing)
+            + "); they are written during the switch. Nothing was run."
+        ]
+    )
+
+
+def _report(env: Environment, out: Outcome, summary: Optional[str]) -> None:
     for line in out.lines:
         print(line)
     for problem in out.problems:
@@ -359,8 +442,13 @@ def main(
     write_summary(env, out, summary)
     if out.problems:
         print("NEEDS A PERSON")
-        return 1
-    return 0
+
+
+def _write_output(name: str, value: str) -> None:
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{name}={value}\n")
 
 
 if __name__ == "__main__":

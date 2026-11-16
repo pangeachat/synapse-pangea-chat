@@ -31,10 +31,10 @@ A run merges from the record and its history, so a second run changes nothing. A
 
 ## The nightly pass
 
-A scheduled workflow runs the pass nightly, and on demand, for two weeks after a switch (Will, 2026-11-15): staging only, through 2026-11-28; production is a separate decision. It dry-runs the course spaces without applying them, dry-runs the progress records, applies only when some need it, then dry-runs again. With the guard live, a rewrite found means a stale write got past it. Its inputs sit in a temporary folder deleted with these endpoints.
+A scheduled workflow runs the pass nightly, and on demand, for two weeks after a switch (Will, 2026-11-15): staging through 2026-11-28. Production is built but off: no nightly window until a person sets one on its switch night, so until then it runs only by hand, and never before its inputs are committed, which its switch writes. It dry-runs the course spaces without applying them, dry-runs the progress records, applies only when some need it, then dry-runs again. With the guard live, a rewrite found means a stale write got past it. Its inputs sit in a temporary folder deleted with these endpoints.
 
 - **Counts only:** the Actions logs are public, so no learner, room or note is printed, and an error shows only its type.
 - **It fails for a person** on a failed call; a space still naming old Can-Dos (that apply stays manual); more than five spaces refused or left with old ids; more than five failed or refused records in a run; a second dry run that still finds rewrites; or more than five records in the last dry run left with old ids or a lost completion (refused, remote, not the learner's own, failed, or an old key left). Deactivated learners' records are a separate count.
-- **Credentials:** the admin token is minted in memory from the bot's credentials, through a role limited to that secret and this repository's main branch.
+- **Credentials:** the admin token is minted in memory from that environment's bot credentials, through a role limited to that secret and this repository's main branch, on a fixed device per environment that is never logged out.
 
 The operator script's progress apply exits non-zero on the same undone records, listing deactivated ones apart.
