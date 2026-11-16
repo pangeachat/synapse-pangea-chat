@@ -315,8 +315,10 @@ class SetCoursePlan(Resource):
         new_list: Optional[Dict[str, Any]] = None
         built: Optional[Dict[str, Any]] = None
         # A switch builds the new quest's Can-Do list; a space already on the
-        # quest whose list is empty (a failed read) gets it rebuilt.
-        if update.outcome == UPDATE or current_list == {}:
+        # quest whose list is empty (a failed read) or missing (made before
+        # courses got their own list, admin-dash-api#472) gets it built.
+        rebuild = not current_list
+        if update.outcome == UPDATE or rebuild:
             built = await self._course_missions.read(req.quest_id)
             if built is None:
                 logger.error(
@@ -327,7 +329,7 @@ class SetCoursePlan(Resource):
                     (
                         "an empty list is written, so readers use the shared quest"
                         if update.outcome == UPDATE
-                        else "its empty list stays"
+                        else "its list stays as it is"
                     ),
                 )
             # The read can take seconds; a teacher who changed course or
@@ -380,7 +382,7 @@ class SetCoursePlan(Resource):
                     "revision": can_do_list_revision(new_list),
                     "missions": len((new_list or {}).get("missions") or []),
                 }
-                if update.outcome == UPDATE or current_list == {}
+                if update.outcome == UPDATE or rebuild
                 else None
             ),
             "dry_run": req.dry_run,

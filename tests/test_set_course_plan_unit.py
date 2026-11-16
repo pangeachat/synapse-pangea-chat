@@ -392,6 +392,31 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent[0]["content"]["revision"], 1)
         self.assertTrue(body["can_do_list"]["built"])
 
+    async def test_a_missing_can_do_list_on_the_quest_is_written(self) -> None:
+        # A space made before courses got their own Can-Do list (admin-dash-api#472).
+        endpoint, api = self._endpoint(can_do_list=None, on="new")
+
+        status, body = await self._post(endpoint, expected="new")
+
+        self.assertEqual(status, 200, body)
+        sent = self._sent(api)
+        self.assertEqual(sent[0]["type"], "pangea.course_missions")
+        self.assertEqual(sent[0]["content"]["revision"], 1)
+        self.assertNotIn("pangea.course_plan", [e["type"] for e in sent])
+        self.assertTrue(body["can_do_list"]["built"])
+
+    async def test_a_failed_read_writes_nothing_for_a_missing_can_do_list(
+        self,
+    ) -> None:
+        endpoint, api = self._endpoint(can_do_list=None, built=None, on="new")
+
+        with self.assertLogs(module.logger, level="ERROR"):
+            status, body = await self._post(endpoint, expected="new")
+
+        self.assertEqual(status, 200, body)
+        self.assertNotIn("pangea.course_missions", [e["type"] for e in self._sent(api)])
+        self.assertFalse(body["can_do_list"]["built"])
+
     async def test_a_failed_rebuild_leaves_the_empty_can_do_list(self) -> None:
         endpoint, api = self._endpoint(can_do_list={}, built=None, on="new")
 
