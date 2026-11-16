@@ -38,6 +38,12 @@ more a few weeks after, with the same map.
            --homeserver https://matrix.staging.pangea.chat \\
            --apply staging-progress.json --results staging-progress-results.json
 
+With ``--valid-ids`` (one JSON list: every Can-Do row id on THIS environment,
+merged ones included), the dry run also removes from course lists and pins
+every Can-Do id that is no Can-Do there, and reports each by id with counts of
+what the teacher had set on it; the apply writes the same. Without it, unknown
+ids are left as they are.
+
 The map file is one JSON object: old Can-Do row id -> merged row id, for THIS
 environment, since row ids differ between environments. The statements file is
 one JSON object: Can-Do row id -> its statement, for every old and merged
@@ -45,8 +51,16 @@ Can-Do in the map, leaving out the old Can-Dos on the quest step's no-note
 list. An entry with no note gets its old Can-Dos' statements as one, and the
 report counts them as notes added. A report records the
 homeserver, the map and which operation made it, and an apply refuses a
-report made on another homeserver or by the other operation. Space reports
-quote teachers' notes: keep them out of the repo.
+report made on another homeserver or by the other operation. Reports name
+rooms, courses and learners: keep them out of the repo. A trimmed note is
+reported as lengths and counts; its text stays in the room's history, in the
+event the dry run read.
+
+The progress apply exits 1 when any record is left with old ids or a lost
+completion (refused, on another server, not the learner's own, failed, or an
+old key left in place), so a person decides what to do with it. Deactivated
+learners' records are listed on their own and do not fail it: their old ids
+stay in rooms no app or account can read or write.
 
 ``MATRIX_ADMIN_TOKEN`` is a server admin's access token, supplied out-of-band
 (org ``access-controls.instructions.md``). It is never printed.
@@ -126,21 +140,21 @@ def dry_run(
     can_do_map: Dict[str, str],
     room_ids: Optional[List[str]] = None,
     statements: Optional[Dict[str, str]] = None,
+    valid_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """The report: the endpoint's dry-run answer for each space."""
     statements = statements or {}
     spaces = []
     for room_id in room_ids or walk_spaces(homeserver, token):
-        status, body = _call(
-            f"{homeserver}{MIGRATE_PATH}",
-            token,
-            {
-                "room_id": room_id,
-                "can_do_map": can_do_map,
-                "statements": statements,
-                "dry_run": True,
-            },
-        )
+        request: Dict[str, Any] = {
+            "room_id": room_id,
+            "can_do_map": can_do_map,
+            "statements": statements,
+            "dry_run": True,
+        }
+        if valid_ids is not None:
+            request["valid_ids"] = valid_ids
+        status, body = _call(f"{homeserver}{MIGRATE_PATH}", token, request)
         spaces.append({"room_id": room_id, "status": status, "body": body})
         time.sleep(PAUSE_SECONDS)
     return {
@@ -148,6 +162,7 @@ def dry_run(
         "homeserver": homeserver,
         "can_do_map": can_do_map,
         "statements": statements,
+        "valid_ids": valid_ids,
         "spaces": spaces,
     }
 
@@ -170,16 +185,15 @@ def apply(homeserver: str, token: str, report: Dict[str, Any]) -> List[Dict[str,
     _check_report(report, homeserver, "spaces")
     results = []
     for space in filter(to_write, report["spaces"]):
-        status, body = _call(
-            f"{homeserver}{MIGRATE_PATH}",
-            token,
-            {
-                "room_id": space["room_id"],
-                "can_do_map": report["can_do_map"],
-                "statements": report.get("statements") or {},
-                "expected": space["body"]["expected"],
-            },
-        )
+        request: Dict[str, Any] = {
+            "room_id": space["room_id"],
+            "can_do_map": report["can_do_map"],
+            "statements": report.get("statements") or {},
+            "expected": space["body"]["expected"],
+        }
+        if report.get("valid_ids") is not None:
+            request["valid_ids"] = report["valid_ids"]
+        status, body = _call(f"{homeserver}{MIGRATE_PATH}", token, request)
         results.append({"room_id": space["room_id"], "status": status, "body": body})
         time.sleep(PAUSE_SECONDS)
     return results
@@ -198,17 +212,51 @@ def summarize_report(report: Dict[str, Any]) -> List[str]:
         f"{sum(len(c.get('notes_added', [])) for c in copies)} entries gain a note "
         "from the old wording",
         f"{sum(len(c.get('notes_trimmed', [])) for c in copies)} notes trimmed",
+        "combining leaves out "
+        f"{sum(e.get('due_dates_dropped', 0) for c in copies for e in c.get('combined', []))}"
+        " due dates, "
+        f"{sum(e.get('cities_dropped', 0) for c in copies for e in c.get('combined', []))}"
+        " cities, "
+        f"{sum(len(e.get('fields_dropped', [])) for c in copies for e in c.get('combined', []))}"
+        " other fields, and shows "
+        f"{sum(e.get('hidden_now_shown', 0) for c in copies for e in c.get('combined', []))}"
+        " hidden activities",
         f"{sum(len(c.get('removed_combined', [])) for c in copies)} removed Can-Dos "
         f"combined, {sum(len(c.get('removed_into_missions', [])) for c in copies)} "
         "joined a shown Can-Do",
-        f"{sum(len(p.get('pooled', [])) for p in pins)} pin sets pooled",
+        f"{sum(len(p.get('pooled', [])) for p in pins)} pin sets pooled, "
+        f"{sum(len(p.get('unpinned_siblings', [])) for p in pins)} with an unpinned "
+        f"old Can-Do, {sum(p.get('pin_values_dropped', 0) for p in pins)} pin "
+        "values dropped",
     ]
+    unknown = [e for c in copies for e in c.get("unknown_removed", [])]
+    unknown_pins = sum(len(p.get("unknown_removed", [])) for p in pins)
+    if unknown or unknown_pins:
+        lines.append(
+            f"{len(unknown)} entries naming no Can-Do removed from lists "
+            f"({sum(e['activities'] for e in unknown)} activities, "
+            f"{sum(e['note'] for e in unknown)} notes, "
+            f"{sum(e['due_at'] for e in unknown)} due dates), "
+            f"{unknown_pins} from pins: "
+            + " ".join(sorted({e["lo_id"] for e in unknown}))
+        )
     for label, matches in (
         ("refused, no local instructor", lambda s: s["status"] == 409),
         (
             "Can-Do list left alone, readers ignore it",
             lambda s: (s["body"].get("course_missions") or {}).get("outcome")
             in ("ignored_by_readers", "rewrite_failed"),
+        ),
+        (
+            "left with old ids",
+            lambda s: bool(
+                (s["body"].get("course_missions") or {}).get("old_ids_left")
+            ),
+        ),
+        (
+            "pins unreadable, left alone",
+            lambda s: (s["body"].get("teacher_mode") or {}).get("outcome")
+            == "unreadable",
         ),
         ("failed", lambda s: s["status"] not in (200, 409)),
     ):
@@ -270,18 +318,42 @@ def run_progress(
         time.sleep(PAUSE_SECONDS)
 
 
+UNRESOLVED_OUTCOMES = (
+    "refused",
+    "not_learners_own",
+    "not_local",
+    "failed",
+)
+
+
+def unresolved(record: Dict[str, Any]) -> bool:
+    """Left with old ids or a lost completion; a deactivated learner's record
+    is counted on its own instead."""
+    if record["outcome"] == "deactivated":
+        return False
+    return record["outcome"] in UNRESOLVED_OUTCOMES or bool(record.get("old_keys_left"))
+
+
 def per_course(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
-    """Counts per course: records, rewrites, keys moved, completions kept."""
+    """Counts per course: records, rewrites, keys moved, completions kept and
+    restored."""
     counts: Dict[str, Dict[str, int]] = {}
     for record in records:
         course = counts.setdefault(
             record["course_id"],
-            {"records": 0, "rewrite": 0, "keys_moved": 0, "completions_kept": 0},
+            {
+                "records": 0,
+                "rewrite": 0,
+                "keys_moved": 0,
+                "completions_kept": 0,
+                "completions_restored": 0,
+            },
         )
         course["records"] += 1
         course["rewrite"] += record["outcome"] == "rewrite"
         course["keys_moved"] += record["keys_moved"]
         course["completions_kept"] += record["completions_kept"]
+        course["completions_restored"] += record.get("completions_restored", 0)
     return counts
 
 
@@ -293,15 +365,28 @@ def summarize_progress(records: List[Dict[str, Any]], dry_run: bool) -> List[str
         + ("to rewrite" if dry_run else "rewritten")
         + f", in {sum(1 for c in courses.values() if c['rewrite'])} courses",
         f"{sum(r['keys_moved'] for r in records)} keys moved, "
-        f"{sum(r['completions_kept'] for r in records)} completions kept",
+        f"{sum(r['completions_kept'] for r in records)} completions kept, "
+        f"{sum(r.get('completions_restored', 0) for r in records)} restored",
+        f"{sum(r.get('dates_unreadable', 0) for r in records)} unreadable dates "
+        "passed over",
     ]
-    for outcome in (
-        "deactivated",
-        "refused",
-        "not_learners_own",
-        "not_local",
-        "failed",
-    ):
+    left = [
+        f"{r['user_id']} {r['room_id']} {r['course_id']}"
+        for r in records
+        if r["outcome"] == "unchanged" and r.get("old_keys_left")
+    ]
+    if left:
+        lines.append(f"{len(left)} with an old key left in place:")
+        lines.extend(f"  {line}" for line in left)
+    deactivated = [
+        f"{r['user_id']} {r['room_id']} {r['course_id']}"
+        for r in records
+        if r["outcome"] == "deactivated"
+    ]
+    if deactivated:
+        lines.append(f"{len(deactivated)} deactivated (outside the limit):")
+        lines.extend(f"  {line}" for line in deactivated)
+    for outcome in ("unreadable", *UNRESOLVED_OUTCOMES):
         ids = [
             f"{r['user_id']} {r['room_id']} {r['course_id']}"
             for r in records
@@ -329,6 +414,10 @@ def main() -> int:
         help="Dry run: Can-Do row id -> statement, for the old Can-Dos' notes.",
     )
     parser.add_argument("--report", help="Dry run: where to write the report.")
+    parser.add_argument(
+        "--valid-ids",
+        help="Dry run: every Can-Do row id on this environment, to remove the rest.",
+    )
     parser.add_argument(
         "--room-id",
         action="append",
@@ -367,7 +456,11 @@ def main() -> int:
         can_do_map = json.load(f)
     with open(args.statements, encoding="utf-8") as f:
         statements = json.load(f)
-    report = dry_run(homeserver, token, can_do_map, args.room_id, statements)
+    valid_ids = None
+    if args.valid_ids:
+        with open(args.valid_ids, encoding="utf-8") as f:
+            valid_ids = json.load(f)
+    report = dry_run(homeserver, token, can_do_map, args.room_id, statements, valid_ids)
     _write_json(args.report, report)
     print("\n".join(summarize_report(report)))
     return 0
@@ -390,7 +483,7 @@ def _progress(
             args.results, {"records": records, "per_course": per_course(records)}
         )
         print("\n".join(summarize_progress(records, dry_run=False)))
-        return 0 if all(r["outcome"] != "failed" for r in records) else 1
+        return 1 if any(map(unresolved, records)) else 0
     if not args.map or not args.report:
         parser.error("a dry run needs --map and --report")
     with open(args.map, encoding="utf-8") as f:

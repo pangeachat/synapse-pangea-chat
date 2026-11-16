@@ -328,7 +328,13 @@ class TestMigrateCourseProgress(BaseSynapseE2ETest):
         self.assertEqual([r["outcome"] for r in mine], ["rewrite"])
         self.assertEqual(
             script.per_course(mine)[course],
-            {"records": 1, "rewrite": 1, "keys_moved": 1, "completions_kept": 1},
+            {
+                "records": 1,
+                "rewrite": 1,
+                "keys_moved": 1,
+                "completions_kept": 1,
+                "completions_restored": 0,
+            },
         )
         report = {"kind": "spaces", "homeserver": self.server_url}
         with self.assertRaises(SystemExit):
@@ -343,3 +349,88 @@ class TestMigrateCourseProgress(BaseSynapseE2ETest):
             [f"M-{tag}"],
         )
         self.assertEqual(self._current(admin, room, course)["sender"], fay_id)
+
+    async def test_completions_only_history_holds_come_back(self) -> None:
+        await self.homeserver()
+        (_, admin) = await self.new_user("op", admin=True)
+        tag = self.tag
+        old1, old2, merged = f"x1-{tag}", f"x2-{tag}", f"M-{tag}"
+        can_do_map = {old1: merged, old2: merged}
+        course = f"!course-{tag}:localhost"
+
+        # Gil completed x1 (dated) and x2 (flagged, no date: an early app);
+        # then an app with a reduced outline wrote a record with neither.
+        (gil_id, gil) = await self.new_user("gil")
+        room = self._analytics_room(gil)
+        self._put(gil, room, course, _record({old1: _entry(300, SEEN)}))
+        self._put(gil, room, course, _record({old1: _entry(310, SEEN)}))
+        self._put(gil, room, course, _record({old2: {**_entry(50), "completed": True}}))
+        # x2 then went on, not complete, to more XP than any completed entry.
+        self._put(gil, room, course, _record({old2: _entry(400)}))
+        self._put(gil, room, course, _record({}))
+
+        # Hal's only completion was flagged with no date, and then dropped.
+        (_, hal) = await self.new_user("hal")
+        hal_room = self._analytics_room(hal)
+        self._put(
+            hal, hal_room, course, _record({old2: {**_entry(90), "completed": True}})
+        )
+        self._put(hal, hal_room, course, _record({"other": _entry(1)}))
+
+        dry = self._run(admin, can_do_map, dry_run=True)
+        self.assertEqual(dry[(room, course)]["outcome"], "rewrite")
+        self.assertEqual(dry[(room, course)]["completions_restored"], 1)
+        done = self._run(admin, can_do_map, dry_run=False)
+        self.assertEqual(done[(room, course)]["outcome"], "rewrite")
+
+        gil_now = self._current(admin, room, course)
+        self.assertEqual(gil_now["sender"], gil_id)
+        # The figures of the history entry with the most XP, complete or not,
+        # its date the earliest found.
+        self.assertEqual(gil_now["content"]["can_dos"], {merged: _entry(400, SEEN)})
+        hal_now = self._current(admin, hal_room, course)
+        self.assertEqual(
+            hal_now["content"]["can_dos"],
+            {
+                "other": _entry(1),
+                merged: {
+                    **_entry(90),
+                    "completed": True,
+                    "completed_before_tracking": True,
+                },
+            },
+        )
+
+        again = self._run(admin, can_do_map, dry_run=True)
+        self.assertEqual(again[(room, course)]["outcome"], "unchanged")
+        self.assertEqual(again[(hal_room, course)]["outcome"], "unchanged")
+
+    async def test_every_page_counts_what_it_left(self) -> None:
+        await self.homeserver()
+        (_, admin) = await self.new_user("op", admin=True)
+        (teacher_id, teacher) = await self.new_user("teacher")
+        tag = self.tag
+        can_do_map = {f"x1-{tag}": f"M-{tag}"}
+        course = f"!course-{tag}:localhost"
+        # A record someone else sent, naming no old id, is not left undone.
+        (ivy_id, ivy) = await self.new_user("ivy")
+        ivy_room = self._analytics_room(ivy, ivy_id, teacher_id, 100)
+        self._join(teacher, ivy_room)
+        self._put(teacher, ivy_room, course, _record({"other": _entry(1)}))
+        # An unreadable record is counted, not passed over.
+        (_, jo) = await self.new_user("jo")
+        jo_room = self._analytics_room(jo)
+        self._put(jo, jo_room, course, {"can_dos": "nonsense"})
+
+        resp = requests.post(
+            f"{self.server_url}{_PATH}",
+            json={"can_do_map": can_do_map, "dry_run": True, "limit": 200},
+            headers=self._auth(admin),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        page = resp.json()
+        found = {(r["room_id"], r["course_id"]): r for r in page["records"]}
+        self.assertEqual(found[(ivy_room, course)]["outcome"], "unchanged")
+        self.assertEqual(found[(jo_room, course)]["outcome"], "unreadable")
+        self.assertGreaterEqual(page["counts"]["unreadable"], 1)
+        self.assertEqual(page["counts"]["records"], len(page["records"]))

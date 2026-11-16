@@ -53,11 +53,19 @@ def _records(**outcomes: int) -> List[Dict[str, Any]]:
     return [_record(o) for o, n in outcomes.items() for _ in range(n)]
 
 
-def _space(status: int = 200, writes: bool = False) -> Dict[str, Any]:
+def _space(
+    status: int = 200, writes: bool = False, old_ids_left: int = 0
+) -> Dict[str, Any]:
     body: Dict[str, Any] = {
         "writes": [{"room_id": COURSE}] if writes else [],
         "course_missions": {"notes_trimmed": [{"dropped": NOTE}]},
     }
+    if old_ids_left:
+        body["course_missions"] = {
+            "outcome": "ignored_by_readers",
+            "reason": f"{COURSE} due_at",
+            "old_ids_left": old_ids_left,
+        }
     if status != 200:
         body = {"error": f"refused for {COURSE}"}
     return {"room_id": COURSE, "status": status, "body": body}
@@ -236,6 +244,73 @@ class TestDecisions(unittest.TestCase):
         code, out, _ = _main(None, make_steps=boom)
         self.assertEqual(code, 1)
         self.assertIn("minting the admin token failed (RuntimeError)", out)
+
+
+class TestUnresolved(unittest.TestCase):
+    """Audit finding 5: records and spaces left undone fail the night over
+    the limit, whether or not anything was applied."""
+
+    def test_records_left_undone_fail_even_with_nothing_to_rewrite(self) -> None:
+        fake = FakeHomeserver(
+            [_records(unchanged=3, not_local=3, not_learners_own=3, deactivated=2)]
+        )
+        code, out, _ = _main(fake)
+        self.assertEqual(code, 1)
+        self.assertNotIn("apply", fake.calls)
+        self.assertIn("6 progress records left with old ids or a lost completion", out)
+
+    def test_records_left_undone_at_the_limit_pass_and_are_counted(self) -> None:
+        fake = FakeHomeserver([_records(unchanged=3, not_local=5)])
+        code, out, _ = _main(fake)
+        self.assertEqual(code, 0, out)
+        self.assertIn("not_local 5", out)
+
+    def test_deactivated_learners_are_counted_outside_the_limit(self) -> None:
+        # Coordinator, 2026-11-15: their records keep old ids in rooms nobody
+        # can read or write; counted on their own, never failing the night.
+        fake = FakeHomeserver([_records(unchanged=3, deactivated=40)])
+        code, out, summary = _main(fake)
+        self.assertEqual(code, 0, out)
+        self.assertIn("deactivated 40", out)
+        self.assertIn(
+            "40 deactivated learners' records still name old ids (outside the limit)",
+            out,
+        )
+        self.assertIn("ok", summary.splitlines()[0])
+
+    def test_records_left_undone_after_the_apply_fail(self) -> None:
+        fake = FakeHomeserver(
+            [
+                _records(rewrite=1),
+                _records(rewrite=1),
+                _records(unchanged=1, not_local=nightly.FAILURE_LIMIT + 1),
+            ]
+        )
+        code, _, _ = _main(fake)
+        self.assertEqual(code, 1)
+
+    def test_an_old_key_left_in_an_unchanged_record_counts(self) -> None:
+        records = _records(unchanged=nightly.FAILURE_LIMIT + 1)
+        for record in records:
+            record["old_keys_left"] = 1
+        code, out, _ = _main(FakeHomeserver([records]))
+        self.assertEqual(code, 1, out)
+
+    def test_an_unreadable_record_is_a_known_outcome(self) -> None:
+        counts = nightly.progress_counts(_records(unreadable=2))
+        self.assertEqual((counts["unreadable"], counts["failed"]), (2, 0))
+
+    def test_spaces_refused_or_left_with_old_ids_fail_over_the_limit(self) -> None:
+        spaces = [_space(409)] * 3 + [_space(old_ids_left=2)] * 3
+        code, out, _ = _main(FakeHomeserver([_records(unchanged=1)], spaces=spaces))
+        self.assertEqual(code, 1)
+        self.assertIn("6 course spaces refused or left with old ids", out)
+
+    def test_spaces_left_at_the_limit_pass_and_are_counted(self) -> None:
+        spaces = [_space(409)] * 2 + [_space(old_ids_left=1)] * 3
+        code, out, _ = _main(FakeHomeserver([_records(unchanged=1)], spaces=spaces))
+        self.assertEqual(code, 0, out)
+        self.assertIn("left_with_old_ids 3", out)
 
 
 class TestEndDate(unittest.TestCase):

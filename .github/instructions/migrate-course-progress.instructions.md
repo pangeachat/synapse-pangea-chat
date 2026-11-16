@@ -1,43 +1,40 @@
 ---
-applyTo: "synapse_pangea_chat/migrate_course_can_dos/course_progress.py"
-description: "One-off operator endpoint that moves each learner's course progress record from old (pre-merge) Can-Do ids to the merged Can-Dos, sent as the learner, without losing a completion."
+applyTo: "synapse_pangea_chat/migrate_course_can_dos/course_progress.py,scripts/nightly_can_do_progress.py"
+description: "One-off operator endpoint that moves each learner's course progress record from old (pre-merge) Can-Do ids to the merged Can-Dos, sent as the learner, without losing a completion; and the nightly pass that repeats it."
 ---
 
 # Migrate Course Progress
 
-Part of step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pangeachat/.github/issues/832)). A learner's progress in a course is a `pangea.course_progress` state event in their analytics room, with the course room ID as its state key. Its `can_dos` are keyed by Can-Do id, and the dashboard shows them as the app's own figures. This operation moves each record to the merged Can-Dos. It runs on each environment right after the course spaces ([migrate-course-can-dos](migrate-course-can-dos.instructions.md)), then in the later passes below, and is removed with that operation after the last. It runs on the server rather than in the app (Gabby, 2026-11-11).
+Part of step 8 of the Can-Do migration ([pangeachat/.github#832](https://github.com/pangeachat/.github/issues/832)). A learner's progress in a course is a `pangea.course_progress` state event in their analytics room, keyed by course room ID; the dashboard shows its `can_dos` as the app's own figures. This server-side operation (Gabby, 2026-11-11) moves each record to the merged Can-Dos, right after the course spaces ([migrate-course-can-dos](migrate-course-can-dos.instructions.md)) and in later passes.
 
 ## Contract
 
-- `POST /_synapse/client/pangea/v1/migrate_course_progress`, server admins only.
-- **Input:** the same map of old Can-Do row id to merged row id, `dry_run`, and a page: `after` (the previous page's `next`) and `limit` (at most 200).
-- **Response:** for each record in the page: its room, course and learner; its outcome (`rewrite`, `unchanged`, `deactivated`, `refused`, `not_learners_own`, `not_local` or `failed`); how many old keys moved and how many completions were kept. Then `next`.
+`POST /_synapse/client/pangea/v1/migrate_course_progress`, server admins only. It takes the environment's old-to-merged id map, `dry_run`, and a page (`after`, `limit` up to 200). It answers, per record, an outcome (`rewrite`, `unchanged`, `unreadable`, `deactivated`, `refused`, `not_learners_own`, `not_local`, `failed`) with counts of keys moved, completions kept and restored, old keys left and unreadable dates, then page totals.
 
 ## What it does
 
-1. Reads every `pangea.course_progress` in an analytics room, one page at a time.
-2. Leaves alone, and reports, a record the learner did not send. The learner is the room's creator. The dashboard counts only the learner's own record; sent by the learner, this one would start to count.
-3. Moves each old key to its merged Can-Do, in the old key's place, and removes the old key. A merged Can-Do is written only when the record names it, or names an old id of it. Its XP figures stay as the record has them under the merged id. Otherwise they come from the old entry with the most XP, and the app recomputes them on its next write.
-4. Gives the merged Can-Do the earliest first completion it finds, with the threshold and the replay mark stored beside that date. The merged Can-Do is completed whenever any old entry it stands for was or a first completion is kept, so a record never says "not completed" beside a first completion; the app writes a dated entry as completed too. It looks in the current record and in every earlier version the learner sent, under both the old ids and the merged id. After a course switches, a learner's app rebuilds the record from the Can-Dos the course lists and drops the old entries with their dates; the earlier versions still hold them.
-5. Leaves every other field and entry as it is.
-6. Sends the record as the learner in an ordinary state event, at about ten records a second. The dashboard then counts it, and the analytics forwarder delivers it. It notifies nobody, because no push rule matches the event type ([analytics-room-push-suppression](analytics-room-push-suppression.instructions.md)).
-7. Skips and reports a deactivated learner, a learner on another server, and a room that refuses the send.
-8. Logs counts and ids, never a record's content.
+1. A record that is not an object with a `can_dos` object is `unreadable`, as no reader reads it.
+2. A record the learner (the room's creator) did not send is left alone, reported `not_learners_own` when it names an old id: the dashboard counts only the learner's own record.
+3. Each old key moves to its merged Can-Do in its place. An old entry that is not an object stays and is counted.
+4. A merged Can-Do the record no longer names is restored, at the end, when an earlier version the learner sent holds a completion of it, even one a teacher has since removed (Will, 2026-11-15).
+5. **XP: the larger wins** (Will, 2026-11-15). Figures come whole from one entry, never summed: the record's own merged entry, even with less XP; else the old entry with the most XP, first on a tie; else, when restored, the earlier entry with the most XP. The app recomputes them on its next write.
+6. The earliest first completion anywhere is kept, with its threshold and replay mark, and the Can-Do is completed if any entry it stands for ever was. A completion with no date anywhere gets the replay mark and no date, so the app dates it from history; a made-up date could never be corrected.
+7. Everything else is left as it is. The record is sent as the learner, about ten a second, notifying nobody ([analytics-room-push-suppression](analytics-room-push-suppression.instructions.md)).
+8. A learner on another server, or a room that refuses the send, is skipped and reported. A deactivated learner's record keeps its old ids and is counted on its own, never toward a failure limit: nobody reads or writes that room again, and the dashboard moves its stored figures itself ([admin-dash-api#494](https://github.com/pangeachat/admin-dash-api/pull/494)). Nothing is redacted.
+9. Logs and Sentry carry ids, counts and error types, never content. A refused or failed send is reported with its room and course; a written page that left anything unmoved, deactivated records aside, is reported with its counts.
 
-A dry run does everything except the sends.
+A dry run sends nothing and reports no page.
 
 ## Re-runs and the later passes
 
-Every run merges from the current record and its history, so a second run changes nothing. An app that loaded a course's outline before the switch keeps the old ids until the `revision` of the course's Can-Do list changes or the app restarts, and in that time it can write old ids back. The course-space migration bumps the revision. A course without a Can-Do list of its own gives the app no such signal. Once the environment's map is loaded into the stale progress guard (`synapse_pangea_chat/stale_progress_guard/`), the homeserver corrects such a write before storing it, keeping the record's Can-Dos and dates. The later passes are then a safety net, for a write made before the map was loaded or one the guard let through because its check failed. They merge those records again from history: nightly for two weeks (below), right before the old Can-Dos are deleted, and a few weeks after the deletion. The environment's map is kept until that last pass. Reading a record and sending it are not one atomic step: an app write in the moment between them is replaced, and the app restores its figures on its next write.
+A run merges from the record and its history, so a second run changes nothing. An app that loaded a course before the switch can write old ids back until the course list's `revision` changes or it restarts. The stale progress guard (`synapse_pangea_chat/stale_progress_guard/`) corrects such writes once the map is loaded; the later passes catch the rest: nightly for two weeks, before the old Can-Dos are deleted, and a few weeks after. The map is kept until then. A read and its send are not atomic: an app write between them is replaced, and the app restores its figures next time.
 
 ## The nightly pass
 
-For two weeks after an environment's switch, a scheduled workflow in this repository runs the pass nightly, and can be started by hand (Will, 2026-11-15). Only staging is configured, through 2026-11-28; production is a separate decision. With the guard live it is a safety net, and its end date stays as set: a run that finds rewrites after the map is loaded means a stale write got past the guard. Its map and statements are committed in a temporary folder deleted with these endpoints. It dry-runs the course spaces without applying them, dry-runs the progress records, applies only when some need rewriting, then dry-runs again.
+A scheduled workflow runs the pass nightly, and on demand, for two weeks after a switch (Will, 2026-11-15): staging only, through 2026-11-28; production is a separate decision. It dry-runs the course spaces without applying them, dry-runs the progress records, applies only when some need it, then dry-runs again. With the guard live, a rewrite found means a stale write got past it. Its inputs sit in a temporary folder deleted with these endpoints.
 
-- **Counts only.** Reports name learners and quote teachers' notes, and this repository's Actions logs are public, so nothing else is printed, written or uploaded; an error shows only its type.
-- **It fails for a person** on a failed call, more than five failed or refused records (nothing is applied), a course space still naming old Can-Dos (the space apply stays manual), or a second dry run that still finds rewrites.
-- **Credentials.** The admin token is minted in memory from the bot's credentials, read through a role limited to that one secret and this repository's main branch.
+- **Counts only:** the Actions logs are public, so no learner, room or note is printed, and an error shows only its type.
+- **It fails for a person** on a failed call; a space still naming old Can-Dos (that apply stays manual); more than five spaces refused or left with old ids; more than five failed or refused records in a run; a second dry run that still finds rewrites; or more than five records in the last dry run left with old ids or a lost completion (refused, remote, not the learner's own, failed, or an old key left). Deactivated learners' records are a separate count.
+- **Credentials:** the admin token is minted in memory from the bot's credentials, through a role limited to that secret and this repository's main branch.
 
-## Not in scope
-
-- The dashboard's stored first-completion dates. They move on the dashboard's side, in the order the migration's deploy note gives.
+The operator script's progress apply exits non-zero on the same undone records, listing deactivated ones apart.

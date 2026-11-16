@@ -58,6 +58,10 @@ def _merge(
     return rewrite.content, rewrite.report
 
 
+def _two(report: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: report[k] for k in ("keys_moved", "completions_kept")}
+
+
 class TestMergeProgress(unittest.TestCase):
     def test_an_old_key_moves_to_its_merged_can_do_in_its_place(self) -> None:
         old = _entry(700, SEEN, 500)
@@ -66,7 +70,7 @@ class TestMergeProgress(unittest.TestCase):
         assert content is not None
         self.assertEqual(list(content["can_dos"]), ["a", "M", "b"])
         self.assertEqual(content["can_dos"]["M"], old)
-        self.assertEqual(report, {"keys_moved": 1, "completions_kept": 1})
+        self.assertEqual(_two(report), {"keys_moved": 1, "completions_kept": 1})
         # The rest of the record is left as it is.
         self.assertEqual(
             {k: v for k, v in content.items() if k != "can_dos"},
@@ -116,7 +120,7 @@ class TestMergeProgress(unittest.TestCase):
         self.assertEqual(merged["first_completed_at"], SEEN)
         self.assertEqual(merged["xp_to_complete_at_first_completion"], 500)
         self.assertNotIn("completed_before_tracking", merged)
-        self.assertEqual(report, {"keys_moved": 0, "completions_kept": 1})
+        self.assertEqual(_two(report), {"keys_moved": 0, "completions_kept": 1})
 
     def test_the_merged_entry_is_completed_when_any_old_entry_was(self) -> None:
         # One old Can-Do completed, the other still in progress with more XP.
@@ -134,7 +138,7 @@ class TestMergeProgress(unittest.TestCase):
         self.assertNotIn("completed_before_tracking", merged)
         # Never "not completed, first completed on a date".
         self.assertIs(merged["completed"], True)
-        self.assertEqual(report, {"keys_moved": 2, "completions_kept": 1})
+        self.assertEqual(_two(report), {"keys_moved": 2, "completions_kept": 1})
 
         # A second run changes nothing.
         again, _ = _merge(content["can_dos"])
@@ -164,7 +168,7 @@ class TestMergeProgress(unittest.TestCase):
         self.assertEqual(merged["first_completed_at"], EARLIER)
         self.assertEqual(merged["xp_to_complete_at_first_completion"], 100)
         self.assertIs(merged["completed"], True)
-        self.assertEqual(report, {"keys_moved": 1, "completions_kept": 1})
+        self.assertEqual(_two(report), {"keys_moved": 1, "completions_kept": 1})
 
     def test_a_completed_old_entry_with_no_date_completes_the_merged_entry(
         self,
@@ -190,7 +194,7 @@ class TestMergeProgress(unittest.TestCase):
         merged = content["can_dos"]["M"]
         self.assertEqual(merged, _entry(60))
         self.assertIs(merged["completed"], False)
-        self.assertEqual(report, {"keys_moved": 2, "completions_kept": 0})
+        self.assertEqual(_two(report), {"keys_moved": 2, "completions_kept": 0})
 
     def test_a_dated_entry_under_the_merged_id_is_never_left_not_completed(
         self,
@@ -207,7 +211,7 @@ class TestMergeProgress(unittest.TestCase):
         self.assertIs(merged["completed"], True)
         self.assertEqual(merged["first_completed_at"], SEEN)
         self.assertEqual(merged["xp"], 140)
-        self.assertEqual(report, {"keys_moved": 0, "completions_kept": 0})
+        self.assertEqual(_two(report), {"keys_moved": 0, "completions_kept": 0})
 
         again, _ = _merge(content["can_dos"])
         self.assertIsNone(again)
@@ -219,7 +223,7 @@ class TestMergeProgress(unittest.TestCase):
         )
 
         self.assertIsNone(content)
-        self.assertEqual(report, {"keys_moved": 0, "completions_kept": 0})
+        self.assertEqual(_two(report), {"keys_moved": 0, "completions_kept": 0})
 
     def test_a_stale_app_writing_old_ids_back_is_undone(self) -> None:
         # After a first run, an app holding the old outline wrote x1 again
@@ -302,6 +306,142 @@ class TestMergeProgress(unittest.TestCase):
 
         assert rewrite.content is not None
         self.assertEqual(rewrite.content["can_dos"]["M"]["first_completed_at"], SEEN)
+
+
+class TestRecoveryFromHistory(unittest.TestCase):
+    """Audit finding 1: a completion only history holds is never lost."""
+
+    def test_a_merged_can_do_missing_from_the_record_comes_back(self) -> None:
+        # The app wrote a reduced record with no entry at all for M.
+        content, report = _merge(
+            {"a": _entry(1)},
+            [("x1", _entry(300, SEEN, 500)), ("x1", _entry(120))],
+        )
+
+        assert content is not None
+        self.assertEqual(list(content["can_dos"]), ["a", "M"])
+        # Its figures from the history entry with the most XP, as for old
+        # entries in the record.
+        self.assertEqual(content["can_dos"]["M"], _entry(300, SEEN, 500))
+        self.assertEqual(report["completions_restored"], 1)
+        self.assertEqual(report["completions_kept"], 1)
+
+    def test_an_empty_record_gets_its_completions_back(self) -> None:
+        content, report = _merge({}, [("M", _entry(80, EARLIER, 60))])
+
+        assert content is not None
+        self.assertEqual(content["can_dos"], {"M": _entry(80, EARLIER, 60)})
+        self.assertEqual(report["completions_restored"], 1)
+
+    def test_history_without_a_completion_restores_nothing(self) -> None:
+        content, report = _merge({}, [("x1", _entry(300))])
+
+        self.assertIsNone(content)
+        self.assertEqual(report["completions_restored"], 0)
+
+    def test_an_undated_completion_in_history_completes_the_entry(self) -> None:
+        # An early app wrote completed with no date and no replay mark.
+        undated = {**_entry(200), "completed": True}
+        content, report = _merge({"x2": _entry(40)}, [("x1", undated)])
+
+        assert content is not None
+        merged = content["can_dos"]["M"]
+        self.assertIs(merged["completed"], True)
+        # No date is made up: the replay mark asks the app to date it from
+        # the learner's history, as it does for any completion it never saw.
+        self.assertIsNone(merged["first_completed_at"])
+        self.assertIs(merged["completed_before_tracking"], True)
+        self.assertEqual(merged["xp"], 40)
+
+    def test_an_undated_completion_restores_a_missing_entry(self) -> None:
+        undated = {**_entry(200), "completed": True}
+        content, _ = _merge({}, [("x1", undated)])
+
+        assert content is not None
+        self.assertEqual(
+            content["can_dos"]["M"],
+            {**undated, "completed_before_tracking": True},
+        )
+
+    def test_an_undated_completed_old_entry_gets_the_replay_mark(self) -> None:
+        content, _ = _merge({"x1": {**_entry(110), "completed": True}})
+
+        assert content is not None
+        self.assertIs(content["can_dos"]["M"]["completed"], True)
+        self.assertIs(content["can_dos"]["M"]["completed_before_tracking"], True)
+
+    def test_a_dated_completion_anywhere_still_wins_over_undated(self) -> None:
+        undated = {**_entry(200), "completed": True}
+        content, _ = _merge({}, [("x1", undated), ("x2", _entry(50, LATER, 70))])
+
+        assert content is not None
+        merged = content["can_dos"]["M"]
+        self.assertEqual(merged["first_completed_at"], LATER)
+        self.assertNotIn("completed_before_tracking", merged)
+        self.assertEqual(merged["xp"], 200)
+
+    def test_restoring_twice_changes_nothing(self) -> None:
+        history: List[Tuple[str, Dict[str, Any]]] = [("x1", _entry(300, SEEN, 500))]
+        first, _ = _merge({}, history)
+        assert first is not None
+        again = merge_progress(first, history + [("M", _entry(300, SEEN, 500))], MAP)
+        self.assertIsNone(again.content)
+
+
+class TestXpAsTheMergeLeavesIt(unittest.TestCase):
+    """Audit finding 7: what the merge does to XP today, pinned; no
+    recomputation (an open question for Will)."""
+
+    def test_two_old_entries_keep_the_larger_whole_not_the_sum(self) -> None:
+        a = {**_entry(60), "skills": {"writing": 60}}
+        b = {**_entry(70), "skills": {"speaking": 70}}
+        content, _ = _merge({"x1": a, "x2": b})
+
+        assert content is not None
+        # Every figure from the one entry with the most XP; nothing added.
+        self.assertEqual(content["can_dos"]["M"], b)
+
+    def test_a_tie_keeps_the_first_in_the_record(self) -> None:
+        a, b = {**_entry(70), "chat": 1}, {**_entry(70), "chat": 2}
+        content, _ = _merge({"x1": a, "x2": b})
+
+        assert content is not None
+        self.assertEqual(content["can_dos"]["M"]["chat"], 1)
+
+    def test_a_merged_entry_with_less_xp_keeps_its_own_figures(self) -> None:
+        content, _ = _merge({"M": _entry(0), "x1": _entry(100, SEEN, 100)})
+
+        assert content is not None
+        merged = content["can_dos"]["M"]
+        self.assertEqual(merged["xp"], 0)
+        self.assertEqual(merged["chat"], 0)
+        # ...while it takes the old entry's completion.
+        self.assertIs(merged["completed"], True)
+        self.assertEqual(merged["first_completed_at"], SEEN)
+
+
+class TestHonestCounts(unittest.TestCase):
+    """Audit finding 5: what the merge leaves or defaults is counted."""
+
+    def test_an_old_key_left_in_place_is_counted(self) -> None:
+        _, report = _merge({"x1": "nonsense", "z1": _entry(5)})
+        self.assertEqual(report["old_keys_left"], 1)
+
+    def test_no_old_key_left_counts_zero(self) -> None:
+        _, report = _merge({"x1": _entry(5)})
+        self.assertEqual(report["old_keys_left"], 0)
+
+    def test_an_unreadable_date_or_threshold_is_counted(self) -> None:
+        _, report = _merge(
+            {
+                "x1": {
+                    **_entry(10, EARLIER),
+                    "xp_to_complete_at_first_completion": "x",
+                },
+                "x2": {**_entry(10), "first_completed_at": "yesterday"},
+            },
+        )
+        self.assertEqual(report["dates_unreadable"], 2)
 
 
 class TestParseRequest(unittest.TestCase):

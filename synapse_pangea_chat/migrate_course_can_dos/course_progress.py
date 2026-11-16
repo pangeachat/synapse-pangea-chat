@@ -15,6 +15,7 @@ one after a stale app wrote old ids back, never loses a completion.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import (
@@ -50,6 +51,7 @@ from synapse_pangea_chat.migrate_course_can_dos.migrate_course_can_dos import (
     Rewrite,
     parse_can_do_map,
 )
+from synapse_pangea_chat.migrate_course_can_dos.report import report, report_failure
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 
 logger = logging.getLogger(
@@ -89,6 +91,19 @@ def _instant(value: Any) -> Optional[datetime]:
     return parsed
 
 
+def _date_unreadable(entry: Any) -> bool:
+    """An entry whose date or threshold is set but could not be read: no
+    completion is taken from it, and the count says so."""
+    if not isinstance(entry, Mapping):
+        return False
+    at = entry.get(DATE_KEY)
+    threshold = entry.get(THRESHOLD_KEY)
+    return (at is not None and _instant(at) is None) or not (
+        threshold is None
+        or (isinstance(threshold, int) and not isinstance(threshold, bool))
+    )
+
+
 def _completion(entry: Any) -> Optional[Tuple[datetime, Dict[str, Any]]]:
     """An entry's first completion: when, and the fields that go with it.
     None for an entry with no readable date, or a threshold the dashboard
@@ -109,9 +124,26 @@ def _completion(entry: Any) -> Optional[Tuple[datetime, Dict[str, Any]]]:
     }
 
 
+def _completed(entry: Any) -> bool:
+    """Any sign the entry was complete: the flag, or a date."""
+    return isinstance(entry, Mapping) and (
+        entry.get(COMPLETED_KEY) is True or _completion(entry) is not None
+    )
+
+
 def _xp(entry: Mapping[str, Any]) -> int:
     xp = entry.get("xp")
     return xp if isinstance(xp, int) and not isinstance(xp, bool) else 0
+
+
+def empty_report() -> Dict[str, Any]:
+    return {
+        "keys_moved": 0,
+        "completions_kept": 0,
+        "completions_restored": 0,
+        "old_keys_left": 0,
+        "dates_unreadable": 0,
+    }
 
 
 def merge_progress(
@@ -122,15 +154,20 @@ def merge_progress(
     """The record with each old Can-Do key moved to its merged Can-Do.
 
     ``earlier`` holds ``(Can-Do id, entry)`` from the learner's earlier
-    versions of this record. A merged Can-Do is written only when the current
-    record names it, or an old id of it. Its figures stay as the current
+    versions of this record. A merged Can-Do is written when the current
+    record names it, or an old id of it, or when an earlier version holds a
+    completion of it (dated, or flagged ``completed``): a completion is never
+    lost because the app left its entry out. Its figures stay as the current
     record has them under the merged id, else come from the old entry with
-    the most XP. Its first completion is the earliest found anywhere, with
-    the threshold and replay mark stored beside it, and it is completed
-    whenever any old entry it stands for was or a first completion is kept.
-    Everything else in the record is left as it is.
+    the most XP in the record, else from the earlier entry with the most XP.
+    Its first completion is the earliest found anywhere, with the threshold
+    and replay mark stored beside it. It is completed whenever any entry it
+    stands for, now or earlier, was; complete with no date found anywhere, it
+    gets the replay mark, so the app dates it from the learner's history
+    rather than the migration making one up. Everything else in the record is
+    left as it is.
     """
-    report: Dict[str, Any] = {"keys_moved": 0, "completions_kept": 0}
+    report = empty_report()
     record: Dict[str, Any] = unfreeze(content)
     can_dos = record.get("can_dos")
     if not isinstance(can_dos, dict):
@@ -145,25 +182,43 @@ def merge_progress(
         merged = target(key)
         if merged is not None:
             groups.setdefault(merged, []).append(key)
-    if not groups:
-        return Rewrite(None, report)
     history: Dict[str, List[Any]] = {}
     for key, entry in earlier:
         merged = target(key)
-        if merged in groups:
+        if merged is not None:
             history.setdefault(merged, []).append(entry)
+    # Merged Can-Dos the record no longer names at all, whose completion only
+    # an earlier version holds, in the order history first shows them.
+    restored = [
+        merged
+        for merged, entries in history.items()
+        if merged not in groups and any(_completed(e) for e in entries)
+    ]
+    for merged in restored:
+        groups[merged] = []
+    if not groups:
+        return Rewrite(None, report)
 
     entries: Dict[str, Optional[Dict[str, Any]]] = {}
     for merged, keys in groups.items():
         current = can_dos.get(merged)
         olds = [can_dos[key] for key in keys if key != merged]
+        past = history.get(merged, [])
+        report["dates_unreadable"] += sum(
+            1 for entry in [current, *olds] if _date_unreadable(entry)
+        )
         base: Optional[Dict[str, Any]] = None
         if isinstance(current, dict):
             base = current
         else:
-            readable = [entry for entry in olds if isinstance(entry, dict)]
+            readable: List[Mapping[str, Any]] = [
+                entry for entry in olds if isinstance(entry, dict)
+            ]
+            if not readable and merged in restored:
+                readable = [entry for entry in past if isinstance(entry, Mapping)]
             if readable:
-                base = max(readable, key=_xp)
+                most = max(readable, key=_xp)
+                base = dict(most)
         if base is None:
             entries[merged] = None  # nothing readable to move; left as it is
             continue
@@ -171,7 +226,7 @@ def merge_progress(
         best: Optional[Tuple[datetime, Dict[str, Any]]] = None
         best_from_current = False
         # The current merged entry first, so a tie keeps it.
-        for index, candidate in enumerate([current, *olds, *history.get(merged, [])]):
+        for index, candidate in enumerate([current, *olds, *past]):
             found = _completion(candidate)
             if found is not None and (best is None or found[0] < best[0]):
                 best, best_from_current = found, index == 0
@@ -193,18 +248,15 @@ def merge_progress(
         # never say "not completed" beside a first completion. The app writes
         # a dated entry as completed too (a completed Mission stays complete),
         # so a kept date always means completed.
-        completed_olds = [
-            old
-            for old in olds
-            if isinstance(old, Mapping) and old.get(COMPLETED_KEY) is True
-        ]
-        if completed_olds or best is not None:
+        completed_elsewhere = any(_completed(e) for e in [*olds, *past])
+        if completed_elsewhere or best is not None:
             entry[COMPLETED_KEY] = True
-            # Complete with no date found: keep the mark that lets the app
-            # replay its date from history.
-            if best is None and any(
-                old.get(REPLAYED_KEY) is True for old in completed_olds
-            ):
+            # Complete with no date found anywhere: the replay mark, so the app
+            # dates it from history (CanDoProgress.awaitsReplay) instead of
+            # dating it the day it next writes. The current entry's own state
+            # is left as the app wrote it.
+            if best is None and completed_elsewhere:
+                entry.setdefault(DATE_KEY, None)
                 entry[REPLAYED_KEY] = True
         entries[merged] = entry
 
@@ -215,11 +267,23 @@ def merge_progress(
             out[key] = value
         elif merged not in out:
             out[merged] = entries[merged]
+    for merged in restored:
+        if entries[merged] is not None:
+            out[merged] = entries[merged]
+            report["completions_restored"] += 1
     report["keys_moved"] = sum(
         1 for key in can_dos if key in can_do_map and entries[can_do_map[key]]
     )
+    report["old_keys_left"] = sum(1 for key in out if key in can_do_map)
     if out == can_dos:
-        return Rewrite(None, {"keys_moved": 0, "completions_kept": 0})
+        return Rewrite(
+            None,
+            {
+                **empty_report(),
+                "old_keys_left": report["old_keys_left"],
+                "dates_unreadable": report["dates_unreadable"],
+            },
+        )
     record["can_dos"] = out
     return Rewrite(record, report)
 
@@ -281,12 +345,13 @@ _RECORDS_SQL = """
     LIMIT ?
 """
 
-# The dated entries, under the given Can-Do ids, of every version of one
-# record the learner sent: rejected and redacted events left out.
+# Every entry, under the given Can-Do ids, of every version of one record the
+# learner sent: rejected and redacted events left out. Incomplete ones too: a
+# Can-Do restored from history takes the figures of its entry with the most XP,
+# whether or not that one was complete; merge_progress decides whether any
+# completion warrants the restore.
 _EARLIER_SQL = """
-    SELECT DISTINCT c.key, c.value ->> 'first_completed_at',
-        c.value -> 'xp_to_complete_at_first_completion',
-        c.value -> 'completed_before_tracking'
+    SELECT DISTINCT c.key, c.value::text
     FROM events e
     JOIN event_json ej ON ej.event_id = e.event_id
     CROSS JOIN LATERAL jsonb_each(
@@ -299,8 +364,18 @@ _EARLIER_SQL = """
         AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.redacts = e.event_id)
         AND c.key = ANY(?)
         AND jsonb_typeof(c.value) = 'object'
-        AND c.value ->> 'first_completed_at' IS NOT NULL
 """
+
+# Outcomes that leave a record holding old ids or missing a completion: the
+# nightly runner fails over a limit of them. A deactivated learner's record is
+# counted on its own instead: its old ids stay in a room no app or account can
+# read or write (coordinator, 2026-11-15).
+UNRESOLVED_OUTCOMES = (
+    "refused",
+    "not_local",
+    "not_learners_own",
+    "failed",
+)
 
 
 class MigrateCourseProgress(Resource):
@@ -351,8 +426,8 @@ class MigrateCourseProgress(Resource):
                 return
             answer = await self.page(req, operator)
             respond_with_json(request, 200, answer, send_cors=True)
-        except Exception:
-            logger.exception("Error migrating course progress records")
+        except Exception as e:
+            report_failure("migrate_course_progress: the page failed", e)
             respond_with_json(
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
@@ -370,27 +445,39 @@ class MigrateCourseProgress(Resource):
             ANALYTICS_ROOM_TYPE,
             req.limit,
         )
-        merged_from: Dict[str, List[str]] = {}
-        for old, new in req.can_do_map.items():
-            merged_from.setdefault(new, []).append(old)
+        # Every old and merged id: history is read for each record, since a
+        # completion can sit under an id the current record no longer names.
+        history_keys = sorted({*req.can_do_map, *req.can_do_map.values()})
         records = []
         for room_id, course_id in rows:
-            records.append(await self._record(room_id, course_id, req, merged_from))
-        written = sum(1 for record in records if record["changed"])
+            records.append(await self._record(room_id, course_id, req, history_keys))
+        counts = page_counts(records)
         logger.info(
-            "migrate_course_progress: operator=%s dry_run=%s records=%d "
-            "to_rewrite=%d written=%d keys_moved=%d completions_kept=%d",
+            "migrate_course_progress: operator=%s dry_run=%s %s",
             operator,
             req.dry_run,
-            len(records),
-            sum(1 for record in records if record["outcome"] == "rewrite"),
-            written,
-            sum(record["keys_moved"] for record in records),
-            sum(record["completions_kept"] for record in records),
+            " ".join(f"{key}={value}" for key, value in counts.items()),
         )
+        left = {
+            key: value
+            for key, value in counts.items()
+            if value
+            and key
+            in (*UNRESOLVED_OUTCOMES, "unreadable", "old_keys_left", "dates_unreadable")
+        }
+        if left and not req.dry_run:
+            # Failed sends are reported one by one; this is the page's count of
+            # everything left unmoved, so it reaches the team, not only the
+            # operator's report.
+            report(
+                "migrate_course_progress: records left unmoved",
+                after=f"{room_after}|{course_after}",
+                **left,
+            )
         return {
             "dry_run": req.dry_run,
             "records": records,
+            "counts": counts,
             "next": list(rows[-1]) if len(rows) == req.limit else None,
         }
 
@@ -399,7 +486,7 @@ class MigrateCourseProgress(Resource):
         room_id: str,
         course_id: str,
         req: ProgressRequest,
-        merged_from: Mapping[str, Sequence[str]],
+        history_keys: Sequence[str],
     ) -> Dict[str, Any]:
         state = await self._api.get_room_state(
             room_id,
@@ -413,44 +500,42 @@ class MigrateCourseProgress(Resource):
             "course_id": course_id,
             "user_id": learner,
             "outcome": "unchanged",
-            "keys_moved": 0,
-            "completions_kept": 0,
+            **empty_report(),
             "changed": False,
         }
-        if event is None or learner is None:
+        content = unfreeze(event.content) if event is not None else None
+        if (
+            learner is None
+            or not isinstance(content, dict)
+            or not isinstance(content.get("can_dos"), dict)
+        ):
+            # Neither the app nor the dashboard reads it as a record.
+            answer["outcome"] = "unreadable"
             return answer
+        assert event is not None
         if event.sender != learner:
             # The dashboard counts only the learner's own record; sent again
-            # by the learner, this one would start to count.
-            answer["outcome"] = "not_learners_own"
+            # by the learner, this one would start to count. Reported only
+            # when it names old ids, the one case the migration leaves undone.
+            mine = merge_progress(content, [], req.can_do_map)
+            answer.update(mine.report)
+            if mine.content is not None or mine.report["old_keys_left"]:
+                answer["outcome"] = "not_learners_own"
             return answer
 
-        content = unfreeze(event.content)
-        can_dos = content.get("can_dos") if isinstance(content, dict) else None
-        if not isinstance(can_dos, dict):
-            return answer
-        merged_ids = {
-            req.can_do_map.get(key, key)
-            for key in can_dos
-            if key in req.can_do_map or key in merged_from
-        }
-        if not merged_ids:
-            return answer
-        keys = sorted(
-            {*merged_ids, *(old for new in merged_ids for old in merged_from[new])}
-        )
-        earlier = [
-            (key, {DATE_KEY: at, THRESHOLD_KEY: threshold, REPLAYED_KEY: replayed})
-            for key, at, threshold, replayed in await self._store.db_pool.execute(
-                "migrate_course_progress_earlier",
-                _EARLIER_SQL,
-                room_id,
-                COURSE_PROGRESS_STATE_EVENT_TYPE,
-                course_id,
-                learner,
-                keys,
-            )
-        ]
+        earlier: List[Tuple[str, Mapping[str, Any]]] = []
+        for key, raw in await self._store.db_pool.execute(
+            "migrate_course_progress_earlier",
+            _EARLIER_SQL,
+            room_id,
+            COURSE_PROGRESS_STATE_EVENT_TYPE,
+            course_id,
+            learner,
+            list(history_keys),
+        ):
+            value = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(value, Mapping):
+                earlier.append((key, value))
         rewrite = merge_progress(content, earlier, req.can_do_map)
         answer.update(rewrite.report)
         if rewrite.content is None:
@@ -478,24 +563,40 @@ class MigrateCourseProgress(Resource):
         except AuthError as e:
             # The learner left their analytics room, or lost the power to
             # write it, since the record was read.
-            logger.warning(
-                "migrate_course_progress: %s refused the record for %s sent as "
-                "%s: %s",
-                room_id,
-                course_id,
-                learner,
-                e.errcode,
+            report(
+                "migrate_course_progress: the room refused the record",
+                room_id=room_id,
+                course_id=course_id,
+                errcode=e.errcode,
             )
             answer["outcome"] = "refused"
             return answer
-        except Exception:
-            logger.exception(
-                "migrate_course_progress: writing the record for %s in %s failed",
-                course_id,
-                room_id,
+        except Exception as e:
+            report_failure(
+                "migrate_course_progress: writing the record failed",
+                e,
+                room_id=room_id,
+                course_id=course_id,
             )
             answer["outcome"] = "failed"
             return answer
         answer["changed"] = True
         await self._clock.sleep(SEND_PAUSE)
         return answer
+
+
+def page_counts(records: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+    """The page's records by outcome, and its summed counts."""
+    counts: Dict[str, int] = {"records": len(records)}
+    for outcome in (
+        "rewrite",
+        "unchanged",
+        "unreadable",
+        "deactivated",
+        *UNRESOLVED_OUTCOMES,
+    ):
+        counts[outcome] = sum(1 for r in records if r["outcome"] == outcome)
+    for key in empty_report():
+        counts[key] = sum(r.get(key, 0) for r in records)
+    counts["written"] = sum(1 for r in records if r.get("changed"))
+    return counts
