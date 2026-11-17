@@ -469,6 +469,100 @@ class TestNewRoomCarriesItsInitialState(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent[:2], [2, 10])
         self.assertEqual(store.cursor, 2)
 
+    async def test_a_room_that_becomes_a_course_goes_out_whole_with_its_plan(
+        self,
+    ) -> None:
+        # The read lands after createRoom's create and the creator's join but
+        # before the plan: the room is no course yet, so both are skipped.
+        course = "!course:hs"
+        create = FakeEvent(2, "m.room.create", "", {"type": "m.space"}, course)
+        member = FakeEvent(3, "m.room.member", "@t:hs", {"membership": "join"}, course)
+        power = FakeEvent(5, "m.room.power_levels", "", {"users": {}}, course)
+        plan = FakeEvent(9, "pangea.course_plan", "", {"l2": "es"}, course)
+        store = FakeStore([create, member, power, plan], head=3)
+        store.course_room_ids = set()
+        store.state[course] = [create, member]
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+        self.assertEqual(_delivered_positions(ingest), [])
+        self.assertEqual(store.cursor, 3)
+
+        # The plan arrives and the room is now a course: the batch carrying
+        # the plan carries the create and the join it missed.
+        store.head_pos = 9
+        store.course_room_ids = {course}
+        store.state[course] = [create, member, power, plan]
+        await fwd.step()
+
+        last = [e["stream_pos"] for e in ingest.bodies[-1]["events"]]
+        self.assertEqual(sorted(last), [2, 3, 5, 9])
+        self.assertEqual(ingest.bodies[-1]["delivered_through"], 9)
+
+    async def test_a_plan_whose_state_would_not_fit_starts_the_next_batch(
+        self,
+    ) -> None:
+        course = "!course:hs"
+        events = [FakeEvent(p) for p in range(1, 1001)]
+        plan = FakeEvent(998, "pangea.course_plan", "", {"l2": "es"}, course)
+        events[997] = plan
+        state = [
+            FakeEvent(
+                p,
+                "m.room.create" if p == 1001 else "m.room.member",
+                "" if p == 1001 else f"@u{p}:hs",
+                {"membership": "join"},
+                course,
+            )
+            for p in range(1001, 1006)
+        ] + [plan]
+        store = FakeStore(events, head=1000)
+        store.state[course] = state
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock(), batch_max=1000)
+        await fwd.start()
+
+        self.assertTrue(await fwd.step())
+        first = ingest.bodies[0]
+        self.assertLessEqual(len(first["events"]), INGEST_MAX_EVENTS)
+        self.assertEqual(first["delivered_through"], 997)
+        self.assertEqual(store.cursor, 997)
+        self.assertNotIn(998, [e["stream_pos"] for e in first["events"]])
+
+        await fwd.step()
+        second = [e["stream_pos"] for e in ingest.bodies[1]["events"]]
+        self.assertEqual(second, [998, 999, 1000, 1001, 1002, 1003, 1004, 1005])
+        self.assertEqual(store.cursor, 1000)
+
+    async def test_a_plan_in_the_create_batch_adds_nothing_twice(self) -> None:
+        course = "!course:hs"
+        create = FakeEvent(2, "m.room.create", "", {"type": "m.space"}, course)
+        member = FakeEvent(3, "m.room.member", "@t:hs", {"membership": "join"}, course)
+        plan = FakeEvent(9, "pangea.course_plan", "", {"l2": "es"}, course)
+        store = FakeStore([create, member, plan], head=9)
+        store.state[course] = [create, member, plan]
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+
+        self.assertEqual(_delivered_positions(ingest), [2, 3, 9])
+
+    async def test_a_plan_with_a_state_key_reads_no_state(self) -> None:
+        course = "!course:hs"
+        store = FakeStore(
+            [FakeEvent(4, "pangea.course_plan", "x", {"l2": "es"}, room_id=course)],
+            head=4,
+        )
+        store.state[course] = [FakeEvent(1, "m.room.create", "", {}, course)]
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+
+        self.assertEqual(_delivered_positions(ingest), [4])
+
     async def test_a_batch_with_no_create_reads_no_state(self) -> None:
         course = "!course:hs"
         store = FakeStore(
