@@ -385,6 +385,40 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
         await self._until(lambda: self._acked_with(child), "the space child")
         self._assert_no_forwarder_errors()
 
+    async def test_a_space_that_becomes_a_course_goes_out_whole(self) -> None:
+        # admin-dash-api#504: a read between createRoom's create and its plan
+        # skips the create and the creator's join as no course's. Here the
+        # plan comes in a later request, so every read before it is such a read.
+        await self._start()
+        await self._until(
+            lambda: self._sql("SELECT to_regclass('pangea_analytics_forward_cursor')")[
+                0
+            ][0],
+            "the forwarder's cursor table",
+        )
+        teacher, t_token = await self.new_user("pteacher")
+        space = self._create_room(
+            t_token, preset="public_chat", creation_content={"type": "m.space"}
+        )
+        create = self._sql(
+            "SELECT event_id FROM current_state_events WHERE room_id = %s "
+            "AND type = 'm.room.create'",
+            (space,),
+        )[0][0]
+        join = self._member_event(space, teacher)
+        passed = max(self._pos(create), self._pos(join))
+        await self._until(lambda: self._cursor() >= passed, "the cursor past the space")
+        self.assertEqual(self._sent_from(space), [])
+
+        plan = self._put_state(
+            t_token, space, "pangea.course_plan", "", {"uuid": "plan", "l2": "es"}
+        )
+        batches = await self._until(lambda: self._acked_with(plan), "the plan")
+        sent = {e["event_id"] for e in batches[0]["events"]}
+        self.assertIn(create, sent)
+        self.assertIn(join, sent)
+        self._assert_no_forwarder_errors()
+
     def _snapshot(self, room_id: str) -> Any:
         resp = requests.post(
             f"{self.server_url}/_synapse/client/pangea/v1/analytics_state",
@@ -717,6 +751,12 @@ class TestAnalyticsForwardE2E(_ForwardHelpers):
 
     async def test_course_progress_forwarded_live_and_in_the_snapshot(self) -> None:
         await self._start()
+        await self._until(
+            lambda: self._sql("SELECT to_regclass('pangea_analytics_forward_cursor')")[
+                0
+            ][0],
+            "the forwarder's cursor table",
+        )
         teacher, t_token = await self.new_user("pteacher")
         student, s_token = await self.new_user("pstudent")
         course = self._course(t_token, teacher, teacher, "es")

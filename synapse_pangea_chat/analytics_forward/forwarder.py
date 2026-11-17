@@ -28,6 +28,7 @@ from typing import Any, Awaitable, Callable, List, Optional, Set, Tuple
 
 from synapse_pangea_chat.analytics_forward import metrics
 from synapse_pangea_chat.analytics_forward.config import START_AT_CURRENT
+from synapse_pangea_chat.analytics_forward.consent import COURSE_PLAN_TYPE
 from synapse_pangea_chat.analytics_forward.wire import (
     BadAck,
     check_ack,
@@ -66,6 +67,14 @@ SAFETY_BATCH_MAX = 20
 #: The most events the ingest takes in one batch (admin-dash-api
 #: ``matrix_ingest_router._MAX_RECORDS``); a larger batch is refused whole.
 INGEST_MAX_EVENTS = 1000
+
+
+def _carries_room_state(event: Any) -> bool:
+    """A room's create, and the plan that makes a space a course, go out with
+    the room's current state (``Forwarder.step``)."""
+    if not event.is_state() or event.get_state_key() != "":
+        return False
+    return event.type in ("m.room.create", COURSE_PLAN_TYPE)
 
 
 class DeliveryError(Exception):
@@ -300,28 +309,30 @@ class Forwarder:
         # its initial state (admin-dash-api#504). The room's create goes out
         # with the room's current state, so the dashboard never holds a new
         # room without its plan; the later re-send is a no-op there.
+        # A course space is a course only once its plan is in current state,
+        # so a read in that window skipped its create and the creator's join
+        # as no course's; the plan goes out with the room's current state too,
+        # which carries them. Every plan does, not only the first: a re-send
+        # is a no-op at the ingest and plans are rare.
         # The ingest refuses a batch of more than INGEST_MAX_EVENTS events, so
-        # the batch ends before a create whose state would not fit; the cut
+        # the batch ends before an event whose state would not fit; the cut
         # events go in the next batch and the cursor stops before them.
         kept: List[Any] = []
         added: List[Any] = []
         seen: Set[str] = set()
         for event in events:
             extra: List[Any] = []
-            if (
-                event.type == "m.room.create"
-                and event.is_state()
-                and event.room_id in course_rooms
-            ):
+            if event.room_id in course_rooms and _carries_room_state(event):
                 for state in await self._store.current_state(event.room_id):
                     if state.event_id not in seen and state.event_id != event.event_id:
                         extra.append(state)
                 if len(extra) >= INGEST_MAX_EVENTS:
                     logger.warning(
-                        "analytics forwarder: a new room has %d state events; "
-                        "only its oldest %d go with its create",
+                        "analytics forwarder: a room has %d state events; "
+                        "only its oldest %d go with its %s",
                         len(extra),
                         INGEST_MAX_EVENTS - 1,
+                        event.type,
                     )
                     extra = extra[: INGEST_MAX_EVENTS - 1]
             if kept and len(kept) + len(added) + 1 + len(extra) > INGEST_MAX_EVENTS:
