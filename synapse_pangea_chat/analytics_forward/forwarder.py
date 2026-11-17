@@ -63,6 +63,9 @@ MAX_ANSWER_BYTES = 64 * 1024
 #: Incidents per batch. A text can be an event's whole 64 KB, so twenty keep
 #: one POST bounded; the rest follow at the busy pace.
 SAFETY_BATCH_MAX = 20
+#: The most events the ingest takes in one batch (admin-dash-api
+#: ``matrix_ingest_router._MAX_RECORDS``); a larger batch is refused whole.
+INGEST_MAX_EVENTS = 1000
 
 
 class DeliveryError(Exception):
@@ -293,7 +296,46 @@ class Forwarder:
         course_rooms = await self._store.course_rooms(
             {event.room_id for event in events}
         )
+        # A read can land between createRoom's first events and the rest of
+        # its initial state (admin-dash-api#504). The room's create goes out
+        # with the room's current state, so the dashboard never holds a new
+        # room without its plan; the later re-send is a no-op there.
+        # The ingest refuses a batch of more than INGEST_MAX_EVENTS events, so
+        # the batch ends before a create whose state would not fit; the cut
+        # events go in the next batch and the cursor stops before them.
+        kept: List[Any] = []
+        added: List[Any] = []
+        seen: Set[str] = set()
         for event in events:
+            extra: List[Any] = []
+            if (
+                event.type == "m.room.create"
+                and event.is_state()
+                and event.room_id in course_rooms
+            ):
+                for state in await self._store.current_state(event.room_id):
+                    if state.event_id not in seen and state.event_id != event.event_id:
+                        extra.append(state)
+                if len(extra) >= INGEST_MAX_EVENTS:
+                    logger.warning(
+                        "analytics forwarder: a new room has %d state events; "
+                        "only its oldest %d go with its create",
+                        len(extra),
+                        INGEST_MAX_EVENTS - 1,
+                    )
+                    extra = extra[: INGEST_MAX_EVENTS - 1]
+            if kept and len(kept) + len(added) + 1 + len(extra) > INGEST_MAX_EVENTS:
+                reached = int(kept[-1].internal_metadata.stream_ordering)
+                break
+            kept.append(event)
+            added.extend(extra)
+            seen.update(state.event_id for state in extra)
+        cut = len(kept) < len(events)
+        sent: Set[str] = set()
+        for event in [*kept, *added]:
+            if event.event_id in sent:
+                continue
+            sent.add(event.event_id)
             state_key = event.get_state_key() if event.is_state() else None
             if not is_forwarded(event.type, state_key):
                 continue
@@ -322,7 +364,7 @@ class Forwarder:
             self._last_post_ms is None or read_ms - self._last_post_ms >= self._poll_ms
         )
         fence, owed, rev = self._fence, sorted(self._owed), self._rev
-        full = len(events) >= self._batch_max
+        full = cut or len(events) >= self._batch_max
         send_due, self._send_due = self._send_due, False
         if not (
             records or dirty or marks or fence or full or heartbeat_due or send_due
