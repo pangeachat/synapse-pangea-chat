@@ -19,6 +19,7 @@ from synapse_pangea_chat.analytics_forward.config import (
 )
 from synapse_pangea_chat.analytics_forward.forwarder import (
     BUSY_PAUSE_SECONDS,
+    INGEST_MAX_EVENTS,
     MAX_BACKOFF_SECONDS,
     PROFILE_CLOCK_GRACE_MS,
     SAFETY_BATCH_MAX,
@@ -411,6 +412,62 @@ class TestNewRoomCarriesItsInitialState(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             ingest.bodies[0]["pending_accepts"], [{"room_id": room, "user_id": "@t:hs"}]
         )
+
+    async def test_a_create_whose_state_would_not_fit_starts_the_next_batch(
+        self,
+    ) -> None:
+        course = "!course:hs"
+        events = [FakeEvent(p) for p in range(1, 1001)]
+        create = FakeEvent(998, "m.room.create", "", {"type": "m.space"}, course)
+        events[997] = create
+        state = [create] + [
+            FakeEvent(
+                p,
+                "pangea.course_plan" if p == 1001 else "m.room.member",
+                "" if p == 1001 else f"@u{p}:hs",
+                {"membership": "join"},
+                course,
+            )
+            for p in range(1001, 1006)
+        ]
+        store = FakeStore(events, head=1000)
+        store.state[course] = state
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock(), batch_max=1000)
+        await fwd.start()
+
+        self.assertTrue(await fwd.step())
+        first = ingest.bodies[0]
+        self.assertLessEqual(len(first["events"]), INGEST_MAX_EVENTS)
+        self.assertEqual(first["delivered_through"], 997)
+        self.assertEqual(store.cursor, 997)
+        self.assertNotIn(998, [e["stream_pos"] for e in first["events"]])
+
+        await fwd.step()
+        second = [e["stream_pos"] for e in ingest.bodies[1]["events"]]
+        self.assertEqual(second, [998, 999, 1000, 1001, 1002, 1003, 1004, 1005])
+        self.assertEqual(store.cursor, 1000)
+
+    async def test_a_room_with_more_state_than_a_batch_is_capped(self) -> None:
+        course = "!course:hs"
+        create = FakeEvent(2, "m.room.create", "", {"type": "m.space"}, course)
+        store = FakeStore([create], head=2)
+        store.state[course] = [create] + [
+            FakeEvent(p, "m.room.member", f"@u{p}:hs", {"membership": "join"}, course)
+            for p in range(10, 1510)
+        ]
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        with self.assertLogs(
+            "synapse.modules.synapse_pangea_chat.analytics_forward", "WARNING"
+        ):
+            await fwd.step()
+
+        sent = [e["stream_pos"] for e in ingest.bodies[0]["events"]]
+        self.assertEqual(len(sent), INGEST_MAX_EVENTS)
+        self.assertEqual(sent[:2], [2, 10])
+        self.assertEqual(store.cursor, 2)
 
     async def test_a_batch_with_no_create_reads_no_state(self) -> None:
         course = "!course:hs"
