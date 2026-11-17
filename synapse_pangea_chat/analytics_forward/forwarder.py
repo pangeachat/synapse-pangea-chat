@@ -293,7 +293,25 @@ class Forwarder:
         course_rooms = await self._store.course_rooms(
             {event.room_id for event in events}
         )
-        for event in events:
+        # A read can land between createRoom's first events and the rest of
+        # its initial state (admin-dash-api#504). The room's create goes out
+        # with the room's current state, so the dashboard never holds a new
+        # room without its plan; the later re-send is a no-op there.
+        forwarded = list(events)
+        seen = {event.event_id for event in events}
+        for room_id in sorted(
+            {
+                event.room_id
+                for event in events
+                if event.type == "m.room.create" and event.is_state()
+            }
+            & course_rooms
+        ):
+            for event in await self._store.current_state(room_id):
+                if event.event_id not in seen:
+                    seen.add(event.event_id)
+                    forwarded.append(event)
+        for event in forwarded:
             state_key = event.get_state_key() if event.is_state() else None
             if not is_forwarded(event.type, state_key):
                 continue

@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from synapse_pangea_chat.analytics_forward.consent import PROFILE_KEY
-from synapse_pangea_chat.analytics_forward.wire import FORWARDED_TYPES
+from synapse_pangea_chat.analytics_forward.wire import FORWARDED_TYPES, STATE_TYPES
 from synapse_pangea_chat.moderation.incidents import (
     OutboxEntry,
     create_tables,
@@ -330,6 +330,24 @@ class ForwardStore:
         # Rejected events are dropped here too; a dropped one is never sent.
         events = await self._main.get_events_as_list([eid for _, eid in rows])
         return events, reached
+
+    async def current_state(self, room_id: str) -> List[Any]:
+        """The room's current state of the forwarded types, as the snapshot
+        reads it (``resources.AnalyticsState``)."""
+        from synapse.types.state import StateFilter
+
+        state = await self._hs.get_storage_controllers().state.get_current_state(
+            room_id,
+            state_filter=StateFilter.from_types([(t, None) for t in STATE_TYPES]),
+        )
+        return sorted(
+            (
+                event
+                for event in state.values()
+                if isinstance(event.internal_metadata.stream_ordering, int)
+            ),
+            key=lambda event: int(event.internal_metadata.stream_ordering),
+        )
 
     async def course_rooms(self, room_ids: Iterable[str]) -> Set[str]:
         """Those of ``room_ids`` the dashboard reads, by current state: analytics

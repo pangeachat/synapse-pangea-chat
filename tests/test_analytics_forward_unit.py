@@ -94,6 +94,8 @@ class FakeStore:
         #: The rooms the course filter passes; None passes every room.
         self.course_room_ids: Optional[Set[str]] = None
         self.filtered: List[Set[str]] = []
+        #: Each room's current state (forwarded types), as Synapse holds it.
+        self.state: Dict[str, List[FakeEvent]] = {}
         # The safety record and its outbox on a real SQLite database, written
         # by the real IncidentStore and read by the same SQL the forwarder's
         # store runs (moderation/incidents.py).
@@ -126,6 +128,9 @@ class FakeStore:
             rows[-1].internal_metadata.stream_ordering if len(rows) >= limit else upto
         )
         return rows, reached
+
+    async def current_state(self, room_id: str) -> List[FakeEvent]:
+        return list(self.state.get(room_id, []))
 
     async def course_rooms(self, room_ids: Iterable[str]) -> Set[str]:
         asked = set(room_ids)
@@ -367,6 +372,59 @@ class TestCourseRoomFilter(unittest.IsolatedAsyncioTestCase):
         await fwd.step()
         # An owed invite would be named in the batch until answered.
         self.assertEqual([b["pending_accepts"] for b in ingest.bodies], [[]])
+
+
+class TestNewRoomCarriesItsInitialState(unittest.IsolatedAsyncioTestCase):
+    """admin-dash-api#504: a read can land between createRoom's first events
+    and the rest of its initial state. The batch that carries a room's create
+    carries the room's current state with it, so the dashboard never holds a
+    new course without its plan."""
+
+    async def test_the_create_batch_carries_the_course_plan(self) -> None:
+        course = "!course:hs"
+        create = FakeEvent(2, "m.room.create", "", {"type": "m.space"}, course)
+        member = FakeEvent(3, "m.room.member", "@t:hs", {"membership": "join"}, course)
+        plan = FakeEvent(9, "pangea.course_plan", "", {"l2": "es"}, course)
+        name = FakeEvent(10, "m.room.name", "", {"name": "Class"}, course)
+        store = FakeStore([create, member, plan, name], head=3)
+        store.state[course] = [create, member, plan, name]
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+
+        self.assertEqual(_delivered_positions(ingest), [2, 3, 9, 10])
+        self.assertEqual(ingest.bodies[0]["delivered_through"], 3)
+
+    async def test_an_invite_in_the_carried_state_is_owed(self) -> None:
+        room = "!an:hs"
+        create = FakeEvent(2, "m.room.create", "", {"type": "p.analytics"}, room)
+        invite = FakeEvent(5, "m.room.member", "@t:hs", {"membership": "invite"}, room)
+        store = FakeStore([create, invite], head=2)
+        store.state[room] = [create, invite]
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+
+        self.assertEqual(_delivered_positions(ingest), [2, 5])
+        self.assertEqual(
+            ingest.bodies[0]["pending_accepts"], [{"room_id": room, "user_id": "@t:hs"}]
+        )
+
+    async def test_a_batch_with_no_create_reads_no_state(self) -> None:
+        course = "!course:hs"
+        store = FakeStore(
+            [FakeEvent(4, "m.room.name", "", {"name": "Class"}, room_id=course)],
+            head=4,
+        )
+        store.state[course] = [FakeEvent(1, "m.room.create", "", {}, course)]
+        ingest = Ingest()
+        fwd = _forwarder(store, ingest, Clock())
+        await fwd.start()
+        await fwd.step()
+
+        self.assertEqual(_delivered_positions(ingest), [4])
 
 
 class TestCursorOnlyOnAck(unittest.IsolatedAsyncioTestCase):
