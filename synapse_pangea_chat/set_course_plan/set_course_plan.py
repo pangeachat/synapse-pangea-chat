@@ -1,19 +1,54 @@
 """Server-admin endpoint: point an existing course space at a different quest,
 give it the new quest's Can-Do list, and rename it to match.
 
-``POST /_synapse/client/pangea/v1/set_course_plan``
+Design: set-course-plan.instructions.md. This docstring owns the mechanics.
 
-Design: set-course-plan.instructions.md. The space ends up as a course created
-from the new quest would be: the course space's Can-Do list
-(``pangea.course_missions``) is built by the same CMS read creation uses and
-written first, then the course plan, name and topic. A read that fails writes
-an empty list, as create-course-space requires; sending the request again once
-the plan has landed rebuilds it. The events are sent as the space's own
-strongest local
-instructor (``joined_local_instructors``, power level 100, which readers
-require of the list's sender), so nobody joins and nobody's power level
-changes; the operator is recorded in the log line instead.
+``POST /_synapse/client/pangea/v1/set_course_plan``, server admins only (401
+without a valid token, 403 for a non-admin, 400 for a malformed body).
+
+Request: ``room_id``, ``quest_id`` (the quest to point at),
+``expected_quest_id`` (the quest the operator expects the space holds now),
+``title``, ``description``, optional ``dry_run``. One space per call; the
+operator script loops over spaces.
+
+Response: ``previous_quest_id``, ``quest_id``, ``previous_name``,
+``previous_topic``, ``changes`` (the event types written, in order),
+``can_do_list`` (``built``, ``previous_revision``, ``revision``,
+``missions``; null when no list was built or tried), ``sender``,
+``changed``, ``dry_run``.
+
+Steps:
+
+1. Read ``pangea.course_plan``. No plan: 404, not a course.
+2. Read the plan id as public-courses does (``extract_plan_id``). A plan id
+   other than ``expected_quest_id``: 409 with ``current_quest_id``. Checked
+   before "already there".
+3. Plan, name and topic already match and the course copy has content:
+   ``changed: false``, nothing written. A space on the quest whose copy is
+   empty or missing gets it built (admin-dash-api#472, scripts/
+   write_course_copies.py); a failed read then writes nothing.
+4. On a plan change, build ``pangea.course_missions`` for the new quest with
+   ``CourseMissionsReader`` (the read creation uses; the quest owner's private
+   activities and the space's pins are not in it), at revision one above the
+   old copy's (1 if none) so an open Studio refuses a stale publish. Re-read
+   the plan and copy after the read; either changed: 409, nothing written. A
+   failed read writes empty content and logs an error.
+5. Write the plan with ``uuid`` set to the new quest. ``l2`` and every other
+   field are kept and the request cannot change them; the legacy
+   ``course_plan_id`` is dropped.
+6. Write the name (``title``) and topic (``description``, in createRoom's
+   shape), each only when it differs.
+7. Send every event as ``joined_local_instructors(...)[0]`` (power level 100).
+   None: 409, nothing written.
+8. Write order is copy, plan, name, topic. A room refusal (AuthError): 409
+   with ``refused`` and ``written``; any other failure: 500 with ``written``.
+   Stopped before the plan landed: resend the same request. Stopped after:
+   resend with the new quest as ``expected_quest_id``.
+9. Log the operator, room, old and new quest, changes and sender.
+
+A dry run does everything but the writes, including the CMS read.
 """
+
 
 from __future__ import annotations
 

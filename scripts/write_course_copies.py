@@ -6,7 +6,7 @@ mid-October 2026; a space made before that, or one whose creation read failed,
 has none, and the dashboard refuses such a course (admin-dash-api#472). For
 each one, this sends set_course_plan with the space's own quest as both the
 current and the new quest and its current name and topic, so the endpoint only
-builds the list (set-course-plan.instructions.md, step 3). A space that holds
+builds the list (set_course_plan.py module docstring, step 3). A space that holds
 a list, empty or not, is left alone.
 
     MATRIX_ADMIN_TOKEN=... python scripts/write_course_copies.py \\
