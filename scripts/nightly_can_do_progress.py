@@ -116,16 +116,16 @@ ENVIRONMENTS = {
         first_night=datetime.date(2026, 11, 15),
         last_night=datetime.date(2026, 11, 28),
     ),
-    # Built, not enabled: manual runs only until a person sets the window on the
-    # night production switches, and its map and statements are committed by the
-    # production switch itself.
     "prod": Environment(
         name="prod",
         homeserver="https://matrix.pangea.chat",
         secret_id="/prod/bot/matrix-credentials",
         device_id="admin-script-can-do-switch-prod",
-        first_night=None,
-        last_night=None,
+        # Production switched on 2026-11-18 (step 16 of #832's runbook); two weeks.
+        # Doc note for a person: migrate-course-progress "The nightly pass" still
+        # says production is built but off; it may want this window instead.
+        first_night=datetime.date(2026, 11, 19),
+        last_night=datetime.date(2026, 12, 2),
     ),
 }
 

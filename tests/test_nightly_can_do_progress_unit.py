@@ -404,6 +404,19 @@ class TestCountsOnly(unittest.TestCase):
 
 
 class TestEnvironments(unittest.TestCase):
+    def test_prod_data_files_are_committed_and_consistent(self) -> None:
+        with open(PROD.map_path, encoding="utf-8") as f:
+            can_do_map = json.load(f)
+        with open(PROD.statements_path, encoding="utf-8") as f:
+            statements = json.load(f)
+        # The 652 old ids the production guard was loaded with on 2026-11-18.
+        self.assertEqual(len(can_do_map), 652)
+        merged = set(can_do_map.values())
+        self.assertEqual(len(merged), 36)
+        self.assertFalse(merged & set(can_do_map))
+        self.assertTrue(merged <= set(statements))
+        self.assertTrue(set(statements) <= set(can_do_map) | merged)
+
     def test_staging_and_prod_are_the_only_environments(self) -> None:
         self.assertEqual(sorted(nightly.ENVIRONMENTS), ["prod", "staging"])
         with contextlib.redirect_stderr(io.StringIO()):
@@ -474,12 +487,25 @@ class TestDue(unittest.TestCase):
         self.assertEqual(self.due("staging", "scheduled", after), "due=false")
         self.assertEqual(self.due("staging", "manual", after), "due=false")
 
-    def test_prod_has_no_schedule_until_a_window_is_set(self) -> None:
-        self.assertIsNone(PROD.first_night)
-        self.assertEqual(self.due("prod", "scheduled"), "due=false")
-        _, out, _, summary = _run(
-            ["--environment", "prod", "--due", "scheduled"], make_steps=_never
-        )
+    def test_prod_runs_nightly_from_19_november_to_2_december(self) -> None:
+        self.assertEqual(PROD.first_night, datetime.date(2026, 11, 19))
+        self.assertEqual(PROD.last_night, datetime.date(2026, 12, 2))
+        for day, due in (
+            (datetime.date(2026, 11, 18), "due=false"),
+            (datetime.date(2026, 11, 19), "due=true"),
+            (datetime.date(2026, 12, 2), "due=true"),
+            (datetime.date(2026, 12, 3), "due=false"),
+        ):
+            self.assertEqual(self.due("prod", "scheduled", day), due, day)
+
+    def test_an_environment_without_a_window_is_never_scheduled(self) -> None:
+        unset = dataclasses.replace(PROD, first_night=None, last_night=None)
+        with mock.patch.dict(nightly.ENVIRONMENTS, {"prod": unset}):
+            self.assertEqual(self.due("prod", "scheduled"), "due=false")
+            _, out, _, summary = _run(
+                ["--environment", "prod", "--due", "scheduled"], make_steps=_never
+            )
+            self.assertEqual(self.due("prod", "manual"), "due=true")
         self.assertIn("no nightly window is set", out)
         self.assertIn("no nightly window is set", summary)
 
