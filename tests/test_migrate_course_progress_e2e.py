@@ -1,5 +1,5 @@
 """Integration tests for the learner progress migration, against a local
-Synapse + PostgreSQL (migrate-course-progress.instructions.md)."""
+Synapse + PostgreSQL (course_progress.py's docstring)."""
 
 from __future__ import annotations
 

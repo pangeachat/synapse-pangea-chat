@@ -1,6 +1,5 @@
 """Unit tests for the nightly Can-Do progress pass's decisions
-(scripts/nightly_can_do_progress.py; migrate-course-progress.instructions.md,
-"The nightly pass")."""
+(scripts/nightly_can_do_progress.py and its docstring)."""
 
 from __future__ import annotations
 
@@ -436,7 +435,7 @@ class TestEnvironments(unittest.TestCase):
             statements = json.load(f)
         self.assertTrue(can_do_map)
         merged = set(can_do_map.values())
-        # A merged id is never itself mapped (migrate-course-can-dos, Contract).
+        # A merged id is never itself mapped (migrate_course_can_dos.py's docstring, Contract).
         self.assertFalse(merged & set(can_do_map))
         self.assertTrue(merged <= set(statements))
 
