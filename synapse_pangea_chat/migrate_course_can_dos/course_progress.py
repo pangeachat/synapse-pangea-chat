@@ -3,14 +3,53 @@
 
 ``POST /_synapse/client/pangea/v1/migrate_course_progress``
 
-Design: migrate-course-progress.instructions.md. A learner's
-``pangea.course_progress`` (in their analytics room, state key = course room
-id) keys ``can_dos`` by Can-Do id. A learner's app rebuilds that record from
-the Can-Dos its course lists, so once a course switches it drops the old
-entries and their completion dates. Each merged Can-Do therefore takes the
-earliest completion found in the current record and in every earlier version
-the learner sent, under the old ids and the merged id alike, so a re-run, or
-one after a stale app wrote old ids back, never loses a completion.
+One-off, for the Can-Do merge (pangeachat/.github#832), run right after the
+course spaces and in later passes (``scripts/nightly_can_do_progress.py`` and
+the runbook skill, 2-step-choreographer ``migrate-plans-to-merged-can-dos``);
+on the server rather than in the app (Gabby, 2026-11-11). Removed with the
+migration, after its last pass.
+
+A learner's ``pangea.course_progress`` (in their analytics room, state key =
+course room id) keys ``can_dos`` by Can-Do id, and the dashboard shows them as
+the app's own figures. A learner's app rebuilds the record from the Can-Dos its
+course lists, so once a course switches it drops the old entries and their
+dates. Each record is therefore merged from its current content and every
+earlier version the learner sent, so a re-run, or one after a stale app wrote
+old ids back, changes nothing and never loses a completion.
+
+Contract. Server admins only, a page at a time (``after``, ``limit`` up to
+200). Per record: an outcome (``rewrite``, ``unchanged``, ``unreadable``,
+``deactivated``, ``refused``, ``not_learners_own``, ``not_local``,
+``failed``) and counts; then the page's totals.
+
+Rules (``merge_progress``):
+
+- A record that is not an object with a ``can_dos`` object is ``unreadable``.
+  One the learner (the room's creator) did not send is left alone, reported
+  ``not_learners_own`` when it names an old id: the dashboard counts only the
+  learner's own.
+- Each old key moves to its merged Can-Do in its place; an old entry that is
+  not an object stays and is counted.
+- A merged Can-Do the record no longer names is restored, at the end, when an
+  earlier version holds a completion of it, even one a teacher has since
+  removed (Will, 2026-11-15).
+- XP: the larger wins (Will, 2026-11-15). Figures come whole from one entry,
+  never summed: the record's own merged entry, even with less XP; else the old
+  entry with the most XP, first on a tie; else, when restored, the earlier
+  entry with the most XP. The app recomputes them on its next write.
+- The earliest first completion anywhere is kept with its threshold and replay
+  mark, and the Can-Do is completed if any entry it stands for ever was. A
+  completion with no date anywhere gets the replay mark and no date, so the
+  app dates it from history; a made-up date could never be corrected.
+- Sent as the learner, about ten a second, notifying nobody. A learner on
+  another server, or a room that refuses, is skipped and reported. A
+  deactivated learner's record keeps its old ids and is counted apart, never
+  toward a failure limit: nobody reads or writes that room again, and the
+  dashboard moves its stored figures itself (admin-dash-api#494). Nothing is
+  redacted.
+- Logs and Sentry carry ids, counts and error types, never content
+  (``report.py``). A written page that left anything unmoved, deactivated
+  records aside, reaches Sentry with its counts; a dry run reports none.
 """
 
 from __future__ import annotations

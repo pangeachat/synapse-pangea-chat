@@ -1,13 +1,13 @@
 # The nightly progress pass of the merged Can-Do switch (pangeachat/.github#832).
 # Temporary: deleted with the migration endpoints (scripts/can_do_switch_data/README.md).
-# Design: .github/instructions/migrate-course-progress.instructions.md, "The nightly pass".
+# Design: the docstring of scripts/nightly_can_do_progress.py.
 #
 # This repository is public, so its Actions logs are too: the runner prints counts
 # only, and nothing is uploaded as an artifact.
 #
 # The schedule runs every environment whose nightly window (ENVIRONMENTS in
-# scripts/nightly_can_do_progress.py) includes today; production has none until a
-# person sets one, so it runs only when started by hand.
+# scripts/nightly_can_do_progress.py) includes today; started by hand, any environment
+# runs until its last night.
 name: Nightly Can-Do progress pass
 run-name: "Can-Do progress pass · ${{ inputs.environment || 'scheduled' }}"
 

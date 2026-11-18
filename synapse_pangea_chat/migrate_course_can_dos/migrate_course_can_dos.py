@@ -3,13 +3,69 @@ to the merged Can-Dos that replace them, keeping every teacher edit.
 
 ``POST /_synapse/client/pangea/v1/migrate_course_can_dos``
 
-Design: migrate-course-can-dos.instructions.md. The course space's Can-Do
-list (``pangea.course_missions``) is rewritten as raw JSON, so fields this module
-does not model, Content Studio's included, survive; old Can-Dos that map to one
-merged Can-Do combine into one entry. The pins in ``pangea.teacher_mode`` are
-re-keyed the same way, every other field kept. Both are sent as the space's
-strongest local instructor, as ``set_course_plan`` does, and a write happens
-only while both events are still the ones the operator's dry run read.
+One-off, for the Can-Do merge (pangeachat/.github#832); the operator runs it
+through ``scripts/migrate_course_can_dos.py`` by the runbook skill
+(2-step-choreographer ``migrate-plans-to-merged-can-dos``). Removed with the
+migration, after its last progress pass.
+
+Contract. Server admins only, one space per call. Input: the room id; the
+environment's map of old Can-Do row id to merged row id (a merged id is never
+itself mapped); optionally ``valid_ids``, every Can-Do id on the environment,
+refused unless it holds every merged id, so a wrong file can never empty a
+course; and either ``dry_run: true`` or ``expected``, the event ids of the list
+and pins the dry run read. The answer gives what changes as ids, counts and
+lengths. Refused (409): no joined local instructor; a space changed since its
+dry run; a write the room refuses.
+
+What it does:
+
+- The Can-Do list (``pangea.course_missions``) is rewritten as raw JSON, so
+  fields this module does not model, Content Studio's included, survive. Each
+  old id in ``missions`` and ``removed_missions`` becomes its merged id; old
+  Can-Dos landing on one merged Can-Do combine (Gabby, 2026-11-11), by the
+  rules below. ``revision`` is bumped, so Studio refuses a publish from a draft
+  opened before the move.
+- With ``valid_ids``, an entry or pin naming neither an old id the map moves
+  nor a Can-Do on the environment is removed (Will, 2026-11-15); the app
+  already showed nothing for it.
+- The pins in ``pangea.teacher_mode`` are re-keyed the same way, every other
+  field kept, whoever sent them, since the app reads them from any sender.
+- A list readers ignore is left alone and reported with the old ids it still
+  names: one failing the client's strict parse (``copy_problem``, field for
+  field, including its ``due_at`` rule, ``due_at_readable``), or one whose
+  sender is below power level 100. A rewrite therefore never makes an ignored
+  list take effect. Pins that are not an object are left and reported.
+- Both are sent as the space's strongest local instructor, list first, as
+  ``set_course_plan`` does, only while the space still holds both events the
+  dry run read; an edited space is skipped and reported. The check and the
+  send are not atomic.
+
+Combining a live course's entries (the one written authority for it; the
+dashboard does not combine a live course's drafts itself):
+
+- Place: the first occurrence's. Occurrences directly after it form one span;
+  a later occurrence with entries between gives up its slot.
+- Due date: the span's last date, or the latest before it when the last has
+  none. Earlier dates in the span, and every given-up slot's date, are dropped.
+- Activities: the first entry's order, then the others' new ids; removed and
+  deleted ids pool the same way. One entry's shown activity stays shown.
+- Note: distinct notes joined with " / "; over 280 UTF-16 units, the first note
+  with "(+N more)", cut to fit. An entry left with no note gets its old
+  Can-Dos' statements by the quests' rule (Will, 2026-11-13); one with a note,
+  or combined with one, gains none.
+- City and other fields: from the first entry that has them; the others are
+  dropped.
+- Removed Can-Dos combine the same way. When the course still shows the merged
+  Can-Do, a removed old one's activities join it as hidden, and it can no
+  longer be restored on its own.
+- Pins pool. An old Can-Do listed with no pins adds nothing, so its activities
+  stop showing under the pinned merged Can-Do. A pin value that is not a list
+  of ids is dropped.
+
+Every drop above is counted in the answer, for the operator to read before the
+apply. Answers, logs and Sentry carry ids, counts, lengths and error types,
+never a teacher's words (``report.py``); a trimmed note's text stays in the
+room's history.
 """
 
 from __future__ import annotations

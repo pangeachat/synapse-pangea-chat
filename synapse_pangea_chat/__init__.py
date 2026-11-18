@@ -569,13 +569,13 @@ class PangeaChat:
 
         # --- Migrate Course Can-Dos ---
         # One-off: old Can-Do ids to merged ones in a course space
-        # (migrate-course-can-dos.instructions.md).
+        # (design: migrate_course_can_dos/migrate_course_can_dos.py's docstring).
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/migrate_course_can_dos",
             resource=MigrateCourseCanDos(api),
         )
         # Then each learner's progress record, sent as the learner
-        # (migrate-course-progress.instructions.md).
+        # (design: migrate_course_can_dos/course_progress.py's docstring).
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/migrate_course_progress",
             resource=MigrateCourseProgress(api),

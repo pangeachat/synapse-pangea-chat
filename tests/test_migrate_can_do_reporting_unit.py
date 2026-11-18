@@ -1,6 +1,6 @@
 """Unit tests for what the Can-Do migration reports: ids, counts and error
 types only, and the operator script's account of what was left undone
-(migrate-course-can-dos.instructions.md, migrate-course-progress.instructions.md)."""
+(the docstrings of migrate_course_can_dos.py and course_progress.py)."""
 
 from __future__ import annotations
 

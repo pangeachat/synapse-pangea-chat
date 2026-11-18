@@ -2,8 +2,11 @@
 """The nightly progress pass of the merged Can-Do switch, for one environment.
 
 Temporary: deleted with the migration endpoints (scripts/can_do_switch_data/README.md).
-Run by .github/workflows/nightly-can-do-progress.yml; design in
-.github/instructions/migrate-course-progress.instructions.md ("The nightly pass").
+Run by .github/workflows/nightly-can-do-progress.yml, nightly for two weeks
+after an environment's switch and on demand (Will, 2026-11-15); each
+environment's window is in ENVIRONMENTS below. With the stale progress guard
+live, a rewrite found means a stale write got past it. The migration rules are
+in synapse_pangea_chat/migrate_course_can_dos/.
 
 In order, against the environment's homeserver:
 
@@ -24,10 +27,12 @@ It prints counts only. The reports name rooms, courses and learners and quote
 teachers' notes, and this repository's Actions logs are public, so no report is
 written to disk, no room, course or learner id is printed, and an error is
 printed as its type, never its message. The admin token is minted in memory from
-the bot's Matrix credentials in AWS Secrets Manager and never printed.
+that environment's bot Matrix credentials in AWS Secrets Manager, through a
+role limited to that one secret and this repository's main branch, on a fixed
+device per environment that is never logged out; it is never printed.
 
-Environments: staging, and production built but not enabled (manual runs only,
-and none until its map and statements are committed).
+The operator script's progress apply (scripts/migrate_course_can_dos.py) exits
+non-zero on the same undone records, listing deactivated ones apart.
 
 Exit codes: 0 done or nothing to do, 1 something needs a person.
 """
@@ -122,8 +127,6 @@ ENVIRONMENTS = {
         secret_id="/prod/bot/matrix-credentials",
         device_id="admin-script-can-do-switch-prod",
         # Production switched on 2026-11-18 (step 16 of #832's runbook); two weeks.
-        # Doc note for a person: migrate-course-progress "The nightly pass" still
-        # says production is built but off; it may want this window instead.
         first_night=datetime.date(2026, 11, 19),
         last_night=datetime.date(2026, 12, 2),
     ),
