@@ -11,6 +11,13 @@ activities (``activity_ids``) lists those of them the library returns, in its
 order, and all of them when it returns none; the entry's note is copied too
 (org quests.instructions.md, "Each entry in the Can-Do sequence").
 
+The library read is the course listing's: the newest ``ACTIVITY_LIMIT`` rows
+for all the quest's Can-Dos together. A merged Can-Do carries hundreds of
+activities, so that page can miss a selection entirely (pangeachat/.github#832);
+the selected activities it missed are therefore read by id, under the same
+clauses, as the course listing does (2-step-choreographer#3523). The page only
+fills an entry that has no selected activity to show.
+
 The list is optional. A CMS read that fails leaves the course without one and
 the Studio writes it on first publish, so a failure here is logged and never
 blocks course creation. See create-course-space.instructions.md.
@@ -25,7 +32,7 @@ from urllib.parse import quote, urlencode
 
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.module_api import ModuleApi
-from synapse.util.async_helpers import timeout_deferred
+from synapse.util.async_helpers import timeout_deferred, yieldable_gather_results
 
 from synapse_pangea_chat.cms_http import cms_request, service_headers
 from synapse_pangea_chat.room_code.instructor_access import user_power
@@ -40,6 +47,12 @@ COURSE_ADMIN_POWER = 100
 FETCH_TIMEOUT_SECONDS = 3
 # The course listing's own page size (choreo list_activity_plans_for_los).
 ACTIVITY_LIMIT = 200
+# Selected activities the page missed are read by id this many at a time, as
+# choreo does (_ID_LOOKUP_CHUNK), keeping each query string short.
+SELECTED_CHUNK = 40
+# A chunk's rows beyond one per id are duplicate canonical rows; more than this
+# many per id refuses the read rather than cut it short.
+SELECTED_ROWS_PER_ID = 5
 MAX_BODY_BYTES = 16_000_000
 # Readers refuse a whole list whose note is longer, counted in UTF-16 units as
 # the client and the CMS count it.
@@ -239,12 +252,14 @@ def build_course_missions_content(
 ) -> Dict[str, Any]:
     """The Can-Do list: each learning objective in quest order with its activities.
 
-    ``activities`` are ``activities-v2`` rows in the listing's order. Each
-    activity is identified by its content id (``res.plan.activity_id``), never
-    its row id, and the first row per activity wins, as the client dedupes.
-    An entry's selection keeps those of its activities the listing returns, in
-    the selection's order; one the listing returns none of keeps them all, so
-    a stale selection never empties a Can-Do.
+    ``activities`` are ``activities-v2`` rows in the listing's order, then the
+    selected rows the listing's page missed. Each activity is identified by its
+    content id (``res.plan.activity_id``), never its row id, and the first row
+    per activity wins, as the client dedupes. An entry's selection keeps those
+    of its activities that are listed (visible, at the course's language, filed
+    under the entry's Can-Do), in the selection's order; one with none of them
+    listed keeps every listed activity, so a stale selection never empties a
+    Can-Do.
     """
     l2 = quest_target_language(quest)
     if l2 is None:
@@ -275,15 +290,52 @@ def build_course_missions_content(
     return {"version": 1, "revision": 1, "missions": missions}
 
 
-def activities_query(lo_ids: Sequence[str], l2: str) -> str:
-    """The ``activities-v2`` query the course listing runs (choreo
-    list_activity_plans_for_los), without the course-member private rows."""
-    params = [
+def _listing_clauses(l2: str) -> List[Tuple[str, str]]:
+    return [
         ("where[and][0][req.source_request_hash][exists]", "false"),
         ("where[and][1][hidden][not_equals]", "true"),
         ("where[and][2][visibility][not_equals]", "private"),
         ("where[and][3][res.plan.l2][equals]", l2),
     ]
+
+
+def selected_query(activity_ids: Sequence[str], l2: str) -> str:
+    """The rows of ``activity_ids`` the course listing would list, by content
+    id. Which Can-Do each one serves is checked on the rows themselves."""
+    params = _listing_clauses(l2)
+    params += [
+        ("where[and][4][res.plan.activity_id][in]", ",".join(activity_ids)),
+        ("limit", str(len(activity_ids) * SELECTED_ROWS_PER_ID)),
+        ("depth", "0"),
+    ]
+    return urlencode(params)
+
+
+def missed_selections(
+    quest: Mapping[str, Any], window: Sequence[Mapping[str, Any]]
+) -> List[str]:
+    """Every activity the quest's entries select that ``window`` does not hold
+    as a visible row, each once, in quest order."""
+    l2 = quest_target_language(quest)
+    held = {
+        _plan(doc).get("activity_id")
+        for doc in window
+        if isinstance(doc, Mapping) and l2 is not None and _visible_at(doc, l2)
+    }
+    return list(
+        dict.fromkeys(
+            a
+            for entry in _quest_entries(quest).values()
+            for a in _selected(entry)
+            if a not in held
+        )
+    )
+
+
+def activities_query(lo_ids: Sequence[str], l2: str) -> str:
+    """The ``activities-v2`` query the course listing runs (choreo
+    list_activity_plans_for_los), without the course-member private rows."""
+    params = _listing_clauses(l2)
     params += [
         (f"where[and][4][or][{i}][learningObjectiveRefs][contains]", lo_id)
         for i, lo_id in enumerate(lo_ids)
@@ -337,7 +389,41 @@ class CourseMissionsReader:
         docs = found.get("docs") if isinstance(found, Mapping) else None
         if not isinstance(docs, list):
             raise CourseMissionsError("activities read returned no docs list")
-        return build_course_missions_content(quest, docs)
+        total = found.get("totalDocs")
+        if isinstance(total, int) and total > len(docs):
+            logger.info(
+                "Can-Do list for quest %s: the library page holds the newest %d "
+                "of %d rows; selected activities outside it are read by id",
+                quest_id,
+                len(docs),
+                total,
+            )
+        missed = missed_selections(quest, docs)
+        chunks = [
+            missed[start : start + SELECTED_CHUNK]
+            for start in range(0, len(missed), SELECTED_CHUNK)
+        ]
+        # Concurrently: the whole read is bounded by FETCH_TIMEOUT_SECONDS.
+        extra = await yieldable_gather_results(self._selected_rows, chunks, l2)
+        return build_course_missions_content(
+            quest, [*docs, *(row for rows in extra for row in rows)]
+        )
+
+    async def _selected_rows(
+        self, chunk: Sequence[str], l2: str
+    ) -> List[Mapping[str, Any]]:
+        """The listed rows of one chunk of selected ids. A failure raises, as
+        the page read does: a course never starts with part of a selection."""
+        found = await self._get("activities-v2?" + selected_query(chunk, l2))
+        docs = found.get("docs") if isinstance(found, Mapping) else None
+        if not isinstance(docs, list):
+            raise CourseMissionsError("selected activities read returned no docs list")
+        total = found.get("totalDocs")
+        if isinstance(total, int) and total > len(docs):
+            raise CourseMissionsError(
+                f"selected activities read returned {len(docs)} of {total} rows"
+            )
+        return docs
 
     async def read(self, quest_id: str) -> Optional[Dict[str, Any]]:
         """The Can-Do list for ``quest_id``, or None when it cannot be built."""

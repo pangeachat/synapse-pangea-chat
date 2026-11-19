@@ -394,5 +394,177 @@ class TestCourseMissionsReader(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [])
 
 
+def _store_reader(
+    quest: Dict[str, Any],
+    window: List[Dict[str, Any]],
+    library: List[Dict[str, Any]],
+    calls: List[Dict[str, str]],
+    by_id_code: int = 200,
+    window_total: Optional[int] = None,
+) -> CourseMissionsReader:
+    """A CMS whose newest-rows read answers ``window`` and whose read by id
+    answers the ``library`` rows the query names."""
+    from synapse.util.clock import Clock
+    from twisted.internet import reactor
+
+    api = MagicMock()
+    api._hs.get_clock.return_value = Clock(reactor, server_name="test")  # type: ignore[arg-type]
+
+    async def request(method: str, uri: str, headers: Any = None) -> _Response:
+        parsed = urlparse(uri)
+        query = dict(parse_qsl(parsed.query))
+        calls.append(query)
+        if parsed.path.startswith("/api/quest-plans/"):
+            return _Response(200, quest)
+        ids_key = next((k for k in query if "res.plan.activity_id" in k), None)
+        if ids_key is None:
+            total = len(window) if window_total is None else window_total
+            return _Response(200, {"docs": window, "totalDocs": total})
+        if by_id_code != 200:
+            return _Response(by_id_code, {})
+        wanted = set(query[ids_key].split(","))
+        docs = [d for d in library if d["res"]["plan"]["activity_id"] in wanted]
+        return _Response(200, {"docs": docs, "totalDocs": len(docs)})
+
+    api.http_client.request = request
+    return CourseMissionsReader(api, "http://cms.test/", "key")
+
+
+def _selecting(entries: List[Tuple[str, Optional[List[str]]]]) -> Dict[str, Any]:
+    quest = _quest([lo for lo, _ in entries])
+    for step, (_, ids) in zip(quest["res"]["learning_objective_sequence"], entries):
+        step["activity_ids"] = ids
+    return quest
+
+
+class TestSelectedActivitiesReadById(unittest.IsolatedAsyncioTestCase):
+    """A merged Can-Do carries hundreds of activities, so the newest 200 rows
+    can miss a quest's selection entirely (pangeachat/.github#832). Selected
+    activities are read by id; the newest rows only fill an entry that
+    selects nothing."""
+
+    def setUp(self) -> None:
+        from unittest.mock import patch
+
+        patcher = patch(
+            "synapse_pangea_chat.cms_http.read_body_with_max_size", _read_body
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_a_selection_older_than_the_newest_rows_is_kept(self) -> None:
+        window = [_activity(f"new-{i}", ["lo-a"]) for i in range(200)]
+        library = [_activity("old-2", ["lo-a"]), _activity("old-1", ["lo-a"])]
+        quest = _selecting([("lo-a", ["old-1", "old-2"])])
+        calls: List[Dict[str, str]] = []
+
+        content = await _store_reader(quest, window, library, calls).read("quest-1")
+
+        assert content is not None
+        self.assertEqual(content["missions"][0]["activity_ids"], ["old-1", "old-2"])
+
+    async def test_part_in_the_window_and_part_read_by_id_keeps_the_order(
+        self,
+    ) -> None:
+        window = [_activity("sel-2", ["lo-a"]), _activity("other", ["lo-a"])]
+        library = [_activity("sel-1", ["lo-a"]), _activity("sel-3", ["lo-a"])]
+        quest = _selecting([("lo-a", ["sel-1", "sel-2", "sel-3"])])
+        calls: List[Dict[str, str]] = []
+
+        content = await _store_reader(quest, window, library, calls).read("quest-1")
+
+        assert content is not None
+        self.assertEqual(
+            content["missions"][0]["activity_ids"], ["sel-1", "sel-2", "sel-3"]
+        )
+        # Only what the window missed is read by id, with the listing's clauses.
+        [by_id] = [q for q in calls if any("activity_id" in k for k in q)]
+        ids_key = next(k for k in by_id if "res.plan.activity_id" in k)
+        self.assertEqual(by_id[ids_key].split(","), ["sel-1", "sel-3"])
+        self.assertEqual(by_id["where[and][1][hidden][not_equals]"], "true")
+        self.assertEqual(by_id["where[and][2][visibility][not_equals]"], "private")
+        self.assertEqual(by_id["where[and][3][res.plan.l2][equals]"], "es")
+
+    async def test_hidden_missing_or_other_can_do_activities_stay_out(self) -> None:
+        window = [_activity("new-1", ["lo-a"])]
+        library = [
+            _activity("kept", ["lo-a"]),
+            _activity("hidden", ["lo-a"], hidden=True),
+            _activity("elsewhere", ["lo-b"]),
+            _activity("other-l2", ["lo-a"], l2="fr"),
+        ]
+        quest = _selecting(
+            [("lo-a", ["kept", "hidden", "elsewhere", "other-l2", "missing"])]
+        )
+
+        content = await _store_reader(quest, window, library, []).read("quest-1")
+
+        assert content is not None
+        self.assertEqual(content["missions"][0]["activity_ids"], ["kept"])
+
+    async def test_a_selection_naming_only_unavailable_activities_lists_all(
+        self,
+    ) -> None:
+        # org quests.instructions.md: an entry with no selected activity to
+        # show shows every activity for its Can-Do.
+        window = [_activity("new-1", ["lo-a"]), _activity("new-2", ["lo-a"])]
+        quest = _selecting([("lo-a", ["missing"]), ("lo-b", None)])
+
+        content = await _store_reader(quest, window, [], []).read("quest-1")
+
+        assert content is not None
+        self.assertEqual(content["missions"][0]["activity_ids"], ["new-1", "new-2"])
+        self.assertEqual(content["missions"][1]["activity_ids"], [])
+
+    async def test_a_large_selection_is_read_in_batches(self) -> None:
+        from synapse_pangea_chat.email_invite.course_missions import (
+            SELECTED_CHUNK,
+        )
+
+        selected = [f"sel-{i:03d}" for i in range(SELECTED_CHUNK * 2 + 5)]
+        library = [_activity(a, ["lo-a"]) for a in selected]
+        quest = _selecting([("lo-a", selected)])
+        calls: List[Dict[str, str]] = []
+
+        content = await _store_reader(quest, [], library, calls).read("quest-1")
+
+        assert content is not None
+        self.assertEqual(content["missions"][0]["activity_ids"], selected)
+        sizes = [
+            len(q[k].split(","))
+            for q in calls
+            for k in q
+            if "res.plan.activity_id" in k
+        ]
+        self.assertEqual(sizes, [SELECTED_CHUNK, SELECTED_CHUNK, 5])
+
+    async def test_a_failed_read_by_id_yields_no_can_do_list(self) -> None:
+        # Never part of a selection: a course without a list reads the quest.
+        quest = _selecting([("lo-a", ["old-1"])])
+        reader = _store_reader(quest, [], [], [], by_id_code=503)
+
+        with self.assertLogs(
+            "synapse.module.synapse_pangea_chat.email_invite.course_missions",
+            "WARNING",
+        ):
+            self.assertIsNone(await reader.read("quest-1"))
+
+    async def test_a_full_window_is_logged(self) -> None:
+        window = [_activity(f"new-{i}", ["lo-a"]) for i in range(200)]
+        quest = _selecting([("lo-a", None)])
+
+        with self.assertLogs(
+            "synapse.module.synapse_pangea_chat.email_invite.course_missions",
+            "INFO",
+        ) as logs:
+            content = await _store_reader(quest, window, [], [], window_total=650).read(
+                "quest-1"
+            )
+
+        assert content is not None
+        self.assertEqual(len(content["missions"][0]["activity_ids"]), 200)
+        self.assertTrue(any("newest 200" in line for line in logs.output))
+
+
 if __name__ == "__main__":
     unittest.main()
