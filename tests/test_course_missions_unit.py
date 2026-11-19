@@ -557,9 +557,9 @@ class TestSelectedActivitiesReadById(unittest.IsolatedAsyncioTestCase):
             "synapse.module.synapse_pangea_chat.email_invite.course_missions",
             "INFO",
         ) as logs:
-            content = await _store_reader(
-                quest, window, [], [], window_total=650
-            ).read("quest-1")
+            content = await _store_reader(quest, window, [], [], window_total=650).read(
+                "quest-1"
+            )
 
         assert content is not None
         self.assertEqual(len(content["missions"][0]["activity_ids"]), 200)
