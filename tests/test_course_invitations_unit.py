@@ -368,8 +368,10 @@ class TestCoursePlanReplacement(unittest.IsolatedAsyncioTestCase):
         )
         result = await self.resource.replace("@operator:x", self.body())
         request, operator = self.room_plan.apply.await_args.args
+        # A plan replacement never replaces a list in place (no event named).
         self.assertEqual(
-            tuple(request), ("!room:x", "quest-2", "quest", "Tailored", "Text", False)
+            tuple(request),
+            ("!room:x", "quest-2", "quest", "Tailored", "Text", False, None),
         )
         self.assertEqual(operator, "@operator:x")
         self.assertEqual(result["course_plan_id"], "quest-2")

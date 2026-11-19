@@ -377,6 +377,14 @@ class CourseMissionsReader:
         """The quest's Missions, in order; raises when the CMS cannot say."""
         return quest_lo_ids(await self._quest(quest_id))
 
+    async def quest_selections(self, quest_id: str) -> Dict[str, List[str]]:
+        """Each quest entry's selected activity ids, by Can-Do; raises when
+        the CMS cannot say."""
+        return {
+            lo_id: _selected(entry)
+            for lo_id, entry in _quest_entries(await self._quest(quest_id)).items()
+        }
+
     async def _build(self, quest_id: str) -> Dict[str, Any]:
         quest = await self._quest(quest_id)
         l2 = quest_target_language(quest)

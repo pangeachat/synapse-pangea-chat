@@ -14,6 +14,18 @@ a list, empty or not, is left alone.
     MATRIX_ADMIN_TOKEN=... python scripts/write_course_copies.py \\
         --homeserver https://matrix.staging.pangea.chat --commit
 
+With ``--rooms FILE`` it instead replaces the lists named in the file, one
+per line as ``<room id> <list event id>`` (``#`` starts a comment): the lists
+the builder made from the newest 200 library rows only, before it read a
+quest's selected activities by id (pangeachat/.github#832). Each goes through
+set_course_plan's ``replace_copy_event_id``, so a room whose list is no longer
+that event (a teacher published since) is refused and left alone. The dry run
+prints, per room, the activities in the current list, in the rebuilt one, and
+the current ones outside the quest's selection.
+
+    MATRIX_ADMIN_TOKEN=... python scripts/write_course_copies.py \\
+        --homeserver https://matrix.staging.pangea.chat --rooms rebuild.txt
+
 ``MATRIX_ADMIN_TOKEN`` is a server admin's access token, supplied out-of-band
 (org ``access-controls.instructions.md``). It is never printed. The run prints
 room and quest ids only, exits 1 when any space needs a look (unreadable,
@@ -99,17 +111,17 @@ def _state(events: List[Dict[str, Any]], event_type: str) -> Optional[Dict[str, 
     return None
 
 
-def needed_request(
+def _plan_request(
     events: List[Dict[str, Any]], room_id: str
 ) -> Optional[Dict[str, Any]]:
-    """The set_course_plan body that builds this space's list, or None when it
-    is not a course or already holds a list."""
+    """The set_course_plan body that keeps this space on its quest, name and
+    topic, or None when it is not a course."""
     plan = _state(events, COURSE_PLAN_TYPES[0]) or {}
     quest = next(
         (plan[k] for k in PLAN_ID_KEYS if isinstance(plan.get(k), str) and plan[k]),
         None,
     )
-    if quest is None or _state(events, COURSE_MISSIONS_TYPE) is not None:
+    if quest is None:
         return None
     name = (_state(events, "m.room.name") or {}).get("name")
     topic = (_state(events, "m.room.topic") or {}).get("topic")
@@ -120,6 +132,99 @@ def needed_request(
         "title": name if isinstance(name, str) else "",
         "description": topic if isinstance(topic, str) else "",
     }
+
+
+def parse_rooms(text: str) -> List[Tuple[str, str]]:
+    """``(room id, list event id)`` per line of a --rooms file."""
+    rooms: List[Tuple[str, str]] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if (
+            len(parts) != 2
+            or not parts[0].startswith("!")
+            or not parts[1].startswith("$")
+        ):
+            raise SystemExit(
+                f"--rooms line {number}: expected '<room id> <list event id>'"
+            )
+        rooms.append((parts[0], parts[1]))
+    return rooms
+
+
+def _room_events(
+    homeserver: str, token: str, room_id: str
+) -> Optional[List[Dict[str, Any]]]:
+    path = f"{ADMIN_ROOMS_PATH}/{urllib.parse.quote(room_id, safe='')}/state"
+    status, page = _call(f"{homeserver}{path}", token)
+    if status != 200:
+        print(f"  {room_id}: state unreadable (HTTP {status})")
+        return None
+    return page.get("state") or []
+
+
+def run_replace(
+    homeserver: str, token: str, rooms: List[Tuple[str, str]], commit: bool
+) -> int:
+    """Replace each named list; per room, what changes."""
+    replaced, problems = 0, 0
+    for room_id, event_id in rooms:
+        events = _room_events(homeserver, token, room_id)
+        body = _plan_request(events, room_id) if events is not None else None
+        if body is None:
+            if events is not None:
+                print(f"  {room_id}: not a course")
+            problems += 1
+            continue
+        if not body["title"]:
+            print(f"  {room_id}: no name; set_course_plan needs one")
+            problems += 1
+            continue
+        status, answer = _call(
+            f"{homeserver}{SET_COURSE_PLAN_PATH}",
+            token,
+            {**body, "replace_copy_event_id": event_id, "dry_run": not commit},
+        )
+        answer = answer if isinstance(answer, dict) else {}
+        built = answer.get("can_do_list") or {}
+        if status == 409 and "current_copy_event_id" in answer:
+            print(
+                f"  {room_id}: left alone, its list was published over "
+                f"(now {answer['current_copy_event_id']})"
+            )
+            problems += 1
+        elif status != 200 or not built.get("built"):
+            print(
+                f"  {room_id}: quest {body['quest_id']} HTTP {status} "
+                f"{answer.get('error') or ''} {built}"
+            )
+            problems += 1
+        else:
+            print(
+                f"  {room_id}: quest {body['quest_id']}: "
+                f"{built.get('current_activities')} activities now, "
+                f"{built.get('rebuilt_activities')} rebuilt, "
+                f"{built.get('current_outside_selection')} outside the selection"
+            )
+            replaced += 1
+        time.sleep(PAUSE_SECONDS)
+    print(
+        f"\n{replaced} {'replaced' if commit else 'would be replaced'}, "
+        f"{problems} need a look"
+    )
+    return 1 if problems else 0
+
+
+def needed_request(
+    events: List[Dict[str, Any]], room_id: str
+) -> Optional[Dict[str, Any]]:
+    """The set_course_plan body that builds this space's list, or None when it
+    is not a course or already holds a list."""
+    if _state(events, COURSE_MISSIONS_TYPE) is not None:
+        return None
+    return _plan_request(events, room_id)
 
 
 def run(homeserver: str, token: str, commit: bool) -> int:
@@ -171,6 +276,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--commit", action="store_true", help="write (default: dry run)"
     )
     parser.add_argument("--confirm-production", action="store_true")
+    parser.add_argument(
+        "--rooms",
+        help="replace the lists named in this file (<room id> <list event id> "
+        "per line) instead of building missing ones",
+    )
     args = parser.parse_args(argv)
     token = os.environ.get("MATRIX_ADMIN_TOKEN")
     if not token:
@@ -184,6 +294,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"REFUSING: {homeserver} is production; pass --confirm-production"
         )
     print("COMMIT" if args.commit else "DRY RUN")
+    if args.rooms:
+        with open(args.rooms, encoding="utf-8") as f:
+            rooms = parse_rooms(f.read())
+        return run_replace(homeserver, token, rooms, args.commit)
     return run(homeserver, token, args.commit)
 
 
