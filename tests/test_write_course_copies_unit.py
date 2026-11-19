@@ -117,5 +117,106 @@ class TestWriteCourseCopies(unittest.TestCase):
                 script.main(["--homeserver", "https://matrix.pangea.chat"])
 
 
+class TestReplaceListedRooms(unittest.TestCase):
+    """--rooms: replace the lists the builder made from its newest rows only
+    (pangeachat/.github#832), each only while its room still holds the list
+    event named in the file."""
+
+    def _run(
+        self,
+        file_text: str,
+        rooms: Dict[str, Optional[List[Dict[str, Any]]]],
+        commit: bool = False,
+        answer: tuple = (
+            200,
+            {
+                "can_do_list": {
+                    "built": True,
+                    "current_activities": 400,
+                    "rebuilt_activities": 292,
+                    "current_outside_selection": 216,
+                }
+            },
+        ),
+    ) -> tuple:
+        posts: List[Dict[str, Any]] = []
+
+        def call(url: str, token: str, body: Optional[Dict[str, Any]] = None) -> tuple:
+            if body is not None:
+                posts.append(body)
+                return answer
+            room = next(
+                r for r in rooms if r.replace("!", "%21").replace(":", "%3A") in url
+            )
+            state = rooms[room]
+            return (200, {"state": state}) if state is not None else (500, {})
+
+        out = io.StringIO()
+        with mock.patch.object(script, "_call", side_effect=call), mock.patch.object(
+            script, "walk_spaces", side_effect=AssertionError("no walk")
+        ), mock.patch.object(script.time, "sleep"), redirect_stdout(out):
+            code = script.run_replace(HS, "t", script.parse_rooms(file_text), commit)
+        return code, posts, out.getvalue()
+
+    def test_the_rooms_file_names_a_room_and_its_list_event(self) -> None:
+        self.assertEqual(
+            script.parse_rooms("# built since the switch\n!a:x $e1\n\n!b:x  $e2\n"),
+            [("!a:x", "$e1"), ("!b:x", "$e2")],
+        )
+        for bad in ("!a:x", "a:x $e1", "!a:x e1", "!a:x $e1 extra"):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                script.parse_rooms(bad)
+
+    def test_each_listed_room_is_sent_a_replacement_of_its_named_list(self) -> None:
+        code, posts, out = self._run(
+            "!a:x $e1\n", {"!a:x": _space("q1", has_list=True)}
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            posts,
+            [
+                {
+                    "room_id": "!a:x",
+                    "quest_id": "q1",
+                    "expected_quest_id": "q1",
+                    "title": "My class",
+                    "description": "Mine",
+                    "replace_copy_event_id": "$e1",
+                    "dry_run": True,
+                }
+            ],
+        )
+        # What changes, per room, before anything is written.
+        self.assertIn(
+            "!a:x: quest q1: 400 activities now, 292 rebuilt, 216 outside", out
+        )
+
+    def test_commit_writes(self) -> None:
+        _, posts, _ = self._run(
+            "!a:x $e1\n", {"!a:x": _space("q1", has_list=True)}, commit=True
+        )
+        self.assertFalse(posts[0]["dry_run"])
+
+    def test_a_list_published_since_is_reported_and_exits_1(self) -> None:
+        refused = (
+            409,
+            {
+                "error": "The course's Can-Do list is not the one named",
+                "current_copy_event_id": "$teacher",
+            },
+        )
+        code, _, out = self._run(
+            "!a:x $e1\n", {"!a:x": _space("q1", has_list=True)}, answer=refused
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("published over", out)
+
+    def test_an_unreadable_room_or_one_with_no_quest_sends_nothing(self) -> None:
+        code, posts, _ = self._run(
+            "!a:x $e1\n!b:x $e2\n", {"!a:x": None, "!b:x": _space(None)}
+        )
+        self.assertEqual((code, posts), (1, []))
+
+
 if __name__ == "__main__":
     unittest.main()

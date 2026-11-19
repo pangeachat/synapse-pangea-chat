@@ -254,8 +254,8 @@ class TestParseRequest(unittest.TestCase):
                 self.assertIsInstance(error, str)
 
 
-class TestEndpoint(unittest.IsolatedAsyncioTestCase):
-    """The handler's write order, sender and failure answers."""
+class _EndpointHarness(unittest.IsolatedAsyncioTestCase):
+    """A handler over a fake ModuleApi."""
 
     _BODY = {
         "room_id": "!space:test",
@@ -276,6 +276,7 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         can_do_list: Optional[Dict[str, Any]] = _OLD_CAN_DO_LIST,
         built: Optional[Dict[str, Any]] = _BUILT,
         on: str = "old",
+        copy_event_id: str = "$copy",
     ) -> tuple[SetCoursePlan, MagicMock]:
         api = MagicMock()
         api._hs.get_auth.return_value.get_user_by_req = AsyncMock(
@@ -291,7 +292,9 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
             ("m.room.name", ""): SimpleNamespace(content={"name": "Old title"}),
         }
         if can_do_list is not None:
-            state[("pangea.course_missions", "")] = SimpleNamespace(content=can_do_list)
+            state[("pangea.course_missions", "")] = SimpleNamespace(
+                content=can_do_list, event_id=copy_event_id
+            )
         api.get_room_state = AsyncMock(return_value=state)
         api.create_and_send_event_into_room = AsyncMock()
         config = SimpleNamespace(
@@ -310,10 +313,11 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         endpoint: SetCoursePlan,
         instructors: Optional[List[str]] = None,
         expected: str = "old",
+        **extra: Any,
     ) -> tuple[int, Dict[str, Any]]:
         if instructors is None:
             instructors = ["@teacher:test"]
-        body = {**self._BODY, "expected_quest_id": expected}
+        body = {**self._BODY, "expected_quest_id": expected, **extra}
         with patch.object(
             module, "extract_body_json", AsyncMock(return_value=body)
         ), patch.object(
@@ -327,6 +331,10 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _sent(api: MagicMock) -> List[Dict[str, Any]]:
         return [c.args[0] for c in api.create_and_send_event_into_room.await_args_list]
+
+
+class TestEndpoint(_EndpointHarness):
+    """The handler's write order, sender and failure answers."""
 
     async def test_a_full_move_writes_four_events_as_one_instructor(self) -> None:
         endpoint, api = self._endpoint()
@@ -505,6 +513,164 @@ class TestEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 401)
         self.assertEqual(body["errcode"], "M_UNAUTHORIZED")
         api.get_room_state.assert_not_awaited()
+
+
+class TestReplaceCanDoList(_EndpointHarness):
+    """Rebuilding a course's list the server built wrongly (pangeachat/.github
+    #832): only while the space still holds the exact list event named, so a
+    list a teacher has published since is never overwritten."""
+
+    _BUILT_LIST = {
+        "version": 1,
+        "revision": 1,
+        "missions": [
+            {"lo_id": "lo-a", "activity_ids": ["s1", "s2", "s3"]},
+            {"lo_id": "lo-b", "activity_ids": ["b1"]},
+        ],
+    }
+    _WRONG_LIST = {
+        "version": 1,
+        "revision": 1,
+        "missions": [
+            {"lo_id": "lo-a", "activity_ids": ["s1", "x1", "x2"]},
+            {"lo_id": "lo-b", "activity_ids": ["b1", "b2"]},
+        ],
+    }
+
+    def _replacing(
+        self, copy_event_id: str = "$built"
+    ) -> tuple[SetCoursePlan, MagicMock]:
+        endpoint, api = self._endpoint(
+            can_do_list=self._WRONG_LIST,
+            built=self._BUILT_LIST,
+            on="new",
+            copy_event_id=copy_event_id,
+        )
+        endpoint._course_missions.quest_selections = AsyncMock(  # type: ignore[method-assign]
+            return_value={"lo-a": ["s1", "s2", "s3"], "lo-b": []}
+        )
+        return endpoint, api
+
+    async def test_the_named_list_is_replaced_one_revision_up(self) -> None:
+        endpoint, api = self._replacing()
+
+        status, body = await self._post(
+            endpoint, expected="new", replace_copy_event_id="$built"
+        )
+
+        self.assertEqual(status, 200, body)
+        sent = self._sent(api)
+        self.assertEqual(sent[0]["type"], "pangea.course_missions")
+        self.assertEqual(sent[0]["content"], {**self._BUILT_LIST, "revision": 2})
+        self.assertEqual(sent[0]["sender"], "@teacher:test")
+        self.assertNotIn("pangea.course_plan", [e["type"] for e in sent])
+        self.assertEqual(
+            body["can_do_list"],
+            {
+                "built": True,
+                "previous_revision": 1,
+                "revision": 2,
+                "missions": 2,
+                "replaced": "$built",
+                "current_activities": 5,
+                "rebuilt_activities": 4,
+                # x1 and x2 under lo-a; lo-b selects nothing, so none of its own.
+                "current_outside_selection": 2,
+            },
+        )
+
+    async def test_a_list_published_since_is_refused_and_never_read(self) -> None:
+        endpoint, api = self._replacing(copy_event_id="$teacher-publish")
+
+        status, body = await self._post(
+            endpoint, expected="new", replace_copy_event_id="$built"
+        )
+
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["current_copy_event_id"], "$teacher-publish")
+        api.create_and_send_event_into_room.assert_not_awaited()
+        endpoint._course_missions.read.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_a_space_with_no_list_is_refused(self) -> None:
+        endpoint, api = self._endpoint(can_do_list=None, on="new")
+
+        status, body = await self._post(
+            endpoint, expected="new", replace_copy_event_id="$built"
+        )
+
+        self.assertEqual(status, 409, body)
+        self.assertIsNone(body["current_copy_event_id"])
+        api.create_and_send_event_into_room.assert_not_awaited()
+
+    async def test_a_list_published_during_the_read_is_refused(self) -> None:
+        endpoint, api = self._replacing()
+        first = await api.get_room_state()
+        published = dict(first)
+        published[("pangea.course_missions", "")] = SimpleNamespace(
+            content=self._WRONG_LIST, event_id="$teacher-publish"
+        )
+        api.get_room_state = AsyncMock(side_effect=[first, published])
+
+        with self.assertLogs(module.logger, level="WARNING"):
+            status, body = await self._post(
+                endpoint, expected="new", replace_copy_event_id="$built"
+            )
+
+        self.assertEqual(status, 409, body)
+        api.create_and_send_event_into_room.assert_not_awaited()
+
+    async def test_a_dry_run_reports_the_counts_and_writes_nothing(self) -> None:
+        endpoint, api = self._replacing()
+
+        status, body = await self._post(
+            endpoint, expected="new", replace_copy_event_id="$built", dry_run=True
+        )
+
+        self.assertEqual(status, 200, body)
+        api.create_and_send_event_into_room.assert_not_awaited()
+        self.assertEqual(body["can_do_list"]["rebuilt_activities"], 4)
+        self.assertFalse(body["changed"])
+
+    async def test_a_list_that_cannot_be_rebuilt_is_left_alone(self) -> None:
+        endpoint, api = self._replacing()
+        endpoint._course_missions.read = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        with self.assertLogs(module.logger, level="ERROR"):
+            status, body = await self._post(
+                endpoint, expected="new", replace_copy_event_id="$built"
+            )
+
+        self.assertEqual(status, 200, body)
+        self.assertNotIn("pangea.course_missions", [e["type"] for e in self._sent(api)])
+        self.assertFalse(body["can_do_list"]["built"])
+
+
+class TestReplaceRequest(unittest.TestCase):
+    _VALID = {
+        "room_id": "!space:test",
+        "quest_id": "q",
+        "expected_quest_id": "q",
+        "title": "T",
+        "description": "",
+        "replace_copy_event_id": "$built",
+    }
+
+    def test_a_replacement_names_its_event_and_stays_on_the_quest(self) -> None:
+        parsed, error = parse_request(self._VALID)
+        assert parsed is not None, error
+        self.assertEqual(parsed.replace_copy_event_id, "$built")
+        parsed, _ = parse_request(
+            {k: v for k, v in self._VALID.items() if k != "replace_copy_event_id"}
+        )
+        assert parsed is not None
+        self.assertIsNone(parsed.replace_copy_event_id)
+        for bad in (
+            {**self._VALID, "quest_id": "other"},
+            {**self._VALID, "replace_copy_event_id": ""},
+            {**self._VALID, "replace_copy_event_id": 3},
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(parse_request(bad)[0])
 
 
 if __name__ == "__main__":

@@ -46,6 +46,17 @@ Steps:
    resend with the new quest as ``expected_quest_id``.
 9. Log the operator, room, old and new quest, changes and sender.
 
+Replacing a list the server built wrongly (``replace_copy_event_id``): the
+course stays on its quest (``quest_id`` equals ``expected_quest_id``) and its
+list is rebuilt even though it has content, but only while the space still
+holds the very list event named. Any other list, or none, is refused with 409
+and ``current_copy_event_id`` before the CMS read, so a list a teacher has
+published since is never overwritten; one published during the read is refused
+by the re-read. The answer counts the activities in the current and rebuilt
+lists, and the current ones outside the quest's selection. Used by
+``scripts/write_course_copies.py --rooms`` (pangeachat/.github#832: lists the
+builder made from the newest 200 rows only, before it read selections by id).
+
 A dry run does everything but the writes, including the CMS read.
 """
 
@@ -220,6 +231,8 @@ class SetCoursePlanRequest(NamedTuple):
     title: str
     description: str
     dry_run: bool
+    # The list event to replace, or None for an ordinary move or build.
+    replace_copy_event_id: Optional[str] = None
 
 
 def parse_request(
@@ -246,12 +259,45 @@ def parse_request(
     dry_run = body.get("dry_run", False)
     if not isinstance(dry_run, bool):
         return None, "'dry_run' must be a boolean"
+    replace: Optional[str] = None
+    if "replace_copy_event_id" in body:
+        replace = _valid_id(body.get("replace_copy_event_id"))
+        if replace is None:
+            return None, "'replace_copy_event_id' must be an event ID"
+        if quest_id != expected_quest_id:
+            return None, "A replacement keeps the course on its quest"
     return (
         SetCoursePlanRequest(
-            room_id, quest_id, expected_quest_id, title, description, dry_run
+            room_id, quest_id, expected_quest_id, title, description, dry_run, replace
         ),
         None,
     )
+
+
+def _activity_count(content: Optional[Mapping[str, Any]]) -> int:
+    missions = (content or {}).get("missions")
+    return sum(
+        len(set(m.get("activity_ids") or []))
+        for m in (missions if isinstance(missions, list) else [])
+        if isinstance(m, Mapping) and isinstance(m.get("activity_ids"), list)
+    )
+
+
+def outside_selection(
+    content: Optional[Mapping[str, Any]], selections: Mapping[str, List[str]]
+) -> int:
+    """The list's activities under Can-Dos whose quest entry selects some,
+    that the selection does not name. An entry selecting nothing counts none."""
+    missions = (content or {}).get("missions")
+    count = 0
+    for m in missions if isinstance(missions, list) else []:
+        if not isinstance(m, Mapping) or not isinstance(m.get("activity_ids"), list):
+            continue
+        lo_id = m.get("lo_id")
+        chosen = set(selections.get(lo_id, [])) if isinstance(lo_id, str) else set()
+        if chosen:
+            count += len(set(m["activity_ids"]) - chosen)
+    return count
 
 
 class SetCoursePlan(Resource):
@@ -315,6 +361,33 @@ class SetCoursePlan(Resource):
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
 
+    async def _replacement_counts(
+        self,
+        quest_id: str,
+        event_id: Optional[str],
+        current: Optional[Mapping[str, Any]],
+        built: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """What a replacement changes, for the operator to read first."""
+        try:
+            selections = await self._course_missions.quest_selections(quest_id)
+            outside: Optional[int] = outside_selection(current, selections)
+        # silent-ok: a count for the operator's report, not the write; logged, reported as null
+        except Exception as e:
+            logger.warning(
+                "set_course_plan: the selection of quest %s could not be read "
+                "for the report: %s",
+                quest_id,
+                type(e).__name__,
+            )
+            outside = None
+        return {
+            "replaced": event_id,
+            "current_activities": _activity_count(current),
+            "rebuilt_activities": _activity_count(built) if built else None,
+            "current_outside_selection": outside,
+        }
+
     async def apply(
         self, req: SetCoursePlanRequest, operator: str
     ) -> Tuple[int, Dict[str, Any]]:
@@ -346,13 +419,26 @@ class SetCoursePlan(Resource):
 
         current_name = _state_text(state.get((EventTypes.Name, "")), "name")
         current_topic = _state_text(state.get((EventTypes.Topic, "")), "topic")
-        current_list = _content(state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
+        list_event = state.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
+        current_list = _content(list_event)
+        list_event_id = getattr(list_event, "event_id", None)
+        replacing = req.replace_copy_event_id is not None
+        if replacing and list_event_id != req.replace_copy_event_id:
+            # A teacher published over the list the operator named: theirs wins.
+            return (
+                409,
+                {
+                    "error": "The course's Can-Do list is not the one named",
+                    "current_copy_event_id": list_event_id,
+                },
+            )
         new_list: Optional[Dict[str, Any]] = None
         built: Optional[Dict[str, Any]] = None
         # A switch builds the new quest's Can-Do list; a space already on the
         # quest whose list is empty (a failed read) or missing (made before
-        # courses got their own list, admin-dash-api#472) gets it built.
-        rebuild = not current_list
+        # courses got their own list, admin-dash-api#472) gets it built, and
+        # so does a replacement of the named list.
+        rebuild = not current_list or replacing
         if update.outcome == UPDATE or rebuild:
             built = await self._course_missions.read(req.quest_id)
             if built is None:
@@ -376,10 +462,11 @@ class SetCoursePlan(Resource):
                     (COURSE_MISSIONS_STATE_EVENT_TYPE, ""),
                 ],
             )
+            again_list = again.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
             if (
                 _content(again.get((self._event_type, ""))) != _content(event)
-                or _content(again.get((COURSE_MISSIONS_STATE_EVENT_TYPE, "")))
-                != current_list
+                or _content(again_list) != current_list
+                or getattr(again_list, "event_id", None) != list_event_id
             ):
                 logger.warning(
                     "set_course_plan: %s changed while its Can-Do list was "
@@ -416,6 +503,13 @@ class SetCoursePlan(Resource):
                     "previous_revision": can_do_list_revision(current_list),
                     "revision": can_do_list_revision(new_list),
                     "missions": len((new_list or {}).get("missions") or []),
+                    **(
+                        await self._replacement_counts(
+                            req.quest_id, req.replace_copy_event_id, current_list, built
+                        )
+                        if replacing
+                        else {}
+                    ),
                 }
                 if update.outcome == UPDATE or rebuild
                 else None
