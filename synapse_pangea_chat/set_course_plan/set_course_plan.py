@@ -439,6 +439,7 @@ class SetCoursePlan(Resource):
         # courses got their own list, admin-dash-api#472) gets it built, and
         # so does a replacement of the named list.
         rebuild = not current_list or replacing
+        counts: Dict[str, Any] = {}
         if update.outcome == UPDATE or rebuild:
             built = await self._course_missions.read(req.quest_id)
             if built is None:
@@ -453,7 +454,13 @@ class SetCoursePlan(Resource):
                         else "its list stays as it is"
                     ),
                 )
-            # The read can take seconds; a teacher who changed course or
+            if replacing:
+                # Every CMS read comes before the re-check below, so nothing
+                # waits on the network between it and the write.
+                counts = await self._replacement_counts(
+                    req.quest_id, req.replace_copy_event_id, current_list, built
+                )
+            # The reads can take seconds; a teacher who changed course or
             # published a Can-Do list in the meantime wins.
             again = await self._api.get_room_state(
                 room_id,
@@ -503,13 +510,7 @@ class SetCoursePlan(Resource):
                     "previous_revision": can_do_list_revision(current_list),
                     "revision": can_do_list_revision(new_list),
                     "missions": len((new_list or {}).get("missions") or []),
-                    **(
-                        await self._replacement_counts(
-                            req.quest_id, req.replace_copy_event_id, current_list, built
-                        )
-                        if replacing
-                        else {}
-                    ),
+                    **counts,
                 }
                 if update.outcome == UPDATE or rebuild
                 else None

@@ -619,6 +619,30 @@ class TestReplaceCanDoList(_EndpointHarness):
         self.assertEqual(status, 409, body)
         api.create_and_send_event_into_room.assert_not_awaited()
 
+    async def test_a_list_published_during_the_counts_read_is_refused(self) -> None:
+        # The counts read the quest again; a teacher who publishes while it is
+        # in flight still wins (Codex review of #377).
+        endpoint, api = self._replacing()
+        first = await api.get_room_state()
+        published = dict(first)
+        published[("pangea.course_missions", "")] = SimpleNamespace(
+            content=self._WRONG_LIST, event_id="$teacher-publish"
+        )
+
+        async def selections(quest_id: str) -> Dict[str, List[str]]:
+            api.get_room_state = AsyncMock(return_value=published)
+            return {"lo-a": ["s1", "s2", "s3"], "lo-b": []}
+
+        endpoint._course_missions.quest_selections = selections  # type: ignore[method-assign]
+
+        with self.assertLogs(module.logger, level="WARNING"):
+            status, body = await self._post(
+                endpoint, expected="new", replace_copy_event_id="$built"
+            )
+
+        self.assertEqual(status, 409, body)
+        api.create_and_send_event_into_room.assert_not_awaited()
+
     async def test_a_dry_run_reports_the_counts_and_writes_nothing(self) -> None:
         endpoint, api = self._replacing()
 
