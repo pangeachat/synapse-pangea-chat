@@ -295,6 +295,16 @@ class TestClaimRules(_Base):
 
     async def test_managed_record_alone_blocks_a_second_claim_in_the_course(self):
         first, second = await self.h.add(INVITED, "second@school.example")
+        # Distinct creation times, so "oldest" is the rule under test and not
+        # a tie broken by id.
+        for ident, created in ((first, 1000), (second, 2000)):
+            await self.h.main.db_pool.runInteraction(
+                "created",
+                lambda txn, i=ident["invitation_id"], t=created: txn.execute(
+                    "UPDATE pangea_seat_invitation SET created_at_ms = ? WHERE id = ?",
+                    (t, i),
+                ),
+            )
         self.h.verify(STUDENT, INVITED_KEY)
         await self.h.open(STUDENT, first["invitation_id"])
         # Even if the joined row were missed, the managed record refuses.
@@ -424,6 +434,16 @@ class TestClaimRules(_Base):
         self,
     ):
         first, second = await self.h.add(INVITED, "second@school.example")
+        # Distinct creation times, so "oldest" is the rule under test and not
+        # a tie broken by id.
+        for ident, created in ((first, 1000), (second, 2000)):
+            await self.h.main.db_pool.runInteraction(
+                "created",
+                lambda txn, i=ident["invitation_id"], t=created: txn.execute(
+                    "UPDATE pangea_seat_invitation SET created_at_ms = ? WHERE id = ?",
+                    (t, i),
+                ),
+            )
         self.h.verify(STUDENT, INVITED_KEY)
         self.h.verify(STUDENT, "second@school.example", 2)
         status, body = await self.h.open(STUDENT, first["invitation_id"])
@@ -460,6 +480,16 @@ class TestClaimRules(_Base):
 
     async def test_one_joined_invitation_per_course_holds_in_the_database_itself(self):
         first, second = await self.h.add(INVITED, "second@school.example")
+        # Distinct creation times, so "oldest" is the rule under test and not
+        # a tie broken by id.
+        for ident, created in ((first, 1000), (second, 2000)):
+            await self.h.main.db_pool.runInteraction(
+                "created",
+                lambda txn, i=ident["invitation_id"], t=created: txn.execute(
+                    "UPDATE pangea_seat_invitation SET created_at_ms = ? WHERE id = ?",
+                    (t, i),
+                ),
+            )
         self.h.verify(STUDENT, INVITED_KEY)
         await self.h.open(STUDENT, first["invitation_id"])
         with self.assertRaises(Exception) as raised:
@@ -1524,6 +1554,103 @@ class TestClaimByEmailHook(_Base):
         self.assertGreaterEqual(sentry.capture_message.call_count, 2)
         self.assertNotIn(INVITED_KEY, str(sentry.mock_calls))
         self.assertNotIn(INVITED_KEY, captured.text())
+        self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
+
+
+class TestClaimOnJoin(_Base):
+    """A student who joins the course space by its class code is claimed by
+    their verified address, as at sign-in, for that course only."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.callback = MembershipRelease(self.h.store, self.h.claims)
+
+    async def join(self, room: str = ROOM, user: str = STUDENT) -> None:
+        self.h.main.membership[(room, user)] = "join"
+        await self.callback.on_new_event(_member_event(room, user, "join", user), {})
+
+    async def test_a_join_with_a_matching_verified_address_claims_that_courses_invitation(
+        self,
+    ):
+        (inv,) = await self.h.add(INVITED)
+        (elsewhere,) = await self.h.add(INVITED, room=OTHER_ROOM)
+        self.h.verify(STUDENT, INVITED_KEY)
+        await self.join()
+        row = await self.h.row(inv["invitation_id"])
+        self.assertEqual((row["state"], row["claimant"]), ("joined", STUDENT))
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
+        # Only the course joined: the other course's invitation still waits.
+        self.assertEqual(
+            (await self.h.row(elsewhere["invitation_id"]))["state"], "invited"
+        )
+
+    async def test_a_join_without_a_verified_address_or_with_another_claims_nothing(
+        self,
+    ):
+        (inv,) = await self.h.add(INVITED)
+        await self.join()
+        self.h.verify(OTHER, "someone@else.example")
+        await self.join(user=OTHER)
+        self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+
+    async def test_a_join_to_a_room_with_no_invitations_claims_nothing(self):
+        (inv,) = await self.h.add(INVITED)
+        self.h.verify(STUDENT, INVITED_KEY)
+        await self.join(room="!chat:x")
+        self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
+        self.assertNotIn(("!chat:x", STUDENT), self.h.joiner.joins)
+
+    async def test_a_second_join_or_one_already_claimed_does_nothing_more(self):
+        (inv,) = await self.h.add(INVITED)
+        self.h.verify(STUDENT, INVITED_KEY)
+        await self.h.open(STUDENT, inv["invitation_id"])
+        before = await self.h.events()
+        await self.join()
+        await self.join()
+        row = await self.h.row(inv["invitation_id"])
+        self.assertEqual((row["state"], row["claimant"]), ("joined", STUDENT))
+        self.assertEqual(await self.h.events(), before)
+
+    async def test_one_claim_per_course_on_join_the_oldest(self):
+        first, second = await self.h.add(INVITED, "second@school.example")
+        # Distinct creation times, so "oldest" is the rule under test and not
+        # a tie broken by id.
+        for ident, created in ((first, 1000), (second, 2000)):
+            await self.h.main.db_pool.runInteraction(
+                "created",
+                lambda txn, i=ident["invitation_id"], t=created: txn.execute(
+                    "UPDATE pangea_seat_invitation SET created_at_ms = ? WHERE id = ?",
+                    (t, i),
+                ),
+            )
+        self.h.verify(STUDENT, INVITED_KEY)
+        self.h.verify(STUDENT, "second@school.example", 2)
+        await self.join()
+        await self.join()
+        self.assertEqual((await self.h.row(first["invitation_id"]))["state"], "joined")
+        self.assertEqual(
+            (await self.h.row(second["invitation_id"]))["state"], "invited"
+        )
+
+    async def test_a_failed_claim_on_join_is_reported_never_raised(self):
+        (inv,) = await self.h.add(INVITED)
+        self.h.verify(STUDENT, INVITED_KEY)
+        self.h.main.db_pool.error = RuntimeError("db down")
+        with patch.object(report, "sentry_sdk") as sentry:
+            await self.join()
+        self.h.main.db_pool.error = None
+        sentry.capture_message.assert_called()
+        self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
+
+    async def test_a_claim_that_cannot_join_is_reported_never_raised(self):
+        (inv,) = await self.h.add(INVITED)
+        self.h.verify(STUDENT, INVITED_KEY)
+        self.h.joiner.refuse.add(STUDENT)
+        with patch.object(report, "sentry_sdk") as sentry:
+            await self.join()
+        self.h.joiner.refuse.clear()
+        sentry.capture_message.assert_called()
         self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
 
 

@@ -729,16 +729,21 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         )
         self.assertNotIn("school", limited.text)
 
-    async def test_concurrent_claims_never_double_claim(self):
+    async def test_joining_by_the_class_code_claims_the_verified_address_invitation(
+        self,
+    ):
+        """The app may drop the invitation's own link: a student who joins the
+        course space by its class code is claimed by their verified address,
+        for that course only."""
         await self.boot()
-        for name in ("teacher", "student", "a", "b"):
+        for name in ("teacher", "student"):
             await self.user(name)
         await self.user("root", admin=True)
         room = self.course("teacher")
-        self.bind("student", INVITED_KEY, SECOND)
-        first, second = self.add(room, INVITED, SECOND)
-        # Already in the course through the class code, so the race is the
-        # claim's alone and not two joins of one account.
+        other = self.course("teacher", "French 101", "fr3nchc")
+        self.bind("student", INVITED_KEY)
+        (inv,) = self.add(room, INVITED)
+        (elsewhere,) = self.add(other, INVITED)
         resp = self.call(
             "POST",
             P + "knock_with_code",
@@ -752,6 +757,41 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             self.tokens["student"],
             body={},
         )
+        student = self.users["student"]
+        # The claim runs in the join's callback, after the event is persisted.
+        self.assertEqual(
+            self.managed_soon(student, room, (student, room)), (student, room)
+        )
+        row = self.listing(room)[inv["invitation_id"]]
+        self.assertEqual((row["state"], row["claimant"]), ("joined", student))
+        self.assertEqual(
+            self.listing(other)[elsewhere["invitation_id"]]["state"], "invited"
+        )
+
+    async def test_concurrent_claims_never_double_claim(self):
+        await self.boot()
+        for name in ("teacher", "student", "a", "b"):
+            await self.user(name)
+        await self.user("root", admin=True)
+        room = self.course("teacher")
+        first, second = self.add(room, INVITED, SECOND)
+        # Already in the course through the class code, so the race is the
+        # claim's alone and not two joins of one account. The addresses are
+        # verified after the join, which would otherwise claim the oldest.
+        resp = self.call(
+            "POST",
+            P + "knock_with_code",
+            self.tokens["student"],
+            body={"access_code": CODE},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.ok(
+            "POST",
+            f"/_matrix/client/v3/join/{quote(room, safe='')}",
+            self.tokens["student"],
+            body={},
+        )
+        self.bind("student", INVITED_KEY, SECOND)
         shared = self.add(room, THIRD)[0]["invitation_id"]
         for name in ("a", "b"):
             self.assertEqual(self.open(name, shared).json()["result"], "pending")
