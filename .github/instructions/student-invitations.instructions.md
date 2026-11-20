@@ -27,6 +27,7 @@ The module is where a student invitation lives: it keeps the invitation a teache
 ## The claim
 
 - Every way in (opening the link, the teacher's grant or Approve all, signing in, or verifying a newly added address) goes through one claim, so two people can never claim the same invitation. The module is the one place an address is matched to an account.
+- Joining the course space also claims the student's waiting invitation for an address their account has verified.
 - The sign-up hint shows the course name and a masked address only while the invitation is still waiting.
 - A teacher's action re-checks that the caller is a current admin of the course and refuses every other caller the same way, so a refusal reveals nothing about which courses exist.
 - The history is only ever added to; a sent email enters it once the mail service accepts it.
