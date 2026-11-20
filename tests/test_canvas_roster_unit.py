@@ -1344,6 +1344,22 @@ class TestLearnerLaunch(_Base):
         # The identity is the match: no request is written.
         self.assertIsNone(await self.c.h.store.get_request(exact["id"], STUDENT))
 
+    async def test_canvas_claim_records_management_started_via_canvas(self):
+        row = await self.canvas_row()
+        # The account also has the invited address verified: the claim still
+        # comes from the Canvas launch.
+        self.c.h.verify(STUDENT, "student@school.example")
+        status, body = await self.c.learner_l1(
+            STUDENT, await self.c.ticket(self.c.launch())
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual((await self.c.h.row(row["id"]))["joined_via"], "canvas")
+        (event,) = await self.c.h.managed_events()
+        self.assertEqual(
+            (event["user_id"], event["actor"], event["via"]),
+            (STUDENT, "system", "canvas"),
+        )
+
     async def test_canvas_claim_transaction_rechecks_the_identity_itself(self):
         row = await self.canvas_row()
         for identity in (

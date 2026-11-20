@@ -26,6 +26,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    NamedTuple,
     Optional,
     Protocol,
     Tuple,
@@ -228,6 +229,41 @@ def _view_fields(
         "canvas_identity": row["lti_user_id"] is not None,
         "pending_count": pending_count if row["state"] == STATE_INVITED else 0,
         "same_student_as": same_student_as if row["state"] == STATE_INVITED else None,
+    }
+
+
+class _PageQuery(NamedTuple):
+    from_ms: Optional[int]
+    to_ms: Optional[int]
+    before: Optional[Tuple[int, str]]
+
+
+def _page_query(query: Any) -> Tuple[Optional[_PageQuery], Result]:
+    """A ledger read's ``from``, ``to`` and ``cursor``, or the 400 to send."""
+    bounds: Dict[str, Optional[int]] = {}
+    for name in ("from", "to"):
+        raw = query.get(name)
+        if raw is None:
+            bounds[name] = None
+        elif isinstance(raw, str) and raw.isdigit() and len(raw) <= 15:
+            bounds[name] = int(raw)
+        else:
+            return None, _bad(f"'{name}' must be milliseconds since the epoch")
+    cursor = query.get("cursor")
+    before = None
+    if cursor is not None:
+        before = _parse_cursor(cursor)
+        if before is None:
+            return None, _bad("'cursor' is not valid")
+    return _PageQuery(bounds["from"], bounds["to"], before), (200, {})
+
+
+def _page_body(
+    events: List[Dict[str, Any]], after: Optional[Tuple[int, str]]
+) -> Dict[str, Any]:
+    return {
+        "events": events,
+        "next_cursor": f"{after[0]}.{after[1]}" if after is not None else None,
     }
 
 
@@ -594,6 +630,20 @@ class StudentInvitationHandlers:
             "events": events,
             "next_cursor": f"{after[0]}.{after[1]}" if after is not None else None,
         }
+
+    async def managed_events(self, caller: str, query: Any) -> Result:
+        """This course's managed-account activity (#799), newest first, one
+        page at a time, read as T12 is."""
+        room_id, refusal = await self._admin_room(caller, query)
+        if room_id is None:
+            return refusal
+        page, bad = _page_query(query)
+        if page is None:
+            return bad
+        events, after = await self._store.managed_events(
+            room_id, from_ms=page.from_ms, to_ms=page.to_ms, before=page.before
+        )
+        return 200, _page_body(events, after)
 
     # --- student routes ---
 

@@ -27,6 +27,8 @@ DEFAULT_LIMITS: Dict[str, Tuple[int, int]] = {
     "student_invitations_open": (10, 60),
     # T12, the activity read.
     "student_invitations_events": (60, 60),
+    # The managed-account activity read (#799).
+    "student_invitations_managed_events": (60, 60),
     # choreo reads it with the student's token on a full gate recompute.
     "student_invitations_mine_joined": (120, 60),
     "student_invitations_hint": (10, 60),

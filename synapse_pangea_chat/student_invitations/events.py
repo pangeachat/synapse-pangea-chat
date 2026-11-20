@@ -66,6 +66,13 @@ EVENT_SCHEMA = (
 )
 
 
+def new_event_id() -> str:
+    """An event id for this ledger or the managed-account one
+    (``managed_events.py``), from one sequence so the events of one
+    transaction sort in write order across both."""
+    return f"{next(_SEQUENCE):012d}{secrets.token_hex(8)}"
+
+
 def record_event(
     txn: Any,
     *,
@@ -79,7 +86,7 @@ def record_event(
     """Append one event inside the caller's transaction; returns its id."""
     if action not in ACTIONS:
         raise ValueError("unknown invitation event action")
-    event_id = f"{next(_SEQUENCE):012d}{secrets.token_hex(8)}"
+    event_id = new_event_id()
     txn.execute(
         "INSERT INTO pangea_seat_invitation_event"
         " (event_id, room_id, ts_ms, actor, action, invitation_id, count)"
