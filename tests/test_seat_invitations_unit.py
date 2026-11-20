@@ -1601,6 +1601,33 @@ class TestClaimOnJoin(_Base):
         self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
         self.assertNotIn(("!chat:x", STUDENT), self.h.joiner.joins)
 
+    async def test_a_join_reads_only_the_rooms_waiting_invitations_for_the_accounts_addresses(
+        self,
+    ):
+        """Runs on every join in every room: never the room's whole list. A
+        room with no waiting invitation costs one indexed read and nothing
+        else; a course reads only its waiting rows for the account's addresses."""
+        (inv,) = await self.h.add(INVITED)
+        self.h.verify(STUDENT, INVITED_KEY)
+        whole_list = patch.object(
+            self.h.store, "list_room", side_effect=AssertionError("whole list read")
+        )
+        emails = patch.object(
+            self.h.accounts,
+            "verified_email_keys",
+            wraps=self.h.accounts.verified_email_keys,
+        )
+        with whole_list, emails as looked_up:
+            await self.join(room="!chat:x")
+            looked_up.assert_not_called()
+            await self.join()
+            looked_up.assert_called()
+        self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "joined")
+        self.assertEqual(
+            await self.h.store.invited_in_room_for_keys(ROOM, [INVITED_KEY]), []
+        )
+        self.assertFalse(await self.h.store.has_invited("!chat:x"))
+
     async def test_a_second_join_or_one_already_claimed_does_nothing_more(self):
         (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)

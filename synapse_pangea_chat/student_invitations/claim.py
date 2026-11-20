@@ -265,29 +265,25 @@ class StudentClaims:
         """On joining a course space: the sign-in claim, for that course only.
         A student who joins by the class code (the app may drop the
         invitation's own link) is claimed by a verified address as at
-        sign-in. Only ``invited`` rows of this room, oldest first, so a room
-        with none (any room that is not a course with waiting invitations)
-        costs one read and claims nothing; a second join claims nothing more
-        (the claim itself allows one joined invitation per course).
+        sign-in. It runs on every join in every room, so it never reads a
+        room's whole list: a room with no waiting invitation (every room that
+        is not a course with one) costs one indexed read; a course then reads
+        only its waiting rows for the account's verified addresses, oldest
+        first. A second join claims nothing more (the claim itself allows one
+        joined invitation per course).
         Never raises: a failed claim must not fail the join's event.
 
         For review in the PR: the student invitations doc's list of the ways
         a claim happens may deserve a line for joining the course space."""
         try:
-            rows = [
-                r
-                for r in await self._store.list_room(room_id)
-                if r["state"] == STATE_INVITED
-            ]
-            if not rows:
+            if not await self._store.has_invited(room_id):
                 return
             keys = await self._accounts.verified_email_keys(user_id)
+            rows = await self._store.invited_in_room_for_keys(room_id, keys)
         except Exception as error:
             report_failure("student invitation lookup on join", error, room=room_id)
             return
         for row in rows:
-            if row["email_key"] not in keys:
-                continue
             try:
                 outcome, _ = await self.claim(row["id"], user_id)
             except Exception as error:
