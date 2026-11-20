@@ -1,4 +1,8 @@
-"""Release on leave, kick or ban (SPEC §7, "Leaving").
+"""Release on leave, kick or ban (SPEC §7, "Leaving"), and claim on join.
+
+A join to a course space runs the sign-in claim for that course only
+(``StudentClaims.claim_matching_in_room``): a student who joins by the class
+code is claimed by a verified address, as if they had opened their link.
 
 When the claimant of a joined invitation leaves the course space, or is
 kicked (a ``leave`` sent by someone else) or banned from it, the invitation
@@ -25,6 +29,7 @@ logger = logging.getLogger(
 )
 
 RELEASING_MEMBERSHIPS = frozenset({"leave", "ban"})
+JOIN = "join"
 
 
 class MembershipRelease:
@@ -42,7 +47,12 @@ class MembershipRelease:
             return
         if event.type != "m.room.member" or not isinstance(event.state_key, str):
             return
-        if event.content.get("membership") not in RELEASING_MEMBERSHIPS:
+        membership = event.content.get("membership")
+        if membership == JOIN:
+            # Never raises; only ``invited`` rows of this room are read.
+            await self._claims.claim_matching_in_room(event.state_key, event.room_id)
+            return
+        if membership not in RELEASING_MEMBERSHIPS:
             return
         try:
             released = await self._store.release_on_leave(

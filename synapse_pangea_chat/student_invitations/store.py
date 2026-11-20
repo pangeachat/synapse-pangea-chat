@@ -291,6 +291,49 @@ class StudentInvitationStore:
 
         return await self.db.runInteraction("pangea_seat_invitation_keys", select)
 
+    async def has_invited(self, room_id: str) -> bool:
+        """Whether the room has an ``invited`` row: one read on the
+        (course_room_id, email_key) unique index's leading column, returning
+        nothing for a room that is not a course. Runs on every join."""
+        await self.ensure()
+
+        def select(txn: Any) -> bool:
+            txn.execute(
+                "SELECT 1 FROM pangea_seat_invitation"
+                " WHERE course_room_id = ? AND state = 'invited' LIMIT 1",
+                (room_id,),
+            )
+            return txn.fetchone() is not None
+
+        return await self.db.runInteraction(
+            "pangea_seat_invitation_has_invited", select
+        )
+
+    async def invited_in_room_for_keys(
+        self, room_id: str, email_keys: Iterable[str]
+    ) -> List[Dict]:
+        """``invited`` rows of one course whose email key is one of these,
+        oldest first: a lookup per key on the (course_room_id, email_key)
+        unique index."""
+        keys = sorted(set(email_keys))
+        if not keys:
+            return []
+        await self.ensure()
+
+        def select(txn: Any) -> List[Dict]:
+            rows: List[Dict] = []
+            for key in keys:
+                txn.execute(
+                    _SELECT + "WHERE course_room_id = ? AND email_key = ?"
+                    " AND state = 'invited'",
+                    (room_id, key),
+                )
+                rows.extend(r for r in (_row(x) for x in txn.fetchall()) if r)
+            rows.sort(key=lambda r: (r["created_at_ms"], r["id"]))
+            return rows
+
+        return await self.db.runInteraction("pangea_seat_invitation_room_keys", select)
+
     async def canvas_invited(self, identity: CanvasIdentity) -> List[Dict]:
         """``invited`` rows, in any course, imported with exactly this Canvas
         identity."""
