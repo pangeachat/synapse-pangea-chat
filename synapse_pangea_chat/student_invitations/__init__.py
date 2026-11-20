@@ -143,6 +143,12 @@ def register_student_invitations(
             "teacher",
             h.events,
         ),
+        "student_invitations_managed_events": (
+            "student_invitations/managed_events",
+            "GET",
+            "teacher",
+            h.managed_events,
+        ),
         "student_invitations_mine_joined": (
             "student_invitations/mine/joined",
             "GET",

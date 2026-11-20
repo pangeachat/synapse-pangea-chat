@@ -41,4 +41,4 @@ Before seats, the dashboard's class-list upload sent a different invitation thro
 
 ## Open questions
 
-- Graduation, how management began and who graduated the student are not recorded yet, and a student who joins by class code or link is not marked ([pangeachat/.github#799](https://github.com/pangeachat/.github/issues/799)).
+- Graduation and who graduated the student are not recorded yet, and a student who joins by class code or link is not marked ([pangeachat/.github#799](https://github.com/pangeachat/.github/issues/799)).

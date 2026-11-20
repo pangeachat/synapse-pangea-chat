@@ -482,6 +482,26 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         self.assertEqual(
             self.managed(self.users["student"], room), (self.users["student"], room)
         )
+        # The managed-account ledger, through the registered route (#799).
+        (started,) = self.ok(
+            "GET",
+            SI + "managed_events",
+            self.tokens["teacher"],
+            params={"room_id": room},
+        )["events"]
+        self.assertEqual(
+            (started["user_id"], started["actor"], started["action"], started["via"]),
+            (self.users["student"], "system", "management_started", "email"),
+        )
+        self.assertEqual(
+            self.call(
+                "GET",
+                SI + "managed_events",
+                self.tokens["student"],
+                params={"room_id": room},
+            ).status_code,
+            403,
+        )
         self.assertEqual(
             self.ok("GET", SI + "mine/joined", self.tokens["student"]),
             {
@@ -886,10 +906,10 @@ class TestSchemaMigrationOnPostgres(unittest.TestCase):
                 )
                 self.assertEqual(
                     columns["pangea_seat_invitation"],
-                    ["id", "state", "send_at_ms", "first_due_ms"],
+                    ["id", "state", "send_at_ms", "first_due_ms", "joined_via"],
                 )
                 cur.execute("SELECT * FROM pangea_seat_invitation")
-                self.assertEqual(cur.fetchall(), [("i", "invited", None, None)])
+                self.assertEqual(cur.fetchall(), [("i", "invited", None, None, None)])
                 cur.execute("SELECT * FROM pangea_invitation_ack")
                 self.assertEqual(cur.fetchall(), [("i", "u", 5, None)])
                 cur.execute("SELECT * FROM pangea_managed_account")
