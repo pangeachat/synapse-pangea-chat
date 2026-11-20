@@ -2,13 +2,14 @@
 
 When the claimant of a joined invitation leaves the course space, or is
 kicked (a ``leave`` sent by someone else) or banned from it, the invitation
-becomes ``left`` and the managed record is deleted. Rejoining with the class
-code restores nothing: a re-invite is needed.
+becomes ``left``. The managed record stays: only graduation by a course admin
+ends management (pangeachat/.github#799). Rejoining with the class code
+restores nothing on the invitation: a re-invite is needed.
 
-The same callback watches the course's ``m.room.power_levels``: the managed
-record exists exactly while a joined claimant is not a course admin there
-(CONTRACTS C2.5). Runs as an ``on_new_event`` callback and never raises into
-event persistence.
+The same callback watches the course's ``m.room.power_levels``: a joined
+claimant who stops being a course admin there becomes managed (CONTRACTS
+C2.5); becoming one keeps the record. Runs as an ``on_new_event`` callback
+and never raises into event persistence.
 """
 
 from __future__ import annotations
@@ -36,8 +37,7 @@ class MembershipRelease:
         self, event: Any, _state: Mapping[Tuple[str, str], Any]
     ) -> None:
         if event.type == "m.room.power_levels" and event.state_key == "":
-            # A claimant who stops being a course admin becomes managed; one
-            # who becomes a course admin stops being managed (C2.5).
+            # A claimant who stops being a course admin becomes managed (C2.5).
             await self._claims.apply_managed_rule_in_room(event.room_id)
             return
         if event.type != "m.room.member" or not isinstance(event.state_key, str):
