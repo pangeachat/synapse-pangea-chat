@@ -13,8 +13,10 @@ Three tables (SPEC §6):
   2026-10-10). A request is written only when an account opens an invitation
   whose address it does not have verified; it carries the teacher's decision
   (null, granted, denied). A verified match claims with no request.
-- ``pangea_managed_account``: written by every claim (``created_at`` only),
-  deleted when the invitation is revoked or its claimant leaves the course.
+- ``pangea_managed_account``: written by every claim (``created_at`` only).
+  Nothing here deletes it: management ends only when a course admin graduates
+  the student (managed-accounts doc; pangeachat/.github#799), so leaving,
+  removal, a ban, a withdrawn invitation and promotion to admin keep it.
 - ``pangea_seat_invitation_event``: the append-only activity ledger
   (``events.py``), written in the same transaction as each change.
 
@@ -810,8 +812,8 @@ class StudentInvitationStore:
     async def revoke(
         self, room_id: str, invitation_id: str, actor: str, now_ms: int
     ) -> Optional[Dict]:
-        """Revoke; release the managed record if it was joined. None if no
-        such invitation in this course."""
+        """Revoke. A claimant's managed record stays (#799). None if no such
+        invitation in this course."""
         await self.ensure()
 
         def write(txn: Any) -> Optional[Dict]:
@@ -825,8 +827,6 @@ class StudentInvitationStore:
                 return None
             if row["state"] == STATE_REVOKED:
                 return row
-            if row["state"] == STATE_JOINED and row["claimant"] is not None:
-                _delete_managed(txn, row["claimant"], room_id)
             txn.execute(
                 "UPDATE pangea_seat_invitation SET state = 'revoked' WHERE id = ?",
                 (invitation_id,),
@@ -847,7 +847,7 @@ class StudentInvitationStore:
         self, room_id: str, user_id: str, now_ms: int
     ) -> Optional[str]:
         """The claimant left, or was removed from, the course: set its joined
-        invitation ``left`` and delete the managed record. Returns the
+        invitation ``left``. The managed record stays (#799). Returns the
         invitation id released, if any."""
         await self.ensure()
 
@@ -863,7 +863,6 @@ class StudentInvitationStore:
             )
             if txn.rowcount != 1:
                 return None
-            _delete_managed(txn, user_id, room_id)
             record_event(
                 txn,
                 room_id=room_id,
@@ -876,12 +875,10 @@ class StudentInvitationStore:
 
         return await self.db.runInteraction("pangea_seat_invitation_left", write)
 
-    async def set_managed(
-        self, invitation_id: str, user_id: str, managed: bool, now_ms: int
-    ) -> str:
-        """Apply the managed-record rule (C2.5) to one joined invitation:
-        ``managed`` inserts the record, otherwise it is deleted. Idempotent.
-        Returns "inserted", "deleted", "unchanged" or "not_joined"."""
+    async def set_managed(self, invitation_id: str, user_id: str, now_ms: int) -> str:
+        """Insert the managed record for one joined invitation, if missing.
+        Idempotent; never deletes (#799). Returns "inserted", "unchanged" or
+        "not_joined"."""
         await self.ensure()
 
         def write(txn: Any) -> str:
@@ -891,11 +888,7 @@ class StudentInvitationStore:
                 return "not_joined"
             if row["claimant"] != user_id:
                 return "not_joined"
-            room_id = row["course_room_id"]
-            if not managed:
-                _delete_managed(txn, user_id, room_id)
-                return "deleted" if txn.rowcount == 1 else "unchanged"
-            _insert_managed(txn, user_id, room_id, now_ms)
+            _insert_managed(txn, user_id, row["course_room_id"], now_ms)
             return "inserted" if txn.rowcount == 1 else "unchanged"
 
         return await self.db.runInteraction("pangea_managed_account_set", write)
@@ -1035,9 +1028,9 @@ class StudentInvitationStore:
             if _joined_in_course(txn, room_id, user_id) is not None:
                 return ALREADY_CLAIMED_IN_COURSE, row
             if managed:
+                # A record kept from an earlier claim in this course (the
+                # student left and was invited again) stays as it is.
                 _insert_managed(txn, user_id, room_id, now_ms)
-                if txn.rowcount != 1:
-                    return ALREADY_CLAIMED_IN_COURSE, row
             if grant and request is not None and request[0] != DECISION_GRANTED:
                 txn.execute(
                     "UPDATE pangea_invitation_ack SET decision = 'granted'"
@@ -1139,11 +1132,4 @@ def _insert_managed(txn: Any, user_id: str, room_id: str, now_ms: int) -> None:
         "INSERT INTO pangea_managed_account (user_id, course_room_id, created_at_ms)"
         " VALUES (?, ?, ?) ON CONFLICT (user_id, course_room_id) DO NOTHING",
         (user_id, room_id, now_ms),
-    )
-
-
-def _delete_managed(txn: Any, user_id: str, room_id: str) -> None:
-    txn.execute(
-        "DELETE FROM pangea_managed_account WHERE user_id = ? AND course_room_id = ?",
-        (user_id, room_id),
     )
