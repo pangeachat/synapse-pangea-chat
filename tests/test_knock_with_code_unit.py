@@ -488,7 +488,7 @@ class TestClaimResponseHold(unittest.IsolatedAsyncioTestCase):
 
         self.respond.side_effect = lambda *_, **__: events.append("answer")
         handler._provisioner = MagicMock()
-        handler._provisioner.claim = claim
+        handler._provisioner.claim = AsyncMock(side_effect=claim)
         self.events = events
         return handler
 
