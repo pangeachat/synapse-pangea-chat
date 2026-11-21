@@ -2,6 +2,8 @@
 
 Paths: the student opening their invitation, the teacher's Grant and Approve
 all, the ``ClaimByEmail`` hook on every sign-in and verified-email addition,
+joining the course space (by its class code or otherwise; the membership
+callback, for that course only),
 and the Canvas link step and later launches (a row imported with exactly the
 account's own linked Canvas identity). No student confirmation is needed:
 managed-account consent lives in Pangea's Terms (seats amendment 2026-10-10).
@@ -258,3 +260,45 @@ class StudentClaims:
                     row["id"],
                     outcome,
                 )
+
+    async def claim_matching_in_room(self, user_id: str, room_id: str) -> None:
+        """On joining a course space: the sign-in claim, for that course only.
+        A student who joins by the class code (the app may drop the
+        invitation's own link) is claimed by a verified address as at
+        sign-in. It runs on every join in every room, so it never reads a
+        room's whole list: a room with no waiting invitation (every room that
+        is not a course with one) costs one indexed read; a course then reads
+        only its waiting rows for the account's verified addresses, oldest
+        first. A second join claims nothing more (the claim itself allows one
+        joined invitation per course).
+        Never raises: a failed claim must not fail the join's event.
+
+        For review in the PR: the student invitations doc's list of the ways
+        a claim happens may deserve a line for joining the course space."""
+        try:
+            if not await self._store.has_invited(room_id):
+                return
+            keys = await self._accounts.verified_email_keys(user_id)
+            rows = await self._store.invited_in_room_for_keys(room_id, keys)
+        except Exception as error:
+            report_failure("student invitation lookup on join", error, room=room_id)
+            return
+        for row in rows:
+            try:
+                outcome, _ = await self.claim(row["id"], user_id)
+            except Exception as error:
+                report_failure(
+                    "student invitation claim on join",
+                    error,
+                    invitation=row["id"],
+                )
+                continue
+            if outcome == CLAIMED:
+                # One claim per course: the rest stay invited (the roster
+                # marks them "same student as").
+                return
+            logger.info(
+                "Student invitation %s not claimed on join: %s",
+                row["id"],
+                outcome,
+            )
