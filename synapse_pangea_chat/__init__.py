@@ -974,7 +974,7 @@ class PangeaChat:
             "knock_with_code_burst_duration_seconds", 60
         )
         course_claim_response_hold_seconds = config.get(
-            "course_claim_response_hold_seconds", 3.0
+            "course_claim_response_hold_seconds", 5.0
         )
         if (
             isinstance(course_claim_response_hold_seconds, bool)

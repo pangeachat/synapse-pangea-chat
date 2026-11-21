@@ -473,7 +473,7 @@ class TestClaimResponseHold(unittest.IsolatedAsyncioTestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def _claim_handler(self, invitation: dict, hold: float = 3.0) -> KnockWithCode:
+    def _claim_handler(self, invitation: dict, hold: float = 5.0) -> KnockWithCode:
         store = _claim_store()
         store.invitations.for_code = AsyncMock(return_value=invitation)
         handler = _handler(claim_store=store)
@@ -498,7 +498,7 @@ class TestClaimResponseHold(unittest.IsolatedAsyncioTestCase):
             handler = self._claim_handler({"status": status, "specification": {}})
             await handler._async_render_POST(MagicMock())
             self.assertEqual(self.events, ["claim", "hold", "answer"], status)
-            handler._api.sleep.assert_awaited_once_with(3.0)
+            handler._api.sleep.assert_awaited_once_with(5.0)
             self.assertEqual(
                 self.respond.call_args.args[2],
                 {"rooms": [], "already_joined": [ROOM_1], "banned": []},
