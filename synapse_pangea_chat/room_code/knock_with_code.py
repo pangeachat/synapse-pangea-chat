@@ -29,6 +29,7 @@ from synapse_pangea_chat.email_invite.course_claims import (
     CourseClaim,
     CourseClaimStore,
 )
+from synapse_pangea_chat.email_invite.course_invitations import invitation_kind
 from synapse_pangea_chat.room_code.burn_admin_code import burn_admin_code
 from synapse_pangea_chat.room_code.constants import (
     ERRCODE_BANNED_FROM_ROOM,
@@ -97,6 +98,25 @@ class KnockWithCode(Resource):
         self._claim_store = claim_store
         self._notifier = notifier
         self._provisioner = provisioner
+
+    async def _hold_after_creation(self) -> None:
+        """Wait before answering a claim that has just created its course.
+
+        Synapse stores a new room's create event and its creator's join before
+        the rest of its state, so the claimant's app receives the room as
+        joined about a second before it receives ``pangea.course_plan``. The
+        released apps open the course page as soon as this endpoint answers,
+        read the plan once, and show "This course is no longer available" when
+        it is not there yet. Answering a few seconds later lets the sync that
+        carries the plan reach the app first. It narrows the race rather than
+        closing it: the app's own fix is to read the plan again when it
+        arrives. The verified-address claim at sign-in does not wait, because
+        no app is waiting on it to open the course. May deserve a line in
+        knock-with-code.instructions.md, "Claiming a course".
+        """
+        hold = self._config.course_claim_response_hold_seconds
+        if hold > 0:
+            await self._api.sleep(hold)
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -167,7 +187,17 @@ class KnockWithCode(Resource):
             if self._provisioner is not None:
                 invitation = await self._claim_store.invitations.for_code(access_code)
                 if invitation is not None:
+                    # Read before the claim: a completed invitation is a replay
+                    # of a course that already exists.
+                    # An instructor invitation joins a course that already
+                    # holds its plan.
+                    created_now = (
+                        invitation["status"] != "completed"
+                        and invitation_kind(invitation) == "course"
+                    )
                     room = await self._provisioner.claim(invitation, requester_id)
+                    if created_now:
+                        await self._hold_after_creation()
                     respond_with_json(
                         request,
                         200,
