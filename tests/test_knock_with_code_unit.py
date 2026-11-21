@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse_pangea_chat.config import PangeaChatConfig
@@ -478,9 +479,10 @@ class TestClaimResponseHold(unittest.IsolatedAsyncioTestCase):
         store.invitations.for_code = AsyncMock(return_value=invitation)
         handler = _handler(claim_store=store)
         handler._config = PangeaChatConfig(course_claim_response_hold_seconds=hold)
-        handler._api.sleep = AsyncMock()
         events: list[str] = []
-        handler._api.sleep.side_effect = lambda _: events.append("hold")
+        # The handler types its api as ModuleApi; the test's is a mock.
+        self.sleep = AsyncMock(side_effect=lambda _: events.append("hold"))
+        cast(MagicMock, handler._api).sleep = self.sleep
 
         async def claim(*_):
             events.append("claim")
@@ -498,7 +500,7 @@ class TestClaimResponseHold(unittest.IsolatedAsyncioTestCase):
             handler = self._claim_handler({"status": status, "specification": {}})
             await handler._async_render_POST(MagicMock())
             self.assertEqual(self.events, ["claim", "hold", "answer"], status)
-            handler._api.sleep.assert_awaited_once_with(5.0)
+            self.sleep.assert_awaited_once_with(5.0)
             self.assertEqual(
                 self.respond.call_args.args[2],
                 {"rooms": [], "already_joined": [ROOM_1], "banned": []},
