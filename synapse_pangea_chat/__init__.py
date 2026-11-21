@@ -973,6 +973,17 @@ class PangeaChat:
         knock_with_code_burst_duration_seconds = config.get(
             "knock_with_code_burst_duration_seconds", 60
         )
+        course_claim_response_hold_seconds = config.get(
+            "course_claim_response_hold_seconds", 3.0
+        )
+        if (
+            isinstance(course_claim_response_hold_seconds, bool)
+            or not isinstance(course_claim_response_hold_seconds, (int, float))
+            or not 0 <= course_claim_response_hold_seconds <= 15
+        ):
+            raise ValueError(
+                "course_claim_response_hold_seconds must be a number from 0 to 15"
+            )
 
         # --- preview_with_code config ---
         preview_with_code_requests_per_burst = config.get(
@@ -1735,6 +1746,9 @@ class PangeaChat:
             discussion_room_choreo_base_url=discussion_room_choreo_base_url,
             knock_with_code_requests_per_burst=knock_with_code_requests_per_burst,
             knock_with_code_burst_duration_seconds=knock_with_code_burst_duration_seconds,
+            course_claim_response_hold_seconds=float(
+                course_claim_response_hold_seconds
+            ),
             preview_with_code_requests_per_burst=preview_with_code_requests_per_burst,
             preview_with_code_burst_duration_seconds=preview_with_code_burst_duration_seconds,
             preview_with_code_state_event_types=preview_with_code_state_event_types,

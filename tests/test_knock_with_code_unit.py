@@ -452,3 +452,73 @@ class TestStudentInvitationCodes(unittest.IsolatedAsyncioTestCase):
         status, body = self.respond.call_args.args[1], self.respond.call_args.args[2]
         self.assertEqual((status, body["already_joined"]), (200, [ROOM_1]))
         store.students.record_use.assert_awaited_once()
+
+
+class TestClaimResponseHold(unittest.IsolatedAsyncioTestCase):
+    """A claim that creates its course answers a few seconds late, so the
+    claimant's app has the course's plan before it opens the course page.
+    The released apps read the plan once, on opening."""
+
+    def setUp(self) -> None:
+        self.respond = MagicMock()
+        patches = [
+            patch(f"{MODULE}.respond_with_json", self.respond),
+            patch(f"{MODULE}.is_rate_limited", return_value=False),
+            patch(
+                f"{MODULE}.extract_body_json",
+                AsyncMock(return_value={"access_code": CODE}),
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _claim_handler(self, invitation: dict, hold: float = 3.0) -> KnockWithCode:
+        store = _claim_store()
+        store.invitations.for_code = AsyncMock(return_value=invitation)
+        handler = _handler(claim_store=store)
+        handler._config = PangeaChatConfig(course_claim_response_hold_seconds=hold)
+        handler._api.sleep = AsyncMock()
+        events: list[str] = []
+        handler._api.sleep.side_effect = lambda _: events.append("hold")
+
+        async def claim(*_):
+            events.append("claim")
+            return ROOM_1
+
+        self.respond.side_effect = lambda *_, **__: events.append("answer")
+        handler._provisioner = MagicMock()
+        handler._provisioner.claim = claim
+        self.events = events
+        return handler
+
+    async def test_a_claim_that_creates_the_course_holds_then_answers(self) -> None:
+        for status in ("prepared", "provisioning"):
+            self.respond.reset_mock()
+            handler = self._claim_handler({"status": status, "specification": {}})
+            await handler._async_render_POST(MagicMock())
+            self.assertEqual(self.events, ["claim", "hold", "answer"], status)
+            handler._api.sleep.assert_awaited_once_with(3.0)
+            self.assertEqual(
+                self.respond.call_args.args[2],
+                {"rooms": [], "already_joined": [ROOM_1], "banned": []},
+            )
+
+    async def test_a_replay_of_a_completed_claim_answers_at_once(self) -> None:
+        handler = self._claim_handler({"status": "completed", "specification": {}})
+        await handler._async_render_POST(MagicMock())
+        self.assertEqual(self.events, ["claim", "answer"])
+
+    async def test_an_instructor_invitation_answers_at_once(self) -> None:
+        handler = self._claim_handler(
+            {"status": "prepared", "specification": {"kind": "instructor"}}
+        )
+        await handler._async_render_POST(MagicMock())
+        self.assertEqual(self.events, ["claim", "answer"])
+
+    async def test_a_hold_of_zero_answers_at_once(self) -> None:
+        handler = self._claim_handler(
+            {"status": "prepared", "specification": {}}, hold=0
+        )
+        await handler._async_render_POST(MagicMock())
+        self.assertEqual(self.events, ["claim", "answer"])

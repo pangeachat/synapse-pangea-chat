@@ -64,6 +64,9 @@ class PangeaChatConfig:
     # --- room_code config ---
     knock_with_code_requests_per_burst: int = 10
     knock_with_code_burst_duration_seconds: int = 60
+    # How long knock_with_code holds its answer after a claim creates a course
+    # (see KnockWithCode._hold_after_creation). 0 turns the hold off.
+    course_claim_response_hold_seconds: float = 3.0
 
     # --- preview_with_code config ---
     preview_with_code_requests_per_burst: int = 5

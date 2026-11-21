@@ -516,6 +516,9 @@ class BaseSynapseE2ETest(aiounittest.AsyncTestCase):
                 ),
                 "cms_base_url": "http://127.0.0.1:9",
                 "cms_service_api_key": "test-cms-api-key",
+                # No app is waiting on a test's claim; a test of the hold
+                # sets its own.
+                "course_claim_response_hold_seconds": 0,
             }
             if module_config:
                 effective_module_config.update(module_config)
