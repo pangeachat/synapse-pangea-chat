@@ -566,7 +566,10 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         listed = self.listing(room)
         for ident, name in ((a, "student"), (b, "other"), (c, "third")):
             self.assertEqual(listed[ident["invitation_id"]]["state"], "left", name)
-            self.assertIsNone(self.managed(self.users[name], room), name)
+            # Only graduation ends management (#799).
+            self.assertEqual(
+                self.managed(self.users[name], room), (self.users[name], room), name
+            )
         self.assertEqual(listed[late["invitation_id"]]["state"], "joined")
 
         # Rejoining with the class code restores nothing.
@@ -585,7 +588,7 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         )
         await self.login_user("student", "student-pw-123")
         self.assertEqual(self.listing(room)[a["invitation_id"]]["state"], "left")
-        self.assertIsNone(self.managed(self.users["student"], room))
+        self.assertIsNotNone(self.managed(self.users["student"], room))
         self.assertEqual(
             self.ok("GET", SI + "mine/joined", self.tokens["student"]),
             {"invitations": []},
@@ -649,10 +652,13 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
         await self.login_user("member", "member-pw-123")
         self.assertEqual(self.listing(room)[made["invitation_id"]]["state"], "joined")
 
-        # Power levels: a claimant who becomes a course admin is no longer
-        # managed; stepping back down records it again (C2.5).
+        # Power levels: a claimant who becomes a course admin stays managed,
+        # since only graduation ends it (#799); the record is never dropped.
         self.set_power(room, "late", 100)
-        self.assertIsNone(self.managed_soon(self.users["late"], room, None))
+        self.assertEqual(
+            self.managed_soon(self.users["late"], room, None),
+            (self.users["late"], room),
+        )
         url = self.state_url(room, "m.room.power_levels")
         content = self.ok("GET", url, self.tokens["late"])
         content["users"][self.users["late"]] = 0
@@ -662,7 +668,7 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             (self.users["late"], room),
         )
 
-        # Revoke releases the managed record and keeps the membership.
+        # Revoke keeps the managed record and the membership.
         revoked = self.ok(
             "POST",
             SI + "revoke",
@@ -670,7 +676,7 @@ class TestStudentInvitationsE2E(BaseSynapseE2ETest):
             body={"room_id": room, "invitation_id": late["invitation_id"]},
         )
         self.assertEqual(revoked["invitation"]["state"], "revoked")
-        self.assertIsNone(self.managed(self.users["late"], room))
+        self.assertIsNotNone(self.managed(self.users["late"], room))
         self.assertEqual(self.membership(room, "late"), "join")
 
         # The ledger recorded it all, with no address, read by course admins only.

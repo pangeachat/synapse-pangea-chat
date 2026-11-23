@@ -33,7 +33,7 @@ The module is where a student invitation lives: it keeps the invitation a teache
 
 ## The managed-account record
 
-- Each claim marks the student as managed by the course, except a teacher of that course or a server admin, and the mark follows changes to the course's teachers: a student made a teacher loses it. The module keeps each record: the account, the course and when management began.
+- Each claim marks the student as managed by the course, except a teacher of that course or a server admin; a teacher who claimed and is later made a student is marked then. The mark is never removed: leaving, removal, a ban, a withdrawn invitation and being made a teacher all keep it, because only graduation ends management. The module keeps each record: the account, the course and when management began.
 
 ## Invitations sent before seats
 
@@ -41,4 +41,4 @@ Before seats, the dashboard's class-list upload sent a different invitation thro
 
 ## Open questions
 
-- The record the module keeps today ends when the student leaves the course, while the org managed-accounts doc says management lasts until the teacher graduates them; graduation, how management began and who graduated the student are not recorded yet ([pangeachat/.github#799](https://github.com/pangeachat/.github/issues/799)).
+- Graduation, how management began and who graduated the student are not recorded yet, and a student who joins by class code or link is not marked ([pangeachat/.github#799](https://github.com/pangeachat/.github/issues/799)).

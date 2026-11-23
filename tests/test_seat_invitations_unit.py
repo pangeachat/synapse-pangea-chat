@@ -293,25 +293,22 @@ class TestClaimRules(_Base):
             await self.h.store.get_request(by_match["invitation_id"], OTHER)
         )
 
-    async def test_managed_record_alone_blocks_a_second_claim_in_the_course(self):
-        first, second = await self.h.add(INVITED, "second@school.example")
+    async def test_a_kept_managed_record_does_not_block_a_new_claim_in_the_course(
+        self,
+    ):
+        """Management outlives the invitation (#799): a student who left and
+        was invited again claims again, and the record keeps its first time."""
+        (inv,) = await self.h.add(INVITED)
         self.h.verify(STUDENT, INVITED_KEY)
-        await self.h.open(STUDENT, first["invitation_id"])
-        # Even if the joined row were missed, the managed record refuses.
-        await self.h.main.db_pool.runInteraction(
-            "simulate",
-            lambda txn: txn.execute(
-                "UPDATE pangea_seat_invitation SET claimant = NULL WHERE id = ?",
-                (first["invitation_id"],),
-            ),
+        await self.h.open(STUDENT, inv["invitation_id"])
+        first = await self.h.store.managed_record(STUDENT, ROOM)
+        await self.h.store.release_on_leave(ROOM, STUDENT, 50)
+        (again,) = await self.h.add(INVITED)
+        outcome, row = await self.h.store.claim_txn(
+            again["invitation_id"], STUDENT, email_match=True, grant=False, now_ms=99
         )
-        outcome, _ = await self.h.store.claim_txn(
-            second["invitation_id"], STUDENT, email_match=True, grant=False, now_ms=9
-        )
-        self.assertEqual(outcome, "already_claimed_in_course")
-        self.assertEqual(
-            (await self.h.row(second["invitation_id"]))["state"], "invited"
-        )
+        self.assertEqual((outcome, row["state"]), ("claimed", "joined"))
+        self.assertEqual(await self.h.store.managed_record(STUDENT, ROOM), first)
 
     async def test_course_admin_claiming_own_course_invitation_is_joined_but_not_managed(
         self,
@@ -483,7 +480,7 @@ class TestClaimRules(_Base):
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, OTHER_ROOM))
 
-    async def test_every_claim_writes_managed_record_revoke_deletes_it(self):
+    async def test_every_claim_writes_managed_record_revoke_keeps_it(self):
         (by_email, by_grant) = await self.h.add(INVITED, "third@school.example")
         self.h.verify(STUDENT, INVITED_KEY)
         await self.h.open(STUDENT, by_email["invitation_id"])
@@ -507,7 +504,8 @@ class TestClaimRules(_Base):
             TEACHER, {"room_id": ROOM, "invitation_id": by_email["invitation_id"]}
         )
         self.assertEqual((status, body["invitation"]["state"]), (200, "revoked"))
-        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        # Withdrawing the invitation does not end management (#799).
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
         self.assertIsNotNone(await self.h.store.managed_record(OTHER, ROOM))
         # Course membership is unchanged by a revoke.
         self.assertEqual(self.h.main.membership[(ROOM, STUDENT)], "join")
@@ -1528,7 +1526,7 @@ class TestClaimByEmailHook(_Base):
 
 
 class TestMembershipRelease(_Base):
-    async def test_leave_kick_or_ban_sets_the_invitation_left_and_deletes_the_managed_record(
+    async def test_leave_kick_or_ban_sets_the_invitation_left_and_keeps_the_managed_record(
         self,
     ):
         release = MembershipRelease(self.h.store, self.h.claims)
@@ -1546,7 +1544,10 @@ class TestMembershipRelease(_Base):
             )
             row = await self.h.row(inv["invitation_id"])
             self.assertEqual(row["state"], "left", (membership, sender))
-            self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+            # Only graduation ends management (#799).
+            self.assertIsNotNone(
+                await self.h.store.managed_record(STUDENT, ROOM), (membership, sender)
+            )
 
     async def test_other_events_release_nothing(self):
         release = MembershipRelease(self.h.store, self.h.claims)
@@ -1589,7 +1590,7 @@ class TestMembershipRelease(_Base):
         await release.on_new_event(_member_event(ROOM, STUDENT, "join", STUDENT), {})
         await self.h.claims.claim_matching_for(STUDENT)
         self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "left")
-        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
         _, joined = await self.h.handlers.mine_joined(STUDENT)
         self.assertEqual(joined, {"invitations": []})
 
@@ -1606,7 +1607,7 @@ class TestMembershipRelease(_Base):
         self.h.joiner.force_join = join_then_leave  # type: ignore[method-assign]
         await self.h.open(STUDENT, inv["invitation_id"])
         self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "left")
-        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
 
 
 def _power_event(room_id: str) -> Any:
@@ -1621,8 +1622,8 @@ def _power_event(room_id: str) -> Any:
 
 
 class TestManagedRule(_Base):
-    """CONTRACTS C2.5 / SPEC INV-10: a joined invitation has a managed record
-    exactly while its claimant is not a course admin of that course."""
+    """CONTRACTS C2.5 / SPEC INV-10: a joined claimant gets a managed record
+    once not a course admin of that course; only graduation removes it (#799)."""
 
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
@@ -1667,16 +1668,15 @@ class TestManagedRule(_Base):
         await self.h.claims.repair_managed_for(STUDENT)
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
 
-    async def test_promoted_to_server_admin_loses_the_record_on_the_next_claim(self):
-        """A claim path that finds the row already joined by this account
-        re-applies the rule, so a later server-admin promotion is not left
-        managed until the next sign-in."""
+    async def test_promoted_to_server_admin_keeps_the_record(self):
+        """Only graduation ends management (#799); an admin is exempt from
+        the controls while an admin, not unmanaged."""
         ident = await self.claimed()
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
         self.h.main.server_admins.add(STUDENT)
         outcome, _ = await self.h.claims.claim(ident, STUDENT)
         self.assertEqual(outcome, "claimed")
-        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
 
     async def test_claimant_losing_pl100_gets_a_managed_record(self):
         """Rebuilt from the joined invitation alone: no request, no disclosure
@@ -1693,18 +1693,23 @@ class TestManagedRule(_Base):
         await self.release.on_new_event(_power_event(ROOM), {})
         self.assertEqual(await self.h.store.managed_record(STUDENT, ROOM), record)
 
-    async def test_claimant_gaining_pl100_loses_the_managed_record(self):
+    async def test_claimant_gaining_pl100_keeps_the_managed_record(self):
         await self.claimed()
-        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
+        record = await self.h.store.managed_record(STUDENT, ROOM)
+        self.assertIsNotNone(record)
         self.h.admins.admins.add((ROOM, STUDENT))
         await self.release.on_new_event(_power_event(ROOM), {})
-        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        self.assertEqual(await self.h.store.managed_record(STUDENT, ROOM), record)
+        # Demoted again: still the same record, not a new one.
+        self.h.admins.admins.discard((ROOM, STUDENT))
         await self.release.on_new_event(_power_event(ROOM), {})
-        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
-        # The invitation stays joined; only management changes.
+        self.assertEqual(await self.h.store.managed_record(STUDENT, ROOM), record)
         _, joined = await self.h.handlers.mine_joined(STUDENT)
         self.assertEqual(len(joined["invitations"]), 1)
-        # A power-level change in another course touches nothing here.
+
+    async def test_power_level_change_in_another_course_touches_nothing(self):
+        self.h.admins.admins.add((ROOM, STUDENT))
+        await self.claimed()
         self.h.admins.admins.discard((ROOM, STUDENT))
         await self.release.on_new_event(_power_event(OTHER_ROOM), {})
         self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
@@ -1718,12 +1723,17 @@ class TestManagedRule(_Base):
         api._hs.get_datastores.return_value.main = self.h.main
         hook = ClaimByEmail(api, legacy, MagicMock(), student_claims=self.h.claims)
         await self.claimed()
-        # Promoted with no event seen: the next sign-in deletes the record.
+        # Claimed as an admin, then demoted with no event seen: the next
+        # sign-in records it.
         self.h.admins.admins.add((ROOM, STUDENT))
+        (inv,) = await self.h.add(INVITED, room=OTHER_ROOM)
+        self.h.admins.admins.add((OTHER_ROOM, STUDENT))
+        await self.h.open(STUDENT, inv["invitation_id"])
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, OTHER_ROOM))
+        self.h.admins.admins.discard((OTHER_ROOM, STUDENT))
         await hook.on_user_login(STUDENT, None, None)
-        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
-        # Demoted with no event seen: the next sign-in records it again.
-        self.h.admins.admins.discard((ROOM, STUDENT))
+        self.assertIsNotNone(await self.h.store.managed_record(STUDENT, OTHER_ROOM))
+        # Promoted with no event seen: the sign-in keeps the record (#799).
         await hook.on_user_login(STUDENT, None, None)
         self.assertIsNotNone(await self.h.store.managed_record(STUDENT, ROOM))
 
@@ -1744,11 +1754,10 @@ class TestManagedRule(_Base):
             h.verify(STUDENT, INVITED_KEY)
             status, body = await h.open(STUDENT, inv["invitation_id"])
             self.assertEqual(body["result"], "claimed")
+            # Promoted mid-claim keeps the record the claim wrote (#799);
+            # demoted mid-claim gets one from the re-check.
             record = await h.store.managed_record(STUDENT, ROOM)
-            if promoted_mid_claim:
-                self.assertIsNone(record, "promoted during the claim")
-            else:
-                self.assertIsNotNone(record, "demoted during the claim")
+            self.assertIsNotNone(record, promoted_mid_claim)
 
     async def test_power_level_callback_failure_never_fails_the_event(self):
         await self.claimed()

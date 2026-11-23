@@ -12,8 +12,8 @@ The same two moments claim every live student invitation whose address the
 account has verified (``student_invitations.claim``; no confirmation, seats
 amendment 2026-10-10).
 Each sign-in also re-applies the managed-record rule to the account's joined
-invitations (managed exactly while not a course admin there), repairing a
-missed power-level event.
+invitations (managed once not a course admin there), repairing a missed
+power-level event.
 """
 
 from __future__ import annotations

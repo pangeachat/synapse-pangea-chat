@@ -14,8 +14,9 @@ and the account's verified email matches, its request is granted, or the
 Canvas identity matches, and the account holds no other joined invitation in
 the course (``StudentInvitationStore.claim_txn``). The claim records a managed account,
 except when the claimant is a course admin (power level 100) of that course:
-a teacher is never managed by a course they administer. Two concurrent claims of one row: one
-wins, the other sees it no longer ``invited``.
+a teacher is never managed by a course they administer. The record is never
+deleted here; only graduation ends management (#799). Two concurrent claims of
+one row: one wins, the other sees it no longer ``invited``.
 """
 
 from __future__ import annotations
@@ -101,8 +102,8 @@ class StudentClaims:
         if row is None:
             return NOT_LIVE, None
         if row["state"] == STATE_JOINED and row["claimant"] == user_id:
-            # Already this account's: re-apply the managed rule, so a later
-            # course-admin or server-admin change is not left stale.
+            # Already this account's: re-apply the managed rule, so a
+            # claimant who has stopped being an admin is not left unmanaged.
             await self._recheck_managed(row)
             return CLAIMED, row
         if row["state"] != STATE_INVITED:
@@ -150,10 +151,10 @@ class StudentClaims:
         return await self._accounts.is_server_admin(user_id)
 
     async def _recheck_managed(self, row: Dict[str, Any]) -> None:
-        # The admin check ran before the claim transaction, and a power-level
-        # event in between found no joined row to fix. Re-reading now that the
-        # row is joined closes that window; a later event finds the row. A
-        # failure leaves the claim standing and the next sign-in repairs it.
+        # The admin check ran before the claim transaction, and a demotion in
+        # between found no joined row to fix. Re-reading now that the row is
+        # joined closes that window; a later event finds the row. A failure
+        # leaves the claim standing and the next sign-in repairs it.
         try:
             await self.apply_managed_rule(row)
         except Exception as error:
@@ -165,7 +166,7 @@ class StudentClaims:
 
     async def _release_if_gone(self, room_id: str, user_id: str) -> None:
         # A leave between the join and the claim transaction would otherwise
-        # leave a managed record for someone no longer in the course: the
+        # leave the invitation joined for someone no longer in the course: the
         # membership callback ran before the row was joined.
         if await self._accounts.membership(room_id, user_id) != MEMBERSHIP_JOIN:
             released = await self._store.release_on_leave(room_id, user_id, now_ms())
@@ -176,17 +177,19 @@ class StudentClaims:
                 )
 
     async def apply_managed_rule(self, row: Dict[str, Any]) -> None:
-        """C2.5 for one joined invitation: a managed record exactly while its
-        claimant is not a course admin (power level 100, creators count) of
-        the course and not a Synapse server admin. Raises on failure; callers report it.
+        """C2.5 for one joined invitation: record the claimant as managed
+        once they are neither a course admin (power level 100, creators count)
+        of the course nor a Synapse server admin. Becoming an admin later keeps
+        the record: only graduation ends management (#799), and an admin is
+        exempt from the controls while an admin. Raises on failure; callers
+        report it.
         """
         claimant = row["claimant"]
         room_id = row["course_room_id"]
-        is_admin = await self._unmanaged(room_id, claimant)
-        result = await self._store.set_managed(
-            row["id"], claimant, not is_admin, now_ms()
-        )
-        if result in ("inserted", "deleted"):
+        if await self._unmanaged(room_id, claimant):
+            return
+        result = await self._store.set_managed(row["id"], claimant, now_ms())
+        if result == "inserted":
             logger.info(
                 "Managed record %s in %s (invitation %s)",
                 result,
