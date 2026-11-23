@@ -84,28 +84,6 @@ class TestStoreAgainstADatabase(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(claim.promoted_at_ms)
                 self.assertTrue(await self.store.code_in_use(code))
 
-    async def test_a_withdrawn_code_opens_nothing(self) -> None:
-        await self.store.add_code(self.ROOM, "r3mind1", 5)
-        await self.store.remove_code("r3mind1")
-
-        self.assertEqual(await self.store.rooms_for_admin_code("r3mind1"), [])
-        self.assertFalse(await self.store.code_in_use("r3mind1"))
-        self.assertEqual(await self.store.rooms_for_admin_code(self.CODE), [self.ROOM])
-
-    async def test_reminder_target_reads_the_address_and_whether_it_is_claimed(
-        self,
-    ) -> None:
-        target = await self.store.reminder_target(self.ROOM)
-        assert target is not None
-        self.assertEqual(target.requested_email, "t@school.example")
-        self.assertFalse(target.claimed)
-        self.assertIsNone(await self.store.reminder_target("!other:x"))
-
-        self.assertTrue(await self.store.claim(self.ROOM, self.TEACHER, 1))
-        target = await self.store.reminder_target(self.ROOM)
-        assert target is not None
-        self.assertTrue(target.claimed)
-
     async def test_the_claim_code_finds_its_room_until_it_is_spent(self) -> None:
         self.assertEqual(await self.store.rooms_for_admin_code("ADM1NAB"), [self.ROOM])
         self.assertEqual(await self.store.rooms_for_admin_code("0ther1c"), [])

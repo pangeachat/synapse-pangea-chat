@@ -26,8 +26,6 @@ from tests.smtp_sink import SmtpSink, body_text
 
 KNOCK_WITH_CODE_PATH = "/_synapse/client/pangea/v1/knock_with_code"
 APP_BASE_URL = "https://app.example.test"
-REMINDER_PATH = "/_synapse/client/pangea/v1/send_course_claim_reminder"
-PREVIEW_PATH = "/_synapse/client/pangea/v1/preview_with_code"
 
 
 class TestCourseClaimE2E(BaseSynapseE2ETest):
@@ -217,67 +215,6 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
         self.assertEqual(self._power_level(bot, room_id, latecomer_id), 100)
         await asyncio.sleep(1)
         self.assertEqual(len(self.sink.messages_to(self.requested)), 1)
-
-    async def test_a_reminder_link_claims_and_spends_the_first(self) -> None:
-        """create-course-space "Claim reminders": a reminder carries a new
-        claim link; every link works until the claim, which spends them all."""
-        await self._homeserver()
-        bot_id, bot = await self.new_user("bot", admin=True)
-        teacher_id, teacher = await self.new_user("teacher")
-
-        _, first_code = self._codes()
-        room_id = self._legacy_course(bot, bot_id, first_code, self._codes()[0])
-
-        reminder_body = {
-            "room_id": room_id,
-            "subject": "Your course is waiting",
-            "body": "Your course is ready.\n\nOpen it to become its teacher.",
-            "cta_label": "Open your course",
-        }
-        # Only a server admin may send one.
-        refused = self._post(REMINDER_PATH, teacher, reminder_body)
-        self.assertEqual(refused.status_code, 403, refused.text)
-
-        sent = self._post(REMINDER_PATH, bot, reminder_body)
-        self.assertEqual(sent.status_code, 200, sent.text)
-        self.assertEqual(sent.json(), {"sent": True})
-        reminder = self.sink.wait_for(self.requested, "Your course is waiting")
-        self.assertIsNotNone(reminder)
-        assert reminder is not None
-        reminder_text = body_text(reminder)
-        self.assertIn("Open it to become its teacher.", reminder_text)
-        prefix = f"{APP_BASE_URL}/"
-        start = reminder_text.index(prefix) + len(prefix)
-        reminder_code = reminder_text[start : start + 7]
-        self.assertNotEqual(reminder_code.lower(), first_code.lower())
-        self.assertNotIn(
-            reminder_code, reminder_text.replace(prefix + reminder_code, "")
-        )
-        self.assertNotIn("apps.apple.com", reminder_text)
-        self.assertIn("Tap the link again after you sign in", reminder_text)
-
-        # Both links open the course until it is claimed.
-        for code in (first_code, reminder_code):
-            preview = self._post(PREVIEW_PATH, bot, {"access_code": code})
-            self.assertEqual(preview.status_code, 200, preview.text)
-            self.assertIn(room_id, preview.text)
-
-        # Claiming with the reminder's link spends the first one too.
-        claimed = self._post(
-            KNOCK_WITH_CODE_PATH, teacher, {"access_code": reminder_code}
-        )
-        self.assertEqual(claimed.status_code, 200, claimed.text)
-        self.assertEqual(claimed.json()["already_joined"], [room_id])
-        self._join(teacher, room_id)
-        self.assertEqual(self._power_level(bot, room_id, teacher_id), 100)
-        self.assertIsNotNone(self.sink.wait_for(self.requested, "Invite your students"))
-        spent = self._post(KNOCK_WITH_CODE_PATH, teacher, {"access_code": first_code})
-        self.assertEqual(spent.status_code, 200, spent.text)
-        self.assertEqual(spent.json()["already_joined"], [room_id])
-
-        # A claimed course takes no more reminders.
-        after = self._post(REMINDER_PATH, bot, reminder_body)
-        self.assertEqual(after.status_code, 409, after.text)
 
 
 if __name__ == "__main__":

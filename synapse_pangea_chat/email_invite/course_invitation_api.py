@@ -16,11 +16,11 @@ from synapse_pangea_chat.email_invite.course_claim_emails import (
     validate_claimed,
     validate_rendered,
 )
-from synapse_pangea_chat.email_invite.course_claim_reminder import (
+from synapse_pangea_chat.email_invite.course_invitations import invitation_kind
+from synapse_pangea_chat.email_invite.request_fields import (
     _capture_exception,
     _text_field,
 )
-from synapse_pangea_chat.email_invite.course_invitations import invitation_kind
 from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.set_course_plan.set_course_plan import parse_request
