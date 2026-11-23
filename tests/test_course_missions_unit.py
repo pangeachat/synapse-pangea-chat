@@ -975,6 +975,41 @@ class TestRankedReadsAreBounded(unittest.IsolatedAsyncioTestCase):
             built.content["missions"][0]["activity_ids"], ["best-lo-0", "page-lo-0"]
         )
 
+    async def test_a_slow_existence_read_never_costs_the_list(self) -> None:
+        # Whether a missing selection is hidden or gone only labels the
+        # capture: when time is up it is left unclassified, and the list is
+        # built from what was read.
+        clock = _SteppingClock(1.0)
+        quest = _selecting([("lo-a", ["kept", "missing"])])
+        reads: List[Dict[str, str]] = []
+
+        async def request(method: str, uri: str, headers: Any = None) -> _Response:
+            clock.now += clock.step
+            query = dict(parse_qsl(urlparse(uri).query))
+            reads.append(query)
+            if "quest-plans" in uri:
+                return _Response(200, quest)
+            if any("res.plan.activity_id" in k for k in query):
+                return _Response(200, {"docs": [], "totalDocs": 0})
+            page = [_activity("kept", ["lo-a"])]
+            return _Response(200, {"docs": page, "totalDocs": 1})
+
+        reader = _reader({}, [])
+        reader._clock = clock  # type: ignore[assignment]
+        reader._http.request = request  # type: ignore[method-assign, assignment]
+
+        with patch.object(module, "capture_message") as capture:
+            built = await reader.read("quest-1")
+
+        self.assertEqual(built.content["missions"][0]["activity_ids"], ["kept"])
+        self.assertFalse(
+            any("where[res.plan.activity_id][in]" in q for q in reads),
+            "the existence read started after time was up",
+        )
+        self.assertEqual(
+            capture.call_args.kwargs["context"]["entries"][0]["unclassified"], 1
+        )
+
     async def test_can_dos_not_read_in_time_are_ranked_from_the_page_and_left(
         self,
     ) -> None:

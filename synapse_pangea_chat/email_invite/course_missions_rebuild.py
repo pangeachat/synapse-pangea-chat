@@ -13,7 +13,10 @@ creates the course either way. Two outcomes are built again here, after
   wrote (``expected``) is replaced, one revision up, only while the course
   still holds exactly that list.
 
-Either way a list the teacher has published since is never overwritten. A
+Either way a list the teacher has published since is never overwritten, and
+nothing is written once the course is on another quest: a teacher who changed
+course meanwhile may have been left with no list by the app, and the old
+quest's Can-Dos must not land in the new course. A
 rebuild has no one waiting on it, so its read gets ``REBUILD_BUDGET_SECONDS``.
 The list is sent by the course's strongest joined local instructor, as
 set_course_plan sends one: readers ignore a list sent below power level 100.
@@ -36,6 +39,10 @@ from synapse_pangea_chat.email_invite.course_missions import (
     CourseMissionsError,
     CourseMissionsReader,
 )
+from synapse_pangea_chat.email_invite.course_space_defaults import (
+    PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
+)
+from synapse_pangea_chat.public_courses.get_public_courses import extract_plan_id
 from synapse_pangea_chat.room_code.instructor_access import joined_local_instructors
 from synapse_pangea_chat.sentry_capture import capture_message
 
@@ -66,9 +73,20 @@ def _list_content(state: Mapping[Any, Any]) -> Optional[Dict[str, Any]]:
     return _plain(event.content)
 
 
+def _on_quest(state: Mapping[Any, Any], quest_id: str) -> bool:
+    event = state.get((PANGEA_COURSE_PLAN_STATE_EVENT_TYPE, ""))
+    content = event.content if event is not None else None
+    return isinstance(content, Mapping) and extract_plan_id(content) == quest_id
+
+
 def _may_write(
-    current: Optional[Mapping[str, Any]], expected: Optional[Mapping[str, Any]]
+    state: Mapping[Any, Any], quest_id: str, expected: Optional[Mapping[str, Any]]
 ) -> bool:
+    """Still the course the rebuild was for: on the same quest, with no list
+    of its own, or exactly the list the claim wrote."""
+    if not _on_quest(state, quest_id):
+        return False
+    current = _list_content(state)
     return current is None or (expected is not None and current == expected)
 
 
@@ -152,13 +170,18 @@ class CourseMissionsRebuild:
         expected: Optional[Mapping[str, Any]],
         last: bool,
     ) -> None:
-        current = _list_content(
-            await self._api.get_room_state(
-                room_id, [(COURSE_MISSIONS_STATE_EVENT_TYPE, "")]
-            )
+        before = await self._api.get_room_state(
+            room_id,
+            [
+                (COURSE_MISSIONS_STATE_EVENT_TYPE, ""),
+                (PANGEA_COURSE_PLAN_STATE_EVENT_TYPE, ""),
+            ],
         )
-        if not _may_write(current, expected):
-            logger.info("Can-Do list for %s was changed since the claim", room_id)
+        if not _may_write(before, quest_id, expected):
+            logger.info(
+                "Can-Do list for %s: the course or its list changed since the claim",
+                room_id,
+            )
             return
         try:
             built = await self._reader.read(
@@ -186,10 +209,14 @@ class CourseMissionsRebuild:
             return
         # The read takes seconds: a list the teacher published meanwhile wins.
         state = await self._api.get_room_state(room_id)
-        current = _list_content(state)
-        if not _may_write(current, expected):
-            logger.info("Can-Do list for %s was changed during the rebuild", room_id)
+        if not _may_write(state, quest_id, expected):
+            logger.info(
+                "Can-Do list for %s: the course or its list changed during the "
+                "rebuild",
+                room_id,
+            )
             return
+        current = _list_content(state)
         instructors = joined_local_instructors(self._api, state)
         if not instructors:
             self._give_up("no_sender", room_id, quest_id, attempt)

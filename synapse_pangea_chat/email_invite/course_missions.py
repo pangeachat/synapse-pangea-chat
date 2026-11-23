@@ -751,9 +751,10 @@ class CourseMissionsReader:
         # Only for what the page and the selections leave unanswered: whether
         # a selected activity that cannot be shown is hidden or gone, and the
         # best-scored rows of each Can-Do with nothing to show. Started
-        # together; ``_existing`` never raises, so a failed ranked read is
-        # the only failure to wait for, and it fails the whole read.
-        existing_read = run_in_background(self._existing, unshown)
+        # together and both stopped at ``deadline``; ``_existing`` never
+        # raises, so a failed ranked read is the only failure to wait for, and
+        # it fails the whole read.
+        existing_read = run_in_background(self._existing, unshown, deadline)
         ranked_read = run_in_background(self._ranked_rows, nothing, l2, deadline)
         existing = await make_deferred_yieldable(existing_read)
         ranked = await make_deferred_yieldable(ranked_read)
@@ -784,17 +785,33 @@ class CourseMissionsReader:
             )
         return docs
 
-    async def _existing(self, activity_ids: Sequence[str]) -> Optional[List[str]]:
+    async def _existing(
+        self, activity_ids: Sequence[str], deadline: float
+    ) -> Optional[List[str]]:
         """Which of ``activity_ids`` are rows at all, or None when that cannot
-        be read: it only labels a capture, so it never fails the list."""
+        be read by ``deadline``: it only labels a capture, so it never fails
+        or delays the list."""
         if not activity_ids:
             return []
-        try:
-            chunks = await yieldable_gather_results(
+        left = deadline - self._clock.time()
+        if left <= 0:
+            return None
+
+        async def read_all() -> List[List[str]]:
+            return await yieldable_gather_results(
                 self._existing_chunk, _chunks(activity_ids)
             )
+
+        try:
+            chunks = await make_deferred_yieldable(
+                timeout_deferred(
+                    deferred=run_in_background(read_all),
+                    timeout=left,
+                    clock=self._clock,
+                )
+            )
         # silent-ok: a label on the Sentry capture, not the list; logged, and the capture counts the ids as unclassified
-        except CourseMissionsError as e:
+        except (CourseMissionsError, defer.TimeoutError) as e:
             logger.warning(
                 "Can-Do list: could not read whether %d selected activities "
                 "exist: %s",

@@ -27,8 +27,12 @@ BUILT: Dict[str, Any] = {
 LIST_KEY = (COURSE_MISSIONS_STATE_EVENT_TYPE, "")
 
 
-def _state(can_do_list: Optional[Dict[str, Any]]) -> Dict[Any, Any]:
-    state: Dict[Any, Any] = {}
+def _state(
+    can_do_list: Optional[Dict[str, Any]], quest: str = "quest"
+) -> Dict[Any, Any]:
+    state: Dict[Any, Any] = {
+        ("pangea.course_plan", ""): SimpleNamespace(content={"uuid": quest, "l2": "es"})
+    }
     if can_do_list is not None:
         state[LIST_KEY] = SimpleNamespace(content=can_do_list)
     return state
@@ -85,6 +89,28 @@ class TestCourseMissionsRebuild(unittest.IsolatedAsyncioTestCase):
         await rebuild.attempt("!room:x", "quest", 0)
 
         rebuild._reader.read.assert_not_awaited()  # type: ignore[attr-defined]
+        api.create_and_send_event_into_room.assert_not_awaited()
+
+    async def test_a_course_moved_to_another_quest_is_left_alone(self) -> None:
+        # The app may leave a teacher who changed course with no list; the
+        # old quest's Can-Dos must not land in the new course.
+        rebuild, api = self._rebuild(
+            [_state(None, quest="other")], BuiltCourseMissions(BUILT)
+        )
+
+        await rebuild.attempt("!room:x", "quest", 0)
+
+        rebuild._reader.read.assert_not_awaited()  # type: ignore[attr-defined]
+        api.create_and_send_event_into_room.assert_not_awaited()
+
+    async def test_a_course_moved_during_the_read_is_left_alone(self) -> None:
+        rebuild, api = self._rebuild(
+            [_state(None), _state(None, quest="other")], BuiltCourseMissions(BUILT)
+        )
+
+        with patch.object(module, "joined_local_instructors", return_value=["@t:x"]):
+            await rebuild.attempt("!room:x", "quest", 0)
+
         api.create_and_send_event_into_room.assert_not_awaited()
 
     async def test_a_list_published_during_the_read_is_left_alone(self) -> None:
