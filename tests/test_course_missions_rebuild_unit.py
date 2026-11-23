@@ -11,8 +11,10 @@ from synapse_pangea_chat.email_invite.course_missions import (
     CMS_UNAVAILABLE,
     COURSE_MISSIONS_STATE_EVENT_TYPE,
     QUEST_NOT_FOUND,
+    SELECTION_ALL_GONE,
     BuiltCourseMissions,
     CourseMissionsError,
+    Problem,
 )
 from synapse_pangea_chat.email_invite.course_missions_rebuild import (
     REBUILD_DELAYS_SECONDS,
@@ -72,6 +74,37 @@ class TestCourseMissionsRebuild(unittest.IsolatedAsyncioTestCase):
                 "content": BUILT,
             }
         )
+
+    async def test_what_a_first_list_could_not_carry_over_is_reported(
+        self,
+    ) -> None:
+        problems = [Problem(SELECTION_ALL_GONE, "lo-a", {"selected": 1, "kept": 0})]
+        rebuild, _ = self._rebuild(
+            [_state(None), _state(None)], BuiltCourseMissions(BUILT, problems)
+        )
+
+        with patch.object(
+            module, "joined_local_instructors", return_value=["@t:x"]
+        ), patch.object(module, "report_problems") as report:
+            await rebuild.attempt("!room:x", "quest", 0)
+
+        report.assert_called_once_with("quest", problems)
+
+    async def test_a_replacement_does_not_report_its_claim_s_problems_again(
+        self,
+    ) -> None:
+        claimed = {**BUILT, "revision": 1}
+        problems = [Problem(SELECTION_ALL_GONE, "lo-a", {"selected": 1, "kept": 0})]
+        rebuild, _ = self._rebuild(
+            [_state(claimed), _state(claimed)], BuiltCourseMissions(BUILT, problems)
+        )
+
+        with patch.object(
+            module, "joined_local_instructors", return_value=["@t:x"]
+        ), patch.object(module, "report_problems") as report:
+            await rebuild.attempt("!room:x", "quest", 0, claimed)
+
+        report.assert_not_called()
 
     async def test_an_empty_list_left_by_an_old_failure_counts_as_none(self) -> None:
         rebuild, api = self._rebuild(

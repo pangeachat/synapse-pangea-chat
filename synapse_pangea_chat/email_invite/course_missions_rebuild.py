@@ -38,6 +38,7 @@ from synapse_pangea_chat.email_invite.course_missions import (
     RETRYABLE,
     CourseMissionsError,
     CourseMissionsReader,
+    report_problems,
 )
 from synapse_pangea_chat.email_invite.course_space_defaults import (
     PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
@@ -227,6 +228,11 @@ class CourseMissionsRebuild:
             # its stale publish.
             revision = current.get("revision")
             content["revision"] = (revision if isinstance(revision, int) else 0) + 1
+        if expected is None:
+            # The claim built no list, so nothing has reported what this one
+            # could not carry over. A replacement's claim already did; its
+            # tries stay quiet so each loss is reported once.
+            report_problems(quest_id, built.problems)
         await self._api.create_and_send_event_into_room(
             {
                 "type": COURSE_MISSIONS_STATE_EVENT_TYPE,
