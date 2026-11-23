@@ -196,11 +196,13 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         # A dry run names the sender, reports the current name and topic and
         # the Can-Do list it would write, and writes nothing.
         all_four = [_CAN_DO_LIST_EVENT, _COURSE_PLAN, "m.room.name", "m.room.topic"]
-        first_list = {
+        first_list: Dict[str, Any] = {
             "built": True,
             "previous_revision": None,
             "revision": 1,
             "missions": 2,
+            # The new quest selects nothing: each entry pins its ranked ten.
+            "problems": {"selection_unset": 2},
         }
         resp = self._call({**switch, "dry_run": True}, admin_token)
         self.assertEqual(resp.status_code, 200, resp.text)
@@ -299,9 +301,9 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
             legacy_state[("m.room.name", "")]["content"]["name"], "Period 3"
         )
 
-        # With the CMS down, the switch still lands and the Can-Do list is
-        # written empty, so readers fall back to the shared quest. Sending the
-        # request again with the new quest as the expected one rebuilds it.
+        # With the CMS down, the switch is refused with the reason and nothing
+        # is written: an empty Can-Do list would put the shared quest in place
+        # of the course's own. Sending it again once the CMS answers moves it.
         unbuilt = self._create_course_space(
             teacher_token,
             {"uuid": "quest-old", "l2": "es"},
@@ -312,27 +314,23 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
             resp = self._call({**switch, "room_id": unbuilt}, admin_token)
         finally:
             _QuestCmsHandler.down = False
-        self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(
-            resp.json()["can_do_list"],
-            {"built": False, "previous_revision": 2, "revision": None, "missions": 0},
-        )
+        self.assertEqual(resp.status_code, 502, resp.text)
+        self.assertEqual(resp.json()["code"], "cms_unavailable")
         unbuilt_state = self._admin_state(admin_token, unbuilt)
-        self.assertEqual(unbuilt_state[(_CAN_DO_LIST_EVENT, "")]["content"], {})
         self.assertEqual(
-            unbuilt_state[(_COURSE_PLAN, "")]["content"]["uuid"], "quest-new"
+            unbuilt_state[(_CAN_DO_LIST_EVENT, "")]["content"],
+            {"version": 1, "revision": 2, "missions": []},
         )
-        resp = self._call(
-            {**switch, "room_id": unbuilt, "expected_quest_id": "quest-new"},
-            admin_token,
+        self.assertEqual(
+            unbuilt_state[(_COURSE_PLAN, "")]["content"]["uuid"], "quest-old"
         )
+        resp = self._call({**switch, "room_id": unbuilt}, admin_token)
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(resp.json()["changes"], [_CAN_DO_LIST_EVENT])
         self.assertEqual(
             self._admin_state(admin_token, unbuilt)[(_CAN_DO_LIST_EVENT, "")][
                 "content"
             ],
-            {"version": 1, "revision": 1, "missions": _NEW_LIST_ENTRIES},
+            {"version": 1, "revision": 3, "missions": _NEW_LIST_ENTRIES},
         )
 
         # With only a student left, nobody can send the event: refused,

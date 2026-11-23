@@ -17,7 +17,13 @@ from synapse_pangea_chat.email_invite.course_invitations import (
 )
 from synapse_pangea_chat.email_invite.course_missions import (
     COURSE_MISSIONS_STATE_EVENT_TYPE,
+    RETRYABLE,
+    CourseMissionsError,
     CourseMissionsReader,
+    capture_read_failure,
+)
+from synapse_pangea_chat.email_invite.course_missions_rebuild import (
+    CourseMissionsRebuild,
 )
 from synapse_pangea_chat.email_invite.course_space_defaults import (
     DEFAULT_SPACE_POWER_LEVELS,
@@ -55,8 +61,10 @@ class CourseProvisioner:
         blocked_join_gate_enabled=True,
     ):
         self.api = api
-        # Builds the course space's Can-Do list, as for v1 create_course_space.
+        # Builds the course space's Can-Do list at the claim, and again later
+        # when the claim's read failed for a reason that may pass.
         self.course_missions = course_missions
+        self.course_missions_rebuild = CourseMissionsRebuild(api, course_missions)
         self.invitations = invitations
         self.claims = claims
         self.notifier = notifier
@@ -157,16 +165,25 @@ class CourseProvisioner:
                     "content": {"require_analytics_access": True},
                 },
             ]
-            # The course space's Can-Do list. Optional: a failed read is logged
-            # and the course is created without it
-            # (create-course-space.instructions.md).
-            course_missions = await self.course_missions.read(spec["course_plan_id"])
-            if course_missions is not None:
+            # The course space's Can-Do list. A course is created without one
+            # rather than not at all: it reads the shared quest until a later
+            # attempt writes the list (create-course-space.instructions.md).
+            quest_id = spec["course_plan_id"]
+            rebuild = False
+            built = None
+            try:
+                built = await self.course_missions.read(quest_id)
+            except CourseMissionsError as e:
+                capture_read_failure(
+                    e, quest_id, invitation_id=invitation["invitation_id"]
+                )
+                rebuild = e.code in RETRYABLE
+            else:
                 initial.append(
                     {
                         "type": COURSE_MISSIONS_STATE_EVENT_TYPE,
                         "state_key": "",
-                        "content": course_missions,
+                        "content": built.content,
                     }
                 )
             if spec.get("image_url"):
@@ -196,6 +213,14 @@ class CourseProvisioner:
                 },
                 ratelimit=False,
             )
+            if rebuild:
+                self.course_missions_rebuild.schedule(room, quest_id)
+            elif built is not None and built.unfinished:
+                # Whole but partly ranked from the newest rows: built again
+                # later, and replaced only while it is still this list.
+                self.course_missions_rebuild.schedule(
+                    room, quest_id, expected=built.content
+                )
         else:
             room = await self.recover_room(invitation)
         await self.invitations.associate(invitation["invitation_id"], user, room)
