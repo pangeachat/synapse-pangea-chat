@@ -18,7 +18,8 @@ Response: ``previous_quest_id``, ``quest_id``, ``previous_name``,
 from the quest, with its count of entries; null when no list was built or
 tried), ``sender``, ``changed``, ``dry_run``. When the list cannot be built,
 the request is refused with ``error`` and ``code`` (course_missions failure
-codes): 422 when the quest is gone or malformed, 502 when the CMS failed.
+codes, or ``ranked_unfinished`` when the CMS was too slow to rank every
+Can-Do): 422 when the quest is gone or malformed, 502 when the CMS failed.
 
 Steps:
 
@@ -90,6 +91,7 @@ from synapse_pangea_chat.email_invite.course_missions import (
     NO_QUEST,
     QUEST_MALFORMED,
     QUEST_NOT_FOUND,
+    RANKED_UNFINISHED,
     CourseMissionsError,
     CourseMissionsReader,
     capture_read_failure,
@@ -470,6 +472,24 @@ class SetCoursePlan(Resource):
                     {
                         "error": "The quest's Can-Do list could not be built",
                         "code": e.code,
+                    },
+                )
+            if result.unfinished:
+                # Partly ranked from the newest rows only: written, it would
+                # stay, since a list with content is never rebuilt here.
+                logger.error(
+                    "set_course_plan: %d Can-Dos of quest %s not read in time "
+                    "for %s; refused, nothing written",
+                    len(result.unfinished),
+                    req.quest_id,
+                    room_id,
+                )
+                return (
+                    502,
+                    {
+                        "error": "The CMS was too slow to build the quest's "
+                        "Can-Do list",
+                        "code": RANKED_UNFINISHED,
                     },
                 )
             built = result.content

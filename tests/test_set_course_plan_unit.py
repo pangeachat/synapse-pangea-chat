@@ -425,6 +425,20 @@ class TestEndpoint(_EndpointHarness):
         self.assertEqual(answer["status"], 422)
         self.assertEqual(answer["code"], QUEST_NOT_FOUND)
 
+    async def test_a_list_partly_ranked_in_time_is_refused(self) -> None:
+        # Written, it would stay: a list with content is never rebuilt here.
+        endpoint, api = self._endpoint()
+        endpoint._course_missions.read = AsyncMock(  # type: ignore[method-assign]
+            return_value=BuiltCourseMissions(self._BUILT, [], ["lo"])
+        )
+
+        with self.assertLogs(module.logger, level="ERROR"):
+            status, body = await self._post(endpoint)
+
+        self.assertEqual(status, 502)
+        self.assertEqual(body["code"], "ranked_unfinished")
+        api.create_and_send_event_into_room.assert_not_awaited()
+
     async def test_what_the_list_could_not_carry_over_is_counted(self) -> None:
         endpoint, api = self._endpoint()
         endpoint._course_missions.read = AsyncMock(  # type: ignore[method-assign]

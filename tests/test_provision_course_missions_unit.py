@@ -138,3 +138,13 @@ class TestProvisionCanDoList(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("pangea.course_missions", self._state(create_room))
         self.rebuild.schedule.assert_not_called()
         capture.assert_called_once()
+
+    async def test_a_failed_read_is_logged_without_sentry(self) -> None:
+        with self.assertLogs(
+            "synapse.module.synapse_pangea_chat.email_invite.course_missions",
+            "ERROR",
+        ) as logs:
+            await self._claim(CourseMissionsError(QUEST_NOT_FOUND))
+
+        self.assertIn("quest_not_found", logs.output[0])
+        self.assertIn("invitation_id=", logs.output[0])

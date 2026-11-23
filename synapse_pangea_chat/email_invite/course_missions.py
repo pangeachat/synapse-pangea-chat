@@ -969,7 +969,14 @@ def report_problems(quest_id: str, problems: Sequence[Problem]) -> None:
 
 def capture_read_failure(error: CourseMissionsError, quest_id: str, **ids: str) -> None:
     """The caller's capture of a list that could not be built: its code, the
-    quest and the caller's own ids (a room, an invitation)."""
+    quest and the caller's own ids (a room, an invitation). Logged too, so a
+    server without Sentry still says which courses need their list built."""
+    logger.error(
+        "Can-Do list not built for quest %s (%s): %s",
+        quest_id,
+        ", ".join(f"{k}={v}" for k, v in ids.items()),
+        error,
+    )
     capture_message(
         f"Can-Do list not built: {error.code}",
         level="error",
