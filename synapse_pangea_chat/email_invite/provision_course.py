@@ -19,8 +19,10 @@ from synapse_pangea_chat.email_invite.course_missions import (
     COURSE_MISSIONS_STATE_EVENT_TYPE,
     CourseMissionsReader,
 )
-from synapse_pangea_chat.email_invite.create_course_space import (
+from synapse_pangea_chat.email_invite.course_space_defaults import (
     DEFAULT_SPACE_POWER_LEVELS,
+    PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
+    build_course_plan_content,
 )
 from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 from synapse_pangea_chat.room_code.get_inviter_user import was_previously_admin
@@ -143,12 +145,11 @@ class CourseProvisioner:
                 },
                 {"type": "m.room.power_levels", "state_key": "", "content": power},
                 {
-                    "type": "pangea.course_plan",
+                    "type": PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
                     "state_key": "",
-                    "content": {
-                        "uuid": spec["course_plan_id"],
-                        "l2": spec["target_language"],
-                    },
+                    "content": build_course_plan_content(
+                        spec["course_plan_id"], spec["target_language"]
+                    ),
                 },
                 {
                     "type": "pangea.course_settings",

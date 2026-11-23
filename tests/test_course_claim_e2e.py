@@ -1,17 +1,17 @@
-"""E2E: claiming a requested course, through a real Synapse and its mail path.
+"""E2E: claiming a room-backed (legacy) requested course, through a real Synapse
+and its mail path.
 
-knock-with-code.instructions.md ("Claiming a course"): the requesting address
-gets the claim link first and nothing for students; whoever uses it first
-becomes admin; the class code never grants admin; the class link then goes to
-the requesting address. create-course-space: the address
-stays out of room state.
+knock-with-code.instructions.md ("Claiming a course"): legacy room-backed
+claims remain valid. Whoever uses the claim link first becomes admin; the class
+code never grants admin; the class link then goes to the requesting address.
+No endpoint makes these courses any more, so each test builds one as the
+retired v1 endpoint left it (tests/requested_course.py).
 
 The homeserver sends through a local SMTP sink, so the assertions are on the
 mail Synapse actually delivered.
 """
 
 import asyncio
-import json
 import unittest
 from typing import Any, Dict
 from urllib.parse import quote
@@ -21,9 +21,9 @@ import requests
 
 from synapse_pangea_chat.email_invite.course_claim_emails import class_qr_png
 from tests.base_e2e import BaseSynapseE2ETest
+from tests.requested_course import legacy_course
 from tests.smtp_sink import SmtpSink, body_text
 
-CREATE_COURSE_SPACE_PATH = "/_synapse/client/pangea/v1/create_course_space"
 KNOCK_WITH_CODE_PATH = "/_synapse/client/pangea/v1/knock_with_code"
 APP_BASE_URL = "https://app.example.test"
 REMINDER_PATH = "/_synapse/client/pangea/v1/send_course_claim_reminder"
@@ -95,6 +95,25 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
         levels = self._room_get(token, room_id, "state/m.room.power_levels")
         return levels.get("users", {}).get(user_id, levels.get("users_default", 0))
 
+    def _codes(self) -> tuple[str, str]:
+        """A class code and a claim code unique to this test."""
+        self._minted = getattr(self, "_minted", 0) + 1
+        suffix = f"{self.tag}{self._minted}".replace("t", "")
+        return (f"c{suffix}zzzzzz")[:7], (f"a{suffix}qqqqqq")[:7]
+
+    def _legacy_course(
+        self, bot: str, bot_id: str, admin_code: str, class_code: str
+    ) -> str:
+        return legacy_course(
+            self.server_url,
+            self.database_url,
+            bot,
+            bot_id,
+            self.requested,
+            admin_code,
+            class_code,
+        )
+
     def _claim_row(self, room_id: str) -> Any:
         with psycopg2.connect(self.database_url) as conn, conn.cursor() as cur:
             # The table is created on first use, so a homeserver that never
@@ -111,26 +130,13 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
 
     async def test_claim_link_then_class_link(self) -> None:
         await self._homeserver()
-        _, bot = await self.new_user("bot", admin=True)
+        bot_id, bot = await self.new_user("bot", admin=True)
         teacher_id, teacher = await self.new_user("teacher")
         student_id, student = await self.new_user("student")
         latecomer_id, latecomer = await self.new_user("latecomer")
 
-        response = self._post(
-            CREATE_COURSE_SPACE_PATH,
-            bot,
-            {
-                "title": "Spanish 1",
-                "description": "Companion practice for Lessons 1 to 6.",
-                "course_plan_id": "plan-claim",
-                "target_language": "es",
-                "teacher_email": self.requested,
-                "request_summary": "Spanish 1 practice for my class",
-            },
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        created = response.json()
-        room_id = created["room_id"]
+        class_code, admin_code = self._codes()
+        room_id = self._legacy_course(bot, bot_id, admin_code, class_code)
         legacy_status = requests.get(
             f"{self.server_url}/_synapse/client/pangea/v2/course_invitations/{quote(room_id, safe='')}",
             headers={"Authorization": f"Bearer {bot}"},
@@ -139,35 +145,6 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
         self.assertEqual(legacy_status.status_code, 200, legacy_status.text)
         self.assertEqual(legacy_status.json()["status"], "prepared")
         self.assertNotIn(self.requested, legacy_status.text)
-        class_code = created["student_access_code"]
-        admin_code = created["admin_access_code"]
-        self.assertTrue(created["emailed"])
-        self.assertEqual(created["admin_join_url"], f"{APP_BASE_URL}/{admin_code}")
-
-        # Email 1: the claim link and nothing that belongs with students.
-        ready = self.sink.wait_for(self.requested, "Your quest is ready")
-        self.assertIsNotNone(ready)
-        assert ready is not None
-        ready_text = body_text(ready)
-        self.assertIn(f"{APP_BASE_URL}/{admin_code}", ready_text)
-        # The link is the only claim path in mail (decided 2026-10-09):
-        # no printed code, no store links, and the re-tap line instead.
-        self.assertNotIn(
-            admin_code, ready_text.replace(f"{APP_BASE_URL}/{admin_code}", "")
-        )
-        self.assertNotIn("apps.apple.com", ready_text)
-        self.assertNotIn("play.google.com", ready_text)
-        self.assertIn("Tap the link again after you sign in", ready_text)
-        self.assertIn("Spanish 1 practice for my class", ready_text)
-        self.assertNotIn(class_code, ready_text)
-
-        # Neither the requesting address nor the claim code is in room
-        # state: every member can read it.
-        state = self._room_get(bot, room_id, "state")
-        self.assertNotIn(self.requested, json.dumps(state))
-        self.assertNotIn(admin_code, json.dumps(state).lower())
-        join_rules = self._room_get(bot, room_id, "state/m.room.join_rules")
-        self.assertNotIn("admin_access_code", join_rules)
 
         # The claim code previews the course, though it is in no state.
         preview = self._post(
@@ -181,12 +158,12 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
         # The class code never grants admin, whatever the order.
         await self._join_with_code(student, class_code, room_id)
         self.assertEqual(self._power_level(bot, room_id, student_id), 0)
-        self.assertEqual(len(self.sink.messages_to(self.requested)), 1)
+        self.assertEqual(len(self.sink.messages_to(self.requested)), 0)
 
         # The teacher tries their class link first, as a member...
         await self._join_with_code(teacher, class_code, room_id)
         self.assertEqual(self._power_level(bot, room_id, teacher_id), 0)
-        self.assertEqual(len(self.sink.messages_to(self.requested)), 1)
+        self.assertEqual(len(self.sink.messages_to(self.requested)), 0)
 
         # ...then the claim link makes them admin and sends email 2.
         response = self._post(
@@ -219,7 +196,7 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
         # The claim link is spent.
         spent = self._post(KNOCK_WITH_CODE_PATH, latecomer, {"access_code": admin_code})
         self.assertEqual(spent.status_code, 404, spent.text)
-        self.assertEqual(len(self.sink.messages_to(self.requested)), 2)
+        self.assertEqual(len(self.sink.messages_to(self.requested)), 1)
 
         # A later admin code, set by the teacher for a co-teacher, is an
         # ordinary grant: it promotes, and it is not a claim.
@@ -239,24 +216,17 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
         await self._join_with_code(latecomer, co_teacher_code, room_id)
         self.assertEqual(self._power_level(bot, room_id, latecomer_id), 100)
         await asyncio.sleep(1)
-        self.assertEqual(len(self.sink.messages_to(self.requested)), 2)
+        self.assertEqual(len(self.sink.messages_to(self.requested)), 1)
 
     async def test_a_reminder_link_claims_and_spends_the_first(self) -> None:
         """create-course-space "Claim reminders": a reminder carries a new
         claim link; every link works until the claim, which spends them all."""
         await self._homeserver()
-        _, bot = await self.new_user("bot", admin=True)
+        bot_id, bot = await self.new_user("bot", admin=True)
         teacher_id, teacher = await self.new_user("teacher")
 
-        response = self._post(
-            CREATE_COURSE_SPACE_PATH,
-            bot,
-            {"title": "Spanish 1", "teacher_email": self.requested},
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        room_id = response.json()["room_id"]
-        first_code = response.json()["admin_access_code"]
-        self.assertIsNotNone(self.sink.wait_for(self.requested, "Your quest is ready"))
+        _, first_code = self._codes()
+        room_id = self._legacy_course(bot, bot_id, first_code, self._codes()[0])
 
         reminder_body = {
             "room_id": room_id,
@@ -308,21 +278,6 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
         # A claimed course takes no more reminders.
         after = self._post(REMINDER_PATH, bot, reminder_body)
         self.assertEqual(after.status_code, 409, after.text)
-
-    async def test_no_address_means_no_email(self) -> None:
-        await self._homeserver()
-        _, bot = await self.new_user("bot", admin=True)
-
-        response = self._post(CREATE_COURSE_SPACE_PATH, bot, {"title": "No address"})
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertFalse(response.json()["emailed"])
-        await asyncio.sleep(1)
-        self.assertEqual(self.sink.messages_to(self.requested), [])
-        # The claim is recorded (it is where the admin code lives), with
-        # no address and so no notice ever owed.
-        row = self._claim_row(response.json()["room_id"])
-        self.assertIsNotNone(row)
-        self.assertIsNone(row[0])
 
 
 if __name__ == "__main__":

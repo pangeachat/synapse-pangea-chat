@@ -42,7 +42,7 @@ from synapse_pangea_chat.discussion_room import (
     DiscussionJoinCheck,
     DiscussionRoom,
 )
-from synapse_pangea_chat.email_invite import CreateCourseSpace, InviteByEmail
+from synapse_pangea_chat.email_invite import InviteByEmail
 from synapse_pangea_chat.email_invite.claim_by_email import ClaimByEmail
 from synapse_pangea_chat.email_invite.course_claim_emails import CourseClaimMailer
 from synapse_pangea_chat.email_invite.course_claim_notice import CourseClaimNotifier
@@ -417,7 +417,7 @@ class PangeaChat:
         )
 
         # --- Requested-course claim (shared by Room Code and Create Course Space) ---
-        # One store and one mailer: create_course_space records the requesting
+        # One store and one mailer: the v2 preparation records the requesting
         # address and sends the claim link; knock_with_code takes the claim and
         # sends the class link (knock-with-code.instructions.md).
         course_claim_store = CourseClaimStore(api._hs)
@@ -507,14 +507,7 @@ class PangeaChat:
             resource=self.preview_with_code_resource,
         )
 
-        # --- Create Course Space ---
-        self.create_course_space_resource = CreateCourseSpace(
-            api, config, course_claim_store, course_claim_mailer
-        )
-        api.register_web_resource(
-            path="/_synapse/client/pangea/v1/create_course_space",
-            resource=self.create_course_space_resource,
-        )
+        # --- Claim reminders for room-backed (legacy) courses ---
         self.send_course_claim_reminder_resource = SendCourseClaimReminder(
             api, config, course_claim_store, course_claim_mailer
         )
