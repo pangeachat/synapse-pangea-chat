@@ -14,8 +14,12 @@ operator script loops over spaces.
 Response: ``previous_quest_id``, ``quest_id``, ``previous_name``,
 ``previous_topic``, ``changes`` (the event types written, in order),
 ``can_do_list`` (``built``, ``previous_revision``, ``revision``,
-``missions``; null when no list was built or tried), ``sender``,
-``changed``, ``dry_run``.
+``missions``, ``problems``: each kind of thing the list could not carry over
+from the quest, with its count of entries; null when no list was built or
+tried), ``sender``, ``changed``, ``dry_run``. When the list cannot be built,
+the request is refused with ``error`` and ``code`` (course_missions failure
+codes, or ``ranked_unfinished`` when the CMS was too slow to rank every
+Can-Do): 422 when the quest is gone or malformed, 502 when the CMS failed.
 
 Steps:
 
@@ -26,13 +30,15 @@ Steps:
 3. Plan, name and topic already match and the course copy has content:
    ``changed: false``, nothing written. A space on the quest whose copy is
    empty or missing gets it built (admin-dash-api#472, scripts/
-   write_course_copies.py); a failed read then writes nothing.
+   write_course_copies.py).
 4. On a plan change, build ``pangea.course_missions`` for the new quest with
    ``CourseMissionsReader`` (the read creation uses; the quest owner's private
    activities and the space's pins are not in it), at revision one above the
    old copy's (1 if none) so an open Studio refuses a stale publish. Re-read
    the plan and copy after the read; either changed: 409, nothing written. A
-   failed read writes empty content and logs an error.
+   read that fails refuses the whole request with its code and writes
+   nothing: an empty list would put the shared quest in place of the course's
+   own, the silent loss this replaced. The failure is captured.
 5. Write the plan with ``uuid`` set to the new quest. ``l2`` and every other
    field are kept and the request cannot change them; the legacy
    ``course_plan_id`` is dropped.
@@ -82,7 +88,13 @@ from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_invite.course_missions import (
     COURSE_MISSIONS_STATE_EVENT_TYPE,
+    NO_QUEST,
+    QUEST_MALFORMED,
+    QUEST_NOT_FOUND,
+    RANKED_UNFINISHED,
+    CourseMissionsError,
     CourseMissionsReader,
+    capture_read_failure,
 )
 from synapse_pangea_chat.public_courses.backfill_l2 import (
     CANONICAL_PLAN_ID_KEY,
@@ -154,15 +166,16 @@ def can_do_list_revision(content: Optional[Mapping[str, Any]]) -> Optional[int]:
     return None
 
 
+# A read failure the request itself caused, rather than the CMS.
+_QUEST_FAILURES = frozenset({NO_QUEST, QUEST_NOT_FOUND, QUEST_MALFORMED})
+
+
 def can_do_list_content(
-    built: Optional[Mapping[str, Any]], current: Optional[Mapping[str, Any]]
+    built: Mapping[str, Any], current: Optional[Mapping[str, Any]]
 ) -> Dict[str, Any]:
     """The new quest's Can-Do list at one revision above the current list's (1
     when there is none), so a Studio opened on the old list refuses its
-    publish. Empty content when it could not be built, so readers fall back to
-    the new shared quest rather than the old quest's Can-Dos."""
-    if built is None:
-        return {}
+    publish."""
     return {**built, "revision": (can_do_list_revision(current) or 0) + 1}
 
 
@@ -434,26 +447,54 @@ class SetCoursePlan(Resource):
             )
         new_list: Optional[Dict[str, Any]] = None
         built: Optional[Dict[str, Any]] = None
+        problems: Dict[str, int] = {}
         # A switch builds the new quest's Can-Do list; a space already on the
-        # quest whose list is empty (a failed read) or missing (made before
-        # courses got their own list, admin-dash-api#472) gets it built, and
-        # so does a replacement of the named list.
+        # quest whose list is empty (a failed read, before this refused) or
+        # missing (made before courses got their own list,
+        # admin-dash-api#472) gets it built, and so does a replacement of the
+        # named list.
         rebuild = not current_list or replacing
         counts: Dict[str, Any] = {}
         if update.outcome == UPDATE or rebuild:
-            built = await self._course_missions.read(req.quest_id)
-            if built is None:
+            try:
+                result = await self._course_missions.read(req.quest_id)
+            except CourseMissionsError as e:
                 logger.error(
                     "set_course_plan: no Can-Do list could be built for quest "
-                    "%s in %s; %s",
+                    "%s in %s (%s); refused, nothing written",
                     req.quest_id,
                     room_id,
-                    (
-                        "an empty list is written, so readers use the shared quest"
-                        if update.outcome == UPDATE
-                        else "its list stays as it is"
-                    ),
+                    e,
                 )
+                capture_read_failure(e, req.quest_id, room_id=room_id)
+                return (
+                    422 if e.code in _QUEST_FAILURES else 502,
+                    {
+                        "error": "The quest's Can-Do list could not be built",
+                        "code": e.code,
+                    },
+                )
+            if result.unfinished:
+                # Partly ranked from the newest rows only: written, it would
+                # stay, since a list with content is never rebuilt here.
+                logger.error(
+                    "set_course_plan: %d Can-Dos of quest %s not read in time "
+                    "for %s; refused, nothing written",
+                    len(result.unfinished),
+                    req.quest_id,
+                    room_id,
+                )
+                return (
+                    502,
+                    {
+                        "error": "The CMS was too slow to build the quest's "
+                        "Can-Do list",
+                        "code": RANKED_UNFINISHED,
+                    },
+                )
+            built = result.content
+            for problem in result.problems:
+                problems[problem.code] = problems.get(problem.code, 0) + 1
             if replacing:
                 # Every CMS read comes before the re-check below, so nothing
                 # waits on the network between it and the write.
@@ -484,8 +525,7 @@ class SetCoursePlan(Resource):
                     409,
                     {"error": "The space changed while its Can-Do list was built"},
                 )
-            if update.outcome == UPDATE or built is not None:
-                new_list = can_do_list_content(built, current_list)
+            new_list = can_do_list_content(result.content, current_list)
         writes = planned_writes(
             update,
             self._event_type,
@@ -510,6 +550,7 @@ class SetCoursePlan(Resource):
                     "previous_revision": can_do_list_revision(current_list),
                     "revision": can_do_list_revision(new_list),
                     "missions": len((new_list or {}).get("missions") or []),
+                    "problems": problems,
                     **counts,
                 }
                 if update.outcome == UPDATE or rebuild

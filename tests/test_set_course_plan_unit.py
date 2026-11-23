@@ -9,6 +9,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse.api.errors import AuthError, InvalidClientTokenError
 
+from synapse_pangea_chat.email_invite.course_missions import (
+    CMS_UNAVAILABLE,
+    QUEST_NOT_FOUND,
+    SELECTION_ALL_GONE,
+    BuiltCourseMissions,
+    CourseMissionsError,
+    Problem,
+)
 from synapse_pangea_chat.set_course_plan import set_course_plan as module
 from synapse_pangea_chat.set_course_plan.set_course_plan import (
     MISMATCH,
@@ -95,9 +103,6 @@ class TestCanDoList(unittest.TestCase):
         old = {"version": 1, "revision": 3, "missions": []}
 
         self.assertEqual(can_do_list_content(self._BUILT, old)["revision"], 4)
-
-    def test_a_can_do_list_that_could_not_be_built_is_empty(self) -> None:
-        self.assertEqual(can_do_list_content(None, {"revision": 3}), {})
 
     def test_an_unreadable_old_revision_counts_as_none(self) -> None:
         olds: List[Optional[Dict[str, Any]]] = [
@@ -304,7 +309,11 @@ class _EndpointHarness(unittest.IsolatedAsyncioTestCase):
         )
         endpoint = SetCoursePlan(api, config)  # type: ignore[arg-type]
         endpoint._course_missions.read = AsyncMock(  # type: ignore[method-assign]
-            return_value=built
+            side_effect=[
+                CourseMissionsError(CMS_UNAVAILABLE, "CMS answered 503")
+                if built is None
+                else BuiltCourseMissions(built)
+            ]
         )
         return endpoint, api
 
@@ -332,6 +341,23 @@ class _EndpointHarness(unittest.IsolatedAsyncioTestCase):
     def _sent(api: MagicMock) -> List[Dict[str, Any]]:
         return [c.args[0] for c in api.create_and_send_event_into_room.await_args_list]
 
+    async def _refused(
+        self,
+        endpoint: SetCoursePlan,
+        api: MagicMock,
+        expected: str = "old",
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        with self.assertLogs(module.logger, level="ERROR"), patch(
+            "synapse_pangea_chat.email_invite.course_missions.capture_message"
+        ) as capture:
+            status, body = await self._post(endpoint, expected=expected, **extra)
+
+        api.create_and_send_event_into_room.assert_not_awaited()
+        capture.assert_called_once()
+        self.assertEqual(capture.call_args.kwargs["context"]["room_id"], "!space:test")
+        return {"status": status, **body}
+
 
 class TestEndpoint(_EndpointHarness):
     """The handler's write order, sender and failure answers."""
@@ -356,7 +382,13 @@ class TestEndpoint(_EndpointHarness):
         self.assertEqual(sent[0]["content"]["revision"], 4)
         self.assertEqual(
             body["can_do_list"],
-            {"built": True, "previous_revision": 3, "revision": 4, "missions": 1},
+            {
+                "built": True,
+                "previous_revision": 3,
+                "revision": 4,
+                "missions": 1,
+                "problems": {},
+            },
         )
         self.assertEqual(body["previous_name"], "Old title")
         self.assertIsNone(body["previous_topic"])
@@ -370,21 +402,56 @@ class TestEndpoint(_EndpointHarness):
         self.assertEqual(self._sent(api)[0]["content"]["revision"], 1)
         self.assertIsNone(body["can_do_list"]["previous_revision"])
 
-    async def test_a_can_do_list_that_cannot_be_built_is_written_empty(self) -> None:
+    async def test_a_can_do_list_that_cannot_be_built_refuses_the_move(self) -> None:
+        # Never an empty list in place of the course's own: the operator
+        # gets the code and nothing is written, the plan included.
         endpoint, api = self._endpoint(built=None)
+
+        answer = await self._refused(endpoint, api)
+
+        self.assertEqual(answer["status"], 502)
+        self.assertEqual(answer["code"], CMS_UNAVAILABLE)
+
+    async def test_a_quest_that_is_gone_is_refused_as_the_request_s_fault(
+        self,
+    ) -> None:
+        endpoint, api = self._endpoint()
+        endpoint._course_missions.read = AsyncMock(  # type: ignore[method-assign]
+            side_effect=CourseMissionsError(QUEST_NOT_FOUND)
+        )
+
+        answer = await self._refused(endpoint, api)
+
+        self.assertEqual(answer["status"], 422)
+        self.assertEqual(answer["code"], QUEST_NOT_FOUND)
+
+    async def test_a_list_partly_ranked_in_time_is_refused(self) -> None:
+        # Written, it would stay: a list with content is never rebuilt here.
+        endpoint, api = self._endpoint()
+        endpoint._course_missions.read = AsyncMock(  # type: ignore[method-assign]
+            return_value=BuiltCourseMissions(self._BUILT, [], ["lo"])
+        )
 
         with self.assertLogs(module.logger, level="ERROR"):
             status, body = await self._post(endpoint)
 
-        self.assertEqual(status, 200, body)
-        sent = self._sent(api)
-        self.assertEqual(sent[0]["type"], "pangea.course_missions")
-        self.assertEqual(sent[0]["content"], {})
-        self.assertEqual(sent[1]["type"], "pangea.course_plan")
-        self.assertEqual(
-            body["can_do_list"],
-            {"built": False, "previous_revision": 3, "revision": None, "missions": 0},
+        self.assertEqual(status, 502)
+        self.assertEqual(body["code"], "ranked_unfinished")
+        api.create_and_send_event_into_room.assert_not_awaited()
+
+    async def test_what_the_list_could_not_carry_over_is_counted(self) -> None:
+        endpoint, api = self._endpoint()
+        endpoint._course_missions.read = AsyncMock(  # type: ignore[method-assign]
+            return_value=BuiltCourseMissions(
+                self._BUILT,
+                [Problem(SELECTION_ALL_GONE, "lo", {"selected": 1, "kept": 0})],
+            )
         )
+
+        status, body = await self._post(endpoint)
+
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["can_do_list"]["problems"], {SELECTION_ALL_GONE: 1})
 
     async def test_an_empty_can_do_list_on_the_new_quest_is_rebuilt(self) -> None:
         endpoint, api = self._endpoint(can_do_list={}, on="new")
@@ -413,27 +480,21 @@ class TestEndpoint(_EndpointHarness):
         self.assertNotIn("pangea.course_plan", [e["type"] for e in sent])
         self.assertTrue(body["can_do_list"]["built"])
 
-    async def test_a_failed_read_writes_nothing_for_a_missing_can_do_list(
+    async def test_a_failed_read_for_a_missing_can_do_list_is_refused(
         self,
     ) -> None:
         endpoint, api = self._endpoint(can_do_list=None, built=None, on="new")
 
-        with self.assertLogs(module.logger, level="ERROR"):
-            status, body = await self._post(endpoint, expected="new")
+        answer = await self._refused(endpoint, api, expected="new")
 
-        self.assertEqual(status, 200, body)
-        self.assertNotIn("pangea.course_missions", [e["type"] for e in self._sent(api)])
-        self.assertFalse(body["can_do_list"]["built"])
+        self.assertEqual(answer["status"], 502)
 
-    async def test_a_failed_rebuild_leaves_the_empty_can_do_list(self) -> None:
+    async def test_a_failed_rebuild_of_an_empty_can_do_list_is_refused(self) -> None:
         endpoint, api = self._endpoint(can_do_list={}, built=None, on="new")
 
-        with self.assertLogs(module.logger, level="ERROR"):
-            status, body = await self._post(endpoint, expected="new")
+        answer = await self._refused(endpoint, api, expected="new")
 
-        self.assertEqual(status, 200, body)
-        self.assertNotIn("pangea.course_missions", [e["type"] for e in self._sent(api)])
-        self.assertFalse(body["can_do_list"]["built"])
+        self.assertEqual(answer["code"], CMS_UNAVAILABLE)
 
     async def test_a_can_do_list_with_content_on_the_new_quest_is_left_alone(
         self,
@@ -571,6 +632,7 @@ class TestReplaceCanDoList(_EndpointHarness):
                 "previous_revision": 1,
                 "revision": 2,
                 "missions": 2,
+                "problems": {},
                 "replaced": "$built",
                 "current_activities": 5,
                 "rebuilt_activities": 4,
@@ -655,18 +717,19 @@ class TestReplaceCanDoList(_EndpointHarness):
         self.assertEqual(body["can_do_list"]["rebuilt_activities"], 4)
         self.assertFalse(body["changed"])
 
-    async def test_a_list_that_cannot_be_rebuilt_is_left_alone(self) -> None:
+    async def test_a_list_that_cannot_be_rebuilt_is_left_alone_and_refused(
+        self,
+    ) -> None:
         endpoint, api = self._replacing()
-        endpoint._course_missions.read = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        endpoint._course_missions.read = AsyncMock(  # type: ignore[method-assign]
+            side_effect=CourseMissionsError(CMS_UNAVAILABLE)
+        )
 
-        with self.assertLogs(module.logger, level="ERROR"):
-            status, body = await self._post(
-                endpoint, expected="new", replace_copy_event_id="$built"
-            )
+        answer = await self._refused(
+            endpoint, api, expected="new", replace_copy_event_id="$built"
+        )
 
-        self.assertEqual(status, 200, body)
-        self.assertNotIn("pangea.course_missions", [e["type"] for e in self._sent(api)])
-        self.assertFalse(body["can_do_list"]["built"])
+        self.assertEqual(answer["status"], 502)
 
 
 class TestReplaceRequest(unittest.TestCase):

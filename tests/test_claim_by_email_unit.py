@@ -14,6 +14,10 @@ from synapse.api.errors import SynapseError
 from synapse_pangea_chat.email_invite import claim_by_email
 from synapse_pangea_chat.email_invite.claim_by_email import ClaimByEmail
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
+from synapse_pangea_chat.email_invite.course_missions import (
+    QUEST_NOT_FOUND,
+    CourseMissionsError,
+)
 from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
 from tests.moderation_doubles import DbPoolDouble
 
@@ -85,7 +89,10 @@ class TestClaimByEmail(unittest.IsolatedAsyncioTestCase):
             self.invitations,
             self.claims,
             MagicMock(),
-            course_missions=MagicMock(read=AsyncMock(return_value=None)),
+            # No Can-Do list, and no later attempt: these tests are the claim's.
+            course_missions=MagicMock(
+                read=AsyncMock(side_effect=CourseMissionsError(QUEST_NOT_FOUND))
+            ),
         )
         self.claimer = ClaimByEmail(self.api, self.invitations, self.provisioner)
         # The address as the teacher typed it at the booth.

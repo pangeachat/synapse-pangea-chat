@@ -16,7 +16,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Collection, Dict, List, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlparse
 
 import requests
 
@@ -43,6 +43,7 @@ class _QuestCmsHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         auth = self.headers.get("Authorization")
         path = urlparse(self.path).path
+        query = dict(parse_qsl(urlparse(self.path).query))
         code: int
         body: Dict[str, Any]
         if auth != "service-users API-Key test-cms-api-key":
@@ -62,6 +63,45 @@ class _QuestCmsHandler(BaseHTTPRequestHandler):
                         {"learning_objective": "lo-a", "activity_ids": None},
                     ]
                 },
+            }
+        elif path == "/api/quest-plans/quest-gone":
+            code, body = 200, {
+                "id": "quest-gone",
+                "req": {"target_language": "es"},
+                "res": {
+                    "learning_objective_sequence": [
+                        {
+                            "learning_objective": "lo-a",
+                            "activity_ids": ["act-gone"],
+                            "note": "Order food " * 40,
+                        },
+                    ]
+                },
+            }
+        elif (
+            path == "/api/activities-v2" and "where[res.plan.activity_id][in]" in query
+        ):
+            # The selected activity is no row at all.
+            code, body = 200, {"docs": [], "totalDocs": 0}
+        elif path == "/api/activities-v2" and "where[and][5][score][exists]" in query:
+            code, body = 200, {"docs": [], "totalDocs": 0}
+        elif (
+            path == "/api/activities-v2"
+            and "where[and][5][score][greater_than]" in query
+        ):
+            code, body = 200, {
+                "docs": [
+                    {
+                        "id": "row-1",
+                        "req": {},
+                        "res": {"plan": {"activity_id": "act-a", "l2": "es"}},
+                        "learningObjectiveRefs": ["lo-a"],
+                        "hidden": False,
+                        "visibility": "public",
+                        "score": 8,
+                    },
+                ],
+                "totalDocs": 1,
             }
         elif path == "/api/activities-v2":
             code, body = 200, {
@@ -297,6 +337,23 @@ class TestClaimedCourseSpaceE2E(BaseSynapseE2ETest):
             state[(COURSE_PLAN_EVENT_TYPE, "")]["content"],
             {"uuid": "missing-quest", "l2": "es"},
         )
+
+    async def test_a_selection_that_is_gone_pins_the_ranked_list(self) -> None:
+        """An entry whose selected activities are all gone pins its Can-Do's
+        best-scored activities, never every listed one, and an over-long note
+        is shortened rather than dropped."""
+        operator, _, teacher = await self._setup()
+
+        room_id = self._claimed(operator, teacher, "gone", course_plan_id="quest-gone")
+        [mission] = self._state_events(teacher, room_id)[
+            (COURSE_MISSIONS_EVENT_TYPE, "")
+        ]["content"]["missions"]
+
+        self.assertEqual(mission["lo_id"], "lo-a")
+        self.assertEqual(mission["activity_ids"], ["act-a"])
+        self.assertLessEqual(len(mission["note"]), 280)
+        self.assertTrue(mission["note"].startswith("Order food Order food"))
+        self.assertTrue(mission["note"].endswith("\u2026"))
 
 
 if __name__ == "__main__":

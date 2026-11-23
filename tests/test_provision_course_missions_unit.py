@@ -3,8 +3,8 @@ creates the space.
 
 Runs the real invitation store and provisioner over an in-memory database, with
 Synapse's room creation and room state stubbed, as test_claim_by_email_unit
-does. The list is built by the same reader v1 create_course_space uses; a
-failed read (None) creates the course without it.
+does. A read that fails creates the course without the list, captures why, and
+schedules a later attempt when one can get past the failure.
 """
 
 import unittest
@@ -12,6 +12,13 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
+from synapse_pangea_chat.email_invite.course_missions import (
+    CMS_UNAVAILABLE,
+    QUEST_NOT_FOUND,
+    TIMEOUT,
+    BuiltCourseMissions,
+    CourseMissionsError,
+)
 from synapse_pangea_chat.email_invite.provision_course import CourseProvisioner
 from tests.moderation_doubles import DbPoolDouble
 from tests.test_claim_by_email_unit import SPEC, TEACHER, _claimed_room_state
@@ -35,10 +42,17 @@ class TestProvisionCanDoList(unittest.IsolatedAsyncioTestCase):
         claims = CourseClaimStore(api._hs)
         await claims._ensure_table()
         reader = MagicMock()
-        reader.read = AsyncMock(return_value=can_do_list)
+        if isinstance(can_do_list, Exception):
+            reader.read = AsyncMock(side_effect=can_do_list)
+        elif isinstance(can_do_list, BuiltCourseMissions):
+            reader.read = AsyncMock(return_value=can_do_list)
+        else:
+            reader.read = AsyncMock(return_value=BuiltCourseMissions(can_do_list))
         provisioner = CourseProvisioner(
             api, claims.invitations, claims, MagicMock(), course_missions=reader
         )
+        provisioner.course_missions_rebuild = MagicMock()
+        self.rebuild = provisioner.course_missions_rebuild
         ident, _ = await claims.invitations.prepare(
             "@operator:x", "request-1", SPEC, "teacher@school.example", "abc2def", 1
         )
@@ -74,9 +88,63 @@ class TestProvisionCanDoList(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(power["users"], {TEACHER: 100})
         self.assertEqual(power["events"]["pangea.course_missions"], 100)
 
-    async def test_failed_read_still_creates_the_course(self) -> None:
-        create_room, reader, room = await self._claim(None)
+    async def test_a_cms_failure_creates_the_course_captures_and_rebuilds_later(
+        self,
+    ) -> None:
+        for code in (CMS_UNAVAILABLE, TIMEOUT):
+            with self.subTest(code=code), patch(
+                "synapse_pangea_chat.email_invite.course_missions.capture_message"
+            ) as capture:
+                create_room, reader, room = await self._claim(
+                    CourseMissionsError(code, "detail")
+                )
+
+                self.assertEqual(room, "!room:x")
+                self.assertNotIn("pangea.course_missions", self._state(create_room))
+                self.rebuild.schedule.assert_called_once_with("!room:x", "quest")
+                capture.assert_called_once()
+                self.assertEqual(
+                    capture.call_args.args[0], f"Can-Do list not built: {code}"
+                )
+                self.assertEqual(capture.call_args.kwargs["level"], "error")
+                context = capture.call_args.kwargs["context"]
+                self.assertEqual(context["quest_id"], "quest")
+                self.assertIn("invitation_id", context)
+                # Ids only: never the requesting address.
+                self.assertNotIn("teacher@school.example", repr(capture.call_args))
+
+    async def test_a_list_partly_ranked_from_the_page_is_written_and_rebuilt(
+        self,
+    ) -> None:
+        built = BuiltCourseMissions(CAN_DO_LIST, [], ["lo-a"])
+        create_room, _, _ = await self._claim(built)
+
+        self.assertEqual(
+            self._state(create_room)["pangea.course_missions"]["content"], CAN_DO_LIST
+        )
+        self.rebuild.schedule.assert_called_once_with(
+            "!room:x", "quest", expected=CAN_DO_LIST
+        )
+
+    async def test_a_quest_that_is_gone_is_captured_and_not_retried(self) -> None:
+        with patch(
+            "synapse_pangea_chat.email_invite.course_missions.capture_message"
+        ) as capture:
+            create_room, _, room = await self._claim(
+                CourseMissionsError(QUEST_NOT_FOUND)
+            )
 
         self.assertEqual(room, "!room:x")
-        reader.read.assert_awaited_once_with("quest")
         self.assertNotIn("pangea.course_missions", self._state(create_room))
+        self.rebuild.schedule.assert_not_called()
+        capture.assert_called_once()
+
+    async def test_a_failed_read_is_logged_without_sentry(self) -> None:
+        with self.assertLogs(
+            "synapse.module.synapse_pangea_chat.email_invite.course_missions",
+            "ERROR",
+        ) as logs:
+            await self._claim(CourseMissionsError(QUEST_NOT_FOUND))
+
+        self.assertIn("quest_not_found", logs.output[0])
+        self.assertIn("invitation_id=", logs.output[0])

@@ -19,6 +19,10 @@ from synapse.api.errors import SynapseError
 
 from synapse_pangea_chat.email_invite.course_claims import CourseClaimStore
 from synapse_pangea_chat.email_invite.course_invitation_api import CourseInvitationAPI
+from synapse_pangea_chat.email_invite.course_missions import (
+    QUEST_NOT_FOUND,
+    CourseMissionsError,
+)
 from synapse_pangea_chat.email_invite.instructor_invitations import (
     InstructorInvitationAPI,
 )
@@ -129,7 +133,9 @@ class _Base(unittest.IsolatedAsyncioTestCase):
             self.invitations,
             self.claims,
             self.notifier,
-            course_missions=MagicMock(read=AsyncMock(return_value=None)),
+            course_missions=MagicMock(
+                read=AsyncMock(side_effect=CourseMissionsError(QUEST_NOT_FOUND))
+            ),
         )
 
     async def _call(self, method: str, body: Any = None, args: dict | None = None):
