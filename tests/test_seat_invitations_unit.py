@@ -198,6 +198,11 @@ class Harness:
         assert status == 200, body
         return body["events"]
 
+    async def managed_events(self, room: str = ROOM) -> List[Dict[str, Any]]:
+        status, body = await self.handlers.managed_events(TEACHER, {"room_id": room})
+        assert status == 200, body
+        return body["events"]
+
     async def row(self, invitation_id: str) -> Dict[str, Any]:
         row = await self.store.get(invitation_id)
         assert row is not None
@@ -2118,6 +2123,205 @@ class TestEvents(_Base):
         await self.h.events()
         self.assertTrue(captured.text())
         self.assertNotIn(TEACHER, captured.text())
+
+
+class TestManagedEvents(_Base):
+    """The managed-account ledger (#799): one ``management_started`` per
+    managed record, written with it, saying how the student joined."""
+
+    async def claimed_by_email(self, user: str = STUDENT) -> str:
+        (inv,) = await self.h.add(INVITED)
+        self.h.verify(user, INVITED_KEY)
+        status, body = await self.h.open(user, inv["invitation_id"])
+        self.assertEqual(body["result"], "claimed")
+        return inv["invitation_id"]
+
+    async def test_email_claim_records_management_started_via_email(self):
+        ident = await self.claimed_by_email()
+        (event,) = await self.h.managed_events()
+        self.assertEqual(
+            (event["user_id"], event["actor"], event["action"], event["via"]),
+            (STUDENT, "system", "management_started", "email"),
+        )
+        self.assertEqual((await self.h.row(ident))["joined_via"], "email")
+        # Seats Activity stays seats-only.
+        for seat_event in await self.h.events():
+            self.assertNotEqual(seat_event["action"], "management_started")
+            self.assertNotIn("via", seat_event)
+            self.assertNotIn("user_id", seat_event)
+
+    async def test_granted_claim_records_the_granting_teacher(self):
+        (inv,) = await self.h.add(INVITED)
+        ident = inv["invitation_id"]
+        await self.h.open(OTHER, ident)
+        # Verifying the invited address after requesting does not change how
+        # the claim was admitted: the teacher's Grant.
+        self.h.verify(OTHER, INVITED_KEY)
+        outcome, _ = await self.h.approvals.grant(ident, OTHER, TEACHER)
+        self.assertEqual(outcome, "claimed")
+        (event,) = await self.h.managed_events()
+        self.assertEqual(
+            (event["user_id"], event["actor"], event["via"]), (OTHER, TEACHER, "grant")
+        )
+        (claimed,) = [
+            e
+            for e in await self.h.events(action="invitation_claimed")
+            if e["target"] == ident
+        ]
+        # Written after the claim that caused it.
+        self.assertGreater(event["event_id"], claimed["event_id"])
+
+    async def test_grant_whose_request_was_dropped_is_not_credited_to_the_teacher(
+        self,
+    ):
+        (inv,) = await self.h.add(INVITED)
+        ident = inv["invitation_id"]
+        await self.h.open(OTHER, ident)
+        self.assertIsNotNone(await self.h.store.get_request(ident, OTHER))
+        # After the decide handler checked the request, a revoke and re-invite
+        # drop it; the account has meanwhile verified the invited address.
+        await self.h.store.revoke(ROOM, ident, TEACHER, now_ms())
+        await self.h.add(INVITED)
+        self.assertIsNone(await self.h.store.get_request(ident, OTHER))
+        self.h.verify(OTHER, INVITED_KEY)
+        # The Grant the handler goes on to make is admitted by the email match
+        # alone, so neither the method nor the actor is the teacher's Grant.
+        outcome, _ = await self.h.approvals.grant(ident, OTHER, TEACHER)
+        self.assertEqual(outcome, "claimed")
+        (event,) = await self.h.managed_events()
+        self.assertEqual(
+            (event["user_id"], event["actor"], event["via"]), (OTHER, "system", "email")
+        )
+        self.assertEqual((await self.h.row(ident))["joined_via"], "email")
+        self.assertEqual(await self.h.events(action="request_granted"), [])
+
+    async def test_reclaim_after_leave_records_no_second_start(self):
+        release = MembershipRelease(self.h.store, self.h.claims)
+        await self.claimed_by_email()
+        record = await self.h.store.managed_record(STUDENT, ROOM)
+        await release.on_new_event(_member_event(ROOM, STUDENT, "leave", STUDENT), {})
+        await self.claimed_by_email()
+        self.assertEqual(len(await self.h.managed_events()), 1)
+        self.assertEqual(await self.h.store.managed_record(STUDENT, ROOM), record)
+
+    async def test_reinvite_clears_the_join_method_with_the_claimant(self):
+        release = MembershipRelease(self.h.store, self.h.claims)
+        ident = await self.claimed_by_email()
+        await release.on_new_event(_member_event(ROOM, STUDENT, "leave", STUDENT), {})
+        await self.h.add(INVITED)
+        row = await self.h.row(ident)
+        self.assertEqual(
+            (row["state"], row["claimant"], row["joined_via"]), ("invited", None, None)
+        )
+        # The event still names the student who was managed.
+        (event,) = await self.h.managed_events()
+        self.assertEqual(event["user_id"], STUDENT)
+
+    async def test_demoted_admin_starts_management_with_the_original_join_method(
+        self,
+    ):
+        release = MembershipRelease(self.h.store, self.h.claims)
+        self.h.admins.admins.add((ROOM, STUDENT))
+        ident = await self.claimed_by_email()
+        self.assertEqual((await self.h.row(ident))["joined_via"], "email")
+        self.assertEqual(await self.h.managed_events(), [])
+        self.h.admins.admins.discard((ROOM, STUDENT))
+        await release.on_new_event(_power_event(ROOM), {})
+        (event,) = await self.h.managed_events()
+        self.assertEqual(
+            (event["user_id"], event["actor"], event["via"]),
+            (STUDENT, "system", "email"),
+        )
+        # Idempotent: a second scan inserts nothing and records nothing.
+        await release.on_new_event(_power_event(ROOM), {})
+        self.assertEqual(len(await self.h.managed_events()), 1)
+
+    async def test_demoted_admin_claimed_before_this_build_reads_unknown(self):
+        release = MembershipRelease(self.h.store, self.h.claims)
+        self.h.admins.admins.add((ROOM, STUDENT))
+        ident = await self.claimed_by_email()
+        pool = self.h.main.db_pool
+        pool.connection.execute(
+            "UPDATE pangea_seat_invitation SET joined_via = NULL WHERE id = ?",
+            (ident,),
+        )
+        pool.connection.commit()
+        self.h.admins.admins.discard((ROOM, STUDENT))
+        await release.on_new_event(_power_event(ROOM), {})
+        (event,) = await self.h.managed_events()
+        self.assertEqual(event["via"], "unknown")
+
+    async def test_management_started_is_atomic_with_the_record(self):
+        (inv,) = await self.h.add(INVITED)
+        with patch(
+            "synapse_pangea_chat.student_invitations.store.record_managed_event",
+            side_effect=RuntimeError("ledger down"),
+        ):
+            with self.assertRaises(RuntimeError):
+                await self.h.store.claim_txn(
+                    inv["invitation_id"],
+                    STUDENT,
+                    email_match=True,
+                    grant=False,
+                    now_ms=now_ms(),
+                )
+        self.assertIsNone(await self.h.store.managed_record(STUDENT, ROOM))
+        self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "invited")
+
+    async def test_managed_events_read_is_admin_gated_and_paged(self):
+        users = [f"@s{i}:x" for i in range(3)]
+        for i, user in enumerate(users):
+            (inv,) = await self.h.add(f"s{i}@school.example")
+            outcome, _ = await self.h.store.claim_txn(
+                inv["invitation_id"],
+                user,
+                email_match=True,
+                grant=False,
+                now_ms=1000 + i,
+            )
+            self.assertEqual(outcome, "claimed")
+        (elsewhere,) = await self.h.add(INVITED, room=OTHER_ROOM)
+        await self.h.store.claim_txn(
+            elsewhere["invitation_id"], THIRD, email_match=True, grant=False, now_ms=5
+        )
+        status, body = await self.h.handlers.managed_events(STUDENT, {"room_id": ROOM})
+        self.assertEqual((status, body["errcode"]), (403, "M_FORBIDDEN"))
+        events = await self.h.managed_events()
+        self.assertEqual([e["time_ms"] for e in events], [1002, 1001, 1000])
+        # Another course's events never show.
+        self.assertNotIn(THIRD, str(events))
+        self.assertEqual(
+            [
+                e["user_id"]
+                for e in (
+                    await self.h.handlers.managed_events(
+                        TEACHER, {"room_id": ROOM, "from": "1001", "to": "1002"}
+                    )
+                )[1]["events"]
+            ],
+            ["@s1:x"],
+        )
+        for bad in (
+            {"from": "x"},
+            {"to": "-1"},
+            {"cursor": "abc"},
+            {"cursor": "1."},
+        ):
+            status, body = await self.h.handlers.managed_events(
+                TEACHER, {"room_id": ROOM, **bad}
+            )
+            self.assertEqual((status, body["errcode"]), (400, "M_INVALID_PARAM"), bad)
+        with patch("synapse_pangea_chat.student_invitations.store.EVENTS_PAGE", 2):
+            status, first = await self.h.handlers.managed_events(
+                TEACHER, {"room_id": ROOM}
+            )
+            self.assertEqual([e["time_ms"] for e in first["events"]], [1002, 1001])
+            self.assertIsNotNone(first["next_cursor"])
+            status, second = await self.h.handlers.managed_events(
+                TEACHER, {"room_id": ROOM, "cursor": first["next_cursor"]}
+            )
+            self.assertEqual([e["time_ms"] for e in second["events"]], [1000])
+            self.assertIsNone(second["next_cursor"])
 
 
 class TestMigration(_Base):

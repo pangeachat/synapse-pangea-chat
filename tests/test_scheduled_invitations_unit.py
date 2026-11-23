@@ -885,6 +885,7 @@ class TestMigration(unittest.TestCase):
             db.execute(sql)
         db.execute("ALTER TABLE pangea_seat_invitation DROP COLUMN send_at_ms")
         db.execute("ALTER TABLE pangea_seat_invitation DROP COLUMN first_due_ms")
+        db.execute("ALTER TABLE pangea_seat_invitation DROP COLUMN joined_via")
         db.execute(
             "INSERT INTO pangea_seat_invitation (id, course_room_id, email_key,"
             " state, source, invited_by, created_at_ms)"
@@ -908,6 +909,7 @@ class TestMigration(unittest.TestCase):
         ]
         self.assertIn("send_at_ms", columns)
         self.assertIn("first_due_ms", columns)
+        self.assertIn("joined_via", columns)
         self.assertEqual(
             db.execute("SELECT id, send_at_ms FROM pangea_seat_invitation").fetchall(),
             [("a", None)],

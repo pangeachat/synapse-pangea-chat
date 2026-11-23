@@ -1,6 +1,6 @@
 """The module's student invitation tables and every write to them.
 
-Three tables (SPEC §6):
+The tables (SPEC §6):
 
 - ``pangea_seat_invitation``: one row per (course, canonical email). States
   ``invited`` -> ``joined`` (claimed by one account) -> ``left`` (that account
@@ -19,6 +19,8 @@ Three tables (SPEC §6):
   removal, a ban, a withdrawn invitation and promotion to admin keep it.
 - ``pangea_seat_invitation_event``: the append-only activity ledger
   (``events.py``), written in the same transaction as each change.
+- ``pangea_managed_account_event``: the append-only managed-account ledger
+  (``managed_events.py``), written with each managed record inserted.
 
 Every write that decides a claim locks the invitation row first (a no-op
 ``UPDATE``), so on Postgres's repeatable-read transactions a concurrent change
@@ -51,6 +53,15 @@ from synapse_pangea_chat.student_invitations.events import (
     SYSTEM,
     record_event,
 )
+from synapse_pangea_chat.student_invitations.managed_events import (
+    MANAGED_EVENT_SCHEMA,
+    MANAGEMENT_STARTED,
+    VIA_CANVAS,
+    VIA_EMAIL,
+    VIA_GRANT,
+    VIA_UNKNOWN,
+    record_managed_event,
+)
 
 STATE_INVITED = "invited"
 STATE_JOINED = "joined"
@@ -82,6 +93,7 @@ SCHEMA = (
         member_user_id TEXT,
         send_at_ms BIGINT,
         first_due_ms BIGINT,
+        joined_via TEXT,
         UNIQUE (course_room_id, email_key))""",
         """CREATE UNIQUE INDEX IF NOT EXISTS pangea_seat_invitation_one_joined
         ON pangea_seat_invitation (course_room_id, claimant)
@@ -108,6 +120,7 @@ SCHEMA = (
         PRIMARY KEY (user_id, course_room_id))""",
     )
     + EVENT_SCHEMA
+    + MANAGED_EVENT_SCHEMA
 )
 
 COLUMNS = (
@@ -129,6 +142,7 @@ COLUMNS = (
     "member_user_id",
     "send_at_ms",
     "first_due_ms",
+    "joined_via",
 )
 _SELECT = "SELECT " + ", ".join(COLUMNS) + " FROM pangea_seat_invitation "
 REQUEST_COLUMNS = ("invitation_id", "user_id", "requested_at_ms", "decision")
@@ -139,6 +153,7 @@ _REQUEST_SELECT = (
 # T12's field names for the event columns (event_id, ts_ms, actor, action,
 # invitation_id, count).
 EVENT_COLUMNS = ("event_id", "time_ms", "actor", "action", "target", "count")
+MANAGED_EVENT_COLUMNS = ("event_id", "time_ms", "user_id", "actor", "action", "via")
 EVENTS_PAGE = 100
 
 # (lti_issuer, lti_context_id, lti_user_id): a Canvas identity.
@@ -385,10 +400,47 @@ class StudentInvitationStore:
             return [dict(zip(EVENT_COLUMNS, raw)) for raw in txn.fetchall()]
 
         rows = await self.db.runInteraction("pangea_invitation_events", select)
-        if len(rows) <= EVENTS_PAGE:
-            return rows, None
-        page = rows[:EVENTS_PAGE]
-        return page, (page[-1]["time_ms"], page[-1]["event_id"])
+        return _page(rows)
+
+    async def managed_events(
+        self,
+        room_id: str,
+        *,
+        from_ms: Optional[int],
+        to_ms: Optional[int],
+        before: Optional[Tuple[int, str]],
+    ) -> Tuple[List[Dict[str, Any]], Optional[Tuple[int, str]]]:
+        """One page of this course's managed-account events, paged as
+        ``events`` is."""
+        await self.ensure()
+        before_ts, before_id = before if before is not None else (None, None)
+
+        def select(txn: Any) -> List[Dict[str, Any]]:
+            txn.execute(
+                "SELECT event_id, ts_ms, user_id, actor, action, via"
+                " FROM pangea_managed_account_event"
+                " WHERE room_id = ?"
+                " AND (? IS NULL OR ts_ms >= ?)"
+                " AND (? IS NULL OR ts_ms < ?)"
+                " AND (? IS NULL OR ts_ms < ? OR (ts_ms = ? AND event_id < ?))"
+                " ORDER BY ts_ms DESC, event_id DESC LIMIT ?",
+                (
+                    room_id,
+                    from_ms,
+                    from_ms,
+                    to_ms,
+                    to_ms,
+                    before_ts,
+                    before_ts,
+                    before_ts,
+                    before_id,
+                    EVENTS_PAGE + 1,
+                ),
+            )
+            return [dict(zip(MANAGED_EVENT_COLUMNS, raw)) for raw in txn.fetchall()]
+
+        rows = await self.db.runInteraction("pangea_managed_account_events", select)
+        return _page(rows)
 
     async def joined_claimants(self, room_id: str) -> Dict[str, str]:
         """claimant -> invitation id, for this course's joined rows."""
@@ -488,7 +540,8 @@ class StudentInvitationStore:
                     # identity is cleared: this path is never a Canvas import.
                     txn.execute(
                         "UPDATE pangea_seat_invitation SET state = 'invited',"
-                        " claimant = NULL, joined_at_ms = NULL, email = ?,"
+                        " claimant = NULL, joined_at_ms = NULL, joined_via = NULL,"
+                        " email = ?,"
                         " source = ?, invited_by = ?, created_at_ms = ?,"
                         " lti_issuer = NULL, lti_context_id = NULL,"
                         " lti_user_id = NULL, member_user_id = ?,"
@@ -888,8 +941,18 @@ class StudentInvitationStore:
                 return "not_joined"
             if row["claimant"] != user_id:
                 return "not_joined"
-            _insert_managed(txn, user_id, row["course_room_id"], now_ms)
-            return "inserted" if txn.rowcount == 1 else "unchanged"
+            # A claimant who was an admin at the claim: management starts
+            # now, recorded with how they joined (unknown for a claim made
+            # before that was kept).
+            inserted = _insert_managed(
+                txn,
+                user_id,
+                row["course_room_id"],
+                now_ms,
+                actor=SYSTEM,
+                via=row["joined_via"] or VIA_UNKNOWN,
+            )
+            return "inserted" if inserted else "unchanged"
 
         return await self.db.runInteraction("pangea_managed_account_set", write)
 
@@ -1027,11 +1090,17 @@ class StudentInvitationStore:
             # course index backs this for concurrent claims.
             if _joined_in_course(txn, room_id, user_id) is not None:
                 return ALREADY_CLAIMED_IN_COURSE, row
-            if managed:
-                # A record kept from an earlier claim in this course (the
-                # student left and was invited again) stays as it is.
-                _insert_managed(txn, user_id, room_id, now_ms)
-            if grant and request is not None and request[0] != DECISION_GRANTED:
+            # How the claim was admitted, from what this transaction read, not
+            # the caller's flag: a request granted here or before, else the
+            # Canvas identity, else the verified address.
+            if granted:
+                joined_via = VIA_GRANT
+            elif canvas_match(row, canvas_identity):
+                joined_via = VIA_CANVAS
+            else:
+                joined_via = VIA_EMAIL
+            grant_now = grant and request is not None and request[0] != DECISION_GRANTED
+            if grant_now:
                 txn.execute(
                     "UPDATE pangea_invitation_ack SET decision = 'granted'"
                     " WHERE invitation_id = ? AND user_id = ?",
@@ -1047,9 +1116,9 @@ class StudentInvitationStore:
                 )
             txn.execute(
                 "UPDATE pangea_seat_invitation"
-                " SET state = 'joined', claimant = ?, joined_at_ms = ?"
-                " WHERE id = ? AND state = 'invited'",
-                (user_id, now_ms, invitation_id),
+                " SET state = 'joined', claimant = ?, joined_at_ms = ?,"
+                " joined_via = ? WHERE id = ? AND state = 'invited'",
+                (user_id, now_ms, joined_via, invitation_id),
             )
             record_event(
                 txn,
@@ -1059,6 +1128,18 @@ class StudentInvitationStore:
                 now_ms=now_ms,
                 invitation_id=invitation_id,
             )
+            if managed:
+                # After the claim, so its event follows the claim's. A record
+                # kept from an earlier claim in this course (the student left
+                # and was invited again) stays as it is, with no new event.
+                _insert_managed(
+                    txn,
+                    user_id,
+                    room_id,
+                    now_ms,
+                    actor=actor if grant_now else SYSTEM,
+                    via=joined_via,
+                )
             return CLAIMED, _select_one(txn, "WHERE id = ?", (invitation_id,))
 
         try:
@@ -1091,8 +1172,9 @@ def migrate(txn: Any) -> None:
       ``requested_at_ms`` and ``disclosure_version`` is dropped;
     - the managed record keeps only ``created_at_ms``: ``since_ms`` is
       renamed and ``invited_by`` dropped;
-    - invitations gain ``send_at_ms`` (nullable, so no row is rewritten) and
-      the partial index of rows waiting to send, which is empty at this point.
+    - invitations gain ``send_at_ms``, ``first_due_ms`` and ``joined_via``
+      (nullable, so no row is rewritten) and the partial index of rows
+      waiting to send, which is empty at this point.
     """
     request = _columns(txn, "pangea_invitation_ack")
     if "acked_at_ms" in request and "requested_at_ms" not in request:
@@ -1110,7 +1192,11 @@ def migrate(txn: Any) -> None:
     if "invited_by" in managed:
         txn.execute("ALTER TABLE pangea_managed_account DROP COLUMN invited_by")
     invitation = _columns(txn, "pangea_seat_invitation")
-    for column in ("send_at_ms", "first_due_ms"):
+    for column, kind in (
+        ("send_at_ms", "BIGINT"),
+        ("first_due_ms", "BIGINT"),
+        ("joined_via", "TEXT"),
+    ):
         if column not in invitation:
             # Every process runs this on first use; on Postgres one that loses the
             # race waits on the table lock and must then find the column added.
@@ -1118,7 +1204,7 @@ def migrate(txn: Any) -> None:
             txn.execute(
                 "ALTER TABLE pangea_seat_invitation ADD COLUMN "
                 + ("IF NOT EXISTS " if postgres else "")
-                + f"{column} BIGINT"
+                + f"{column} {kind}"
             )
     txn.execute(
         "CREATE INDEX IF NOT EXISTS pangea_seat_invitation_due"
@@ -1127,9 +1213,35 @@ def migrate(txn: Any) -> None:
     )
 
 
-def _insert_managed(txn: Any, user_id: str, room_id: str, now_ms: int) -> None:
+def _insert_managed(
+    txn: Any, user_id: str, room_id: str, now_ms: int, *, actor: str, via: str
+) -> bool:
+    """Insert the managed record if missing and, only then, its
+    ``management_started`` event. Returns whether it was inserted."""
     txn.execute(
         "INSERT INTO pangea_managed_account (user_id, course_room_id, created_at_ms)"
         " VALUES (?, ?, ?) ON CONFLICT (user_id, course_room_id) DO NOTHING",
         (user_id, room_id, now_ms),
     )
+    if txn.rowcount != 1:
+        return False
+    record_managed_event(
+        txn,
+        room_id=room_id,
+        user_id=user_id,
+        actor=actor,
+        action=MANAGEMENT_STARTED,
+        via=via,
+        now_ms=now_ms,
+    )
+    return True
+
+
+def _page(
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Optional[Tuple[int, str]]]:
+    """A ledger page and the position after its last row when more follow."""
+    if len(rows) <= EVENTS_PAGE:
+        return rows, None
+    page = rows[:EVENTS_PAGE]
+    return page, (page[-1]["time_ms"], page[-1]["event_id"])
