@@ -91,10 +91,6 @@ _INSERT_CODE_SQL = """
     VALUES (?, ?, ?)
 """
 
-_DELETE_CODE_SQL = """
-    DELETE FROM pangea_course_claim_code WHERE admin_code_sha256 = ?
-"""
-
 _INSERT_SQL = """
     INSERT INTO pangea_course_claim
         (room_id, requested_email, admin_code_sha256, created_at_ms)
@@ -110,12 +106,6 @@ _ROOMS_FOR_CODE_SQL = """
 
 _CODE_IN_USE_SQL = """
     SELECT 1 FROM pangea_course_claim_code WHERE admin_code_sha256 = ?
-"""
-
-_REMINDER_SQL = """
-    SELECT requested_email, claimed_by
-    FROM pangea_course_claim
-    WHERE room_id = ?
 """
 
 _SELECT_SQL = """
@@ -184,11 +174,9 @@ STATEMENTS = (
     _CREATE_CODE_INDEX_SQL,
     _BACKFILL_CODES_SQL,
     _INSERT_CODE_SQL,
-    _DELETE_CODE_SQL,
     _INSERT_SQL,
     _ROOMS_FOR_CODE_SQL,
     _CODE_IN_USE_SQL,
-    _REMINDER_SQL,
     _SELECT_SQL,
     _CLAIM_SQL,
     _PROMOTED_SQL,
@@ -209,14 +197,6 @@ def admin_code_digest(admin_code: str) -> str:
 class CourseClaim:
     claimed_by: Optional[str]
     promoted_at_ms: Optional[int] = None
-
-
-@attr.s(frozen=True, auto_attribs=True)
-class ReminderTarget:
-    """What a reminder needs from a room's claim record."""
-
-    requested_email: Optional[str]
-    claimed: bool
 
 
 @attr.s(frozen=True, auto_attribs=True)
@@ -257,6 +237,10 @@ class CourseClaimStore:
         admin_code: str,
         now_ms: int,
     ) -> None:
+        """A room-backed course's claim record, as the retired v1 creation
+        endpoint wrote it. Nothing in the module writes one any more; the
+        records that exist keep their claims, and tests build them with this
+        and ``add_code``."""
         await self._ensure_table()
 
         digest = admin_code_digest(admin_code)
@@ -268,7 +252,9 @@ class CourseClaimStore:
         await self._db_pool.runInteraction("pangea_course_claim_record", _insert)
 
     async def add_code(self, room_id: str, admin_code: str, now_ms: int) -> None:
-        """Another claim code for a course: valid until the course is claimed."""
+        """Another claim code for a course, valid until the course is claimed,
+        as the retired v1 reminder added one. Room-backed courses that got
+        reminders hold several; tests build them with this."""
         await self._ensure_table()
         digest = admin_code_digest(admin_code)
 
@@ -276,31 +262,6 @@ class CourseClaimStore:
             txn.execute(_INSERT_CODE_SQL, (digest, room_id, now_ms))
 
         await self._db_pool.runInteraction("pangea_course_claim_add_code", _insert)
-
-    async def remove_code(self, admin_code: str) -> None:
-        """Withdraw a code that was never delivered."""
-        await self._ensure_table()
-        digest = admin_code_digest(admin_code)
-
-        def _delete(txn: Any) -> None:
-            txn.execute(_DELETE_CODE_SQL, (digest,))
-
-        await self._db_pool.runInteraction("pangea_course_claim_remove_code", _delete)
-
-    async def reminder_target(self, room_id: str) -> Optional[ReminderTarget]:
-        """None when the room has no claim record."""
-        await self._ensure_table()
-
-        def _select(txn: Any) -> Optional[ReminderTarget]:
-            txn.execute(_REMINDER_SQL, (room_id,))
-            row = txn.fetchone()
-            if row is None:
-                return None
-            return ReminderTarget(requested_email=row[0], claimed=row[1] is not None)
-
-        return await self._db_pool.runInteraction(
-            "pangea_course_claim_reminder_target", _select
-        )
 
     async def rooms_for_admin_code(self, admin_code: str) -> List[str]:
         """Rooms whose unspent claim code this is."""

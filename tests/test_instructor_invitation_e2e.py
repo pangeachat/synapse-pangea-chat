@@ -19,9 +19,9 @@ from urllib.parse import quote
 import requests
 
 from tests.base_e2e import BaseSynapseE2ETest
+from tests.requested_course import claimed_course
 from tests.smtp_sink import SmtpSink, body_text
 
-CREATE_COURSE_SPACE_PATH = "/_synapse/client/pangea/v1/create_course_space"
 KNOCK_WITH_CODE_PATH = "/_synapse/client/pangea/v1/knock_with_code"
 INSTRUCTOR_INVITATIONS_PATH = "/_synapse/client/pangea/v2/instructor_invitations"
 REMINDER_PATH = "/_synapse/client/pangea/v2/send_course_claim_reminder"
@@ -97,20 +97,18 @@ class TestInstructorInvitationE2E(BaseSynapseE2ETest):
         owner_id, owner = await self.new_user("owner")
         colleague_id, colleague = await self.new_user("colleague")
 
-        # An existing course with a joined instructor.
-        created = self._post(
-            CREATE_COURSE_SPACE_PATH,
+        # An existing course with a joined instructor: a requested course
+        # its owner has claimed.
+        room_id = claimed_course(
+            self.server_url,
+            self.sink,
+            APP_BASE_URL,
             bot,
-            {
-                "title": "Spanish 1",
-                "course_plan_id": "plan-instructor",
-                "target_language": "es",
-                "teacher_email": owner_email,
-            },
+            owner,
+            owner_email,
+            f"e2e-instructor-course-{self.tag}",
+            course_plan_id="plan-instructor",
         )
-        self.assertEqual(created.status_code, 200, created.text)
-        room_id = created.json()["room_id"]
-        await self._claim(owner, created.json()["admin_access_code"], room_id)
         levels = self._power_levels(owner, room_id)
         self.assertEqual(levels["users"].get(owner_id), 100)
 

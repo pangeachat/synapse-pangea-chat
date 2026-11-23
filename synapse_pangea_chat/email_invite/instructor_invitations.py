@@ -19,7 +19,7 @@ from synapse.http.server import respond_with_json
 from synapse.logging.context import run_in_background
 from twisted.web.resource import Resource
 
-from synapse_pangea_chat.email_invite.course_claim_reminder import (
+from synapse_pangea_chat.email_invite.request_fields import (
     _capture_exception,
     _text_field,
 )
