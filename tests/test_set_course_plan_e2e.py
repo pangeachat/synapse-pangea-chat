@@ -157,6 +157,93 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
 
     # ── tests ────────────────────────────────────────────────────────
 
+    async def test_following_a_trimmed_quest_keeps_credit_and_can_be_undone(
+        self,
+    ) -> None:
+        port = self._cms.server_address[1]
+        await self.homeserver(
+            module_config={"cms_base_url": f"http://127.0.0.1:{port}"}
+        )
+        (_, admin_token) = await self.new_user("op", admin=True)
+        (_, teacher_token) = await self.new_user("teacher")
+        old_list = {
+            "version": 1,
+            "revision": 1,
+            "missions": [
+                {"lo_id": "lo-a", "activity_ids": ["old-1", "act-a"], "note": "N"},
+                {"lo_id": "lo-b", "activity_ids": ["old-2"]},
+            ],
+        }
+        space = self._create_course_space(
+            teacher_token,
+            {"uuid": "quest-new", "l2": "es"},
+            name="Course",
+            topic="Text",
+            can_do_list=old_list,
+        )
+        old_event = self._admin_state(admin_token, space)[(_CAN_DO_LIST_EVENT, "")]
+        follow = {
+            "room_id": space,
+            "quest_id": "quest-new",
+            "expected_quest_id": "quest-new",
+            "title": "Course",
+            "description": "Text",
+            "replace_copy_event_id": old_event["event_id"],
+            "keep_progress": True,
+        }
+
+        resp = self._call(follow, admin_token)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        report = resp.json()["can_do_list"]
+        self.assertTrue(report["nothing_lost"], report)
+        self.assertEqual(resp.json()["changes"], [_CAN_DO_LIST_EVENT])
+        merged_event = self._admin_state(admin_token, space)[(_CAN_DO_LIST_EVENT, "")]
+        self.assertEqual(
+            merged_event["content"],
+            {
+                "version": 1,
+                "revision": 2,
+                "missions": [
+                    {
+                        "lo_id": "lo-a",
+                        "activity_ids": ["act-a"],
+                        "removed_activity_ids": ["old-1"],
+                        "note": "N",
+                    },
+                    {
+                        "lo_id": "lo-b",
+                        "activity_ids": ["act-b"],
+                        "removed_activity_ids": ["old-2"],
+                    },
+                ],
+            },
+        )
+
+        # The merged list carries removals, a field Content Studio writes: a
+        # second plain replacement of it needs the room named.
+        again = {**follow, "replace_copy_event_id": merged_event["event_id"]}
+        resp = self._call(again, admin_token)
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["code"], "teacher_list")
+
+        # Undo: the earlier list comes back as it was, one revision up.
+        undo = {
+            **follow,
+            "replace_copy_event_id": merged_event["event_id"],
+            "restore_copy_event_id": old_event["event_id"],
+        }
+        del undo["keep_progress"]
+        resp = self._call(undo, admin_token)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        restored = self._admin_state(admin_token, space)[(_CAN_DO_LIST_EVENT, "")]
+        self.assertEqual(restored["content"], {**old_list, "revision": 3})
+
+        # Undoing again names a list the course no longer holds: refused.
+        resp = self._call(undo, admin_token)
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["current_copy_event_id"], restored["event_id"])
+
     async def test_operator_switches_a_course_plan_as_the_teacher(self) -> None:
         port = self._cms.server_address[1]
         await self.homeserver(

@@ -18,6 +18,7 @@ from synapse_pangea_chat.email_invite.course_missions import (
     Problem,
 )
 from synapse_pangea_chat.set_course_plan import set_course_plan as module
+from synapse_pangea_chat.set_course_plan.merge_can_do_list import MergedCanDoList
 from synapse_pangea_chat.set_course_plan.set_course_plan import (
     MISMATCH,
     NOT_A_COURSE,
@@ -576,10 +577,8 @@ class TestEndpoint(_EndpointHarness):
         api.get_room_state.assert_not_awaited()
 
 
-class TestReplaceCanDoList(_EndpointHarness):
-    """Rebuilding a course's list the server built wrongly (pangeachat/.github
-    #832): only while the space still holds the exact list event named, so a
-    list a teacher has published since is never overwritten."""
+class _ReplacingHarness(_EndpointHarness):
+    """A course on its quest whose named list the builder made wrongly."""
 
     _BUILT_LIST = {
         "version": 1,
@@ -611,6 +610,12 @@ class TestReplaceCanDoList(_EndpointHarness):
             return_value={"lo-a": ["s1", "s2", "s3"], "lo-b": []}
         )
         return endpoint, api
+
+
+class TestReplaceCanDoList(_ReplacingHarness):
+    """Rebuilding a course's list the server built wrongly (pangeachat/.github
+    #832): only while the space still holds the exact list event named, so a
+    list a teacher has published since is never overwritten."""
 
     async def test_the_named_list_is_replaced_one_revision_up(self) -> None:
         endpoint, api = self._replacing()
@@ -732,6 +737,294 @@ class TestReplaceCanDoList(_EndpointHarness):
         self.assertEqual(answer["status"], 502)
 
 
+class TestReplaceKeepingProgress(_ReplacingHarness):
+    """A course whose quest trimmed its choices follows the quest, and keeps
+    every id its list credits, its due dates and its own Can-Dos."""
+
+    async def _post(self, endpoint, instructors=None, expected="old", **extra):  # type: ignore[override]
+        # The script sends the course's own name and topic back: no rename.
+        extra = {"title": "Old title", "description": "", **extra}
+        return await super()._post(endpoint, instructors, expected, **extra)
+
+    _TEACHER_LIST = {
+        "version": 1,
+        "revision": 5,
+        "time_zone": "America/Chicago",
+        "missions": [
+            {
+                "lo_id": "lo-a",
+                "activity_ids": ["s1", "x1"],
+                "due_at": "2026-12-01T00:00:00Z",
+            }
+        ],
+    }
+
+    async def test_old_ids_move_to_removed_one_revision_up(self) -> None:
+        endpoint, api = self._replacing()
+
+        status, body = await self._post(
+            endpoint,
+            expected="new",
+            replace_copy_event_id="$built",
+            keep_progress=True,
+        )
+
+        self.assertEqual(status, 200, body)
+        (sent,) = self._sent(api)
+        self.assertEqual(sent["type"], "pangea.course_missions")
+        self.assertEqual(
+            sent["content"],
+            {
+                "version": 1,
+                "revision": 2,
+                "missions": [
+                    {
+                        "lo_id": "lo-a",
+                        "activity_ids": ["s1", "s2", "s3"],
+                        "removed_activity_ids": ["x1", "x2"],
+                    },
+                    {
+                        "lo_id": "lo-b",
+                        "activity_ids": ["b1"],
+                        "removed_activity_ids": ["b2"],
+                    },
+                ],
+            },
+        )
+        merged = body["can_do_list"]
+        self.assertEqual(merged["lost"], [])
+        self.assertTrue(merged["nothing_lost"])
+        self.assertEqual(
+            [(e["lo_id"], e["moved_to_removed"]) for e in merged["entries"]],
+            [("lo-a", 2), ("lo-b", 1)],
+        )
+
+    async def test_a_teachers_list_is_refused_before_any_read(self) -> None:
+        endpoint, api = self._endpoint(
+            can_do_list=self._TEACHER_LIST,
+            built=self._BUILT_LIST,
+            on="new",
+            copy_event_id="$built",
+        )
+
+        extras: List[Dict[str, Any]] = [{}, {"keep_progress": True}]
+        for extra in extras:
+            with self.subTest(extra=extra):
+                status, body = await self._post(
+                    endpoint, expected="new", replace_copy_event_id="$built", **extra
+                )
+                self.assertEqual(status, 409, body)
+                self.assertEqual(body["code"], "teacher_list")
+        api.create_and_send_event_into_room.assert_not_awaited()
+        endpoint._course_missions.read.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_a_teachers_list_named_explicitly_keeps_its_edits(self) -> None:
+        endpoint, api = self._endpoint(
+            can_do_list=self._TEACHER_LIST,
+            built=self._BUILT_LIST,
+            on="new",
+            copy_event_id="$built",
+        )
+        endpoint._course_missions.quest_selections = AsyncMock(  # type: ignore[method-assign]
+            return_value={"lo-a": ["s1", "s2", "s3"], "lo-b": []}
+        )
+
+        status, body = await self._post(
+            endpoint,
+            expected="new",
+            replace_copy_event_id="$built",
+            keep_progress=True,
+            allow_teacher_list=True,
+        )
+
+        self.assertEqual(status, 200, body)
+        (sent,) = self._sent(api)
+        self.assertEqual(sent["content"]["time_zone"], "America/Chicago")
+        self.assertEqual(sent["content"]["revision"], 6)
+        self.assertEqual(
+            sent["content"]["missions"][0],
+            {
+                "lo_id": "lo-a",
+                "activity_ids": ["s1", "s2", "s3"],
+                "removed_activity_ids": ["x1"],
+                "due_at": "2026-12-01T00:00:00Z",
+            },
+        )
+        self.assertTrue(body["can_do_list"]["nothing_lost"])
+
+    async def test_a_merge_that_would_lose_anything_is_refused(self) -> None:
+        endpoint, api = self._replacing()
+
+        with patch.object(
+            module,
+            "merge_can_do_list",
+            return_value=MergedCanDoList(
+                {"version": 1, "revision": 1, "missions": []},
+                [],
+                ["lo-a: Can-Do dropped"],
+            ),
+        ), self.assertLogs(module.logger, level="ERROR"):
+            status, body = await self._post(
+                endpoint,
+                expected="new",
+                replace_copy_event_id="$built",
+                keep_progress=True,
+            )
+
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["code"], "would_lose")
+        self.assertEqual(body["lost"], ["lo-a: Can-Do dropped"])
+        api.create_and_send_event_into_room.assert_not_awaited()
+
+    async def test_a_dry_run_reports_each_entry_and_writes_nothing(self) -> None:
+        endpoint, api = self._replacing()
+
+        status, body = await self._post(
+            endpoint,
+            expected="new",
+            replace_copy_event_id="$built",
+            keep_progress=True,
+            dry_run=True,
+        )
+
+        self.assertEqual(status, 200, body)
+        api.create_and_send_event_into_room.assert_not_awaited()
+        self.assertEqual(len(body["can_do_list"]["entries"]), 2)
+        self.assertTrue(body["can_do_list"]["nothing_lost"])
+
+
+class TestRestoreCanDoList(_EndpointHarness):
+    """Undo: a course's earlier list written back as a new revision, only
+    while the course still holds the list the operator names."""
+
+    async def _post(self, endpoint, instructors=None, expected="old", **extra):  # type: ignore[override]
+        # The script sends the course's own name and topic back: no rename.
+        extra = {"title": "Old title", "description": "", **extra}
+        return await super()._post(endpoint, instructors, expected, **extra)
+
+    _EARLIER = {
+        "version": 1,
+        "revision": 1,
+        "missions": [{"lo_id": "lo-a", "activity_ids": ["x1", "x2"]}],
+    }
+    _NOW = {
+        "version": 1,
+        "revision": 2,
+        "missions": [
+            {
+                "lo_id": "lo-a",
+                "activity_ids": ["s1"],
+                "removed_activity_ids": ["x1", "x2"],
+            }
+        ],
+    }
+
+    def _restoring(
+        self, earlier: Any = None, copy_event_id: str = "$merged"
+    ) -> tuple[SetCoursePlan, MagicMock]:
+        endpoint, api = self._endpoint(
+            can_do_list=self._NOW, on="new", copy_event_id=copy_event_id
+        )
+        if earlier is None:
+            earlier = SimpleNamespace(
+                event_id="$earlier",
+                room_id="!space:test",
+                type="pangea.course_missions",
+                state_key="",
+                content=self._EARLIER,
+            )
+        api._hs.get_datastores.return_value.main.get_event = AsyncMock(
+            return_value=earlier
+        )
+        endpoint._store = api._hs.get_datastores.return_value.main
+        return endpoint, api
+
+    async def test_the_earlier_list_is_written_back_one_revision_up(self) -> None:
+        endpoint, api = self._restoring()
+
+        status, body = await self._post(
+            endpoint,
+            expected="new",
+            replace_copy_event_id="$merged",
+            restore_copy_event_id="$earlier",
+        )
+
+        self.assertEqual(status, 200, body)
+        (sent,) = self._sent(api)
+        self.assertEqual(sent["type"], "pangea.course_missions")
+        self.assertEqual(sent["content"], {**self._EARLIER, "revision": 3})
+        self.assertEqual(sent["sender"], "@teacher:test")
+        self.assertEqual(body["can_do_list"]["restored"], "$earlier")
+        endpoint._course_missions.read.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_a_list_published_since_is_not_undone(self) -> None:
+        endpoint, api = self._restoring(copy_event_id="$teacher-publish")
+
+        status, body = await self._post(
+            endpoint,
+            expected="new",
+            replace_copy_event_id="$merged",
+            restore_copy_event_id="$earlier",
+        )
+
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["current_copy_event_id"], "$teacher-publish")
+        api.create_and_send_event_into_room.assert_not_awaited()
+
+    async def test_only_a_can_do_list_of_the_same_room_is_restored(self) -> None:
+        base: Dict[str, Any] = {
+            "event_id": "$earlier",
+            "room_id": "!space:test",
+            "type": "pangea.course_missions",
+            "state_key": "",
+            "content": self._EARLIER,
+        }
+        bads: List[Optional[Dict[str, Any]]] = [
+            None,
+            {**base, "room_id": "!other:test"},
+            {**base, "type": "m.room.name"},
+            {**base, "state_key": "x"},
+            {**base, "content": {}},
+        ]
+        for bad in bads:
+            with self.subTest(bad=bad):
+                earlier = None if bad is None else SimpleNamespace(**bad)
+                endpoint, api = self._restoring()
+                api._hs.get_datastores.return_value.main.get_event = AsyncMock(
+                    return_value=earlier
+                )
+                status, body = await self._post(
+                    endpoint,
+                    expected="new",
+                    replace_copy_event_id="$merged",
+                    restore_copy_event_id="$earlier",
+                )
+                self.assertEqual(status, 422, body)
+                api.create_and_send_event_into_room.assert_not_awaited()
+
+    async def test_a_list_published_while_reading_the_earlier_one_wins(
+        self,
+    ) -> None:
+        endpoint, api = self._restoring()
+        first = await api.get_room_state()
+        published = dict(first)
+        published[("pangea.course_missions", "")] = SimpleNamespace(
+            content=self._NOW, event_id="$teacher-publish"
+        )
+        api.get_room_state = AsyncMock(side_effect=[first, published])
+
+        with self.assertLogs(module.logger, level="WARNING"):
+            status, body = await self._post(
+                endpoint,
+                expected="new",
+                replace_copy_event_id="$merged",
+                restore_copy_event_id="$earlier",
+            )
+
+        self.assertEqual(status, 409, body)
+        api.create_and_send_event_into_room.assert_not_awaited()
+
+
 class TestReplaceRequest(unittest.TestCase):
     _VALID = {
         "room_id": "!space:test",
@@ -755,6 +1048,31 @@ class TestReplaceRequest(unittest.TestCase):
             {**self._VALID, "quest_id": "other"},
             {**self._VALID, "replace_copy_event_id": ""},
             {**self._VALID, "replace_copy_event_id": 3},
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(parse_request(bad)[0])
+
+    def test_keeping_progress_allowing_and_restoring_go_with_a_replacement(
+        self,
+    ) -> None:
+        parsed, error = parse_request(
+            {**self._VALID, "keep_progress": True, "allow_teacher_list": True}
+        )
+        assert parsed is not None, error
+        self.assertTrue(parsed.keep_progress)
+        self.assertTrue(parsed.allow_teacher_list)
+        parsed, error = parse_request({**self._VALID, "restore_copy_event_id": "$e"})
+        assert parsed is not None, error
+        self.assertEqual(parsed.restore_copy_event_id, "$e")
+        plain = {k: v for k, v in self._VALID.items() if k != "replace_copy_event_id"}
+        for bad in (
+            {**plain, "keep_progress": True},
+            {**plain, "allow_teacher_list": True},
+            {**plain, "restore_copy_event_id": "$e"},
+            {**self._VALID, "keep_progress": "yes"},
+            {**self._VALID, "allow_teacher_list": 1},
+            {**self._VALID, "restore_copy_event_id": ""},
+            {**self._VALID, "restore_copy_event_id": "$e", "keep_progress": True},
         ):
             with self.subTest(bad=bad):
                 self.assertIsNone(parse_request(bad)[0])
