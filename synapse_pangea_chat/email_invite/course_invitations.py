@@ -372,20 +372,23 @@ class CourseInvitationStore:
 
     async def list_instructor(self, status):
         """Instructor invitations in ``status``, newest first, as ``status()``
-        reports them. Never the address."""
+        reports them, each with the ``request_key`` its caller prepared it under.
+        Never the address."""
         await self.ensure()
 
         def select(txn):
             txn.execute(
-                SELECT + "WHERE status = ? ORDER BY created_at_ms DESC, invitation_id",
+                "SELECT request_key, "
+                + SELECT[len("SELECT ") :]
+                + "WHERE status = ? ORDER BY created_at_ms DESC, invitation_id",
                 (status,),
             )
-            return [self.row(r) for r in txn.fetchall()]
+            return [(r[0], self.row(r[1:])) for r in txn.fetchall()]
 
         rows = await self.db.runInteraction("pangea_invitation_list", select)
         return [
-            await self.status(row["invitation_id"])
-            for row in rows
+            {**await self.status(row["invitation_id"]), "request_key": key}
+            for key, row in rows
             if invitation_kind(row) == "instructor"
         ]
 

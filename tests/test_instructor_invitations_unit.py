@@ -321,10 +321,38 @@ class TestList(_Base):
                 "completed_at_ms",
                 "deliveries",
                 "delivery_outcome",
+                "request_key",
             },
         )
         self.assertEqual(row["deliveries"], 0)
         self.assertEqual(row["room_id"], ROOM)
+        self.assertNotIn(EMAIL, str(body))
+
+    async def test_returns_only_a_request_key_in_the_runners_hashed_shape(self):
+        """The runner finds a person's invitations by comparing its own hashed key
+        (``instructor:`` and 32 lowercase hex characters). Any other key a caller
+        stored, which could be an address, comes back as null."""
+        hashed = "instructor:" + "0123456789abcdef" * 2
+        keys = {
+            hashed: hashed,
+            "instructor:" + "0123456789ABCDEF" * 2: None,
+            "instructor:" + "0123456789abcdef" * 2 + "0": None,
+            "instructor:" + "0123456789abcde": None,
+            EMAIL: None,
+            "invite-3": None,
+        }
+        ids = {}
+        for i, key in enumerate(keys):
+            self.api._hs.get_clock.return_value.time_msec.return_value = 100 + i
+            ids[(await self._prepare(request_key=key))["invitation_id"]] = key
+        status, body = await self._call("GET")
+        self.assertEqual(status, 200)
+        returned = {
+            row["invitation_id"]: row["request_key"]
+            for row in body["invitations"]
+            if row["invitation_id"] in ids
+        }
+        self.assertEqual(returned, {ident: keys[key] for ident, key in ids.items()})
         self.assertNotIn(EMAIL, str(body))
 
     async def test_filters_by_status_and_refuses_unknown_ones(self):
