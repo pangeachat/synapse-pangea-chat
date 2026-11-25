@@ -20,6 +20,7 @@ from typing import (
     Any,
     Collection,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     Literal,
@@ -53,6 +54,10 @@ OTHER_COURSES, DMS, CALLS = CONTROLS
 OUTSIDE, IN_COURSE = DEFAULTS
 # The refusing control, as "<group>.<control>", in the error body.
 CONTROL_FIELD = "org.pangea.control"
+# The refusal when a managed party's controls cannot be read.
+UNAVAILABLE = "unavailable"
+# How often each process re-reads who is managed, for other processes' writes.
+REFRESH_MS = 60_000
 CALL_PREFIXES = (
     "m.call.",
     "org.matrix.call.",
@@ -155,6 +160,10 @@ class Controls:
         self._joiner = joiner
         self._reachable = frozenset(reachable)
         self._courses = ChatCourses.from_homeserver(api._hs)
+        # Who a Protected course manages, read once per process, then kept up
+        # by the module's own writes and a periodic refresh. An action no
+        # managed user is party to never reads anything else of the module's.
+        self._managed: Optional[FrozenSet[str]] = None
 
     def register(self) -> None:
         self._api.register_spam_checker_callbacks(
@@ -164,6 +173,70 @@ class Controls:
             user_may_send_3pid_invite=self.user_may_send_3pid_invite,
             user_may_create_room=self.user_may_create_room,
         )
+        self._api.looping_background_call(
+            self._refresh_or_report, REFRESH_MS, run_on_all_instances=True
+        )
+
+    # --- who is managed ---
+
+    async def refresh(self) -> None:
+        rows = await self._store.managed_rows()
+        protected = set()
+        for room_id in {room_id for _, room_id in rows}:
+            state = await self._api.get_room_state(room_id, [(COURSE_MANAGEMENT, "")])
+            if is_protected(state):
+                protected.add(room_id)
+        self._managed = frozenset(u for u, room_id in rows if room_id in protected)
+
+    async def _refresh_or_report(self) -> None:
+        try:
+            await self.refresh()
+        except Exception as error:
+            # silent-ok: the last set read stays in use; reported
+            report_failure("protected controls refresh", error)
+
+    async def known(self) -> FrozenSet[str]:
+        """The set; a failed first read leaves it empty until the next
+        refresh, so requests do not each retry it."""
+        if self._managed is None:
+            try:
+                await self.refresh()
+            finally:
+                if self._managed is None:
+                    self._managed = frozenset()
+        return self._managed
+
+    async def _involves(self, users: Iterable[Optional[str]]) -> bool:
+        known = await self.known()
+        return any(user in known for user in users if user)
+
+    async def _in_small_room(self, user_id: str, room_id: str) -> bool:
+        """``user_id`` or, in a room of two joined members at most (a DM),
+        the other is managed. Synapse's cached joined members, read only once
+        someone is managed."""
+        known = await self.known()
+        if not known:
+            return False
+        if user_id in known:
+            return True
+        joined = await self._main.get_users_in_room(room_id)
+        return len(joined) <= 2 and any(user in known for user in joined)
+
+    async def _guard(self, what: str, involved: Any, decide: Any) -> Answer:
+        """``decide()`` only for an action a managed user is party to: before
+        that is known a failure allows, after it refuses."""
+        try:
+            if not await involved:
+                return NOT_SPAM
+        except Exception as error:
+            # silent-ok: no managed party established, so the action is not this module's to fail; reported
+            report_failure(f"protected controls {what}", error)
+            return NOT_SPAM
+        try:
+            return await decide()
+        except Exception as error:
+            report_failure(f"protected controls {what}", error)
+            return refused(UNAVAILABLE)
 
     # --- reads ---
 
@@ -265,6 +338,42 @@ class Controls:
     # --- spam-checker callbacks ---
 
     async def check_event_for_spam(self, event: Any) -> Answer:
+        involved = self._in_small_room(event.sender, event.room_id)
+        return await self._guard("send", involved, lambda: self._send(event))
+
+    async def user_may_join_room(
+        self, user_id: str, room_id: str, is_invited: bool
+    ) -> Answer:
+        involved = self._in_small_room(user_id, room_id)
+        return await self._guard("join", involved, lambda: self._join(user_id, room_id))
+
+    async def user_may_invite(self, inviter: str, invitee: str, room_id: str) -> Answer:
+        return await self._guard(
+            "invite",
+            self._involves([inviter, invitee]),
+            lambda: self._invite(inviter, invitee, room_id),
+        )
+
+    async def user_may_send_3pid_invite(
+        self, inviter: str, medium: str, address: str, room_id: str
+    ) -> Answer:
+        return await self._guard(
+            "email invite",
+            self._involves([inviter]),
+            lambda: self._invite_email(inviter, room_id),
+        )
+
+    async def user_may_create_room(self, user_id: str, config: dict) -> Answer:
+        invites = [u for u in config.get("invite") or [] if isinstance(u, str)]
+        return await self._guard(
+            "create",
+            self._involves([user_id] + invites[:1]),
+            lambda: self._create(user_id, config, invites),
+        )
+
+    # --- the decisions, for an action a managed user is party to ---
+
+    async def _send(self, event: Any) -> Answer:
         sender, room_id = event.sender, event.room_id
         other = await self._dm_other(room_id, sender)
         managed = await self.managing([sender] + ([other] if other else []))
@@ -288,9 +397,7 @@ class Controls:
             return refused(await self._both_ways(managed, (sender, other), names))
         return refused(call_in_room(courses, ()) if call and courses else None)
 
-    async def user_may_join_room(
-        self, user_id: str, room_id: str, is_invited: bool
-    ) -> Answer:
+    async def _join(self, user_id: str, room_id: str) -> Answer:
         other = await self._dm_other(room_id, user_id)
         managed = await self.managing([user_id] + ([other] if other else []))
         if not managed:
@@ -302,7 +409,7 @@ class Controls:
             return NOT_SPAM
         return refused(await self._both_ways(managed, (user_id, other), (DMS,)))
 
-    async def user_may_invite(self, inviter: str, invitee: str, room_id: str) -> Answer:
+    async def _invite(self, inviter: str, invitee: str, room_id: str) -> Answer:
         managed = await self.managing([inviter, invitee])
         if not managed:
             return NOT_SPAM
@@ -317,9 +424,7 @@ class Controls:
             return NOT_SPAM
         return refused(await self._both_ways(managed, (inviter, invitee), (DMS,)))
 
-    async def user_may_send_3pid_invite(
-        self, inviter: str, medium: str, address: str, room_id: str
-    ) -> Answer:
+    async def _invite_email(self, inviter: str, room_id: str) -> Answer:
         """An email invitation no account answers yet: someone outside."""
         managed = await self.managing([inviter])
         if not managed:
@@ -331,8 +436,8 @@ class Controls:
             return NOT_SPAM
         return refused(with_person(managed[inviter], DMS, ()))
 
-    async def user_may_create_room(self, user_id: str, config: dict) -> Answer:
-        invites = [u for u in config.get("invite") or [] if isinstance(u, str)]
+    async def _create(self, user_id: str, config: dict, invites: List[str]) -> Answer:
+        """A space is a course; a room made with one invitation is a DM."""
         emails = config.get("invite_3pid") or []
         managed = await self.managing([user_id] + invites[:1])
         if not managed:
@@ -353,7 +458,15 @@ class Controls:
 
     async def status(self, user_id: str) -> Dict[str, Any]:
         """The caller's managing courses and effective controls."""
-        courses = (await self.managing([user_id])).get(user_id, [])
+        courses: List[Managing] = []
+        try:
+            involved = await self._involves([user_id])
+        except Exception as error:
+            # silent-ok: no managed party established, so nothing to show; reported
+            report_failure("protected controls status", error)
+            involved = False
+        if involved:
+            courses = (await self.managing([user_id])).get(user_id, [])
         return {
             "courses": [
                 {"room_id": c.room_id, "management": c.controls, "admin": c.is_admin}
@@ -363,14 +476,28 @@ class Controls:
         }
 
     async def browse_refusal(self, user_id: str) -> Optional[str]:
+        answer = await self._guard(
+            "browse",
+            self._involves([user_id]),
+            lambda: self._browse(user_id),
+        )
+        return None if answer == NOT_SPAM else answer[1][CONTROL_FIELD]
+
+    async def _browse(self, user_id: str) -> Answer:
         courses = (await self.managing([user_id])).get(user_id, [])
-        return outside(courses, OTHER_COURSES)
+        return refused(outside(courses, OTHER_COURSES))
 
     # --- taking out and putting back ---
 
     def reconcile_later(self, user_ids: Iterable[str]) -> None:
+        """Called wherever management starts or changes, so it also adds the
+        students to the set (a student not managed after all only costs the
+        full check)."""
+        users = list(user_ids)
+        if self._managed is not None:
+            self._managed |= frozenset(users)
         self._api.run_as_background_process(
-            "pangea_protected_reconcile", self._reconcile_all, list(user_ids)
+            "pangea_protected_reconcile", self._reconcile_all, users
         )
 
     async def _reconcile_all(self, user_ids: List[str]) -> None:

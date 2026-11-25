@@ -508,6 +508,19 @@ class StudentInvitationStore:
 
         return await self.db.runInteraction("pangea_managed_account_room", select)
 
+    async def managed_rows(self) -> List[Tuple[str, str]]:
+        """Every (user, course) with a managed record."""
+        await self.ensure()
+
+        def select(txn: Any) -> List[Tuple[str, str]]:
+            txn.execute(
+                "SELECT user_id, course_room_id FROM pangea_managed_account"
+                " WHERE status = 'managed'"
+            )
+            return [(row[0], row[1]) for row in txn.fetchall()]
+
+        return await self.db.runInteraction("pangea_managed_account_all", select)
+
     async def managing_courses(self, user_ids: Sequence[str]) -> Dict[str, List[str]]:
         """The courses managing each of ``user_ids``; users not managed are
         left out."""

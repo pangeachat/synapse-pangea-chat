@@ -504,6 +504,17 @@ class TestExistingAccountConsent(_Base):
         await self.h.claims.claim_matching_for(STUDENT)
         self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "joined")
 
+    async def test_a_claim_in_a_course_that_is_not_protected_applies_no_controls(
+        self,
+    ):
+        self.h.admins.protected.clear()
+        claimed: List[str] = []
+        self.h.claims.claimed = claimed.append
+        (inv,) = await self.h.add(INVITED)
+        await self.h.claims.claim_matching_for(STUDENT)
+        self.assertEqual((await self.h.row(inv["invitation_id"]))["state"], "joined")
+        self.assertEqual(claimed, [])
+
     async def test_the_students_own_canvas_identity_is_not_asked(self):
         identity = ("https://canvas.example", "ctx", "u1")
         await self.store.import_canvas(
@@ -580,6 +591,16 @@ class TestCourseManagementRoute(_Base):
             enabled,
             cast(Controls, self.controls),
         )
+
+    async def test_a_course_that_is_not_protected_moves_no_one(self):
+        # Its seat claimants have managed records, but no Protected course.
+        await self.store.start_managed(
+            ROOM, STUDENT, actor="system", via="email", joined_at_ms=1, now_ms=1
+        )
+        status, _ = await self.handlers(True).set(
+            TEACHER, {"room_id": ROOM, "outside": {"other_courses": True}}
+        )
+        self.assertEqual((status, self.controls.reconciled), (200, []))
 
     async def test_dormant_nobody_can_make_a_course_protected(self):
         status, body = await self.handlers(False).set(

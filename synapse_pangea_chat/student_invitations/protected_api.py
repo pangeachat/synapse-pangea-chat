@@ -157,7 +157,10 @@ class ProtectedCourseHandlers:
             await self._store.record_managed(
                 room_id, CONTROL_CHANGED, caller, now_ms(), details=changes
             )
-        if any(wanted[g][OTHER_COURSES] != current[g][OTHER_COURSES] for g in DEFAULTS):
+        moved = any(
+            wanted[g][OTHER_COURSES] != current[g][OTHER_COURSES] for g in DEFAULTS
+        )
+        if wanted["protected"] and moved:
             # Take the students out of, or put them back into, course rooms.
             records = await self._store.managed_in_room(room_id)
             self._controls.reconcile_later(
