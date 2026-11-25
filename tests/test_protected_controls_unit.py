@@ -291,12 +291,11 @@ class UnmanagedCostTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_protected_courses_for_the_safety_page(self) -> None:
         # Only the Protected courses managing the sender, the one they are
-        # admin of included; anyone else costs no read of the module's.
+        # admin of included, read from the records even before this
+        # process's set knows the student.
         self.assertEqual(await self.controls.protected_courses("@s:hs"), (A, B))
-        self.store.calls.clear()
+        self.assertEqual(self.store.calls, ["managing_courses"])
         self.assertEqual(await self.controls.protected_courses("@seat:hs"), ())
-        self.assertEqual(self.store.calls, [])
         self.store.broken = True
-        self.controls._managed = None
         with self.assertRaises(RuntimeError):
             await self.controls.protected_courses("@s:hs")

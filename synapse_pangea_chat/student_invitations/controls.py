@@ -264,10 +264,10 @@ class Controls:
 
     async def protected_courses(self, user_id: str) -> Tuple[str, ...]:
         """The Protected courses managing ``user_id``, whose Safety pages
-        list what moderation flags from them in any chat. Raises when the
-        records cannot be read; the moderation recorder logs it."""
-        if user_id not in await self.known():
-            return ()
+        list what moderation flags from them in any chat. Read from the
+        records, not the per-process set: Tier 2 runs on the background
+        instance, which can learn of a new managed student up to a refresh
+        late. Raises when the records cannot be read; the recorder logs it."""
         courses = (await self.managing([user_id])).get(user_id, [])
         return tuple(course.room_id for course in courses)
 
