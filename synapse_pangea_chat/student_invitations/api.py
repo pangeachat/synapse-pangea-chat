@@ -53,6 +53,7 @@ from synapse_pangea_chat.notice_delivery.rate_limit import SlidingWindowRateLimi
 from synapse_pangea_chat.student_invitations.accounts import Accounts, email_key
 from synapse_pangea_chat.student_invitations.approvals import Approvals
 from synapse_pangea_chat.student_invitations.claim import (
+    NEEDS_CONSENT,
     ClaimJoinFailed,
     StudentClaims,
     now_ms,
@@ -647,11 +648,14 @@ class StudentInvitationHandlers:
 
     # --- student routes ---
 
-    async def open(self, caller: str, invitation_id: str) -> Result:
+    async def open(
+        self, caller: str, invitation_id: str, consent: bool = False
+    ) -> Result:
         """S1, a signed-in student opening their invitation link: claimed at
         once if the account has the invited address verified; otherwise a
-        request for the teacher, answered ``pending`` (or ``denied``).
-        Idempotent."""
+        request for the teacher, answered ``pending`` (or ``denied``). An
+        account older than an invitation to a Protected course is answered
+        ``needs_consent`` until it opens with ``consent`` (#799). Idempotent."""
         ident = _string(invitation_id)
         row = await self._store.get(ident) if ident is not None else None
         if row is None or not (
@@ -663,6 +667,8 @@ class StudentInvitationHandlers:
         answer = {"invitation_id": row["id"], "room_id": room_id}
         if row["state"] == STATE_JOINED:
             return 200, {"result": "claimed", **answer}
+        if not consent and await self._claims.needs_consent(row, caller):
+            return 200, {"result": NEEDS_CONSENT, **answer}
         if row["email_key"] not in await self._accounts.verified_email_keys(caller):
             # Another address records a request for the teacher: a request
             # never stands in for a claim.
@@ -679,7 +685,7 @@ class StudentInvitationHandlers:
                 return 200, {"result": "denied", **answer}
             logger.info("student invitation %s requested", row["id"])
             return 200, {"result": "pending", **answer}
-        outcome, _ = await self._claims.claim(row["id"], caller)
+        outcome, _ = await self._claims.claim(row["id"], caller, consent=consent)
         if outcome == CLAIMED:
             return 200, {"result": "claimed", **answer}
         if outcome == ALREADY_CLAIMED_IN_COURSE:
@@ -851,9 +857,10 @@ class InvitationOpenRoute(StudentInvitationRoute):
         caller = await self._caller(request)
         if not isinstance(caller, str):
             return caller
-        if read_json(request) != {}:
-            return _bad("The request body must be an empty JSON object")
-        return await self._handler(caller, ident)
+        body = read_json(request)
+        if body not in ({}, {"consent": True}):
+            return _bad('The request body must be {} or {"consent": true}')
+        return await self._handler(caller, ident, consent=bool(body))
 
 
 class StudentInvitationsRoot(Resource):

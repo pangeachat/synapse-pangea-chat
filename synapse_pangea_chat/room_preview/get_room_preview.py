@@ -15,6 +15,7 @@ from synapse_pangea_chat.room_preview.constants import (
     MEMBERSHIP_JOIN,
     PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE,
     PANGEA_ACTIVITY_ROLE_STATE_EVENT_TYPE,
+    PANGEA_COURSE_MANAGEMENT_STATE_EVENT_TYPE,
     PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
 )
 
@@ -396,6 +397,11 @@ async def get_room_preview(
         # room's embedded plan body never reaches the unauthenticated preview.
         elif event_type == PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE:
             event_data = _filter_activity_plan_content(event_data)
+        # Only the Protected flag: the controls are the course admin's.
+        elif event_type == PANGEA_COURSE_MANAGEMENT_STATE_EVENT_TYPE:
+            content = event_data.get("content")
+            protected = isinstance(content, dict) and content.get("protected") is True
+            event_data = {**event_data, "content": {"protected": protected}}
 
         fetched_room_data[room_id][event_type][key] = event_data
 

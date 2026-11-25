@@ -27,6 +27,13 @@ from synapse_pangea_chat.student_invitations.invite_email import InviteMailer
 from synapse_pangea_chat.student_invitations.membership_callback import (
     MembershipRelease,
 )
+from synapse_pangea_chat.student_invitations.protected import (
+    ManagedMembership,
+    ProtectedRules,
+)
+from synapse_pangea_chat.student_invitations.protected_api import (
+    ProtectedCourseHandlers,
+)
 from synapse_pangea_chat.student_invitations.rate_limits import limit_for
 from synapse_pangea_chat.student_invitations.rooms import (
     ModuleCourseAdmins,
@@ -75,6 +82,14 @@ def register_student_invitations(
         mailer=mailer,
     )
     h = handlers
+    p = ProtectedCourseHandlers(
+        api,
+        store,
+        admins,
+        accounts,
+        claims.unmanaged,
+        config.protected_courses_enabled,
+    )
     routes: Dict[str, Tuple[str, str, str, Callable[..., Any]]] = {
         # route name: (path, method, kind, handler)
         "student_invitations_add": (
@@ -161,6 +176,26 @@ def register_student_invitations(
             "public",
             h.hint,
         ),
+        # Protected courses (#799, protected_api.py).
+        "course_management": ("course_management/set", "POST", "teacher", p.set),
+        "course_management_members": (
+            "course_management/members",
+            "GET",
+            "teacher",
+            p.members,
+        ),
+        "course_management_answer": (
+            "course_management/answer",
+            "POST",
+            "student",
+            p.answer,
+        ),
+        "course_management_manage_members": (
+            "course_management/manage_members",
+            "POST",
+            "student",
+            p.manage,
+        ),
     }
     for name, (path, method, kind, handler) in routes.items():
         burst, seconds = limit_for(config.student_invitation_rate_limits, name)
@@ -201,5 +236,13 @@ def register_student_invitations(
     api.register_third_party_rules_callbacks(
         on_new_event=MembershipRelease(store, claims).on_new_event
     )
+    # Protected courses: the event and directory rules on every process; the
+    # membership records once, on the main process (the hook fires on every
+    # process that sees the event).
+    ProtectedRules(api)
+    if api.worker_name is None:
+        api.register_third_party_rules_callbacks(
+            on_new_event=ManagedMembership(api, store, claims.unmanaged).on_new_event
+        )
     ScheduledInvites(api, store, rooms, mailer).start()
     return StudentInvitations(store, claims, mailer, handlers)

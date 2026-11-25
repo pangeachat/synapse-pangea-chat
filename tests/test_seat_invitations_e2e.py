@@ -902,7 +902,14 @@ class TestSchemaMigrationOnPostgres(unittest.TestCase):
                 )
                 self.assertEqual(
                     columns["pangea_managed_account"],
-                    ["user_id", "course_room_id", "created_at_ms"],
+                    [
+                        "user_id",
+                        "course_room_id",
+                        "created_at_ms",
+                        "status",
+                        "joined_via",
+                        "joined_at_ms",
+                    ],
                 )
                 self.assertEqual(
                     columns["pangea_seat_invitation"],
@@ -913,6 +920,7 @@ class TestSchemaMigrationOnPostgres(unittest.TestCase):
                 cur.execute("SELECT * FROM pangea_invitation_ack")
                 self.assertEqual(cur.fetchall(), [("i", "u", 5, None)])
                 cur.execute("SELECT * FROM pangea_managed_account")
-                self.assertEqual(cur.fetchall(), [("u", "r", 7)])
+                # A record from before #799 reads as managed.
+                self.assertEqual(cur.fetchall(), [("u", "r", 7, "managed", None, None)])
             finally:
                 conn.close()

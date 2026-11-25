@@ -4,7 +4,9 @@ Paths: the student opening their invitation, the teacher's Grant and Approve
 all, the ``ClaimByEmail`` hook on every sign-in and verified-email addition,
 and the Canvas link step and later launches (a row imported with exactly the
 account's own linked Canvas identity). No student confirmation is needed:
-managed-account consent lives in Pangea's Terms (seats amendment 2026-10-10).
+managed-account consent lives in Pangea's Terms (seats amendment 2026-10-10),
+except for an account older than its invitation to a Protected course, which
+is asked first (``needs_consent``, #799).
 
 Order: (1) force-join the account to the course with the shared
 ``assign_room_membership`` join (a no-op when already joined; joining is
@@ -45,6 +47,10 @@ logger = logging.getLogger(
 )
 
 MEMBERSHIP_JOIN = "join"
+# The account existed before its invitation and the course is Protected: it
+# is asked before the claim manages it (managed-accounts doc), and the
+# invitation stays ``invited`` until it accepts.
+NEEDS_CONSENT = "needs_consent"
 
 
 class Joiner(Protocol):
@@ -54,6 +60,9 @@ class Joiner(Protocol):
 
 class CourseAdmins(Protocol):
     async def is_course_admin(self, room_id: str, user_id: str) -> bool:
+        ...
+
+    async def is_protected(self, room_id: str) -> bool:
         ...
 
 
@@ -86,16 +95,20 @@ class StudentClaims:
         grant: bool = False,
         canvas_identity: Optional[CanvasIdentity] = None,
         actor: str = SYSTEM,
+        consent: bool = False,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Claim ``invitation_id`` for ``user_id``. ``grant`` is the teacher
         ``actor``'s Grant of the account's request, recorded only if the claim
-        it allows happens.
+        it allows happens. ``consent`` is the student accepting management
+        (``needs_consent``); a request the teacher grants was made by the
+        student opening the invitation, which asked them then.
         ``canvas_identity`` is the (issuer, Canvas course, Canvas user id) of
         the account's own Canvas link, from a validated launch.
 
         Returns (outcome, row): ``claimed`` (also when already joined by this
         account), ``not_live``, ``not_eligible`` (no email match, no granted
-        request and no Canvas match) or ``already_claimed_in_course``. Raises
+        request and no Canvas match), ``needs_consent`` or
+        ``already_claimed_in_course``. Raises
         ``ClaimJoinFailed`` if the account cannot be joined to the course.
         """
         row = await self._store.get(invitation_id)
@@ -117,6 +130,11 @@ class StudentClaims:
         )
         if not (email_match or granted or canvas_match(row, canvas_identity)):
             return NOT_ELIGIBLE, row
+        # Asked because an educator may have typed someone else's address:
+        # the student's own Canvas identity is no typed address.
+        canvas = canvas_match(row, canvas_identity)
+        if not (consent or grant or canvas) and await self.needs_consent(row, user_id):
+            return NEEDS_CONSENT, row
 
         room_id = row["course_room_id"]
         joined = await self._joiner.force_join(room_id, user_id)
@@ -126,7 +144,7 @@ class StudentClaims:
         # A course admin claiming an invitation in their own course is
         # joined but never managed by it (owner amendment 2026-10-09), and a
         # Synapse server admin is never managed at all (owner, 2026-10-12).
-        is_admin = await self._unmanaged(room_id, user_id)
+        is_admin = await self.unmanaged(room_id, user_id)
         outcome, claimed = await self._store.claim_txn(
             invitation_id,
             user_id,
@@ -143,7 +161,17 @@ class StudentClaims:
             await self._recheck_managed(claimed)
         return outcome, claimed if claimed is not None else row
 
-    async def _unmanaged(self, room_id: str, user_id: str) -> bool:
+    async def needs_consent(self, row: Dict[str, Any], user_id: str) -> bool:
+        """An account older than its invitation, to a Protected course, is
+        asked before a claim manages it; a course admin never is managed."""
+        room_id = row["course_room_id"]
+        if not await self._admins.is_protected(room_id):
+            return False
+        if await self.unmanaged(room_id, user_id):
+            return False
+        return await self._accounts.created_at_ms(user_id) < row["created_at_ms"]
+
+    async def unmanaged(self, room_id: str, user_id: str) -> bool:
         """Never managed here: a course admin of this course, or a Synapse
         server admin."""
         if await self._admins.is_course_admin(room_id, user_id):
@@ -186,7 +214,7 @@ class StudentClaims:
         """
         claimant = row["claimant"]
         room_id = row["course_room_id"]
-        if await self._unmanaged(room_id, claimant):
+        if await self.unmanaged(room_id, claimant):
             return
         result = await self._store.set_managed(row["id"], claimant, now_ms())
         if result == "inserted":

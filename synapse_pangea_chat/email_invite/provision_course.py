@@ -30,6 +30,7 @@ from synapse_pangea_chat.email_invite.course_space_defaults import (
     PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
     build_course_plan_content,
 )
+from synapse_pangea_chat.joined_via import VIA_INSTRUCTOR, module_write, named
 from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 from synapse_pangea_chat.room_code.get_inviter_user import was_previously_admin
 from synapse_pangea_chat.room_code.instructor_access import (
@@ -315,9 +316,15 @@ class CourseProvisioner:
                         room_id=room,
                         new_membership="invite",
                     )
-                await self.api.update_room_membership(
-                    sender=user, target=user, room_id=room, new_membership="join"
-                )
+                # Named so a Protected course does not manage its instructor.
+                with module_write():
+                    await self.api.update_room_membership(
+                        sender=user,
+                        target=user,
+                        room_id=room,
+                        new_membership="join",
+                        content=named(VIA_INSTRUCTOR),
+                    )
                 state = await self.api.get_room_state(room)
             power = state.get(("m.room.power_levels", ""))
             # Event content arrives as Synapse's immutable mapping, which cannot be

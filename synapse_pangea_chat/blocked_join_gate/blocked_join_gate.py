@@ -22,6 +22,7 @@ from synapse_pangea_chat.blocked_join_gate.constants import (
 from synapse_pangea_chat.blocked_join_gate.is_blocked_by_room_admin import (
     is_blocked_by_room_admin,
 )
+from synapse_pangea_chat.joined_via import module_write, named
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.blocked_join_gate")
 
@@ -52,20 +53,24 @@ def server_initiated_entry() -> Iterator[None]:
         _server_initiated.reset(token)
 
 
-async def server_initiated_join(api: ModuleApi, room_id: str, user_id: str) -> None:
+async def server_initiated_join(
+    api: ModuleApi, room_id: str, user_id: str, via: Optional[str] = None
+) -> None:
     """Join ``user_id`` to ``room_id`` as themselves, on the server's behalf.
 
     An orchestrated join rather than a membership request, so it is exempt
     from the gate; the room's own join rules still apply (a restricted room
     admits the user through its allow list, an invited user through the
     invite). Shared by every flow that joins a user without their client.
+    ``via`` names the module path in the join event (``joined_via``).
     """
-    with server_initiated_entry():
+    with server_initiated_entry(), module_write():
         await api.update_room_membership(
             sender=user_id,
             target=user_id,
             room_id=room_id,
             new_membership=MEMBERSHIP_JOIN,
+            content=named(via) if via is not None else None,
         )
 
 

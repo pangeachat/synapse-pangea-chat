@@ -66,6 +66,13 @@ class Accounts:
         name = await self._main.get_profile_displayname(UserID.from_string(user_id))
         return name if isinstance(name, str) and name else None
 
+    async def created_at_ms(self, user_id: str) -> int:
+        """When the account was registered (Synapse keeps seconds)."""
+        user = await self._main.get_user_by_id(user_id)
+        if user is None:
+            raise LookupError("no such account")
+        return int(user.creation_ts) * 1000
+
     async def is_server_admin(self, user_id: str) -> bool:
         """Whether the account is a Synapse server admin (never managed)."""
         return bool(await self._main.is_server_admin(user_id))

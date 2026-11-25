@@ -94,6 +94,7 @@ from synapse_pangea_chat.room_code import KnockWithCode, RequestRoomCode
 from synapse_pangea_chat.room_preview import (
     PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE,
     PANGEA_ACTIVITY_ROLE_STATE_EVENT_TYPE,
+    PANGEA_COURSE_MANAGEMENT_STATE_EVENT_TYPE,
     PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
     RoomPreview,
     invalidate_room_cache,
@@ -922,6 +923,7 @@ class PangeaChat:
             PANGEA_COURSE_PLAN_STATE_EVENT_TYPE,
             PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE,
             PANGEA_ACTIVITY_ROLE_STATE_EVENT_TYPE,
+            PANGEA_COURSE_MANAGEMENT_STATE_EVENT_TYPE,
         ]
         all_event_types = list(set(room_preview_state_event_types + pangea_types))
 
@@ -1406,6 +1408,10 @@ class PangeaChat:
         if not isinstance(blocked_join_gate_enabled, bool):
             raise ValueError('Config "blocked_join_gate_enabled" must be a boolean')
 
+        protected_courses_enabled = config.get("protected_courses_enabled", False)
+        if not isinstance(protected_courses_enabled, bool):
+            raise ValueError('Config "protected_courses_enabled" must be a boolean')
+
         course_default_chats_enabled = config.get("course_default_chats_enabled", True)
         if not isinstance(course_default_chats_enabled, bool):
             raise ValueError('Config "course_default_chats_enabled" must be a boolean')
@@ -1813,6 +1819,7 @@ class PangeaChat:
             delayed_push_max_delay_ms=delayed_push_max_delay_ms,
             delayed_push_require_synapse_version=delayed_push_require_synapse_version,
             blocked_join_gate_enabled=blocked_join_gate_enabled,
+            protected_courses_enabled=protected_courses_enabled,
             course_default_chats_enabled=course_default_chats_enabled,
             course_session_admins_enabled=course_session_admins_enabled,
             moderation_tier1_enabled=moderation_tier1_enabled,
