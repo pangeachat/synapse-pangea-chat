@@ -72,9 +72,14 @@ request carries ``allow_teacher_list``.
 as it is, the course's list follows it without losing anything it credits or
 holds (merge_can_do_list.py): old ids no longer shown move to
 ``removed_activity_ids``; due dates, notes, the time zone and the course's own
-Can-Dos stay. The answer adds ``entries`` (per Can-Do counts), ``lost`` and
-``nothing_lost``; a merge that would lose anything is refused with 409 and
-code ``would_lose``, nothing written.
+Can-Dos stay. Hidden, private or otherwise unlisted old ids are credited the
+same way; a Can-Do whose quest entry lists nothing is left as it is
+(``quest_empty``). The answer adds ``entries`` (per Can-Do counts), ``lost``,
+``nothing_lost`` and ``totals`` (shown before as the course listing lists the
+old ids today, shown after, moved to removed, Can-Dos showing nothing before
+and after; the "before" counts are null when the CMS cannot say which ids it
+lists). A merge that would lose anything is refused with 409 and code
+``would_lose``, nothing written.
 
 ``restore_copy_event_id`` (with ``replace_copy_event_id``, the list the course
 holds now): that earlier ``pangea.course_missions`` event of the same room is
@@ -89,7 +94,17 @@ A dry run does everything but the writes, including the CMS read.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    AbstractSet,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 
 from synapse.api.constants import EventTypes
 from synapse.api.errors import (
@@ -129,6 +144,8 @@ from synapse_pangea_chat.set_course_plan.merge_can_do_list import (
     is_teacher_list,
     merge_can_do_list,
     plain,
+    shown_ids,
+    totals,
 )
 
 if TYPE_CHECKING:
@@ -575,6 +592,9 @@ class SetCoursePlan(Resource):
                 counts = await self._replacement_counts(
                     req.quest_id, req.replace_copy_event_id, current_list, built
                 )
+            listable: Optional[AbstractSet[str]] = None
+            if req.keep_progress and current_list is not None:
+                listable = await self._listable(req.quest_id, event, current_list)
             # The reads can take seconds; a teacher who changed course or
             # published a Can-Do list in the meantime wins.
             again = await self._api.get_room_state(
@@ -625,6 +645,7 @@ class SetCoursePlan(Resource):
                     entries=merged.entries,
                     lost=merged.lost,
                     nothing_lost=not merged.lost,
+                    totals=totals(plain(current_list), merged, listable),
                 )
             else:
                 new_list = can_do_list_content(result.content, current_list)
@@ -649,6 +670,32 @@ class SetCoursePlan(Resource):
                 else None
             ),
         )
+
+    async def _listable(
+        self, quest_id: str, plan_event: Any, current_list: Mapping[str, Any]
+    ) -> Optional[AbstractSet[str]]:
+        """Which ids the course's list shows today the course listing lists,
+        so the report counts what learners see now; None when the CMS cannot
+        say, which only blanks those counts."""
+        plan = _content(plan_event) or {}
+        l2 = plan.get("l2") if isinstance(plan.get("l2"), str) else None
+        try:
+            if l2 is None:
+                l2 = await self._course_missions.quest_language(quest_id)
+            if l2 is None:
+                return None
+            return await self._course_missions.listable_ids(
+                shown_ids(plain(current_list)), l2
+            )
+        # silent-ok: counts for the operator's report, not the write; logged, reported as null
+        except Exception as e:
+            logger.warning(
+                "set_course_plan: which ids quest %s's course lists today could "
+                "not be read for the report: %s",
+                quest_id,
+                type(e).__name__,
+            )
+            return None
 
     async def _restore(
         self,

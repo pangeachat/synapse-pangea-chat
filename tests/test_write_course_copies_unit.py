@@ -240,6 +240,17 @@ _MERGED = (
                     "shows_none": False,
                 },
                 {
+                    "lo_id": "lo-gone",
+                    "status": "quest_empty",
+                    "shown_before": 2,
+                    "shown_after": 2,
+                    "moved_to_removed": 0,
+                    "back_to_shown": 0,
+                    "removed_after": 0,
+                    "note": None,
+                    "shows_none": False,
+                },
+                {
                     "lo_id": "lo-own",
                     "status": "course_only",
                     "shown_before": 3,
@@ -253,6 +264,14 @@ _MERGED = (
             ],
             "lost": [],
             "nothing_lost": True,
+            "totals": {
+                "entries": 3,
+                "shown_before": 5,
+                "shown_after": 7,
+                "moved_to_removed": 26,
+                "empty_before": 1,
+                "empty_after": 1,
+            },
         }
     },
 )
@@ -319,11 +338,17 @@ class TestReplaceKeepingProgress(unittest.TestCase):
         self.assertNotIn("allow_teacher_list", posts[0])
         self.assertIn("!a:x: quest q1: 2 Can-Dos, nothing lost", out)
         self.assertIn(
-            "lo-a: follows_quest, shown 30 -> 4, 26 moved to removed, "
+            "as the app shows it: 5 activities shown -> 7, 26 moved to removed, "
+            "Can-Dos showing nothing 1 -> 1",
+            out,
+        )
+        self.assertIn(
+            "lo-a: follows_quest, list names 30 -> shows 4, 26 moved to removed, "
             "0 shown again, 26 removed in all, note course_kept",
             out,
         )
-        self.assertIn("lo-own: course_only, shown 3 -> 3", out)
+        self.assertIn("lo-gone: EMPTY, the quest lists nothing", out)
+        self.assertIn("lo-own: course_only, the quest no longer has this Can-Do", out)
 
     def test_a_loss_is_printed_and_never_called_nothing_lost(self) -> None:
         lossy = (

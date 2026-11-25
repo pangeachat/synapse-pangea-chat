@@ -8,6 +8,8 @@ from synapse_pangea_chat.set_course_plan.merge_can_do_list import (
     is_teacher_list,
     losses,
     merge_can_do_list,
+    shown_ids,
+    totals,
 )
 
 
@@ -69,12 +71,37 @@ class TestFollowTheQuest(unittest.TestCase):
         self.assertEqual(merged.content["missions"], [_m("lo-a", ["a", "b"])])
         self.assertEqual(merged.entries[0]["moved_to_removed"], 0)
 
-    def test_an_entry_left_with_nothing_to_show_is_flagged(self) -> None:
-        merged = merge_can_do_list(_list(_m("lo-a", ["x"])), _list(_m("lo-a", [])))
+    def test_hidden_or_unlistable_old_ids_are_credited_like_dropped_ones(
+        self,
+    ) -> None:
+        # The builder lists only what the course listing lists; an old id the
+        # review hid is never in it, so it moves to removed and keeps counting.
+        current = _list(_m("lo-a", ["hidden-1", "kept", "private-2"]))
+        merged = merge_can_do_list(current, _list(_m("lo-a", ["kept", "new"])))
         self.assertEqual(
-            merged.content["missions"], [_m("lo-a", [], removed_activity_ids=["x"])]
+            merged.content["missions"],
+            [
+                _m(
+                    "lo-a",
+                    ["kept", "new"],
+                    removed_activity_ids=["hidden-1", "private-2"],
+                )
+            ],
         )
-        self.assertTrue(merged.entries[0]["shows_none"])
+        self.assertEqual(merged.lost, [])
+
+    def test_an_entry_the_quest_has_nothing_listable_for_is_left_as_it_is(
+        self,
+    ) -> None:
+        # Never an empty entry written silently: the course keeps what it has
+        # and the dry run names the entry.
+        mission = _m("lo-a", ["x"], removed_activity_ids=["y"], note="Ours")
+        merged = merge_can_do_list(_list(mission), _list(_m("lo-a", [])))
+        self.assertEqual(merged.content["missions"], [mission])
+        (entry,) = merged.entries
+        self.assertEqual(entry["status"], "quest_empty")
+        self.assertEqual(entry["moved_to_removed"], 0)
+        self.assertEqual(merged.lost, [])
 
 
 class TestWhatTheCourseKeeps(unittest.TestCase):
@@ -164,6 +191,48 @@ class TestWhatTheCourseKeeps(unittest.TestCase):
         before = copy.deepcopy(current)
         merge_can_do_list(current, _list(_m("lo-a", ["d"])))
         self.assertEqual(current, before)
+
+
+class TestTotals(unittest.TestCase):
+    """Per room, as the app shows it: an id counts as shown only when the
+    listing lists it."""
+
+    def test_shown_before_counts_listable_ids_only(self) -> None:
+        current = _list(
+            _m("lo-a", ["h1", "h2", "k"]),
+            _m("lo-b", ["h3"]),
+            _m("lo-own", ["o1"]),
+        )
+        built = _list(_m("lo-a", ["k", "n"]), _m("lo-b", []))
+        merged = merge_can_do_list(current, built)
+
+        result = totals(current, merged, listable={"k", "o1"})
+
+        self.assertEqual(
+            result,
+            {
+                "entries": 3,
+                "shown_before": 2,  # k under lo-a, o1 under lo-own
+                "shown_after": 3,  # k, n (the quest's listed choices), o1
+                "moved_to_removed": 2,  # h1, h2; lo-b is left as it is
+                "empty_before": 1,  # lo-b showed nothing listable
+                "empty_after": 1,  # lo-b: its quest entry lists nothing
+            },
+        )
+
+    def test_unknown_listability_is_reported_as_unknown(self) -> None:
+        current = _list(_m("lo-a", ["a"]))
+        merged = merge_can_do_list(current, _list(_m("lo-a", ["a"])))
+        result = totals(current, merged, listable=None)
+        self.assertIsNone(result["shown_before"])
+        self.assertIsNone(result["empty_before"])
+        self.assertEqual(result["shown_after"], 1)
+
+    def test_shown_ids_are_every_shown_id_once(self) -> None:
+        self.assertEqual(
+            shown_ids(_list(_m("lo-a", ["a", "b"]), _m("lo-b", ["b", "c"]))),
+            ["a", "b", "c"],
+        )
 
 
 class TestNothingLost(unittest.TestCase):

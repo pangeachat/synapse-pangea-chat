@@ -17,6 +17,11 @@ content-studio.instructions.md "No progress is lost"). So, per Can-Do:
 - The entry's note is the course's when it has one (it may be the teacher's;
   a builder-written one cannot be told apart), else the quest's. ``due_at``
   and any other field of the entry are kept as they are.
+- An old id that is hidden, private to someone else or otherwise not listed
+  is never among the built entry's (the builder reads what the course listing
+  lists), so it moves to ``removed_activity_ids`` like a dropped one.
+- A Can-Do whose quest entry has nothing listable is left exactly as it is
+  (``quest_empty``), never written empty: the dry run names it.
 - A Can-Do the course has and the quest no longer has is kept unchanged, in
   place: learners may have progress on it. A Can-Do new to the quest is added
   after the course's, unless the course removed it (``removed_missions``).
@@ -31,7 +36,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
+from typing import AbstractSet, Any, Dict, List, Mapping, Optional
 
 # The only fields the server's builder writes. Content Studio adds the others
 # (the course's time zone at first publish, due dates, removals), so a list
@@ -43,6 +48,7 @@ FOLLOWS_QUEST = "follows_quest"
 COURSE_ONLY = "course_only"
 ADDED = "added"
 REMOVED_BY_COURSE = "removed_by_course"
+QUEST_EMPTY = "quest_empty"
 
 
 def plain(value: Any) -> Any:
@@ -149,14 +155,14 @@ def merge_can_do_list(
         if lo_id in seen:
             continue
         seen.add(lo_id)
-        if lo_id in quest:
+        if lo_id in quest and _ids(quest[lo_id].get("activity_ids")):
             merged, entry = _follow(mission, quest[lo_id])
         else:
             merged = dict(copy.deepcopy(mission))
             shown = len(_ids(mission.get("activity_ids")))
             entry = {
                 "lo_id": lo_id,
-                "status": COURSE_ONLY,
+                "status": QUEST_EMPTY if lo_id in quest else COURSE_ONLY,
                 "shown_before": shown,
                 "shown_after": shown,
                 "moved_to_removed": 0,
@@ -192,6 +198,55 @@ def merge_can_do_list(
     content = {k: copy.deepcopy(v) for k, v in current.items() if k != "missions"}
     content["missions"] = missions
     return MergedCanDoList(content, entries, losses(current, content))
+
+
+def shown_ids(content: Optional[Mapping[str, Any]]) -> List[str]:
+    """Every id the list shows, once, in order."""
+    return list(
+        dict.fromkeys(
+            a for m in _missions(content) for a in _ids(m.get("activity_ids"))
+        )
+    )
+
+
+def totals(
+    current: Mapping[str, Any],
+    merged: MergedCanDoList,
+    listable: Optional[AbstractSet[str]],
+) -> Dict[str, Any]:
+    """Per room, as the app shows it: an id counts as shown only when the
+    course listing lists it (``listable``, None when that read failed). An
+    entry that follows the quest shows the builder's ids, listed by
+    construction; one left as it was shows what it showed."""
+    status = {e["lo_id"]: e["status"] for e in merged.entries}
+
+    def listed(mission: Mapping[str, Any], follows: bool) -> Optional[int]:
+        ids = _ids(mission.get("activity_ids"))
+        if follows:
+            return len(ids)
+        if listable is None:
+            return None
+        return sum(1 for a in ids if a in listable)
+
+    before = [listed(m, False) for m in _missions(current)]
+    after = [
+        listed(m, status.get(m["lo_id"]) in (FOLLOWS_QUEST, ADDED))
+        for m in _missions(merged.content)
+    ]
+    known_before = None if any(n is None for n in before) else before
+    known_after = None if any(n is None for n in after) else after
+    return {
+        "entries": len(after),
+        "shown_before": sum(known_before) if known_before is not None else None,
+        "shown_after": sum(known_after) if known_after is not None else None,
+        "moved_to_removed": sum(e.get("moved_to_removed", 0) for e in merged.entries),
+        "empty_before": (
+            sum(1 for n in known_before if n == 0) if known_before is not None else None
+        ),
+        "empty_after": (
+            sum(1 for n in known_after if n == 0) if known_after is not None else None
+        ),
+    }
 
 
 def losses(current: Mapping[str, Any], after: Mapping[str, Any]) -> List[str]:

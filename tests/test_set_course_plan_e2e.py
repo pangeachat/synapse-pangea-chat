@@ -197,6 +197,19 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         self.assertEqual(resp.status_code, 200, resp.text)
         report = resp.json()["can_do_list"]
         self.assertTrue(report["nothing_lost"], report)
+        # The fake library lists act-a and act-b only: today lo-a shows act-a
+        # and lo-b shows nothing; after, each shows its quest's activity.
+        self.assertEqual(
+            report["totals"],
+            {
+                "entries": 2,
+                "shown_before": 1,
+                "shown_after": 2,
+                "moved_to_removed": 2,
+                "empty_before": 1,
+                "empty_after": 0,
+            },
+        )
         self.assertEqual(resp.json()["changes"], [_CAN_DO_LIST_EVENT])
         merged_event = self._admin_state(admin_token, space)[(_CAN_DO_LIST_EVENT, "")]
         self.assertEqual(

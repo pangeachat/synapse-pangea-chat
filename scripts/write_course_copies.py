@@ -34,8 +34,11 @@ with ``--allow-teacher-list <room id>``.
 costing anyone: each Can-Do shows the quest's chosen activities, every id the
 list named that is no longer shown moves to ``removed_activity_ids`` (hidden,
 still credited), and due dates, notes, the time zone and the course's own
-Can-Dos stay (set_course_plan/merge_can_do_list.py). The dry run prints, per
-room and Can-Do, shown before and after, moved to removed and what is lost;
+Can-Dos stay (set_course_plan/merge_can_do_list.py). Hidden or unlisted old
+ids are credited the same way; a Can-Do the quest lists nothing for is kept as
+it is and printed as EMPTY. The dry run prints, per room, activities shown
+before (as the app lists them today) and after, moved to removed, and Can-Dos
+showing nothing before and after; per Can-Do, what changes; and what is lost.
 "nothing lost" is the server's comparison of the two lists, and a list that
 would lose anything is refused, not written. A commit prints, and with
 ``--undo-out FILE`` appends, one undo line per room written:
@@ -203,6 +206,10 @@ def parse_undo(text: str) -> List[Tuple[str, str, str]]:
     return rooms
 
 
+def _count(value: Any) -> str:
+    return str(value) if isinstance(value, int) else "unknown"
+
+
 def _print_merge(room_id: str, quest_id: str, built: Dict[str, Any]) -> None:
     """Per room and Can-Do, what following the quest changes; "nothing lost"
     only when the server found nothing lost."""
@@ -211,26 +218,43 @@ def _print_merge(room_id: str, quest_id: str, built: Dict[str, Any]) -> None:
     print(f"  {room_id}: quest {quest_id}: {built.get('missions')} Can-Dos, {verdict}")
     for item in lost:
         print(f"      lost {item}")
+    totals = built.get("totals") or {}
+    print(
+        "    as the app shows it: "
+        f"{_count(totals.get('shown_before'))} activities shown -> "
+        f"{_count(totals.get('shown_after'))}, "
+        f"{_count(totals.get('moved_to_removed'))} moved to removed, "
+        f"Can-Dos showing nothing {_count(totals.get('empty_before'))} -> "
+        f"{_count(totals.get('empty_after'))}"
+    )
     for entry in built.get("entries") or []:
-        if entry.get("status") == "removed_by_course":
+        status = entry.get("status")
+        if status == "removed_by_course":
             print(
                 f"    {entry['lo_id']}: removed_by_course, left out as the course has it"
             )
             continue
-        line = (
-            f"    {entry['lo_id']}: {entry['status']}, "
-            f"shown {entry['shown_before']} -> {entry['shown_after']}"
-        )
-        if entry["status"] != "course_only":
-            line += (
-                f", {entry['moved_to_removed']} moved to removed, "
-                f"{entry['back_to_shown']} shown again, "
-                f"{entry['removed_after']} removed in all"
+        if status == "course_only":
+            print(
+                f"    {entry['lo_id']}: course_only, the quest no longer has this "
+                "Can-Do; kept as it is (learners may have progress on it)"
             )
-            if entry.get("note"):
-                line += f", note {entry['note']}"
-        if entry.get("shows_none"):
-            line += ", SHOWS NONE (the app hides this Can-Do; its credit stays)"
+            continue
+        if status == "quest_empty":
+            print(
+                f"    {entry['lo_id']}: EMPTY, the quest lists nothing for this "
+                "Can-Do; kept as it is, not written empty"
+            )
+            continue
+        line = (
+            f"    {entry['lo_id']}: {status}, "
+            f"list names {entry['shown_before']} -> shows {entry['shown_after']}, "
+            f"{entry['moved_to_removed']} moved to removed, "
+            f"{entry['back_to_shown']} shown again, "
+            f"{entry['removed_after']} removed in all"
+        )
+        if entry.get("note"):
+            line += f", note {entry['note']}"
         print(line)
 
 

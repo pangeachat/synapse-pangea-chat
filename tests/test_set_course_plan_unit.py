@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Set
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from synapse.api.errors import AuthError, InvalidClientTokenError
@@ -758,6 +758,90 @@ class TestReplaceKeepingProgress(_ReplacingHarness):
             }
         ],
     }
+
+    def _replacing(  # type: ignore[override]
+        self, copy_event_id: str = "$built"
+    ) -> tuple[SetCoursePlan, MagicMock]:
+        endpoint, api = super()._replacing(copy_event_id)
+        # The wrong list shows s1, x1, x2 and b1, b2; the listing lists s1, b1.
+        endpoint._course_missions.listable_ids = AsyncMock(  # type: ignore[method-assign]
+            return_value={"s1", "b1"}
+        )
+        return endpoint, api
+
+    async def test_the_totals_count_what_learners_see_before_and_after(
+        self,
+    ) -> None:
+        endpoint, _ = self._replacing()
+
+        status, body = await self._post(
+            endpoint, expected="new", replace_copy_event_id="$built", keep_progress=True
+        )
+
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            body["can_do_list"]["totals"],
+            {
+                "entries": 2,
+                "shown_before": 2,
+                "shown_after": 4,
+                "moved_to_removed": 3,
+                "empty_before": 0,
+                "empty_after": 0,
+            },
+        )
+        endpoint._course_missions.listable_ids.assert_awaited_once()  # type: ignore[attr-defined]
+        self.assertEqual(
+            endpoint._course_missions.listable_ids.await_args.args,  # type: ignore[attr-defined]
+            (["s1", "x1", "x2", "b1", "b2"], "es"),
+        )
+
+    async def test_an_unreadable_listing_blanks_the_counts_not_the_write(
+        self,
+    ) -> None:
+        endpoint, api = self._replacing()
+        endpoint._course_missions.listable_ids = AsyncMock(  # type: ignore[method-assign]
+            side_effect=CourseMissionsError(CMS_UNAVAILABLE)
+        )
+
+        with self.assertLogs(module.logger, level="WARNING"):
+            status, body = await self._post(
+                endpoint,
+                expected="new",
+                replace_copy_event_id="$built",
+                keep_progress=True,
+            )
+
+        self.assertEqual(status, 200, body)
+        self.assertIsNone(body["can_do_list"]["totals"]["shown_before"])
+        self.assertEqual(len(self._sent(api)), 1)
+
+    async def test_a_list_published_during_the_listing_read_is_refused(
+        self,
+    ) -> None:
+        endpoint, api = self._replacing()
+        first = await api.get_room_state()
+        published = dict(first)
+        published[("pangea.course_missions", "")] = SimpleNamespace(
+            content=self._WRONG_LIST, event_id="$teacher-publish"
+        )
+
+        async def listable(activity_ids: Sequence[str], l2: str) -> Set[str]:
+            api.get_room_state = AsyncMock(return_value=published)
+            return {"s1"}
+
+        endpoint._course_missions.listable_ids = listable  # type: ignore[method-assign]
+
+        with self.assertLogs(module.logger, level="WARNING"):
+            status, body = await self._post(
+                endpoint,
+                expected="new",
+                replace_copy_event_id="$built",
+                keep_progress=True,
+            )
+
+        self.assertEqual(status, 409, body)
+        api.create_and_send_event_into_room.assert_not_awaited()
 
     async def test_old_ids_move_to_removed_one_revision_up(self) -> None:
         endpoint, api = self._replacing()
