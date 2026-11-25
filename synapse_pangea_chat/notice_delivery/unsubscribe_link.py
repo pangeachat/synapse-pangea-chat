@@ -99,14 +99,19 @@ class MintUnsubscribeLink(Resource):
                     send_cors=True,
                 )
                 return
-            if not self._api.is_mine(user_id) or not await self._api.check_user_exists(
-                user_id
-            ):
+            # check_user_exists answers with the account's id as stored, which may differ in case from the one asked
+            # for; the token names the stored id, because that is the id the unsubscribe page reads and writes.
+            canonical = (
+                await self._api.check_user_exists(user_id)
+                if self._api.is_mine(user_id)
+                else None
+            )
+            if not canonical:
                 respond_with_json(
                     request, 404, {"error": "Unknown user"}, send_cors=True
                 )
                 return
-            code, payload = self.mint(user_id, category)
+            code, payload = self.mint(canonical, category)
             respond_with_json(request, code, payload, send_cors=True)
         # silent-ok: the caller's auth failure, answered 401 (logged at INFO)
         except (AuthError, InvalidClientTokenError, MissingClientTokenError) as e:

@@ -48,6 +48,29 @@ def _api(
     return api
 
 
+class TestCanonicalUser(unittest.IsolatedAsyncioTestCase):
+    async def test_the_token_names_the_account_as_the_server_spells_it(self):
+        # A differently cased localpart finds the same account; the token must name it as stored, or the refusal
+        # would land on an id no reader uses.
+        api = _api()
+        responses = []
+        with patch(
+            "synapse_pangea_chat.notice_delivery.unsubscribe_link.respond_with_json",
+            lambda request, code, payload, send_cors=False: responses.append(
+                (code, payload)
+            ),
+        ):
+            await MintUnsubscribeLink(api, _config())._async_render_POST(
+                _Request(
+                    {"user_id": "@Alice:my.domain.name", "category": "suggestions"}
+                )
+            )
+        code, payload = responses[0]
+        self.assertEqual(code, 200)
+        token = parse_qs(urlparse(payload["url"]).query)["t"][0]
+        self.assertEqual(tokens.verify_token(SECRET, token, now_ms=NOW_MS)["u"], USER)
+
+
 class _Request:
     def __init__(self, body):
         self.content = BytesIO(
