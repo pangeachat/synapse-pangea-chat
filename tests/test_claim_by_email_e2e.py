@@ -110,7 +110,9 @@ class TestClaimByEmailE2E(ClaimByEmailHelpers, BaseSynapseE2ETest):
             tokens["teacher"],
         ).json()
         self.assertEqual(power["users"][users["teacher"]], 100)
-        self.assertIsNotNone(self.sink.wait_for(requested, "Invite your students"))
+        self.assertIsNotNone(
+            self.sink.wait_for(requested, "Prepared course first is ready")
+        )
 
         # Signing in again makes no second course.
         _, tokens["teacher"] = await self.login_user(
