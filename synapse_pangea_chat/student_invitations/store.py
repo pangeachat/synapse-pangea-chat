@@ -16,8 +16,10 @@ The tables (SPEC §6):
 - ``pangea_managed_account``: written by every claim, and by a join of a
   Protected course (``protected.py``), with how and when the student joined.
   ``status`` is ``managed``, or ``asked``/``declined`` for a member who was
-  in a course before it became Protected. Nothing here deletes it: management
-  ends only when a course admin graduates the student (managed-accounts doc;
+  in a course before it became Protected; ``graduated`` (by whom, when, and
+  when the student saw it) or ``moved`` by the team once management ended
+  (``graduation.py``). Nothing here deletes it: management ends only when a
+  course admin graduates the student, or the team moves it (managed-accounts doc;
   pangeachat/.github#799), so leaving, removal, a ban, a withdrawn invitation
   and promotion to admin keep it.
 - ``pangea_seat_invitation_event``: the append-only activity ledger
@@ -57,10 +59,12 @@ from synapse_pangea_chat.student_invitations.events import (
     record_event,
 )
 from synapse_pangea_chat.student_invitations.managed_events import (
+    GRADUATION,
     MANAGED_EVENT_SCHEMA,
     MANAGEMENT_ASKED,
     MANAGEMENT_DECLINED,
     MANAGEMENT_STARTED,
+    MOVED,
     VIA_CANVAS,
     VIA_EMAIL,
     VIA_GRANT,
@@ -125,6 +129,9 @@ SCHEMA = (
         status TEXT NOT NULL DEFAULT 'managed',
         joined_via TEXT,
         joined_at_ms BIGINT,
+        graduated_by TEXT,
+        graduated_at_ms BIGINT,
+        graduation_seen_ms BIGINT,
         PRIMARY KEY (user_id, course_room_id))""",
     )
     + EVENT_SCHEMA
@@ -177,6 +184,8 @@ RECORD_COLUMNS = (
     "status",
     "joined_via",
     "joined_at_ms",
+    "graduated_by",
+    "graduated_at_ms",
 )
 _RECORD_SELECT = "SELECT " + ", ".join(RECORD_COLUMNS) + " FROM pangea_managed_account "
 MANAGED = "managed"
@@ -702,6 +711,118 @@ class StudentInvitationStore:
             return len(rows) * len(details)
 
         return await self.db.runInteraction("pangea_managed_account_record", write)
+
+    # --- graduation and support moves ---
+
+    async def graduate(
+        self,
+        room_id: str,
+        user_ids: Optional[Sequence[str]],
+        actor: str,
+        now_ms: int,
+    ) -> List[str]:
+        """End this course's management of ``user_ids`` (every managed student
+        when None), each with a ``graduated`` row. Returns those graduated."""
+        await self.ensure()
+
+        def write(txn: Any) -> List[str]:
+            txn.execute(
+                "SELECT user_id, joined_via FROM pangea_managed_account"
+                " WHERE course_room_id = ? AND status = 'managed' ORDER BY user_id",
+                (room_id,),
+            )
+            rows = [r for r in txn.fetchall() if user_ids is None or r[0] in user_ids]
+            for user_id, via in rows:
+                txn.execute(
+                    "UPDATE pangea_managed_account SET status = 'graduated',"
+                    " graduated_by = ?, graduated_at_ms = ?, graduation_seen_ms = NULL"
+                    " WHERE user_id = ? AND course_room_id = ?",
+                    (actor, now_ms, user_id, room_id),
+                )
+                record_managed_event(
+                    txn,
+                    room_id=room_id,
+                    user_id=user_id,
+                    actor=actor,
+                    action=GRADUATION,
+                    via=via or VIA_UNKNOWN,
+                    now_ms=now_ms,
+                )
+            return [r[0] for r in rows]
+
+        return await self.db.runInteraction("pangea_managed_account_graduate", write)
+
+    async def unseen_graduations(self, user_id: str) -> List[Dict[str, Any]]:
+        await self.ensure()
+
+        def select(txn: Any) -> List[Dict[str, Any]]:
+            txn.execute(
+                "SELECT course_room_id, graduated_by, graduated_at_ms"
+                " FROM pangea_managed_account WHERE user_id = ?"
+                " AND status = 'graduated' AND graduation_seen_ms IS NULL"
+                " ORDER BY graduated_at_ms",
+                (user_id,),
+            )
+            keys = ("room_id", "graduated_by", "graduated_at_ms")
+            return [dict(zip(keys, raw)) for raw in txn.fetchall()]
+
+        return await self.db.runInteraction("pangea_managed_account_unseen", select)
+
+    async def see_graduation(self, user_id: str, room_id: str, now_ms: int) -> bool:
+        """Mark the student's graduation from this course seen; False when
+        there is none."""
+        await self.ensure()
+
+        def write(txn: Any) -> bool:
+            txn.execute(
+                "UPDATE pangea_managed_account"
+                " SET graduation_seen_ms = COALESCE(graduation_seen_ms, ?)"
+                " WHERE user_id = ? AND course_room_id = ? AND status = 'graduated'",
+                (now_ms, user_id, room_id),
+            )
+            return bool(txn.rowcount == 1)
+
+        return await self.db.runInteraction("pangea_managed_account_seen", write)
+
+    async def move_managed(
+        self, user_id: str, from_room: str, to_room: str, actor: str, now_ms: int
+    ) -> bool:
+        """The team moves a managed student's management to another course,
+        with a ``moved`` row in each. False when ``from_room`` does not manage
+        them."""
+        await self.ensure()
+
+        def write(txn: Any) -> bool:
+            txn.execute(
+                "UPDATE pangea_managed_account SET status = 'moved'"
+                " WHERE user_id = ? AND course_room_id = ? AND status = 'managed'",
+                (user_id, from_room),
+            )
+            if txn.rowcount != 1:
+                return False
+            via = (_record(txn, user_id, from_room) or {}).get("joined_via")
+            txn.execute(
+                "INSERT INTO pangea_managed_account (user_id, course_room_id,"
+                " created_at_ms, status) VALUES (?, ?, ?, 'managed')"
+                " ON CONFLICT (user_id, course_room_id) DO UPDATE"
+                " SET status = 'managed', created_at_ms = ?",
+                (user_id, to_room, now_ms, now_ms),
+            )
+            for room_id, detail in ((from_room, "to"), (to_room, "from")):
+                other = to_room if room_id == from_room else from_room
+                record_managed_event(
+                    txn,
+                    room_id=room_id,
+                    user_id=user_id,
+                    actor=actor,
+                    action=MOVED,
+                    via=via or VIA_UNKNOWN,
+                    now_ms=now_ms,
+                    detail=f"{detail} {other}",
+                )
+            return True
+
+        return await self.db.runInteraction("pangea_managed_account_move", write)
 
     # --- writes ---
 
@@ -1407,7 +1528,8 @@ def migrate(txn: Any) -> None:
       (nullable, so no row is rewritten) and the partial index of rows
       waiting to send, which is empty at this point;
     - managed records gain ``status`` (existing ones are ``managed``),
-      ``joined_via`` and ``joined_at_ms``, and their ledger ``detail``.
+      ``joined_via``, ``joined_at_ms`` and the graduation columns, and their
+      ledger ``detail``.
     """
     request = _columns(txn, "pangea_invitation_ack")
     if "acked_at_ms" in request and "requested_at_ms" not in request:
@@ -1431,6 +1553,9 @@ def migrate(txn: Any) -> None:
         ("pangea_managed_account", "status", "TEXT NOT NULL DEFAULT 'managed'"),
         ("pangea_managed_account", "joined_via", "TEXT"),
         ("pangea_managed_account", "joined_at_ms", "BIGINT"),
+        ("pangea_managed_account", "graduated_by", "TEXT"),
+        ("pangea_managed_account", "graduated_at_ms", "BIGINT"),
+        ("pangea_managed_account", "graduation_seen_ms", "BIGINT"),
         ("pangea_managed_account_event", "detail", "TEXT"),
     ):
         existing = _columns(txn, table)

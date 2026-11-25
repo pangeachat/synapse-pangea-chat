@@ -432,3 +432,108 @@ class TestProtectedCoursesE2E(BaseSynapseE2ETest):
         bystander, _ = await self.new_user("bystander")
         plain = self.dm(o_token, bystander)
         self.assertEqual(plain.status_code, 200, plain.text)
+
+    def invite_and_join(self, room: str, token: str, user: str, u_token: str) -> None:
+        self.ok(
+            "POST",
+            f"/_matrix/client/v3/rooms/{quote(room)}/invite",
+            token,
+            body={"user_id": user},
+        )
+        self.ok("POST", f"/_matrix/client/v3/join/{quote(room)}", u_token, body={})
+
+    async def test_graduation_end_to_end(self) -> None:
+        await self.homeserver(module_config=CONFIG, synapse_config_overrides=LIMITS)
+        teacher, t_token = await self.new_user("teacher")
+        other_teacher, ot_token = await self.new_user("otherteacher")
+        student, s_token = await self.new_user("student")
+        mate, m_token = await self.new_user("mate")
+        outsider, o_token = await self.new_user("outsider")
+        server = teacher.split(":", 1)[1]
+        course = self.course(t_token)
+        chat = self.chat(course, t_token, server)
+        self.set_controls(course, t_token, protected=True)
+        for user, token in ((student, s_token), (mate, m_token)):
+            self.invite_and_join(course, t_token, user, token)
+        self.ok("POST", f"/_matrix/client/v3/join/{quote(chat)}", s_token, body={})
+        # The student shares analytics with the teacher.
+        analytics = self.ok(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            s_token,
+            body={"creation_content": {"type": "p.analytics"}, "invite": [teacher]},
+        )["room_id"]
+        self.ok("POST", f"/_matrix/client/v3/join/{quote(analytics)}", t_token, body={})
+        self.refused(self.dm(s_token, outsider), "outside.dms")
+
+        # Only a course admin graduates.
+        one = {"room_id": course, "user_ids": [student]}
+        resp = self.call("POST", P + "course_management/graduate", m_token, body=one)
+        self.assertEqual(resp.status_code, 403, resp.text)
+        self.assertEqual(
+            self.ok("POST", P + "course_management/graduate", t_token, body=one),
+            {"graduated": [student]},
+        )
+        self.membership_becomes(analytics, teacher, s_token, "leave")
+        # The controls are lifted.
+        self.assertEqual(self.dm(s_token, outsider).status_code, 200)
+        elsewhere = self.course(o_token)
+        self.assertEqual(self.join(elsewhere, s_token).status_code, 200)
+        # The course's history is readable, not changeable; still a member.
+        for _ in range(100):
+            if self.send(chat, s_token).status_code == 403:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the graduate can still send in the course chat")
+        self.ok(
+            "GET",
+            f"/_matrix/client/v3/rooms/{quote(chat)}/messages",
+            s_token,
+            params={"dir": "b"},
+        )
+        self.membership_becomes(course, student, t_token, "join")
+        self.assertIn((student, "graduated", "invite"), self.ledger(course, t_token))
+        # The app shows the graduation once.
+        mine = self.ok("GET", P + "course_management/mine", s_token)
+        self.assertEqual(mine["courses"], [])
+        self.assertEqual([g["room_id"] for g in mine["graduations"]], [course])
+        self.assertEqual([g["graduated_by"] for g in mine["graduations"]], [teacher])
+        self.ok(
+            "POST",
+            P + "course_management/graduation_seen",
+            s_token,
+            body={"room_id": course},
+        )
+        mine = self.ok("GET", P + "course_management/mine", s_token)
+        self.assertEqual(mine["graduations"], [])
+
+        # Joining the course again manages again.
+        self.ok(
+            "POST", f"/_matrix/client/v3/rooms/{quote(course)}/leave", s_token, body={}
+        )
+        self.invite_and_join(course, t_token, student, s_token)
+        self.assertEqual(self.records(course, t_token)[student][0], "managed")
+        self.refused(self.dm(s_token, outsider), "outside.dms")
+
+        # Managed by a second Protected course too; graduating the whole class
+        # of the first leaves the second's controls in place.
+        second = self.course(ot_token)
+        self.set_controls(
+            second, ot_token, protected=True, outside={"other_courses": True}
+        )
+        self.set_controls(course, t_token, outside={"other_courses": True})
+        self.invite_and_join(second, ot_token, student, s_token)
+        self.assertEqual(
+            self.ok(
+                "POST",
+                P + "course_management/graduate",
+                t_token,
+                body={"room_id": course, "all": True},
+            ),
+            {"graduated": sorted([mate, student])},
+        )
+        self.assertEqual(self.dm(m_token, outsider).status_code, 200)
+        mine = self.ok("GET", P + "course_management/mine", s_token)
+        self.assertEqual([c["room_id"] for c in mine["courses"]], [second])
+        self.refused(self.dm(s_token, outsider), "outside.dms")

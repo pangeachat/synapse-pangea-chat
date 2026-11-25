@@ -1,8 +1,11 @@
 """The Protected course routes (pangeachat/.github#799), served as the
 student invitation routes are: ``course_management/set`` and ``/members``
 (course admin), ``/answer`` (the member asked), ``/mine`` (the caller's
-managing courses and effective controls) and ``/manage_members`` (the
-Pangea team, a Synapse server admin, manages without asking)."""
+managing courses, effective controls and unseen graduations),
+``/graduate`` (course admin, one or all), ``/graduation_seen`` (the student)
+and the Pangea team's, a Synapse server admin's: ``/manage_members``
+(manages without asking) and ``/move`` (moves a student's management to
+another Protected course)."""
 
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ from synapse_pangea_chat.student_invitations.api import (
 )
 from synapse_pangea_chat.student_invitations.claim import CourseAdmins, now_ms
 from synapse_pangea_chat.student_invitations.controls import OTHER_COURSES, Controls
+from synapse_pangea_chat.student_invitations.graduation import Graduation
 from synapse_pangea_chat.student_invitations.managed_events import CONTROL_CHANGED
 from synapse_pangea_chat.student_invitations.protected import (
     CONTROLS,
@@ -39,6 +43,8 @@ from synapse_pangea_chat.student_invitations.store import (
 )
 
 MAX_MEMBERS = 500
+TEAM_ONLY = (403, {"error": "Forbidden", "errcode": "M_FORBIDDEN"})
+NOT_PROTECTED = ("ORG.PANGEA.NOT_PROTECTED", "The course is not Protected")
 NOT_VERIFIED = (
     403,
     {
@@ -84,6 +90,7 @@ class ProtectedCourseHandlers:
         unmanaged: Callable[[str, str], Awaitable[bool]],
         enabled: bool,
         controls: Controls,
+        graduation: Graduation,
     ) -> None:
         self._api = api
         self._main = api._hs.get_datastores().main
@@ -93,6 +100,7 @@ class ProtectedCourseHandlers:
         self._unmanaged = unmanaged
         self._enabled = enabled
         self._controls = controls
+        self._graduation = graduation
 
     def _room(self, args: Any) -> Optional[str]:
         return valid_room_id(args.get("room_id")) if isinstance(args, dict) else None
@@ -203,7 +211,63 @@ class ProtectedCourseHandlers:
         return 200, {"status": status}
 
     async def mine(self, caller: str) -> Result:
-        return 200, await self._controls.status(caller)
+        status = await self._controls.status(caller)
+        status["graduations"] = await self._store.unseen_graduations(caller)
+        return 200, status
+
+    async def graduate(self, caller: str, body: Any) -> Result:
+        """Graduate ``user_ids``, or with ``all`` every managed student."""
+        room_id = self._room(body)
+        user_ids = body.get("user_ids") if isinstance(body, dict) else None
+        everyone = isinstance(body, dict) and body.get("all") is True
+        listed = (
+            isinstance(user_ids, list)
+            and 1 <= len(user_ids) <= MAX_MEMBERS
+            and all(isinstance(u, str) for u in user_ids)
+        )
+        if room_id is None or everyone == listed:
+            return _bad("'room_id' and either 'user_ids' or 'all' are required")
+        if not await self._admins.is_course_admin(room_id, caller):
+            return 403, FORBIDDEN
+        if not await self._admins.is_protected(room_id):
+            return _conflict(*NOT_PROTECTED)
+        graduated = await self._store.graduate(
+            room_id, None if everyone else user_ids, caller, now_ms()
+        )
+        self._graduation.later(room_id, graduated)
+        return 200, {"graduated": graduated}
+
+    async def graduation_seen(self, caller: str, body: Any) -> Result:
+        room_id = self._room(body)
+        if room_id is None:
+            return _bad("'room_id' must be a valid Matrix room ID")
+        if not await self._store.see_graduation(caller, room_id, now_ms()):
+            return 404, NOT_FOUND
+        return 200, {}
+
+    async def move(self, caller: str, body: Any) -> Result:
+        """The team moves a student's management to another Protected course
+        in one step; their memberships are moved with the existing tools."""
+        args = body if isinstance(body, dict) else {}
+        source = valid_room_id(args.get("from_room_id"))
+        target = valid_room_id(args.get("to_room_id"))
+        user_id = args.get("user_id")
+        if source is None or target is None or source == target:
+            return _bad("'from_room_id' and a different 'to_room_id' are required")
+        if not isinstance(user_id, str):
+            return _bad("'user_id' is required")
+        if not await self._accounts.is_server_admin(caller):
+            return TEAM_ONLY
+        # A record only manages in a Protected course (``Controls.managing``).
+        for room_id in (source, target):
+            if not await self._admins.is_protected(room_id):
+                return _conflict(*NOT_PROTECTED)
+        if not await self._store.move_managed(
+            user_id, source, target, caller, now_ms()
+        ):
+            return 404, NOT_FOUND
+        self._controls.reconcile_later([user_id])
+        return 200, {"moved": True}
 
     async def manage(self, caller: str, body: Any) -> Result:
         room_id = self._room(body)
@@ -216,7 +280,7 @@ class ProtectedCourseHandlers:
         ):
             return _bad(f"'room_id' and 1 to {MAX_MEMBERS} 'user_ids' are required")
         if not await self._accounts.is_server_admin(caller):
-            return 403, {"error": "Forbidden", "errcode": "M_FORBIDDEN"}
+            return TEAM_ONLY
         managed = []
         for user_id in user_ids:
             status = await self._store.answer(

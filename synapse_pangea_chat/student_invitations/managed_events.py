@@ -4,7 +4,7 @@
 (``events.py``): a row each time an account becomes managed by a course
 (written in the same transaction as the managed record, and only when that
 record actually starts), is asked or declines, has a control changed, or
-leaves, is removed or banned, or rejoins. A row holds the course, the student,
+leaves, is removed or banned, rejoins, graduates or is moved. A row holds the course, the student,
 who acted (a Matrix id, or ``system``), the action, how the student joined
 the course, the time, and a ``detail`` for a control change. It is read only by a course admin of that course,
 on its own route, and never appears in Seats Activity.
@@ -30,6 +30,10 @@ LEFT = "left"
 REMOVED = "removed"
 BANNED = "banned"
 REJOINED = "rejoined"
+# Management ends: a course admin graduates the student, or the team moves
+# it to another course (``detail`` names it, ``to <room>`` or ``from <room>``).
+GRADUATION = "graduated"
+MOVED = "moved"
 MANAGED_ACTIONS = frozenset(
     {
         MANAGEMENT_STARTED,
@@ -40,6 +44,8 @@ MANAGED_ACTIONS = frozenset(
         REMOVED,
         BANNED,
         REJOINED,
+        GRADUATION,
+        MOVED,
     }
 )
 
