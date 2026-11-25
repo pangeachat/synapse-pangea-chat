@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from synapse.api.errors import Codes, SynapseError
 from synapse.http import server
@@ -35,6 +35,10 @@ EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 ERRCODE_NO_ELIGIBLE_INSTRUCTOR = "ORG.PANGEA.NO_ELIGIBLE_INSTRUCTOR"
 
 LIST_STATUSES = ("prepared", "provisioning", "completed", "revoked")
+#: The engagement runner's request key: ``instructor:`` and the first 32 hex
+#: characters of the SHA-256 of the room and the address (engagement
+#: ``instructors.request_key_for``). Only a key of this shape is listed.
+RUNNER_REQUEST_KEY = re.compile(r"instructor:[0-9a-f]{32}")
 LIST_FIELDS = (
     "invitation_id",
     "room_id",
@@ -153,10 +157,26 @@ class InstructorInvitationAPI(Resource):
                 {
                     **{field: row[field] for field in LIST_FIELDS},
                     "deliveries": len(row["deliveries"]),
+                    "request_key": _listed_request_key(row["request_key"]),
                 }
                 for row in rows
             ]
         }
+
+
+def _listed_request_key(key: Any) -> Optional[str]:
+    """The request key as this admin-only list may show it, or None.
+
+    The runner finds a person's invitations by computing its key for a room and
+    an address and comparing (erasure finds their drafts without the service
+    returning an address). Whoever holds the list can therefore confirm a guessed
+    address for a listed room: inherent in that comparison, and acceptable only
+    because the list is for server admins. Do not widen who can read it without
+    revisiting this. Any key not in the runner's hashed shape is withheld, since
+    another caller may have prepared under an address or a name."""
+    if isinstance(key, str) and RUNNER_REQUEST_KEY.fullmatch(key):
+        return key
+    return None
 
 
 def _content_text(event, key: str) -> str:
