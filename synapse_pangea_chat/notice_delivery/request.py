@@ -124,6 +124,25 @@ class Destination:
             )
         return cls(kind, **ids)
 
+    @classmethod
+    def stored(cls, data: Dict[str, Any]) -> Destination:
+        """A destination ``parse`` already accepted and ``as_request`` stored, read back
+        without checking it again: an external host removed from the allowlist since
+        must retire the link at the click (``destination_url``), not stop the mail."""
+        return cls(
+            str(data["kind"]),
+            **{
+                key: data.get(key)
+                for key in (
+                    "activity_id",
+                    "session_room_id",
+                    "course_room_id",
+                    "url",
+                    "path",
+                )
+            },
+        )
+
     def for_course(self, room_id: str) -> Destination:
         """This destination with the claimed course filled in where it names a course
         and was stored without one (``parse`` with ``claimed_course``)."""

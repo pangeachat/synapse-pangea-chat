@@ -181,11 +181,9 @@ class CourseClaimNotifier:
             if target is None:
                 links.append("")
                 continue
-            destination = Destination.parse(
-                target,
-                self._config.notice_external_link_hosts,
-                claimed_course=True,
-            ).for_course(room_id)
+            # Read back as stored, not parsed again: a host removed from the allowlist
+            # retires the link at the click and must not keep the share kit from going.
+            destination = Destination.stored(target).for_course(room_id)
             links.append(
                 signed_click_url(
                     self._api,

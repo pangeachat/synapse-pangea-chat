@@ -122,6 +122,22 @@ class TestNotify(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_token(sent["cta_url"])["d"], {"k": "dashboard", "c": ROOM})
         self.assertEqual(sent["cta2_url"], "")
 
+    async def test_a_host_removed_from_the_allowlist_does_not_stop_the_mail(
+        self,
+    ) -> None:
+        """The policy retires a removed host's links at the click
+        (notice-delivery, "The click record"); the share kit still goes."""
+        from synapse_pangea_chat.config import PangeaChatConfig
+
+        notifier, store, mailer = _notifier(NoticeReservation(REQUESTED, 1))
+        notifier._config = PangeaChatConfig(notice_external_link_hosts=[])
+
+        await notifier.notify(ROOM, CLAIMER)
+
+        sent = mailer.send_course_claimed.await_args.kwargs
+        self.assertEqual(_token(sent["cta2_url"])["d"]["k"], "external")
+        store.mark_notice_sent.assert_awaited_once()
+
     async def test_a_link_that_cannot_be_signed_leaves_the_notice_owed(self) -> None:
         notifier, store, mailer = _notifier(NoticeReservation(REQUESTED, 1))
         api: Any = notifier._api
