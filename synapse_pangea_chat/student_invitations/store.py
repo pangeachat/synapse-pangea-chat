@@ -800,13 +800,16 @@ class StudentInvitationStore:
             )
             if txn.rowcount != 1:
                 return False
-            via = (_record(txn, user_id, from_room) or {}).get("joined_via")
+            source = _record(txn, user_id, from_room) or {}
+            via, joined_at = source.get("joined_via"), source.get("joined_at_ms")
             txn.execute(
                 "INSERT INTO pangea_managed_account (user_id, course_room_id,"
-                " created_at_ms, status) VALUES (?, ?, ?, 'managed')"
+                " created_at_ms, status, joined_via, joined_at_ms)"
+                " VALUES (?, ?, ?, 'managed', ?, ?)"
                 " ON CONFLICT (user_id, course_room_id) DO UPDATE"
-                " SET status = 'managed', created_at_ms = ?",
-                (user_id, to_room, now_ms, now_ms),
+                " SET status = 'managed', created_at_ms = ?, joined_via = ?,"
+                " joined_at_ms = ?",
+                (user_id, to_room, now_ms, via, joined_at, now_ms, via, joined_at),
             )
             for room_id, detail in ((from_room, "to"), (to_room, "from")):
                 other = to_room if room_id == from_room else from_room

@@ -9,10 +9,11 @@ real homeserver are in ``test_protected_courses_e2e.py``.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple, cast
 
 from synapse_pangea_chat.student_invitations.controls import Controls
-from synapse_pangea_chat.student_invitations.graduation import read_only
+from synapse_pangea_chat.student_invitations.graduation import Graduation, read_only
 from synapse_pangea_chat.student_invitations.protected import ManagedMembership
 from synapse_pangea_chat.student_invitations.protected_api import (
     ProtectedCourseHandlers,
@@ -112,6 +113,10 @@ class TestGraduationRecord(_Managed):
         )
         moved = [r for r in await self.ledger() if r[2] == "moved"]
         self.assertEqual(moved, [(STUDENT, OPS, "moved", "code", f"to {OTHER_ROOM}")])
+        # The destination keeps how and when the student joined.
+        record = await self.store.managed_record(STUDENT, OTHER_ROOM)
+        assert record is not None
+        self.assertEqual((record["joined_via"], record["joined_at_ms"]), ("code", 1))
         rows = await self.h.managed_events(OTHER_ROOM)
         self.assertEqual(
             [(e["user_id"], e["action"], e["detail"]) for e in rows],
@@ -130,6 +135,75 @@ class TestReadOnly(_Base):
         content = {"events_default": 10, "users": {STUDENT: 5}}
         self.assertIsNone(read_only(content, STUDENT, 5))
         self.assertEqual(read_only({}, STUDENT, 0), {"users": {STUDENT: -1}})
+
+    def test_state_events_count_too(self):
+        content = {"events_default": 20, "state_default": 10}
+        self.assertEqual(read_only(content, STUDENT, 10)["users"], {STUDENT: 9})
+        # Without ``state_default`` the room's default of 50 applies.
+        self.assertEqual(
+            read_only({"events_default": 20}, STUDENT, 20)["users"], {STUDENT: 19}
+        )
+
+
+class _Courses:
+    async def for_room(self, room_id: str, position: int) -> Tuple[str, ...]:
+        return (ROOM,)
+
+    def position_now(self) -> int:
+        return 0
+
+
+class _Reconcile:
+    async def reconcile(self, user_id: str) -> None:
+        return None
+
+
+class TestGraduationEffects(_Base):
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.sent: List[Dict[str, Any]] = []
+        api = SimpleNamespace(
+            _hs=self.h.api._hs,
+            get_room_state=self.room_state,
+            create_and_send_event_into_room=self.send,
+            is_mine=lambda _: True,
+        )
+
+        async def rooms(_: str) -> set:
+            return {ROOM}
+
+        self.h.main.get_rooms_for_user = rooms
+        self.h.main.get_room_max_stream_ordering = lambda: 0
+        self.graduation = Graduation(api, self.h.admins, _Reconcile())
+        self.graduation._courses = cast(Any, _Courses())
+
+    async def room_state(self, room_id: str, event_filter: Any) -> Dict:
+        levels = {"users": {TEACHER: 100, STUDENT: 100}, "events_default": 0}
+        return {
+            ("m.room.create", ""): SimpleNamespace(
+                type="m.room.create",
+                sender=TEACHER,
+                content={"creator": TEACHER},
+                room_version=SimpleNamespace(msc4289_creator_power_enabled=False),
+            ),
+            ("m.room.power_levels", ""): SimpleNamespace(
+                type="m.room.power_levels", content=levels
+            ),
+            ("m.room.member", TEACHER): SimpleNamespace(
+                type="m.room.member", state_key=TEACHER, content={"membership": "join"}
+            ),
+        }
+
+    async def send(self, event: Dict[str, Any]) -> None:
+        self.sent.append(event)
+
+    async def test_a_current_course_admin_keeps_their_power_level(self):
+        self.h.admins.admins.add((ROOM, STUDENT))
+        await self.graduation.apply(ROOM, [STUDENT])
+        self.assertEqual(self.sent, [])
+        self.h.admins.admins.discard((ROOM, STUDENT))
+        await self.graduation.apply(ROOM, [STUDENT])
+        self.assertEqual([e["content"]["users"][STUDENT] for e in self.sent], [-1])
 
 
 class FakeGraduation:

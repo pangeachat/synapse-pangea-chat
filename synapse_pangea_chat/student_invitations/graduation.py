@@ -22,18 +22,24 @@ from synapse_pangea_chat.public_courses.select_state_sender import (
 from synapse_pangea_chat.student_invitations.report import report_failure
 
 
-def _int(value: Any) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+def _int(value: Any, default: int = 0) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return default
 
 
 def read_only(
     content: Mapping[str, Any], user_id: str, current: int
 ) -> Optional[Dict[str, Any]]:
-    """The power levels with ``user_id`` one below every event level the room
-    names; None when they already are."""
+    """The power levels with ``user_id`` one below sending any event, state
+    or not; None when they already are."""
     events = content.get("events")
-    levels = list(events.values()) if isinstance(events, Mapping) else []
-    below = min(_int(v) for v in [content.get("events_default"), *levels]) - 1
+    levels = [_int(v) for v in events.values()] if isinstance(events, Mapping) else []
+    defaults = [
+        _int(content.get("events_default")),
+        _int(content.get("state_default"), 50),
+    ]
+    below = min(defaults + levels) - 1
     if current <= below:
         return None
     users = content.get("users")
@@ -61,6 +67,8 @@ class Graduation:
             try:
                 await self._controls.reconcile(user_id)
                 rooms = sorted(await self._main.get_rooms_for_user(user_id))
+                # A student promoted to the course's admin keeps their level.
+                admin = await self._admins.is_course_admin(room_id, user_id)
             except Exception as error:
                 report_failure("graduation", error, room=room_id, user=user_id)
                 continue
@@ -70,7 +78,8 @@ class Graduation:
                         room, self._courses.position_now()
                     )
                     if room_id in owners:
-                        await self._read_only(room, user_id)
+                        if not admin:
+                            await self._read_only(room, user_id)
                     else:
                         await self._unshare(room, user_id, room_id)
                 except Exception as error:
