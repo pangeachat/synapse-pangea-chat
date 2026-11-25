@@ -75,6 +75,7 @@ from synapse_pangea_chat.moderation import severity as moderation_severity
 from synapse_pangea_chat.notice_delivery import (
     MISSED_MESSAGE_UNSUBSCRIBE_PATH,
     DeliverNotice,
+    MintUnsubscribeLink,
     MissedMessageUnsubscribe,
     NoticeClick,
     NoticeUnsubscribe,
@@ -772,6 +773,12 @@ class PangeaChat:
         self._api.register_web_resource(
             path="/_synapse/client/pangea/v1/unsubscribe",
             resource=self.notice_unsubscribe_resource,
+        )
+        # The same signed link, minted for account mail the engagement runner sends itself.
+        self.notice_unsubscribe_link_resource = MintUnsubscribeLink(api, config)
+        self._api.register_web_resource(
+            path="/_synapse/client/pangea/v1/notice_unsubscribe_link",
+            resource=self.notice_unsubscribe_link_resource,
         )
         if config.notice_missed_message_unsubscribe_enabled:
             # Module resources are attached after Synapse's own, so this

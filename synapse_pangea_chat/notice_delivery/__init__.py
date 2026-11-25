@@ -16,6 +16,7 @@ from synapse_pangea_chat.notice_delivery.open_session_notice import OpenSessionN
 from synapse_pangea_chat.notice_delivery.prepare import PrepareNotice
 from synapse_pangea_chat.notice_delivery.refusal_store import RefusalStore
 from synapse_pangea_chat.notice_delivery.unsubscribe import NoticeUnsubscribe
+from synapse_pangea_chat.notice_delivery.unsubscribe_link import MintUnsubscribeLink
 
 __all__ = [
     "DeliverNotice",
@@ -23,6 +24,7 @@ __all__ = [
     "MissedMessageUnsubscribe",
     "NoticeClick",
     "NoticeUnsubscribe",
+    "MintUnsubscribeLink",
     "OpenSessionNotice",
     "PrepareNotice",
     "RefusalStore",
