@@ -72,7 +72,8 @@ class ProtectedRules:
     """Refuses, before an event is stored: a ``pangea.course_management``
     event or a ``joined_via`` name the module did not write; the redaction of
     a ``pangea.course_management`` event; and in a Protected course, a join
-    rule other than ``knock`` and listing it in the room directory."""
+    rule other than ``knock``, redacting its join rule and listing it in the
+    room directory."""
 
     def __init__(self, api: Any) -> None:
         self._main = api._hs.get_datastores().main
@@ -97,7 +98,11 @@ class ProtectedRules:
             target = await self._main.get_event(
                 event.redacts, allow_none=True, allow_rejected=True
             )
-            if target is not None and target.type == COURSE_MANAGEMENT:
+            # The state events that make a course Protected and keep it knock.
+            kept = {COURSE_MANAGEMENT}
+            if is_protected(state):
+                kept.add("m.room.join_rules")
+            if target is not None and target.type in kept:
                 return _REFUSE
         return _ALLOW
 

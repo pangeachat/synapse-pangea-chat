@@ -155,14 +155,23 @@ class TestRules(_Base):
             e = event("m.room.join_rules", {"join_rule": rule, "access_code": "c"})
             self.assertEqual(await self.allowed(e, protected), ok, (rule, protected))
 
-    async def test_the_event_cannot_be_redacted(self):
+    async def test_the_event_and_a_protected_courses_join_rule_cannot_be_redacted(
+        self,
+    ):
         self.events.add(
             event(COURSE_MANAGEMENT, PROTECTED, event_id="$flag"),
+            event("m.room.join_rules", {"join_rule": "knock"}, event_id="$rules"),
             event("m.room.name", {"name": "x"}, event_id="$name"),
         )
-        for target, ok in (("$flag", False), ("$name", True), ("$gone", True)):
+        for target, protected, ok in (
+            ("$flag", True, False),
+            ("$rules", True, False),
+            ("$rules", False, True),
+            ("$name", True, True),
+            ("$gone", True, True),
+        ):
             e = event("m.room.redaction", {}, state_key=None, redacts=target)
-            self.assertEqual(await self.allowed(e), ok, target)
+            self.assertEqual(await self.allowed(e, protected), ok, target)
 
     async def test_a_protected_course_is_never_listed(self):
         check = self.rules.check_visibility_can_be_modified

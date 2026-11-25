@@ -89,11 +89,11 @@ class ProtectedCourseHandlers:
         self._unmanaged = unmanaged
         self._enabled = enabled
 
-    async def _room(self, args: Any) -> Optional[str]:
+    def _room(self, args: Any) -> Optional[str]:
         return valid_room_id(args.get("room_id")) if isinstance(args, dict) else None
 
     async def set(self, caller: str, body: Any) -> Result:
-        room_id = await self._room(body)
+        room_id = self._room(body)
         if room_id is None:
             return _bad("'room_id' must be a valid Matrix room ID")
         if not await self._admins.is_course_admin(room_id, caller):
@@ -168,7 +168,7 @@ class ProtectedCourseHandlers:
         return await self._store.ask(room_id, members, caller, at)
 
     async def members(self, caller: str, query: Any) -> Result:
-        room_id = await self._room(query)
+        room_id = self._room(query)
         if room_id is None:
             return _bad("'room_id' must be a valid Matrix room ID")
         if not await self._admins.is_course_admin(room_id, caller):
@@ -176,7 +176,7 @@ class ProtectedCourseHandlers:
         return 200, {"members": await self._store.managed_in_room(room_id)}
 
     async def answer(self, caller: str, body: Any) -> Result:
-        room_id = await self._room(body)
+        room_id = self._room(body)
         if room_id is None or not isinstance(body.get("accept"), bool):
             return _bad("'room_id' and 'accept' are required")
         status = await self._store.answer(
@@ -187,7 +187,7 @@ class ProtectedCourseHandlers:
         return 200, {"status": status}
 
     async def manage(self, caller: str, body: Any) -> Result:
-        room_id = await self._room(body)
+        room_id = self._room(body)
         user_ids = body.get("user_ids") if isinstance(body, dict) else None
         if (
             room_id is None
