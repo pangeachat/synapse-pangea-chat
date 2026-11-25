@@ -9,6 +9,7 @@ import requests
 
 from synapse_pangea_chat.email_invite.course_claim_emails import class_qr_png
 from tests.base_e2e import BaseSynapseE2ETest
+from tests.mock_cms_server import MockCmsServer
 from tests.smtp_sink import SmtpSink, body_text
 
 PREFIX = "/_synapse/client/pangea/"
@@ -17,12 +18,29 @@ APP = "https://app.example.test"
 
 class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
     sink: SmtpSink
+    cms: MockCmsServer
+    cms_url: str
 
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
         cls.sink = SmtpSink().start()
         cls.addClassCleanup(cls.sink.stop)
+        # A claimed course takes a new quest only once that quest's Can-Do
+        # list is built (set-course-plan), so the quests it moves to must be
+        # readable. Each has no Can-Dos, so its list is built from the quest
+        # alone.
+        cls.cms = MockCmsServer()
+        cls.cms_url = cls.cms.start()
+        cls.addClassCleanup(cls.cms.stop)
+        for quest in ("quest-starter", "quest-tailored", "quest-final"):
+            cls.cms.seed_quest(
+                {
+                    "id": quest,
+                    "req": {"target_language": "es"},
+                    "res": {"learning_objective_sequence": []},
+                }
+            )
 
     def request(self, method, path, token, body=None):
         return requests.request(
@@ -316,7 +334,7 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
         """create-course-space.instructions.md, "Replacing the course plan"."""
         email = f"replace+{self.tag}@school.example"
         await self.homeserver(
-            module_config={"app_base_url": APP},
+            module_config={"app_base_url": APP, "cms_base_url": self.cms_url},
             synapse_config_overrides={"email": self.sink.synapse_email_config()},
         )
         users, tokens = {}, {}
@@ -384,6 +402,17 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
         )
         self.assertEqual(
             self.state(teacher, room, "m.room.topic")["topic"], "Tailored course text"
+        )
+
+        # A quest whose Can-Do list cannot be built is refused with the reason,
+        # and the room keeps its quest.
+        unbuilt = self.post(
+            path, op, replacement("quest-missing", "quest-tailored", "Missing course")
+        )
+        self.assertEqual(unbuilt.status_code, 422, unbuilt.text)
+        self.assertEqual(unbuilt.json()["code"], "quest_not_found")
+        self.assertEqual(
+            self.state(teacher, room, "pangea.course_plan")["uuid"], "quest-tailored"
         )
 
         # After the claim the room is rewritten, sent as its instructor.
