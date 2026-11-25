@@ -398,6 +398,24 @@ class TestCoursePlanReplacement(unittest.IsolatedAsyncioTestCase):
             (status["course_plan_id"], status["replacements"]), ("quest", [])
         )
 
+    async def test_a_room_refusal_with_a_reason_code_still_has_an_answer(self):
+        """set-course-plan's refusal names its reason as ``code``; that must not
+        collide with the error body's own code, or the request goes unanswered."""
+        await self.claimed()
+        self.room_plan.apply.return_value = (
+            502,
+            {
+                "error": "The quest's Can-Do list could not be built",
+                "code": "cms_unavailable",
+            },
+        )
+        with self.assertRaises(SynapseError) as error:
+            await self.resource.replace("@operator:x", self.body())
+        self.assertEqual(error.exception.code, 502)
+        body = error.exception.error_dict(None)
+        self.assertEqual(body["reason"], "cms_unavailable")
+        self.assertEqual(body["errcode"], "M_UNKNOWN")
+
     async def test_a_claimed_dry_run_records_nothing(self):
         await self.claimed()
         self.room_plan.apply.return_value = (

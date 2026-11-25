@@ -252,7 +252,15 @@ class CourseInvitationAPI(Resource):
             raise SynapseError(400, error)
         code, answer = await self.room_plan.apply(request, operator)
         if code != 200:
-            extra = {k: v for k, v in answer.items() if k not in ("error", "errcode")}
+            extra = {
+                k: v for k, v in answer.items() if k not in ("error", "errcode", "code")
+            }
+            # The refusal's own reason code (set-course-plan's ``code``, such as
+            # ``cms_unavailable``) cannot ride as ``code``: Synapse builds the error
+            # body as ``cs_error(msg, code, **extra)``, and a second ``code`` raised
+            # inside the error handler, so the request was never answered.
+            if "code" in answer:
+                extra["reason"] = answer["code"]
             if "current_quest_id" in extra:
                 # The name the preparation's refusal uses, so callers read one field.
                 extra["current_course_plan_id"] = extra["current_quest_id"]

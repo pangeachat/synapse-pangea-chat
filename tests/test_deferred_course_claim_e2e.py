@@ -9,6 +9,7 @@ import requests
 
 from synapse_pangea_chat.email_invite.course_claim_emails import class_qr_png
 from tests.base_e2e import BaseSynapseE2ETest
+from tests.mock_cms_server import MockCmsServer
 from tests.smtp_sink import SmtpSink, body_text
 
 PREFIX = "/_synapse/client/pangea/"
@@ -17,12 +18,38 @@ APP = "https://app.example.test"
 
 class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
     sink: SmtpSink
+    cms: MockCmsServer
+    cms_url: str
 
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
         cls.sink = SmtpSink().start()
         cls.addClassCleanup(cls.sink.stop)
+        # A course plan replaced after the claim rebuilds the course's Can-Do
+        # list from the quest (set-course-plan), so the CMS has to answer.
+        cls.cms = MockCmsServer()
+        cls.cms_url = cls.cms.start()
+        cls.addClassCleanup(cls.cms.stop)
+        for quest_id in ("quest-starter", "quest-tailored", "quest-final"):
+            cls.cms.seed_quest(
+                {
+                    "id": quest_id,
+                    "req": {"target_language": "es"},
+                    "res": {
+                        "learning_objective_sequence": [
+                            {"learning_objective": "lo-1", "activity_ids": None}
+                        ]
+                    },
+                }
+            )
+
+    def module_config(self):
+        return {
+            "app_base_url": APP,
+            "cms_base_url": self.cms_url,
+            "cms_service_api_key": "test-cms-api-key",
+        }
 
     def request(self, method, path, token, body=None):
         return requests.request(
@@ -49,7 +76,7 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
         email = f"requester+{self.tag}@school.example"
         race_email = f"race+{self.tag}@school.example"
         await self.homeserver(
-            module_config={"app_base_url": APP},
+            module_config=self.module_config(),
             synapse_config_overrides={"email": self.sink.synapse_email_config()},
         )
         tokens = {}
@@ -316,7 +343,7 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
         """create-course-space.instructions.md, "Replacing the course plan"."""
         email = f"replace+{self.tag}@school.example"
         await self.homeserver(
-            module_config={"app_base_url": APP},
+            module_config=self.module_config(),
             synapse_config_overrides={"email": self.sink.synapse_email_config()},
         )
         users, tokens = {}, {}
@@ -384,6 +411,16 @@ class TestDeferredCourseClaimE2E(BaseSynapseE2ETest):
         )
         self.assertEqual(
             self.state(teacher, room, "m.room.topic")["topic"], "Tailored course text"
+        )
+
+        # A quest the CMS cannot build a Can-Do list for is refused with an
+        # answer, and the room keeps its plan.
+        missing = self.post(
+            path, op, replacement("quest-missing", "quest-tailored", "Missing")
+        )
+        self.assertEqual(missing.status_code, 422, missing.text)
+        self.assertEqual(
+            self.state(teacher, room, "pangea.course_plan")["uuid"], "quest-tailored"
         )
 
         # After the claim the room is rewritten, sent as its instructor.
