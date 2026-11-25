@@ -30,6 +30,21 @@ logger = logging.getLogger(
 )
 
 
+class _RoomPlanRefusal(SynapseError):
+    """A set_course_plan refusal sent on with its body's own fields. That body
+    can carry ``code`` (why the quest's Can-Do list could not be built), which
+    ``additional_fields`` cannot: ``cs_error`` takes ``code`` as its errcode
+    parameter, so the error dict raised TypeError in ``handle``'s own except
+    clause and the request was never answered."""
+
+    def __init__(self, status, msg, errcode, fields):
+        super().__init__(status, msg, errcode)
+        self._fields = fields
+
+    def error_dict(self, config):
+        return {**self._fields, "error": self.msg, "errcode": self.errcode}
+
+
 class CourseInvitationAPI(Resource):
     def __init__(
         self,
@@ -256,11 +271,11 @@ class CourseInvitationAPI(Resource):
             if "current_quest_id" in extra:
                 # The name the preparation's refusal uses, so callers read one field.
                 extra["current_course_plan_id"] = extra["current_quest_id"]
-            raise SynapseError(
+            raise _RoomPlanRefusal(
                 code,
                 answer.get("error", "Course plan replacement failed"),
                 answer.get("errcode", Codes.UNKNOWN),
-                additional_fields=extra,
+                extra,
             )
         quest = fields["course_plan_id"]
         held = invitation["specification"].get("course_plan_id")
