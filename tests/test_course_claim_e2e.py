@@ -19,7 +19,6 @@ from urllib.parse import quote
 import psycopg2
 import requests
 
-from synapse_pangea_chat.email_invite.course_claim_emails import class_qr_png
 from tests.base_e2e import BaseSynapseE2ETest
 from tests.requested_course import legacy_course
 from tests.smtp_sink import SmtpSink, body_text
@@ -171,18 +170,18 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
         self.assertEqual(response.json()["already_joined"], [room_id])
         self.assertEqual(self._power_level(bot, room_id, teacher_id), 100)
 
-        claimed = self.sink.wait_for(self.requested, "Invite your students")
+        # The module's own share kit (#936): the course on the dashboard, signed,
+        # and no class link, code or QR code.
+        claimed = self.sink.wait_for(self.requested, "Spanish 1 is ready")
         self.assertIsNotNone(claimed)
         assert claimed is not None
         claimed_text = body_text(claimed)
-        self.assertIn(f"{APP_BASE_URL}/{class_code}", claimed_text)
-        # The module's own template carries the link's QR code, inline.
+        self.assertIn("Open your course in the educator dashboard", claimed_text)
+        self.assertIn("/_synapse/client/pangea/v1/n?t=", claimed_text)
+        self.assertNotIn(f"{APP_BASE_URL}/{class_code}", claimed_text)
+        self.assertNotIn(class_code, claimed_text)
         images = [p for p in claimed.walk() if p.get_content_type() == "image/png"]
-        self.assertEqual(len(images), 1)
-        self.assertEqual(
-            images[0].get_payload(decode=True),
-            class_qr_png(f"{APP_BASE_URL}/{class_code}"),
-        )
+        self.assertEqual(images, [])
         self.assertNotIn(admin_code, claimed_text)
 
         # The address is cleared once it has done its job.

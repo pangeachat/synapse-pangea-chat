@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -32,7 +32,10 @@ DESTINATION_IDS = {
     "subscription": frozenset(),
     "external": frozenset({"url"}),
     "workspace": frozenset({"path"}),
+    "dashboard": frozenset({"course_room_id"}),
 }
+#: The kinds that name a course, whose course a claimed email may leave for the claim to fill.
+COURSE_KINDS = frozenset({"course", "dashboard"})
 
 
 def string(data: Dict[str, Any], key: str, limit: int = 512) -> str:
@@ -78,7 +81,12 @@ class Destination:
         data: Any,
         external_link_hosts: Iterable[str],
         name: str = "destination",
+        claimed_course: bool = False,
     ) -> Destination:
+        """``claimed_course``: the destination belongs to a claimed email, stored before
+        its course exists, so a course or dashboard destination may leave out
+        ``course_room_id`` and ``for_course`` fills it with the claimed course at send.
+        """
         if not isinstance(data, dict):
             raise ValueError(f"{name} must be an object")
         kind = string(data, "kind", 32)
@@ -99,7 +107,10 @@ class Destination:
                 raise ValueError(f"{name} of kind {kind} takes no {key}")
         if kind == "activity" and not ids["activity_id"]:
             raise ValueError(f"{name} of kind activity requires activity_id")
-        if kind == "course" and not (ids["course_room_id"] or "").startswith("!"):
+        course = ids["course_room_id"]
+        if course is not None and not course.startswith("!"):
+            raise ValueError(f"{name}.course_room_id must be a room id")
+        if kind == "course" and course is None and not claimed_course:
             raise ValueError(f"{name} of kind course requires a course_room_id")
         if kind == "external" and not external_host_allowed(
             ids["url"], external_link_hosts
@@ -112,6 +123,41 @@ class Destination:
                 f"{name} of kind workspace requires a relative path starting with one slash"
             )
         return cls(kind, **ids)
+
+    @classmethod
+    def stored(cls, data: Dict[str, Any]) -> Destination:
+        """A destination ``parse`` already accepted and ``as_request`` stored, read back
+        without checking it again: an external host removed from the allowlist since
+        must retire the link at the click (``destination_url``), not stop the mail."""
+        return cls(
+            str(data["kind"]),
+            **{
+                key: data.get(key)
+                for key in (
+                    "activity_id",
+                    "session_room_id",
+                    "course_room_id",
+                    "url",
+                    "path",
+                )
+            },
+        )
+
+    def for_course(self, room_id: str) -> Destination:
+        """This destination with the claimed course filled in where it names a course
+        and was stored without one (``parse`` with ``claimed_course``)."""
+        if self.kind in COURSE_KINDS and not self.course_room_id:
+            return replace(self, course_room_id=room_id)
+        return self
+
+    def as_request(self) -> Dict[str, str]:
+        """The request form ``parse`` takes, for storing a parsed destination."""
+        result = {"kind": self.kind}
+        for key in ("activity_id", "session_room_id", "course_room_id", "url", "path"):
+            value = getattr(self, key)
+            if value:
+                result[key] = value
+        return result
 
     @classmethod
     def from_ids(cls, data: Dict[str, Any]) -> Destination:

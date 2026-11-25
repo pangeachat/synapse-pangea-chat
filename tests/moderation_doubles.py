@@ -309,6 +309,26 @@ class DbPoolDouble:
         self.connection.commit()
         return result
 
+    async def simple_upsert(
+        self,
+        table: str,
+        keyvalues: Dict[str, Any],
+        values: Dict[str, Any],
+        desc: str = "simple_upsert",
+        **_: Any,
+    ) -> None:
+        """Synapse's ``simple_upsert``: insert the row, or update its ``values``."""
+        columns = {**keyvalues, **values}
+        sql = (
+            f"INSERT INTO {table} ({', '.join(columns)})"
+            f" VALUES ({', '.join('?' for _ in columns)})"
+            f" ON CONFLICT ({', '.join(keyvalues)}) DO UPDATE SET "
+            + ", ".join(f"{c} = excluded.{c}" for c in values)
+        )
+        await self.runInteraction(
+            desc, lambda txn: txn.execute(sql, tuple(columns.values()))
+        )
+
 
 class EventStoreDouble:
     def __init__(self, redacted: bool = False, missing: bool = False) -> None:

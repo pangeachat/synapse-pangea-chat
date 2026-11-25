@@ -104,6 +104,53 @@ class TestInvitations(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(await self.store.for_code("ABC2DEF"))
         self.assertTrue(await self.claims.code_in_use("abc2def"))
 
+    async def test_a_delivery_address_redirects_mail_but_not_the_claim_identity(self):
+        """A corrected address (#936): later mail and the share kit go there, while
+        the requesting address stays the one an account claims by without a link."""
+        self.assertEqual(
+            await self.store.delivery_address(self.ident), "teacher@school.example"
+        )
+        self.assertTrue(
+            await self.store.set_delivery_address(self.ident, "new@school.example")
+        )
+        self.assertEqual(
+            await self.store.delivery_address(self.ident), "new@school.example"
+        )
+        self.assertEqual(
+            (await self.store.get(self.ident))["requested_email"],
+            "teacher@school.example",
+        )
+        await self.store.reserve_creation(self.ident, "@teacher:x")
+        await self.store.associate(self.ident, "@teacher:x", "!room:x")
+        self.assertFalse(
+            await self.store.set_delivery_address(self.ident, "late@school.example")
+        )
+        await self.store.complete(self.ident, "@teacher:x", "!room:x", 10)
+        reservation = await self.claims.reserve_notice("!room:x", "@teacher:x", 12, 100)
+        self.assertEqual(reservation.requested_email, "new@school.example")
+        self.assertIsNone(await self.store.delivery_address(self.ident))
+
+    async def test_a_claimed_email_keeps_its_destinations_and_unsubscribe_link(self):
+        await self.store.store_claimed_email(
+            self.ident,
+            {
+                "subject": "s",
+                "html": "{{cta_url}}",
+                "text": "{{cta_url}}",
+                "receiving_reason": "r",
+                "destination": {"kind": "dashboard"},
+                "secondary_destination": None,
+                "unsubscribe_url": "https://api.pangea.chat/u/x",
+            },
+            5,
+        )
+        await self.store.reserve_creation(self.ident, "@teacher:x")
+        await self.store.associate(self.ident, "@teacher:x", "!room:x")
+        stored = await self.store.claimed_email_for_room("!room:x")
+        self.assertEqual(stored["destination"], {"kind": "dashboard"})
+        self.assertIsNone(stored["secondary_destination"])
+        self.assertEqual(stored["unsubscribe_url"], "https://api.pangea.chat/u/x")
+
     async def test_delivery_audit_is_private_and_ambiguous_attempt_survives_restart(
         self,
     ):

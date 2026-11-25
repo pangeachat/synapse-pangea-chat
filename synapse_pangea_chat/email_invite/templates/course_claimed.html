@@ -1,39 +1,22 @@
 {% extends "_brand_email_base.html" %}
 {% from "_brand_cta_button.html" import cta_button %}
-{% set title = "Your course is ready to go" %}
+{% set title = course_title ~ " is ready" %}
 {% set show_unsubscribe = false %}
 {% block content %}
             <tr>
               <td class="body-content" style="padding:36px 40px 24px;">
-                <p style="font-size: 20px; font-weight: 700; margin-bottom: 12px">
-                  Congratulations! Your task-based conversation journey is ready
-                  to go!
-                </p>
                 <p style="margin-bottom: 8px">
-                  You can invite your students to <strong>{{ course_title }}</strong>
-                  by sharing the link below:
+                  Open your course in the educator dashboard to:
                 </p>
-                <div class="feature">
-                  <p style="margin: 0; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 15px; word-break: break-all">
-                    <a href="{{ class_url }}" style="color: #5e3acf">{{ class_url }}</a>
-                  </p>
-                </div>
-                <div style="text-align: center; margin: 20px 0">
-                  <img src="{{ class_qr_src }}" width="200" height="200" alt="QR code for the class link" style="display: block; margin: 0 auto; width: 200px; height: 200px; border: 0">
-                  <p style="font-size: 14px; color: #555555; margin: 8px 0 0">
-                    Put this on a slide; students scan it to open the class link.
-                  </p>
-                </div>
+                <ul style="margin: 0 0 16px; padding-left: 20px">
+                  <li>Add students</li>
+                  <li>Review Pangea Chat safety features</li>
+                  <li>Edit your curriculum</li>
+                  <li>Buy student seats to Pangea Pro</li>
+                </ul>
+                {{ cta_button(dashboard_url, "Open dashboard") }}
                 <p>
-                  Students will be directed to make an account, automatically
-                  enrolled in your class and be conversing in curriculum-aligned
-                  conversation activities in no time.
-                </p>
-                <p>
-                  Your students will receive a free 7-day trial on account
-                  creation and can subscribe in-app afterwards. If you'd like to
-                  cover your students' seats, just hit reply for an invoice, to
-                  redeem a promotional offer, or any other questions.
+                  Need help? <a href="{{ support_url }}" style="color: #5e3acf">Schedule a Teacher Support call</a> with the team.
                 </p>
               </td>
             </tr>
