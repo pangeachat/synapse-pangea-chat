@@ -150,6 +150,51 @@ class TestNoticeDeliveryE2E(BaseSynapseE2ETest):
         self.assertEqual(data["reason"], "category_refused")
         self.assertIsNone(data["push"])
 
+    async def test_a_minted_unsubscribe_link_is_the_one_the_page_answers(self):
+        # Account mail the engagement runner sends itself carries this link; one-click on it refuses the category.
+        from urllib.parse import urlparse
+
+        alice_id, alice_token, admin_token = await self._alice_and_admin()
+        mint_url = (
+            f"{self.server_url}/_synapse/client/pangea/v1/notice_unsubscribe_link"
+        )
+        refused = requests.post(
+            mint_url,
+            json={"user_id": alice_id, "category": "suggestions"},
+            headers={"Authorization": f"Bearer {alice_token}"},
+        )
+        self.assertEqual(refused.status_code, 403, refused.text)
+        minted = requests.post(
+            mint_url,
+            json={"user_id": alice_id, "category": "suggestions"},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        self.assertEqual(minted.status_code, 200, minted.text)
+        link = urlparse(minted.json()["url"])
+        self.assertEqual(link.path, "/_synapse/client/pangea/v1/unsubscribe")
+        page = requests.get(f"{self.server_url}{link.path}?{link.query}")
+        self.assertEqual(page.status_code, 200, page.text)
+        unknown = requests.post(
+            mint_url,
+            json={
+                "user_id": f"@nobody-{self.tag}:{SERVER_NAME}",
+                "category": "suggestions",
+            },
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        self.assertEqual(unknown.status_code, 404, unknown.text)
+        done = requests.post(
+            f"{self.server_url}{link.path}?{link.query}",
+            data="List-Unsubscribe=One-Click",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(done.status_code, 200, done.text)
+        after = requests.get(
+            f"{self.server_url}/_matrix/client/v3/user/{alice_id}/account_data/{PREFERENCES_TYPE}",
+            headers={"Authorization": f"Bearer {alice_token}"},
+        ).json()
+        self.assertEqual(after["refused"], ["suggestions"])
+
     async def test_unsubscribe_round_trip_writes_account_data(self):
         alice_id, alice_token, _admin_token = await self._alice_and_admin()
         token = tokens.sign_token(
