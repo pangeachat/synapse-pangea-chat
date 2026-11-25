@@ -218,5 +218,244 @@ class TestReplaceListedRooms(unittest.TestCase):
         self.assertEqual((code, posts), (1, []))
 
 
+_MERGED = (
+    200,
+    {
+        "can_do_list": {
+            "built": True,
+            "missions": 2,
+            "current_activities": 278,
+            "rebuilt_activities": 35,
+            "current_outside_selection": 243,
+            "entries": [
+                {
+                    "lo_id": "lo-a",
+                    "status": "follows_quest",
+                    "shown_before": 30,
+                    "shown_after": 4,
+                    "moved_to_removed": 26,
+                    "back_to_shown": 0,
+                    "removed_after": 26,
+                    "note": "course_kept",
+                    "shows_none": False,
+                },
+                {
+                    "lo_id": "lo-gone",
+                    "status": "quest_empty",
+                    "shown_before": 2,
+                    "shown_after": 2,
+                    "moved_to_removed": 0,
+                    "back_to_shown": 0,
+                    "removed_after": 0,
+                    "note": None,
+                    "shows_none": False,
+                },
+                {
+                    "lo_id": "lo-own",
+                    "status": "course_only",
+                    "shown_before": 3,
+                    "shown_after": 3,
+                    "moved_to_removed": 0,
+                    "back_to_shown": 0,
+                    "removed_after": 0,
+                    "note": None,
+                    "shows_none": False,
+                },
+            ],
+            "lost": [],
+            "nothing_lost": True,
+            "totals": {
+                "entries": 3,
+                "shown_before": 5,
+                "shown_after": 7,
+                "moved_to_removed": 26,
+                "empty_before": 1,
+                "empty_after": 1,
+            },
+        }
+    },
+)
+
+
+def _with_list_event(
+    events: List[Dict[str, Any]], event_id: str
+) -> List[Dict[str, Any]]:
+    return [
+        {**e, "event_id": event_id} if e["type"] == "pangea.course_missions" else e
+        for e in events
+    ]
+
+
+class TestReplaceKeepingProgress(unittest.TestCase):
+    """--rooms --keep-progress: follow the trimmed quest, keep every credited
+    id, refuse a teacher's list unless the room is named, and leave an undo
+    line for every room written."""
+
+    def _run(
+        self,
+        file_text: str,
+        rooms: Dict[str, List[List[Dict[str, Any]]]],
+        answer: tuple = _MERGED,
+        commit: bool = False,
+        allow: frozenset = frozenset(),
+    ) -> tuple:
+        posts: List[Dict[str, Any]] = []
+        reads: Dict[str, int] = {}
+
+        def call(url: str, token: str, body: Optional[Dict[str, Any]] = None) -> tuple:
+            if body is not None:
+                posts.append(body)
+                return answer
+            room = next(
+                r for r in rooms if r.replace("!", "%21").replace(":", "%3A") in url
+            )
+            n = reads.get(room, 0)
+            reads[room] = n + 1
+            return (200, {"state": rooms[room][min(n, len(rooms[room]) - 1)]})
+
+        out = io.StringIO()
+        undo = io.StringIO()
+        with mock.patch.object(script, "_call", side_effect=call), mock.patch.object(
+            script.time, "sleep"
+        ), redirect_stdout(out):
+            code = script.run_replace(
+                HS,
+                "t",
+                script.parse_rooms(file_text),
+                commit,
+                keep_progress=True,
+                allow_teacher_list=allow,
+                undo_out=undo,
+            )
+        return code, posts, out.getvalue(), undo.getvalue()
+
+    def test_each_entry_is_reported_and_nothing_lost_is_said(self) -> None:
+        before = _with_list_event(_space("q1", has_list=True), "$e1")
+        code, posts, out, _ = self._run("!a:x $e1\n", {"!a:x": [before]})
+
+        self.assertEqual(code, 0)
+        self.assertTrue(posts[0]["keep_progress"])
+        self.assertNotIn("allow_teacher_list", posts[0])
+        self.assertIn("!a:x: quest q1: 2 Can-Dos, nothing lost", out)
+        self.assertIn(
+            "as the app shows it: 5 activities shown -> 7, 26 moved to removed, "
+            "Can-Dos showing nothing 1 -> 1",
+            out,
+        )
+        self.assertIn(
+            "lo-a: follows_quest, list names 30 -> shows 4, 26 moved to removed, "
+            "0 shown again, 26 removed in all, note course_kept",
+            out,
+        )
+        self.assertIn("lo-gone: EMPTY, the quest lists nothing", out)
+        self.assertIn("lo-own: course_only, the quest no longer has this Can-Do", out)
+
+    def test_a_loss_is_printed_and_never_called_nothing_lost(self) -> None:
+        lossy = (
+            409,
+            {
+                "error": "Following the quest would lose part of the course's list",
+                "code": "would_lose",
+                "lost": ["lo-a: due_at changed"],
+            },
+        )
+        before = _with_list_event(_space("q1", has_list=True), "$e1")
+        code, _, out, _ = self._run("!a:x $e1\n", {"!a:x": [before]}, answer=lossy)
+
+        self.assertEqual(code, 1)
+        self.assertNotIn("nothing lost", out)
+        self.assertIn("lo-a: due_at changed", out)
+
+    def test_a_teachers_list_is_refused_unless_its_room_is_named(self) -> None:
+        refused = (
+            409,
+            {"error": "published by a teacher", "code": "teacher_list"},
+        )
+        before = _with_list_event(_space("q1", has_list=True), "$e1")
+        code, _, out, _ = self._run("!a:x $e1\n", {"!a:x": [before]}, answer=refused)
+        self.assertEqual(code, 1)
+        self.assertIn("!a:x: refused, a teacher published this list", out)
+
+        _, posts, _, _ = self._run(
+            "!a:x $e1\n", {"!a:x": [before]}, allow=frozenset({"!a:x"})
+        )
+        self.assertTrue(posts[0]["allow_teacher_list"])
+
+    def test_a_commit_leaves_an_undo_line_naming_the_new_and_old_lists(
+        self,
+    ) -> None:
+        before = _with_list_event(_space("q1", has_list=True), "$e1")
+        # A teacher publishes right after the write: the undo line still names
+        # the list the server wrote, never the room's latest one (Codex).
+        teacher = _with_list_event(_space("q1", has_list=True), "$teacher")
+        written = (200, {**_MERGED[1], "can_do_list_event_id": "$merged"})
+        _, _, out, undo = self._run(
+            "!a:x $e1\n", {"!a:x": [before, teacher]}, answer=written, commit=True
+        )
+
+        self.assertEqual(undo, "!a:x $merged $e1\n")
+        self.assertIn("undo: !a:x $merged $e1", out)
+
+    def test_a_commit_the_server_names_no_event_for_needs_a_look(self) -> None:
+        before = _with_list_event(_space("q1", has_list=True), "$e1")
+        code, _, out, undo = self._run("!a:x $e1\n", {"!a:x": [before]}, commit=True)
+
+        self.assertEqual((code, undo), (1, ""))
+        self.assertIn("the server named no list event", out)
+
+
+class TestUndo(unittest.TestCase):
+    """--undo: write each room's earlier list back, only while the room still
+    holds the list the file names."""
+
+    def test_the_undo_file_names_the_current_and_the_earlier_list(self) -> None:
+        self.assertEqual(
+            script.parse_undo("# from the run\n!a:x $merged $e1\n"),
+            [("!a:x", "$merged", "$e1")],
+        )
+        for bad in ("!a:x $merged", "!a:x merged $e1", "!a:x $m $e1 extra"):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                script.parse_undo(bad)
+
+    def test_each_room_is_sent_a_restore_of_its_earlier_list(self) -> None:
+        posts: List[Dict[str, Any]] = []
+        restored = (
+            200,
+            {"can_do_list": {"restored": "$e1", "previous_revision": 2, "revision": 3}},
+        )
+
+        def call(url: str, token: str, body: Optional[Dict[str, Any]] = None) -> tuple:
+            if body is not None:
+                posts.append(body)
+                return restored
+            return (200, {"state": _space("q1", has_list=True)})
+
+        out = io.StringIO()
+        with mock.patch.object(script, "_call", side_effect=call), mock.patch.object(
+            script.time, "sleep"
+        ), redirect_stdout(out):
+            code = script.run_undo(HS, "t", [("!a:x", "$merged", "$e1")], False)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            posts,
+            [
+                {
+                    "room_id": "!a:x",
+                    "quest_id": "q1",
+                    "expected_quest_id": "q1",
+                    "title": "My class",
+                    "description": "Mine",
+                    "replace_copy_event_id": "$merged",
+                    "restore_copy_event_id": "$e1",
+                    "dry_run": True,
+                }
+            ],
+        )
+        self.assertIn(
+            "!a:x: $e1 restored over $merged, revision 2 -> 3", out.getvalue()
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

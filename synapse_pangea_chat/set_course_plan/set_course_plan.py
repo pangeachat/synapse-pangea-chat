@@ -63,6 +63,30 @@ lists, and the current ones outside the quest's selection. Used by
 ``scripts/write_course_copies.py --rooms`` (pangeachat/.github#832: lists the
 builder made from the newest 200 rows only, before it read selections by id).
 
+A replaced list Content Studio published (any field the builder never writes:
+``time_zone``, ``removed_missions``, ``due_at``, ``removed_activity_ids``) is
+refused with 409 and code ``teacher_list`` before the CMS read, unless the
+request carries ``allow_teacher_list``.
+
+``keep_progress`` (with ``replace_copy_event_id``): instead of the built list
+as it is, the course's list follows it without losing anything it credits or
+holds (merge_can_do_list.py): old ids no longer shown move to
+``removed_activity_ids``; due dates, notes, the time zone and the course's own
+Can-Dos stay. Hidden, private or otherwise unlisted old ids are credited the
+same way; a Can-Do whose quest entry lists nothing is left as it is
+(``quest_empty``). The answer adds ``entries`` (per Can-Do counts), ``lost``,
+``nothing_lost`` and ``totals`` (shown before as the course listing lists the
+old ids today, shown after, moved to removed, Can-Dos showing nothing before
+and after; the "before" counts are null when the CMS cannot say which ids it
+lists). A merge that would lose anything is refused with 409 and code
+``would_lose``, nothing written.
+
+``restore_copy_event_id`` (with ``replace_copy_event_id``, the list the course
+holds now): that earlier ``pangea.course_missions`` event of the same room is
+written back as it was, one revision above the current list, with no CMS read.
+An event of another room or type, or with no content: 422. The undo of a
+replacement, ``scripts/write_course_copies.py --undo``.
+
 A dry run does everything but the writes, including the CMS read.
 """
 
@@ -70,7 +94,17 @@ A dry run does everything but the writes, including the CMS read.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    AbstractSet,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 
 from synapse.api.constants import EventTypes
 from synapse.api.errors import (
@@ -106,6 +140,13 @@ from synapse_pangea_chat.public_courses.get_public_courses import (
 )
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.room_code.instructor_access import joined_local_instructors
+from synapse_pangea_chat.set_course_plan.merge_can_do_list import (
+    is_teacher_list,
+    merge_can_do_list,
+    plain,
+    shown_ids,
+    totals,
+)
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -167,6 +208,8 @@ def can_do_list_revision(content: Optional[Mapping[str, Any]]) -> Optional[int]:
 
 
 # A read failure the request itself caused, rather than the CMS.
+TEACHER_LIST = "teacher_list"
+WOULD_LOSE = "would_lose"
 _QUEST_FAILURES = frozenset({NO_QUEST, QUEST_NOT_FOUND, QUEST_MALFORMED})
 
 
@@ -246,6 +289,14 @@ class SetCoursePlanRequest(NamedTuple):
     dry_run: bool
     # The list event to replace, or None for an ordinary move or build.
     replace_copy_event_id: Optional[str] = None
+    # A replacement that follows the quest keeping what the list credits
+    # (merge_can_do_list), rather than writing the built list as it is.
+    keep_progress: bool = False
+    # A replacement may overwrite a list a teacher published from Content
+    # Studio only when the operator names that room for it.
+    allow_teacher_list: bool = False
+    # A replacement that writes this earlier list event of the room back.
+    restore_copy_event_id: Optional[str] = None
 
 
 def parse_request(
@@ -279,9 +330,35 @@ def parse_request(
             return None, "'replace_copy_event_id' must be an event ID"
         if quest_id != expected_quest_id:
             return None, "A replacement keeps the course on its quest"
+    flags: Dict[str, bool] = {}
+    for key in ("keep_progress", "allow_teacher_list"):
+        value = body.get(key, False)
+        if not isinstance(value, bool):
+            return None, f"'{key}' must be a boolean"
+        if value and replace is None:
+            return None, f"'{key}' needs 'replace_copy_event_id'"
+        flags[key] = value
+    restore: Optional[str] = None
+    if "restore_copy_event_id" in body:
+        restore = _valid_id(body.get("restore_copy_event_id"))
+        if restore is None:
+            return None, "'restore_copy_event_id' must be an event ID"
+        if replace is None:
+            return None, "'restore_copy_event_id' needs 'replace_copy_event_id'"
+        if flags["keep_progress"]:
+            return None, "A restore writes the earlier list as it was"
     return (
         SetCoursePlanRequest(
-            room_id, quest_id, expected_quest_id, title, description, dry_run, replace
+            room_id,
+            quest_id,
+            expected_quest_id,
+            title,
+            description,
+            dry_run,
+            replace,
+            flags["keep_progress"],
+            flags["allow_teacher_list"],
+            restore,
         ),
         None,
     )
@@ -327,6 +404,7 @@ class SetCoursePlan(Resource):
         self._course_missions = CourseMissionsReader(
             api, config.cms_base_url, config.cms_service_api_key
         )
+        self._store = api._hs.get_datastores().main
 
     def render_POST(self, request: SynapseRequest):
         run_in_background(self._async_render_POST, request)
@@ -445,6 +523,19 @@ class SetCoursePlan(Resource):
                     "current_copy_event_id": list_event_id,
                 },
             )
+        if req.restore_copy_event_id is not None:
+            return await self._restore(req, operator, state, event, list_event)
+        if replacing and not req.allow_teacher_list and is_teacher_list(current_list):
+            # Content Studio's fields are the teacher's edits; the operator
+            # names a room for them to be followed through on purpose.
+            return (
+                409,
+                {
+                    "error": "The course's Can-Do list was published by a "
+                    "teacher; name the room to replace it anyway",
+                    "code": TEACHER_LIST,
+                },
+            )
         new_list: Optional[Dict[str, Any]] = None
         built: Optional[Dict[str, Any]] = None
         problems: Dict[str, int] = {}
@@ -501,6 +592,9 @@ class SetCoursePlan(Resource):
                 counts = await self._replacement_counts(
                     req.quest_id, req.replace_copy_event_id, current_list, built
                 )
+            listable: Optional[AbstractSet[str]] = None
+            if req.keep_progress and current_list is not None:
+                listable = await self._listable(req.quest_id, event, current_list)
             # The reads can take seconds; a teacher who changed course or
             # published a Can-Do list in the meantime wins.
             again = await self._api.get_room_state(
@@ -525,7 +619,165 @@ class SetCoursePlan(Resource):
                     409,
                     {"error": "The space changed while its Can-Do list was built"},
                 )
-            new_list = can_do_list_content(result.content, current_list)
+            if req.keep_progress and current_list is not None:
+                merged = merge_can_do_list(plain(current_list), result.content)
+                if merged.lost:
+                    # The merge exists to lose nothing; a list it cannot carry
+                    # whole is left as it is for the operator to look at.
+                    logger.error(
+                        "set_course_plan: following quest %s in %s would lose "
+                        "%d things; refused, nothing written",
+                        req.quest_id,
+                        room_id,
+                        len(merged.lost),
+                    )
+                    return (
+                        409,
+                        {
+                            "error": "Following the quest would lose part of "
+                            "the course's list",
+                            "code": WOULD_LOSE,
+                            "lost": merged.lost,
+                        },
+                    )
+                new_list = can_do_list_content(merged.content, current_list)
+                counts.update(
+                    entries=merged.entries,
+                    lost=merged.lost,
+                    nothing_lost=not merged.lost,
+                    totals=totals(plain(current_list), merged, listable),
+                )
+            else:
+                new_list = can_do_list_content(result.content, current_list)
+        return await self._write(
+            req,
+            operator,
+            state,
+            update,
+            current_name,
+            current_topic,
+            new_list,
+            (
+                {
+                    "built": built is not None,
+                    "previous_revision": can_do_list_revision(current_list),
+                    "revision": can_do_list_revision(new_list),
+                    "missions": len((new_list or {}).get("missions") or []),
+                    "problems": problems,
+                    **counts,
+                }
+                if update.outcome == UPDATE or rebuild
+                else None
+            ),
+        )
+
+    async def _listable(
+        self, quest_id: str, plan_event: Any, current_list: Mapping[str, Any]
+    ) -> Optional[AbstractSet[str]]:
+        """Which ids the course's list shows today the course listing lists,
+        so the report counts what learners see now; None when the CMS cannot
+        say, which only blanks those counts."""
+        plan = _content(plan_event) or {}
+        l2 = plan.get("l2") if isinstance(plan.get("l2"), str) else None
+        try:
+            if l2 is None:
+                l2 = await self._course_missions.quest_language(quest_id)
+            if l2 is None:
+                return None
+            return await self._course_missions.listable_ids(
+                shown_ids(plain(current_list)), l2
+            )
+        # silent-ok: counts for the operator's report, not the write; logged, reported as null
+        except Exception as e:
+            logger.warning(
+                "set_course_plan: which ids quest %s's course lists today could "
+                "not be read for the report: %s",
+                quest_id,
+                type(e).__name__,
+            )
+            return None
+
+    async def _restore(
+        self,
+        req: SetCoursePlanRequest,
+        operator: str,
+        state: Mapping[Any, Any],
+        plan_event: Any,
+        list_event: Any,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Write an earlier list event of the room back, one revision above
+        the current list, so a replacement can be undone. The caller has
+        checked the course still holds the list the operator named."""
+        room_id = req.room_id
+        restore_id = req.restore_copy_event_id
+        assert restore_id is not None  # the caller restores only when named
+        earlier = await self._store.get_event(restore_id, allow_none=True)
+        earlier_list = _content(earlier) if earlier is not None else None
+        if (
+            earlier is None
+            or getattr(earlier, "room_id", None) != room_id
+            or getattr(earlier, "type", None) != COURSE_MISSIONS_STATE_EVENT_TYPE
+            or getattr(earlier, "state_key", None) != ""
+            or not earlier_list
+        ):
+            return (
+                422,
+                {
+                    "error": "The event to restore is not a Can-Do list of "
+                    "this course",
+                    "restore_copy_event_id": req.restore_copy_event_id,
+                },
+            )
+        current_list = _content(list_event)
+        again = await self._api.get_room_state(
+            room_id,
+            [(self._event_type, ""), (COURSE_MISSIONS_STATE_EVENT_TYPE, "")],
+        )
+        again_list = again.get((COURSE_MISSIONS_STATE_EVENT_TYPE, ""))
+        if _content(again.get((self._event_type, ""))) != _content(
+            plan_event
+        ) or getattr(again_list, "event_id", None) != getattr(
+            list_event, "event_id", None
+        ):
+            logger.warning(
+                "set_course_plan: %s changed while its earlier Can-Do list "
+                "was read; refused, nothing written",
+                room_id,
+            )
+            return (409, {"error": "The space changed while its list was read"})
+        new_list = can_do_list_content(plain(earlier_list), current_list)
+        update = plan_update(_content(plan_event), req.expected_quest_id, req.quest_id)
+        return await self._write(
+            req,
+            operator,
+            state,
+            update,
+            _state_text(state.get((EventTypes.Name, "")), "name"),
+            _state_text(state.get((EventTypes.Topic, "")), "topic"),
+            new_list,
+            {
+                "built": False,
+                "restored": req.restore_copy_event_id,
+                "replaced": req.replace_copy_event_id,
+                "previous_revision": can_do_list_revision(current_list),
+                "revision": can_do_list_revision(new_list),
+                "missions": len(new_list.get("missions") or []),
+            },
+        )
+
+    async def _write(
+        self,
+        req: SetCoursePlanRequest,
+        operator: str,
+        state: Mapping[Any, Any],
+        update: PlanUpdate,
+        current_name: Optional[str],
+        current_topic: Optional[str],
+        new_list: Optional[Dict[str, Any]],
+        can_do_list_report: Optional[Dict[str, Any]],
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Send the planned writes as the course's strongest instructor."""
+        room_id = req.room_id
         writes = planned_writes(
             update,
             self._event_type,
@@ -542,20 +794,9 @@ class SetCoursePlan(Resource):
             "previous_name": current_name,
             "previous_topic": current_topic,
             "changes": [event_type for event_type, _ in writes],
-            # Reported whenever a Can-Do list was built or tried, so a failed
-            # rebuild of an empty list is visible too.
-            "can_do_list": (
-                {
-                    "built": built is not None,
-                    "previous_revision": can_do_list_revision(current_list),
-                    "revision": can_do_list_revision(new_list),
-                    "missions": len((new_list or {}).get("missions") or []),
-                    "problems": problems,
-                    **counts,
-                }
-                if update.outcome == UPDATE or rebuild
-                else None
-            ),
+            # Reported whenever a Can-Do list was built, tried or restored,
+            # so a failed rebuild of an empty list is visible too.
+            "can_do_list": can_do_list_report,
             "dry_run": req.dry_run,
         }
         if not writes:
@@ -575,10 +816,13 @@ class SetCoursePlan(Resource):
         sender = instructors[0]
 
         written: List[str] = []
+        # The list event this call wrote, so an undo names exactly it and
+        # never a list a teacher published just after.
+        list_event_id: Optional[str] = None
         if not req.dry_run:
             for event_type, content in writes:
                 try:
-                    await self._api.create_and_send_event_into_room(
+                    sent = await self._api.create_and_send_event_into_room(
                         {
                             "type": event_type,
                             "state_key": "",
@@ -619,6 +863,9 @@ class SetCoursePlan(Resource):
                     )
                     return (500, {"error": "Internal server error", "written": written})
                 written.append(event_type)
+                if event_type == COURSE_MISSIONS_STATE_EVENT_TYPE:
+                    event_id = getattr(sent, "event_id", None)
+                    list_event_id = event_id if isinstance(event_id, str) else None
         logger.info(
             "set_course_plan: operator=%s room=%s %s -> %s changes=%s "
             "sent_as=%s dry_run=%s",
@@ -630,4 +877,12 @@ class SetCoursePlan(Resource):
             sender,
             req.dry_run,
         )
-        return (200, {**answer, "sender": sender, "changed": not req.dry_run})
+        return (
+            200,
+            {
+                **answer,
+                "sender": sender,
+                "changed": not req.dry_run,
+                "can_do_list_event_id": list_event_id,
+            },
+        )

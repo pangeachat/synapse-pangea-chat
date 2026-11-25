@@ -47,6 +47,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
     TypeGuard,
 )
@@ -719,6 +720,25 @@ class CourseMissionsReader:
             lo_id: _selected(entry)
             for lo_id, entry in _quest_entries(await self._quest(quest_id)).items()
         }
+
+    async def quest_language(self, quest_id: str) -> Optional[str]:
+        """The quest's target language, the one its courses list at."""
+        return quest_target_language(await self._quest(quest_id))
+
+    async def listable_ids(self, activity_ids: Sequence[str], l2: str) -> Set[str]:
+        """Which of these activity content ids the course listing lists at
+        ``l2`` (visible, canonical, not private), read by id as the builder
+        reads selections. Raises when the CMS cannot say."""
+        listed: Set[str] = set()
+        ids = list(dict.fromkeys(activity_ids))
+        for start in range(0, len(ids), SELECTED_CHUNK):
+            for doc in await self._selected_rows(
+                ids[start : start + SELECTED_CHUNK], l2
+            ):
+                activity_id = _plan(doc).get("activity_id")
+                if isinstance(activity_id, str) and _visible_at(doc, l2):
+                    listed.add(activity_id)
+        return listed
 
     async def _build(self, quest_id: str, deadline: float) -> BuiltCourseMissions:
         quest = await self._quest(quest_id)
