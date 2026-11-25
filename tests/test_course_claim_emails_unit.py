@@ -107,24 +107,26 @@ class TestClaimEmailTemplates(unittest.TestCase):
                 self.assertIn("Start my quest:", text)
                 self.assertIn("Tap the link again after you sign in", text)
 
-    def test_course_claimed_carries_class_link_and_claimer(self) -> None:
+    def test_course_claimed_sends_the_teacher_to_the_dashboard(self) -> None:
+        """The module's own share kit (#936): the course on the dashboard and the
+        Teacher Support calendar, and no class link, code or QR code."""
         env = self._env()
         for name in ("course_claimed.html", "course_claimed.txt"):
             with self.subTest(template=name):
                 out = env.get_template(name).render(
                     app_name="Pangea Chat",
                     course_title="Spanish 1",
-                    class_url="https://app.pangea.chat/cls4abc",
-                    class_code="cls4abc",
-                    class_qr_src="cid:class-qr.1@host",
+                    dashboard_url="https://hs.example/n?t=dash",
+                    support_url="https://hs.example/n?t=help",
                 )
-                self.assertIn("https://app.pangea.chat/cls4abc", out)
-                self.assertIn("cls4abc", out)
+                self.assertIn("Spanish 1 is ready", out)
+                self.assertIn("Add students", out)
+                self.assertIn("Buy student seats to Pangea Pro", out)
+                self.assertIn("https://hs.example/n?t=dash", out)
+                self.assertIn("https://hs.example/n?t=help", out)
+                self.assertNotIn("cid:", out)
+                self.assertNotIn("class code", out.lower())
                 self.assertNotIn("Apple Inc.", out)
-                if name.endswith(".html"):
-                    self.assertIn('src="cid:class-qr.1@host"', out)
-                else:
-                    self.assertNotIn("cid:", out)
 
     def test_html_escapes_request_text(self) -> None:
         out = (
@@ -278,7 +280,7 @@ class TestShareKitQrCode(unittest.IsolatedAsyncioTestCase):
         ]
         return course_claim_emails.CourseClaimMailer(api), sendmail
 
-    async def _send_claimed(self, rendered: dict[str, str] | None) -> Any:
+    async def _send_claimed(self, rendered: dict[str, Any] | None, **links: str) -> Any:
         import email
         from unittest.mock import patch
 
@@ -296,6 +298,7 @@ class TestShareKitQrCode(unittest.IsolatedAsyncioTestCase):
                 class_url=self.CLASS_URL,
                 class_code="cls4abc",
                 rendered=rendered,
+                **links,
             )
         sendmail.assert_awaited_once()
         args = sendmail.await_args.args
@@ -360,10 +363,53 @@ class TestShareKitQrCode(unittest.IsolatedAsyncioTestCase):
             self.CLASS_URL, message.get_payload()[1].get_payload(decode=True).decode()
         )
 
-    async def test_the_module_template_carries_the_qr_code(self) -> None:
-        message = await self._send_claimed(None)
-        self.assertEqual(message["Subject"], "Invite your students to Spanish 1")
-        self._assert_qr_attached(message)
+    async def test_the_module_template_carries_no_qr_code(self) -> None:
+        """The module's own share kit sends the teacher to the dashboard (#936):
+        its signed links, and no image part."""
+        message = await self._send_claimed(
+            None,
+            cta_url="https://hs.example/n?t=dash",
+            cta2_url="https://hs.example/n?t=help",
+        )
+        self.assertEqual(message["Subject"], "Spanish 1 is ready")
+        types = [part.get_content_type() for part in message.walk()]
+        self.assertNotIn("image/png", types)
+        html = message.get_payload()[1].get_payload(decode=True).decode()
+        self.assertIn("https://hs.example/n?t=dash", html)
+        self.assertIn("https://hs.example/n?t=help", html)
+
+    async def test_a_caller_kit_fills_its_signed_links(self) -> None:
+        """A kit with destinations: the signed links fill ``{{cta_url}}`` and
+        ``{{cta2_url}}``, and no class link is needed."""
+        message = await self._send_claimed(
+            {
+                "subject": "Spanish 1 is ready",
+                "html": '<p><a href="{{cta_url}}">Open</a> <a href="{{cta2_url}}">Help</a></p>',
+                "text": "Open: {{cta_url}} Help: {{cta2_url}}",
+            },
+            cta_url="https://hs.example/n?t=a&b=1",
+            cta2_url="https://hs.example/n?t=help",
+        )
+        plain = message.get_payload()[0].get_payload(decode=True).decode()
+        html = message.get_payload()[1].get_payload(decode=True).decode()
+        self.assertIn("Open: https://hs.example/n?t=a&b=1", plain)
+        self.assertIn('href="https://hs.example/n?t=a&amp;b=1"', html)
+        self.assertIn("https://hs.example/n?t=help", html)
+        self.assertIsNone(message["List-Unsubscribe"])
+
+    async def test_a_caller_unsubscribe_link_adds_the_one_click_headers(self) -> None:
+        unsubscribe = "https://api.pangea.chat/cms/u/abc"
+        message = await self._send_claimed(
+            {
+                "subject": "Spanish 1 is ready",
+                "html": f'<p><a href="{{{{cta_url}}}}">Open</a> <a href="{unsubscribe}">Unsubscribe</a></p>',
+                "text": f"Open: {{{{cta_url}}}} Unsubscribe: {unsubscribe}",
+                "unsubscribe_url": unsubscribe,
+            },
+            cta_url="https://hs.example/n?t=dash",
+        )
+        self.assertEqual(message["List-Unsubscribe"], f"<{unsubscribe}>")
+        self.assertEqual(message["List-Unsubscribe-Post"], "List-Unsubscribe=One-Click")
 
     def test_the_transport_the_mailer_borrows_takes_what_it_passes(self) -> None:
         """``_sendmail`` is Synapse-internal: a rename or a changed keyword

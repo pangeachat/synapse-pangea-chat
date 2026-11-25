@@ -1,9 +1,13 @@
-Congratulations! Your task-based conversation journey is ready to go!
+{{ course_title }} is ready
 
-You can invite your students to {{ course_title }} by sharing the link below:
+Open your course in the educator dashboard to:
+- Add students
+- Review Pangea Chat safety features
+- Edit your curriculum
+- Buy student seats to Pangea Pro
 
-{{ class_url }}
+Open dashboard:
+{{ dashboard_url }}
 
-Students will be directed to make an account, automatically enrolled in your class and be conversing in curriculum-aligned conversation activities in no time.
-
-Your students will receive a free 7-day trial on account creation and can subscribe in-app afterwards. If you'd like to cover your students' seats, just hit reply for an invoice, to redeem a promotional offer, or any other questions.
+Need help? Schedule a Teacher Support call with the team:
+{{ support_url }}

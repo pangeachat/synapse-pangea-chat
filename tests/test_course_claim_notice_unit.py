@@ -23,6 +23,20 @@ ROOM = "!course:my.domain.name"
 CLAIMER = "@rivera:my.domain.name"
 REQUESTED = "teacher@school.example"
 MODULE = "synapse_pangea_chat.email_invite.course_claim_notice"
+SECRET = b"claim-notice-test-secret"
+
+
+def _token(url: str) -> dict:
+    """The payload of a signed click link, verified."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from synapse_pangea_chat.notice_delivery.tokens import verify_token
+
+    parts = urlsplit(url)
+    assert parts.path == "/_synapse/client/pangea/v1/n", url
+    payload = verify_token(SECRET, parse_qs(parts.query)["t"][0], now_ms=1_000)
+    assert payload is not None
+    return payload
 
 
 def _notifier(
@@ -30,6 +44,8 @@ def _notifier(
 ) -> tuple[CourseClaimNotifier, MagicMock, MagicMock]:
     api: Any = MagicMock()
     api._hs.get_clock.return_value.time_msec.return_value = 1_000
+    api._hs.config.key.macaroon_secret_key = SECRET
+    api._hs.config.server.public_baseurl = "https://hs.example/"
     join_rules = MagicMock(type="m.room.join_rules")
     join_rules.content = {"join_rule": "knock"}
     if class_code is not None:
@@ -71,6 +87,67 @@ class TestNotify(unittest.IsolatedAsyncioTestCase):
         store.mark_notice_sent.assert_awaited_once_with(ROOM, CLAIMER, 1_000)
         self.capture.assert_not_called()
         self.assertIsNone(sent["rendered"])  # nothing stored: the module's template
+
+    async def test_the_module_template_links_the_course_on_the_dashboard(self) -> None:
+        notifier, _, mailer = _notifier(NoticeReservation(REQUESTED, 1))
+
+        await notifier.notify(ROOM, CLAIMER)
+
+        sent = mailer.send_course_claimed.await_args.kwargs
+        cta, cta2 = _token(sent["cta_url"]), _token(sent["cta2_url"])
+        self.assertEqual(cta["d"], {"k": "dashboard", "c": ROOM})
+        self.assertEqual((cta["u"], cta["l"], cta["o"]), (CLAIMER, "cta", "claim_mail"))
+        self.assertEqual(cta2["d"]["k"], "external")
+        self.assertTrue(cta2["d"]["u"].startswith("https://calendar.app.google/"))
+
+    async def test_stored_destinations_are_signed_with_the_claimed_course(
+        self,
+    ) -> None:
+        notifier, store, mailer = _notifier(NoticeReservation(REQUESTED, 1))
+        store.invitations.claimed_email_for_room = AsyncMock(
+            return_value={
+                "subject": "s",
+                "html": "{{cta_url}}",
+                "text": "{{cta_url}}",
+                "receiving_reason": "",
+                "destination": {"kind": "dashboard"},
+                "secondary_destination": None,
+                "unsubscribe_url": None,
+            }
+        )
+
+        await notifier.notify(ROOM, CLAIMER)
+
+        sent = mailer.send_course_claimed.await_args.kwargs
+        self.assertEqual(_token(sent["cta_url"])["d"], {"k": "dashboard", "c": ROOM})
+        self.assertEqual(sent["cta2_url"], "")
+
+    async def test_a_host_removed_from_the_allowlist_does_not_stop_the_mail(
+        self,
+    ) -> None:
+        """The policy retires a removed host's links at the click
+        (notice-delivery, "The click record"); the share kit still goes."""
+        from synapse_pangea_chat.config import PangeaChatConfig
+
+        notifier, store, mailer = _notifier(NoticeReservation(REQUESTED, 1))
+        notifier._config = PangeaChatConfig(notice_external_link_hosts=[])
+
+        await notifier.notify(ROOM, CLAIMER)
+
+        sent = mailer.send_course_claimed.await_args.kwargs
+        self.assertEqual(_token(sent["cta2_url"])["d"]["k"], "external")
+        store.mark_notice_sent.assert_awaited_once()
+
+    async def test_a_link_that_cannot_be_signed_leaves_the_notice_owed(self) -> None:
+        notifier, store, mailer = _notifier(NoticeReservation(REQUESTED, 1))
+        api: Any = notifier._api
+        api._hs.config.server.public_baseurl = None
+
+        await notifier.notify(ROOM, CLAIMER)
+
+        mailer.send_course_claimed.assert_not_awaited()
+        store.mark_notice_sent.assert_not_awaited()
+        self.capture.assert_called()
 
     async def test_the_callers_stored_email_is_what_goes_out(self) -> None:
         notifier, store, mailer = _notifier(NoticeReservation(REQUESTED, 1))

@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from synapse.api.errors import SynapseError
+from synapse.storage.engines import PostgresEngine
 from synapse.util.threepids import canonicalise_email
 
 from synapse_pangea_chat.email_invite.course_claims import admin_code_digest
@@ -42,6 +43,26 @@ SCHEMA = (
         previous_course_plan_id TEXT, course_plan_id TEXT NOT NULL,
         operator_id TEXT NOT NULL)""",
 )
+#: Columns added after their tables were first created, by table: each is added in place
+#: on first use. ``delivery_email`` is where the caller last asked the invitation's mail
+#: to go; ``requested_email`` stays the address an account claims by without a link.
+#: The claimed email's destinations are stored in their request form, as JSON.
+ADDED_COLUMNS = (
+    ("pangea_course_invitation", "delivery_email", "TEXT"),
+    ("pangea_course_invitation_claimed_email", "destination", "TEXT"),
+    ("pangea_course_invitation_claimed_email", "secondary_destination", "TEXT"),
+    ("pangea_course_invitation_claimed_email", "unsubscribe_url", "TEXT"),
+)
+#: What a stored claimed email holds, as ``claimed_email_for_room`` returns it.
+CLAIMED_EMAIL_FIELDS = (
+    "subject",
+    "html",
+    "text",
+    "receiving_reason",
+    "destination",
+    "secondary_destination",
+    "unsubscribe_url",
+)
 REPLACED_FIELDS = ("course_plan_id", "title", "description")
 COLUMNS = (
     "invitation_id",
@@ -54,6 +75,22 @@ COLUMNS = (
     "completed_at_ms",
 )
 SELECT = "SELECT " + ", ".join(COLUMNS) + " FROM pangea_course_invitation "
+
+
+def _columns(txn, table, postgres):
+    if postgres:
+        txn.execute(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_schema = current_schema() AND table_name = ?",
+            (table,),
+        )
+    else:
+        txn.execute("SELECT name FROM pragma_table_info(?)", (table,))
+    return {r[0] for r in txn.fetchall()}
+
+
+def _json_or_none(value):
+    return json.dumps(value, sort_keys=True) if value is not None else None
 
 
 def unavailable() -> SynapseError:
@@ -109,6 +146,17 @@ class CourseInvitationStore:
         def create(txn):
             for sql in SCHEMA:
                 txn.execute(sql)
+            postgres = isinstance(getattr(txn, "database_engine", None), PostgresEngine)
+            for table, column, kind in ADDED_COLUMNS:
+                if column in _columns(txn, table, postgres):
+                    continue
+                # Every process runs this on first use; on Postgres one that loses the
+                # race waits on the table lock and must then find the column added.
+                txn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN "
+                    + ("IF NOT EXISTS " if postgres else "")
+                    + f"{column} {kind}"
+                )
 
         await self.db.runInteraction("pangea_invitation_schema", create)
         self.ready = True
@@ -272,8 +320,10 @@ class CourseInvitationStore:
                 if not row or row[0] != "completed":
                     raise recovery_required()
                 return
+            # The share kit goes where the caller last sent this invitation's mail.
             txn.execute(
-                "SELECT requested_email FROM pangea_course_invitation WHERE invitation_id = ?",
+                "SELECT COALESCE(delivery_email, requested_email) FROM pangea_course_invitation"
+                " WHERE invitation_id = ?",
                 (invitation_id,),
             )
             email = txn.fetchone()[0]
@@ -286,7 +336,8 @@ class CourseInvitationStore:
                 (room_id, email, "invitation:" + invitation_id, now, user, now, now),
             )
             txn.execute(
-                "UPDATE pangea_course_invitation SET requested_email = NULL WHERE invitation_id = ?",
+                "UPDATE pangea_course_invitation SET requested_email = NULL, delivery_email = NULL"
+                " WHERE invitation_id = ?",
                 (invitation_id,),
             )
 
@@ -302,7 +353,8 @@ class CourseInvitationStore:
         def update(txn):
             txn.execute(
                 """UPDATE pangea_course_invitation
-                SET status = 'completed', completed_at_ms = ?, requested_email = NULL
+                SET status = 'completed', completed_at_ms = ?, requested_email = NULL,
+                    delivery_email = NULL
                 WHERE invitation_id = ? AND claimant = ? AND room_id = ? AND status = 'provisioning'""",
                 (now, invitation_id, user, room_id),
             )
@@ -375,6 +427,39 @@ class CourseInvitationStore:
 
         await self.db.runInteraction("pangea_invitation_delivery_finish", update)
 
+    async def delivery_address(self, invitation_id):
+        """Where this invitation's mail goes: the address the caller last gave, else
+        the requesting address. None once the invitation no longer holds one."""
+        await self.ensure()
+
+        def read(txn):
+            txn.execute(
+                "SELECT COALESCE(delivery_email, requested_email) FROM pangea_course_invitation"
+                " WHERE invitation_id = ?",
+                (invitation_id,),
+            )
+            row = txn.fetchone()
+            return row[0] if row else None
+
+        return await self.db.runInteraction("pangea_invitation_delivery_address", read)
+
+    async def set_delivery_address(self, invitation_id, email):
+        """Send this prepared invitation's mail, and its share kit at the claim, to
+        ``email`` from now on. The requesting address, which an account claims by
+        without a link, is unchanged. False when the invitation is no longer
+        prepared."""
+        await self.ensure()
+
+        def update(txn):
+            txn.execute(
+                "UPDATE pangea_course_invitation SET delivery_email = ?"
+                " WHERE invitation_id = ? AND status = 'prepared'",
+                (email, invitation_id),
+            )
+            return txn.rowcount == 1
+
+        return await self.db.runInteraction("pangea_invitation_set_delivery", update)
+
     async def store_claimed_email(self, invitation_id, email, now):
         """Keep the caller-rendered email to send when this invitation is claimed (the latest
         one the caller sent replaces any earlier)."""
@@ -383,9 +468,15 @@ class CourseInvitationStore:
             "pangea_course_invitation_claimed_email",
             keyvalues={"invitation_id": invitation_id},
             values={
-                **{
-                    k: email[k] for k in ("subject", "html", "text", "receiving_reason")
-                },
+                "subject": email["subject"],
+                "html": email["html"],
+                "text": email["text"],
+                "receiving_reason": email["receiving_reason"],
+                "destination": _json_or_none(email.get("destination")),
+                "secondary_destination": _json_or_none(
+                    email.get("secondary_destination")
+                ),
+                "unsubscribe_url": email.get("unsubscribe_url"),
                 "stored_at_ms": now,
             },
             desc="pangea_store_claimed_email",
@@ -397,18 +488,21 @@ class CourseInvitationStore:
 
         def read(txn):
             txn.execute(
-                """SELECT c.subject, c.html, c.text, c.receiving_reason
-                FROM pangea_course_invitation_claimed_email c
+                "SELECT "
+                + ", ".join("c." + f for f in CLAIMED_EMAIL_FIELDS)
+                + """ FROM pangea_course_invitation_claimed_email c
                 JOIN pangea_course_invitation i ON i.invitation_id = c.invitation_id
                 WHERE i.room_id = ?""",
                 (room_id,),
             )
             row = txn.fetchone()
-            return (
-                dict(zip(("subject", "html", "text", "receiving_reason"), row))
-                if row
-                else None
-            )
+            if not row:
+                return None
+            email = dict(zip(CLAIMED_EMAIL_FIELDS, row))
+            for field in ("destination", "secondary_destination"):
+                if email[field] is not None:
+                    email[field] = json.loads(email[field])
+            return email
 
         return await self.db.runInteraction("pangea_claimed_email_for_room", read)
 

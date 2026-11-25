@@ -1,11 +1,11 @@
 """Sending the claim notice, once, with a retry for a failed send.
 
-The notice is the second email of a requested course's claim: the class link,
-sent to the address the course was requested from
-(knock-with-code.instructions.md, "Claiming a course"). It is how the teacher
-gets the link to share, so a transient mail failure must not lose it: the admin
-code is already spent by then, and resubmitting the link answers "code not
-found".
+The notice is the second email of a requested course's claim, the share kit,
+sent to the address the course was requested from or the delivery address the
+caller last gave (knock-with-code.instructions.md, "Claiming a course"). It is
+how the teacher is sent on to the course, so a transient mail failure must not
+lose it: the admin code is already spent by then, and resubmitting the link
+answers "code not found".
 
 ``notify`` sends it under a lease from the claim store. ``knock_with_code``
 calls it right after the claim; a looping call retries every owed notice whose
@@ -32,6 +32,11 @@ from synapse_pangea_chat.moderation.compat import (
     background_process_args,
     looping_call_interval,
 )
+from synapse_pangea_chat.notice_delivery.common import (
+    CLICK_ORIGIN_CLAIM_MAIL,
+    signed_click_url,
+)
+from synapse_pangea_chat.notice_delivery.request import Destination
 from synapse_pangea_chat.room_code.constants import (
     ACCESS_CODE_JOIN_RULE_CONTENT_KEY,
     EVENT_TYPE_M_ROOM_JOIN_RULES,
@@ -59,6 +64,9 @@ logger = logging.getLogger(
 NOTICE_LEASE_MS = 10 * 60 * 1000
 #: How often the retry looks for owed notices.
 RETRY_INTERVAL_SECONDS = 5 * 60
+#: The Teacher Support calendar, the module's own share kit's second link (the
+#: engagement check-in's call to action).
+TEACHER_SUPPORT_URL = "https://calendar.app.google/mLWQeUmdB5pdLjK66"
 
 
 def _capture_exception(e: Exception) -> None:
@@ -125,12 +133,15 @@ class CourseClaimNotifier:
             # A read failure here raises: the notice stays owed and is retried, never sent from the
             # module's template in place of the caller's.
             rendered = await self._store.invitations.claimed_email_for_room(room_id)
+            cta_url, cta2_url = self._links(rendered, room_id, claimer_id)
             await self._mailer.send_course_claimed(
                 email_address=reservation.requested_email,
                 course_title=course_title,
                 class_url=build_join_url(self._config.app_base_url, class_code),
                 class_code=class_code,
                 rendered=rendered,
+                cta_url=cta_url,
+                cta2_url=cta2_url,
             )
             await self._store.mark_notice_sent(
                 room_id, claimer_id, self._clock.time_msec()
@@ -147,6 +158,43 @@ class CourseClaimNotifier:
                         f"Claim notice for {room_id} abandoned after {attempt} attempts"
                     )
                 )
+
+    def _links(
+        self, rendered: Optional[dict], room_id: str, claimer_id: str
+    ) -> tuple[str, str]:
+        """The share kit's signed links, made for the claiming account: to the caller's
+        stored destinations, with the claimed course filled in, or, for the module's
+        own template, to the course on the dashboard and the Teacher Support
+        calendar. Empty where a caller's email has no such link."""
+        if rendered is not None:
+            targets = [
+                rendered.get("destination"),
+                rendered.get("secondary_destination"),
+            ]
+        else:
+            targets = [
+                {"kind": "dashboard"},
+                {"kind": "external", "url": TEACHER_SUPPORT_URL},
+            ]
+        links = []
+        for target, link in zip(targets, ("cta", "cta2")):
+            if target is None:
+                links.append("")
+                continue
+            # Read back as stored, not parsed again: a host removed from the allowlist
+            # retires the link at the click and must not keep the share kit from going.
+            destination = Destination.stored(target).for_course(room_id)
+            links.append(
+                signed_click_url(
+                    self._api,
+                    self._config,
+                    user_id=claimer_id,
+                    destination=destination.compact(),
+                    link=link,
+                    origin=CLICK_ORIGIN_CLAIM_MAIL,
+                )
+            )
+        return links[0], links[1]
 
     async def _course_title_and_class_code(self, room_id: str) -> tuple[str, str]:
         state = await self._api.get_room_state(

@@ -20,6 +20,7 @@ from synapse.module_api import ModuleApi
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.notice_delivery.common import (
+    CLICK_ORIGIN_CLAIM_MAIL,
     LINK_NAMES,
     TOKEN_KIND_CLICK,
     app_url,
@@ -101,6 +102,7 @@ class NoticeClick(Resource):
                 self._config.app_base_url,
                 token_destination(payload),
                 self._config.notice_external_link_hosts,
+                self._config.admin_dash_base_url,
             )
             if not self._open_limiter.is_rate_limited(str(token)):
                 await self.record_open(payload)
@@ -126,6 +128,10 @@ class NoticeClick(Resource):
 
     async def record_open(self, payload: Dict[str, Any]) -> bool:
         """Persist the opened event; True when it was written."""
+        if payload.get("o") == CLICK_ORIGIN_CLAIM_MAIL:
+            # silent-ok: claim mail is not a notice in the bot DM, so there is no event to
+            # record its open against; its links are signed for the destination only.
+            return False
         room_id = payload.get("r")
         notice_event_id = payload.get("e")
         if not isinstance(room_id, str) or not isinstance(notice_event_id, str):

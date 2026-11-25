@@ -140,6 +140,11 @@ class TestDestinationParsing(unittest.TestCase):
             "app with an id": {"kind": "app", "activity_id": "act"},
             "subscription with a url": {"kind": "subscription", "url": BOOKING},
             "course with an activity": {**COURSE, "activity_id": "act"},
+            "dashboard with a bad room id": {
+                "kind": "dashboard",
+                "course_room_id": "x",
+            },
+            "dashboard with a url": {"kind": "dashboard", "url": BOOKING},
         }
         for name, destination in cases.items():
             with self.subTest(name=name), self.assertRaises(ValueError) as error:
@@ -230,6 +235,30 @@ class TestDestinationParsing(unittest.TestCase):
         )
 
 
+class TestClaimedCourseDestinations(unittest.TestCase):
+    """A claimed email's destinations are stored before the course exists (#936)."""
+
+    def test_a_course_destination_may_leave_its_course_for_the_claim(self):
+        hosts = ["calendar.app.google"]
+        with self.assertRaises(ValueError):
+            Destination.parse({"kind": "course"}, hosts)
+        for kind in ("course", "dashboard"):
+            with self.subTest(kind=kind):
+                stored = Destination.parse({"kind": kind}, hosts, claimed_course=True)
+                self.assertEqual(stored.as_request(), {"kind": kind})
+                self.assertEqual(
+                    stored.for_course("!new:x").compact(), {"k": kind, "c": "!new:x"}
+                )
+        named = Destination.parse(
+            {"kind": "course", "course_room_id": "!old:x"}, hosts, claimed_course=True
+        )
+        self.assertEqual(named.for_course("!new:x").course_room_id, "!old:x")
+        external = Destination.parse(
+            {"kind": "external", "url": BOOKING}, hosts, claimed_course=True
+        )
+        self.assertIs(external.for_course("!new:x"), external)
+
+
 class TestClickResolution(unittest.IsolatedAsyncioTestCase):
     def _token(self, **extra):
         payload = {
@@ -273,6 +302,12 @@ class TestClickResolution(unittest.IsolatedAsyncioTestCase):
                 {"k": "workspace", "p": "/?c=%21course%3Ax&left=practice"},
                 "https://app.example.test/?c=%21course%3Ax&left=practice",
             ),
+            # The dashboard's own id form: dots escaped, so its static export
+            # does not reload the page (admin-dash src/lib/route-id.ts).
+            "dashboard": (
+                {"k": "dashboard", "c": "!course:pangea.chat"},
+                "https://admin.pangea.chat/courses/%21course%3Apangea%2Echat/",
+            ),
         }
         for kind, (compact, expected) in cases.items():
             with self.subTest(kind=kind):
@@ -284,6 +319,33 @@ class TestClickResolution(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(event["content"]["link"], "cta")
                 self.assertEqual(event["content"]["destination_kind"], kind)
                 self.assertEqual(event["content"]["notification_event_id"], "$notice:x")
+
+    async def test_a_dashboard_link_without_a_course_opens_the_course_list(self):
+        redirect = await self._click(_api(), self._token(d={"k": "dashboard"}, l="cta"))
+        self.assertEqual(redirect, "https://admin.pangea.chat/courses")
+
+    async def test_a_claim_mail_link_redirects_without_recording_an_open(self):
+        """Claim mail is not a notice in the bot DM: its link carries no notice
+        event, lands where it was signed for, and writes nothing."""
+        api = _api()
+        token = tokens.sign_token(
+            SECRET,
+            {
+                "k": "click",
+                "u": USER,
+                "d": {"k": "dashboard", "c": "!course:x"},
+                "l": "cta",
+                "o": "claim_mail",
+            },
+            now_ms=NOW_MS,
+            ttl_ms=10_000,
+        )
+        with self.assertNoLogs(
+            "synapse.module.synapse_pangea_chat.notice_delivery.click", "WARNING"
+        ):
+            redirect = await self._click(api, token)
+        self.assertEqual(redirect, "https://admin.pangea.chat/courses/%21course%3Ax/")
+        api.create_and_send_event_into_room.assert_not_awaited()
 
     async def test_the_second_link_records_which_link_was_opened(self):
         api = _api()

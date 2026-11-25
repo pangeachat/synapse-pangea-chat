@@ -8,11 +8,13 @@ from synapse.api.errors import Codes, SynapseError
 from synapse.http import server
 from synapse.http.server import respond_with_json
 from synapse.logging.context import run_in_background
+from synapse.util.threepids import canonicalise_email
 from twisted.mail.smtp import SMTPDeliveryError
 from twisted.web.resource import Resource
 
 from synapse_pangea_chat.email_invite.build_join_url import build_join_url
 from synapse_pangea_chat.email_invite.course_claim_emails import (
+    unsubscribe_url_problem,
     validate_claimed,
     validate_rendered,
 )
@@ -21,6 +23,7 @@ from synapse_pangea_chat.email_invite.request_fields import (
     _capture_exception,
     _text_field,
 )
+from synapse_pangea_chat.notice_delivery.request import Destination
 from synapse_pangea_chat.room_code.code_lookup import new_unique_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 from synapse_pangea_chat.set_course_plan.set_course_plan import parse_request
@@ -337,7 +340,21 @@ class CourseInvitationAPI(Resource):
             if not isinstance(reason, str) or len(reason) > 2000:
                 raise SynapseError(400, "Invalid receiving_reason")
             rendered.update(html=html, text=text, receiving_reason=reason.strip())
-        claimed = self._claimed_email(body)
+        if body.get("unsubscribe_url") is not None:
+            # The caller holds the refusal and wrote its own link in; the module adds
+            # the one-click headers for it and passes the link through.
+            if "html" not in rendered:
+                raise SynapseError(
+                    400, "unsubscribe_url needs the rendered html and text"
+                )
+            problem = unsubscribe_url_problem(
+                body["unsubscribe_url"], rendered["html"], rendered["text"]
+            )
+            if problem:
+                raise SynapseError(400, problem)
+            rendered["unsubscribe_url"] = body["unsubscribe_url"]
+        send_to = _email_field(body, "send_to")
+        claimed = self._claimed_email(body, self.config.notice_external_link_hosts)
         invitation = await self.invitations.get(ident)
         if not invitation:
             raise SynapseError(404, "Invitation not found")
@@ -346,19 +363,22 @@ class CourseInvitationAPI(Resource):
                 409,
                 "Recover partial claims before sending; completed or revoked invitations cannot be reminded",
             )
+        if send_to is not None and not await self.invitations.set_delivery_address(
+            ident, send_to
+        ):
+            raise SynapseError(409, "The invitation is no longer prepared")
         if claimed is not None:
             # Stored before the send, so the share kit at claim is the caller's whatever this
             # delivery's outcome.
             await self.invitations.store_claimed_email(
                 ident, claimed, self.api._hs.get_clock().time_msec()
             )
-        await self.send(
-            ident, await self.code(), invitation["requested_email"], rendered=rendered
-        )
+        address = send_to or await self.invitations.delivery_address(ident)
+        await self.send(ident, await self.code(), address, rendered=rendered)
         return await self.invitations.status(ident)
 
     @staticmethod
-    def _claimed_email(body):
+    def _claimed_email(body, external_link_hosts):
         """The caller-rendered email to send at the claim, validated, or None."""
         given = body.get("claimed_email")
         if given is None:
@@ -372,13 +392,45 @@ class CourseInvitationAPI(Resource):
         }
         if not all(email.values()):
             raise SynapseError(400, "claimed_email needs subject, html and text")
-        problem = validate_claimed(email["html"], email["text"])
+        for field in ("destination", "secondary_destination"):
+            if given.get(field) is None:
+                email[field] = None
+                continue
+            try:
+                # Stored before the course exists: a course or dashboard destination may
+                # leave its course out for the claim to fill.
+                email[field] = Destination.parse(
+                    given[field],
+                    external_link_hosts,
+                    name=f"claimed_email.{field}",
+                    claimed_course=True,
+                ).as_request()
+            except ValueError as error:
+                raise SynapseError(400, str(error)) from error
+        if email["secondary_destination"] is not None and email["destination"] is None:
+            raise SynapseError(
+                400, "claimed_email.secondary_destination needs a destination"
+            )
+        problem = validate_claimed(
+            email["html"],
+            email["text"],
+            destination=email["destination"] is not None,
+            secondary=email["secondary_destination"] is not None,
+        )
         if problem:
             raise SynapseError(400, "claimed_email: " + problem)
         reason = given.get("receiving_reason", "")
         if not isinstance(reason, str) or len(reason) > 2000:
             raise SynapseError(400, "Invalid claimed_email.receiving_reason")
         email["receiving_reason"] = reason.strip()
+        email["unsubscribe_url"] = None
+        if given.get("unsubscribe_url") is not None:
+            problem = unsubscribe_url_problem(
+                given["unsubscribe_url"], email["html"], email["text"]
+            )
+            if problem:
+                raise SynapseError(400, "claimed_email: " + problem)
+            email["unsubscribe_url"] = given["unsubscribe_url"]
         return email
 
     async def send(self, ident, code, email, spec=None, rendered=None):
@@ -422,3 +474,16 @@ class CourseInvitationAPI(Resource):
             await self.invitations.finish_delivery(attempt, outcome, clock.time_msec())
             return
         await self.invitations.finish_delivery(attempt, "accepted", clock.time_msec())
+
+
+def _email_field(body, name):
+    """An optional email address in the request, canonicalised, or None."""
+    value = body.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > 320 or "@" not in value:
+        raise SynapseError(400, f"{name} must be an email address")
+    try:
+        return canonicalise_email(value)
+    except ValueError as error:
+        raise SynapseError(400, f"{name} must be an email address") from error

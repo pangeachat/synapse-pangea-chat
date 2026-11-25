@@ -119,6 +119,9 @@ class TestV2RemindCallerRendered(unittest.IsolatedAsyncioTestCase):
         invitations.status = AsyncMock(
             return_value={"invitation_id": "inv-1", "status": "prepared"}
         )
+        invitations.delivery_address = AsyncMock(return_value="t@x.org")
+        invitations.set_delivery_address = AsyncMock(return_value=True)
+        invitations.store_claimed_email = AsyncMock()
         resource = CourseInvitationAPI(
             api, PangeaChatConfig(), MagicMock(), invitations, MagicMock(), "reminder"
         )
@@ -185,6 +188,104 @@ class TestV2RemindCallerRendered(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertNotIn("html", r.send.await_args.kwargs["rendered"])
+
+    def _body(self, **extra: Any) -> dict:
+        return {
+            "invitation_id": "inv-1",
+            "subject": "s",
+            "body": "b",
+            "cta_label": "Accept",
+            "html": '<a href="{{cta_url}}">Accept</a>',
+            "text": "Accept: {{cta_url}}",
+            **extra,
+        }
+
+    async def test_send_to_becomes_the_delivery_address(self) -> None:
+        """A corrected address (#936): this reminder goes there, and so does every
+        later send; the requesting address is left alone."""
+        r = self._resource()
+        await r.remind(self._body(send_to="New@X.org"))
+        r.invitations.set_delivery_address.assert_awaited_once_with(
+            "inv-1", "new@x.org"
+        )
+        self.assertEqual(r.send.await_args.args[2], "new@x.org")
+        r.send.reset_mock()
+        await r.remind(self._body())
+        self.assertEqual(r.send.await_args.args[2], "t@x.org")
+
+    async def test_a_bad_send_to_is_refused_before_anything_is_written(self) -> None:
+        from synapse.api.errors import SynapseError
+
+        r = self._resource()
+        for bad in ("nobody", 7, "a@" + "x" * 400):
+            with self.subTest(bad=bad), self.assertRaises(SynapseError) as caught:
+                await r.remind(self._body(send_to=bad))
+            self.assertEqual(caught.exception.code, 400)
+        r.invitations.set_delivery_address.assert_not_awaited()
+        r.send.assert_not_awaited()
+
+    async def test_an_unsubscribe_link_must_be_shown_in_both_parts(self) -> None:
+        from synapse.api.errors import SynapseError
+
+        link = "https://api.pangea.chat/cms/u/abc?x=1&y=2"
+        r = self._resource()
+        await r.remind(
+            self._body(
+                html=f'<a href="{{{{cta_url}}}}">A</a><a href="{link.replace("&", "&amp;")}">U</a>',
+                text=f"A: {{{{cta_url}}}} U: {link}",
+                unsubscribe_url=link,
+            )
+        )
+        self.assertEqual(r.send.await_args.kwargs["rendered"]["unsubscribe_url"], link)
+        for extra in (
+            {"unsubscribe_url": link},  # not shown in either part
+            {
+                "unsubscribe_url": "http://api.pangea.chat/u",
+                "text": "http://api.pangea.chat/u {{cta_url}}",
+            },
+        ):
+            with self.subTest(extra=extra), self.assertRaises(SynapseError) as caught:
+                await r.remind(self._body(**extra))
+            self.assertEqual(caught.exception.code, 400)
+
+    async def test_a_claimed_email_stores_its_destinations(self) -> None:
+        """The claimed email's links are destinations, signed at the claim; a
+        dashboard destination may leave its course for the claim to fill."""
+        from synapse.api.errors import SynapseError
+
+        r = self._resource()
+        claimed = {
+            "subject": "Spanish 1 is ready",
+            "html": '<a href="{{cta_url}}">Open</a> <a href="{{cta2_url}}">Help</a>',
+            "text": "Open: {{cta_url}} Help: {{cta2_url}}",
+            "destination": {"kind": "dashboard"},
+            "secondary_destination": {
+                "kind": "external",
+                "url": "https://calendar.app.google/abc",
+            },
+        }
+        await r.remind(self._body(claimed_email=claimed))
+        stored = r.invitations.store_claimed_email.await_args.args[1]
+        self.assertEqual(stored["destination"], {"kind": "dashboard"})
+        self.assertEqual(
+            stored["secondary_destination"],
+            {"kind": "external", "url": "https://calendar.app.google/abc"},
+        )
+        for broken in (
+            {
+                **claimed,
+                "secondary_destination": None,
+            },  # {{cta2_url}} with no destination
+            {**claimed, "destination": None, "secondary_destination": None},
+            {
+                **claimed,
+                "destination": {"kind": "external", "url": "https://evil.example/"},
+            },
+            {**claimed, "destination": {"kind": "course", "course_room_id": "nope"}},
+        ):
+            with self.assertRaises(SynapseError) as caught:
+                await r.remind(self._body(claimed_email=broken))
+            self.assertEqual(caught.exception.code, 400)
 
 
 class TestV2PrepareWithoutEmail(unittest.IsolatedAsyncioTestCase):
