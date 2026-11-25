@@ -590,6 +590,7 @@ class TestCourseManagementRoute(_Base):
             self.h.claims.unmanaged,
             enabled,
             cast(Controls, self.controls),
+            cast(Any, None),
         )
 
     async def test_a_course_that_is_not_protected_moves_no_one(self):
@@ -692,7 +693,9 @@ class TestCourseManagementRoute(_Base):
         self.h.main.server_admins.add("@ops:x")
         self.assertEqual(await h.manage("@ops:x", args), (200, {"managed": [STUDENT]}))
         self.assertEqual(self.controls.reconciled, [[STUDENT]])
-        self.assertEqual(await h.mine(STUDENT), (200, {"user": STUDENT}))
+        self.assertEqual(
+            await h.mine(STUDENT), (200, {"user": STUDENT, "graduations": []})
+        )
 
 
 class FakeControls:

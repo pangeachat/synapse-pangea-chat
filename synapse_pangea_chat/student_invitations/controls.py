@@ -510,8 +510,11 @@ class Controls:
     async def reconcile(self, user_id: str) -> None:
         """Leave the course rooms the controls refuse, marked ``REMOVED_BY``;
         rejoin the marked ones they allow (and every one once the student is
-        no longer managed, as at graduation)."""
+        no longer managed, as at graduation, which also drops them from the
+        set)."""
         courses = (await self.managing([user_id])).get(user_id, [])
+        if not courses and self._managed is not None:
+            self._managed -= {user_id}
         for room_id in sorted(await self._main.get_rooms_for_user(user_id)):
             owners = await self._owners(room_id)
             control = in_room(courses, room_id, owners)

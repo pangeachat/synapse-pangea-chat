@@ -38,6 +38,9 @@ DEFAULT_LIMITS: Dict[str, Tuple[int, int]] = {
     "course_management_mine": (60, 60),
     "course_management_answer": (10, 60),
     "course_management_manage_members": (10, 60),
+    "course_management_graduate": (30, 60),
+    "course_management_graduation_seen": (10, 60),
+    "course_management_move": (10, 60),
     # Canvas (CONTRACTS C5 L1-L2, C2 T10-T11). The link step may come without
     # a token (a bound ticket), so it counts per client IP.
     "lti_link": (30, 60),

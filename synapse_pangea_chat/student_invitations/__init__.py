@@ -24,6 +24,7 @@ from synapse_pangea_chat.student_invitations.api import (
 from synapse_pangea_chat.student_invitations.approvals import Approvals
 from synapse_pangea_chat.student_invitations.claim import StudentClaims
 from synapse_pangea_chat.student_invitations.controls import Controls
+from synapse_pangea_chat.student_invitations.graduation import Graduation
 from synapse_pangea_chat.student_invitations.invite_email import InviteMailer
 from synapse_pangea_chat.student_invitations.membership_callback import (
     MembershipRelease,
@@ -99,6 +100,7 @@ def register_student_invitations(
         claims.unmanaged,
         config.protected_courses_enabled,
         controls,
+        Graduation(api, admins, controls),
     )
     routes: Dict[str, Tuple[str, str, str, Callable[..., Any]]] = {
         # route name: (path, method, kind, handler)
@@ -211,6 +213,24 @@ def register_student_invitations(
             "POST",
             "student",
             p.manage,
+        ),
+        "course_management_graduate": (
+            "course_management/graduate",
+            "POST",
+            "teacher",
+            p.graduate,
+        ),
+        "course_management_graduation_seen": (
+            "course_management/graduation_seen",
+            "POST",
+            "student",
+            p.graduation_seen,
+        ),
+        "course_management_move": (
+            "course_management/move",
+            "POST",
+            "student",
+            p.move,
         ),
     }
     for name, (path, method, kind, handler) in routes.items():

@@ -298,6 +298,8 @@ class TestClaimRules(_Base):
                 "status": "managed",
                 "joined_via": "grant",
                 "joined_at_ms": 4,
+                "graduated_by": None,
+                "graduated_at_ms": None,
             },
         )
         # A verified match needs no request at all.
@@ -371,6 +373,8 @@ class TestClaimRules(_Base):
                 "status",
                 "joined_via",
                 "joined_at_ms",
+                "graduated_by",
+                "graduated_at_ms",
             },
         )
         self.assertEqual((record["user_id"], record["course_room_id"]), (STUDENT, ROOM))
@@ -2390,6 +2394,8 @@ class TestMigration(_Base):
                     "status": "managed",
                     "joined_via": None,
                     "joined_at_ms": None,
+                    "graduated_by": None,
+                    "graduated_at_ms": None,
                 },
             )
 
@@ -2408,6 +2414,9 @@ class TestMigration(_Base):
                 "status",
                 "joined_via",
                 "joined_at_ms",
+                "graduated_by",
+                "graduated_at_ms",
+                "graduation_seen_ms",
             },
         )
         self.assertEqual(
