@@ -262,6 +262,15 @@ class Controls:
                 )
         return result
 
+    async def protected_courses(self, user_id: str) -> Tuple[str, ...]:
+        """The Protected courses managing ``user_id``, whose Safety pages
+        list what moderation flags from them in any chat. Raises when the
+        records cannot be read; the moderation recorder logs it."""
+        if user_id not in await self.known():
+            return ()
+        courses = (await self.managing([user_id])).get(user_id, [])
+        return tuple(course.room_id for course in courses)
+
     async def _owners(self, room_id: str) -> Tuple[str, ...]:
         return await self._courses.for_room(room_id, self._courses.position_now())
 

@@ -7,13 +7,17 @@ flag."""
 
 from __future__ import annotations
 
+import json
 import time
-from typing import Any, Dict, Optional
+import uuid
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
+import psycopg2
 import requests
 
 from tests.base_e2e import BaseSynapseE2ETest
+from tests.mock_moderation_server import MockModerationServer
 
 P = "/_synapse/client/pangea/v1/"
 CODE = "pr0tect"
@@ -537,3 +541,122 @@ class TestProtectedCoursesE2E(BaseSynapseE2ETest):
         mine = self.ok("GET", P + "course_management/mine", s_token)
         self.assertEqual([c["room_id"] for c in mine["courses"]], [second])
         self.refused(self.dm(s_token, outsider), "outside.dms")
+
+
+class TestProtectedModerationE2E(BaseSynapseE2ETest):
+    """A managed student's flags reach the Protected course from any chat;
+    everyone else's, and every report, stay with the chat's own course. Its
+    own class: the moderation config is a homeserver of its own."""
+
+    moderation: MockModerationServer
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.moderation = MockModerationServer().start()
+        cls.addClassCleanup(cls.moderation.stop)
+
+    call = TestProtectedCoursesE2E.call
+    ok = TestProtectedCoursesE2E.ok
+    state = TestProtectedCoursesE2E.state
+    course = TestProtectedCoursesE2E.course
+    chat = TestProtectedCoursesE2E.chat
+    set_controls = TestProtectedCoursesE2E.set_controls
+    invite_and_join = TestProtectedCoursesE2E.invite_and_join
+
+    def flag(self, room: str, token: str) -> str:
+        sent = self.call(
+            "PUT",
+            f"/_matrix/client/v3/rooms/{quote(room)}/send/m.room.message/"
+            f"t{time.monotonic_ns()}",
+            token,
+            body={"msgtype": "m.text", "body": "FLAGME you are awful"},
+        )
+        self.assertEqual(sent.status_code, 200, sent.text)
+        return str(sent.json()["event_id"])
+
+    def course_ids(self, incident_id: str) -> List[str]:
+        """The row's stored courses, once Tier 2 has written it."""
+        conn = psycopg2.connect(self.database_url)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                for _ in range(120):
+                    cur.execute(
+                        "SELECT course_ids FROM pangea_safety_incidents"
+                        " WHERE incident_id = %s",
+                        (incident_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        return list(json.loads(row[0]))
+                    time.sleep(0.5)
+        finally:
+            conn.close()
+        self.fail(f"{incident_id} was never written")
+
+    async def test_a_managed_students_flags_reach_the_protected_course(
+        self,
+    ) -> None:
+        moderation = {
+            "tier2_enabled": True,
+            "choreo_base_url": self.moderation.base_url,
+            "choreo_access_token": "syt_mock_service_token",
+        }
+        await self.homeserver(
+            module_config={**CONFIG, "moderation": moderation},
+            synapse_config_overrides=LIMITS,
+        )
+        teacher, t_token = await self.new_user("teacher")
+        student, s_token = await self.new_user("student")
+        mate, m_token = await self.new_user("mate")
+        _, o_token = await self.new_user("outsider")
+        server = teacher.split(":", 1)[1]
+        other = self.course(o_token)
+        other_chat = self.chat(other, o_token, server)
+        course = self.course(t_token)
+        course_chat = self.chat(course, t_token, server)
+        self.set_controls(
+            course, t_token, protected=True, outside={"other_courses": True}
+        )
+        for user, token in ((student, s_token), (mate, m_token)):
+            self.invite_and_join(course, t_token, user, token)
+        for room in (course_chat, other, other_chat):
+            self.ok("POST", f"/_matrix/client/v3/join/{quote(room)}", s_token, body={})
+        dm = self.ok(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            s_token,
+            body={"preset": "private_chat", "is_direct": True, "invite": [mate]},
+        )["room_id"]
+        self.ok("POST", f"/_matrix/client/v3/join/{quote(dm)}", m_token, body={})
+
+        in_other = self.flag(other_chat, s_token)
+        in_dm = self.flag(dm, s_token)
+        in_course = self.flag(course_chat, s_token)
+        by_outsider = self.flag(other_chat, o_token)
+        report = self.ok(
+            "POST",
+            P + "report",
+            m_token,
+            body={
+                "report_id": str(uuid.uuid4()),
+                "room_id": dm,
+                "event_id": in_dm,
+                "reason": "rude",
+            },
+        )["incident_id"]
+
+        self.assertEqual(self.course_ids(f"mod:{in_other}"), [other, course])
+        self.assertEqual(self.course_ids(f"mod:{in_dm}"), [course])
+        self.assertEqual(self.course_ids(f"mod:{in_course}"), [course])
+        self.assertEqual(self.course_ids(f"mod:{by_outsider}"), [other])
+        self.assertEqual(self.course_ids(report), [])
+        # Read back as the Protected course's admin sees it.
+        listed = self.ok(
+            "GET", P + "safety_incidents", t_token, params={"space_id": course}
+        )["incidents"]
+        self.assertEqual(
+            sorted(i["event_id"] for i in listed),
+            sorted([in_other, in_dm, in_course]),
+        )
