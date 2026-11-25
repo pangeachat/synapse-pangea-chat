@@ -26,3 +26,5 @@ USERS_POWER_LEVEL_KEY = "users"  # existing power level key
 PANGEA_COURSE_PLAN_STATE_EVENT_TYPE = "pangea.course_plan"
 PANGEA_ACTIVITY_PLAN_STATE_EVENT_TYPE = "pangea.activity_plan"
 PANGEA_ACTIVITY_ROLE_STATE_EVENT_TYPE = "pangea.activity_roles"
+# Projected to its Protected flag, so the app can warn before a knock (#799).
+PANGEA_COURSE_MANAGEMENT_STATE_EVENT_TYPE = "pangea.course_management"

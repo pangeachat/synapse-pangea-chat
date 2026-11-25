@@ -155,7 +155,7 @@ class TestKnockWithCodeResponses(unittest.IsolatedAsyncioTestCase):
             RoomCodeMatch(room_id=ROOM_2, is_admin_code=False),
         ]
 
-        async def invite(api, user_id, room_id):
+        async def invite(api, user_id, room_id, via=None):
             if room_id == ROOM_1:
                 raise RuntimeError("boom")
 

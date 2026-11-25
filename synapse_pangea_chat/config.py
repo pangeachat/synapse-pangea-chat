@@ -236,6 +236,11 @@ class PangeaChatConfig:
     # only; the rule itself is fixed by design.
     blocked_join_gate_enabled: bool = True
 
+    # --- protected courses (#799) ---
+    # Stands in for the verified-educator check (#793) until it exists: off,
+    # no course can be made Protected.
+    protected_courses_enabled: bool = False
+
     # --- course_default_chats config ---
     # Keeps a space's default chats complete (every member joined, space
     # admins as chat admins) and serves the repair endpoint. The off switch

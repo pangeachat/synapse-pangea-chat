@@ -13,10 +13,13 @@ The tables (SPEC §6):
   2026-10-10). A request is written only when an account opens an invitation
   whose address it does not have verified; it carries the teacher's decision
   (null, granted, denied). A verified match claims with no request.
-- ``pangea_managed_account``: written by every claim (``created_at`` only).
-  Nothing here deletes it: management ends only when a course admin graduates
-  the student (managed-accounts doc; pangeachat/.github#799), so leaving,
-  removal, a ban, a withdrawn invitation and promotion to admin keep it.
+- ``pangea_managed_account``: written by every claim, and by a join of a
+  Protected course (``protected.py``), with how and when the student joined.
+  ``status`` is ``managed``, or ``asked``/``declined`` for a member who was
+  in a course before it became Protected. Nothing here deletes it: management
+  ends only when a course admin graduates the student (managed-accounts doc;
+  pangeachat/.github#799), so leaving, removal, a ban, a withdrawn invitation
+  and promotion to admin keep it.
 - ``pangea_seat_invitation_event``: the append-only activity ledger
   (``events.py``), written in the same transaction as each change.
 - ``pangea_managed_account_event``: the append-only managed-account ledger
@@ -55,6 +58,8 @@ from synapse_pangea_chat.student_invitations.events import (
 )
 from synapse_pangea_chat.student_invitations.managed_events import (
     MANAGED_EVENT_SCHEMA,
+    MANAGEMENT_ASKED,
+    MANAGEMENT_DECLINED,
     MANAGEMENT_STARTED,
     VIA_CANVAS,
     VIA_EMAIL,
@@ -117,6 +122,9 @@ SCHEMA = (
         user_id TEXT NOT NULL,
         course_room_id TEXT NOT NULL,
         created_at_ms BIGINT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'managed',
+        joined_via TEXT,
+        joined_at_ms BIGINT,
         PRIMARY KEY (user_id, course_room_id))""",
     )
     + EVENT_SCHEMA
@@ -153,7 +161,27 @@ _REQUEST_SELECT = (
 # T12's field names for the event columns (event_id, ts_ms, actor, action,
 # invitation_id, count).
 EVENT_COLUMNS = ("event_id", "time_ms", "actor", "action", "target", "count")
-MANAGED_EVENT_COLUMNS = ("event_id", "time_ms", "user_id", "actor", "action", "via")
+MANAGED_EVENT_COLUMNS = (
+    "event_id",
+    "time_ms",
+    "user_id",
+    "actor",
+    "action",
+    "via",
+    "detail",
+)
+RECORD_COLUMNS = (
+    "user_id",
+    "course_room_id",
+    "created_at_ms",
+    "status",
+    "joined_via",
+    "joined_at_ms",
+)
+_RECORD_SELECT = "SELECT " + ", ".join(RECORD_COLUMNS) + " FROM pangea_managed_account "
+MANAGED = "managed"
+ASKED = "asked"
+DECLINED = "declined"
 EVENTS_PAGE = 100
 
 # (lti_issuer, lti_context_id, lti_user_id): a Canvas identity.
@@ -417,7 +445,7 @@ class StudentInvitationStore:
 
         def select(txn: Any) -> List[Dict[str, Any]]:
             txn.execute(
-                "SELECT event_id, ts_ms, user_id, actor, action, via"
+                "SELECT event_id, ts_ms, user_id, actor, action, via, detail"
                 " FROM pangea_managed_account_event"
                 " WHERE room_id = ?"
                 " AND (? IS NULL OR ts_ms >= ?)"
@@ -462,17 +490,180 @@ class StudentInvitationStore:
         await self.ensure()
 
         def select(txn: Any) -> Optional[Dict]:
-            txn.execute(
-                "SELECT user_id, course_room_id, created_at_ms"
-                " FROM pangea_managed_account WHERE user_id = ? AND course_room_id = ?",
-                (user_id, room_id),
-            )
-            raw = txn.fetchone()
-            if raw is None:
-                return None
-            return dict(zip(("user_id", "course_room_id", "created_at_ms"), raw))
+            return _record(txn, user_id, room_id)
 
         return await self.db.runInteraction("pangea_managed_account_get", select)
+
+    async def managed_in_room(self, room_id: str) -> List[Dict[str, Any]]:
+        """Every record of this course, managed, asked or declined, for the
+        roster."""
+        await self.ensure()
+
+        def select(txn: Any) -> List[Dict]:
+            txn.execute(
+                _RECORD_SELECT + "WHERE course_room_id = ? ORDER BY user_id",
+                (room_id,),
+            )
+            return [dict(zip(RECORD_COLUMNS, raw)) for raw in txn.fetchall()]
+
+        return await self.db.runInteraction("pangea_managed_account_room", select)
+
+    # --- Protected courses (protected.py) ---
+
+    async def start_managed(
+        self,
+        room_id: str,
+        user_id: str,
+        *,
+        actor: str,
+        via: Optional[str],
+        joined_at_ms: Optional[int],
+        now_ms: int,
+    ) -> bool:
+        """Manage this member: a new record, or an asked or declined one made
+        managed (``via`` None keeps the one it has). Returns whether
+        management started now."""
+        await self.ensure()
+
+        def write(txn: Any) -> bool:
+            return _insert_managed(
+                txn,
+                user_id,
+                room_id,
+                now_ms,
+                actor=actor,
+                via=via,
+                at=joined_at_ms,
+                start=True,
+            )
+
+        return await self.db.runInteraction("pangea_managed_account_start", write)
+
+    async def ask(
+        self,
+        room_id: str,
+        members: Sequence[Tuple[str, str, Optional[int]]],
+        actor: str,
+        now_ms: int,
+    ) -> List[str]:
+        """Record each (member, how joined, when) as ``asked``, with a
+        ``management_asked`` row: one with no record yet, or managed by a
+        claim made before the course became Protected at ``now_ms``, which
+        did not ask them. Returns those asked."""
+        await self.ensure()
+
+        def write(txn: Any) -> List[str]:
+            asked: List[str] = []
+            for user_id, via, joined_at_ms in members:
+                txn.execute(
+                    "INSERT INTO pangea_managed_account (user_id, course_room_id,"
+                    " created_at_ms, status, joined_via, joined_at_ms)"
+                    " VALUES (?, ?, ?, 'asked', ?, ?)"
+                    " ON CONFLICT (user_id, course_room_id) DO NOTHING",
+                    (user_id, room_id, now_ms, via, joined_at_ms),
+                )
+                if txn.rowcount != 1:
+                    txn.execute(
+                        "UPDATE pangea_managed_account SET status = 'asked'"
+                        " WHERE user_id = ? AND course_room_id = ?"
+                        " AND status = 'managed' AND created_at_ms < ?",
+                        (user_id, room_id, now_ms),
+                    )
+                if txn.rowcount == 1:
+                    asked.append(user_id)
+                    record_managed_event(
+                        txn,
+                        room_id=room_id,
+                        user_id=user_id,
+                        actor=actor,
+                        action=MANAGEMENT_ASKED,
+                        via=via,
+                        now_ms=now_ms,
+                    )
+            return asked
+
+        return await self.db.runInteraction("pangea_managed_account_ask", write)
+
+    async def answer(
+        self,
+        room_id: str,
+        user_id: str,
+        *,
+        accept: bool,
+        actor: str,
+        now_ms: int,
+        from_statuses: Sequence[str] = (ASKED,),
+    ) -> Optional[str]:
+        """Accept or decline management for a record in ``from_statuses``.
+        Returns the new status, or None when there is no such record."""
+        await self.ensure()
+
+        def write(txn: Any) -> Optional[str]:
+            record = _record(txn, user_id, room_id)
+            if record is None or record["status"] not in from_statuses:
+                return None
+            if accept:
+                _insert_managed(
+                    txn, user_id, room_id, now_ms, actor=actor, via=None, start=True
+                )
+                return MANAGED
+            txn.execute(
+                "UPDATE pangea_managed_account SET status = 'declined'"
+                " WHERE user_id = ? AND course_room_id = ? AND status = ?",
+                (user_id, room_id, record["status"]),
+            )
+            if txn.rowcount == 1 and record["status"] != DECLINED:
+                record_managed_event(
+                    txn,
+                    room_id=room_id,
+                    user_id=user_id,
+                    actor=actor,
+                    action=MANAGEMENT_DECLINED,
+                    via=record["joined_via"] or VIA_UNKNOWN,
+                    now_ms=now_ms,
+                )
+            return DECLINED
+
+        return await self.db.runInteraction("pangea_managed_account_answer", write)
+
+    async def record_managed(
+        self,
+        room_id: str,
+        action: str,
+        actor: str,
+        now_ms: int,
+        *,
+        user_id: Optional[str] = None,
+        details: Sequence[Optional[str]] = (None,),
+    ) -> int:
+        """A ledger row per detail for the managed student ``user_id``, or for
+        every managed student of the course when None (a control change).
+        Returns the rows written; none for a student not managed here."""
+        await self.ensure()
+
+        def write(txn: Any) -> int:
+            txn.execute(
+                "SELECT user_id, joined_via FROM pangea_managed_account"
+                " WHERE course_room_id = ? AND status = 'managed'"
+                " AND (? IS NULL OR user_id = ?) ORDER BY user_id",
+                (room_id, user_id, user_id),
+            )
+            rows = txn.fetchall()
+            for student, via in rows:
+                for detail in details:
+                    record_managed_event(
+                        txn,
+                        room_id=room_id,
+                        user_id=student,
+                        actor=actor,
+                        action=action,
+                        via=via or VIA_UNKNOWN,
+                        now_ms=now_ms,
+                        detail=detail,
+                    )
+            return len(rows) * len(details)
+
+        return await self.db.runInteraction("pangea_managed_account_record", write)
 
     # --- writes ---
 
@@ -1131,7 +1322,8 @@ class StudentInvitationStore:
             if managed:
                 # After the claim, so its event follows the claim's. A record
                 # kept from an earlier claim in this course (the student left
-                # and was invited again) stays as it is, with no new event.
+                # and was invited again) stays as it is, with no new event; an
+                # asked or declined one is managed by this new claim.
                 _insert_managed(
                     txn,
                     user_id,
@@ -1139,6 +1331,7 @@ class StudentInvitationStore:
                     now_ms,
                     actor=actor if grant_now else SYSTEM,
                     via=joined_via,
+                    start=True,
                 )
             return CLAIMED, _select_one(txn, "WHERE id = ?", (invitation_id,))
 
@@ -1174,7 +1367,9 @@ def migrate(txn: Any) -> None:
       renamed and ``invited_by`` dropped;
     - invitations gain ``send_at_ms``, ``first_due_ms`` and ``joined_via``
       (nullable, so no row is rewritten) and the partial index of rows
-      waiting to send, which is empty at this point.
+      waiting to send, which is empty at this point;
+    - managed records gain ``status`` (existing ones are ``managed``),
+      ``joined_via`` and ``joined_at_ms``, and their ledger ``detail``.
     """
     request = _columns(txn, "pangea_invitation_ack")
     if "acked_at_ms" in request and "requested_at_ms" not in request:
@@ -1191,18 +1386,23 @@ def migrate(txn: Any) -> None:
         )
     if "invited_by" in managed:
         txn.execute("ALTER TABLE pangea_managed_account DROP COLUMN invited_by")
-    invitation = _columns(txn, "pangea_seat_invitation")
-    for column, kind in (
-        ("send_at_ms", "BIGINT"),
-        ("first_due_ms", "BIGINT"),
-        ("joined_via", "TEXT"),
+    for table, column, kind in (
+        ("pangea_seat_invitation", "send_at_ms", "BIGINT"),
+        ("pangea_seat_invitation", "first_due_ms", "BIGINT"),
+        ("pangea_seat_invitation", "joined_via", "TEXT"),
+        ("pangea_managed_account", "status", "TEXT NOT NULL DEFAULT 'managed'"),
+        ("pangea_managed_account", "joined_via", "TEXT"),
+        ("pangea_managed_account", "joined_at_ms", "BIGINT"),
+        ("pangea_managed_account_event", "detail", "TEXT"),
     ):
-        if column not in invitation:
+        existing = _columns(txn, table)
+        # A table not created yet gets every column from its CREATE.
+        if existing and column not in existing:
             # Every process runs this on first use; on Postgres one that loses the
             # race waits on the table lock and must then find the column added.
             postgres = isinstance(getattr(txn, "database_engine", None), PostgresEngine)
             txn.execute(
-                "ALTER TABLE pangea_seat_invitation ADD COLUMN "
+                f"ALTER TABLE {table} ADD COLUMN "
                 + ("IF NOT EXISTS " if postgres else "")
                 + f"{column} {kind}"
             )
@@ -1213,25 +1413,61 @@ def migrate(txn: Any) -> None:
     )
 
 
-def _insert_managed(
-    txn: Any, user_id: str, room_id: str, now_ms: int, *, actor: str, via: str
-) -> bool:
-    """Insert the managed record if missing and, only then, its
-    ``management_started`` event. Returns whether it was inserted."""
+def _record(txn: Any, user_id: str, room_id: str) -> Optional[Dict[str, Any]]:
     txn.execute(
-        "INSERT INTO pangea_managed_account (user_id, course_room_id, created_at_ms)"
-        " VALUES (?, ?, ?) ON CONFLICT (user_id, course_room_id) DO NOTHING",
-        (user_id, room_id, now_ms),
+        _RECORD_SELECT + "WHERE user_id = ? AND course_room_id = ?",
+        (user_id, room_id),
+    )
+    raw = txn.fetchone()
+    return dict(zip(RECORD_COLUMNS, raw)) if raw is not None else None
+
+
+def _insert_managed(
+    txn: Any,
+    user_id: str,
+    room_id: str,
+    now_ms: int,
+    *,
+    actor: str,
+    via: Optional[str],
+    at: Optional[int] = None,
+    start: bool = False,
+) -> bool:
+    """Insert the managed record if missing and, with ``start``, make an
+    asked or declined one managed; only then write its ``management_started``
+    event. ``start`` is a decision to manage: a new join of a Protected
+    course, a new claim, an accepted ask or the team's; never a repair, which
+    must not overrule an ask or a decline. ``via`` and ``at`` (when joined,
+    default now) replace the record's when given. Returns whether management
+    started."""
+    joined_at = at if at is not None else now_ms
+    txn.execute(
+        "INSERT INTO pangea_managed_account (user_id, course_room_id,"
+        " created_at_ms, status, joined_via, joined_at_ms)"
+        " VALUES (?, ?, ?, 'managed', ?, ?)"
+        " ON CONFLICT (user_id, course_room_id) DO NOTHING",
+        (user_id, room_id, now_ms, via, joined_at),
     )
     if txn.rowcount != 1:
-        return False
+        if not start:
+            return False
+        txn.execute(
+            "UPDATE pangea_managed_account SET status = 'managed',"
+            " created_at_ms = ?, joined_via = COALESCE(?, joined_via),"
+            " joined_at_ms = CASE WHEN ? IS NULL THEN joined_at_ms ELSE ? END"
+            " WHERE user_id = ? AND course_room_id = ? AND status <> 'managed'",
+            (now_ms, via, via, joined_at, user_id, room_id),
+        )
+        if txn.rowcount != 1:
+            return False
+    record = _record(txn, user_id, room_id)
     record_managed_event(
         txn,
         room_id=room_id,
         user_id=user_id,
         actor=actor,
         action=MANAGEMENT_STARTED,
-        via=via,
+        via=(record or {}).get("joined_via") or VIA_UNKNOWN,
         now_ms=now_ms,
     )
     return True

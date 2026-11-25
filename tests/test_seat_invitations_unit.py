@@ -120,10 +120,14 @@ class FakeAdmins:
     def __init__(self) -> None:
         self.admins: Set[Tuple[str, str]] = {(ROOM, TEACHER), (OTHER_ROOM, TEACHER)}
         self.checks: List[Tuple[str, str]] = []
+        self.protected: Set[str] = set()
 
     async def is_course_admin(self, room_id: str, user_id: str) -> bool:
         self.checks.append((room_id, user_id))
         return (room_id, user_id) in self.admins
+
+    async def is_protected(self, room_id: str) -> bool:
+        return room_id in self.protected
 
 
 class FakeRooms:
@@ -287,7 +291,14 @@ class TestClaimRules(_Base):
         )
         self.assertEqual(
             await self.h.store.managed_record(STUDENT, ROOM),
-            {"user_id": STUDENT, "course_room_id": ROOM, "created_at_ms": 4},
+            {
+                "user_id": STUDENT,
+                "course_room_id": ROOM,
+                "created_at_ms": 4,
+                "status": "managed",
+                "joined_via": "grant",
+                "joined_at_ms": 4,
+            },
         )
         # A verified match needs no request at all.
         outcome, _ = await self.h.store.claim_txn(
@@ -349,8 +360,19 @@ class TestClaimRules(_Base):
         status, body = await self.h.open(STUDENT, inv["invitation_id"])
         self.assertEqual(body["result"], "claimed")
         record = await self.h.store.managed_record(STUDENT, ROOM)
-        # The managed record carries only its time (no disclosure, no inviter).
-        self.assertEqual(set(record), {"user_id", "course_room_id", "created_at_ms"})
+        # The managed record carries its status and how and when the student
+        # joined (#799); no disclosure, no inviter.
+        self.assertEqual(
+            set(record),
+            {
+                "user_id",
+                "course_room_id",
+                "created_at_ms",
+                "status",
+                "joined_via",
+                "joined_at_ms",
+            },
+        )
         self.assertEqual((record["user_id"], record["course_room_id"]), (STUDENT, ROOM))
         self.assertIn((ROOM, STUDENT), self.h.admins.checks)
 
@@ -662,8 +684,10 @@ class TestOpen(_Base):
     async def test_open_route_takes_the_id_from_the_path_and_an_empty_body(self):
         calls: List[Any] = []
 
-        async def handler(caller: str, ident: str) -> Tuple[int, Any]:
-            calls.append((caller, ident))
+        async def handler(
+            caller: str, ident: str, consent: bool = False
+        ) -> Tuple[int, Any]:
+            calls.append((caller, ident, consent))
             return 200, {}
 
         class Auth:
@@ -691,9 +715,12 @@ class TestOpen(_Base):
             return r
 
         self.assertEqual(await route._dispatch(request([b"open"], b"{}")), (200, {}))
-        self.assertEqual(calls, [(STUDENT, "inv-1")])
-        # The body is exactly `{}`.
-        for body in (b"", b'{"x": 1}', b"[]", b"not json"):
+        self.assertEqual(calls, [(STUDENT, "inv-1", False)])
+        # Accepting management (#799) is the one other body.
+        body = b'{"consent": true}'
+        self.assertEqual(await route._dispatch(request([b"open"], body)), (200, {}))
+        self.assertEqual(calls[-1], (STUDENT, "inv-1", True))
+        for body in (b"", b'{"x": 1}', b'{"consent": false}', b"[]", b"not json"):
             status, answer = await route._dispatch(request([b"open"], body))
             self.assertEqual(
                 (status, answer["errcode"]), (400, "M_INVALID_PARAM"), body
@@ -701,7 +728,7 @@ class TestOpen(_Base):
         for postpath in ([], [b"close"], [b"open", b"more"]):
             status, _ = await route._dispatch(request(postpath, b"{}"))
             self.assertEqual(status, 404, postpath)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
 
 
 class TestApprovals(_Base):
@@ -2353,9 +2380,17 @@ class TestMigration(_Base):
                     "decision": "denied",
                 },
             )
+            # A record from before #799 reads as managed, how it joined unknown.
             self.assertEqual(
                 await store.managed_record("u", "!r:x"),
-                {"user_id": "u", "course_room_id": "!r:x", "created_at_ms": 7},
+                {
+                    "user_id": "u",
+                    "course_room_id": "!r:x",
+                    "created_at_ms": 7,
+                    "status": "managed",
+                    "joined_via": None,
+                    "joined_at_ms": None,
+                },
             )
 
         def columns(table: str) -> set:
@@ -2366,7 +2401,14 @@ class TestMigration(_Base):
 
         self.assertEqual(
             columns("pangea_managed_account"),
-            {"user_id", "course_room_id", "created_at_ms"},
+            {
+                "user_id",
+                "course_room_id",
+                "created_at_ms",
+                "status",
+                "joined_via",
+                "joined_at_ms",
+            },
         )
         self.assertEqual(
             columns("pangea_invitation_ack"),

@@ -12,6 +12,10 @@ from synapse_pangea_chat.course_member_emails.members import (
     effective_power_levels,
 )
 from synapse_pangea_chat.room_code.constants import ACCESS_CODE_JOIN_RULE_CONTENT_KEY
+from synapse_pangea_chat.student_invitations.protected import (
+    COURSE_MANAGEMENT,
+    is_protected,
+)
 
 SPACE_ROOM_TYPE = "m.space"
 MEMBERSHIP_JOIN = "join"
@@ -50,6 +54,13 @@ class ModuleCourseAdmins:
             [user_id], power.content if power is not None else None, creators
         )
         return levels[user_id] >= COURSE_ADMIN_POWER_LEVEL
+
+    async def is_protected(self, room_id: str) -> bool:
+        """Whether the course is Protected (``protected.py``)."""
+        state = await self._api.get_room_state(
+            room_id=room_id, event_filter=[(COURSE_MANAGEMENT, "")]
+        )
+        return is_protected(state)
 
 
 class ModuleCourseRooms:

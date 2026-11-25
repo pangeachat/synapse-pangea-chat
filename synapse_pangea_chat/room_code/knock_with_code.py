@@ -46,6 +46,12 @@ try:
 except ImportError:
     # Sentry is an optional Synapse extra; without it captures are no-ops.
     sentry_sdk = None
+from synapse_pangea_chat.joined_via import (
+    VIA_CODE,
+    VIA_INSTRUCTOR,
+    module_write,
+    named,
+)
 from synapse_pangea_chat.room_code.code_index import RoomCodeMatch
 from synapse_pangea_chat.room_code.code_lookup import rooms_for_code
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
@@ -346,15 +352,23 @@ class KnockWithCode(Resource):
                             api=self._api,
                             user_id=requester_id,
                             room_id=match.room_id,
+                            # An admin code or a course claim makes an admin.
+                            via=(
+                                VIA_INSTRUCTOR
+                                if match.is_admin_code or claim is not None
+                                else VIA_CODE
+                            ),
                         )
 
                     if claim is not None and membership != MEMBERSHIP_JOIN:
-                        await self._api.update_room_membership(
-                            sender=requester_id,
-                            target=requester_id,
-                            room_id=match.room_id,
-                            new_membership=MEMBERSHIP_JOIN,
-                        )
+                        with module_write():
+                            await self._api.update_room_membership(
+                                sender=requester_id,
+                                target=requester_id,
+                                room_id=match.room_id,
+                                new_membership=MEMBERSHIP_JOIN,
+                                content=named(VIA_INSTRUCTOR),
+                            )
                         membership = MEMBERSHIP_JOIN
                     # Admin code: promote to admin and burn the code
                     if match.is_admin_code:

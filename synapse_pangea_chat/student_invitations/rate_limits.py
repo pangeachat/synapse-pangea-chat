@@ -32,6 +32,11 @@ DEFAULT_LIMITS: Dict[str, Tuple[int, int]] = {
     # choreo reads it with the student's token on a full gate recompute.
     "student_invitations_mine_joined": (120, 60),
     "student_invitations_hint": (10, 60),
+    # Protected courses (#799).
+    "course_management": (30, 60),
+    "course_management_members": (60, 60),
+    "course_management_answer": (10, 60),
+    "course_management_manage_members": (10, 60),
     # Canvas (CONTRACTS C5 L1-L2, C2 T10-T11). The link step may come without
     # a token (a bound ticket), so it counts per client IP.
     "lti_link": (30, 60),
