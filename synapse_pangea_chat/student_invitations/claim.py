@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple
 
 from synapse_pangea_chat.student_invitations.accounts import Accounts
 from synapse_pangea_chat.student_invitations.events import SYSTEM
@@ -86,6 +86,9 @@ class StudentClaims:
         self._accounts = accounts
         self._joiner = joiner
         self._admins = admins
+        # Runs after a claim of a Protected course, with the claimant: its
+        # controls apply to the rooms they are already in.
+        self.claimed: Callable[[str], None] = lambda _: None
 
     async def claim(
         self,
@@ -159,6 +162,8 @@ class StudentClaims:
             logger.info("Claimed student invitation %s", invitation_id)
             await self._release_if_gone(room_id, user_id)
             await self._recheck_managed(claimed)
+            if not is_admin and await self._admins.is_protected(room_id):
+                self.claimed(user_id)
         return outcome, claimed if claimed is not None else row
 
     async def needs_consent(self, row: Dict[str, Any], user_id: str) -> bool:

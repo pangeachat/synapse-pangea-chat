@@ -444,6 +444,10 @@ class PangeaChat:
         self.student_invitations = register_student_invitations(
             api, config, base=StudentInvitationAPI(api, course_claim_store)
         )
+        # Browse refuses a managed student while joining other courses is off.
+        self.public_courses.browse_refusal = (
+            self.student_invitations.controls.browse_refusal
+        )
 
         # Registers its own sign-in and verified-address callbacks.
         self.claim_by_email = ClaimByEmail(
@@ -1419,6 +1423,16 @@ class PangeaChat:
         if not isinstance(protected_courses_enabled, bool):
             raise ValueError('Config "protected_courses_enabled" must be a boolean')
 
+        always_reachable = config.get("protected_courses_always_reachable", [])
+        if not isinstance(always_reachable, list) or not all(
+            isinstance(u, str) and u.startswith("@") and ":" in u
+            for u in always_reachable
+        ):
+            raise ValueError(
+                "protected_courses_always_reachable must be a list of full Matrix"
+                " user IDs"
+            )
+
         course_default_chats_enabled = config.get("course_default_chats_enabled", True)
         if not isinstance(course_default_chats_enabled, bool):
             raise ValueError('Config "course_default_chats_enabled" must be a boolean')
@@ -1827,6 +1841,7 @@ class PangeaChat:
             delayed_push_require_synapse_version=delayed_push_require_synapse_version,
             blocked_join_gate_enabled=blocked_join_gate_enabled,
             protected_courses_enabled=protected_courses_enabled,
+            protected_courses_always_reachable=always_reachable,
             course_default_chats_enabled=course_default_chats_enabled,
             course_session_admins_enabled=course_session_admins_enabled,
             moderation_tier1_enabled=moderation_tier1_enabled,

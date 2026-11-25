@@ -1,15 +1,16 @@
 """Protected courses (pangeachat/.github#799): the ``pangea.course_management``
 event, the rules that keep a Protected course private and ``knock``, and the
-records and ledger rows its memberships write. Enforcing the controls is
-later work."""
+records and ledger rows its memberships write. The controls are enforced in
+``controls.py``."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from synapse_pangea_chat.joined_via import (
     JOINED_VIA,
+    REMOVED_BY,
     VIA_CLAIM,
     VIA_INSTRUCTOR,
     is_module_write,
@@ -70,10 +71,10 @@ def is_protected(state: StateMap) -> bool:
 
 class ProtectedRules:
     """Refuses, before an event is stored: a ``pangea.course_management``
-    event or a ``joined_via`` name the module did not write; the redaction of
-    a ``pangea.course_management`` event; and in a Protected course, a join
-    rule other than ``knock``, redacting its join rule and listing it in the
-    room directory."""
+    event, or a ``joined_via`` or ``removed_by`` mark, the module did not
+    write; the redaction of a ``pangea.course_management`` event; and in a
+    Protected course, a join rule other than ``knock``, redacting its join
+    rule and listing it in the room directory."""
 
     def __init__(self, api: Any) -> None:
         self._main = api._hs.get_datastores().main
@@ -89,7 +90,9 @@ class ProtectedRules:
             return _ALLOW
         if event.type == COURSE_MANAGEMENT:
             return _REFUSE
-        if event.type == "m.room.member" and JOINED_VIA in event.content:
+        if event.type == "m.room.member" and (
+            JOINED_VIA in event.content or REMOVED_BY in event.content
+        ):
             return _REFUSE
         if event.type == "m.room.join_rules" and event.get_state_key() == "":
             if is_protected(state) and event.content.get("join_rule") != KNOCK:
@@ -145,26 +148,48 @@ async def how_joined(main: Any, member: Any) -> Tuple[str, int]:
 
 
 class ManagedMembership:
-    """The ``on_new_event`` callback for member events of a Protected course.
-    Never raises into event persistence: a failure is reported."""
+    """The ``on_new_event`` callback for member and power level events of a
+    Protected course. Never raises into event persistence: a failure is
+    retried once, then reported. ``reconcile(user_ids)`` applies the controls
+    to students whose management starts or whose admin status may change."""
 
-    def __init__(self, api: Any, store: StudentInvitationStore, unmanaged: Any) -> None:
+    def __init__(
+        self,
+        api: Any,
+        store: StudentInvitationStore,
+        unmanaged: Any,
+        reconcile: Callable[[List[str]], None],
+    ) -> None:
         self._main = api._hs.get_datastores().main
         self._store = store
         # (room_id, user_id) -> whether this member is never managed here.
         self._unmanaged = unmanaged
+        self._reconcile = reconcile
 
     async def on_new_event(self, event: Any, state: StateMap) -> None:
-        if event.type != "m.room.member" or not isinstance(event.state_key, str):
-            return
         if not is_protected(state):
             return
-        try:
-            await self._on_member(event)
-        except Exception as error:
-            report_failure(
-                "protected course membership record", error, room=event.room_id
-            )
+        if event.type == "m.room.power_levels" and event.state_key == "":
+            work = self._on_levels
+        elif event.type == "m.room.member" and isinstance(event.state_key, str):
+            work = self._on_member
+        else:
+            return
+        for attempt in (1, 2):
+            try:
+                await work(event)
+                return
+            except Exception as error:
+                if attempt == 2:
+                    report_failure(
+                        "protected course membership record",
+                        error,
+                        room=event.room_id,
+                    )
+
+    async def _on_levels(self, event: Any) -> None:
+        records = await self._store.managed_in_room(event.room_id)
+        self._reconcile([r["user_id"] for r in records if r["status"] == MANAGED])
 
     async def _on_member(self, event: Any) -> None:
         room_id, user_id = event.room_id, event.state_key
@@ -198,6 +223,7 @@ class ManagedMembership:
                 now_ms=now_ms(),
             ):
                 logger.info("Managed record started in %s by a join", room_id)
+                self._reconcile([user_id])
             return
         if membership == "ban" and before != "ban":
             action = BANNED

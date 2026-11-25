@@ -35,6 +35,7 @@ DEFAULT_LIMITS: Dict[str, Tuple[int, int]] = {
     # Protected courses (#799).
     "course_management": (30, 60),
     "course_management_members": (60, 60),
+    "course_management_mine": (60, 60),
     "course_management_answer": (10, 60),
     "course_management_manage_members": (10, 60),
     # Canvas (CONTRACTS C5 L1-L2, C2 T10-T11). The link step may come without

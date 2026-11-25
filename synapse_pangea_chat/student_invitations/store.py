@@ -508,6 +508,42 @@ class StudentInvitationStore:
 
         return await self.db.runInteraction("pangea_managed_account_room", select)
 
+    async def managed_rows(self) -> List[Tuple[str, str]]:
+        """Every (user, course) with a managed record."""
+        await self.ensure()
+
+        def select(txn: Any) -> List[Tuple[str, str]]:
+            txn.execute(
+                "SELECT user_id, course_room_id FROM pangea_managed_account"
+                " WHERE status = 'managed'"
+            )
+            return [(row[0], row[1]) for row in txn.fetchall()]
+
+        return await self.db.runInteraction("pangea_managed_account_all", select)
+
+    async def managing_courses(self, user_ids: Sequence[str]) -> Dict[str, List[str]]:
+        """The courses managing each of ``user_ids``; users not managed are
+        left out."""
+        if not user_ids:
+            return {}
+        await self.ensure()
+
+        def select(txn: Any) -> Dict[str, List[str]]:
+            result: Dict[str, List[str]] = {}
+            for user_id in user_ids:
+                txn.execute(
+                    "SELECT course_room_id FROM pangea_managed_account"
+                    " WHERE user_id = ? AND status = 'managed'"
+                    " ORDER BY course_room_id",
+                    (user_id,),
+                )
+                rooms = [room_id for (room_id,) in txn.fetchall()]
+                if rooms:
+                    result[user_id] = rooms
+            return result
+
+        return await self.db.runInteraction("pangea_managed_account_of", select)
+
     # --- Protected courses (protected.py) ---
 
     async def start_managed(
