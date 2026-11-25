@@ -39,7 +39,9 @@ CONFIG = {
 CONTROL = "org.pangea.control"
 
 
-class TestProtectedCoursesE2E(BaseSynapseE2ETest):
+class ProtectedE2E(BaseSynapseE2ETest):
+    """The requests both classes make; no tests of its own."""
+
     def call(
         self,
         method: str,
@@ -67,6 +69,69 @@ class TestProtectedCoursesE2E(BaseSynapseE2ETest):
             f"/_matrix/client/v3/rooms/{quote(room, safe='')}/state/{event_type}/{key}"
         )
 
+    def course(self, token: str) -> str:
+        """A course space anyone can join, with a course plan."""
+        return self.ok(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            token,
+            body={
+                "preset": "public_chat",
+                "creation_content": {"type": "m.space"},
+                "initial_state": [
+                    {
+                        "type": "pangea.course_plan",
+                        "state_key": "",
+                        "content": {"uuid": "p"},
+                    }
+                ],
+            },
+        )["room_id"]
+
+    def chat(self, space: str, token: str, server: str) -> str:
+        """A public chat of ``space``, linked both ways."""
+        room = self.ok(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            token,
+            body={
+                "preset": "public_chat",
+                "initial_state": [
+                    {
+                        "type": "m.space.parent",
+                        "state_key": space,
+                        "content": {"via": [server]},
+                    }
+                ],
+            },
+        )["room_id"]
+        self.ok(
+            "PUT",
+            self.state(space, "m.space.child", room),
+            token,
+            body={"via": [server]},
+        )
+        return room
+
+    def set_controls(self, room: str, token: str, **groups: Any) -> None:
+        self.ok(
+            "POST",
+            P + "course_management/set",
+            token,
+            body={"room_id": room, **groups},
+        )
+
+    def invite_and_join(self, room: str, token: str, user: str, u_token: str) -> None:
+        self.ok(
+            "POST",
+            f"/_matrix/client/v3/rooms/{quote(room)}/invite",
+            token,
+            body={"user_id": user},
+        )
+        self.ok("POST", f"/_matrix/client/v3/join/{quote(room)}", u_token, body={})
+
+
+class TestProtectedCoursesE2E(ProtectedE2E):
     def ledger(self, room: str, token: str) -> list:
         events = self.ok(
             "GET",
@@ -242,50 +307,6 @@ class TestProtectedCoursesE2E(BaseSynapseE2ETest):
             {"protected": True},
         )
 
-    def course(self, token: str) -> str:
-        """A course space anyone can join, with a course plan."""
-        return self.ok(
-            "POST",
-            "/_matrix/client/v3/createRoom",
-            token,
-            body={
-                "preset": "public_chat",
-                "creation_content": {"type": "m.space"},
-                "initial_state": [
-                    {
-                        "type": "pangea.course_plan",
-                        "state_key": "",
-                        "content": {"uuid": "p"},
-                    }
-                ],
-            },
-        )["room_id"]
-
-    def chat(self, space: str, token: str, server: str) -> str:
-        """A public chat of ``space``, linked both ways."""
-        room = self.ok(
-            "POST",
-            "/_matrix/client/v3/createRoom",
-            token,
-            body={
-                "preset": "public_chat",
-                "initial_state": [
-                    {
-                        "type": "m.space.parent",
-                        "state_key": space,
-                        "content": {"via": [server]},
-                    }
-                ],
-            },
-        )["room_id"]
-        self.ok(
-            "PUT",
-            self.state(space, "m.space.child", room),
-            token,
-            body={"via": [server]},
-        )
-        return room
-
     def join(self, room: str, token: str) -> requests.Response:
         return self.call(
             "POST", f"/_matrix/client/v3/join/{quote(room)}", token, body={}
@@ -320,14 +341,6 @@ class TestProtectedCoursesE2E(BaseSynapseE2ETest):
                 return
             time.sleep(0.1)
         self.fail(f"{user} never became {want} in {room}")
-
-    def set_controls(self, room: str, token: str, **groups: Any) -> None:
-        self.ok(
-            "POST",
-            P + "course_management/set",
-            token,
-            body={"room_id": room, **groups},
-        )
 
     async def test_the_controls_end_to_end(self) -> None:
         await self.homeserver(module_config=CONFIG, synapse_config_overrides=LIMITS)
@@ -437,15 +450,6 @@ class TestProtectedCoursesE2E(BaseSynapseE2ETest):
         plain = self.dm(o_token, bystander)
         self.assertEqual(plain.status_code, 200, plain.text)
 
-    def invite_and_join(self, room: str, token: str, user: str, u_token: str) -> None:
-        self.ok(
-            "POST",
-            f"/_matrix/client/v3/rooms/{quote(room)}/invite",
-            token,
-            body={"user_id": user},
-        )
-        self.ok("POST", f"/_matrix/client/v3/join/{quote(room)}", u_token, body={})
-
     async def test_graduation_end_to_end(self) -> None:
         await self.homeserver(module_config=CONFIG, synapse_config_overrides=LIMITS)
         teacher, t_token = await self.new_user("teacher")
@@ -543,7 +547,7 @@ class TestProtectedCoursesE2E(BaseSynapseE2ETest):
         self.refused(self.dm(s_token, outsider), "outside.dms")
 
 
-class TestProtectedModerationE2E(BaseSynapseE2ETest):
+class TestProtectedModerationE2E(ProtectedE2E):
     """A managed student's flags reach the Protected course from any chat;
     everyone else's, and every report, stay with the chat's own course. Its
     own class: the moderation config is a homeserver of its own."""
@@ -555,14 +559,6 @@ class TestProtectedModerationE2E(BaseSynapseE2ETest):
         super().setUpClass()
         cls.moderation = MockModerationServer().start()
         cls.addClassCleanup(cls.moderation.stop)
-
-    call = TestProtectedCoursesE2E.call
-    ok = TestProtectedCoursesE2E.ok
-    state = TestProtectedCoursesE2E.state
-    course = TestProtectedCoursesE2E.course
-    chat = TestProtectedCoursesE2E.chat
-    set_controls = TestProtectedCoursesE2E.set_controls
-    invite_and_join = TestProtectedCoursesE2E.invite_and_join
 
     def flag(self, room: str, token: str) -> str:
         sent = self.call(
