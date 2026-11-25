@@ -1,21 +1,7 @@
 """The Protected course routes (pangeachat/.github#799), served as the
-student invitation routes are (``api.py``: token, rate limit, input, then
-the caller's right).
-
-- ``course_management/set`` (course admin): set the Protected flag and the
-  controls. Making a course Protected makes it ``private`` (out of the room
-  directory), then ``knock``, asks each member already in it, then writes
-  the flag; the caller is the actor of every ledger row. Making a course
-  Protected needs a verified educator (``is_verified_educator``); once
-  Protected, a course stays Protected here.
-- ``course_management/members`` (course admin): each record of the course,
-  managed, asked or declined, for the roster.
-- ``course_management/answer`` (the member asked): accept or decline.
-  Declining leaves them in the course, unmanaged.
-- ``course_management/manage_members`` (Pangea team, a Synapse server
-  admin): manage asked or declined members without asking, at a verified
-  educator's request.
-"""
+student invitation routes are: ``course_management/set`` and ``/members``
+(course admin), ``/answer`` (the member asked) and ``/manage_members`` (the
+Pangea team, a Synapse server admin, manages without asking)."""
 
 from __future__ import annotations
 
@@ -129,11 +115,21 @@ class ProtectedCourseHandlers:
             await self._api.public_room_list_manager.remove_room_from_public_room_list(
                 room_id
             )
-            await self._knock(room_id, caller, state.get(("m.room.join_rules", "")))
-        # Members are asked before the flag is written, so a failure before
-        # it leaves the course not Protected and a retry asks again; records
-        # made after this were made in a Protected course.
-        asked = await self._ask(room_id, caller, now_ms()) if turning_on else []
+            rules = state.get(("m.room.join_rules", ""))
+            content = unfreeze(rules.content) if rules is not None else {}
+            if content.get("join_rule") != KNOCK:
+                await self._api.create_and_send_event_into_room(
+                    {
+                        "type": "m.room.join_rules",
+                        "room_id": room_id,
+                        "sender": caller,
+                        "state_key": "",
+                        "content": {**content, "join_rule": KNOCK},
+                    }
+                )
+        # Members are asked after the flag, so the join hook covers anyone
+        # joining from then on; records made after ``at`` are the hook's.
+        at = now_ms()
         if wanted != current:
             with module_write():
                 await self._api.create_and_send_event_into_room(
@@ -145,6 +141,7 @@ class ProtectedCourseHandlers:
                         "content": wanted,
                     }
                 )
+        asked = await self._ask(room_id, caller, at) if turning_on else []
         changes = [
             f"{group}.{name}={'on' if wanted[group][name] else 'off'}"
             for group in DEFAULTS
@@ -156,20 +153,6 @@ class ProtectedCourseHandlers:
                 room_id, CONTROL_CHANGED, caller, now_ms(), details=changes
             )
         return 200, {"management": wanted, "asked": asked}
-
-    async def _knock(self, room_id: str, caller: str, join_rules: Any) -> None:
-        content = unfreeze(join_rules.content) if join_rules is not None else {}
-        if content.get("join_rule") == KNOCK:
-            return
-        await self._api.create_and_send_event_into_room(
-            {
-                "type": "m.room.join_rules",
-                "room_id": room_id,
-                "sender": caller,
-                "state_key": "",
-                "content": {**content, "join_rule": KNOCK},
-            }
-        )
 
     async def _ask(self, room_id: str, caller: str, at: int) -> List[str]:
         """Ask each member already in the course (``store.ask``)."""

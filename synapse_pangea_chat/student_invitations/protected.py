@@ -1,22 +1,7 @@
-"""Protected courses (pangeachat/.github#799; managed-accounts and
-course-spaces docs): the course's ``pangea.course_management`` state event,
-the rules that keep a Protected course private and ``knock``, and the
-records and ledger rows a Protected course's memberships write.
-
-The event holds the Protected flag and the course admin's controls: three
-that reach outside the course, off until turned on, and the same three
-between members of the course, on until turned off. Only the module writes
-it (``protected_api.py``, under ``joined_via.module_write``). Enforcing the
-controls is later work; this module records them.
-
-A persisted join of a Protected course makes the member managed, recording
-how they joined: the path the module named in the join or in the invitation
-it follows (``joined_via.py``), else an approved request or another
-invitation. Course admins, Synapse server admins and the paths that make an
-admin are not managed; a claim records its own management in its
-transaction. A managed student's leave, removal, ban and rejoin are ledger
-rows.
-"""
+"""Protected courses (pangeachat/.github#799): the ``pangea.course_management``
+event, the rules that keep a Protected course private and ``knock``, and the
+records and ledger rows its memberships write. Enforcing the controls is
+later work."""
 
 from __future__ import annotations
 

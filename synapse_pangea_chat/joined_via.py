@@ -1,18 +1,8 @@
 """How a member joined, as the module's own membership writes name it
-(pangeachat/.github#799).
-
-A module path that invites or joins someone into a course puts
-``org.pangea.joined_via`` in that membership event's content: ``code`` (the
-class code or link), ``claim`` (an invitation claim, which records its own
-management) or ``instructor`` (a path that makes the member an admin). The
-Protected course rules (``student_invitations/protected.py``) refuse the key
-on any event the module did not write, so a member can never name their own
-way in. ``module_write`` is also how the module writes the one state event
-only it may write, ``pangea.course_management``.
-
-A leaf module: the membership paths import it without importing the
-student invitations package.
-"""
+(pangeachat/.github#799): ``org.pangea.joined_via`` is ``code``, ``claim`` or
+``instructor``. The Protected course rules refuse the key, and the
+``pangea.course_management`` event, on any event not written under
+``module_write``. A leaf module, so membership paths import it freely."""
 
 from __future__ import annotations
 
@@ -25,9 +15,8 @@ VIA_CODE = "code"
 VIA_CLAIM = "claim"
 VIA_INSTRUCTOR = "instructor"
 
-# Set only around the module's own event writes. Contextvars follow the await
-# chain into Synapse's event creation, where the rules read it, and nowhere
-# else (blocked_join_gate.server_initiated_entry works the same way).
+# Follows the await chain into Synapse's event creation, as
+# blocked_join_gate.server_initiated_entry does.
 _module_write = contextvars.ContextVar("pangea_module_write", default=False)
 
 
@@ -45,5 +34,4 @@ def is_module_write() -> bool:
 
 
 def named(via: str) -> Dict[str, Any]:
-    """The content a module membership write adds to name its path."""
     return {JOINED_VIA: via}

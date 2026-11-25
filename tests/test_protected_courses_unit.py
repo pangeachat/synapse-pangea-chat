@@ -12,6 +12,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import patch
 
 from synapse_pangea_chat.joined_via import JOINED_VIA, module_write
 from synapse_pangea_chat.student_invitations.protected import (
@@ -357,6 +358,28 @@ class TestAskingExistingMembers(_Base):
             ],
         )
 
+    async def test_an_answer_reports_the_status_actually_stored(self):
+        from synapse_pangea_chat.student_invitations import store as store_module
+
+        await self.store.ask(ROOM, [(STUDENT, "code", 1)], TEACHER, 10)
+        await self.store.answer(ROOM, STUDENT, accept=True, actor=STUDENT, now_ms=11)
+        real = store_module._record
+
+        reads: List[str] = []
+
+        def stale(txn: Any, user_id: str, room_id: str) -> Any:
+            # The first read was made before a concurrent accept landed.
+            reads.append(user_id)
+            record = real(txn, user_id, room_id)
+            return {**record, "status": "asked"} if len(reads) == 1 else record
+
+        with patch.object(store_module, "_record", stale):
+            status = await self.store.answer(
+                ROOM, STUDENT, accept=False, actor=STUDENT, now_ms=12
+            )
+        self.assertEqual(status, "managed")
+        self.assertNotIn("management_declined", [r[2] for r in await self.ledger()])
+
     async def test_a_member_managed_by_an_earlier_claim_is_asked_too(self):
         await self.store.start_managed(
             ROOM, STUDENT, actor="system", via="email", joined_at_ms=1, now_ms=5
@@ -466,6 +489,7 @@ class FakeApi:
         self._hs = h.api._hs
         self.sent: List[Tuple[Dict[str, Any], bool]] = []
         self.unlisted: List[str] = []
+        self.joins_before_flag = False
         self.room_state: Dict[Tuple[str, str], Any] = {
             ("m.room.join_rules", ""): event(
                 "m.room.join_rules", {"join_rule": "public", "access_code": "c1"}
@@ -488,6 +512,9 @@ class FakeApi:
     async def create_and_send_event_into_room(self, d: Dict[str, Any]) -> Any:
         from synapse_pangea_chat.joined_via import is_module_write
 
+        if d["type"] == COURSE_MANAGEMENT and self.joins_before_flag:
+            # Joined just before the flag: no hook managed them.
+            self.room_state[("m.room.member", THIRD)] = member(THIRD, "join")
         self.sent.append((d, is_module_write()))
         self.room_state[(d["type"], d["state_key"])] = event(d["type"], d["content"])
         return None
@@ -557,6 +584,21 @@ class TestCourseManagementRoute(_Base):
         self.assertEqual((status, body["errcode"]), (409, "ORG.PANGEA.PROTECTED_STAYS"))
         status, _ = await h.set(TEACHER, {"room_id": ROOM, "outside": {"dms": "on"}})
         self.assertEqual(status, 400)
+
+    async def test_members_are_asked_after_the_flag_so_no_join_is_missed(self):
+        self.fake.joins_before_flag = True
+        # Managed by the join hook once the flag is written: not asked again.
+        await self.store.start_managed(
+            ROOM, OTHER, actor="system", via="code", joined_at_ms=1, now_ms=LATER
+        )
+        self.fake.room_state[("m.room.member", OTHER)] = member(OTHER, "join")
+        status, body = await self.handlers(True).set(
+            TEACHER, {"room_id": ROOM, "protected": True}
+        )
+        self.assertEqual((status, sorted(body["asked"])), (200, [STUDENT, THIRD]))
+        record = await self.store.managed_record(OTHER, ROOM)
+        assert record is not None
+        self.assertEqual(record["status"], "managed")
 
     async def test_answer_members_and_team_routes(self):
         h = self.handlers(True)

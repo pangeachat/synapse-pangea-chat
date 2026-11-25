@@ -595,34 +595,36 @@ class StudentInvitationStore:
         from_statuses: Sequence[str] = (ASKED,),
     ) -> Optional[str]:
         """Accept or decline management for a record in ``from_statuses``.
-        Returns the new status, or None when there is no such record."""
+        Returns the status stored, or None when there is no such record."""
         await self.ensure()
 
         def write(txn: Any) -> Optional[str]:
             record = _record(txn, user_id, room_id)
             if record is None or record["status"] not in from_statuses:
                 return None
-            if accept:
-                _insert_managed(
-                    txn, user_id, room_id, now_ms, actor=actor, via=None, start=True
+            status = MANAGED if accept else DECLINED
+            if status != record["status"]:
+                # Conditional on the status read, so the answer and its ledger
+                # row never disagree with what is stored.
+                txn.execute(
+                    "UPDATE pangea_managed_account SET status = ?,"
+                    " created_at_ms = ? WHERE user_id = ? AND course_room_id = ?"
+                    " AND status = ?",
+                    (status, now_ms, user_id, room_id, record["status"]),
                 )
-                return MANAGED
-            txn.execute(
-                "UPDATE pangea_managed_account SET status = 'declined'"
-                " WHERE user_id = ? AND course_room_id = ? AND status = ?",
-                (user_id, room_id, record["status"]),
-            )
-            if txn.rowcount == 1 and record["status"] != DECLINED:
+                if txn.rowcount != 1:
+                    stored = _record(txn, user_id, room_id)
+                    return stored["status"] if stored is not None else None
                 record_managed_event(
                     txn,
                     room_id=room_id,
                     user_id=user_id,
                     actor=actor,
-                    action=MANAGEMENT_DECLINED,
+                    action=MANAGEMENT_STARTED if accept else MANAGEMENT_DECLINED,
                     via=record["joined_via"] or VIA_UNKNOWN,
                     now_ms=now_ms,
                 )
-            return DECLINED
+            return status
 
         return await self.db.runInteraction("pangea_managed_account_answer", write)
 
