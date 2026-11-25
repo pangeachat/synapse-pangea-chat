@@ -121,6 +121,7 @@ class TestClaimEmailTemplates(unittest.TestCase):
                 )
                 self.assertIn("Spanish 1 is ready", out)
                 self.assertIn("Add students", out)
+                self.assertIn("Buy student seats to Pangea Pro", out)
                 self.assertIn("https://hs.example/n?t=dash", out)
                 self.assertIn("https://hs.example/n?t=help", out)
                 self.assertNotIn("cid:", out)

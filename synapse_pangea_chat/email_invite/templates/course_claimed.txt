@@ -4,6 +4,7 @@ Open your course in the educator dashboard to:
 - Add students
 - Review Pangea Chat safety features
 - Edit your curriculum
+- Buy student seats to Pangea Pro
 
 Open dashboard:
 {{ dashboard_url }}
