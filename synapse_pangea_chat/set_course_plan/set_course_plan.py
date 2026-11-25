@@ -769,10 +769,13 @@ class SetCoursePlan(Resource):
         sender = instructors[0]
 
         written: List[str] = []
+        # The list event this call wrote, so an undo names exactly it and
+        # never a list a teacher published just after.
+        list_event_id: Optional[str] = None
         if not req.dry_run:
             for event_type, content in writes:
                 try:
-                    await self._api.create_and_send_event_into_room(
+                    sent = await self._api.create_and_send_event_into_room(
                         {
                             "type": event_type,
                             "state_key": "",
@@ -813,6 +816,9 @@ class SetCoursePlan(Resource):
                     )
                     return (500, {"error": "Internal server error", "written": written})
                 written.append(event_type)
+                if event_type == COURSE_MISSIONS_STATE_EVENT_TYPE:
+                    event_id = getattr(sent, "event_id", None)
+                    list_event_id = event_id if isinstance(event_id, str) else None
         logger.info(
             "set_course_plan: operator=%s room=%s %s -> %s changes=%s "
             "sent_as=%s dry_run=%s",
@@ -824,4 +830,12 @@ class SetCoursePlan(Resource):
             sender,
             req.dry_run,
         )
-        return (200, {**answer, "sender": sender, "changed": not req.dry_run})
+        return (
+            200,
+            {
+                **answer,
+                "sender": sender,
+                "changed": not req.dry_run,
+                "can_do_list_event_id": list_event_id,
+            },
+        )

@@ -360,13 +360,23 @@ class TestReplaceKeepingProgress(unittest.TestCase):
         self,
     ) -> None:
         before = _with_list_event(_space("q1", has_list=True), "$e1")
-        after = _with_list_event(_space("q1", has_list=True), "$merged")
+        # A teacher publishes right after the write: the undo line still names
+        # the list the server wrote, never the room's latest one (Codex).
+        teacher = _with_list_event(_space("q1", has_list=True), "$teacher")
+        written = (200, {**_MERGED[1], "can_do_list_event_id": "$merged"})
         _, _, out, undo = self._run(
-            "!a:x $e1\n", {"!a:x": [before, after]}, commit=True
+            "!a:x $e1\n", {"!a:x": [before, teacher]}, answer=written, commit=True
         )
 
         self.assertEqual(undo, "!a:x $merged $e1\n")
         self.assertIn("undo: !a:x $merged $e1", out)
+
+    def test_a_commit_the_server_names_no_event_for_needs_a_look(self) -> None:
+        before = _with_list_event(_space("q1", has_list=True), "$e1")
+        code, _, out, undo = self._run("!a:x $e1\n", {"!a:x": [before]}, commit=True)
+
+        self.assertEqual((code, undo), (1, ""))
+        self.assertIn("the server named no list event", out)
 
 
 class TestUndo(unittest.TestCase):

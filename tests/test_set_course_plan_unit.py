@@ -761,6 +761,9 @@ class TestReplaceKeepingProgress(_ReplacingHarness):
 
     async def test_old_ids_move_to_removed_one_revision_up(self) -> None:
         endpoint, api = self._replacing()
+        api.create_and_send_event_into_room = AsyncMock(
+            return_value=SimpleNamespace(event_id="$written")
+        )
 
         status, body = await self._post(
             endpoint,
@@ -791,6 +794,8 @@ class TestReplaceKeepingProgress(_ReplacingHarness):
                 ],
             },
         )
+        # The event the server wrote, for the undo line (Codex).
+        self.assertEqual(body["can_do_list_event_id"], "$written")
         merged = body["can_do_list"]
         self.assertEqual(merged["lost"], [])
         self.assertTrue(merged["nothing_lost"])

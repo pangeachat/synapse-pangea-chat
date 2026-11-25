@@ -203,17 +203,6 @@ def parse_undo(text: str) -> List[Tuple[str, str, str]]:
     return rooms
 
 
-def _list_event_id(events: List[Dict[str, Any]]) -> Optional[str]:
-    for event in events:
-        if (
-            event.get("type") == COURSE_MISSIONS_TYPE
-            and event.get("state_key", "") == ""
-        ):
-            event_id = event.get("event_id")
-            return event_id if isinstance(event_id, str) else None
-    return None
-
-
 def _print_merge(room_id: str, quest_id: str, built: Dict[str, Any]) -> None:
     """Per room and Can-Do, what following the quest changes; "nothing lost"
     only when the server found nothing lost."""
@@ -328,11 +317,13 @@ def run_replace(
                 _print_merge(room_id, body["quest_id"], built)
             replaced += 1
             if commit and keep_progress:
-                after = _room_events(homeserver, token, room_id)
-                new_id = _list_event_id(after) if after is not None else None
-                if new_id is None:
+                # The id the server reports for the list it wrote, never the
+                # room's latest list: a teacher may have published since.
+                new_id = answer.get("can_do_list_event_id")
+                if not isinstance(new_id, str):
                     print(
-                        f"    undo: {room_id}: new list event unreadable; find it in the room"
+                        f"    undo: {room_id}: the server named no list event; "
+                        "find it in the room"
                     )
                     problems += 1
                 else:

@@ -308,8 +308,9 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         # description, all sent as the teacher.
         resp = self._call(switch, admin_token)
         self.assertEqual(resp.status_code, 200, resp.text)
+        written_list_event_id = resp.json().pop("can_do_list_event_id")
         self.assertEqual(
-            resp.json(),
+            {k: v for k, v in resp.json().items() if k != "can_do_list_event_id"},
             {
                 "room_id": space,
                 "previous_quest_id": "quest-old",
@@ -325,6 +326,8 @@ class TestSetCoursePlanEndpoint(BaseSynapseE2ETest):
         )
         after = self._admin_state(admin_token, space)
         can_do_list_event = after[(_CAN_DO_LIST_EVENT, "")]
+        # The answer names the list event it wrote, for an undo line.
+        self.assertEqual(written_list_event_id, can_do_list_event["event_id"])
         self.assertEqual(
             can_do_list_event["content"],
             {"version": 1, "revision": 1, "missions": _NEW_LIST_ENTRIES},
