@@ -21,6 +21,7 @@ DESTINATION_KINDS = (
     "subscription",
     "external",
     "workspace",
+    "dashboard",
 )
 #: A workspace path is relative to the app: it starts with a single slash and never names a scheme or host.
 WORKSPACE_PATH_MAX = 1024
@@ -36,6 +37,9 @@ CLICK_PATH = "_synapse/client/pangea/v1/n"
 UNSUBSCRIBE_PATH = "_synapse/client/pangea/v1/unsubscribe"
 
 TOKEN_KIND_CLICK = "click"
+#: A click token's origin when the link was not sent as a notice in the bot DM (the claim
+#: mail): there is no notice event to record an open against, so none is attempted.
+CLICK_ORIGIN_CLAIM_MAIL = "claim_mail"
 #: The most item links one email may carry: a list of up to five things, each its own
 #: signed link (the learner funnel's open-sessions roundup lists up to five sessions).
 MAX_ITEM_LINKS = 5
@@ -98,6 +102,40 @@ def now_ms(api: ModuleApi) -> int:
 
 def click_url(base: str, token: str) -> str:
     return f"{base}{CLICK_PATH}?{urlencode({'t': token})}"
+
+
+def signed_click_url(
+    api: ModuleApi,
+    config: "PangeaChatConfig",
+    *,
+    user_id: str,
+    destination: Dict[str, str],
+    link: str,
+    origin: str,
+) -> str:
+    """A click link outside notice delivery (the claim mail), signed exactly as a
+    notice's: it names the person, its compact ``destination`` and which link it is, and
+    goes through ``/n``. ``origin`` marks it as having no notice event to record an open
+    against. Raises when the link cannot be signed, so the mail stays owed rather than
+    going out without its link."""
+    from synapse_pangea_chat.notice_delivery.tokens import (
+        MILLISECONDS_PER_DAY,
+        sign_token,
+    )
+
+    secret = token_secret(api, config)
+    base = public_baseurl(api)
+    if secret is None or base is None:
+        raise RuntimeError(
+            "a click link needs the token secret and the homeserver's public_baseurl"
+        )
+    token = sign_token(
+        secret,
+        {"k": TOKEN_KIND_CLICK, "u": user_id, "d": destination, "l": link, "o": origin},
+        now_ms=now_ms(api),
+        ttl_ms=config.notice_token_ttl_days * MILLISECONDS_PER_DAY,
+    )
+    return click_url(base, token)
 
 
 def unsubscribe_url(base: str, token: str) -> str:
@@ -171,14 +209,34 @@ def token_destination(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"k": "app"}
 
 
+def dashboard_url(admin_dash_base_url: str, course_room_id: Optional[str]) -> str:
+    """The teacher dashboard: a course's overview, else the course list (from which a
+    single-course teacher is taken into their course). The room id is one path segment
+    with its dots escaped as ``%2E``, the dashboard's own form (admin-dash
+    ``src/lib/route-id.ts``): an unescaped dot makes its static export reload the page.
+    """
+    base = admin_dash_base_url.rstrip("/")
+    if not course_room_id:
+        return f"{base}/courses"
+    return f"{base}/courses/{quote(course_room_id, safe='').replace('.', '%2E')}/"
+
+
 def destination_url(
-    app_base_url: str, destination: Dict[str, Any], external_link_hosts: Iterable[str]
+    app_base_url: str,
+    destination: Dict[str, Any],
+    external_link_hosts: Iterable[str],
+    admin_dash_base_url: Optional[str] = None,
 ) -> str:
     """The URL a click on a destination lands on. The workspace URL grammar is
     the client's (routing.instructions.md): ``?c=`` is the course context and
     ``left=course`` opens its card; ``?right=`` opens a settings page."""
     base = app_base_url.rstrip("/")
     kind = destination.get("k")
+    if kind == "dashboard" and admin_dash_base_url:
+        course = destination.get("c")
+        return dashboard_url(
+            admin_dash_base_url, course if isinstance(course, str) else None
+        )
     if kind == "activity":
         return app_url(
             base, activity_id=destination.get("a"), session_room_id=destination.get("s")

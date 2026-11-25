@@ -47,6 +47,7 @@ def _config(**overrides):
     config.notice_admin_requests_per_minute = 600
     config.notice_admin_burst = 100
     config.app_base_url = "https://app.example.test"
+    config.admin_dash_base_url = "https://admin.pangea.chat"
     config.send_push_sygnal_url = "https://sygnal.example.test"
     config.notice_external_link_hosts = ["calendar.app.google", "admin.pangea.chat"]
 

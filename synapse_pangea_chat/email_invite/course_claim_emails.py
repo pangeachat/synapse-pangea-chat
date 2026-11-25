@@ -6,8 +6,10 @@
    printed code and no store badges (decided 2026-10-09): a teacher who
    installs the app first claims by signing in with the requesting address.
 2. Course claimed: sent once the admin code is used, to the requesting address
-   rather than the claiming account. It carries the class link, and its QR code
-   as an inline image for a slide.
+   (or the delivery address the caller last gave) rather than the claiming
+   account. The caller's copy decides what it carries: signed links to
+   destinations (the course on the dashboard), the class link and code, and the
+   class link's QR code as an inline image for a slide.
 3. Claim reminder: sent on a server admin's request to a course not yet
    claimed, with a new claim link carried as the first email carries it. The
    caller renders its words, so it does not change when the message catalog's
@@ -35,6 +37,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape as html_escape
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import segno
 from synapse.logging.context import make_deferred_yieldable, run_in_background
@@ -83,23 +86,73 @@ CLASS_SLOT = "{{class_url}}"
 CLASS_CODE_SLOT = "{{class_code}}"
 #: An image source in the share kit's HTML: the QR code of the class link, attached inline.
 CLASS_QR_SLOT = "{{class_qr}}"
-#: The share kit goes after the claim: it carries the class link, never a claim link or a refusal link.
-CLAIMED_FORBIDDEN_SLOTS = (CLAIM_SLOT, "{{unsubscribe_url}}", "{{cta2_url}}")
+#: The claimed email's signed links: ``{{cta_url}}`` to its destination and
+#: ``{{cta2_url}}`` to its second one, signed at the claim (it is never a claim link).
+CTA_SLOT = CLAIM_SLOT
+CTA2_SLOT = "{{cta2_url}}"
+#: The module cannot fill an unsubscribe slot: the caller writes its own link in.
+CLAIMED_FORBIDDEN_SLOTS = ("{{unsubscribe_url}}",)
 
 
-def validate_claimed(html: str, text: str) -> str | None:
-    """Why a caller-rendered claimed email is refused, or None: both parts carry
-    the class link slot, neither carries a slot this mail cannot fill, and the
-    QR code is placed in the HTML only."""
+def validate_claimed(
+    html: str, text: str, *, destination: bool = False, secondary: bool = False
+) -> str | None:
+    """Why a caller-rendered claimed email is refused, or None. Each part carries a
+    link: a signed call to action or the class link. A call to action's slot is in both
+    parts exactly when its destination is given, so no link is dropped or left
+    unrendered; no part carries a slot this mail cannot fill; and the QR code is placed
+    in the HTML only."""
     for part, name in ((html, "html"), (text, "text")):
-        if CLASS_SLOT not in part:
-            return f"{name} must contain {CLASS_SLOT}"
+        if CLASS_SLOT not in part and CTA_SLOT not in part:
+            return f"{name} must contain {CTA_SLOT} or {CLASS_SLOT}"
+        for slot, given, field in (
+            (CTA_SLOT, destination, "destination"),
+            (CTA2_SLOT, secondary, "secondary_destination"),
+        ):
+            if given and slot not in part:
+                return f"{name} must contain {slot} for its {field}"
+            if slot in part and not given:
+                return f"{name} contains {slot} but no {field} was given"
         for slot in CLAIMED_FORBIDDEN_SLOTS:
             if slot in part:
-                return f"{name} must not contain {slot}: the claimed email carries the class link only"
+                return f"{name} must not contain {slot}: write the unsubscribe link in and pass it as unsubscribe_url"
     if CLASS_QR_SLOT in text:
         return f"text must not contain {CLASS_QR_SLOT}: plain text cannot show an image"
     return None
+
+
+#: The longest unsubscribe link a caller may give.
+UNSUBSCRIBE_URL_MAX = 2048
+
+
+def unsubscribe_url_problem(url: Any, html: str, text: str) -> str | None:
+    """Why a caller's unsubscribe link is refused, or None. It is an https link the
+    caller wrote into both parts itself, so the headers and the visible link agree
+    (engagement notices.instructions.md, "What every send carries")."""
+    if not isinstance(url, str) or len(url) > UNSUBSCRIBE_URL_MAX:
+        return f"unsubscribe_url must be a string of at most {UNSUBSCRIBE_URL_MAX} characters"
+    parts = urlsplit(url)
+    if (
+        parts.scheme != "https"
+        or not parts.hostname
+        or any(c in url for c in "<>\r\n ")
+    ):
+        return "unsubscribe_url must be an https link"
+    if url not in html and html_escape(url, quote=True) not in html:
+        return "html must show the unsubscribe_url"
+    if url not in text:
+        return "text must show the unsubscribe_url"
+    return None
+
+
+def list_unsubscribe_headers(url: str | None) -> dict[str, str]:
+    """The one-click unsubscribe headers (RFC 8058) for a caller's unsubscribe link."""
+    if not url:
+        return {}
+    return {
+        "List-Unsubscribe": f"<{url}>",
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    }
 
 
 def fill_class_slots(
@@ -111,12 +164,16 @@ def fill_class_slots(
     receiving_reason: str,
     postal_address: str,
     class_qr_src: str = "",
+    cta_url: str = "",
+    cta2_url: str = "",
 ) -> tuple[str, str]:
     """Literal replacement of the claimed email's slots, the values escaped in the HTML.
     The QR code's image source fills the HTML only."""
     values = {
         CLASS_SLOT: class_url,
         CLASS_CODE_SLOT: class_code,
+        CTA_SLOT: cta_url,
+        CTA2_SLOT: cta2_url,
         "{{receiving_reason}}": receiving_reason,
         "{{postal_address}}": postal_address,
     }
@@ -165,9 +222,11 @@ def build_related_message(
     html: str,
     text: str,
     images: list[InlineImage],
+    headers: dict[str, str] | None = None,
 ) -> bytes:
     """The message Synapse's mailer would build, with ``images`` attached to the
-    HTML as inline parts: the plain text, or the HTML with its images."""
+    HTML as inline parts and any extra ``headers``: the plain text, or the HTML with
+    its images."""
     related = MIMEMultipart("related")
     related.attach(MIMEText(html, "html", "utf-8"))
     for image in images:
@@ -185,6 +244,8 @@ def build_related_message(
     message["Message-ID"] = email.utils.make_msgid()
     message["Auto-Submitted"] = "auto-generated"
     message["X-Auto-Response-Suppress"] = "All"
+    for name, value in (headers or {}).items():
+        message[name] = value
     message.attach(MIMEText(text, "plain", "utf-8"))
     message.attach(related)
     return message.as_string().encode("utf8")
@@ -282,16 +343,21 @@ class CourseClaimMailer:
         course_title: str,
         class_url: str,
         class_code: str,
-        rendered: dict[str, str] | None = None,
+        rendered: dict[str, Any] | None = None,
+        cta_url: str = "",
+        cta2_url: str = "",
     ) -> None:
-        """The share kit at claim: the caller's rendered email with the class link
+        """The share kit at claim: the caller's rendered email with its slots
         filled in by literal replacement when one was stored for the invitation,
         else the module's own template (invitations prepared before the caller
         rendered it). Caller content is never evaluated as a template.
 
-        The QR code of the class link is attached inline wherever the HTML asks
-        for it: always in the module's template, and in a caller's email only
-        when its HTML carries the ``{{class_qr}}`` slot."""
+        ``cta_url`` and ``cta2_url`` are the signed links, already made for this
+        claim: to the stored destinations for a caller's email, and to the course on
+        the dashboard and the Teacher Support calendar for the module's template.
+        The QR code of the class link is attached inline only where a caller's HTML
+        carries the ``{{class_qr}}`` slot; the module's template carries none, and a
+        caller's ``unsubscribe_url`` adds the one-click unsubscribe headers."""
         if rendered is not None:
             images = (
                 [class_qr_image(class_url)] if CLASS_QR_SLOT in rendered["html"] else []
@@ -304,6 +370,8 @@ class CourseClaimMailer:
                 receiving_reason=rendered.get("receiving_reason") or "",
                 postal_address=self._postal_address,
                 class_qr_src=images[0].src if images else "",
+                cta_url=cta_url,
+                cta2_url=cta2_url,
             )
             await self._send(
                 email_address=email_address,
@@ -312,23 +380,21 @@ class CourseClaimMailer:
                 html=html,
                 text=text,
                 images=images,
+                headers=list_unsubscribe_headers(rendered.get("unsubscribe_url")),
             )
             return
-        qr = class_qr_image(class_url)
         template_vars = {
             "app_name": self._app_name,
             "course_title": course_title,
-            "class_url": class_url,
-            "class_code": class_code,
-            "class_qr_src": qr.src,
+            "dashboard_url": cta_url,
+            "support_url": cta2_url,
         }
         await self._send(
             email_address=email_address,
-            subject=f"Invite your students to {_subject_title(course_title)}",
+            subject=f"{_subject_title(course_title)} is ready",
             app_name=self._app_name,
             html=self._claimed_html.render(**template_vars),
             text=self._claimed_text.render(**template_vars),
-            images=[qr],
         )
 
     async def send_course_reminder(
@@ -343,12 +409,14 @@ class CourseClaimMailer:
         html: str | None = None,
         text: str | None = None,
         receiving_reason: str | None = None,
+        unsubscribe_url: str | None = None,
     ) -> None:
         """The reminder around the caller's body in the module's template, or,
         when the caller rendered the whole email (``html`` and ``text`` with
         the ``{{cta_url}}`` slot), that email with the claim link and the
         footer slots filled by literal replacement. Caller content is never
-        evaluated as a template."""
+        evaluated as a template. A caller's ``unsubscribe_url``, already written
+        into its email, adds the one-click unsubscribe headers."""
         if html is not None and text is not None:
             rendered_html, rendered_text = fill_claim_slots(
                 html,
@@ -373,13 +441,21 @@ class CourseClaimMailer:
             app_name=self._app_name,
             html=rendered_html,
             text=rendered_text,
+            headers=list_unsubscribe_headers(unsubscribe_url),
         )
 
     async def _send(
-        self, *, images: list[InlineImage] | None = None, **kwargs: Any
+        self,
+        *,
+        images: list[InlineImage] | None = None,
+        headers: dict[str, str] | None = None,
+        **kwargs: Any,
     ) -> None:
-        if images:
-            sending = run_in_background(self._send_with_images, images=images, **kwargs)
+        if images or headers:
+            # Synapse's send_email takes neither inline images nor extra headers.
+            sending = run_in_background(
+                self._send_built, images=images or [], headers=headers or {}, **kwargs
+            )
         else:
             sending = run_in_background(self._send_email_handler.send_email, **kwargs)
         await make_deferred_yieldable(
@@ -388,7 +464,7 @@ class CourseClaimMailer:
             )
         )
 
-    async def _send_with_images(
+    async def _send_built(
         self,
         *,
         email_address: str,
@@ -397,9 +473,10 @@ class CourseClaimMailer:
         html: str,
         text: str,
         images: list[InlineImage],
+        headers: dict[str, str],
     ) -> None:
         """Synapse's ``send_email`` sends only text and HTML, so a message with
-        inline images is built here and handed to the same handler's SMTP
+        inline images or extra headers is built here and handed to the same handler's SMTP
         transport and settings: the same sender, stream and headers. Those are
         Synapse internals, not module API; the unit tests check them against
         the Synapse version they run."""
@@ -419,6 +496,7 @@ class CourseClaimMailer:
             html=html,
             text=text,
             images=images,
+            headers=headers,
         )
         await handler._sendmail(
             handler._reactor,
