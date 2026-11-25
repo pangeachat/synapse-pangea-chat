@@ -27,8 +27,9 @@ incident is on record even though no course's Safety page lists it yet.
 **A managed student's incidents also reach their Protected courses**
 (pangeachat/.github#799, trust-and-safety "Protected courses"): every
 Protected course managing the sender is added to the chat's own courses,
-whichever chat it was. Only moderation's incidents come through here; a
-report keeps the chat's own courses. Management is the managed record read
+whichever chat it was. Only what AI moderation flags (Tier 2, call
+transcripts included) is routed so (managed-accounts doc); a Tier 1 block,
+and a report, which never comes through here, keep the chat's own courses. Management is the managed record read
 when the row is resolved, not room state at the incident's position. A
 lookup that fails is logged at ERROR and the row keeps the chat's courses.
 """
@@ -48,6 +49,7 @@ from synapse_pangea_chat.moderation.compat import (
 )
 from synapse_pangea_chat.moderation.courses import ChatCourses
 from synapse_pangea_chat.moderation.incidents import (
+    ACTION_BLOCKED,
     SOURCE_MODERATION,
     Incident,
     IncidentStore,
@@ -153,6 +155,7 @@ class IncidentRecorder:
         if (
             self.managing_courses is None
             or incident.source != SOURCE_MODERATION
+            or incident.action == ACTION_BLOCKED
             or incident.subject_id is None
         ):
             return ()

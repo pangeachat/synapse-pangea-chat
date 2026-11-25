@@ -11,6 +11,7 @@ import unittest
 from typing import Any, Dict, Optional, Tuple, cast
 
 from synapse_pangea_chat.moderation.incidents import (
+    ACTION_BLOCKED,
     ACTION_REDACTED,
     SOURCE_MODERATION,
     Incident,
@@ -53,11 +54,13 @@ async def _broken(user_id: str) -> Tuple[str, ...]:
     raise RuntimeError("down")
 
 
-def _incident(room_id: str, sender: Optional[str] = STUDENT) -> Incident:
+def _incident(
+    room_id: str, sender: Optional[str] = STUDENT, action: str = ACTION_REDACTED
+) -> Incident:
     return Incident(
         incident_id="mod:$e",
         source=SOURCE_MODERATION,
-        action=ACTION_REDACTED,
+        action=action,
         outcome=None,
         subject_id=sender,
         reporter_id=None,
@@ -86,7 +89,8 @@ class ManagedFlagsRouteTest(unittest.IsolatedAsyncioTestCase):
 
     async def courses(self, room_id: str, **kw: Any) -> Any:
         sender = kw.pop("sender", STUDENT)
-        resolved = await self.recorder(**kw).resolve(_incident(room_id, sender))
+        action = kw.pop("action", ACTION_REDACTED)
+        resolved = await self.recorder(**kw).resolve(_incident(room_id, sender, action))
         return resolved.course_ids
 
     async def test_a_managed_students_flag_reaches_the_protected_course(
@@ -101,6 +105,13 @@ class ManagedFlagsRouteTest(unittest.IsolatedAsyncioTestCase):
     async def test_anyone_else_keeps_own_chat_routing(self) -> None:
         self.assertEqual(await self.courses(DM, sender=OTHER), ())
         self.assertEqual(await self.courses(PLAIN_CHAT, sender=OTHER), (PLAIN,))
+
+    async def test_a_tier1_block_keeps_own_chat_routing(self) -> None:
+        # Only what AI moderation flags reaches the Protected course.
+        self.assertEqual(await self.courses(DM, action=ACTION_BLOCKED), ())
+        self.assertEqual(
+            await self.courses(PLAIN_CHAT, action=ACTION_BLOCKED), (PLAIN,)
+        )
 
     async def test_with_protected_courses_off_nothing_changes(self) -> None:
         self.assertEqual(await self.courses(DM, managing=None), ())
