@@ -14,6 +14,8 @@ JOINED_VIA = "org.pangea.joined_via"
 VIA_CODE = "code"
 VIA_CLAIM = "claim"
 VIA_INSTRUCTOR = "instructor"
+# On a leave the controls made (``controls.reconcile``): the refusing control.
+REMOVED_BY = "org.pangea.removed_by"
 
 # Follows the await chain into Synapse's event creation, as
 # blocked_join_gate.server_initiated_entry does.

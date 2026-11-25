@@ -240,6 +240,9 @@ class PangeaChatConfig:
     # Stands in for the verified-educator check (#793) until it exists: off,
     # no course can be made Protected.
     protected_courses_enabled: bool = False
+    # Accounts a managed student can always message and call: Pangea's bot
+    # and support.
+    protected_courses_always_reachable: List[str] = attr.Factory(list)
 
     # --- course_default_chats config ---
     # Keeps a space's default chats complete (every member joined, space

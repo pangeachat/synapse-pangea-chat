@@ -7,6 +7,7 @@ flag."""
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
@@ -24,6 +25,14 @@ LIMITS = {
         "per_user": {"per_second": 9999, "burst_count": 9999},
     },
 }
+
+
+CONFIG = {
+    "protected_courses_enabled": True,
+    "room_preview_state_event_types": [],
+    "protected_courses_always_reachable": [],
+}
+CONTROL = "org.pangea.control"
 
 
 class TestProtectedCoursesE2E(BaseSynapseE2ETest):
@@ -70,13 +79,7 @@ class TestProtectedCoursesE2E(BaseSynapseE2ETest):
         return {m["user_id"]: (m["status"], m["joined_via"]) for m in members}
 
     async def test_a_protected_course_end_to_end(self) -> None:
-        await self.homeserver(
-            module_config={
-                "protected_courses_enabled": True,
-                "room_preview_state_event_types": [],
-            },
-            synapse_config_overrides=LIMITS,
-        )
+        await self.homeserver(module_config=CONFIG, synapse_config_overrides=LIMITS)
         teacher, t_token = await self.new_user("teacher")
         early, e_token = await self.new_user("early")
         coder, c_token = await self.new_user("coder")
@@ -234,3 +237,198 @@ class TestProtectedCoursesE2E(BaseSynapseE2ETest):
             preview["pangea.course_management"]["default"]["content"],
             {"protected": True},
         )
+
+    def course(self, token: str) -> str:
+        """A course space anyone can join, with a course plan."""
+        return self.ok(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            token,
+            body={
+                "preset": "public_chat",
+                "creation_content": {"type": "m.space"},
+                "initial_state": [
+                    {
+                        "type": "pangea.course_plan",
+                        "state_key": "",
+                        "content": {"uuid": "p"},
+                    }
+                ],
+            },
+        )["room_id"]
+
+    def chat(self, space: str, token: str, server: str) -> str:
+        """A public chat of ``space``, linked both ways."""
+        room = self.ok(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            token,
+            body={
+                "preset": "public_chat",
+                "initial_state": [
+                    {
+                        "type": "m.space.parent",
+                        "state_key": space,
+                        "content": {"via": [server]},
+                    }
+                ],
+            },
+        )["room_id"]
+        self.ok(
+            "PUT",
+            self.state(space, "m.space.child", room),
+            token,
+            body={"via": [server]},
+        )
+        return room
+
+    def join(self, room: str, token: str) -> requests.Response:
+        return self.call(
+            "POST", f"/_matrix/client/v3/join/{quote(room)}", token, body={}
+        )
+
+    def refused(self, resp: requests.Response, control: str) -> None:
+        self.assertEqual(resp.status_code, 403, resp.text)
+        self.assertEqual(resp.json().get(CONTROL), control, resp.text)
+
+    def dm(self, token: str, other: str) -> requests.Response:
+        return self.call(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            token,
+            body={"preset": "private_chat", "is_direct": True, "invite": [other]},
+        )
+
+    def send(
+        self, room: str, token: str, kind: str = "m.room.message"
+    ) -> requests.Response:
+        return self.call(
+            "PUT",
+            f"/_matrix/client/v3/rooms/{quote(room)}/send/{kind}/t{time.monotonic_ns()}",
+            token,
+            body={"msgtype": "m.text", "body": "hi"},
+        )
+
+    def membership_becomes(self, room: str, user: str, token: str, want: str) -> None:
+        for _ in range(100):
+            got = self.call("GET", self.state(room, "m.room.member", user), token)
+            if got.status_code == 200 and got.json().get("membership") == want:
+                return
+            time.sleep(0.1)
+        self.fail(f"{user} never became {want} in {room}")
+
+    def set_controls(self, room: str, token: str, **groups: Any) -> None:
+        self.ok(
+            "POST",
+            P + "course_management/set",
+            token,
+            body={"room_id": room, **groups},
+        )
+
+    async def test_the_controls_end_to_end(self) -> None:
+        await self.homeserver(module_config=CONFIG, synapse_config_overrides=LIMITS)
+        teacher, t_token = await self.new_user("teacher")
+        student, s_token = await self.new_user("student")
+        mate, m_token = await self.new_user("mate")
+        outsider, o_token = await self.new_user("outsider")
+        server = teacher.split(":", 1)[1]
+
+        # The student is already in another course and its chat.
+        other = self.course(o_token)
+        other_chat = self.chat(other, o_token, server)
+        for room in (other, other_chat):
+            self.ok("POST", f"/_matrix/client/v3/join/{quote(room)}", s_token, body={})
+
+        # Protected course A; the student and a classmate join by invitation.
+        course = self.course(t_token)
+        self.set_controls(course, t_token, protected=True)
+        for user, token in ((student, s_token), (mate, m_token)):
+            self.ok(
+                "POST",
+                f"/_matrix/client/v3/rooms/{quote(course)}/invite",
+                t_token,
+                body={"user_id": user},
+            )
+            self.ok("POST", f"/_matrix/client/v3/join/{quote(course)}", token, body={})
+
+        # Managed: taken out of the other course, which they cannot rejoin,
+        # browse, or create.
+        self.membership_becomes(other_chat, student, o_token, "leave")
+        self.membership_becomes(other, student, o_token, "leave")
+        self.refused(self.join(other_chat, s_token), "outside.other_courses")
+        self.refused(
+            self.call("GET", "/_synapse/client/pangea/v1/public_courses", s_token),
+            "outside.other_courses",
+        )
+        resp = self.call(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            s_token,
+            body={"creation_content": {"type": "m.space"}},
+        )
+        self.refused(resp, "outside.other_courses")
+        mine = self.ok("GET", P + "course_management/mine", s_token)
+        self.assertEqual([c["room_id"] for c in mine["courses"]], [course])
+        self.assertFalse(mine["controls"]["outside"]["dms"])
+        self.assertTrue(mine["controls"]["in_course"]["dms"])
+
+        # A DM with someone outside: refused both ways.
+        self.refused(self.dm(o_token, student), "outside.dms")
+        self.refused(self.dm(s_token, outsider), "outside.dms")
+        # A group room is no DM, whatever order its invitations go out in.
+        group = self.call(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            s_token,
+            body={"invite": [outsider, mate]},
+        )
+        self.assertEqual(group.status_code, 200, group.text)
+        # An invitation into an empty room is checked at its join, both ways.
+        lone = self.ok("POST", "/_matrix/client/v3/createRoom", s_token, body={})
+        self.ok(
+            "POST",
+            f"/_matrix/client/v3/rooms/{quote(lone['room_id'])}/invite",
+            s_token,
+            body={"user_id": outsider},
+        )
+        self.refused(self.join(lone["room_id"], o_token), "outside.dms")
+        # The course admin is always reachable.
+        admin_dm = self.dm(t_token, student)
+        self.assertEqual(admin_dm.status_code, 200, admin_dm.text)
+        admin_dm_id = admin_dm.json()["room_id"]
+        self.ok(
+            "POST", f"/_matrix/client/v3/join/{quote(admin_dm_id)}", s_token, body={}
+        )
+        self.assertEqual(self.send(admin_dm_id, s_token).status_code, 200)
+
+        # A classmate DM is allowed until the in-course control is turned off.
+        mate_dm = self.dm(m_token, student)
+        self.assertEqual(mate_dm.status_code, 200, mate_dm.text)
+        mate_dm_id = mate_dm.json()["room_id"]
+        self.ok(
+            "POST", f"/_matrix/client/v3/join/{quote(mate_dm_id)}", s_token, body={}
+        )
+        self.assertEqual(self.send(mate_dm_id, m_token).status_code, 200)
+        self.set_controls(course, t_token, in_course={"dms": False})
+        self.refused(self.send(mate_dm_id, m_token), "in_course.dms")
+        self.refused(self.send(mate_dm_id, s_token), "in_course.dms")
+
+        # A call is refused where calls are off.
+        alone = self.ok("POST", "/_matrix/client/v3/createRoom", s_token, body={})
+        self.refused(
+            self.send(alone["room_id"], s_token, "m.call.invite"), "outside.calls"
+        )
+        self.assertEqual(self.send(alone["room_id"], s_token).status_code, 200)
+
+        # Turned on: back into the other course, and joining is allowed.
+        self.set_controls(course, t_token, outside={"other_courses": True})
+        self.membership_becomes(other, student, o_token, "join")
+        self.membership_becomes(other_chat, student, o_token, "join")
+        self.ok("GET", "/_synapse/client/pangea/v1/public_courses", s_token)
+        third = self.course(o_token)
+        self.assertEqual(self.join(third, s_token).status_code, 200)
+
+        # Someone unmanaged is unaffected.
+        bystander, _ = await self.new_user("bystander")
+        plain = self.dm(o_token, bystander)
+        self.assertEqual(plain.status_code, 200, plain.text)

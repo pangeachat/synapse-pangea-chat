@@ -1,6 +1,7 @@
 """The Protected course routes (pangeachat/.github#799), served as the
 student invitation routes are: ``course_management/set`` and ``/members``
-(course admin), ``/answer`` (the member asked) and ``/manage_members`` (the
+(course admin), ``/answer`` (the member asked), ``/mine`` (the caller's
+managing courses and effective controls) and ``/manage_members`` (the
 Pangea team, a Synapse server admin, manages without asking)."""
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from synapse_pangea_chat.student_invitations.api import (
     valid_room_id,
 )
 from synapse_pangea_chat.student_invitations.claim import CourseAdmins, now_ms
+from synapse_pangea_chat.student_invitations.controls import OTHER_COURSES, Controls
 from synapse_pangea_chat.student_invitations.managed_events import CONTROL_CHANGED
 from synapse_pangea_chat.student_invitations.protected import (
     CONTROLS,
@@ -32,6 +34,7 @@ from synapse_pangea_chat.student_invitations.protected import (
 from synapse_pangea_chat.student_invitations.store import (
     ASKED,
     DECLINED,
+    MANAGED,
     StudentInvitationStore,
 )
 
@@ -80,6 +83,7 @@ class ProtectedCourseHandlers:
         accounts: Accounts,
         unmanaged: Callable[[str, str], Awaitable[bool]],
         enabled: bool,
+        controls: Controls,
     ) -> None:
         self._api = api
         self._main = api._hs.get_datastores().main
@@ -88,6 +92,7 @@ class ProtectedCourseHandlers:
         self._accounts = accounts
         self._unmanaged = unmanaged
         self._enabled = enabled
+        self._controls = controls
 
     def _room(self, args: Any) -> Optional[str]:
         return valid_room_id(args.get("room_id")) if isinstance(args, dict) else None
@@ -152,6 +157,12 @@ class ProtectedCourseHandlers:
             await self._store.record_managed(
                 room_id, CONTROL_CHANGED, caller, now_ms(), details=changes
             )
+        if any(wanted[g][OTHER_COURSES] != current[g][OTHER_COURSES] for g in DEFAULTS):
+            # Take the students out of, or put them back into, course rooms.
+            records = await self._store.managed_in_room(room_id)
+            self._controls.reconcile_later(
+                r["user_id"] for r in records if r["status"] == MANAGED
+            )
         return 200, {"management": wanted, "asked": asked}
 
     async def _ask(self, room_id: str, caller: str, at: int) -> List[str]:
@@ -184,7 +195,12 @@ class ProtectedCourseHandlers:
         )
         if status is None:
             return 404, NOT_FOUND
+        if status == MANAGED:
+            self._controls.reconcile_later([caller])
         return 200, {"status": status}
+
+    async def mine(self, caller: str) -> Result:
+        return 200, await self._controls.status(caller)
 
     async def manage(self, caller: str, body: Any) -> Result:
         room_id = self._room(body)
@@ -210,4 +226,5 @@ class ProtectedCourseHandlers:
             )
             if status is not None:
                 managed.append(user_id)
+        self._controls.reconcile_later(managed)
         return 200, {"managed": managed}

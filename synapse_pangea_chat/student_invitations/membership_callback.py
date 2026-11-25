@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping, Tuple
 
+from synapse_pangea_chat.joined_via import REMOVED_BY
 from synapse_pangea_chat.student_invitations.claim import StudentClaims, now_ms
 from synapse_pangea_chat.student_invitations.report import report_failure
 from synapse_pangea_chat.student_invitations.store import StudentInvitationStore
@@ -43,6 +44,9 @@ class MembershipRelease:
         if event.type != "m.room.member" or not isinstance(event.state_key, str):
             return
         if event.content.get("membership") not in RELEASING_MEMBERSHIPS:
+            return
+        if REMOVED_BY in event.content:
+            # Taken out by a Protected course's control: put back the same way.
             return
         try:
             released = await self._store.release_on_leave(

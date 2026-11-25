@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from synapse.api.errors import (
     AuthError,
@@ -28,6 +28,11 @@ from synapse_pangea_chat.public_courses.is_rate_limited import (
 from synapse_pangea_chat.public_courses.types import CourseFilters
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.public_courses")
+CONTROL_FIELD = "org.pangea.control"
+
+
+async def _none(_: str) -> Optional[str]:
+    return None
 
 
 class PublicCourses(Resource):
@@ -42,6 +47,9 @@ class PublicCourses(Resource):
         self._central_course_admins = central_course_admins(
             config.central_course_admin_user_ids, api.server_name
         )
+        # The Protected course control refusing the caller, if any
+        # (student_invitations.controls); set by PangeaChat.
+        self.browse_refusal: Callable[[str], Awaitable[Optional[str]]] = _none
 
     def render_GET(self, request: SynapseRequest):
         run_in_background(self._async_render_GET, request)
@@ -53,6 +61,20 @@ class PublicCourses(Resource):
             requester_id = requester.user.to_string()
 
             is_rate_limited(requester_id, self._config)
+
+            control = await self.browse_refusal(requester_id)
+            if control is not None:
+                respond_with_json(
+                    request,
+                    403,
+                    {
+                        "error": "Browsing courses is off for this account",
+                        "errcode": "M_FORBIDDEN",
+                        CONTROL_FIELD: control,
+                    },
+                    send_cors=True,
+                )
+                return
 
             def _get_raw_arg(key: str):
                 # Synapse/Twisted request arg keys may be bytes or str depending on code path.

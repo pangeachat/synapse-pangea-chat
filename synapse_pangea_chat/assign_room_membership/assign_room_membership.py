@@ -173,17 +173,20 @@ class AssignRoomMembership(Resource):
                 request, 500, {"error": "Internal server error"}, send_cors=True
             )
 
-    async def force_join(self, room_id: str, user_id: str) -> dict[str, Any]:
+    async def force_join(
+        self, room_id: str, user_id: str, via: str | None = VIA_CLAIM
+    ) -> dict[str, Any]:
         """Join a local account to a room server-side, as this endpoint's
         ``force_join`` does: a no-op when already joined, refused when banned.
         Shared with the student invitation claim, so the join names it
-        (``joined_via``): the claim records its own management."""
+        (``joined_via``): the claim records its own management. The
+        Protected course controls put a student back with no name."""
         return await self._assign_user(
             requester=None,
             room_id=room_id,
             user_id=user_id,
             force_join=True,
-            via=VIA_CLAIM,
+            via=via,
         )
 
     def _is_valid_room_id(self, room_id: str) -> bool:

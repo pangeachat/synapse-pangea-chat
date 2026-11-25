@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 from unittest.mock import patch
 
 from synapse_pangea_chat.joined_via import JOINED_VIA, module_write
+from synapse_pangea_chat.student_invitations.controls import Controls
 from synapse_pangea_chat.student_invitations.protected import (
     COURSE_MANAGEMENT,
     ManagedMembership,
@@ -209,8 +210,9 @@ class TestHowJoined(_Base):
 class TestJoinRecords(_Base):
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
+        self.started: List[str] = []
         self.callback = ManagedMembership(
-            self.h.api, self.store, self.h.claims.unmanaged
+            self.h.api, self.store, self.h.claims.unmanaged, self.started.extend
         )
         self.events.add(
             member(STUDENT, "invite", event_id="$code", content={JOINED_VIA: "code"})
@@ -232,6 +234,35 @@ class TestJoinRecords(_Base):
             await self.ledger(),
             [(STUDENT, "system", "management_started", "code", None)],
         )
+        # Starting management applies the controls to the student's rooms.
+        self.assertEqual(self.started, [STUDENT])
+        # So does a power level change, which can make a student an admin.
+        levels = event("m.room.power_levels", {"users": {STUDENT: 100}})
+        await self.callback.on_new_event(levels, state(True))
+        await self.callback.on_new_event(levels, state(False))
+        self.assertEqual(self.started, [STUDENT, STUDENT])
+
+    async def test_a_failed_record_is_retried_once_then_reported(self):
+        real, calls = self.store.start_managed, []
+
+        async def flaky(*args: Any, **kw: Any) -> bool:
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("blip")
+            return await real(*args, **kw)
+
+        with patch.object(self.store, "start_managed", flaky):
+            await self.on(member(STUDENT, "join", replaces="$code", ts=5))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((await self.ledger())[0][2], "management_started")
+
+        async def broken(*args: Any, **kw: Any) -> bool:
+            raise RuntimeError("down")
+
+        target = "synapse_pangea_chat.student_invitations.protected.report_failure"
+        with patch.object(self.store, "start_managed", broken), patch(target) as report:
+            await self.on(member(OTHER, "join", replaces="$code"))
+        report.assert_called_once()
 
     async def test_not_protected_admins_claims_and_instructors_are_not_managed(self):
         await self.on(member(STUDENT, "join", replaces="$code"), protected=False)
@@ -455,11 +486,15 @@ class TestExistingAccountConsent(_Base):
         # Sign-in does not claim it either.
         await self.h.claims.claim_matching_for(STUDENT)
         self.assertEqual((await self.h.row(ident))["state"], "invited")
+        claimed: List[str] = []
+        self.h.claims.claimed = claimed.append
         status, body = await self.h.handlers.open(STUDENT, ident, consent=True)
         self.assertEqual((status, body["result"]), (200, "claimed"))
         record = await self.store.managed_record(STUDENT, ROOM)
         assert record is not None
         self.assertEqual((record["status"], record["joined_via"]), ("managed", "email"))
+        # The controls then apply to the rooms the claimant is already in.
+        self.assertEqual(claimed, [STUDENT])
 
     async def test_a_new_account_or_a_course_that_is_not_protected_claims_at_once(
         self,
@@ -533,6 +568,7 @@ class TestCourseManagementRoute(_Base):
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
         self.fake = FakeApi(self.h)
+        self.controls = FakeControls()
 
     def handlers(self, enabled: bool) -> ProtectedCourseHandlers:
         return ProtectedCourseHandlers(
@@ -542,6 +578,7 @@ class TestCourseManagementRoute(_Base):
             self.h.accounts,
             self.h.claims.unmanaged,
             enabled,
+            cast(Controls, self.controls),
         )
 
     async def test_dormant_nobody_can_make_a_course_protected(self):
@@ -589,6 +626,10 @@ class TestCourseManagementRoute(_Base):
             (STUDENT, TEACHER, "control_changed", "unknown", "in_course.calls=off"),
         )
         self.assertEqual(len(self.fake.sent), 3)  # knock is not rewritten
+        # Only a change to joining courses moves students between rooms.
+        self.assertEqual(self.controls.reconciled, [])
+        await h.set(TEACHER, {"room_id": ROOM, "outside": {"other_courses": True}})
+        self.assertEqual(self.controls.reconciled, [[STUDENT]])
         status, body = await h.set(TEACHER, {"room_id": ROOM, "protected": False})
         self.assertEqual((status, body["errcode"]), (409, "ORG.PANGEA.PROTECTED_STAYS"))
         status, _ = await h.set(TEACHER, {"room_id": ROOM, "outside": {"dms": "on"}})
@@ -629,6 +670,19 @@ class TestCourseManagementRoute(_Base):
         self.assertEqual((await h.manage(TEACHER, args))[0], 403)
         self.h.main.server_admins.add("@ops:x")
         self.assertEqual(await h.manage("@ops:x", args), (200, {"managed": [STUDENT]}))
+        self.assertEqual(self.controls.reconciled, [[STUDENT]])
+        self.assertEqual(await h.mine(STUDENT), (200, {"user": STUDENT}))
+
+
+class FakeControls:
+    def __init__(self) -> None:
+        self.reconciled: List[List[str]] = []
+
+    def reconcile_later(self, user_ids: Any) -> None:
+        self.reconciled.append(list(user_ids))
+
+    async def status(self, user_id: str) -> Dict[str, Any]:
+        return {"user": user_id}
 
 
 if __name__ == "__main__":

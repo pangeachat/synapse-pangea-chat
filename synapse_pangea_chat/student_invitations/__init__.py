@@ -23,6 +23,7 @@ from synapse_pangea_chat.student_invitations.api import (
 )
 from synapse_pangea_chat.student_invitations.approvals import Approvals
 from synapse_pangea_chat.student_invitations.claim import StudentClaims
+from synapse_pangea_chat.student_invitations.controls import Controls
 from synapse_pangea_chat.student_invitations.invite_email import InviteMailer
 from synapse_pangea_chat.student_invitations.membership_callback import (
     MembershipRelease,
@@ -52,11 +53,14 @@ class StudentInvitations:
         claims: StudentClaims,
         mailer: InviteMailer,
         handlers: StudentInvitationHandlers,
+        controls: Controls,
     ) -> None:
         self.store = store
         self.claims = claims
         self.mailer = mailer
         self.handlers = handlers
+        # ``reconcile`` puts a graduated student back into their courses.
+        self.controls = controls
 
 
 def register_student_invitations(
@@ -69,7 +73,12 @@ def register_student_invitations(
     store = StudentInvitationStore(homeserver)
     accounts = Accounts(api)
     admins = ModuleCourseAdmins(api)
-    claims = StudentClaims(store, accounts, AssignRoomMembership(api, config), admins)
+    joiner = AssignRoomMembership(api, config)
+    claims = StudentClaims(store, accounts, joiner, admins)
+    controls = Controls(
+        api, store, admins, joiner, config.protected_courses_always_reachable
+    )
+    claims.claimed = lambda user_id: controls.reconcile_later([user_id])
     rooms = ModuleCourseRooms(api)
     mailer = InviteMailer(api, config, rooms, accounts)
     handlers = StudentInvitationHandlers(
@@ -89,6 +98,7 @@ def register_student_invitations(
         accounts,
         claims.unmanaged,
         config.protected_courses_enabled,
+        controls,
     )
     routes: Dict[str, Tuple[str, str, str, Callable[..., Any]]] = {
         # route name: (path, method, kind, handler)
@@ -184,6 +194,12 @@ def register_student_invitations(
             "teacher",
             p.members,
         ),
+        "course_management_mine": (
+            "course_management/mine",
+            "GET",
+            "student",
+            p.mine,
+        ),
         "course_management_answer": (
             "course_management/answer",
             "POST",
@@ -236,13 +252,18 @@ def register_student_invitations(
     api.register_third_party_rules_callbacks(
         on_new_event=MembershipRelease(store, claims).on_new_event
     )
-    # Protected courses: the event and directory rules on every process; the
-    # membership records once, on the main process (the hook fires on every
-    # process that sees the event).
+    # Protected courses: the event and directory rules and the controls on
+    # every process; the membership records once, on the main process (the
+    # hook fires on every process that sees the event).
     ProtectedRules(api)
+    controls.register()
     if api.worker_name is None:
-        api.register_third_party_rules_callbacks(
-            on_new_event=ManagedMembership(api, store, claims.unmanaged).on_new_event
+        started = ManagedMembership(
+            api,
+            store,
+            claims.unmanaged,
+            controls.reconcile_later,
         )
+        api.register_third_party_rules_callbacks(on_new_event=started.on_new_event)
     ScheduledInvites(api, store, rooms, mailer).start()
-    return StudentInvitations(store, claims, mailer, handlers)
+    return StudentInvitations(store, claims, mailer, handlers, controls)
