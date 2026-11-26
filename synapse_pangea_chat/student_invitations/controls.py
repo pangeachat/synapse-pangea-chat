@@ -164,6 +164,10 @@ class Controls:
         # by the module's own writes and a periodic refresh. An action no
         # managed user is party to never reads anything else of the module's.
         self._managed: Optional[FrozenSet[str]] = None
+        # Students a reconcile failed for, reconciled again on the next
+        # refresh tick. In memory: a restart loses them until another
+        # reconcile.
+        self._retry: Set[str] = set()
 
     def register(self) -> None:
         self._api.register_spam_checker_callbacks(
@@ -189,6 +193,9 @@ class Controls:
         self._managed = frozenset(u for u, room_id in rows if room_id in protected)
 
     async def _refresh_or_report(self) -> None:
+        if self._retry:
+            retry, self._retry = self._retry, set()
+            self.reconcile_later(retry)
         try:
             await self.refresh()
         except Exception as error:
@@ -543,6 +550,7 @@ class Controls:
             try:
                 await self.reconcile(user_id)
             except Exception as error:
+                self._retry.add(user_id)
                 report_failure("protected controls reconcile", error, user=user_id)
 
     async def reconcile(self, user_id: str) -> None:
@@ -557,7 +565,8 @@ class Controls:
             try:
                 await self._take_out(courses, user_id, room_id)
             except Exception as error:
-                # silent-ok: the other rooms go on; reported, and a later reconcile (a control or power-level change, a claim) retries it
+                # silent-ok: the other rooms go on; reported, and retried on the next refresh tick
+                self._retry.add(user_id)
                 report_failure(
                     "protected controls leave", error, room=room_id, user=user_id
                 )
@@ -568,7 +577,8 @@ class Controls:
             try:
                 await self._put_back(courses, user_id, room)
             except Exception as error:
-                # silent-ok: the other rooms go on; reported, and a later reconcile retries it
+                # silent-ok: the other rooms go on; reported, and retried on the next refresh tick
+                self._retry.add(user_id)
                 report_failure(
                     "protected controls restore", error, room=room.room_id, user=user_id
                 )

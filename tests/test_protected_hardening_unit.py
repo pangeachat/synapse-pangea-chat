@@ -224,6 +224,105 @@ class TestRestoreIsolatedPerRoom(IsolatedAsyncioTestCase):
         api.update_room_membership.assert_awaited_once()
 
 
+class _FlakyJoiner:
+    """Fails the first restore into ``!a:x``, then joins."""
+
+    def __init__(self) -> None:
+        self.failures = [RuntimeError("upstream timeout")]
+        self.joined: List[str] = []
+
+    async def force_join(self, room_id: str, user_id: str, **kw: Any) -> Dict:
+        if self.failures:
+            raise self.failures.pop()
+        self.joined.append(room_id)
+        return {"success": True}
+
+
+class TestFailedRestoreRetriedOnTheNextTick(IsolatedAsyncioTestCase):
+    async def test_the_next_refresh_retries_until_it_succeeds(self) -> None:
+        main = SimpleNamespace(
+            get_rooms_for_user=AsyncMock(return_value=set()),
+            get_rooms_for_local_user_where_membership_is=AsyncMock(
+                return_value=[SimpleNamespace(room_id="!a:x", event_id="$a")]
+            ),
+            get_event=AsyncMock(
+                return_value=SimpleNamespace(content={REMOVED_BY: "x"})
+            ),
+        )
+        jobs: List[Any] = []
+        api = SimpleNamespace(
+            _hs=SimpleNamespace(
+                get_datastores=lambda: SimpleNamespace(main=main),
+                get_storage_controllers=lambda: None,
+            ),
+            run_as_background_process=lambda _, f, *a: jobs.append(f(*a)),
+            get_room_state=AsyncMock(return_value={}),
+        )
+        joiner = _FlakyJoiner()
+        with patch(CHAT_COURSES):
+            controls = Controls(api, _PairStore(), _PairAdmins(), joiner, ())
+        controls._courses = cast(Any, _Owned())
+
+        async def tick() -> None:
+            await controls._refresh_or_report()
+            await asyncio.gather(*jobs)
+            jobs.clear()
+
+        with patch(CONTROLS_REPORT):
+            await controls.reconcile(OTHER)
+        self.assertEqual(joiner.joined, [])
+        await tick()
+        self.assertEqual(joiner.joined, ["!a:x"])
+        # A success clears it: the following tick reconciles no one.
+        await tick()
+        self.assertEqual(joiner.joined, ["!a:x"])
+
+    async def test_a_failed_read_of_the_controls_is_retried_too(self) -> None:
+        controls = pair_controls((STUDENT, OTHER))
+        api = cast(Any, controls._api)
+        jobs: List[Any] = []
+        api.run_as_background_process = lambda _, f, *a: jobs.append(f(*a))
+        reconcile = AsyncMock(side_effect=[RuntimeError("db"), None])
+        with patch.object(controls, "reconcile", reconcile):
+            with patch(CONTROLS_REPORT):
+                await controls._reconcile_all([STUDENT])
+            await controls._refresh_or_report()
+            await asyncio.gather(*jobs)
+        self.assertEqual(reconcile.await_count, 2)
+
+    async def test_a_failed_take_out_is_retried_too(self) -> None:
+        controls = pair_controls((STUDENT, OTHER))
+        api = cast(Any, controls._api)
+        api.main.get_rooms_for_user = AsyncMock(return_value={"!x:x"})
+        api.main.get_rooms_for_local_user_where_membership_is = AsyncMock(
+            return_value=[]
+        )
+        jobs: List[Any] = []
+        api.run_as_background_process = lambda _, f, *a: jobs.append(f(*a))
+        left: List[str] = []
+        failures = [RuntimeError("upstream timeout")]
+
+        async def leave(user: str, target: str, room_id: str, *_: Any) -> None:
+            if failures:
+                raise failures.pop()
+            left.append(room_id)
+
+        api.update_room_membership = leave
+        controls._courses = cast(
+            Any,
+            SimpleNamespace(
+                for_room=AsyncMock(return_value=("!another:x",)),
+                position_now=lambda: 0,
+            ),
+        )
+        with patch(CONTROLS_REPORT):
+            await controls.reconcile(STUDENT)
+        self.assertEqual(left, [])
+        await controls._refresh_or_report()
+        await asyncio.gather(*jobs)
+        self.assertEqual(left, ["!x:x"])
+
+
 # --- 3. a granted request needs the consent recorded with it ---
 
 
