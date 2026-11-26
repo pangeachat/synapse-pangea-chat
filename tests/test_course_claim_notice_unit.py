@@ -126,7 +126,7 @@ class TestNotify(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         """The policy retires a removed host's links at the click
-        (notice-delivery, "The click record"); the share kit still goes."""
+        (notice-delivery, "Email and links"); the share kit still goes."""
         from synapse_pangea_chat.config import PangeaChatConfig
 
         notifier, store, mailer = _notifier(NoticeReservation(REQUESTED, 1))

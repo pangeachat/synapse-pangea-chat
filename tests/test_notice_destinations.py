@@ -1,6 +1,7 @@
 """Notice destinations: what a request may ask a link to open, the second
 signed link, where each kind lands when clicked, and what the open records
-(notice-delivery.instructions.md, "Deliver a notice" and "The click record").
+(notice-delivery.instructions.md, "Email and links"; docs/notice-delivery-api.md,
+"Destinations").
 """
 
 from __future__ import annotations

@@ -55,6 +55,24 @@ No new CMS collection or preference store is required. Existing CMS service-user
 
 Admin limits are independently configurable through `notice_admin_requests_per_minute` (600) and `notice_admin_burst` (100), per endpoint and caller. These are admission limits, not a measured guarantee of email throughput. Pace batches and keep concurrency bounded.
 
+## Destinations
+
+`destination` and the optional `secondary_destination` are objects with a `kind`:
+
+| Kind | Ids | Lands on |
+| --- | --- | --- |
+| `app` | none | the World map |
+| `activity` | `activity_id`, optional `session_room_id` | the activity, in its session when one exists |
+| `course` | `course_room_id` | the course's card |
+| `subscription` | none | the subscription settings page |
+| `workspace` | `path`: relative, one leading slash, no scheme or host | any page in the client's workspace URL grammar |
+| `external` | `url`: https on a `notice_external_link_hosts` host | that page; re-checked at the click, so a removed host sends the person to the World map |
+| `dashboard` | optional `course_room_id` | the educator dashboard's course page, or its course list without a course |
+
+A kind given an id it does not take, a missing required id or an unlisted host is refused with the reason. A request without a `destination` object means an activity destination from its top-level `activity_id` and `session_room_id`, or the World map when neither is present. A claim email's `course` or `dashboard` destination may omit `course_room_id`; the claim fills it at send.
+
+A `secondary_destination` requires `{{cta2_url}}` in both the HTML and the plain text. `item_destinations` is an ordered list of one to five destinations of the same kinds, each signed as its own link (`item1` … `item5`); item *i* requires `{{item<i>_url}}` in both bodies. A slot without its link, or a link without its slot, is refused. The flat compatibility body takes a `destination` but no second link and no items.
+
 ## Local verification
 
 Run from this checkout with its absolute path in `PYTHONPATH`, so spawned Synapse processes load this checkout instead of another editable installation. The ordinary suite is `python -m unittest discover -s tests -t . -p 'test_*.py'`.

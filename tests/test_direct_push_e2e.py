@@ -186,8 +186,7 @@ class TestDirectPushWithoutSygnalUrlE2E(BaseSynapseE2ETest):
 
 
 class TestDirectPushSygnalChoiceE2E(BaseSynapseE2ETest):
-    """Which Sygnal a push goes to (notice-delivery.instructions.md, "Which
-    Sygnal"): the one the device registered when it is allowed, else the
+    """Which Sygnal a push goes to (``DirectPush._sygnal_url_for``): the one the device registered when it is allowed, else the
     default."""
 
     default_sygnal: RecordingSygnal

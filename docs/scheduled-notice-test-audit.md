@@ -1,6 +1,6 @@
 # Scheduled notice eligibility and cancellation — test audit
 
-Date: 2026-10-08. Intent: [notice-delivery.instructions.md, Scheduled delivery](../.github/instructions/notice-delivery.instructions.md#scheduled-delivery). The user approved the eligibility/cancellation wording and requested load testing before production rollout.
+Date: 2026-10-08. Intent: [notice-delivery.instructions.md, Scheduled notices](../.github/instructions/notice-delivery.instructions.md#scheduled-notices). The user approved the eligibility/cancellation wording and requested load testing before production rollout.
 
 ## Coverage
 

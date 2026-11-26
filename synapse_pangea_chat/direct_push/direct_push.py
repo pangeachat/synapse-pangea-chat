@@ -41,7 +41,14 @@ class DirectPush(Resource):
     This path intentionally bypasses Matrix event persistence so callers can
     deliver a push payload without attaching it to any room. The tradeoff is
     that event-driven notification behavior, including normal email delivery,
-    is not triggered automatically by default.
+    is not triggered automatically by default. Callers who want channel
+    selection, refusals, the email leg or the click record use deliver_notice,
+    which uses this as its push leg.
+
+    The push names its sender: for a notice, the account that sent the notice
+    event; for a bare send_push, the calling admin. It is never taken from the
+    request body, because the client follows a notice's link only when its
+    sender is that environment's bot (client notices.instructions.md).
     """
 
     isLeaf = True
@@ -294,7 +301,14 @@ class DirectPush(Resource):
 
     def _sygnal_url_for(self, pusher: Dict[str, Any]) -> Optional[str]:
         """The Sygnal the device registered when it is an allowed one, else the
-        configured default (notice-delivery.instructions.md, "Which Sygnal")."""
+        configured default. A push token belongs to the Firebase project of the
+        app build that registered it, and only the Sygnal holding that project's
+        credentials can deliver to it: a production build signed in to staging
+        registers production Sygnal (client deployment.instructions.md,
+        "Environment switcher"). The allowlist exists because the device chooses
+        this address and this transport skips Synapse's block on internal
+        addresses; without it any account could aim the server at an internal
+        host."""
         registered_url = (pusher.get("data") or {}).get("url")
         if registered_url in self._config.send_push_allowed_sygnal_urls:
             return registered_url
