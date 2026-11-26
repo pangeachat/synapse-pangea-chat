@@ -746,22 +746,24 @@ class StudentInvitationStore:
 
         return await self.db.runInteraction("pangea_managed_account_graduate", write)
 
-    async def unseen_graduates(
+    async def graduates(
         self, room_id: str, user_ids: Optional[Sequence[str]]
-    ) -> List[str]:
+    ) -> Dict[str, bool]:
         """Of ``user_ids`` (every student when None), those graduated from
-        this course who have not seen it yet."""
+        this course, each with whether they have seen it."""
         await self.ensure()
 
-        def select(txn: Any) -> List[str]:
+        def select(txn: Any) -> Dict[str, bool]:
             txn.execute(
-                "SELECT user_id FROM pangea_managed_account WHERE course_room_id = ?"
-                " AND status = 'graduated' AND graduation_seen_ms IS NULL"
-                " ORDER BY user_id",
+                "SELECT user_id, graduation_seen_ms FROM pangea_managed_account"
+                " WHERE course_room_id = ? AND status = 'graduated'",
                 (room_id,),
             )
-            found = [row[0] for row in txn.fetchall()]
-            return [u for u in found if user_ids is None or u in user_ids]
+            return {
+                user_id: seen is not None
+                for user_id, seen in txn.fetchall()
+                if user_ids is None or user_id in user_ids
+            }
 
         return await self.db.runInteraction("pangea_managed_account_graduates", select)
 
@@ -1625,7 +1627,8 @@ def _ask(
     since: int,
 ) -> bool:
     """Ask one member (``ask``): a new ``asked`` record, or a managed one
-    made before ``since`` made asked, with a ``management_asked`` row.
+    made before ``since`` (or in the same millisecond, which cannot be
+    ordered: asked, the safe side) made asked, with a ``management_asked`` row.
     Returns whether they were asked now."""
     txn.execute(
         "INSERT INTO pangea_managed_account (user_id, course_room_id,"
@@ -1638,7 +1641,7 @@ def _ask(
         txn.execute(
             "UPDATE pangea_managed_account SET status = 'asked'"
             " WHERE user_id = ? AND course_room_id = ?"
-            " AND status = 'managed' AND created_at_ms < ?",
+            " AND status = 'managed' AND created_at_ms <= ?",
             (user_id, room_id, since),
         )
     if txn.rowcount != 1:

@@ -260,6 +260,17 @@ class TestAnOlderRequestGrantedAfterProtection(_Base):
             "managed",
         )
 
+    async def test_a_request_in_the_same_millisecond_is_asked(self) -> None:
+        await self.h.handlers.open(STUDENT, self.ident)
+        request = await self.store.get_request(self.ident, STUDENT)
+        assert request is not None
+        self.h.admins.protected.add(ROOM)
+        self.h.admins.since[ROOM] = request["requested_at_ms"]
+        await self.h.approvals.grant(self.ident, STUDENT, TEACHER)
+        record = await self.store.managed_record(STUDENT, ROOM)
+        assert record is not None
+        self.assertEqual(record["status"], "asked")
+
     async def test_a_request_made_under_protection_was_asked_then(self) -> None:
         self.h.admins.protected.add(ROOM)
         self.h.admins.since[ROOM] = 1
@@ -338,6 +349,14 @@ class TestSetupRepeatable(_RouteBase):
         assert record is not None
         self.assertEqual(record["status"], "asked")
 
+    async def test_a_record_in_the_same_millisecond_is_asked(self) -> None:
+        await self.store.start_managed(
+            ROOM, STUDENT, actor="system", via="email", joined_at_ms=1, now_ms=100
+        )
+        # The flag event is stamped 100 too (``FakeApi``).
+        status, body = await self.p.set(TEACHER, {"room_id": ROOM, "protected": True})
+        self.assertEqual((status, body["asked"]), (200, [STUDENT]))
+
     async def test_a_later_change_asks_no_one_managed_since(self) -> None:
         await self.p.set(TEACHER, {"room_id": ROOM, "protected": True})
         # A join after protection, managed by the hook; and the asked member's yes.
@@ -406,7 +425,7 @@ class TestGraduationRetry(_RouteBase):
             ROOM, STUDENT, actor="system", via="code", joined_at_ms=1, now_ms=2
         )
 
-    async def test_a_retry_reapplies_until_the_student_has_seen_it(self) -> None:
+    async def test_a_retry_reapplies_the_effects(self) -> None:
         one = {"room_id": ROOM, "user_ids": [STUDENT]}
         self.assertEqual(
             await self.p.graduate(TEACHER, one), (200, {"graduated": [STUDENT]})
@@ -420,10 +439,45 @@ class TestGraduationRetry(_RouteBase):
             self.graduation.applied,
             [(ROOM, [STUDENT]), (ROOM, [STUDENT]), (ROOM, [STUDENT])],
         )
-        # Once seen, the student may have shared their analytics again.
+        self.assertEqual(self.graduation.shared, [[], [], []])
+        # Once seen, the student may have shared their analytics again: the
+        # rest is repaired, that sharing is kept.
         await self.store.see_graduation(STUDENT, ROOM, 5)
         await self.p.graduate(TEACHER, one)
-        self.assertEqual(self.graduation.applied[-1], (ROOM, []))
+        self.assertEqual(self.graduation.applied[-1], (ROOM, [STUDENT]))
+        self.assertEqual(self.graduation.shared[-1], [STUDENT])
+
+    async def test_a_graduation_seen_at_once_still_gets_its_effects(self) -> None:
+        real_graduate = self.store.graduate
+
+        async def graduate_then_seen(*args: Any) -> List[str]:
+            graduated = await real_graduate(*args)
+            await self.store.see_graduation(STUDENT, ROOM, 5)
+            return graduated
+
+        with patch.object(self.store, "graduate", graduate_then_seen):
+            await self.p.graduate(TEACHER, {"room_id": ROOM, "user_ids": [STUDENT]})
+        self.assertEqual(self.graduation.applied, [(ROOM, [STUDENT])])
+        self.assertEqual(self.graduation.shared, [[]])
+
+
+class TestGraduationKeepsSharing(_Base):
+    async def test_a_student_who_shares_again_keeps_it(self) -> None:
+        self.h.main.get_rooms_for_user = AsyncMock(return_value={CHAT})
+        self.h.main.get_room_max_stream_ordering = lambda: 0
+        api = SimpleNamespace(_hs=self.h.api._hs)
+        graduation = Graduation(
+            api, self.h.admins, SimpleNamespace(reconcile=AsyncMock())
+        )
+        graduation._courses = cast(
+            Any,
+            SimpleNamespace(
+                for_room=AsyncMock(return_value=()), position_now=lambda: 0
+            ),
+        )
+        with patch.object(graduation, "_unshare", AsyncMock()) as unshare:
+            await graduation.apply(ROOM, [STUDENT, OTHER], [OTHER])
+        self.assertEqual([c.args[1] for c in unshare.call_args_list], [STUDENT])
 
 
 # --- 7. two graduations in one room keep both power levels ---

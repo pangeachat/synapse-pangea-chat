@@ -192,7 +192,9 @@ class StudentClaims:
         if request is None or not await self.needs_consent(row, user_id):
             return None
         since = await self._admins.protected_since(row["course_room_id"])
-        if since is None or request["requested_at_ms"] >= since:
+        # A request in the same millisecond cannot be ordered: asked, the
+        # safe side.
+        if since is None or request["requested_at_ms"] > since:
             return None
         return since
 

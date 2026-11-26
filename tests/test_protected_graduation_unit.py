@@ -209,9 +209,11 @@ class TestGraduationEffects(_Base):
 class FakeGraduation:
     def __init__(self) -> None:
         self.applied: List[Tuple[str, List[str]]] = []
+        self.shared: List[List[str]] = []
 
-    def later(self, room_id: str, user_ids: Any) -> None:
+    def later(self, room_id: str, user_ids: Any, shared: Any = ()) -> None:
         self.applied.append((room_id, list(user_ids)))
+        self.shared.append(list(shared))
 
 
 class TestGraduationRoutes(_Managed):

@@ -9,7 +9,7 @@ offers the existing share flow. Membership and bans are never changed."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from synapse.api.constants import EventTypes
 from synapse.util.async_helpers import Linearizer
@@ -59,14 +59,22 @@ class Graduation:
         # graduations in one room must not each restore the other's student.
         self._levels = Linearizer("pangea_graduation_levels", clock=api._hs.get_clock())
 
-    def later(self, room_id: str, user_ids: Iterable[str]) -> None:
+    def later(
+        self, room_id: str, user_ids: Iterable[str], shared: Iterable[str] = ()
+    ) -> None:
         self._api.run_as_background_process(
-            "pangea_protected_graduation", self.apply, room_id, list(user_ids)
+            "pangea_protected_graduation",
+            self.apply,
+            room_id,
+            list(user_ids),
+            list(shared),
         )
 
-    async def apply(self, room_id: str, user_ids: List[str]) -> None:
+    async def apply(
+        self, room_id: str, user_ids: List[str], shared: Sequence[str] = ()
+    ) -> None:
         """Each step of each student is reported on failure and the rest go
-        on."""
+        on. A student in ``shared`` keeps the analytics sharing they have."""
         for user_id in user_ids:
             try:
                 await self._controls.reconcile(user_id)
@@ -84,7 +92,7 @@ class Graduation:
                     if room_id in owners:
                         if not admin:
                             await self._read_only(room, user_id)
-                    else:
+                    elif user_id not in shared:
                         await self._unshare(room, user_id, room_id)
                 except Exception as error:
                     report_failure("graduation", error, room=room, user=user_id)

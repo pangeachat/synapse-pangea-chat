@@ -248,12 +248,14 @@ class ProtectedCourseHandlers:
             return _conflict(*NOT_PROTECTED)
         wanted = None if everyone else user_ids
         graduated = await self._store.graduate(room_id, wanted, caller, now_ms())
-        # The effects run on every graduated student the student has not yet
-        # seen graduate, so a retry repairs effects that failed; they are
-        # idempotent. Not once seen: the student may have shared their
-        # analytics again, which a repeat would undo.
-        repair = await self._store.unseen_graduates(room_id, wanted)
-        self._graduation.later(room_id, repair)
+        # The effects run on every graduated student asked for, not only the
+        # new ones, so a retry repairs effects that failed; they are
+        # idempotent. Except removing the admins from a student's analytics
+        # once the student has seen their graduation: they may have shared
+        # their analytics again, which a repeat would undo.
+        graduates = await self._store.graduates(room_id, wanted)
+        shared = [u for u, seen in graduates.items() if seen and u not in graduated]
+        self._graduation.later(room_id, sorted(graduates), shared)
         return 200, {"graduated": graduated}
 
     async def graduation_seen(self, caller: str, body: Any) -> Result:
