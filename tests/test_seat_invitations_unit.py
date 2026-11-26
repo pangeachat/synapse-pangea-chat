@@ -121,8 +121,6 @@ class FakeAdmins:
         self.admins: Set[Tuple[str, str]] = {(ROOM, TEACHER), (OTHER_ROOM, TEACHER)}
         self.checks: List[Tuple[str, str]] = []
         self.protected: Set[str] = set()
-        # When each Protected course became Protected; 0 when not given.
-        self.since: Dict[str, int] = {}
 
     async def is_course_admin(self, room_id: str, user_id: str) -> bool:
         self.checks.append((room_id, user_id))
@@ -130,9 +128,6 @@ class FakeAdmins:
 
     async def is_protected(self, room_id: str) -> bool:
         return room_id in self.protected
-
-    async def protected_since(self, room_id: str) -> Optional[int]:
-        return self.since.get(room_id, 0) if room_id in self.protected else None
 
 
 class FakeRooms:
@@ -585,9 +580,11 @@ class TestOpen(_Base):
             self.assertEqual((status, body["result"]), (200, "pending"))
         request = await self.h.store.get_request(ident, OTHER)
         self.assertEqual(
-            set(request), {"invitation_id", "user_id", "requested_at_ms", "decision"}
+            set(request),
+            {"invitation_id", "user_id", "requested_at_ms", "decision", "consented_ms"},
         )
         self.assertIsNone(request["decision"])
+        self.assertIsNone(request["consented_ms"])
         self.assertEqual(
             [e["action"] for e in await self.h.events()],
             ["request_made", "students_added"],
@@ -2387,6 +2384,8 @@ class TestMigration(_Base):
                     "user_id": "u",
                     "requested_at_ms": 5,
                     "decision": "denied",
+                    # Added by the migration, empty for an earlier request.
+                    "consented_ms": None,
                 },
             )
             # A record from before #799 reads as managed, how it joined unknown.
@@ -2426,7 +2425,13 @@ class TestMigration(_Base):
         )
         self.assertEqual(
             columns("pangea_invitation_ack"),
-            {"invitation_id", "user_id", "requested_at_ms", "decision"},
+            {
+                "invitation_id",
+                "user_id",
+                "requested_at_ms",
+                "decision",
+                "consented_ms",
+            },
         )
         # The migrated tables take new rows.
         (inv,) = await self.h.add(INVITED)

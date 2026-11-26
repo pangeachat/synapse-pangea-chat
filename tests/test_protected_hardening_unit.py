@@ -48,8 +48,6 @@ from tests.test_protected_courses_unit import (
 )
 from tests.test_protected_graduation_unit import FakeGraduation
 from tests.test_seat_invitations_unit import (
-    INVITED,
-    INVITED_KEY,
     OTHER,
     ROOM,
     STUDENT,
@@ -226,7 +224,7 @@ class TestRestoreIsolatedPerRoom(IsolatedAsyncioTestCase):
         api.update_room_membership.assert_awaited_once()
 
 
-# --- 3. a request made before protection, granted after it, is asked ---
+# --- 3. a granted request needs the consent recorded with it ---
 
 
 class TestAnOlderRequestGrantedAfterProtection(_Base):
@@ -240,17 +238,19 @@ class TestAnOlderRequestGrantedAfterProtection(_Base):
         (inv,) = await self.h.add("someone@else.example")
         self.ident = inv["invitation_id"]
 
+    async def record(self) -> str:
+        record = await self.store.managed_record(STUDENT, ROOM)
+        assert record is not None
+        return str(record["status"])
+
     async def test_it_is_asked_not_managed(self) -> None:
         # Not Protected yet: the request is recorded with no question.
         status, body = await self.h.handlers.open(STUDENT, self.ident)
         self.assertEqual(body["result"], "pending")
         self.h.admins.protected.add(ROOM)
-        self.h.admins.since[ROOM] = LATER
         outcome, _ = await self.h.approvals.grant(self.ident, STUDENT, TEACHER)
         self.assertEqual(outcome, "claimed")
-        record = await self.store.managed_record(STUDENT, ROOM)
-        assert record is not None
-        self.assertEqual(record["status"], "asked")
+        self.assertEqual(await self.record(), "asked")
         self.assertEqual(
             (await self.ledger())[-1][:3], (STUDENT, TEACHER, "management_asked")
         )
@@ -264,58 +264,37 @@ class TestAnOlderRequestGrantedAfterProtection(_Base):
             "managed",
         )
 
-    async def test_a_request_in_the_same_millisecond_is_asked(self) -> None:
-        await self.h.handlers.open(STUDENT, self.ident)
-        request = await self.store.get_request(self.ident, STUDENT)
-        assert request is not None
+    async def test_a_request_whose_check_missed_the_protection_is_asked(self) -> None:
+        # The course became Protected between the open route's consent check
+        # and its request: no consent is recorded, whatever the times say.
         self.h.admins.protected.add(ROOM)
-        self.h.admins.since[ROOM] = request["requested_at_ms"]
+        no_check = AsyncMock(return_value=False)
+        with patch.object(self.h.claims, "needs_consent", no_check):
+            await self.h.handlers.open(STUDENT, self.ident)
         await self.h.approvals.grant(self.ident, STUDENT, TEACHER)
-        record = await self.store.managed_record(STUDENT, ROOM)
-        assert record is not None
-        self.assertEqual(record["status"], "asked")
+        self.assertEqual(await self.record(), "asked")
 
-    def protect_during_the_join(self) -> Any:
-        """A patch of the claim's join that makes the course Protected
-        between the claim's consent check and its transaction."""
-        join = self.h.joiner.force_join
-
-        async def join_then_protect(room_id: str, user_id: str) -> Dict:
-            self.h.admins.protected.add(ROOM)
-            self.h.admins.since[ROOM] = LATER
-            return await join(room_id, user_id)
-
-        return patch.object(self.h.joiner, "force_join", join_then_protect)
-
-    async def test_a_grant_while_the_course_becomes_protected_asks(self) -> None:
-        await self.h.handlers.open(STUDENT, self.ident)
-        with self.protect_during_the_join():
-            outcome, _ = await self.h.approvals.grant(self.ident, STUDENT, TEACHER)
-        self.assertEqual(outcome, "claimed")
-        record = await self.store.managed_record(STUDENT, ROOM)
-        assert record is not None
-        self.assertEqual(record["status"], "asked")
-
-    async def test_a_claim_while_the_course_becomes_protected_asks(self) -> None:
-        (inv,) = await self.h.add(INVITED)
-        self.h.verify(STUDENT, INVITED_KEY)
-        with self.protect_during_the_join():
-            outcome, _ = await self.h.claims.claim(inv["invitation_id"], STUDENT)
-        self.assertEqual(outcome, "claimed")
-        record = await self.store.managed_record(STUDENT, ROOM)
-        assert record is not None
-        self.assertEqual(record["status"], "asked")
-
-    async def test_a_request_made_under_protection_was_asked_then(self) -> None:
+    async def test_consent_on_the_first_opening_is_recorded(self) -> None:
         self.h.admins.protected.add(ROOM)
-        self.h.admins.since[ROOM] = 1
+        await self.h.handlers.open(STUDENT, self.ident, consent=True)
+        await self.h.approvals.grant(self.ident, STUDENT, TEACHER)
+        self.assertEqual(await self.record(), "managed")
+
+    async def test_consent_given_on_opening_is_recorded_and_managed(self) -> None:
+        await self.h.handlers.open(STUDENT, self.ident)
+        self.h.admins.protected.add(ROOM)
+        status, body = await self.h.handlers.open(STUDENT, self.ident)
+        self.assertEqual(body["result"], "needs_consent")
         status, body = await self.h.handlers.open(STUDENT, self.ident, consent=True)
         self.assertEqual(body["result"], "pending")
+        request = await self.store.get_request(self.ident, STUDENT)
+        assert request is not None
+        self.assertIsNotNone(request["consented_ms"])
+        made = [e for e in await self.h.events() if e["action"] == "request_made"]
+        self.assertEqual(len(made), 1)
         outcome, _ = await self.h.approvals.grant(self.ident, STUDENT, TEACHER)
         self.assertEqual(outcome, "claimed")
-        record = await self.store.managed_record(STUDENT, ROOM)
-        assert record is not None
-        self.assertEqual(record["status"], "managed")
+        self.assertEqual(await self.record(), "managed")
 
 
 # --- 4. the setup of a Protected course completes on a retry ---
@@ -398,14 +377,6 @@ class TestSetupRepeatable(_RouteBase):
             (await self.ledger())[-1][2:],
             ("control_changed", "unknown", "outside.other_courses=on"),
         )
-
-    async def test_a_record_in_the_same_millisecond_is_asked(self) -> None:
-        await self.store.start_managed(
-            ROOM, STUDENT, actor="system", via="email", joined_at_ms=1, now_ms=100
-        )
-        # The flag event is stamped 100 too (``FakeApi``).
-        status, body = await self.p.set(TEACHER, {"room_id": ROOM, "protected": True})
-        self.assertEqual((status, body["asked"]), (200, [STUDENT]))
 
     async def test_a_later_change_asks_no_one_managed_since(self) -> None:
         await self.p.set(TEACHER, {"room_id": ROOM, "protected": True})
@@ -492,6 +463,83 @@ class TestGraduationRetry(_RouteBase):
         record = await self.store.managed_record(STUDENT, ROOM)
         assert record is not None
         self.assertEqual(self.graduation.graduated_at, [record["graduated_at_ms"]] * 4)
+
+
+class TestGraduationRetryRepairs(_Base):
+    """A real effect fails on the first try; the retried ``/graduate``
+    leaves the student read-only."""
+
+    async def test_a_failed_power_level_write_is_repaired_by_a_retry(self) -> None:
+        self.h.admins.protected.add(ROOM)
+        await self.store.start_managed(
+            ROOM, STUDENT, actor="system", via="code", joined_at_ms=1, now_ms=2
+        )
+        levels: Dict[str, Any] = {"users": {TEACHER: 100, STUDENT: 0}}
+        failures = [RuntimeError("send failed")]
+        jobs: List[Any] = []
+
+        async def room_state(room_id: str, event_filter: Any) -> Dict:
+            return {
+                ("m.room.create", ""): SimpleNamespace(
+                    type="m.room.create",
+                    sender=TEACHER,
+                    content={"creator": TEACHER},
+                    room_version=SimpleNamespace(msc4289_creator_power_enabled=False),
+                ),
+                ("m.room.power_levels", ""): SimpleNamespace(
+                    type="m.room.power_levels", content=dict(levels)
+                ),
+                ("m.room.member", TEACHER): SimpleNamespace(
+                    type="m.room.member",
+                    state_key=TEACHER,
+                    content={"membership": "join"},
+                ),
+            }
+
+        async def send_event(d: Dict[str, Any]) -> None:
+            if failures:
+                raise failures.pop()
+            levels.update(d["content"])
+
+        self.h.main.get_room_max_stream_ordering = lambda: 0
+        self.h.main.get_rooms_for_user = AsyncMock(return_value={ROOM})
+        api = SimpleNamespace(
+            _hs=self.h.api._hs,
+            get_room_state=room_state,
+            create_and_send_event_into_room=send_event,
+            is_mine=lambda _: True,
+            run_as_background_process=lambda _, f, *a: jobs.append(f(*a)),
+        )
+        graduation = Graduation(
+            api, self.h.admins, SimpleNamespace(reconcile=AsyncMock())
+        )
+        graduation._courses = cast(
+            Any,
+            SimpleNamespace(
+                for_room=AsyncMock(return_value=(ROOM,)), position_now=lambda: 0
+            ),
+        )
+        p = ProtectedCourseHandlers(
+            FakeApi(self.h),
+            self.store,
+            self.h.admins,
+            self.h.accounts,
+            self.h.claims.unmanaged,
+            True,
+            cast(Controls, FakeControls()),
+            graduation,
+        )
+        one = {"room_id": ROOM, "user_ids": [STUDENT]}
+        report = "synapse_pangea_chat.student_invitations.graduation.report_failure"
+        with patch(report) as reported:
+            await p.graduate(TEACHER, one)
+            await asyncio.gather(*jobs)
+        self.assertTrue(reported.called)
+        self.assertEqual(levels["users"][STUDENT], 0)
+        jobs.clear()
+        await p.graduate(TEACHER, one)
+        await asyncio.gather(*jobs)
+        self.assertEqual(levels["users"][STUDENT], -1)
 
 
 class TestUnshareKeepsALaterShare(_Base):

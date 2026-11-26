@@ -119,6 +119,7 @@ SCHEMA = (
         user_id TEXT NOT NULL,
         requested_at_ms BIGINT NOT NULL,
         decision TEXT,
+        consented_ms BIGINT,
         PRIMARY KEY (invitation_id, user_id))""",
         """CREATE INDEX IF NOT EXISTS pangea_invitation_ack_user
         ON pangea_invitation_ack (user_id)""",
@@ -160,9 +161,15 @@ COLUMNS = (
     "joined_via",
 )
 _SELECT = "SELECT " + ", ".join(COLUMNS) + " FROM pangea_seat_invitation "
-REQUEST_COLUMNS = ("invitation_id", "user_id", "requested_at_ms", "decision")
+REQUEST_COLUMNS = (
+    "invitation_id",
+    "user_id",
+    "requested_at_ms",
+    "decision",
+    "consented_ms",
+)
 _REQUEST_SELECT = (
-    "SELECT invitation_id, user_id, requested_at_ms, decision"
+    "SELECT invitation_id, user_id, requested_at_ms, decision, consented_ms"
     " FROM pangea_invitation_ack "
 )
 # T12's field names for the event columns (event_id, ts_ms, actor, action,
@@ -1325,11 +1332,12 @@ class StudentInvitationStore:
         return await self.db.runInteraction("pangea_managed_account_set", write)
 
     async def record_request(
-        self, invitation_id: str, user_id: str, now_ms: int
+        self, invitation_id: str, user_id: str, now_ms: int, consent: bool = False
     ) -> Tuple[str, Optional[Dict]]:
         """Record this account's request on an ``invited`` row (the caller
         has checked that the account does not have the invited address
         verified). Idempotent: an existing request and its decision stay.
+        ``consent`` records that the account accepted management (#799).
         Returns ("ok", request), ("not_live", None), or
         ("already_in_course", None) when the account holds a joined
         invitation in this course: then nothing is written (owner rule
@@ -1343,14 +1351,22 @@ class StudentInvitationStore:
                 return "not_live", None
             if _joined_in_course(txn, row["course_room_id"], user_id) is not None:
                 return "already_in_course", None
+            consented = now_ms if consent else None
             txn.execute(
                 "INSERT INTO pangea_invitation_ack"
-                " (invitation_id, user_id, requested_at_ms, decision)"
-                " VALUES (?, ?, ?, NULL)"
+                " (invitation_id, user_id, requested_at_ms, decision, consented_ms)"
+                " VALUES (?, ?, ?, NULL, ?)"
                 " ON CONFLICT (invitation_id, user_id) DO NOTHING",
-                (invitation_id, user_id, now_ms),
+                (invitation_id, user_id, now_ms, consented),
             )
-            if txn.rowcount == 1:
+            if txn.rowcount != 1 and consent:
+                # Consent given on opening again is kept with the request.
+                txn.execute(
+                    "UPDATE pangea_invitation_ack SET consented_ms = ?"
+                    " WHERE invitation_id = ? AND user_id = ? AND consented_ms IS NULL",
+                    (now_ms, invitation_id, user_id),
+                )
+            elif txn.rowcount == 1:
                 record_event(
                     txn,
                     room_id=row["course_room_id"],
@@ -1418,7 +1434,7 @@ class StudentInvitationStore:
         managed: bool = True,
         canvas_identity: Optional[CanvasIdentity] = None,
         actor: str = SYSTEM,
-        ask_since: Optional[int] = None,
+        ask: bool = False,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """The claim's database step (C2.4 step 2), all or nothing.
 
@@ -1431,8 +1447,8 @@ class StudentInvitationStore:
         no other joined invitation in the course. A grant is recorded only
         together with the claim it allows. ``managed`` is False when the
         claimant administers the course (owner amendment 2026-10-09): no
-        managed record is written. With ``ask_since`` (when the course became
-        Protected) the claimant is asked instead, as ``ask`` asks a member.
+        managed record is written. With ``ask`` the claimant is asked
+        instead, as ``ask`` asks a member.
         The claim and a grant are recorded as events in the same transaction.
         """
         await self.ensure()
@@ -1498,7 +1514,7 @@ class StudentInvitationStore:
                 now_ms=now_ms,
                 invitation_id=invitation_id,
             )
-            if managed and ask_since is not None:
+            if managed and ask:
                 _ask(
                     txn,
                     room_id,
@@ -1507,7 +1523,7 @@ class StudentInvitationStore:
                     now_ms,
                     actor if grant_now else SYSTEM,
                     now_ms,
-                    ask_since,
+                    None,
                 )
             elif managed:
                 # After the claim, so its event follows the claim's. A record
@@ -1555,6 +1571,8 @@ def migrate(txn: Any) -> None:
       ``requested_at_ms`` and ``disclosure_version`` is dropped;
     - the managed record keeps only ``created_at_ms``: ``since_ms`` is
       renamed and ``invited_by`` dropped;
+    - requests gain ``consented_ms``, when the account accepted management
+      as it opened the invitation (nullable: earlier requests carry none);
     - invitations gain ``send_at_ms``, ``first_due_ms`` and ``joined_via``
       (nullable, so no row is rewritten) and the partial index of rows
       waiting to send, which is empty at this point;
@@ -1581,6 +1599,7 @@ def migrate(txn: Any) -> None:
         ("pangea_seat_invitation", "send_at_ms", "BIGINT"),
         ("pangea_seat_invitation", "first_due_ms", "BIGINT"),
         ("pangea_seat_invitation", "joined_via", "TEXT"),
+        ("pangea_invitation_ack", "consented_ms", "BIGINT"),
         ("pangea_managed_account", "status", "TEXT NOT NULL DEFAULT 'managed'"),
         ("pangea_managed_account", "joined_via", "TEXT"),
         ("pangea_managed_account", "joined_at_ms", "BIGINT"),
@@ -1624,12 +1643,11 @@ def _ask(
     joined_at_ms: Optional[int],
     actor: str,
     now_ms: int,
-    since: int,
+    since: Optional[int],
 ) -> bool:
-    """Ask one member (``ask``): a new ``asked`` record, or a managed one
-    made before ``since`` (or in the same millisecond, which cannot be
-    ordered: asked, the safe side) made asked, with a ``management_asked`` row.
-    Returns whether they were asked now."""
+    """Ask one member (``ask``): a new ``asked`` record, or (unless ``since``
+    is None) a managed one made before ``since`` made asked, with a
+    ``management_asked`` row. Returns whether they were asked now."""
     txn.execute(
         "INSERT INTO pangea_managed_account (user_id, course_room_id,"
         " created_at_ms, status, joined_via, joined_at_ms)"
@@ -1637,11 +1655,11 @@ def _ask(
         " ON CONFLICT (user_id, course_room_id) DO NOTHING",
         (user_id, room_id, now_ms, via, joined_at_ms),
     )
-    if txn.rowcount != 1:
+    if txn.rowcount != 1 and since is not None:
         txn.execute(
             "UPDATE pangea_managed_account SET status = 'asked'"
             " WHERE user_id = ? AND course_room_id = ?"
-            " AND status = 'managed' AND created_at_ms <= ?",
+            " AND status = 'managed' AND created_at_ms < ?",
             (user_id, room_id, since),
         )
     if txn.rowcount != 1:
