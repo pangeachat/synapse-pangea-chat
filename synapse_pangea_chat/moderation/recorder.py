@@ -23,6 +23,15 @@ resolving it at once. A lookup that fails does not stop the write: the row is
 written with no courses, counted
 (`pangea_safety_incident_courses_unresolved_total`) and logged, so the
 incident is on record even though no course's Safety page lists it yet.
+
+**A managed student's incidents also reach their Protected courses**
+(pangeachat/.github#799, trust-and-safety "Protected courses"): every
+Protected course managing the sender is added to the chat's own courses,
+whichever chat it was. Only what AI moderation flags (Tier 2, call
+transcripts included) is routed so (managed-accounts doc); a Tier 1 block,
+and a report, which never comes through here, keep the chat's own courses. Management is the managed record read
+when the row is resolved, not room state at the incident's position. A
+lookup that fails is logged at ERROR and the row keeps the chat's courses.
 """
 
 from typing import Any, Awaitable, Callable, Optional, Tuple
@@ -39,7 +48,13 @@ from synapse_pangea_chat.moderation.compat import (
     reraise_if_cancelled,
 )
 from synapse_pangea_chat.moderation.courses import ChatCourses
-from synapse_pangea_chat.moderation.incidents import Incident, IncidentStore
+from synapse_pangea_chat.moderation.incidents import (
+    ACTION_BLOCKED,
+    SOURCE_MODERATION,
+    Incident,
+    IncidentStore,
+    unique,
+)
 from synapse_pangea_chat.moderation.log_safety import error_site, scrubbing_logger
 from synapse_pangea_chat.moderation.room_names import RoomNames
 
@@ -50,6 +65,10 @@ logger = scrubbing_logger("synapse.modules.synapse_pangea_chat.moderation.record
 #: briefly down is outlasted and one that is down for good is not hammered.
 RETRY_ATTEMPTS = 5
 RETRY_FIRST_DELAY_SECONDS = 1.0
+
+#: The Protected courses managing a user; set only while Protected courses
+#: are on (`Controls.protected_courses`).
+ManagingCourses = Callable[[str], Awaitable[Tuple[str, ...]]]
 
 
 class IncidentRecorder:
@@ -71,6 +90,7 @@ class IncidentRecorder:
         self.room_names = room_names or RoomNames.from_homeserver(homeserver)
         self._attempts = attempts
         self._first_delay = first_delay_seconds
+        self.managing_courses: Optional[ManagingCourses] = None
 
     def position_now(self) -> Optional[int]:
         """The position to anchor an incident happening now, or None when it
@@ -96,6 +116,7 @@ class IncidentRecorder:
         if position is None:
             position = self.courses.position_now()
         courses = await self._courses_or_empty(incident, position)
+        courses = unique(courses + await self._managing_or_empty(incident))
         # Read with the courses and carried with them, so a retry does not
         # read it again. Best effort: None when it cannot be read.
         room_name = incident.room_name
@@ -123,6 +144,30 @@ class IncidentRecorder:
             logger.warning(
                 "safety incident %s course lookup failed at %s (%s); written "
                 "with no courses",
+                incident.incident_id,
+                error_site(exc),
+                type(exc).__name__,
+            )
+            return ()
+
+    async def _managing_or_empty(self, incident: Incident) -> Tuple[str, ...]:
+        """The Protected courses managing the incident's sender."""
+        if (
+            self.managing_courses is None
+            or incident.source != SOURCE_MODERATION
+            or incident.action == ACTION_BLOCKED
+            or incident.subject_id is None
+        ):
+            return ()
+        try:
+            return await self.managing_courses(incident.subject_id)
+        except Exception as exc:
+            reraise_if_cancelled(exc)
+            # silent-ok: the row keeps the chat's own courses; logged at
+            # ERROR by type and site.
+            logger.error(
+                "safety incident %s managing-course lookup failed at %s (%s); "
+                "written with the chat's courses only",
                 incident.incident_id,
                 error_site(exc),
                 type(exc).__name__,

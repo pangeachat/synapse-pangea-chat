@@ -288,3 +288,14 @@ class UnmanagedCostTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.api, "run_as_background_process", create=True):
             self.controls.reconcile_later([W])
         self.assertIn(W, await self.controls.known())
+
+    async def test_protected_courses_for_the_safety_page(self) -> None:
+        # Only the Protected courses managing the sender, the one they are
+        # admin of included, read from the records even before this
+        # process's set knows the student.
+        self.assertEqual(await self.controls.protected_courses("@s:hs"), (A, B))
+        self.assertEqual(self.store.calls, ["managing_courses"])
+        self.assertEqual(await self.controls.protected_courses("@seat:hs"), ())
+        self.store.broken = True
+        with self.assertRaises(RuntimeError):
+            await self.controls.protected_courses("@s:hs")

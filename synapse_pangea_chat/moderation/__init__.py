@@ -111,7 +111,7 @@ from synapse_pangea_chat.moderation.log_safety import (
 )
 from synapse_pangea_chat.moderation.profanity import contains_profanity
 from synapse_pangea_chat.moderation.recheck import MAX_AGE_SECONDS, RecheckStore
-from synapse_pangea_chat.moderation.recorder import IncidentRecorder
+from synapse_pangea_chat.moderation.recorder import IncidentRecorder, ManagingCourses
 from synapse_pangea_chat.moderation.refusal import refusal_body
 from synapse_pangea_chat.moderation.refusal import (
     validate_messages as validate_refusal_messages,
@@ -742,6 +742,11 @@ class ChatModeration:
             api.register_third_party_rules_callbacks(
                 on_new_event=self.on_new_event,
             )
+
+    def route_to_managing_courses(self, managing: ManagingCourses) -> None:
+        """File each incident also under the Protected courses managing its
+        sender (`recorder`); called only while Protected courses are on."""
+        self._recorder.managing_courses = managing
 
     def _start_tier2(self) -> None:
         """Build the Tier-2 machinery, on the one instance that should run it.

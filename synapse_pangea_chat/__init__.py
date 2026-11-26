@@ -806,6 +806,11 @@ class PangeaChat:
         self.chat_moderation: Optional[ChatModeration] = None
         if config.moderation_tier1_enabled or config.moderation_tier2_enabled:
             self.chat_moderation = ChatModeration(api, config)
+            # A managed student's flags also reach their Protected courses.
+            if config.protected_courses_enabled:
+                self.chat_moderation.route_to_managing_courses(
+                    self.student_invitations.controls.protected_courses
+                )
 
         # --- Limit User Directory ---
         if config.limit_user_directory_public_attribute_search_path is not None:
