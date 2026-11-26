@@ -1645,8 +1645,8 @@ def _ask(
     now_ms: int,
     since: Optional[int],
 ) -> bool:
-    """Ask one member (``ask``): a new ``asked`` record, or (unless ``since``
-    is None) a managed one made before ``since`` made asked, with a
+    """Ask one member (``ask``): a new ``asked`` record, or a managed one
+    made before ``since`` (any, when None) made asked, with a
     ``management_asked`` row. Returns whether they were asked now."""
     txn.execute(
         "INSERT INTO pangea_managed_account (user_id, course_room_id,"
@@ -1655,12 +1655,12 @@ def _ask(
         " ON CONFLICT (user_id, course_room_id) DO NOTHING",
         (user_id, room_id, now_ms, via, joined_at_ms),
     )
-    if txn.rowcount != 1 and since is not None:
+    if txn.rowcount != 1:
         txn.execute(
             "UPDATE pangea_managed_account SET status = 'asked'"
-            " WHERE user_id = ? AND course_room_id = ?"
-            " AND status = 'managed' AND created_at_ms < ?",
-            (user_id, room_id, since),
+            " WHERE user_id = ? AND course_room_id = ? AND status = 'managed'"
+            " AND (? IS NULL OR created_at_ms < ?)",
+            (user_id, room_id, since, since),
         )
     if txn.rowcount != 1:
         return False

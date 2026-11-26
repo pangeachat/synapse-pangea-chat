@@ -264,6 +264,17 @@ class TestAnOlderRequestGrantedAfterProtection(_Base):
             "managed",
         )
 
+    async def test_a_record_kept_from_an_earlier_claim_is_asked_too(self) -> None:
+        # Managed by a claim before protection, then left the course: the
+        # setup asked only members, so the grant asks it.
+        await self.store.start_managed(
+            ROOM, STUDENT, actor="system", via="email", joined_at_ms=1, now_ms=1
+        )
+        await self.h.handlers.open(STUDENT, self.ident)
+        self.h.admins.protected.add(ROOM)
+        await self.h.approvals.grant(self.ident, STUDENT, TEACHER)
+        self.assertEqual(await self.record(), "asked")
+
     async def test_a_request_whose_check_missed_the_protection_is_asked(self) -> None:
         # The course became Protected between the open route's consent check
         # and its request: no consent is recorded, whatever the times say.
