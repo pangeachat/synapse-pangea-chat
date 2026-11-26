@@ -12,6 +12,7 @@ from typing import Any, Iterator, Literal, Mapping, Optional, Tuple, Union
 from synapse.api.errors import Codes
 from synapse.events import EventBase
 from synapse.module_api import NOT_SPAM, ModuleApi
+from synapse.types import UserID, create_requester
 
 from synapse_pangea_chat.blocked_join_gate.constants import (
     EVENT_TYPE_M_ROOM_MEMBER,
@@ -53,8 +54,47 @@ def server_initiated_entry() -> Iterator[None]:
         _server_initiated.reset(token)
 
 
+async def set_membership(
+    api: ModuleApi,
+    sender: str,
+    target: str,
+    room_id: str,
+    membership: str,
+    content: Optional[dict] = None,
+    *,
+    ratelimit: bool = True,
+) -> None:
+    """``ModuleApi.update_room_membership``, which rate limits joins and
+    invites against ``sender``'s budget. With ``ratelimit`` False, the same
+    change through Synapse's room member handler without the rate limit, for
+    a membership the module restores on its own (internal API: re-check on
+    every Synapse upgrade). The handler adds the profile to a join or invite
+    itself."""
+    if ratelimit:
+        await api.update_room_membership(
+            sender=sender,
+            target=target,
+            room_id=room_id,
+            new_membership=membership,
+            content=content,
+        )
+        return
+    await api._hs.get_room_member_handler().update_membership(
+        requester=create_requester(sender),
+        target=UserID.from_string(target),
+        room_id=room_id,
+        action=membership,
+        content=dict(content or {}),
+        ratelimit=False,
+    )
+
+
 async def server_initiated_join(
-    api: ModuleApi, room_id: str, user_id: str, via: Optional[str] = None
+    api: ModuleApi,
+    room_id: str,
+    user_id: str,
+    via: Optional[str] = None,
+    ratelimit: bool = True,
 ) -> None:
     """Join ``user_id`` to ``room_id`` as themselves, on the server's behalf.
 
@@ -62,15 +102,18 @@ async def server_initiated_join(
     from the gate; the room's own join rules still apply (a restricted room
     admits the user through its allow list, an invited user through the
     invite). Shared by every flow that joins a user without their client.
-    ``via`` names the module path in the join event (``joined_via``).
+    ``via`` names the module path in the join event (``joined_via``);
+    ``ratelimit`` as ``set_membership``.
     """
     with server_initiated_entry(), module_write():
-        await api.update_room_membership(
-            sender=user_id,
-            target=user_id,
-            room_id=room_id,
-            new_membership=MEMBERSHIP_JOIN,
-            content=named(via) if via is not None else None,
+        await set_membership(
+            api,
+            user_id,
+            user_id,
+            room_id,
+            MEMBERSHIP_JOIN,
+            named(via) if via is not None else None,
+            ratelimit=ratelimit,
         )
 
 

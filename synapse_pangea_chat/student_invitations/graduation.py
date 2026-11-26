@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from synapse.api.constants import EventTypes
+from synapse.util.async_helpers import Linearizer
 from synapse.util.frozenutils import unfreeze
 
 from synapse_pangea_chat.analytics_push_suppression import ANALYTICS_ROOM_TYPE
@@ -54,6 +55,9 @@ class Graduation:
         self._admins = admins
         self._controls = controls
         self._courses = ChatCourses.from_homeserver(api._hs)
+        # The power levels are a whole-event read-modify-write: two
+        # graduations in one room must not each restore the other's student.
+        self._levels = Linearizer("pangea_graduation_levels", clock=api._hs.get_clock())
 
     def later(self, room_id: str, user_ids: Iterable[str]) -> None:
         self._api.run_as_background_process(
@@ -86,6 +90,10 @@ class Graduation:
                     report_failure("graduation", error, room=room, user=user_id)
 
     async def _read_only(self, room_id: str, user_id: str) -> None:
+        async with self._levels.queue(room_id):
+            await self._demote(room_id, user_id)
+
+    async def _demote(self, room_id: str, user_id: str) -> None:
         state = await self._api.get_room_state(
             room_id, [(EventTypes.Create, ""), (EventTypes.PowerLevels, "")]
         )

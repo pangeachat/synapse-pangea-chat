@@ -15,6 +15,7 @@ from synapse_pangea_chat.room_code.constants import ACCESS_CODE_JOIN_RULE_CONTEN
 from synapse_pangea_chat.student_invitations.protected import (
     COURSE_MANAGEMENT,
     is_protected,
+    protected_since,
 )
 
 SPACE_ROOM_TYPE = "m.space"
@@ -61,6 +62,13 @@ class ModuleCourseAdmins:
             room_id=room_id, event_filter=[(COURSE_MANAGEMENT, "")]
         )
         return is_protected(state)
+
+    async def protected_since(self, room_id: str) -> Optional[int]:
+        """When the course became Protected; None when it is not."""
+        state = await self._api.get_room_state(
+            room_id=room_id, event_filter=[(COURSE_MANAGEMENT, "")]
+        )
+        return await protected_since(self._main, state.get((COURSE_MANAGEMENT, "")))
 
 
 class ModuleCourseRooms:

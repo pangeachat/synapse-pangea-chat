@@ -65,6 +65,9 @@ class CourseAdmins(Protocol):
     async def is_protected(self, room_id: str) -> bool:
         ...
 
+    async def protected_since(self, room_id: str) -> Optional[int]:
+        ...
+
 
 class ClaimJoinFailed(Exception):
     """The account could not be joined to the course (banned, no inviter)."""
@@ -140,6 +143,7 @@ class StudentClaims:
             return NEEDS_CONSENT, row
 
         room_id = row["course_room_id"]
+        ask_since = await self._ask_since(row, request, user_id) if grant else None
         joined = await self._joiner.force_join(room_id, user_id)
         if not joined.get("success"):
             raise ClaimJoinFailed(joined.get("action", "failed"))
@@ -157,6 +161,7 @@ class StudentClaims:
             managed=not is_admin,
             canvas_identity=canvas_identity,
             actor=actor,
+            ask_since=None if consent else ask_since,
         )
         if outcome == CLAIMED and claimed is not None:
             logger.info("Claimed student invitation %s", invitation_id)
@@ -175,6 +180,21 @@ class StudentClaims:
         if await self.unmanaged(room_id, user_id):
             return False
         return await self._accounts.created_at_ms(user_id) < row["created_at_ms"]
+
+    async def _ask_since(
+        self, row: Dict[str, Any], request: Optional[Dict[str, Any]], user_id: str
+    ) -> Optional[int]:
+        """When the course became Protected, if the teacher grants a request
+        an account that needs consent made before then: opening the
+        invitation did not ask it, so the claim asks it as an existing member
+        is asked (``ask``) instead of managing it. A request made since was
+        asked when opened (``needs_consent``)."""
+        if request is None or not await self.needs_consent(row, user_id):
+            return None
+        since = await self._admins.protected_since(row["course_room_id"])
+        if since is None or request["requested_at_ms"] >= since:
+            return None
+        return since
 
     async def unmanaged(self, room_id: str, user_id: str) -> bool:
         """Never managed here: a course admin of this course, or a Synapse

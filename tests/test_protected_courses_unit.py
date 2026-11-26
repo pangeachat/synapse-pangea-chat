@@ -637,8 +637,9 @@ class TestCourseManagementRoute(_Base):
             await self.ledger(),
             [(STUDENT, TEACHER, "management_asked", "unknown", None)],
         )
-        # A control change in the Protected course: one row per managed student.
-        await self.store.answer(ROOM, STUDENT, accept=True, actor=STUDENT, now_ms=1)
+        # A control change in the Protected course: one row per managed student
+        # (who answered after the course became Protected at 100, so is not asked again).
+        await self.store.answer(ROOM, STUDENT, accept=True, actor=STUDENT, now_ms=1000)
         status, body = await h.set(
             TEACHER, {"room_id": ROOM, "in_course": {"calls": False}}
         )

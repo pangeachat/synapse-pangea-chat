@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
+from synapse.util.async_helpers import Linearizer
 from synapse.util.frozenutils import unfreeze
 
 from synapse_pangea_chat.joined_via import module_write
@@ -34,6 +35,7 @@ from synapse_pangea_chat.student_invitations.protected import (
     KNOCK,
     how_joined,
     management,
+    protected_since,
 )
 from synapse_pangea_chat.student_invitations.store import (
     ASKED,
@@ -101,6 +103,7 @@ class ProtectedCourseHandlers:
         self._enabled = enabled
         self._controls = controls
         self._graduation = graduation
+        self._locks = Linearizer("pangea_course_management", clock=api._hs.get_clock())
 
     def _room(self, args: Any) -> Optional[str]:
         return valid_room_id(args.get("room_id")) if isinstance(args, dict) else None
@@ -111,6 +114,13 @@ class ProtectedCourseHandlers:
             return _bad("'room_id' must be a valid Matrix room ID")
         if not await self._admins.is_course_admin(room_id, caller):
             return 403, FORBIDDEN
+        # One update of a course at a time in this process, read inside the
+        # lock: a stale read never overwrites a newer write. Across processes
+        # the rules refuse turning protection off (``ProtectedRules``).
+        async with self._locks.queue(room_id):
+            return await self._set(room_id, caller, body)
+
+    async def _set(self, room_id: str, caller: str, body: Any) -> Result:
         state = await self._api.get_room_state(
             room_id, [(COURSE_MANAGEMENT, ""), ("m.room.join_rules", "")]
         )
@@ -140,9 +150,6 @@ class ProtectedCourseHandlers:
                         "content": {**content, "join_rule": KNOCK},
                     }
                 )
-        # Members are asked after the flag, so the join hook covers anyone
-        # joining from then on; records made after ``at`` are the hook's.
-        at = now_ms()
         if wanted != current:
             with module_write():
                 await self._api.create_and_send_event_into_room(
@@ -154,7 +161,9 @@ class ProtectedCourseHandlers:
                         "content": wanted,
                     }
                 )
-        asked = await self._ask(room_id, caller, at) if turning_on else []
+        # On every update of a Protected course, not only the one turning it
+        # on, so a retry finishes a setup that failed after the flag.
+        asked = await self._ask(room_id, caller) if wanted["protected"] else []
         changes = [
             f"{group}.{name}={'on' if wanted[group][name] else 'off'}"
             for group in DEFAULTS
@@ -176,18 +185,24 @@ class ProtectedCourseHandlers:
             )
         return 200, {"management": wanted, "asked": asked}
 
-    async def _ask(self, room_id: str, caller: str, at: int) -> List[str]:
-        """Ask each member already in the course (``store.ask``)."""
-        state = await self._api.get_room_state(room_id, [("m.room.member", None)])
+    async def _ask(self, room_id: str, caller: str) -> List[str]:
+        """Ask each member already in the course when it became Protected
+        (``store.ask``). Members are asked after the flag, so the join hook
+        covers anyone joining from then on; records made since are the
+        hook's or an answer's, and are left alone."""
+        state = await self._api.get_room_state(
+            room_id, [("m.room.member", None), (COURSE_MANAGEMENT, "")]
+        )
+        since = await protected_since(self._main, state.get((COURSE_MANAGEMENT, "")))
         members: List[Tuple[str, str, Optional[int]]] = []
-        for (_, user_id), member in state.items():
-            if member.content.get("membership") != "join":
+        for (kind, user_id), member in state.items():
+            if kind != "m.room.member" or member.content.get("membership") != "join":
                 continue
             if await self._unmanaged(room_id, user_id):
                 continue
             via, joined_at_ms = await how_joined(self._main, member)
             members.append((user_id, via, joined_at_ms))
-        return await self._store.ask(room_id, members, caller, at)
+        return await self._store.ask(room_id, members, caller, now_ms(), since)
 
     async def members(self, caller: str, query: Any) -> Result:
         room_id = self._room(query)
@@ -231,10 +246,14 @@ class ProtectedCourseHandlers:
             return 403, FORBIDDEN
         if not await self._admins.is_protected(room_id):
             return _conflict(*NOT_PROTECTED)
-        graduated = await self._store.graduate(
-            room_id, None if everyone else user_ids, caller, now_ms()
-        )
-        self._graduation.later(room_id, graduated)
+        wanted = None if everyone else user_ids
+        graduated = await self._store.graduate(room_id, wanted, caller, now_ms())
+        # The effects run on every graduated student the student has not yet
+        # seen graduate, so a retry repairs effects that failed; they are
+        # idempotent. Not once seen: the student may have shared their
+        # analytics again, which a repeat would undo.
+        repair = await self._store.unseen_graduates(room_id, wanted)
+        self._graduation.later(room_id, repair)
         return 200, {"graduated": graduated}
 
     async def graduation_seen(self, caller: str, body: Any) -> Result:

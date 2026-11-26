@@ -242,7 +242,11 @@ class TestGraduationRoutes(_Managed):
             await self.p.graduate(TEACHER, {"room_id": ROOM, "all": True}),
             (200, {"graduated": [OTHER]}),
         )
-        self.assertEqual(self.graduation.applied, [(ROOM, [STUDENT]), (ROOM, [OTHER])])
+        # The class graduation also re-applies the effects for STUDENT, who has
+        # not seen their graduation yet, so a retry repairs failed effects.
+        self.assertEqual(
+            self.graduation.applied, [(ROOM, [STUDENT]), (ROOM, [OTHER, STUDENT])]
+        )
         self.h.admins.protected = set()
         status, body = await self.p.graduate(TEACHER, one)
         self.assertEqual((status, body["errcode"]), (409, "ORG.PANGEA.NOT_PROTECTED"))
