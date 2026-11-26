@@ -186,6 +186,8 @@ class CourseInvitationAPI(Resource):
         send_email = body.get("send_email", True)
         if not isinstance(send_email, bool):
             raise SynapseError(400, "send_email must be a boolean")
+        # The invitation is stored before any email goes out, so a failed send leaves it
+        # prepared and eligible for an explicit resend.
         if created and send_email:
             await self.send(ident, code, email, spec=spec)
         return await self.invitations.status(ident)
@@ -210,6 +212,9 @@ class CourseInvitationAPI(Resource):
             if value is None:
                 raise SynapseError(400, "Missing or invalid " + field)
             fields[field] = value
+        # The caller names the quest it expects the invitation to hold, so two replacements
+        # cannot overwrite each other; a dry run makes the same checks and writes nothing
+        # (create-course-space.instructions.md, "Managing an invitation").
         expected = fields.pop("expected_course_plan_id")
         # Required, as set_course_plan requires it: a missing one would clear the topic.
         description = body.get("description")
