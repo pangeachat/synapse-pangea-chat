@@ -669,6 +669,8 @@ class CourseInvitationStore:
             "pangea_invitation_deliveries", deliveries
         )
 
+        # One of unsent, accepted, failed or uncertain. Accepted means the mail server took
+        # the message, short of the inbox; an uncertain attempt is reconciled before a resend.
         result["delivery_outcome"] = (
             result["deliveries"][-1]["outcome"] if result["deliveries"] else "unsent"
         )
