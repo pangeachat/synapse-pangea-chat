@@ -22,6 +22,11 @@ BODY = {
     "body": "Your course is ready.\n\nOpen it to become its teacher.",
     "cta_label": "Open your course",
 }
+VIDEO = {
+    "url": "https://youtu.be/Zhg1_NGdxXQ",
+    "title": "Immersive Homework for Language Learning",
+    "thumbnail_url": "https://assets.pangea.chat/email/video.png",
+}
 
 
 def _resource(
@@ -140,6 +145,45 @@ class TestSendCourseClaimReminder(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(status, 400)
                 store.add_code.assert_not_called()
 
+    async def test_a_video_is_passed_to_the_email(self) -> None:
+        resource, _, mailer = _resource(ReminderTarget("t@school.example", False))
+
+        await self._post(resource, {**BODY, "video": VIDEO})
+
+        status, _ = self._response()
+        self.assertEqual(status, 200)
+        self.assertEqual(mailer.send_course_reminder.await_args.kwargs["video"], VIDEO)
+
+    async def test_no_video_sends_none(self) -> None:
+        resource, _, mailer = _resource(ReminderTarget("t@school.example", False))
+
+        await self._post(resource)
+
+        self.assertIsNone(mailer.send_course_reminder.await_args.kwargs["video"])
+
+    async def test_an_invalid_video_is_refused(self) -> None:
+        invalid = {
+            "not an object": "https://youtu.be/x",
+            "http url": {**VIDEO, "url": "http://youtu.be/x"},
+            "http thumbnail": {**VIDEO, "thumbnail_url": "http://a.example/t.png"},
+            "javascript url": {**VIDEO, "url": "javascript:alert(1)"},
+            "no title": {k: v for k, v in VIDEO.items() if k != "title"},
+            "long title": {**VIDEO, "title": "x" * 101},
+        }
+        for case, video in invalid.items():
+            with self.subTest(case=case):
+                self.respond.reset_mock()
+                resource, store, mailer = _resource(
+                    ReminderTarget("t@school.example", False)
+                )
+
+                await self._post(resource, {**BODY, "video": video})
+
+                status, _ = self._response()
+                self.assertEqual(status, 400)
+                store.add_code.assert_not_called()
+                mailer.send_course_reminder.assert_not_called()
+
     async def test_a_failed_send_withdraws_the_code(self) -> None:
         resource, store, mailer = _resource(ReminderTarget("t@school.example", False))
         mailer.send_course_reminder.side_effect = RuntimeError("smtp down")
@@ -183,6 +227,36 @@ class TestReminderTemplate(unittest.TestCase):
         self.assertIn("Open your course", html)
         self.assertIn("https://app.pangea.chat/n3wcod1", text)
         self.assertIn("Second.", text)
+        self.assertNotIn("Watch:", html)
+        self.assertNotIn("Watch:", text)
+
+    def test_a_video_is_its_thumbnail_linking_out(self) -> None:
+        import jinja2
+
+        from synapse_pangea_chat.email_invite.course_claim_emails import (
+            TEMPLATES_DIR,
+        )
+
+        env = jinja2.Environment(
+            loader=jinja2.FileSystemLoader(TEMPLATES_DIR),
+            autoescape=jinja2.select_autoescape(["html"]),
+        )
+        values = {
+            "app_name": "Pangea Chat",
+            "subject": "Reminder",
+            "paragraphs": ["Watch this."],
+            "cta_label": "Open your course",
+            "claim_url": "https://app.pangea.chat/n3wcod1",
+            "video": {**VIDEO, "title": "Homework <b>demo</b>"},
+        }
+        html = env.get_template("course_reminder.html").render(**values)
+        text = env.get_template("course_reminder.txt").render(**values)
+
+        self.assertIn('src="https://assets.pangea.chat/email/video.png"', html)
+        self.assertEqual(html.count('href="https://youtu.be/Zhg1_NGdxXQ"'), 2)
+        self.assertNotIn("<b>demo</b>", html)
+        self.assertLess(html.index("youtu.be"), html.index("n3wcod1"))
+        self.assertIn("Watch: Homework <b>demo</b>\nhttps://youtu.be/Zhg1_NGdxXQ", text)
 
 
 if __name__ == "__main__":

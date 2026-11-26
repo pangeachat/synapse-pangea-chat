@@ -129,6 +129,7 @@ class CourseClaimMailer:
         body: str,
         cta_label: str,
         claim_url: str,
+        video: Optional[dict[str, str]] = None,
     ) -> None:
         template_vars = {
             "app_name": self._app_name,
@@ -136,6 +137,7 @@ class CourseClaimMailer:
             "paragraphs": reminder_paragraphs(body),
             "cta_label": cta_label,
             "claim_url": claim_url,
+            "video": video,
         }
         await self._send(
             email_address=email_address,

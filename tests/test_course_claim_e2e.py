@@ -293,6 +293,11 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                     "subject": "Your course is waiting",
                     "body": "Your course is ready.\n\nOpen it to become its teacher.",
                     "cta_label": "Open your course",
+                    "video": {
+                        "url": "https://youtu.be/Zhg1_NGdxXQ",
+                        "title": "Immersive Homework for Language Learning",
+                        "thumbnail_url": "https://assets.pangea.chat/email/video.png",
+                    },
                 }
                 # Only a server admin may send one.
                 refused = self._post(REMINDER_PATH, teacher, reminder_body)
@@ -306,6 +311,10 @@ class TestCourseClaimE2E(BaseSynapseE2ETest):
                 assert reminder is not None
                 reminder_text = body_text(reminder)
                 self.assertIn("Open it to become its teacher.", reminder_text)
+                self.assertIn(
+                    "Watch: Immersive Homework for Language Learning\nhttps://youtu.be/Zhg1_NGdxXQ",
+                    reminder_text,
+                )
                 prefix = f"{APP_BASE_URL}/"
                 start = reminder_text.index(prefix) + len(prefix)
                 reminder_code = reminder_text[start : start + 7]
