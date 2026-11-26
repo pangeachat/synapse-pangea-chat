@@ -2,7 +2,8 @@
 
 The notice is the second email of a requested course's claim, the share kit,
 sent to the address the course was requested from or the delivery address the
-caller last gave (knock-with-code.instructions.md, "Claiming a course"). It is
+caller last gave (knock-with-code.instructions.md, "Codes, share kit and
+existing courses"). It is
 how the teacher is sent on to the course, so a transient mail failure must not
 lose it: the admin code is already spent by then, and resubmitting the link
 answers "code not found".

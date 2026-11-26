@@ -1,4 +1,20 @@
-"""First instructor creates a course; retries only recover its original room."""
+"""First instructor creates a course; retries only recover its original room.
+
+Design: knock-with-code.instructions.md, "Claiming a course". Mechanics:
+
+- The create event carries the invitation id (``MARKER``) and the room is
+  associated with the invitation before completion, so a retry after a crash
+  or timeout recovers that room (``recover_room``) and never creates another.
+- An uncertain creation answers ``ORG.PANGEA.CLAIM_RECOVERY_REQUIRED`` (503)
+  and is reconciled before anything is created again; a reservation never
+  expires into another account's claim (course_invitations).
+- Recovery never invites, joins or promotes: a leave, demotion or revocation
+  wins even if completion was interrupted, and when the module cannot tell a
+  step that never succeeded from a withdrawal it stops for an operator.
+- Completion needs joined membership, admin rights and the required course
+  settings verified; the room is answered in ``already_joined``, with no
+  asynchronous polling response.
+"""
 from __future__ import annotations
 
 import json
@@ -268,7 +284,12 @@ class CourseProvisioner:
         existing course and nothing more. No room is provisioned, no class
         code minted, no join rule touched, no ownership transferred and no
         share kit owed (knock-with-code.instructions.md, "Codes, share kit and
-        existing courses")."""
+        existing courses"). A revoked invitation, a demoted winner or another
+        account gets the unknown-code answer; a room with no eligible
+        instructor at claim time, or rights withdrawn during a partial claim,
+        answers recovery required and keeps the reservation for the winner.
+        The claim does not back-fill existing students' analytics rooms; the
+        operator's grant skill does (grant-instructor-analytics-access)."""
         room = invitation["room_id"]
         if not room:
             # Every instructor invitation names its room when prepared; a row
