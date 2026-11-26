@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, Optional, Protocol, Tuple
 
 from synapse_pangea_chat.student_invitations.accounts import Accounts
 from synapse_pangea_chat.student_invitations.events import SYSTEM
+from synapse_pangea_chat.student_invitations.managed_events import VIA_UNKNOWN
 from synapse_pangea_chat.student_invitations.report import report_failure
 from synapse_pangea_chat.student_invitations.store import (
     CLAIMED,
@@ -143,7 +144,9 @@ class StudentClaims:
             return NEEDS_CONSENT, row
 
         room_id = row["course_room_id"]
-        ask_since = await self._ask_since(row, request, user_id) if grant else None
+        ask_since = None
+        if grant and not consent:
+            ask_since = await self._ask_since(row, request, user_id, grant)
         joined = await self._joiner.force_join(room_id, user_id)
         if not joined.get("success"):
             raise ClaimJoinFailed(joined.get("action", "failed"))
@@ -152,19 +155,24 @@ class StudentClaims:
         # joined but never managed by it (owner amendment 2026-10-09), and a
         # Synapse server admin is never managed at all (owner, 2026-10-12).
         is_admin = await self.unmanaged(room_id, user_id)
+        claimed_at = now_ms()
         outcome, claimed = await self._store.claim_txn(
             invitation_id,
             user_id,
             email_match=email_match,
             grant=grant,
-            now_ms=now_ms(),
+            now_ms=claimed_at,
             managed=not is_admin,
             canvas_identity=canvas_identity,
             actor=actor,
-            ask_since=None if consent else ask_since,
+            ask_since=ask_since,
         )
         if outcome == CLAIMED and claimed is not None:
             logger.info("Claimed student invitation %s", invitation_id)
+            if not (consent or canvas or is_admin) and ask_since is None:
+                await self._ask_if_protected_since(
+                    claimed, request, user_id, grant, actor, claimed_at
+                )
             await self._release_if_gone(room_id, user_id)
             await self._recheck_managed(claimed)
             if not is_admin and await self._admins.is_protected(room_id):
@@ -182,21 +190,51 @@ class StudentClaims:
         return await self._accounts.created_at_ms(user_id) < row["created_at_ms"]
 
     async def _ask_since(
-        self, row: Dict[str, Any], request: Optional[Dict[str, Any]], user_id: str
+        self,
+        row: Dict[str, Any],
+        request: Optional[Dict[str, Any]],
+        user_id: str,
+        grant: bool,
     ) -> Optional[int]:
-        """When the course became Protected, if the teacher grants a request
-        an account that needs consent made before then: opening the
-        invitation did not ask it, so the claim asks it as an existing member
-        is asked (``ask``) instead of managing it. A request made since was
-        asked when opened (``needs_consent``)."""
-        if request is None or not await self.needs_consent(row, user_id):
+        """When the course became Protected, if a claim with no consent must
+        ask the account rather than manage it: one that needs consent, by a
+        teacher's grant of a request made before then (opening the
+        invitation did not ask it; a request made since was asked then), or
+        by any other path (the course became Protected after the claim's
+        ``needs_consent``). Asked as an existing member is (``ask``)."""
+        if not await self.needs_consent(row, user_id):
             return None
         since = await self._admins.protected_since(row["course_room_id"])
         # A request in the same millisecond cannot be ordered: asked, the
         # safe side.
-        if since is None or request["requested_at_ms"] > since:
+        if since is None or (grant and request and request["requested_at_ms"] > since):
             return None
         return since
+
+    async def _ask_if_protected_since(
+        self,
+        claimed: Dict[str, Any],
+        request: Optional[Dict[str, Any]],
+        user_id: str,
+        grant: bool,
+        actor: str,
+        claimed_at: int,
+    ) -> None:
+        """The course became Protected while this claim ran, after it read
+        that no asking was needed: the record it managed is asked now."""
+        if await self._ask_since(claimed, request, user_id, grant) is None:
+            return
+        asked = await self._store.ask(
+            claimed["course_room_id"],
+            [(user_id, claimed["joined_via"] or VIA_UNKNOWN, claimed_at)],
+            actor if grant else SYSTEM,
+            now_ms(),
+            since=claimed_at,
+        )
+        if asked:
+            logger.info(
+                "Asked the claimant of %s: protected during the claim", claimed["id"]
+            )
 
     async def unmanaged(self, room_id: str, user_id: str) -> bool:
         """Never managed here: a course admin of this course, or a Synapse

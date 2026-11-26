@@ -161,9 +161,6 @@ class ProtectedCourseHandlers:
                         "content": wanted,
                     }
                 )
-        # On every update of a Protected course, not only the one turning it
-        # on, so a retry finishes a setup that failed after the flag.
-        asked = await self._ask(room_id, caller) if wanted["protected"] else []
         changes = [
             f"{group}.{name}={'on' if wanted[group][name] else 'off'}"
             for group in DEFAULTS
@@ -183,6 +180,10 @@ class ProtectedCourseHandlers:
             self._controls.reconcile_later(
                 r["user_id"] for r in records if r["status"] == MANAGED
             )
+        # Last, and on every update of a Protected course, not only the one
+        # turning it on: asking is the one step derived from state, so a
+        # retry finishes a setup that failed after the flag.
+        asked = await self._ask(room_id, caller) if wanted["protected"] else []
         return 200, {"management": wanted, "asked": asked}
 
     async def _ask(self, room_id: str, caller: str) -> List[str]:
@@ -250,12 +251,8 @@ class ProtectedCourseHandlers:
         graduated = await self._store.graduate(room_id, wanted, caller, now_ms())
         # The effects run on every graduated student asked for, not only the
         # new ones, so a retry repairs effects that failed; they are
-        # idempotent. Except removing the admins from a student's analytics
-        # once the student has seen their graduation: they may have shared
-        # their analytics again, which a repeat would undo.
-        graduates = await self._store.graduates(room_id, wanted)
-        shared = [u for u, seen in graduates.items() if seen and u not in graduated]
-        self._graduation.later(room_id, sorted(graduates), shared)
+        # idempotent (``Graduation``).
+        self._graduation.later(room_id, await self._store.graduates(room_id, wanted))
         return 200, {"graduated": graduated}
 
     async def graduation_seen(self, caller: str, body: Any) -> Result:

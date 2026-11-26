@@ -748,20 +748,20 @@ class StudentInvitationStore:
 
     async def graduates(
         self, room_id: str, user_ids: Optional[Sequence[str]]
-    ) -> Dict[str, bool]:
+    ) -> Dict[str, int]:
         """Of ``user_ids`` (every student when None), those graduated from
-        this course, each with whether they have seen it."""
+        this course, each with when."""
         await self.ensure()
 
-        def select(txn: Any) -> Dict[str, bool]:
+        def select(txn: Any) -> Dict[str, int]:
             txn.execute(
-                "SELECT user_id, graduation_seen_ms FROM pangea_managed_account"
+                "SELECT user_id, graduated_at_ms FROM pangea_managed_account"
                 " WHERE course_room_id = ? AND status = 'graduated'",
                 (room_id,),
             )
             return {
-                user_id: seen is not None
-                for user_id, seen in txn.fetchall()
+                user_id: at
+                for user_id, at in txn.fetchall()
                 if user_ids is None or user_id in user_ids
             }
 

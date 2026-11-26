@@ -48,6 +48,8 @@ from tests.test_protected_courses_unit import (
 )
 from tests.test_protected_graduation_unit import FakeGraduation
 from tests.test_seat_invitations_unit import (
+    INVITED,
+    INVITED_KEY,
     OTHER,
     ROOM,
     STUDENT,
@@ -252,6 +254,8 @@ class TestAnOlderRequestGrantedAfterProtection(_Base):
         self.assertEqual(
             (await self.ledger())[-1][:3], (STUDENT, TEACHER, "management_asked")
         )
+        # Never managed on the way.
+        self.assertNotIn("management_started", [r[2] for r in await self.ledger()])
         # Their answer is the existing one.
         self.assertEqual(
             await self.store.answer(
@@ -267,6 +271,37 @@ class TestAnOlderRequestGrantedAfterProtection(_Base):
         self.h.admins.protected.add(ROOM)
         self.h.admins.since[ROOM] = request["requested_at_ms"]
         await self.h.approvals.grant(self.ident, STUDENT, TEACHER)
+        record = await self.store.managed_record(STUDENT, ROOM)
+        assert record is not None
+        self.assertEqual(record["status"], "asked")
+
+    def protect_during_the_join(self) -> Any:
+        """A patch of the claim's join that makes the course Protected
+        between the claim's consent check and its transaction."""
+        join = self.h.joiner.force_join
+
+        async def join_then_protect(room_id: str, user_id: str) -> Dict:
+            self.h.admins.protected.add(ROOM)
+            self.h.admins.since[ROOM] = LATER
+            return await join(room_id, user_id)
+
+        return patch.object(self.h.joiner, "force_join", join_then_protect)
+
+    async def test_a_grant_while_the_course_becomes_protected_asks(self) -> None:
+        await self.h.handlers.open(STUDENT, self.ident)
+        with self.protect_during_the_join():
+            outcome, _ = await self.h.approvals.grant(self.ident, STUDENT, TEACHER)
+        self.assertEqual(outcome, "claimed")
+        record = await self.store.managed_record(STUDENT, ROOM)
+        assert record is not None
+        self.assertEqual(record["status"], "asked")
+
+    async def test_a_claim_while_the_course_becomes_protected_asks(self) -> None:
+        (inv,) = await self.h.add(INVITED)
+        self.h.verify(STUDENT, INVITED_KEY)
+        with self.protect_during_the_join():
+            outcome, _ = await self.h.claims.claim(inv["invitation_id"], STUDENT)
+        self.assertEqual(outcome, "claimed")
         record = await self.store.managed_record(STUDENT, ROOM)
         assert record is not None
         self.assertEqual(record["status"], "asked")
@@ -348,6 +383,21 @@ class TestSetupRepeatable(_RouteBase):
         record = await self.store.managed_record(STUDENT, ROOM)
         assert record is not None
         self.assertEqual(record["status"], "asked")
+
+    async def test_a_failed_ask_loses_no_control_change(self) -> None:
+        await self.p.set(TEACHER, {"room_id": ROOM, "protected": True})
+        await self.store.answer(ROOM, STUDENT, accept=True, actor=STUDENT, now_ms=300)
+        with patch.object(self.store, "ask", AsyncMock(side_effect=RuntimeError)):
+            with self.assertRaises(RuntimeError):
+                await self.p.set(
+                    TEACHER, {"room_id": ROOM, "outside": {"other_courses": True}}
+                )
+        # Recorded and applied before the one step a retry repeats.
+        self.assertEqual(self.controls.reconciled, [[STUDENT]])
+        self.assertEqual(
+            (await self.ledger())[-1][2:],
+            ("control_changed", "unknown", "outside.other_courses=on"),
+        )
 
     async def test_a_record_in_the_same_millisecond_is_asked(self) -> None:
         await self.store.start_managed(
@@ -435,49 +485,49 @@ class TestGraduationRetry(_RouteBase):
         self.assertEqual(
             await self.p.graduate(TEACHER, everyone), (200, {"graduated": []})
         )
-        self.assertEqual(
-            self.graduation.applied,
-            [(ROOM, [STUDENT]), (ROOM, [STUDENT]), (ROOM, [STUDENT])],
-        )
-        self.assertEqual(self.graduation.shared, [[], [], []])
-        # Once seen, the student may have shared their analytics again: the
-        # rest is repaired, that sharing is kept.
+        # Seen or not: a seen graduation whose effects failed is repaired too.
         await self.store.see_graduation(STUDENT, ROOM, 5)
         await self.p.graduate(TEACHER, one)
-        self.assertEqual(self.graduation.applied[-1], (ROOM, [STUDENT]))
-        self.assertEqual(self.graduation.shared[-1], [STUDENT])
-
-    async def test_a_graduation_seen_at_once_still_gets_its_effects(self) -> None:
-        real_graduate = self.store.graduate
-
-        async def graduate_then_seen(*args: Any) -> List[str]:
-            graduated = await real_graduate(*args)
-            await self.store.see_graduation(STUDENT, ROOM, 5)
-            return graduated
-
-        with patch.object(self.store, "graduate", graduate_then_seen):
-            await self.p.graduate(TEACHER, {"room_id": ROOM, "user_ids": [STUDENT]})
-        self.assertEqual(self.graduation.applied, [(ROOM, [STUDENT])])
-        self.assertEqual(self.graduation.shared, [[]])
+        self.assertEqual(self.graduation.applied, [(ROOM, [STUDENT])] * 4)
+        record = await self.store.managed_record(STUDENT, ROOM)
+        assert record is not None
+        self.assertEqual(self.graduation.graduated_at, [record["graduated_at_ms"]] * 4)
 
 
-class TestGraduationKeepsSharing(_Base):
-    async def test_a_student_who_shares_again_keeps_it(self) -> None:
-        self.h.main.get_rooms_for_user = AsyncMock(return_value={CHAT})
+class TestUnshareKeepsALaterShare(_Base):
+    """The course's admins leave a graduate's analytics room only if they
+    were in it before the graduation; one the student invited again since
+    stays, however often the graduation is repaired."""
+
+    async def test_only_admins_from_before_the_graduation_leave(self) -> None:
+        old_admin, new_admin = TEACHER, "@coteacher:x"
+        self.h.admins.admins.add((ROOM, new_admin))
+        left: List[str] = []
+
+        async def room_state(room_id: str, event_filter: Any) -> Dict:
+            if {t for t, _ in event_filter} == {"m.room.create"}:
+                create = SimpleNamespace(
+                    sender=STUDENT, content={"type": "p.analytics"}
+                )
+                return {("m.room.create", ""): create}
+            return {
+                ("m.room.member", old_admin): member(old_admin, "join", ts=50),
+                ("m.room.member", new_admin): member(new_admin, "invite", ts=150),
+                ("m.room.member", STUDENT): member(STUDENT, "join", ts=10),
+            }
+
+        async def leave(sender: str, target: str, room_id: str, m: str) -> None:
+            left.append(target)
+
         self.h.main.get_room_max_stream_ordering = lambda: 0
-        api = SimpleNamespace(_hs=self.h.api._hs)
-        graduation = Graduation(
-            api, self.h.admins, SimpleNamespace(reconcile=AsyncMock())
+        api = SimpleNamespace(
+            _hs=self.h.api._hs,
+            get_room_state=room_state,
+            update_room_membership=leave,
         )
-        graduation._courses = cast(
-            Any,
-            SimpleNamespace(
-                for_room=AsyncMock(return_value=()), position_now=lambda: 0
-            ),
-        )
-        with patch.object(graduation, "_unshare", AsyncMock()) as unshare:
-            await graduation.apply(ROOM, [STUDENT, OTHER], [OTHER])
-        self.assertEqual([c.args[1] for c in unshare.call_args_list], [STUDENT])
+        graduation = Graduation(api, self.h.admins, None)
+        await graduation._unshare(CHAT, STUDENT, ROOM, 100)
+        self.assertEqual(left, [old_admin])
 
 
 # --- 7. two graduations in one room keep both power levels ---

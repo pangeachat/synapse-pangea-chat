@@ -199,21 +199,21 @@ class TestGraduationEffects(_Base):
 
     async def test_a_current_course_admin_keeps_their_power_level(self):
         self.h.admins.admins.add((ROOM, STUDENT))
-        await self.graduation.apply(ROOM, [STUDENT])
+        await self.graduation.apply(ROOM, {STUDENT: 0})
         self.assertEqual(self.sent, [])
         self.h.admins.admins.discard((ROOM, STUDENT))
-        await self.graduation.apply(ROOM, [STUDENT])
+        await self.graduation.apply(ROOM, {STUDENT: 0})
         self.assertEqual([e["content"]["users"][STUDENT] for e in self.sent], [-1])
 
 
 class FakeGraduation:
     def __init__(self) -> None:
         self.applied: List[Tuple[str, List[str]]] = []
-        self.shared: List[List[str]] = []
+        self.graduated_at: List[int] = []
 
-    def later(self, room_id: str, user_ids: Any, shared: Any = ()) -> None:
-        self.applied.append((room_id, list(user_ids)))
-        self.shared.append(list(shared))
+    def later(self, room_id: str, graduated: Dict[str, int]) -> None:
+        self.applied.append((room_id, sorted(graduated)))
+        self.graduated_at.extend(graduated[u] for u in sorted(graduated))
 
 
 class TestGraduationRoutes(_Managed):
