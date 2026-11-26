@@ -1,3 +1,20 @@
+"""``POST /_synapse/client/pangea/v1/preview_with_code`` — what a code opens.
+
+Previewing reserves no claimant, creates no room and spends no code
+(knock-with-code.instructions.md, "Claiming a course"). For a requested
+course's claim code:
+
+- prepared or provisioning: 409 ``ORG.PANGEA.COURSE_NOT_CREATED``, with no
+  made-up room id, admin or state events;
+- completed: the room's preview only for the winning account while it is
+  still a joined admin; anyone else, and a revoked invitation, gets 404
+  ``ORG.PANGEA.CODE_NOT_FOUND`` with no invitation details.
+
+Ordinary class-code previews keep their original response (400 with no
+errcode when nothing matches). The app's join path does not depend on this
+endpoint.
+"""
+
 from __future__ import annotations
 
 import logging

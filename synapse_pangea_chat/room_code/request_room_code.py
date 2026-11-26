@@ -1,3 +1,12 @@
+"""``GET /_synapse/client/pangea/v1/request_room_code`` — a fresh class code.
+
+Bearer auth. Answers ``{"access_code": ...}``, free across join rules, claim
+codes and student invitation codes (``code_lookup.new_unique_code``, up to
+``MAX_CODE_ATTEMPTS`` tries, else 500). The client stores it in the room's
+``m.room.join_rules`` under ``access_code``. Alphabet: ``generate_room_code``.
+Design: knock-with-code.instructions.md, "Codes".
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING

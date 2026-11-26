@@ -1,3 +1,7 @@
+"""Per-account, per-process rate limit on code attempts: at most
+``knock_with_code_requests_per_burst`` (default 10) per
+``knock_with_code_burst_duration_seconds`` (default 60), answered 429."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
