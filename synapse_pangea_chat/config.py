@@ -199,16 +199,22 @@ class PangeaChatConfig:
     notice_missed_message_unsubscribe_enabled: bool = False
     # Install the per-user push rule that keeps Synapse's own mailer and
     # rule-driven push off p.room.notice events (the bot delivers those itself).
+    # Turning it off stops new installs; rules already installed stay.
     notice_suppress_notice_push_rules: bool = True
     # HMAC key for unsubscribe and click links; falls back to the homeserver's
     # macaroon secret when unset.
     notice_token_secret: Optional[str] = None
+    # How long an emailed link works: past CAN-SPAM's 30 days and CASL's 60.
     notice_token_ttl_days: int = 90
     # Shown in the email footer; a CAN-SPAM requirement for marketing-classified
-    # categories, harmless on the rest.
+    # categories, harmless on the rest. Required once notice_email_enabled is on.
     notice_email_postal_address: Optional[str] = None
+    # Per client address, on the signed-out unsubscribe pages and on click links
+    # that fail verification (a valid click link is not limited).
     notice_public_requests_per_burst: int = 30
     notice_public_burst_duration_seconds: int = 60
+    # Per calling admin, each admin endpoint counted on its own (prepare, deliver,
+    # unsubscribe-link mint); none spends the send_push allowance.
     notice_admin_requests_per_minute: int = 600
     notice_admin_burst: int = 100
     # Hosts an `external` notice destination may link to; re-checked when the

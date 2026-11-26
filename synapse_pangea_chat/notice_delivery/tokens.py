@@ -5,6 +5,13 @@ Both are HMAC-signed with a server secret so the URL cannot be forged or
 edited, and both carry an expiry so an old email cannot act forever. The
 payload is not encrypted: it holds only a user id, a category, and event ids,
 none of which is secret.
+
+Each token names its kind, so a click link cannot unsubscribe and an unsubscribe
+link cannot record a click. A click token also names its destination and which
+link it is (``cta``, ``cta2``, ``item1`` … ``item5``), so the destination cannot be
+edited into the URL and an open records which link was used. The lifetime is
+``notice_token_ttl_days``; the key is ``notice_token_secret``, else the
+homeserver's macaroon secret (``common.token_secret``).
 """
 
 from __future__ import annotations

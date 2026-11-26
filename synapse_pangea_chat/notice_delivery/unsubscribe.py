@@ -5,6 +5,12 @@ standard (RFC 8058) POSTs to the same URL, and a GET must never perform the
 action because mail scanners fetch links automatically. Both write the same
 account-data event the in-app preference screen reads and writes, so the two
 surfaces cannot disagree.
+
+The confirmation page reads the person's current refusals and offers a switch per
+reminder and offer category under a master switch, plus the missed-message switch
+(``preference_rows``). It can add several refusals in one save; a category already
+refused shows off and cannot be turned back on from a signed-out link. The one-click
+POST from a mail client refuses the link's own category.
 """
 
 from __future__ import annotations

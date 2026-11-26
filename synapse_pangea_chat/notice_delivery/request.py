@@ -49,10 +49,11 @@ def string(data: Dict[str, Any], key: str, limit: int = 512) -> str:
 
 @dataclass(frozen=True)
 class Destination:
-    """Where a notice's action link lands: the app home, an activity (with
-    its session when one exists), a course, the subscription page, or an
-    allowed external page. The signed link binds it (notices.instructions.md,
-    "Notice destinations")."""
+    """Where a notice's action link lands: one of ``DESTINATION_KINDS`` (the
+    app home, an activity with its session when one exists, a course, the
+    subscription page, a workspace path, the educator dashboard, or an allowed
+    external page). The signed link binds it (notices.instructions.md, "What
+    every send carries")."""
 
     kind: str
     activity_id: Optional[str] = None
@@ -181,6 +182,12 @@ class Destination:
 
 @dataclass(frozen=True)
 class EmailContent:
+    """The caller's rendered email. Every link slot (``{{cta_url}}``, ``{{cta2_url}}``
+    when a second link is named, ``{{item<i>_url}}`` for each item) and
+    ``{{unsubscribe_url}}``, ``{{receiving_reason}}`` and ``{{postal_address}}`` must
+    appear in both bodies, and no slot may appear without its link, so a link can be
+    neither silently dropped nor left unrendered."""
+
     subject: str
     html: str
     text: str
@@ -455,6 +462,10 @@ class NoticeRequest:
 
 
 def is_structured(data: Dict[str, Any]) -> bool:
+    """Whether the request carries caller-rendered content. The flat body/subject form is
+    the compatibility path for deployed bot callers still migrating: it renders the
+    module's own template, so it takes a destination but no second link and no items,
+    and its caller keeps writing its own Notification_Log row."""
     return any(
         key in data
         for key in (
