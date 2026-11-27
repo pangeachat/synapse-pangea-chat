@@ -1,7 +1,33 @@
 """In-memory index from class/admin code to rooms.
 
-Design: knock-with-code.instructions.md, "Code Lookup". The index only
-suggests rooms; each room's current join rules decide.
+Design: knock-with-code.instructions.md, "Codes". Every code lookup goes
+through here (``get_rooms_with_access_code``): ``knock_with_code``,
+``preview_with_code`` and the collision check every new code passes. Scanning
+every room's join rules per call cost about 100-200 ms of database CPU per
+code, growing with the number of courses, on Synapse's shared database, so a
+class entering codes at once slowed ``/sync`` and sending for everyone (#163).
+
+The index only suggests rooms; each room's current join rules decide:
+
+- Every hit is confirmed against the room's current join rules, which also
+  say whether the code is an admin code, so a rotated code, a spent admin code
+  or a deleted course is never accepted from a stale index.
+- Every miss catches up on join-rules changes committed since the last
+  position and checks again, so a course created a moment ago on another
+  process resolves first time. The committed position is read before the
+  rows, so a late-committing event is read twice rather than skipped.
+- Misses arriving together share one catch-up: a classroom mistyping one code
+  costs a couple of queries, not one per student.
+- The index loads on first use. No startup step and no fallback to the old
+  scan: a stale index can slow a lookup but not make it wrong, so a bug is
+  handled by a revert.
+
+Known limits: the catch-up only sees newer changes, so a state reset that
+points a room back to an older join-rules event goes unseen until restart, and
+a valid code could answer "not found" until then (near impossible with
+federation off; every deploy restarts). An upgraded room copies its
+predecessor's join rules, so both carry the code and a lookup returns only the
+one already indexed; the client never upgrades rooms.
 """
 
 from __future__ import annotations

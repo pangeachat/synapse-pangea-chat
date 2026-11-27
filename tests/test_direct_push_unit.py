@@ -359,7 +359,7 @@ class TestDirectPushHelpers(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSygnalChoice(unittest.IsolatedAsyncioTestCase):
-    """notice-delivery.instructions.md, "Which Sygnal"."""
+    """Which Sygnal a push goes to (``DirectPush._sygnal_url_for``)."""
 
     def _pusher(self, device_id: str, data: dict | None) -> dict:
         return {

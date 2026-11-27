@@ -1,4 +1,10 @@
-"""Durable whole-notice scheduling. Claim before any external side effect."""
+"""Durable whole-notice scheduling. Claim before any external side effect.
+
+One schedule per decision (``NoticeRequest.schedule_key``). When due, the notice is
+revalidated and its eligibility conditions rechecked before the shared delivery
+service runs. An admin may cancel until the worker claims it; cancelling is
+idempotent, and a claimed or uncertain delivery is not reported as cancelled.
+"""
 
 from __future__ import annotations
 

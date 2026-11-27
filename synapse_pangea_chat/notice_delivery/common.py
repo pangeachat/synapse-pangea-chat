@@ -14,6 +14,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("synapse.module.synapse_pangea_chat.notice_delivery.common")
 
+#: Where a notice link may land: ``app`` the World map, ``activity`` an activity (and its
+#: session), ``course`` a course's card, ``subscription`` the subscription settings page,
+#: ``workspace`` any path in the client's workspace URL grammar, ``external`` an https page
+#: on a ``notice_external_link_hosts`` host, and ``dashboard`` the educator dashboard: the
+#: course's page, or the course list when no course is named. A claim email's ``course`` or
+#: ``dashboard`` destination may leave its course out for the claim to fill
+#: (``Destination.parse`` with ``claimed_course``).
 DESTINATION_KINDS = (
     "app",
     "activity",
@@ -160,7 +167,12 @@ def app_url(
 
 
 def preference_rows(raw_preferences):
-    """Display the opt-out categories with their effective persisted state."""
+    """Display the opt-out categories with their effective persisted state.
+
+    Only the global-off categories get a row under the page's master switch. The
+    missed-message switch is rendered apart, outside the master, because the global
+    off does not cover it. Course invitations get no switch until their send path
+    reads this store, and credential mail cannot be refused."""
     from synapse_pangea_chat.notice_delivery.categories import (
         GLOBAL_OFF_CATEGORIES,
         is_refused,
@@ -228,8 +240,14 @@ def destination_url(
     admin_dash_base_url: Optional[str] = None,
 ) -> str:
     """The URL a click on a destination lands on. The workspace URL grammar is
-    the client's (routing.instructions.md): ``?c=`` is the course context and
-    ``left=course`` opens its card; ``?right=`` opens a settings page."""
+    the client's (routing.instructions.md): ``app`` is the World map root;
+    ``activity`` is the shareable activity link (``/:activityId``, with
+    ``?roomid=`` when a session exists); ``?c=`` is the course context and
+    ``left=course`` opens its card; ``?right=`` opens a settings page;
+    ``workspace`` is the app base plus the signed path. ``dashboard`` opens the
+    educator dashboard's course page, or its course list without a course.
+    ``external`` is re-checked against the allowed hosts here, at the click.
+    Anything that does not resolve lands on the World map."""
     base = app_base_url.rstrip("/")
     kind = destination.get("k")
     if kind == "dashboard" and admin_dash_base_url:

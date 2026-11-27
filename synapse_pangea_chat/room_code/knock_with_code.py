@@ -1,3 +1,35 @@
+"""``POST /_synapse/client/pangea/v1/knock_with_code`` — join a course with a code.
+
+Design: knock-with-code.instructions.md. Not a Matrix knock: the user never
+enters ``knock`` membership; the module invites them as a joined admin.
+
+Bearer auth. Body ``{"access_code": "<7 chars>"}``. Answers:
+
+- 200 ``{rooms, already_joined, banned}``: ``rooms`` were invited now or were
+  already invited (the client's own ``/join`` then succeeds, issue #148);
+  ``already_joined`` includes a claimed or replayed course. A room is in
+  exactly one list. The invite arrives over ``/sync``, and the client hides
+  its invite dialog while the code flow handles the join ("Space invite
+  priority" in the client's joining-courses doc).
+- 400 ``M_INVALID_PARAM``: not seven alphanumerics with a digit. This is the
+  only place the format rule lives. Other 400s (no body, no or non-string
+  ``access_code``) carry no errcode, since only a client bug causes them.
+- 404 ``ORG.PANGEA.CODE_NOT_FOUND``: well-formed, opens nothing; also what a
+  spent, revoked or someone else's claim code answers.
+- 403 ``ORG.PANGEA.BANNED_FROM_ROOM`` with ``banned``: banned from every room
+  the code opens (issue #127 / client#6820).
+- 403 ``M_FORBIDDEN``: every room's admins blocked the requester; no detail,
+  so the block is not revealed (blocked-join-gate).
+- 500 ``ORG.PANGEA.INVITE_FAILED`` with ``failed``: every room failed. Before
+  this an all-failed code answered 200 with empty lists, which clients render
+  as "code not found" (issue #197).
+- 503 ``ORG.PANGEA.CLAIM_RECOVERY_REQUIRED``: a requested course's claim
+  could not complete; the reservation stays with the winning account.
+- 429: rate limited (``is_rate_limited``).
+
+Order matters: a private claim or an admin code is processed before the
+"already a member" shortcut, so a member can still be made an admin.
+"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -117,8 +149,11 @@ class KnockWithCode(Resource):
         carries the plan reach the app first. It narrows the race rather than
         closing it: the app's own fix is to read the plan again when it
         arrives. The verified-address claim at sign-in does not wait, because
-        no app is waiting on it to open the course. May deserve a line in
-        knock-with-code.instructions.md, "Claiming a course".
+        no app is waiting on it to open the course. The released apps handle
+        a course answered as already joined before sync catches up only in
+        this narrowed form; end-to-end checks on each supported app are still
+        owed. May deserve a line in knock-with-code.instructions.md,
+        "Claiming a course".
         """
         hold = self._config.course_claim_response_hold_seconds
         if hold > 0:

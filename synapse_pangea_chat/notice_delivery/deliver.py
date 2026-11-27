@@ -75,6 +75,13 @@ BOT_NOTICE_EVENT_TYPE = "p.room.notice"
 EMAIL_MEDIUM = "email"
 MAX_SUBJECT_LENGTH = 120
 
+# The one channel a use-available notice goes by, in this order: refused; in_app (presence
+# online and currently_active); push (a pusher Sygnal accepted, see DirectPush); email (email
+# enabled and a verified address); else none with a reason: email_disabled,
+# no_email_address, no_public_baseurl, no_token_secret or send_failed, prefixed
+# push_failed_then_ when a push device existed but every push failed. A forced push does not
+# fall through to email, a forced email does not try push, and email-only categories go by
+# email whatever the presence.
 CHANNEL_REFUSED = "refused"
 CHANNEL_IN_APP = "in_app"
 CHANNEL_PUSH = "push"
@@ -318,7 +325,7 @@ class DeliverNotice(Resource):
         record_id = None
         # The push stands in for the notice event, so it is sent as that event's
         # sender: a scheduled notice's sender_id, or the admin that asked when
-        # there is no event to read (notice-delivery.instructions.md, Direct push).
+        # there is no event to read (notice-delivery.instructions.md, "Direct push").
         body["_push_sender"] = body.get("sender_id") or body.get("_requested_by")
 
         if req is not None:

@@ -6,6 +6,15 @@ share kit and existing courses").
 instructor-invitation email and follow-up through the v2 claim-reminder
 endpoint with its own rendered copy. ``GET`` lists them for reporting. Server
 admins only; answers never carry the address or a code.
+
+``POST`` takes ``request_key``, ``room_id`` and ``teacher_email``. It refuses a
+room that does not exist (404), one that is not a course space (400) and one
+with no eligible joined local instructor (409,
+``ORG.PANGEA.NO_ELIGIBLE_INSTRUCTOR``): the sender has to exist before the
+invitation does. Unchanged input under a key returns the same invitation;
+changed input conflicts. Status reads report it as ``kind`` ``instructor``.
+``GET ?status=`` lists by status (default prepared), newest first. Revocation
+uses the invitation status resource like any other invitation.
 """
 from __future__ import annotations
 

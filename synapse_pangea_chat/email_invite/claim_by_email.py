@@ -2,7 +2,7 @@
 
 An account whose Synapse-verified email equals a prepared invitation's
 requesting address claims it without the link, through the same first claim
-(create-course-space.instructions.md, "Who the course is created for").
+(create-course-space.instructions.md, "The experience").
 
 It runs when the account signs in, and when a verified address is added to it:
 email sign-up stores the address during registration and the app signs in from

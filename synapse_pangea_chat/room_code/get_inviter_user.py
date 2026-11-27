@@ -108,6 +108,12 @@ async def promote_user_to_admin(
 
 
 async def get_inviter_user(api: ModuleApi, room_id: str) -> Optional[UserID]:
+    """The joined local admin who sends a code's invite: power at least 100
+    and at least the room's invite level, highest first. Never promotes a
+    remaining member to make one. None means the room needs an operator (a
+    default chat has its recovery endpoint, course-default-chats; a course
+    space is investigated case by case); the caller counts the room as failed
+    (``NoInviterAvailableError``). Design: knock-with-code.instructions.md."""
     state = await api.get_room_state(room_id=room_id)
     power = state.get((EventTypes.PowerLevels, ""))
     threshold = max(100, power.content.get("invite", 0) if power else 100)
