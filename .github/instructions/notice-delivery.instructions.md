@@ -41,6 +41,8 @@ Thirty minutes after a learner starts an activity session, the module pushes the
 
 A person's refusals are one account-data event, `pangea.communication_preferences`, which the in-app preference screen and the unsubscribe page both write and every send reads; [notices](../../../engagement/.github/instructions/notices.instructions.md#refusability) says what can be refused. A malformed event reads as nothing refused: silencing someone who never asked is the worse failure, and an unwanted nudge can be refused again.
 
+**Intended — not yet implemented.** A person may also have refused a category on their [contact](../../../cms/.github/instructions/contacts.instructions.md#what-they-have-asked-us-not-to-send), for example through the unsubscribe link in a plain note. Before a lifecycle or promotional notice, the module asks the CMS whether any address confirmed on the account has refused that category, and treats a yes as the account's own refusal. When the CMS cannot be asked, the notice is not sent and the reason is recorded: mailing someone who unsubscribed is the worse failure here, and a missed nudge costs little. Transactional notices do not ask.
+
 Every refusable notice email links to a signed-out unsubscribe page. Opening the link only shows the page; submitting it acts, so a mail scanner cannot unsubscribe anyone. It only adds refusals; turning one back on needs the signed-in screen. Do not promise in-app re-enabling until [client#9234](https://github.com/pangeachat/client/issues/9234) ships.
 
 Synapse's own missed-message mail links to Synapse's unsubscribe page, which acts on a plain open and records no refusal; the module can serve that link with its own page instead.
