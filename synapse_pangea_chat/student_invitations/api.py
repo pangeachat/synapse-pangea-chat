@@ -673,7 +673,7 @@ class StudentInvitationHandlers:
             # Another address records a request for the teacher: a request
             # never stands in for a claim.
             status, request = await self._store.record_request(
-                row["id"], caller, now_ms()
+                row["id"], caller, now_ms(), consent=consent
             )
             if status == "already_in_course":
                 # Identity is the account and its verified address, never the

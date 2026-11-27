@@ -103,8 +103,8 @@ class StudentClaims:
         """Claim ``invitation_id`` for ``user_id``. ``grant`` is the teacher
         ``actor``'s Grant of the account's request, recorded only if the claim
         it allows happens. ``consent`` is the student accepting management
-        (``needs_consent``); a request the teacher grants was made by the
-        student opening the invitation, which asked them then.
+        (``needs_consent``); a request the teacher grants carries the consent
+        given when the student opened the invitation, if they were asked.
         ``canvas_identity`` is the (issuer, Canvas course, Canvas user id) of
         the account's own Canvas link, from a validated launch.
 
@@ -140,6 +140,15 @@ class StudentClaims:
             return NEEDS_CONSENT, row
 
         room_id = row["course_room_id"]
+        # A grant of a request opened without the consent the account needs
+        # (the course was not Protected then): asked, as existing members are.
+        ask = (
+            grant
+            and not consent
+            and request is not None
+            and request["consented_ms"] is None
+            and await self.needs_consent(row, user_id)
+        )
         joined = await self._joiner.force_join(room_id, user_id)
         if not joined.get("success"):
             raise ClaimJoinFailed(joined.get("action", "failed"))
@@ -157,6 +166,7 @@ class StudentClaims:
             managed=not is_admin,
             canvas_identity=canvas_identity,
             actor=actor,
+            ask=ask,
         )
         if outcome == CLAIMED and claimed is not None:
             logger.info("Claimed student invitation %s", invitation_id)

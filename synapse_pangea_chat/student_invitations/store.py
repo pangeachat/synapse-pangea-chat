@@ -119,6 +119,7 @@ SCHEMA = (
         user_id TEXT NOT NULL,
         requested_at_ms BIGINT NOT NULL,
         decision TEXT,
+        consented_ms BIGINT,
         PRIMARY KEY (invitation_id, user_id))""",
         """CREATE INDEX IF NOT EXISTS pangea_invitation_ack_user
         ON pangea_invitation_ack (user_id)""",
@@ -160,9 +161,15 @@ COLUMNS = (
     "joined_via",
 )
 _SELECT = "SELECT " + ", ".join(COLUMNS) + " FROM pangea_seat_invitation "
-REQUEST_COLUMNS = ("invitation_id", "user_id", "requested_at_ms", "decision")
+REQUEST_COLUMNS = (
+    "invitation_id",
+    "user_id",
+    "requested_at_ms",
+    "decision",
+    "consented_ms",
+)
 _REQUEST_SELECT = (
-    "SELECT invitation_id, user_id, requested_at_ms, decision"
+    "SELECT invitation_id, user_id, requested_at_ms, decision, consented_ms"
     " FROM pangea_invitation_ack "
 )
 # T12's field names for the event columns (event_id, ts_ms, actor, action,
@@ -590,42 +597,30 @@ class StudentInvitationStore:
         members: Sequence[Tuple[str, str, Optional[int]]],
         actor: str,
         now_ms: int,
+        since: Optional[int] = None,
     ) -> List[str]:
         """Record each (member, how joined, when) as ``asked``, with a
         ``management_asked`` row: one with no record yet, or managed by a
-        claim made before the course became Protected at ``now_ms``, which
-        did not ask them. Returns those asked."""
+        claim made before the course became Protected at ``since`` (default
+        ``now_ms``), which did not ask them. Repeatable: a record made or
+        answered since is left as it is. Returns those asked."""
         await self.ensure()
 
         def write(txn: Any) -> List[str]:
-            asked: List[str] = []
-            for user_id, via, joined_at_ms in members:
-                txn.execute(
-                    "INSERT INTO pangea_managed_account (user_id, course_room_id,"
-                    " created_at_ms, status, joined_via, joined_at_ms)"
-                    " VALUES (?, ?, ?, 'asked', ?, ?)"
-                    " ON CONFLICT (user_id, course_room_id) DO NOTHING",
-                    (user_id, room_id, now_ms, via, joined_at_ms),
+            return [
+                user_id
+                for user_id, via, joined_at_ms in members
+                if _ask(
+                    txn,
+                    room_id,
+                    user_id,
+                    via,
+                    joined_at_ms,
+                    actor,
+                    now_ms,
+                    now_ms if since is None else since,
                 )
-                if txn.rowcount != 1:
-                    txn.execute(
-                        "UPDATE pangea_managed_account SET status = 'asked'"
-                        " WHERE user_id = ? AND course_room_id = ?"
-                        " AND status = 'managed' AND created_at_ms < ?",
-                        (user_id, room_id, now_ms),
-                    )
-                if txn.rowcount == 1:
-                    asked.append(user_id)
-                    record_managed_event(
-                        txn,
-                        room_id=room_id,
-                        user_id=user_id,
-                        actor=actor,
-                        action=MANAGEMENT_ASKED,
-                        via=via,
-                        now_ms=now_ms,
-                    )
-            return asked
+            ]
 
         return await self.db.runInteraction("pangea_managed_account_ask", write)
 
@@ -732,13 +727,19 @@ class StudentInvitationStore:
                 (room_id,),
             )
             rows = [r for r in txn.fetchall() if user_ids is None or r[0] in user_ids]
+            graduated: List[str] = []
             for user_id, via in rows:
+                # Still managed: a concurrent graduation or move since the
+                # read keeps its own record and row.
                 txn.execute(
                     "UPDATE pangea_managed_account SET status = 'graduated',"
                     " graduated_by = ?, graduated_at_ms = ?, graduation_seen_ms = NULL"
-                    " WHERE user_id = ? AND course_room_id = ?",
+                    " WHERE user_id = ? AND course_room_id = ? AND status = 'managed'",
                     (actor, now_ms, user_id, room_id),
                 )
+                if txn.rowcount != 1:
+                    continue
+                graduated.append(user_id)
                 record_managed_event(
                     txn,
                     room_id=room_id,
@@ -748,9 +749,30 @@ class StudentInvitationStore:
                     via=via or VIA_UNKNOWN,
                     now_ms=now_ms,
                 )
-            return [r[0] for r in rows]
+            return graduated
 
         return await self.db.runInteraction("pangea_managed_account_graduate", write)
+
+    async def graduates(
+        self, room_id: str, user_ids: Optional[Sequence[str]]
+    ) -> Dict[str, int]:
+        """Of ``user_ids`` (every student when None), those graduated from
+        this course, each with when."""
+        await self.ensure()
+
+        def select(txn: Any) -> Dict[str, int]:
+            txn.execute(
+                "SELECT user_id, graduated_at_ms FROM pangea_managed_account"
+                " WHERE course_room_id = ? AND status = 'graduated'",
+                (room_id,),
+            )
+            return {
+                user_id: at
+                for user_id, at in txn.fetchall()
+                if user_ids is None or user_id in user_ids
+            }
+
+        return await self.db.runInteraction("pangea_managed_account_graduates", select)
 
     async def unseen_graduations(self, user_id: str) -> List[Dict[str, Any]]:
         await self.ensure()
@@ -1310,11 +1332,12 @@ class StudentInvitationStore:
         return await self.db.runInteraction("pangea_managed_account_set", write)
 
     async def record_request(
-        self, invitation_id: str, user_id: str, now_ms: int
+        self, invitation_id: str, user_id: str, now_ms: int, consent: bool = False
     ) -> Tuple[str, Optional[Dict]]:
         """Record this account's request on an ``invited`` row (the caller
         has checked that the account does not have the invited address
         verified). Idempotent: an existing request and its decision stay.
+        ``consent`` records that the account accepted management (#799).
         Returns ("ok", request), ("not_live", None), or
         ("already_in_course", None) when the account holds a joined
         invitation in this course: then nothing is written (owner rule
@@ -1328,14 +1351,22 @@ class StudentInvitationStore:
                 return "not_live", None
             if _joined_in_course(txn, row["course_room_id"], user_id) is not None:
                 return "already_in_course", None
+            consented = now_ms if consent else None
             txn.execute(
                 "INSERT INTO pangea_invitation_ack"
-                " (invitation_id, user_id, requested_at_ms, decision)"
-                " VALUES (?, ?, ?, NULL)"
+                " (invitation_id, user_id, requested_at_ms, decision, consented_ms)"
+                " VALUES (?, ?, ?, NULL, ?)"
                 " ON CONFLICT (invitation_id, user_id) DO NOTHING",
-                (invitation_id, user_id, now_ms),
+                (invitation_id, user_id, now_ms, consented),
             )
-            if txn.rowcount == 1:
+            if txn.rowcount != 1 and consent:
+                # Consent given on opening again is kept with the request.
+                txn.execute(
+                    "UPDATE pangea_invitation_ack SET consented_ms = ?"
+                    " WHERE invitation_id = ? AND user_id = ? AND consented_ms IS NULL",
+                    (now_ms, invitation_id, user_id),
+                )
+            elif txn.rowcount == 1:
                 record_event(
                     txn,
                     room_id=row["course_room_id"],
@@ -1403,6 +1434,7 @@ class StudentInvitationStore:
         managed: bool = True,
         canvas_identity: Optional[CanvasIdentity] = None,
         actor: str = SYSTEM,
+        ask: bool = False,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """The claim's database step (C2.4 step 2), all or nothing.
 
@@ -1415,8 +1447,9 @@ class StudentInvitationStore:
         no other joined invitation in the course. A grant is recorded only
         together with the claim it allows. ``managed`` is False when the
         claimant administers the course (owner amendment 2026-10-09): no
-        managed record is written. The claim and a grant are recorded as
-        events in the same transaction.
+        managed record is written. With ``ask`` the claimant is asked
+        instead, as ``ask`` asks a member.
+        The claim and a grant are recorded as events in the same transaction.
         """
         await self.ensure()
 
@@ -1481,7 +1514,18 @@ class StudentInvitationStore:
                 now_ms=now_ms,
                 invitation_id=invitation_id,
             )
-            if managed:
+            if managed and ask:
+                _ask(
+                    txn,
+                    room_id,
+                    user_id,
+                    joined_via,
+                    now_ms,
+                    actor if grant_now else SYSTEM,
+                    now_ms,
+                    None,
+                )
+            elif managed:
                 # After the claim, so its event follows the claim's. A record
                 # kept from an earlier claim in this course (the student left
                 # and was invited again) stays as it is, with no new event; an
@@ -1527,6 +1571,8 @@ def migrate(txn: Any) -> None:
       ``requested_at_ms`` and ``disclosure_version`` is dropped;
     - the managed record keeps only ``created_at_ms``: ``since_ms`` is
       renamed and ``invited_by`` dropped;
+    - requests gain ``consented_ms``, when the account accepted management
+      as it opened the invitation (nullable: earlier requests carry none);
     - invitations gain ``send_at_ms``, ``first_due_ms`` and ``joined_via``
       (nullable, so no row is rewritten) and the partial index of rows
       waiting to send, which is empty at this point;
@@ -1553,6 +1599,7 @@ def migrate(txn: Any) -> None:
         ("pangea_seat_invitation", "send_at_ms", "BIGINT"),
         ("pangea_seat_invitation", "first_due_ms", "BIGINT"),
         ("pangea_seat_invitation", "joined_via", "TEXT"),
+        ("pangea_invitation_ack", "consented_ms", "BIGINT"),
         ("pangea_managed_account", "status", "TEXT NOT NULL DEFAULT 'managed'"),
         ("pangea_managed_account", "joined_via", "TEXT"),
         ("pangea_managed_account", "joined_at_ms", "BIGINT"),
@@ -1586,6 +1633,47 @@ def _record(txn: Any, user_id: str, room_id: str) -> Optional[Dict[str, Any]]:
     )
     raw = txn.fetchone()
     return dict(zip(RECORD_COLUMNS, raw)) if raw is not None else None
+
+
+def _ask(
+    txn: Any,
+    room_id: str,
+    user_id: str,
+    via: str,
+    joined_at_ms: Optional[int],
+    actor: str,
+    now_ms: int,
+    since: Optional[int],
+) -> bool:
+    """Ask one member (``ask``): a new ``asked`` record, or a managed one
+    made before ``since`` (any, when None) made asked, with a
+    ``management_asked`` row. Returns whether they were asked now."""
+    txn.execute(
+        "INSERT INTO pangea_managed_account (user_id, course_room_id,"
+        " created_at_ms, status, joined_via, joined_at_ms)"
+        " VALUES (?, ?, ?, 'asked', ?, ?)"
+        " ON CONFLICT (user_id, course_room_id) DO NOTHING",
+        (user_id, room_id, now_ms, via, joined_at_ms),
+    )
+    if txn.rowcount != 1:
+        txn.execute(
+            "UPDATE pangea_managed_account SET status = 'asked'"
+            " WHERE user_id = ? AND course_room_id = ? AND status = 'managed'"
+            " AND (? IS NULL OR created_at_ms < ?)",
+            (user_id, room_id, since, since),
+        )
+    if txn.rowcount != 1:
+        return False
+    record_managed_event(
+        txn,
+        room_id=room_id,
+        user_id=user_id,
+        actor=actor,
+        action=MANAGEMENT_ASKED,
+        via=via,
+        now_ms=now_ms,
+    )
+    return True
 
 
 def _insert_managed(

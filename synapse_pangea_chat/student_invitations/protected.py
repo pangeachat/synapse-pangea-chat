@@ -69,10 +69,26 @@ def is_protected(state: StateMap) -> bool:
     return event is not None and management(event.content)["protected"]
 
 
+async def protected_since(main: Any, event: Optional[Any]) -> Optional[int]:
+    """When the course became Protected, from its current management
+    ``event``: the oldest of the unbroken run of Protected events it replaced
+    (protection is one-way). None when it is not Protected. A replaced event
+    that cannot be read ends the walk early, a later time: more members are
+    asked, none is managed without asking."""
+    since = None
+    while event is not None and management(event.content)["protected"]:
+        since = event.origin_server_ts
+        prior_id = event.unsigned.get("replaces_state")
+        if not isinstance(prior_id, str):
+            break
+        event = await main.get_event(prior_id, allow_none=True)
+    return since
+
+
 class ProtectedRules:
     """Refuses, before an event is stored: a ``pangea.course_management``
-    event, or a ``joined_via`` or ``removed_by`` mark, the module did not
-    write; the redaction of a ``pangea.course_management`` event; and in a
+    event that turns protection off, even the module's; one, or a
+    ``joined_via`` or ``removed_by`` mark, the module did not write; the redaction of a ``pangea.course_management`` event; and in a
     Protected course, a join rule other than ``knock``, redacting its join
     rule and listing it in the room directory."""
 
@@ -86,6 +102,14 @@ class ProtectedRules:
     async def check_event_allowed(
         self, event: Any, state: StateMap
     ) -> Tuple[bool, Optional[dict]]:
+        if (
+            event.type == COURSE_MANAGEMENT
+            and is_protected(state)
+            and not management(event.content)["protected"]
+        ):
+            # One-way, whoever writes it: a stale write from another process
+            # never turns protection off.
+            return _REFUSE
         if is_module_write():
             return _ALLOW
         if event.type == COURSE_MANAGEMENT:

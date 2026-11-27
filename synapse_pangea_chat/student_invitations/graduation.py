@@ -9,9 +9,10 @@ offers the existing share flow. Membership and bans are never changed."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from synapse.api.constants import EventTypes
+from synapse.util.async_helpers import Linearizer
 from synapse.util.frozenutils import unfreeze
 
 from synapse_pangea_chat.analytics_push_suppression import ANALYTICS_ROOM_TYPE
@@ -19,6 +20,7 @@ from synapse_pangea_chat.moderation.courses import ChatCourses, power_level
 from synapse_pangea_chat.public_courses.select_state_sender import (
     select_state_sender,
 )
+from synapse_pangea_chat.student_invitations.protected import how_joined
 from synapse_pangea_chat.student_invitations.report import report_failure
 
 
@@ -54,16 +56,20 @@ class Graduation:
         self._admins = admins
         self._controls = controls
         self._courses = ChatCourses.from_homeserver(api._hs)
+        # The power levels are a whole-event read-modify-write: two
+        # graduations in one room must not each restore the other's student.
+        self._levels = Linearizer("pangea_graduation_levels", clock=api._hs.get_clock())
 
-    def later(self, room_id: str, user_ids: Iterable[str]) -> None:
+    def later(self, room_id: str, graduated: Mapping[str, int]) -> None:
         self._api.run_as_background_process(
-            "pangea_protected_graduation", self.apply, room_id, list(user_ids)
+            "pangea_protected_graduation", self.apply, room_id, dict(graduated)
         )
 
-    async def apply(self, room_id: str, user_ids: List[str]) -> None:
-        """Each step of each student is reported on failure and the rest go
-        on."""
-        for user_id in user_ids:
+    async def apply(self, room_id: str, graduated: Mapping[str, int]) -> None:
+        """For each graduated student and when they graduated. Each step of
+        each student is reported on failure and the rest go on. Every step is
+        idempotent, so a retried graduation repairs what failed."""
+        for user_id, graduated_at_ms in sorted(graduated.items()):
             try:
                 await self._controls.reconcile(user_id)
                 rooms = sorted(await self._main.get_rooms_for_user(user_id))
@@ -81,11 +87,15 @@ class Graduation:
                         if not admin:
                             await self._read_only(room, user_id)
                     else:
-                        await self._unshare(room, user_id, room_id)
+                        await self._unshare(room, user_id, room_id, graduated_at_ms)
                 except Exception as error:
                     report_failure("graduation", error, room=room, user=user_id)
 
     async def _read_only(self, room_id: str, user_id: str) -> None:
+        async with self._levels.queue(room_id):
+            await self._demote(room_id, user_id)
+
+    async def _demote(self, room_id: str, user_id: str) -> None:
         state = await self._api.get_room_state(
             room_id, [(EventTypes.Create, ""), (EventTypes.PowerLevels, "")]
         )
@@ -110,8 +120,13 @@ class Graduation:
             }
         )
 
-    async def _unshare(self, room_id: str, user_id: str, course: str) -> None:
-        """Remove the course's admins from the student's own analytics room."""
+    async def _unshare(
+        self, room_id: str, user_id: str, course: str, graduated_at_ms: int
+    ) -> None:
+        """Remove the course's admins from the student's own analytics room:
+        those who joined or were invited before the graduation. One the
+        student invited again since is their choice to share, kept on a
+        retry."""
         state = await self._api.get_room_state(room_id, [(EventTypes.Create, "")])
         create = state.get((EventTypes.Create, ""))
         if create is None or create.sender != user_id:
@@ -123,6 +138,9 @@ class Graduation:
             if member == user_id:
                 continue
             if event.content.get("membership") not in ("join", "invite"):
+                continue
+            _, since = await how_joined(self._main, event)
+            if since > graduated_at_ms:
                 continue
             if await self._admins.is_course_admin(course, member):
                 await self._api.update_room_membership(

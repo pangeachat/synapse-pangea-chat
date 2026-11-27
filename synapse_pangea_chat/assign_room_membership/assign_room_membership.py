@@ -23,7 +23,10 @@ from synapse_pangea_chat.analytics_push_suppression import (
     ensure_analytics_invite_push_rule,
     is_analytics_room,
 )
-from synapse_pangea_chat.blocked_join_gate import server_initiated_join
+from synapse_pangea_chat.blocked_join_gate import (
+    server_initiated_join,
+    set_membership,
+)
 from synapse_pangea_chat.joined_via import VIA_CLAIM
 from synapse_pangea_chat.room_code.extract_body_json import extract_body_json
 
@@ -174,19 +177,25 @@ class AssignRoomMembership(Resource):
             )
 
     async def force_join(
-        self, room_id: str, user_id: str, via: str | None = VIA_CLAIM
+        self,
+        room_id: str,
+        user_id: str,
+        via: str | None = VIA_CLAIM,
+        ratelimit: bool = True,
     ) -> dict[str, Any]:
         """Join a local account to a room server-side, as this endpoint's
         ``force_join`` does: a no-op when already joined, refused when banned.
         Shared with the student invitation claim, so the join names it
         (``joined_via``): the claim records its own management. The
-        Protected course controls put a student back with no name."""
+        Protected course controls put a student back with no name, and not
+        rate limited (``set_membership``)."""
         return await self._assign_user(
             requester=None,
             room_id=room_id,
             user_id=user_id,
             force_join=True,
             via=via,
+            ratelimit=ratelimit,
         )
 
     def _is_valid_room_id(self, room_id: str) -> bool:
@@ -238,6 +247,7 @@ class AssignRoomMembership(Resource):
         user_id: str,
         force_join: bool,
         via: str | None = None,
+        ratelimit: bool = True,
     ) -> dict[str, Any]:
         (
             current_membership,
@@ -262,6 +272,7 @@ class AssignRoomMembership(Resource):
                     room_id=room_id,
                     current_membership=current_membership,
                     via=via,
+                    ratelimit=ratelimit,
                 )
                 return self._success_result(user_id, "joined")
 
@@ -279,7 +290,9 @@ class AssignRoomMembership(Resource):
             )
             return self._failure_result(user_id, str(e) or "Room assignment failed")
 
-    async def _invite_user_as_admin(self, user_id: str, room_id: str) -> None:
+    async def _invite_user_as_admin(
+        self, user_id: str, room_id: str, ratelimit: bool = True
+    ) -> None:
         inviter_user_id = await self._get_local_inviter_user_id(room_id)
         if inviter_user_id is None:
             raise RuntimeError("No local joined inviter with sufficient power")
@@ -291,12 +304,14 @@ class AssignRoomMembership(Resource):
             await ensure_analytics_invite_push_rule(self._api, user_id)
             content = {"reason": ANALYTICS_INVITE_REASON}
 
-        await self._api.update_room_membership(
-            sender=inviter_user_id,
-            target=user_id,
-            room_id=room_id,
-            new_membership=MEMBERSHIP_INVITE,
-            content=content,
+        await set_membership(
+            self._api,
+            inviter_user_id,
+            user_id,
+            room_id,
+            MEMBERSHIP_INVITE,
+            content,
+            ratelimit=ratelimit,
         )
 
     async def _join_user_as_admin(
@@ -305,6 +320,7 @@ class AssignRoomMembership(Resource):
         room_id: str,
         current_membership: str | None,
         via: str | None = None,
+        ratelimit: bool = True,
     ) -> None:
         join_rules_event = (
             await self._storage_controllers.state.get_current_state_event(
@@ -319,9 +335,12 @@ class AssignRoomMembership(Resource):
             await self._invite_user_as_admin(
                 user_id=user_id,
                 room_id=room_id,
+                ratelimit=ratelimit,
             )
 
-        await server_initiated_join(self._api, room_id, user_id, via=via)
+        await server_initiated_join(
+            self._api, room_id, user_id, via=via, ratelimit=ratelimit
+        )
 
     async def _get_local_inviter_user_id(self, room_id: str) -> str | None:
         room_state = await self._api.get_room_state(

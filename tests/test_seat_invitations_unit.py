@@ -580,9 +580,11 @@ class TestOpen(_Base):
             self.assertEqual((status, body["result"]), (200, "pending"))
         request = await self.h.store.get_request(ident, OTHER)
         self.assertEqual(
-            set(request), {"invitation_id", "user_id", "requested_at_ms", "decision"}
+            set(request),
+            {"invitation_id", "user_id", "requested_at_ms", "decision", "consented_ms"},
         )
         self.assertIsNone(request["decision"])
+        self.assertIsNone(request["consented_ms"])
         self.assertEqual(
             [e["action"] for e in await self.h.events()],
             ["request_made", "students_added"],
@@ -2382,6 +2384,8 @@ class TestMigration(_Base):
                     "user_id": "u",
                     "requested_at_ms": 5,
                     "decision": "denied",
+                    # Added by the migration, empty for an earlier request.
+                    "consented_ms": None,
                 },
             )
             # A record from before #799 reads as managed, how it joined unknown.
@@ -2421,7 +2425,13 @@ class TestMigration(_Base):
         )
         self.assertEqual(
             columns("pangea_invitation_ack"),
-            {"invitation_id", "user_id", "requested_at_ms", "decision"},
+            {
+                "invitation_id",
+                "user_id",
+                "requested_at_ms",
+                "decision",
+                "consented_ms",
+            },
         )
         # The migrated tables take new rows.
         (inv,) = await self.h.add(INVITED)

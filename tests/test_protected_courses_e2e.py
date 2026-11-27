@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
 
 import psycopg2
@@ -264,16 +264,17 @@ class TestProtectedCoursesE2E(ProtectedE2E):
         self.ok("POST", P + "knock_with_code", c_token, body={"access_code": CODE})
         self.ok("POST", f"/_matrix/client/v3/join/{quote(room)}", c_token, body={})
 
-        self.assertEqual(
-            self.records(room, t_token),
+        self.becomes(
+            lambda: self.records(room, t_token),
             {
                 early: ("managed", "unknown"),
                 coder: ("managed", "code"),
                 asker: ("managed", "request"),
             },
+            "the records",
         )
-        self.assertEqual(
-            self.ledger(room, t_token),
+        self.becomes(
+            lambda: self.ledger(room, t_token),
             [
                 (early, "management_asked", "unknown"),
                 (coder, "management_started", "code"),
@@ -282,6 +283,7 @@ class TestProtectedCoursesE2E(ProtectedE2E):
                 (coder, "left", "code"),
                 (coder, "rejoined", "code"),
             ],
+            "the ledger",
         )
         self.assertNotIn(teacher, self.records(room, t_token))
 
@@ -333,6 +335,19 @@ class TestProtectedCoursesE2E(ProtectedE2E):
             token,
             body={"msgtype": "m.text", "body": "hi"},
         )
+
+    def becomes(self, read: Callable[[], Any], want: Any, what: str) -> None:
+        """Wait for a record the join hook writes after the join returns:
+        Synapse runs ``on_new_event`` in the background. The same 10 s as
+        ``membership_becomes``, read every half second to stay inside the
+        module routes' rate limits."""
+        got = None
+        for _ in range(20):
+            got = read()
+            if got == want:
+                return
+            time.sleep(0.5)
+        self.fail(f"{what}: last seen {got!r}, wanted {want!r}")
 
     def membership_becomes(self, room: str, user: str, token: str, want: str) -> None:
         for _ in range(100):
@@ -521,7 +536,11 @@ class TestProtectedCoursesE2E(ProtectedE2E):
             "POST", f"/_matrix/client/v3/rooms/{quote(course)}/leave", s_token, body={}
         )
         self.invite_and_join(course, t_token, student, s_token)
-        self.assertEqual(self.records(course, t_token)[student][0], "managed")
+        self.becomes(
+            lambda: self.records(course, t_token)[student][0],
+            "managed",
+            "the rejoined student's record",
+        )
         self.refused(self.dm(s_token, outsider), "outside.dms")
 
         # Managed by a second Protected course too; graduating the whole class
@@ -542,8 +561,16 @@ class TestProtectedCoursesE2E(ProtectedE2E):
             {"graduated": sorted([mate, student])},
         )
         self.assertEqual(self.dm(m_token, outsider).status_code, 200)
-        mine = self.ok("GET", P + "course_management/mine", s_token)
-        self.assertEqual([c["room_id"] for c in mine["courses"]], [second])
+        self.becomes(
+            lambda: [
+                c["room_id"]
+                for c in self.ok("GET", P + "course_management/mine", s_token)[
+                    "courses"
+                ]
+            ],
+            [second],
+            "the student's managing courses",
+        )
         self.refused(self.dm(s_token, outsider), "outside.dms")
 
 

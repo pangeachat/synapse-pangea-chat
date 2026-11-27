@@ -8,7 +8,7 @@ controls skip the student while they are its admin. A room a course owns
 (``moderation.courses``) needs ``other_courses``; a direct message is a room no
 course owns whose joined and invited members are two people, and needs
 ``dms`` both ways; a call event needs ``calls`` in any room, both ways in a
-direct message. The admins of every managing course and the configured
+direct message and in a course room of two. The admins of every managing course and the configured
 always-reachable accounts can always be messaged and called. A state that
 cannot be read raises, and the request fails: never allowed by default.
 """
@@ -164,6 +164,10 @@ class Controls:
         # by the module's own writes and a periodic refresh. An action no
         # managed user is party to never reads anything else of the module's.
         self._managed: Optional[FrozenSet[str]] = None
+        # Students a reconcile failed for, reconciled again on the next
+        # refresh tick. In memory: a restart loses them until another
+        # reconcile.
+        self._retry: Set[str] = set()
 
     def register(self) -> None:
         self._api.register_spam_checker_callbacks(
@@ -189,6 +193,9 @@ class Controls:
         self._managed = frozenset(u for u, room_id in rows if room_id in protected)
 
     async def _refresh_or_report(self) -> None:
+        if self._retry:
+            retry, self._retry = self._retry, set()
+            self.reconcile_later(retry)
         try:
             await self.refresh()
         except Exception as error:
@@ -292,16 +299,24 @@ class Controls:
         others = await self._members(room_id) - {user_id}
         return next(iter(others)) if len(others) == 1 else None
 
+    async def _always_reachable(self, courses: Sequence[Managing], other: str) -> bool:
+        """``other`` is a configured always-reachable account or an admin of
+        one of the managing ``courses``."""
+        if other in self._reachable:
+            return True
+        for course in courses:
+            if await self._admins.is_course_admin(course.room_id, other):
+                return True
+        return False
+
     async def _with(
         self, courses: Sequence[Managing], other: str, names: Sequence[str]
     ) -> Optional[str]:
         """A direct message (and, for a call, a call) with ``other``."""
-        if other in self._reachable:
+        if await self._always_reachable(courses, other):
             return None
         classmate_in = set()
         for course in courses:
-            if await self._admins.is_course_admin(course.room_id, other):
-                return None
             (
                 membership,
                 _,
@@ -327,6 +342,27 @@ class Controls:
                 refusal = await self._with(managed[user_id], other, names)
                 if refusal is not None:
                     return refusal
+        return None
+
+    async def _calls_in_course_room(
+        self,
+        managed: Dict[str, List[Managing]],
+        pair: Tuple[str, Optional[str]],
+        owners: Collection[str],
+    ) -> Optional[str]:
+        """A call in a course room: the sender's calls control and, in a room
+        of two, the other person's too, so a classmate cannot call a student
+        whose calls are off. The course's admins and the always-reachable can
+        always call and be called. A group call checks the sender alone."""
+        for user_id, other in (pair, pair[::-1]):
+            if user_id is None or user_id not in managed:
+                continue
+            courses = managed[user_id]
+            if other is not None and await self._always_reachable(courses, other):
+                continue
+            refusal = call_in_room(courses, owners)
+            if refusal is not None:
+                return refusal
         return None
 
     @staticmethod
@@ -395,12 +431,12 @@ class Controls:
         owners = await self._owners(room_id)
         courses = managed.get(sender)
         if owners:
-            if courses is None:
-                return NOT_SPAM
-            return refused(
-                in_room(courses, room_id, owners)
-                or (call_in_room(courses, owners) if call else None)
-            )
+            refusal = in_room(courses, room_id, owners) if courses else None
+            if refusal is None and call:
+                refusal = await self._calls_in_course_room(
+                    managed, (sender, other), owners
+                )
+            return refused(refusal)
         if other is not None:
             names = (DMS, CALLS) if call else (DMS,)
             return refused(await self._both_ways(managed, (sender, other), names))
@@ -514,6 +550,7 @@ class Controls:
             try:
                 await self.reconcile(user_id)
             except Exception as error:
+                self._retry.add(user_id)
                 report_failure("protected controls reconcile", error, user=user_id)
 
     async def reconcile(self, user_id: str) -> None:
@@ -525,22 +562,50 @@ class Controls:
         if not courses and self._managed is not None:
             self._managed -= {user_id}
         for room_id in sorted(await self._main.get_rooms_for_user(user_id)):
-            owners = await self._owners(room_id)
-            control = in_room(courses, room_id, owners)
-            if control is not None:
-                with module_write():
-                    await self._api.update_room_membership(
-                        user_id, user_id, room_id, "leave", {REMOVED_BY: control}
-                    )
+            try:
+                await self._take_out(courses, user_id, room_id)
+            except Exception as error:
+                # silent-ok: the other rooms go on; reported, and retried on the next refresh tick
+                self._retry.add(user_id)
+                report_failure(
+                    "protected controls leave", error, room=room_id, user=user_id
+                )
         left = await self._main.get_rooms_for_local_user_where_membership_is(
             user_id, ["leave"]
         )
         for room in left:
-            event = await self._main.get_event(room.event_id, allow_none=True)
-            if event is None or REMOVED_BY not in event.content:
-                continue
-            owners = await self._owners(room.room_id)
-            if in_room(courses, room.room_id, owners) is None:
-                result = await self._joiner.force_join(room.room_id, user_id, via=None)
-                if not result.get("success"):
-                    raise RuntimeError(f"restore into {room.room_id} failed")
+            try:
+                await self._put_back(courses, user_id, room)
+            except Exception as error:
+                # silent-ok: the other rooms go on; reported, and retried on the next refresh tick
+                self._retry.add(user_id)
+                report_failure(
+                    "protected controls restore", error, room=room.room_id, user=user_id
+                )
+
+    async def _take_out(
+        self, courses: Sequence[Managing], user_id: str, room_id: str
+    ) -> None:
+        control = in_room(courses, room_id, await self._owners(room_id))
+        if control is not None:
+            with module_write():
+                await self._api.update_room_membership(
+                    user_id, user_id, room_id, "leave", {REMOVED_BY: control}
+                )
+
+    async def _put_back(
+        self, courses: Sequence[Managing], user_id: str, room: Any
+    ) -> None:
+        """Rejoin a room the controls took the student out of, once they
+        allow it. Not rate limited: the module restores what it removed, and
+        a limit hit here would leave the student out with nothing to retry."""
+        event = await self._main.get_event(room.event_id, allow_none=True)
+        if event is None or REMOVED_BY not in event.content:
+            return
+        owners = await self._owners(room.room_id)
+        if in_room(courses, room.room_id, owners) is None:
+            result = await self._joiner.force_join(
+                room.room_id, user_id, via=None, ratelimit=False
+            )
+            if not result.get("success"):
+                raise RuntimeError(f"restore into {room.room_id} failed")
