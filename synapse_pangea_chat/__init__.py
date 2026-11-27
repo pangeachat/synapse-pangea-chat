@@ -1359,6 +1359,14 @@ class PangeaChat:
             not isinstance(notice_token_secret, str) or not notice_token_secret.strip()
         ):
             raise ValueError('Config "notice_token_secret" must be a non-empty string')
+        cms_synapse_module_api_key = config.get("cms_synapse_module_api_key")
+        if cms_synapse_module_api_key is not None and (
+            not isinstance(cms_synapse_module_api_key, str)
+            or not cms_synapse_module_api_key.strip()
+        ):
+            raise ValueError(
+                'Config "cms_synapse_module_api_key" must be a non-empty string'
+            )
         notice_token_ttl_days = config.get("notice_token_ttl_days", 90)
         if not isinstance(notice_token_ttl_days, int) or notice_token_ttl_days < 1:
             raise ValueError('Config "notice_token_ttl_days" must be an integer >= 1')
@@ -1831,6 +1839,7 @@ class PangeaChat:
             open_session_notice_bot_user_id=open_session_notice_bot_user_id,
             quest_courses_bot_user_id=quest_courses_bot_user_id,
             notice_token_secret=notice_token_secret,
+            cms_synapse_module_api_key=cms_synapse_module_api_key,
             notice_token_ttl_days=notice_token_ttl_days,
             notice_email_postal_address=notice_email_postal_address,
             notice_public_requests_per_burst=notice_public_requests_per_burst,

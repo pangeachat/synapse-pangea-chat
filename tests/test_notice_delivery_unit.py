@@ -988,3 +988,201 @@ class TestMissedMessageUnsubscribe(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(captured[0][0], 400)
         api.account_data_manager.put_global.assert_not_awaited()
+
+
+def _confirmed(*addresses, validated_at=NOW_MS):
+    return [
+        SimpleNamespace(
+            medium="email", address=a, validated_at=validated_at, added_at=NOW_MS
+        )
+        for a in addresses
+    ]
+
+
+class TestContactRefusal(unittest.IsolatedAsyncioTestCase):
+    """A contact's refusal, read from the CMS, stops nudges and marketing by
+    every channel; an unreadable one stops the send."""
+
+    CMS_REQUEST = "synapse_pangea_chat.notice_delivery.contact_refusal.cms_request"
+    RULE = "synapse_pangea_chat.notice_delivery.deliver.ensure_bot_notice_push_rule"
+
+    def setUp(self):
+        reset_confirmed_users_for_tests()
+
+    def _handler(self, api, sent=1, attempted=None, **config):
+        config.setdefault("cms_base_url", "https://cms.example.test/cms")
+        config.setdefault("cms_synapse_module_api_key", "module-key")
+        return DeliverNotice(api, _config(**config), _direct_push(sent, attempted))
+
+    def _body(self, **overrides):
+        body = {
+            "user_id": USER,
+            "category": "activity_nudges",
+            "variant": "do_activity",
+            "body": "Ready for an activity?",
+            "notice_event_id": "$notice:x",
+            "notice_room_id": "!dm:x",
+        }
+        body.update(overrides)
+        return body
+
+    @staticmethod
+    def _answer(refused=False, suppressed=False, code=200):
+        import json as _json
+
+        return AsyncMock(
+            return_value=(
+                code,
+                _json.dumps({"refused": refused, "suppressed": suppressed}).encode(),
+            )
+        )
+
+    async def test_a_contact_refusal_stops_push_and_in_app(self):
+        for active in (False, True):
+            api = _api(
+                threepids=_confirmed("alice@example.test"), currently_active=active
+            )
+            handler = self._handler(api)
+            with patch(self.CMS_REQUEST, new=self._answer(refused=True)) as ask, patch(
+                self.RULE, new=AsyncMock()
+            ):
+                result = await handler.deliver(self._body())
+            self.assertEqual(result["channel"], CHANNEL_REFUSED)
+            self.assertEqual(result["reason"], "contact_refused")
+            handler._direct_push._send_push.assert_not_awaited()
+            api._hs.get_send_email_handler.return_value.send_email.assert_not_awaited()
+            args, kwargs = ask.await_args
+            self.assertEqual(args[1], "POST")
+            self.assertEqual(
+                args[2], "https://cms.example.test/cms/api/contacts/refusal"
+            )
+            self.assertEqual(
+                kwargs["body"],
+                {"emails": ["alice@example.test"], "category": "activity_nudges"},
+            )
+            self.assertEqual(
+                args[3].getRawHeaders("Authorization"),
+                ["service-users API-Key module-key"],
+            )
+
+    async def test_only_confirmed_addresses_are_asked_and_several_are_sent_together(
+        self,
+    ):
+        threepids = _confirmed("a@example.test", "b@example.test") + [
+            SimpleNamespace(
+                medium="email", address="pending@example.test", validated_at=0
+            ),
+            SimpleNamespace(medium="msisdn", address="+1555", validated_at=NOW_MS),
+        ]
+        handler = self._handler(_api(threepids=threepids))
+        with patch(self.CMS_REQUEST, new=self._answer()) as ask, patch(
+            self.RULE, new=AsyncMock()
+        ):
+            result = await handler.deliver(self._body())
+        self.assertEqual(result["channel"], CHANNEL_PUSH)
+        self.assertEqual(
+            ask.await_args.kwargs["body"]["emails"],
+            ["a@example.test", "b@example.test"],
+        )
+
+    async def test_more_than_twenty_addresses_are_asked_in_turns(self):
+        addresses = [f"a{i}@example.test" for i in range(25)]
+        handler = self._handler(_api(threepids=_confirmed(*addresses)))
+        answers = AsyncMock(
+            side_effect=[
+                (200, b'{"refused": false, "suppressed": false}'),
+                (200, b'{"refused": true, "suppressed": false}'),
+            ]
+        )
+        with patch(self.CMS_REQUEST, new=answers), patch(self.RULE, new=AsyncMock()):
+            result = await handler.deliver(self._body())
+        self.assertEqual(result["reason"], "contact_refused")
+        self.assertEqual(
+            [len(c.kwargs["body"]["emails"]) for c in answers.await_args_list], [20, 5]
+        )
+
+    async def test_an_account_without_a_confirmed_address_makes_no_call(self):
+        handler = self._handler(_api(threepids=()))
+        with patch(self.CMS_REQUEST, new=self._answer(refused=True)) as ask, patch(
+            self.RULE, new=AsyncMock()
+        ):
+            result = await handler.deliver(self._body())
+        ask.assert_not_awaited()
+        self.assertEqual(result["channel"], CHANNEL_PUSH)
+
+    async def test_an_unreadable_refusal_sends_nothing_and_is_captured(self):
+        failures = {
+            "unreachable": AsyncMock(side_effect=ConnectionRefusedError()),
+            "error status": self._answer(code=503),
+            "wrong shape": AsyncMock(return_value=(200, b'{"refused": "no"}')),
+            "not json": AsyncMock(return_value=(200, b"<html>")),
+        }
+        for name, request in failures.items():
+            with self.subTest(name):
+                api = _api(threepids=_confirmed("alice@example.test"))
+                handler = self._handler(api)
+                with patch(self.CMS_REQUEST, new=request), patch(
+                    self.RULE, new=AsyncMock()
+                ), patch(
+                    "synapse_pangea_chat.notice_delivery.deliver.capture_exception"
+                ) as capture, self.assertLogs(
+                    "synapse.module.synapse_pangea_chat.notice_delivery.deliver",
+                    level="ERROR",
+                ):
+                    result = await handler.deliver(self._body())
+                self.assertEqual(result["channel"], CHANNEL_NONE)
+                self.assertEqual(result["reason"], "contact_check_failed")
+                capture.assert_called_once()
+                handler._direct_push._send_push.assert_not_awaited()
+                api.create_and_send_event_into_room.assert_not_awaited()
+
+    async def test_an_unset_key_sends_nothing(self):
+        handler = self._handler(
+            _api(threepids=_confirmed("alice@example.test")),
+            cms_synapse_module_api_key=None,
+        )
+        with patch(self.CMS_REQUEST, new=self._answer()) as ask, patch(
+            self.RULE, new=AsyncMock()
+        ), patch("synapse_pangea_chat.notice_delivery.deliver.capture_exception"):
+            with self.assertLogs(level="ERROR"):
+                result = await handler.deliver(self._body())
+        ask.assert_not_awaited()
+        self.assertEqual(result["reason"], "contact_check_failed")
+
+    async def test_a_suppressed_address_gets_no_email_but_push_still_goes(self):
+        api = _api(threepids=_confirmed("alice@example.test"))
+        handler = self._handler(api, sent=0, attempted=0)
+        with patch(self.CMS_REQUEST, new=self._answer(suppressed=True)), patch(
+            self.RULE, new=AsyncMock()
+        ):
+            result = await handler.deliver(self._body())
+        self.assertEqual(result["channel"], CHANNEL_NONE)
+        self.assertEqual(result["reason"], "contact_suppressed")
+        handler._direct_push._send_push.assert_awaited_once()
+        api._hs.get_send_email_handler.return_value.send_email.assert_not_awaited()
+
+        pushed = self._handler(_api(threepids=_confirmed("alice@example.test")), sent=1)
+        with patch(self.CMS_REQUEST, new=self._answer(suppressed=True)), patch(
+            self.RULE, new=AsyncMock()
+        ):
+            self.assertEqual(
+                (await pushed.deliver(self._body()))["channel"], CHANNEL_PUSH
+            )
+
+    async def test_the_account_refusal_is_read_first_and_the_cms_not_asked(self):
+        api = _api(
+            account_data={"refused": ["activity_nudges"]},
+            threepids=_confirmed("alice@example.test"),
+        )
+        with patch(self.CMS_REQUEST, new=self._answer()) as ask:
+            result = await self._handler(api).deliver(self._body())
+        self.assertEqual(result["reason"], "category_refused")
+        ask.assert_not_awaited()
+
+    def test_config_accepts_the_module_key_and_rejects_an_empty_one(self):
+        base = {"cms_base_url": "x", "cms_service_api_key": "y"}
+        parsed = PangeaChat.parse_config({**base, "cms_synapse_module_api_key": "k"})
+        self.assertEqual(parsed.cms_synapse_module_api_key, "k")
+        self.assertIsNone(PangeaChat.parse_config(base).cms_synapse_module_api_key)
+        with self.assertRaises(ValueError):
+            PangeaChat.parse_config({**base, "cms_synapse_module_api_key": " "})
