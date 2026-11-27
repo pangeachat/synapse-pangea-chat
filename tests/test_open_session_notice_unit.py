@@ -11,6 +11,17 @@ from synapse_pangea_chat.notice_delivery.open_session_notice import (
 from synapse_pangea_chat.notice_delivery.request import NoticeRequest
 from tests.test_notice_schedule import TestScheduledDelivery
 
+from . import notice_cms_stub
+
+
+def setUpModule() -> None:
+    notice_cms_stub.start()
+
+
+def tearDownModule() -> None:
+    notice_cms_stub.stop()
+
+
 BOT = "@bot:test"
 LEARNER = "@alice:test"
 CREATED_MS = 1_790_000_000_000

@@ -15,6 +15,16 @@ from tests import test_notice_content
 from tests.test_notice_content import request_body
 from tests.test_notice_delivery_unit import NOW_MS, _api
 
+from . import notice_cms_stub
+
+
+def setUpModule() -> None:
+    notice_cms_stub.start()
+
+
+def tearDownModule() -> None:
+    notice_cms_stub.stop()
+
 
 def scheduled_body():
     body = request_body("email-only")

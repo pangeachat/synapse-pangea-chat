@@ -30,6 +30,17 @@ from synapse_pangea_chat.notice_delivery.unsubscribe import (
     parse_preference_form,
 )
 
+from . import notice_cms_stub
+
+
+def setUpModule() -> None:
+    notice_cms_stub.start()
+
+
+def tearDownModule() -> None:
+    notice_cms_stub.stop()
+
+
 SECRET = b"unit-test-secret"
 NOW_MS = 1_700_000_000_000
 USER = "@alice:my.domain.name"
@@ -281,21 +292,9 @@ class TestPushRule(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await ensure_bot_notice_push_rule(api, USER))
 
 
-def _cms_answers_nothing_refused(case: unittest.TestCase) -> None:
-    """Email asks the CMS whether its address is suppressed; these tests are
-    about other things, so the CMS answers that nothing is refused."""
-    patcher = patch(
-        "synapse_pangea_chat.notice_delivery.contact_refusal.cms_request",
-        new=AsyncMock(return_value=(200, b'{"refused": false, "suppressed": false}')),
-    )
-    patcher.start()
-    case.addCleanup(patcher.stop)
-
-
 class TestDeliverNotice(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         reset_confirmed_users_for_tests()
-        _cms_answers_nothing_refused(self)
 
     def _handler(self, api, config=None, sent=0, attempted=None):
         return DeliverNotice(api, config or _config(), _direct_push(sent, attempted))
@@ -759,7 +758,6 @@ class TestInAppRequiresOnline(unittest.IsolatedAsyncioTestCase):
 class TestEmailSubjectIsOneLine(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         reset_confirmed_users_for_tests()
-        _cms_answers_nothing_refused(self)
 
     async def test_multiline_body_becomes_a_single_line_subject(self):
         api = _api(
