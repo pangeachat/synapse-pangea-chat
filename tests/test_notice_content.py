@@ -14,6 +14,16 @@ from synapse_pangea_chat.notice_delivery.rate_limit import AdminRateLimiter
 from synapse_pangea_chat.notice_delivery.request import NoticeRequest
 from tests.test_notice_delivery_unit import USER, _api, _config, _direct_push
 
+from . import notice_cms_stub
+
+
+def setUpModule() -> None:
+    notice_cms_stub.start()
+
+
+def tearDownModule() -> None:
+    notice_cms_stub.stop()
+
 
 def request_body(method="use-available"):
     return {

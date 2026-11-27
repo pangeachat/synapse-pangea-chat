@@ -70,6 +70,8 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/user-exports":
             self._handle_create_export()
+        elif parsed.path == "/api/contacts/refusal":
+            self._handle_contact_refusal()
         else:
             self._send_json(404, {"error": "Not found"})
 
@@ -149,6 +151,26 @@ class _MockCmsHandler(BaseHTTPRequestHandler):
         else:
             self._send_json(200, quest)
 
+    # --- contacts/refusal (the CMS's answer to Synapse) ---
+
+    def _handle_contact_refusal(self) -> None:
+        state: _MockCmsState = self.server._state  # type: ignore[attr-defined]
+        body = self._read_json_body()
+        state.record_refusal_ask(self.headers.get("Authorization", ""), body)
+        if state.refusal_status != 200:
+            self._send_json(state.refusal_status, {"error": "unavailable"})
+            return
+        emails = [str(e).strip().lower() for e in body.get("emails") or []]
+        category = body.get("category")
+        refused = suppressed = False
+        for email in emails:
+            contact = state.contact_refusals.get(email)
+            if contact is None:
+                continue
+            refused = refused or category in contact["categories"]
+            suppressed = suppressed or contact["suppressed"]
+        self._send_json(200, {"refused": refused, "suppressed": suppressed})
+
     # --- user-exports handlers ---
 
     def _handle_create_export(self) -> None:
@@ -209,6 +231,9 @@ class _MockCmsState:
         self._matrix_users_by_username: Dict[str, Dict[str, Any]] = {}
         self._matrix_users_by_id: Dict[str, Dict[str, Any]] = {}
         self._exports_by_id: Dict[str, Dict[str, Any]] = {}
+        self.contact_refusals: Dict[str, Dict[str, Any]] = {}
+        self.refusal_asks: List[Tuple[str, Dict[str, Any]]] = []
+        self.refusal_status = 200
         self._activities_by_id: Dict[str, List[Dict[str, Any]]] = {}
         self._activity_faults: Dict[str, Tuple[Optional[int], float]] = {}
         self._quests_by_id: Dict[str, Dict[str, Any]] = {}
@@ -341,6 +366,10 @@ class _MockCmsState:
 
             return dict(doc)
 
+    def record_refusal_ask(self, authorization: str, body: Dict[str, Any]) -> None:
+        with self._lock:
+            self.refusal_asks.append((authorization, body))
+
     def get_exports_for_matrix_user_id(
         self, matrix_user_id: str
     ) -> List[Dict[str, Any]]:
@@ -376,6 +405,24 @@ class MockCmsServer:
 
     def seed_activity(self, doc: Dict[str, Any]) -> None:
         self._state.seed_activity(doc)
+
+    def set_contact_refusal(
+        self, address: str, categories=(), *, suppressed: bool = False
+    ) -> None:
+        """The contact holding ``address`` refuses ``categories``."""
+        self._state.contact_refusals[address.lower()] = {
+            "categories": set(categories),
+            "suppressed": suppressed,
+        }
+
+    def set_refusal_status(self, status: int) -> None:
+        """Answer every refusal ask with ``status``: a CMS that is failing."""
+        self._state.refusal_status = status
+
+    @property
+    def refusal_asks(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Each refusal ask as (Authorization header, body)."""
+        return list(self._state.refusal_asks)
 
     def seed_quest(self, quest: Dict[str, Any]) -> None:
         self._state.seed_quest(quest)

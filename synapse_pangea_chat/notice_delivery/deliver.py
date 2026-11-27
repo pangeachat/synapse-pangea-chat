@@ -43,6 +43,10 @@ from synapse_pangea_chat.notice_delivery.common import (
     token_secret,
     unsubscribe_url,
 )
+from synapse_pangea_chat.notice_delivery.contact_refusal import (
+    ContactRefusals,
+    ContactRefusalUnavailable,
+)
 from synapse_pangea_chat.notice_delivery.delivery_log import (
     DeliveryConflict,
     DeliveryLog,
@@ -65,6 +69,7 @@ from synapse_pangea_chat.notice_delivery.transport_claim import (
     PHASE_PENDING,
     TransportClaims,
 )
+from synapse_pangea_chat.sentry_capture import capture_exception
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -125,6 +130,7 @@ class DeliverNotice(Resource):
             config.notice_admin_requests_per_minute, config.notice_admin_burst
         )
         self._delivery_log = DeliveryLog(api, config)
+        self._contact_refusals = ContactRefusals(api, config)
         self._transport_claims = TransportClaims(api)
         self.schedule = NoticeSchedule(
             api, self._deliver_scheduled, config.notice_external_link_hosts
@@ -491,6 +497,28 @@ class DeliverNotice(Resource):
             )
             return result
 
+        # A contact holding one of the account's confirmed addresses may have
+        # refused this kind by its own unsubscribe link; that stops push and
+        # in-app of the kind too. Every caller is checked, the runner's own rows
+        # included: its scheduled sends go out later than its consent check.
+        # Only nudge and marketing kinds ask; event mail never reaches here.
+        if category in GLOBAL_OFF_CATEGORIES:
+            try:
+                contact = await self._contact_refusals.standing(user_id, category)
+            except ContactRefusalUnavailable as error:
+                logger.error(
+                    "notice not sent: contact refusal unreadable for category=%s: %s",
+                    category,
+                    error,
+                )
+                capture_exception(error)
+                result["reason"] = error.reason
+                return result
+            if contact.refused:
+                result["channel"] = CHANNEL_REFUSED
+                result["reason"] = "contact_refused"
+                return result
+
         if self._config.notice_suppress_notice_push_rules:
             result["push_rule_installed"] = await ensure_bot_notice_push_rule(
                 self._api, user_id
@@ -538,7 +566,10 @@ class DeliverNotice(Resource):
 
         if method == "email-only":
             email = await self._send_email(
-                body, user_id=user_id, category=category, req=req
+                body,
+                user_id=user_id,
+                category=category,
+                req=req,
             )
             result["email"] = email
             result["channel"] = CHANNEL_EMAIL if email["sent"] else CHANNEL_NONE
@@ -571,7 +602,10 @@ class DeliverNotice(Resource):
             return result
 
         email = await self._send_email(
-            body, user_id=user_id, category=category, req=req
+            body,
+            user_id=user_id,
+            category=category,
+            req=req,
         )
         result["email"] = email
         if email["sent"]:
@@ -643,6 +677,23 @@ class DeliverNotice(Resource):
         address = await self._first_email_address(user_id)
         if address is None:
             return {"sent": False, "reason": "no_email_address"}
+        if category in GLOBAL_OFF_CATEGORIES:
+            # A permanent bounce or a complaint stops mail to that one address;
+            # push and in-app were tried first and are unaffected.
+            try:
+                suppressed = await self._contact_refusals.address_suppressed(
+                    address, category
+                )
+            except ContactRefusalUnavailable as error:
+                logger.error(
+                    "notice email not sent: suppression unreadable for category=%s: %s",
+                    category,
+                    error,
+                )
+                capture_exception(error)
+                return {"sent": False, "reason": error.reason}
+            if suppressed:
+                return {"sent": False, "reason": "contact_suppressed"}
 
         now = now_ms(self._api)
         ttl_ms = self._config.notice_token_ttl_days * MILLISECONDS_PER_DAY

@@ -18,6 +18,7 @@ from synapse_pangea_chat.notice_delivery.common import TEMPLATES_DIR
 from synapse_pangea_chat.notice_delivery.tokens import verify_token
 
 from .base_e2e import SERVER_NAME, BaseSynapseE2ETest
+from .mock_cms_server import MockCmsServer
 from .test_register_email_e2e import MockSMTPServer
 
 
@@ -34,6 +35,8 @@ class Links(HTMLParser):
 class TestNoticeEmailSMTP(BaseSynapseE2ETest):
     port: int
     smtp: MockSMTPServer
+    cms: MockCmsServer
+    cms_url: str
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -48,6 +51,11 @@ class TestNoticeEmailSMTP(BaseSynapseE2ETest):
         cls.smtp = MockSMTPServer()
         cls.smtp.start()
         cls.addClassCleanup(cls.smtp.stop)
+        # Email asks the CMS whether a contact refused this kind; this one
+        # knows no contact, so nothing is refused.
+        cls.cms = MockCmsServer()
+        cls.cms_url = cls.cms.start()
+        cls.addClassCleanup(cls.cms.stop)
 
     async def test_real_delivery_has_brand_mime_and_working_unsubscribe(self):
         brand_address = (
@@ -61,6 +69,7 @@ class TestNoticeEmailSMTP(BaseSynapseE2ETest):
                 "notice_email_postal_address": brand_address,
                 "notice_token_secret": "local-test-secret",
                 "app_base_url": "http://127.0.0.1/preview-only",
+                "cms_base_url": self.cms_url,
             },
             synapse_config_overrides={
                 "public_baseurl": f"http://127.0.0.1:{self.port}",

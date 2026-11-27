@@ -30,6 +30,17 @@ from tests.test_notice_delivery_unit import (
 )
 from tests.test_notice_schedule import SQLPool
 
+from . import notice_cms_stub
+
+
+def setUpModule() -> None:
+    notice_cms_stub.start()
+
+
+def tearDownModule() -> None:
+    notice_cms_stub.stop()
+
+
 HOSTS = ["calendar.app.google", "admin.pangea.chat"]
 BOOKING = "https://calendar.app.google/abc123"
 COURSE = {"kind": "course", "course_room_id": "!course:x"}
