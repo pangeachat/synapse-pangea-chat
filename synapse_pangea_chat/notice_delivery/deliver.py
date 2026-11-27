@@ -47,6 +47,7 @@ from synapse_pangea_chat.notice_delivery.contact_refusal import (
     NOTHING_REFUSED,
     ContactRefusals,
     ContactRefusalUnavailable,
+    ContactRefusalUnconfigured,
 )
 from synapse_pangea_chat.notice_delivery.delivery_log import (
     DeliveryConflict,
@@ -507,6 +508,10 @@ class DeliverNotice(Resource):
         if category in GLOBAL_OFF_CATEGORIES:
             try:
                 contact = await self._contact_refusals.standing(user_id, category)
+            except ContactRefusalUnconfigured as error:
+                # Reported once at start (contact_refusal.py); the row says why.
+                result["reason"] = error.reason
+                return result
             except ContactRefusalUnavailable as error:
                 logger.error(
                     "notice not sent: contact refusal unreadable for category=%s: %s",
@@ -514,7 +519,7 @@ class DeliverNotice(Resource):
                     error,
                 )
                 capture_exception(error)
-                result["reason"] = "contact_check_failed"
+                result["reason"] = error.reason
                 return result
             if contact.refused:
                 result["channel"] = CHANNEL_REFUSED

@@ -18,6 +18,7 @@ wrong shape raises ``ContactRefusalUnavailable`` and the caller sends nothing.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, List
 
 import attr
@@ -25,6 +26,11 @@ from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.cms_http import cms_request, service_headers
 from synapse_pangea_chat.config import PangeaChatConfig
+from synapse_pangea_chat.sentry_capture import capture_message
+
+logger = logging.getLogger(
+    "synapse.module.synapse_pangea_chat.notice_delivery.contact_refusal"
+)
 
 EMAIL_MEDIUM = "email"
 # The CMS answers 400 past 20 addresses; an account with more is asked in turns.
@@ -34,6 +40,14 @@ TIMEOUT_SECONDS = 10
 
 class ContactRefusalUnavailable(Exception):
     """The contact's refusal could not be read; nothing may be sent."""
+
+    reason = "contact_check_failed"
+
+
+class ContactRefusalUnconfigured(ContactRefusalUnavailable):
+    """No synapse_module key is configured, so no contact can be asked."""
+
+    reason = "contact_check_unconfigured"
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -54,6 +68,18 @@ class ContactRefusals:
         self._url = config.cms_base_url.rstrip("/") + "/api/contacts/refusal"
         key = config.cms_synapse_module_api_key
         self._headers = service_headers(key, json_body=True) if key else None
+        if self._headers is None:
+            # Said once, loudly, at start: every nudge and marketing notice to an
+            # account with a confirmed address is refused as unchecked until the
+            # key is configured. Each refused send also records its own reason.
+            logger.error(
+                "cms_synapse_module_api_key is not set: nudge and marketing "
+                "notices to accounts with a confirmed email will not be sent"
+            )
+            capture_message(
+                "notice delivery: cms_synapse_module_api_key is not set",
+                level="error",
+            )
 
     async def confirmed_addresses(self, user_id: str) -> List[str]:
         """The email addresses Synapse has confirmed on the account."""
@@ -77,7 +103,7 @@ class ContactRefusals:
             # No address means no contact can hold one: nothing to read.
             return NOTHING_REFUSED
         if self._headers is None:
-            raise ContactRefusalUnavailable("cms_synapse_module_api_key is not set")
+            raise ContactRefusalUnconfigured("cms_synapse_module_api_key is not set")
         refused = suppressed = False
         for start in range(0, len(addresses), MAX_ADDRESSES_PER_ASK):
             answer = await self._ask(

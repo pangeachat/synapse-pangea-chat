@@ -1136,18 +1136,31 @@ class TestContactRefusal(unittest.IsolatedAsyncioTestCase):
                 handler._direct_push._send_push.assert_not_awaited()
                 api.create_and_send_event_into_room.assert_not_awaited()
 
-    async def test_an_unset_key_sends_nothing(self):
-        handler = self._handler(
-            _api(threepids=_confirmed("alice@example.test")),
-            cms_synapse_module_api_key=None,
-        )
+    async def test_an_unset_key_is_reported_once_at_start_and_each_send_says_so(self):
+        with patch(
+            "synapse_pangea_chat.notice_delivery.contact_refusal.capture_message"
+        ) as started, self.assertLogs(
+            "synapse.module.synapse_pangea_chat.notice_delivery.contact_refusal",
+            level="ERROR",
+        ):
+            handler = self._handler(
+                _api(threepids=_confirmed("alice@example.test")),
+                cms_synapse_module_api_key=None,
+            )
+        started.assert_called_once()
         with patch(self.CMS_REQUEST, new=self._answer()) as ask, patch(
             self.RULE, new=AsyncMock()
-        ), patch("synapse_pangea_chat.notice_delivery.deliver.capture_exception"):
-            with self.assertLogs(level="ERROR"):
-                result = await handler.deliver(self._body())
+        ), patch(
+            "synapse_pangea_chat.notice_delivery.deliver.capture_exception"
+        ) as per_send:
+            first = await handler.deliver(self._body())
+            second = await handler.deliver(self._body())
         ask.assert_not_awaited()
-        self.assertEqual(result["reason"], "contact_check_failed")
+        per_send.assert_not_called()
+        for result in (first, second):
+            self.assertEqual(result["channel"], CHANNEL_NONE)
+            self.assertEqual(result["reason"], "contact_check_unconfigured")
+        handler._direct_push._send_push.assert_not_awaited()
 
     async def test_a_suppressed_address_gets_no_email_but_push_still_goes(self):
         api = _api(threepids=_confirmed("alice@example.test"))
