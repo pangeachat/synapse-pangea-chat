@@ -1024,7 +1024,7 @@ class TestContactRefusal(unittest.IsolatedAsyncioTestCase):
 
     def _handler(self, api, sent=1, attempted=None, **config):
         config.setdefault("cms_base_url", "https://cms.example.test/cms")
-        config.setdefault("cms_synapse_module_api_key", "module-key")
+        config.setdefault("cms_service_api_key", "module-key")
         return DeliverNotice(api, _config(**config), _direct_push(sent, attempted))
 
     def _body(self, **overrides):
@@ -1149,32 +1149,6 @@ class TestContactRefusal(unittest.IsolatedAsyncioTestCase):
                 handler._direct_push._send_push.assert_not_awaited()
                 api.create_and_send_event_into_room.assert_not_awaited()
 
-    async def test_an_unset_key_is_reported_once_at_start_and_each_send_says_so(self):
-        with patch(
-            "synapse_pangea_chat.notice_delivery.contact_refusal.capture_message"
-        ) as started, self.assertLogs(
-            "synapse.module.synapse_pangea_chat.notice_delivery.contact_refusal",
-            level="ERROR",
-        ):
-            handler = self._handler(
-                _api(threepids=_confirmed("alice@example.test")),
-                cms_synapse_module_api_key=None,
-            )
-        started.assert_called_once()
-        with patch(self.CMS_REQUEST, new=self._answer()) as ask, patch(
-            self.RULE, new=AsyncMock()
-        ), patch(
-            "synapse_pangea_chat.notice_delivery.deliver.capture_exception"
-        ) as per_send:
-            first = await handler.deliver(self._body())
-            second = await handler.deliver(self._body())
-        ask.assert_not_awaited()
-        per_send.assert_not_called()
-        for result in (first, second):
-            self.assertEqual(result["channel"], CHANNEL_NONE)
-            self.assertEqual(result["reason"], "contact_check_unconfigured")
-        handler._direct_push._send_push.assert_not_awaited()
-
     async def test_a_suppressed_address_gets_no_email_but_push_still_goes(self):
         api = _api(threepids=_confirmed("alice@example.test"))
         handler = self._handler(api, sent=0, attempted=0)
@@ -1246,11 +1220,3 @@ class TestContactRefusal(unittest.IsolatedAsyncioTestCase):
             result = await self._handler(api).deliver(self._body())
         self.assertEqual(result["reason"], "category_refused")
         ask.assert_not_awaited()
-
-    def test_config_accepts_the_module_key_and_rejects_an_empty_one(self):
-        base = {"cms_base_url": "x", "cms_service_api_key": "y"}
-        parsed = PangeaChat.parse_config({**base, "cms_synapse_module_api_key": "k"})
-        self.assertEqual(parsed.cms_synapse_module_api_key, "k")
-        self.assertIsNone(PangeaChat.parse_config(base).cms_synapse_module_api_key)
-        with self.assertRaises(ValueError):
-            PangeaChat.parse_config({**base, "cms_synapse_module_api_key": " "})

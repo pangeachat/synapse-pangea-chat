@@ -204,10 +204,6 @@ class PangeaChatConfig:
     # HMAC key for unsubscribe and click links; falls back to the homeserver's
     # macaroon secret when unset.
     notice_token_secret: Optional[str] = None
-    # The CMS key of scope synapse_module, used to ask whether a contact holding
-    # one of an account's confirmed addresses refused a kind of mail. Unset, every
-    # nudge and marketing notice is refused as unchecked (contact_refusal.py).
-    cms_synapse_module_api_key: Optional[str] = None
     # How long an emailed link works: past CAN-SPAM's 30 days and CASL's 60.
     notice_token_ttl_days: int = 90
     # Shown in the email footer; a CAN-SPAM requirement for marketing-classified

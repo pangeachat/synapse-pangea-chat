@@ -10,15 +10,15 @@ not to send").
 
 The CMS read takes the account's confirmed addresses, read live, and one
 category, and answers only ``refused`` and ``suppressed``. It is read on every
-send, never cached, like the account's own preferences. Consent that cannot be
-checked is not consent: an unset key, an unreachable CMS or an answer of the
-wrong shape raises ``ContactRefusalUnavailable`` and the caller sends nothing.
+send, never cached, like the account's own preferences, with the module's own
+CMS key. Consent that cannot be checked is not consent: an unreachable CMS or
+an answer of the wrong shape raises ``ContactRefusalUnavailable`` and the
+caller sends nothing.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 from typing import Any, List
 
 import attr
@@ -26,11 +26,6 @@ from synapse.module_api import ModuleApi
 
 from synapse_pangea_chat.cms_http import cms_request, service_headers
 from synapse_pangea_chat.config import PangeaChatConfig
-from synapse_pangea_chat.sentry_capture import capture_message
-
-logger = logging.getLogger(
-    "synapse.module.synapse_pangea_chat.notice_delivery.contact_refusal"
-)
 
 EMAIL_MEDIUM = "email"
 # The CMS answers 400 past 20 addresses; an account with more is asked in turns.
@@ -42,12 +37,6 @@ class ContactRefusalUnavailable(Exception):
     """The contact's refusal could not be read; nothing may be sent."""
 
     reason = "contact_check_failed"
-
-
-class ContactRefusalUnconfigured(ContactRefusalUnavailable):
-    """No synapse_module key is configured, so no contact can be asked."""
-
-    reason = "contact_check_unconfigured"
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -67,20 +56,9 @@ class ContactRefusals:
         self._reactor = api._hs.get_reactor()
         self._store = api._hs.get_datastores().main
         self._url = config.cms_base_url.rstrip("/") + "/api/contacts/refusal"
-        key = config.cms_synapse_module_api_key
-        self._headers = service_headers(key, json_body=True) if key else None
-        if self._headers is None:
-            # Said once, loudly, at start: every nudge and marketing notice to an
-            # account with a confirmed address is refused as unchecked until the
-            # key is configured. Each refused send also records its own reason.
-            logger.error(
-                "cms_synapse_module_api_key is not set: nudge and marketing "
-                "notices to accounts with a confirmed email will not be sent"
-            )
-            capture_message(
-                "notice delivery: cms_synapse_module_api_key is not set",
-                level="error",
-            )
+        # The module's own CMS key: the endpoint answers it yes or no and
+        # returns no contact data, so no second credential is needed.
+        self._headers = service_headers(config.cms_service_api_key, json_body=True)
 
     async def confirmed_addresses(self, user_id: str) -> List[str]:
         """The email addresses Synapse has confirmed on the account."""
@@ -103,8 +81,6 @@ class ContactRefusals:
         if not addresses:
             # No address means no contact can hold one: nothing to read.
             return NOTHING_REFUSED
-        if self._headers is None:
-            raise ContactRefusalUnconfigured("cms_synapse_module_api_key is not set")
         refused = suppressed = False
         for start in range(0, len(addresses), MAX_ADDRESSES_PER_ASK):
             answer = await self._ask(
@@ -118,12 +94,9 @@ class ContactRefusals:
         """Whether mail to this one address is suppressed. A bounce or a
         complaint belongs to the address, not the account, so email asks about
         the address it is about to use and nothing else."""
-        if self._headers is None:
-            raise ContactRefusalUnconfigured("cms_synapse_module_api_key is not set")
         return (await self._ask([address], category)).suppressed
 
     async def _ask(self, addresses: List[str], category: str) -> ContactStanding:
-        assert self._headers is not None
         try:
             code, raw = await cms_request(
                 self._http,

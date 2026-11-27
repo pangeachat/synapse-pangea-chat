@@ -7,7 +7,7 @@ from .base_e2e import BaseSynapseE2ETest
 from .mock_cms_server import MockCmsServer
 from .test_notice_delivery_e2e import MODULE_CONFIG
 
-MODULE_KEY = "e2e-synapse-module-key"
+MODULE_KEY = "e2e-module-cms-key"
 
 
 class _Deliveries(BaseSynapseE2ETest):
@@ -59,7 +59,7 @@ class TestContactRefusalE2E(_Deliveries):
             module_config={
                 **MODULE_CONFIG,
                 "cms_base_url": self.cms_url,
-                "cms_synapse_module_api_key": MODULE_KEY,
+                "cms_service_api_key": MODULE_KEY,
             }
         )
         _, admin_token = await self.new_user("admin", admin=True)
@@ -110,9 +110,7 @@ class TestContactRefusalUnreachableE2E(_Deliveries):
     """The CMS address answers nothing at all (the base config's port 9)."""
 
     async def test_an_unreachable_cms_sends_nothing_and_says_why(self):
-        await self.homeserver(
-            module_config={**MODULE_CONFIG, "cms_synapse_module_api_key": MODULE_KEY}
-        )
+        await self.homeserver(module_config=MODULE_CONFIG)
         _, admin = await self.new_user("admin", admin=True)
         user_id = await self._account(admin, self._address("unreachable"))
         data = self._deliver(admin, user_id).json()
