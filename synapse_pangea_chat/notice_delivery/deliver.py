@@ -44,7 +44,6 @@ from synapse_pangea_chat.notice_delivery.common import (
     unsubscribe_url,
 )
 from synapse_pangea_chat.notice_delivery.contact_refusal import (
-    NOTHING_REFUSED,
     ContactRefusals,
     ContactRefusalUnavailable,
     ContactRefusalUnconfigured,
@@ -504,7 +503,6 @@ class DeliverNotice(Resource):
         # in-app of the kind too. Every caller is checked, the runner's own rows
         # included: its scheduled sends go out later than its consent check.
         # Only nudge and marketing kinds ask; event mail never reaches here.
-        contact = NOTHING_REFUSED
         if category in GLOBAL_OFF_CATEGORIES:
             try:
                 contact = await self._contact_refusals.standing(user_id, category)
@@ -577,7 +575,6 @@ class DeliverNotice(Resource):
                 user_id=user_id,
                 category=category,
                 req=req,
-                suppressed=contact.suppressed,
             )
             result["email"] = email
             result["channel"] = CHANNEL_EMAIL if email["sent"] else CHANNEL_NONE
@@ -614,7 +611,6 @@ class DeliverNotice(Resource):
             user_id=user_id,
             category=category,
             req=req,
-            suppressed=contact.suppressed,
         )
         result["email"] = email
         if email["sent"]:
@@ -670,14 +666,9 @@ class DeliverNotice(Resource):
         user_id: str,
         category: str,
         req: Optional[NoticeRequest] = None,
-        suppressed: bool = False,
     ) -> Dict[str, Any]:
         if not self._config.notice_email_enabled:
             return {"sent": False, "reason": "email_disabled"}
-        if suppressed:
-            # A permanent bounce or a complaint on the contact's address stops
-            # mail to it; push and in-app were tried first and are unaffected.
-            return {"sent": False, "reason": "contact_suppressed"}
         secret = token_secret(self._api, self._config)
         if secret is None:
             logger.error(
@@ -691,6 +682,25 @@ class DeliverNotice(Resource):
         address = await self._first_email_address(user_id)
         if address is None:
             return {"sent": False, "reason": "no_email_address"}
+        if category in GLOBAL_OFF_CATEGORIES:
+            # A permanent bounce or a complaint stops mail to that one address;
+            # push and in-app were tried first and are unaffected.
+            try:
+                suppressed = await self._contact_refusals.address_suppressed(
+                    address, category
+                )
+            except ContactRefusalUnconfigured as error:
+                return {"sent": False, "reason": error.reason}
+            except ContactRefusalUnavailable as error:
+                logger.error(
+                    "notice email not sent: suppression unreadable for category=%s: %s",
+                    category,
+                    error,
+                )
+                capture_exception(error)
+                return {"sent": False, "reason": error.reason}
+            if suppressed:
+                return {"sent": False, "reason": "contact_suppressed"}
 
         now = now_ms(self._api)
         ttl_ms = self._config.notice_token_ttl_days * MILLISECONDS_PER_DAY

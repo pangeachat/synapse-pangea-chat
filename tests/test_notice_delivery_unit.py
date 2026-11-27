@@ -281,9 +281,21 @@ class TestPushRule(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await ensure_bot_notice_push_rule(api, USER))
 
 
+def _cms_answers_nothing_refused(case: unittest.TestCase) -> None:
+    """Email asks the CMS whether its address is suppressed; these tests are
+    about other things, so the CMS answers that nothing is refused."""
+    patcher = patch(
+        "synapse_pangea_chat.notice_delivery.contact_refusal.cms_request",
+        new=AsyncMock(return_value=(200, b'{"refused": false, "suppressed": false}')),
+    )
+    patcher.start()
+    case.addCleanup(patcher.stop)
+
+
 class TestDeliverNotice(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         reset_confirmed_users_for_tests()
+        _cms_answers_nothing_refused(self)
 
     def _handler(self, api, config=None, sent=0, attempted=None):
         return DeliverNotice(api, config or _config(), _direct_push(sent, attempted))
@@ -747,6 +759,7 @@ class TestInAppRequiresOnline(unittest.IsolatedAsyncioTestCase):
 class TestEmailSubjectIsOneLine(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         reset_confirmed_users_for_tests()
+        _cms_answers_nothing_refused(self)
 
     async def test_multiline_body_becomes_a_single_line_subject(self):
         api = _api(
@@ -1181,6 +1194,48 @@ class TestContactRefusal(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 (await pushed.deliver(self._body()))["channel"], CHANNEL_PUSH
             )
+
+    async def test_suppression_is_asked_for_the_address_email_uses_and_no_other(self):
+        # A bounced second address must not stop mail to a healthy first one.
+        async def cms(_http, _method, _url, _headers, **kwargs):
+            emails = kwargs["body"]["emails"]
+            suppressed = "bounced@example.test" in emails
+            return 200, (
+                b'{"refused": false, "suppressed": %s}'
+                % (b"true" if suppressed else b"false")
+            )
+
+        api = _api(threepids=_confirmed("healthy@example.test", "bounced@example.test"))
+        handler = self._handler(api, sent=0, attempted=0)
+        ask = AsyncMock(side_effect=cms)
+        with patch(self.CMS_REQUEST, new=ask), patch(self.RULE, new=AsyncMock()):
+            result = await handler.deliver(self._body())
+        self.assertEqual(result["channel"], CHANNEL_EMAIL)
+        self.assertEqual(
+            ask.await_args_list[-1].kwargs["body"]["emails"], ["healthy@example.test"]
+        )
+
+    async def test_an_unreadable_suppression_sends_no_email(self):
+        api = _api(threepids=_confirmed("alice@example.test"))
+        handler = self._handler(api, sent=0, attempted=0)
+        answers = AsyncMock(
+            side_effect=[
+                (200, b'{"refused": false, "suppressed": false}'),
+                (503, b"{}"),
+            ]
+        )
+        with patch(self.CMS_REQUEST, new=answers), patch(
+            self.RULE, new=AsyncMock()
+        ), patch(
+            "synapse_pangea_chat.notice_delivery.deliver.capture_exception"
+        ) as capture, self.assertLogs(
+            level="ERROR"
+        ):
+            result = await handler.deliver(self._body())
+        self.assertEqual(result["channel"], CHANNEL_NONE)
+        self.assertEqual(result["reason"], "contact_check_failed")
+        capture.assert_called_once()
+        api._hs.get_send_email_handler.return_value.send_email.assert_not_awaited()
 
     async def test_the_account_refusal_is_read_first_and_the_cms_not_asked(self):
         api = _api(

@@ -53,7 +53,8 @@ class ContactRefusalUnconfigured(ContactRefusalUnavailable):
 @attr.s(auto_attribs=True, frozen=True)
 class ContactStanding:
     refused: bool = False
-    #: A permanent bounce or a complaint on the address: no email, push and in-app still go.
+    #: A permanent bounce or a complaint on any of the addresses. Delivery does not
+    #: act on this aggregate; email asks about its own address (address_suppressed).
     suppressed: bool = False
 
 
@@ -112,6 +113,14 @@ class ContactRefusals:
             refused = refused or answer.refused
             suppressed = suppressed or answer.suppressed
         return ContactStanding(refused=refused, suppressed=suppressed)
+
+    async def address_suppressed(self, address: str, category: str) -> bool:
+        """Whether mail to this one address is suppressed. A bounce or a
+        complaint belongs to the address, not the account, so email asks about
+        the address it is about to use and nothing else."""
+        if self._headers is None:
+            raise ContactRefusalUnconfigured("cms_synapse_module_api_key is not set")
+        return (await self._ask([address], category)).suppressed
 
     async def _ask(self, addresses: List[str], category: str) -> ContactStanding:
         assert self._headers is not None
