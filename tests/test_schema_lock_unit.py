@@ -3,9 +3,11 @@ two Synapse workers creating the same tables run one after the other instead
 of deadlocking (``synapse_pangea_chat.schema_lock``)."""
 
 import asyncio
+import re
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, List, Optional
 from unittest.mock import MagicMock
@@ -97,6 +99,25 @@ class TestEveryStoreLocksFirst(unittest.IsolatedAsyncioTestCase):
         for store in _stores(Pool()):
             await store.ensure()
         self.assertEqual(len(seen), 6)
+
+
+class TestNoUnlockedSchema(unittest.TestCase):
+    def test_every_module_that_creates_tables_takes_a_lock(self) -> None:
+        """A new store that creates tables without the lock fails here."""
+        root = Path(__file__).resolve().parent.parent / "synapse_pangea_chat"
+        unlocked = [
+            str(path.relative_to(root))
+            for path in sorted(root.rglob("*.py"))
+            if re.search(
+                r"CREATE (UNIQUE )?(TABLE|INDEX) IF NOT EXISTS",
+                text := path.read_text(),
+            )
+            and "lock_schema(txn)" not in text
+            and "pg_advisory_xact_lock" not in text
+            # Statement lists only; their store's transaction takes the lock.
+            and path.name not in ("events.py", "managed_events.py")
+        ]
+        self.assertEqual(unlocked, [])
 
 
 class _PostgresPool:

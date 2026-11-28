@@ -22,6 +22,7 @@ from twisted.web.resource import Resource
 
 from synapse_pangea_chat.delete_room.extract_body_json import extract_body_json
 from synapse_pangea_chat.delete_user.is_rate_limited import is_rate_limited
+from synapse_pangea_chat.schema_lock import lock_schema
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -299,6 +300,7 @@ class DeleteUser(Resource):
             return
 
         def _create_table(txn: Any) -> None:
+            lock_schema(txn)
             txn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {SCHEDULE_TABLE} (

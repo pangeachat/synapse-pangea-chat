@@ -9,6 +9,8 @@ message is gone, or once the row is a week old.
 
 from typing import Any, List, Tuple
 
+from synapse_pangea_chat.schema_lock import lock_schema
+
 #: A row this old is given up on: the message has been readable, unchecked,
 #: for a week, and a check now protects nobody it would have protected then.
 MAX_AGE_SECONDS = 7 * 24 * 60 * 60
@@ -59,6 +61,7 @@ class RecheckStore:
         if not self._table_ready:
 
             def _create(txn: Any) -> None:
+                lock_schema(txn)
                 txn.execute(_CREATE_TABLE_SQL)
 
             await pool.runInteraction("pangea_moderation_create_recheck_table", _create)

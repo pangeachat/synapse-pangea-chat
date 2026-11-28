@@ -50,6 +50,7 @@ from synapse_pangea_chat.public_courses.get_public_courses import (
     extract_plan_id,
 )
 from synapse_pangea_chat.public_courses.select_state_sender import select_state_sender
+from synapse_pangea_chat.schema_lock import lock_schema
 
 if TYPE_CHECKING:
     from synapse_pangea_chat.config import PangeaChatConfig
@@ -202,6 +203,7 @@ class PublicCoursesL2Backfill:
 
     async def _ensure_lease_table(self) -> None:
         def _create(txn: Any) -> None:
+            lock_schema(txn)
             txn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {LEASE_TABLE} (
