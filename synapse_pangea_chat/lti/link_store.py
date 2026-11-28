@@ -20,6 +20,7 @@ from typing import Any, Optional, Tuple
 
 import attr
 
+from synapse_pangea_chat.schema_lock import lock_schema
 from synapse_pangea_chat.student_invitations.events import (
     CANVAS_CONNECTED,
     EVENT_SCHEMA,
@@ -119,6 +120,7 @@ class LtiLinkStore:
             return
 
         def create(txn: Any) -> None:
+            lock_schema(txn)
             # The ledger table too: a connect is recorded with its link.
             for sql in SCHEMA + EVENT_SCHEMA:
                 txn.execute(sql)

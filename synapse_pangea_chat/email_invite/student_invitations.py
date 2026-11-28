@@ -16,6 +16,8 @@ import hashlib
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from synapse_pangea_chat.schema_lock import lock_schema
+
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS pangea_student_invitation (
         invitation_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, email TEXT NOT NULL,
@@ -53,6 +55,7 @@ class StudentInvitationStore:
             return
 
         def create(txn):
+            lock_schema(txn)
             for sql in SCHEMA:
                 txn.execute(sql)
 

@@ -42,6 +42,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from synapse.storage.engines import PostgresEngine
 
+from synapse_pangea_chat.schema_lock import lock_schema
 from synapse_pangea_chat.student_invitations.events import (
     CANVAS_ROSTER_IMPORTED,
     EVENT_SCHEMA,
@@ -271,6 +272,7 @@ class StudentInvitationStore:
             return
 
         def create(txn: Any) -> None:
+            lock_schema(txn)
             for sql in SCHEMA:
                 txn.execute(sql)
             migrate(txn)
