@@ -20,6 +20,8 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple, overload
 
+from synapse_pangea_chat.schema_lock import lock_schema
+
 logger = logging.getLogger(
     "synapse.module.synapse_pangea_chat.user_activity.activity_cache"
 )
@@ -77,6 +79,7 @@ class UserActivityCache:
             return
 
         def create(txn: Any) -> None:
+            lock_schema(txn)
             for sql in SCHEMA:
                 txn.execute(sql)
 

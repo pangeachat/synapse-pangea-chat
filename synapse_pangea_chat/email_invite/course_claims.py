@@ -38,6 +38,8 @@ from typing import Any, List, Optional, Tuple
 
 import attr
 
+from synapse_pangea_chat.schema_lock import lock_schema
+
 COURSE_CLAIM_TABLE = "pangea_course_claim"
 COURSE_CLAIM_CODE_TABLE = "pangea_course_claim_code"
 
@@ -222,6 +224,7 @@ class CourseClaimStore:
             return
 
         def _create(txn: Any) -> None:
+            lock_schema(txn)
             txn.execute(_CREATE_TABLE_SQL)
             txn.execute(_CREATE_CODE_TABLE_SQL)
             txn.execute(_CREATE_CODE_INDEX_SQL)

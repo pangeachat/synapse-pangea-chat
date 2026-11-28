@@ -17,6 +17,8 @@ from typing import Any, List, Optional, Tuple
 
 import attr
 
+from synapse_pangea_chat.schema_lock import lock_schema
+
 PENDING = "pending"
 APPROVED = "approved"
 
@@ -87,6 +89,7 @@ class LtiStore:
             return
 
         def create(txn: Any) -> None:
+            lock_schema(txn)
             for sql in SCHEMA:
                 txn.execute(sql)
 

@@ -56,6 +56,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import attr
 
+from synapse_pangea_chat.schema_lock import lock_schema
+
 INCIDENTS_TABLE = "pangea_safety_incidents"
 INCIDENT_COURSES_TABLE = "pangea_safety_incident_courses"
 INCIDENTS_META_TABLE = "pangea_safety_incidents_meta"
@@ -835,6 +837,7 @@ class IncidentWriteError(Exception):
 def create_tables(txn: Any) -> None:
     """Every table of the record, the forward outbox included. Idempotent; the
     forwarder runs it too, so it never reads a table that is not there yet."""
+    lock_schema(txn)
     for sql in CREATE_STATEMENTS:
         txn.execute(sql)
 

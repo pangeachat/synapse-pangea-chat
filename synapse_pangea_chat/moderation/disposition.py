@@ -76,6 +76,7 @@ from typing import Any, Optional, Tuple
 from synapse_pangea_chat.moderation import metrics
 from synapse_pangea_chat.moderation.compat import reraise_if_cancelled
 from synapse_pangea_chat.moderation.log_safety import error_site, scrubbing_logger
+from synapse_pangea_chat.schema_lock import lock_schema
 
 logger = scrubbing_logger("synapse.modules.synapse_pangea_chat.moderation.disposition")
 
@@ -205,6 +206,7 @@ class DispositionStore:
             return
 
         def _create(txn: Any) -> None:
+            lock_schema(txn)
             txn.execute(_CREATE_TABLE_SQL)
 
         await self._pool().runInteraction(

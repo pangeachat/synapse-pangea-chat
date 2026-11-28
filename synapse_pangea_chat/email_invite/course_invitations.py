@@ -16,6 +16,7 @@ from synapse.storage.engines import PostgresEngine
 from synapse.util.threepids import canonicalise_email
 
 from synapse_pangea_chat.email_invite.course_claims import admin_code_digest
+from synapse_pangea_chat.schema_lock import lock_schema
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS pangea_course_invitation (
@@ -144,6 +145,7 @@ class CourseInvitationStore:
             return
 
         def create(txn):
+            lock_schema(txn)
             for sql in SCHEMA:
                 txn.execute(sql)
             postgres = isinstance(getattr(txn, "database_engine", None), PostgresEngine)

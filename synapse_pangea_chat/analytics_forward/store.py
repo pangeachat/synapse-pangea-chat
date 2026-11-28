@@ -33,6 +33,7 @@ from synapse_pangea_chat.moderation.incidents import (
     remark_outbox,
     settle_outbox,
 )
+from synapse_pangea_chat.schema_lock import lock_schema
 
 _CURSOR_NAME = "analytics_forward"
 #: The pending_accepts revision, kept in the cursor table as a second row.
@@ -281,6 +282,7 @@ class ForwardStore:
             raise RuntimeError("analytics_forward requires a PostgreSQL database")
 
         def _create(txn: Any) -> None:
+            lock_schema(txn)
             txn.execute(_CREATE_CURSOR_SQL)
             txn.execute(_CREATE_OUTBOX_SQL)
             txn.execute(_CREATE_OUTBOX_INDEX_SQL)
