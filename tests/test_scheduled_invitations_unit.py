@@ -881,6 +881,9 @@ class TestMigration(unittest.TestCase):
 
     def test_the_column_and_due_index_are_added_in_place_and_idempotently(self):
         db = sqlite3.connect(":memory:")
+        # Closed here: left to the collector, it raises a ResourceWarning
+        # inside whichever E2E test the collection happens to land in.
+        self.addCleanup(db.close)
         for sql in SCHEMA:
             db.execute(sql)
         db.execute("ALTER TABLE pangea_seat_invitation DROP COLUMN send_at_ms")
